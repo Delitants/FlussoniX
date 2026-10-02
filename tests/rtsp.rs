@@ -479,3 +479,39 @@ async fn rtsp_on_play_callback_receives_protocol_and_denies_before_startup() {
     t.await.unwrap().unwrap();
     task.abort();
 }
+
+#[tokio::test]
+async fn long_stream_name_can_setup_its_advertised_track() {
+    let (_d, app, url, cancel, task) = fixture("standalone").await;
+    let name = format!("{}/{}", "a".repeat(125), "b".repeat(125));
+    app.config.put("streams", &name, json!({"static":false,"inputs":[{"url":"testsrc://"}],"flussonix_token_sha256":format!("{:x}", Sha256::digest(b"owned-token"))})).unwrap();
+    let url = url.replace("/owned", &format!("/{name}"));
+    let mut client = connect(&url).await;
+    let (code, _, body) = request(
+        &mut client,
+        "DESCRIBE",
+        &format!("{url}?token=owned-token"),
+        "",
+    )
+    .await;
+    assert_eq!(code, 200);
+    let sdp = String::from_utf8(body).unwrap();
+    let track = sdp
+        .lines()
+        .find_map(|l| l.strip_prefix("a=control:trackID="))
+        .unwrap();
+    assert_eq!(
+        request(
+            &mut client,
+            "SETUP",
+            &format!("{url}/trackID={track}"),
+            "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n"
+        )
+        .await
+        .0,
+        200
+    );
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+    app.media.stop_all().await;
+}

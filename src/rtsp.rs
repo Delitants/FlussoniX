@@ -1,8 +1,8 @@
 //! RTSP/1.0 live playback, TCP-interleaved H.264/AAC only.
 pub mod protocol;
 use crate::{
-    media_queue::Receiver,
     playback_auth::ViewerRequest,
+    rtp::Receiver,
     server::{App, rtsp_access::Playback},
 };
 use bytes::Bytes;
@@ -283,7 +283,12 @@ fn location(uri: &str) -> Result<(url::Url, String), u16> {
         .decode_utf8()
         .map_err(|_| 400u16)?
         .into_owned();
-    crate::config::valid_name(&name).map_err(|_| 400u16)?;
+    let stream = name
+        .rsplit_once("/trackID=")
+        .filter(|(_, id)| id.parse::<u32>().is_ok())
+        .map(|(stream, _)| stream)
+        .unwrap_or(&name);
+    crate::config::valid_name(stream).map_err(|_| 400u16)?;
     let mut keys = std::collections::HashSet::new();
     if url.query_pairs().any(|(k, _)| !keys.insert(k.into_owned())) {
         return Err(400);
@@ -344,6 +349,9 @@ async fn handle(
             Ok(location) => location,
             Err(code) => return Reply::code(code),
         };
+        if crate::config::valid_name(&name).is_err() {
+            return Reply::code(400);
+        }
         let viewer = ViewerRequest {
             name,
             proto: "rtsp".into(),

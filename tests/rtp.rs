@@ -235,3 +235,69 @@ fn generated_flv_waits_for_declared_tracks_and_ignores_placeholder_headers() {
     decoder.push(&tag(9, &data), &hub).unwrap();
     assert_eq!(hub.rtp.description().unwrap().unwrap().tracks.len(), 2);
 }
+
+#[tokio::test]
+async fn large_access_unit_and_packed_gop_bursts_keep_all_packets() {
+    let h = Hub::new();
+    h.configure(&[video()]);
+    let (_, _, mut rx) = h.subscribe().unwrap();
+    let body = avcc(&[[vec![0x65], vec![42; 5 * 1024 * 1024]].concat()]);
+    h.frame(&frame(7, body, true, 0, 0));
+    let saved = h.subscribe().unwrap().1;
+    assert!(saved.len() > 4096);
+    for p in saved {
+        assert_eq!(rx.recv().await.unwrap(), p);
+    }
+    // Native packed GOPs may contain more AUs than the record count budget.
+    let frames: Vec<_> = (0..5000)
+        .map(|i| {
+            frame(
+                7,
+                avcc(&[vec![if i == 0 { 0x65 } else { 0x41 }, 7]]),
+                i == 0,
+                i * 9000,
+                0,
+            )
+        })
+        .collect();
+    h.frames(&frames);
+    for p in h.subscribe().unwrap().1 {
+        assert_eq!(rx.recv().await.unwrap(), p);
+    }
+}
+
+#[tokio::test]
+async fn overflowing_bootstrap_preserves_live_playback_and_delays_new_join() {
+    let h = Hub::new();
+    h.configure(&[video()]);
+    let (_, _, mut rx) = h.subscribe().unwrap();
+    for i in 0..35 {
+        h.frame(&frame(
+            7,
+            avcc(&[[
+                vec![if i == 0 { 0x65 } else { 0x41 }],
+                vec![42; 1024 * 1024],
+            ]
+            .concat()]),
+            i == 0,
+            i * 90000,
+            0,
+        ));
+        for _ in 0..885 {
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+    let (_, saved, mut late) = h.subscribe().unwrap();
+    assert!(saved.is_empty());
+    h.frame(&frame(7, avcc(&[vec![0x41, 9]]), false, 3600000, 0));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), late.recv())
+            .await
+            .is_err()
+    );
+    h.frame(&frame(7, avcc(&[vec![0x65, 10]]), true, 3700000, 0));
+    assert_eq!(&late.recv().await.unwrap()[16..], &[0x65, 10]);
+}

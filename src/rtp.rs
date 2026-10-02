@@ -1,9 +1,5 @@
 //! Independent H.264/AAC RTP packetization shared by all RTSP viewers.
-use crate::{
-    m4f::Frame,
-    m4s::Track,
-    media_queue::{Channel, Receiver},
-};
+use crate::{m4f::Frame, m4s::Track, media_queue::Channel};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use std::{collections::VecDeque, sync::Mutex, time::Instant};
@@ -56,6 +52,32 @@ struct State {
     ready: bool,
     origin: Option<(u64, Instant)>,
 }
+/// Shares immutable AU/GOP batches; each viewer advances packet slices without copying.
+pub struct Receiver {
+    inner: crate::media_queue::Receiver,
+    batch: Bytes,
+    offset: usize,
+    waiting_key: bool,
+}
+impl Receiver {
+    pub async fn recv(&mut self) -> Result<Bytes, tokio::sync::broadcast::error::RecvError> {
+        loop {
+            if self.offset == self.batch.len() {
+                self.batch = self.inner.recv().await?;
+                self.offset = 0;
+            }
+            let at = self.offset;
+            let len = u32::from_be_bytes(self.batch[at..at + 4].try_into().unwrap()) as usize;
+            if self.batch[at + 4] != 0 {
+                self.waiting_key = false;
+            }
+            self.offset += 5 + len;
+            if !self.waiting_key {
+                return Ok(self.batch.slice(at + 5..self.offset));
+            }
+        }
+    }
+}
 pub struct PlaySnapshot {
     pub description: Description,
     pub packets: Vec<Bytes>,
@@ -74,7 +96,7 @@ impl Default for Hub {
 impl Hub {
     pub fn new() -> Self {
         Self {
-            q: Channel::new(4096, 16 * 1024 * 1024),
+            q: Channel::new(4096, 64 * 1024 * 1024),
             state: Mutex::new(State {
                 input: vec![],
                 tracks: vec![],
@@ -122,7 +144,7 @@ impl Hub {
         Ok((
             describe(&s)?,
             s.bootstrap.iter().map(|(_, b)| b.clone()).collect(),
-            self.q.subscribe(),
+            self.receiver(&s),
         ))
     }
     pub fn play_snapshot(&self) -> Result<PlaySnapshot, String> {
@@ -157,9 +179,17 @@ impl Hub {
         Ok(PlaySnapshot {
             description,
             packets,
-            receiver: self.q.subscribe(),
+            receiver: self.receiver(&s),
             positions,
         })
+    }
+    fn receiver(&self, s: &State) -> Receiver {
+        Receiver {
+            inner: self.q.subscribe(),
+            batch: Bytes::new(),
+            offset: 0,
+            waiting_key: !s.ready && s.tracks.iter().any(|t| t.description.video),
+        }
     }
     pub fn clock(&self, id: u32) -> Option<u32> {
         let s = self.state.lock().unwrap();
@@ -172,7 +202,23 @@ impl Hub {
         )
     }
     pub fn frame(&self, f: &Frame) {
+        self.frames(std::slice::from_ref(f));
+    }
+    /// A packed GOP is one publication so packet bursts cannot evict their own beginning.
+    pub fn frames(&self, frames: &[Frame]) {
         let mut s = self.state.lock().unwrap();
+        let mut batch = Vec::new();
+        for f in frames {
+            Self::packetize(&mut s, f, &mut batch);
+            if s.error.is_some() {
+                return;
+            }
+        }
+        if !batch.is_empty() {
+            let _ = self.q.send(Bytes::from(batch));
+        }
+    }
+    fn packetize(s: &mut State, f: &Frame, batch: &mut Vec<u8>) {
         if s.error.is_some() {
             return;
         }
@@ -200,9 +246,6 @@ impl Hub {
         let audio_only = !s.tracks.iter().any(|t| t.description.video);
         if audio_only {
             s.ready = true;
-        }
-        if !s.ready {
-            return;
         }
         if audio_only {
             while s
@@ -237,12 +280,24 @@ impl Hub {
             s.bootstrap.clear();
             s.bytes = 0;
             s.ready = false;
-            return;
         }
-        for p in packets {
-            s.bytes += p.len();
-            s.bootstrap.push_back((f.dts, p.clone()));
-            let _ = self.q.send(p);
+        for (i, p) in packets.into_iter().enumerate() {
+            if batch.len() + 5 + p.len() > 64 * 1024 * 1024 {
+                s.error = Some("RTP producer batch exceeds 64 MiB".into());
+                s.generation = s.generation.wrapping_add(1);
+                s.bootstrap.clear();
+                s.bytes = 0;
+                s.ready = false;
+                batch.clear();
+                return;
+            }
+            batch.extend((p.len() as u32).to_be_bytes());
+            batch.push(u8::from(video && f.key && i == 0));
+            batch.extend_from_slice(&p);
+            if s.ready {
+                s.bytes += p.len();
+                s.bootstrap.push_back((f.dts, p));
+            }
         }
     }
 }

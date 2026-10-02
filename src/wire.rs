@@ -245,9 +245,7 @@ impl Hub {
         }
         if let Ok((decoded_tracks, frames)) = crate::m4f::unpack(&segment.bytes) {
             self.rtp.configure(&decoded_tracks);
-            for frame in &frames {
-                self.rtp.frame(frame);
-            }
+            self.rtp.frames(&frames);
         }
         if s.tracks != tracks {
             s.tracks = tracks;
