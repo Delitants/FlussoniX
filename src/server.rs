@@ -167,7 +167,20 @@ impl App {
             }
         }
     }
-    async fn invalidate_sessions(&self) {}
+    async fn invalidate_sessions(&self) {
+        let root = self.config.snapshot();
+        let mirrors = self.mirrors.lock().await;
+        self.playback_auth.invalidate(|name| {
+            let cfg = self
+                .config
+                .effective(name)
+                .or_else(|| mirrors.get(name).map(|(_, c)| c.clone()))?;
+            if cfg["disabled"] == true {
+                return None;
+            }
+            Policy::from_config(&cfg, &root).ok()
+        });
+    }
     async fn active(&self) -> u64 {
         self.playback_auth.active()
     }
@@ -367,8 +380,8 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         return match result {
             Ok(v) => {
                 if method == "PUT" {
-                    app.invalidate_sessions().await;
                     app.mirrors.lock().await.clear();
+                    app.invalidate_sessions().await;
                     app.reconcile().await;
                 }
                 json_response(v)
@@ -385,9 +398,44 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     } else {
         (resource, name)
     };
-    if kind == "sessions" && method == "GET" {
-        let sessions = app.playback_auth.snapshots();
-        return json_response(json!({"estimated_count":sessions.len(),"sessions":sessions}));
+    if kind == "sessions" {
+        if name == Some("reauth") && method == "POST" {
+            let Some(stream) = query.get("name") else {
+                return error(StatusCode::BAD_REQUEST, "name required");
+            };
+            if app.resolve(stream).await.is_none() {
+                return error(StatusCode::NOT_FOUND, "stream not found");
+            }
+            let count = app.playback_auth.force_reauth(stream);
+            app.playback_auth.renew_due().await;
+            return json_response(json!({"estimated_count":count}));
+        }
+        if let Some(id) = name {
+            if method == "GET" {
+                return match app.playback_auth.snapshot(id) {
+                    Some(s) => json_response(s),
+                    None => error(StatusCode::NOT_FOUND, "session not found"),
+                };
+            }
+            if method == "DELETE" {
+                return if app.playback_auth.revoke(id) {
+                    StatusCode::NO_CONTENT.into_response()
+                } else {
+                    error(StatusCode::NOT_FOUND, "session not found")
+                };
+            }
+        } else if method == "GET" {
+            let mut sessions = app.playback_auth.snapshots();
+            if let Some(name) = query.get("name") {
+                sessions.retain(|s| s["name"] == name.as_str());
+            }
+            sessions.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+            return json_response(json!({"estimated_count":sessions.len(),"sessions":sessions}));
+        }
+        return error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "session operation not implemented",
+        );
     }
     if !KINDS.contains(&kind) {
         return error(StatusCode::NOT_FOUND, "API operation not implemented");
@@ -430,6 +478,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
                     app.invalidate_sessions().await;
                     if kind == "sources" {
                         app.mirrors.lock().await.clear();
+                        app.invalidate_sessions().await;
                         app.reconcile().await;
                     }
                     if matches!(kind, "streams" | "templates") {
@@ -454,6 +503,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
                     }
                     if kind == "sources" {
                         app.mirrors.lock().await.clear();
+                        app.invalidate_sessions().await;
                         app.reconcile().await;
                     }
                     StatusCode::NO_CONTENT.into_response()
@@ -790,7 +840,18 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             Ok(p) => p,
             Err(_) => return error(StatusCode::FORBIDDEN, "invalid playback policy"),
         };
-        let qs = request.uri().query().unwrap_or("");
+        let qs = request
+            .uri()
+            .query()
+            .unwrap_or("")
+            .split('&')
+            .filter(|pair| {
+                url::form_urlencoded::parse(pair.as_bytes())
+                    .next()
+                    .is_none_or(|(key, _)| key != "flussonix_ticket")
+            })
+            .collect::<Vec<_>>()
+            .join("&");
         let viewer = ViewerRequest {
             name: name.into(),
             proto: if file == "mpegts" {
@@ -818,6 +879,9 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             }
         }
     };
+    if grant.is_cancelled() {
+        return error(StatusCode::FORBIDDEN, "playback revoked");
+    }
     if app.options.role == "lb" {
         return balance(&app, name, raw_path, &query).await;
     }
@@ -853,7 +917,8 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     };
     if file == "m4s" || file == "m4f" {
         let deadline = Instant::now() + Duration::from_secs(8);
-        while !worker.wire.has_info()
+        while !grant.is_cancelled()
+            && !worker.wire.has_info()
             && worker.alive.load(Ordering::Relaxed)
             && Instant::now() < deadline
         {
@@ -879,23 +944,24 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         let guard = ViewerGuard(worker.clone(), grant);
         let egress = app.egress.clone();
         let live = futures_util::stream::unfold(
-            (rx, guard, egress.clone()),
-            |(mut rx, guard, egress)| async move {
-                match tokio::select! {_=guard.0.closed()=>Err(tokio::sync::broadcast::error::RecvError::Closed),result=rx.recv()=>result}
-                {
-                    Ok(bytes) => {
-                        egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                        Some((Ok::<Bytes, std::io::Error>(bytes), (rx, guard, egress)))
-                    }
-                    Err(_) => None,
+            (std::collections::VecDeque::from(initial), rx, guard, egress),
+            |(mut boot, mut rx, guard, egress)| async move {
+                if guard.1.is_cancelled() {
+                    return None;
                 }
+                let bytes = if let Some(bytes) = boot.pop_front() {
+                    bytes
+                } else {
+                    tokio::select! {biased; _=guard.1.cancelled()=>return None,_=guard.0.closed()=>return None,result=rx.recv()=> match result { Ok(bytes)=>bytes, Err(_)=>return None } }
+                };
+                guard.1.add_bytes(bytes.len());
+                egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                Some((
+                    Ok::<Bytes, std::io::Error>(bytes),
+                    (boot, rx, guard, egress),
+                ))
             },
         );
-        let boot = futures_util::stream::iter(initial.into_iter().map(move |b| {
-            egress.fetch_add(b.len() as u64, Ordering::Relaxed);
-            Ok::<Bytes, std::io::Error>(b)
-        }));
-        use futures_util::StreamExt;
         return (
             [
                 (
@@ -908,7 +974,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
                 ),
                 ("cache-control", "no-store"),
             ],
-            Body::from_stream(boot.chain(live)),
+            Body::from_stream(live),
         )
             .into_response();
     }
@@ -920,9 +986,10 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         let stream = futures_util::stream::unfold(
             (rx, guard, egress),
             |(mut rx, guard, egress)| async move {
-                match tokio::select! {_=guard.0.closed()=>Err(tokio::sync::broadcast::error::RecvError::Closed),result=rx.recv()=>result}
+                match tokio::select! {biased; _=guard.1.cancelled()=>Err(tokio::sync::broadcast::error::RecvError::Closed),_=guard.0.closed()=>Err(tokio::sync::broadcast::error::RecvError::Closed),result=rx.recv()=>result}
                 {
                     Ok(bytes) => {
+                        guard.1.add_bytes(bytes.len());
                         egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                         Some((Ok::<Bytes, std::io::Error>(bytes), (rx, guard, egress)))
                     }
@@ -941,6 +1008,9 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     }
     let deadline = Instant::now() + Duration::from_secs(8);
     let bytes = loop {
+        if grant.is_cancelled() {
+            return error(StatusCode::FORBIDDEN, "playback revoked");
+        }
         match app.media.read(name, file).await {
             Ok(b) => break b,
             Err(_)
@@ -963,6 +1033,10 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     } else {
         bytes
     };
+    if grant.is_cancelled() {
+        return error(StatusCode::FORBIDDEN, "playback revoked");
+    }
+    grant.add_bytes(bytes.len());
     app.egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
     let content_type = if file.ends_with(".m3u8") {
         "application/vnd.apple.mpegurl"

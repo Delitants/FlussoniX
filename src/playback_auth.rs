@@ -298,7 +298,11 @@ impl PlaybackAuth {
         let mut user_id = None;
         let mut max = policy.max_sessions;
         let mut unique = false;
-        if let Some(url) = &policy.url {
+        if policy.token_hash.as_ref().is_some_and(|h| {
+            !format!("{:x}", Sha256::digest(r.token.as_bytes())).eq_ignore_ascii_case(h)
+        }) {
+            decision = Decision::Deny;
+        } else if let Some(url) = &policy.url {
             let Ok(_permit) = self.callbacks.try_acquire() else {
                 self.retry(entry, generation);
                 return;
@@ -429,6 +433,96 @@ impl PlaybackAuth {
             s.next_check = Instant::now() + Duration::from_secs(10);
         }
     }
+    /// Only sessions with ongoing activity are renewed. Work is bounded and oldest deadlines run first.
+    pub async fn renew_due(&self) {
+        use futures_util::{StreamExt, stream};
+        let mut due = {
+            let mut all = self.entries.lock().unwrap();
+            all.retain(|_, e| {
+                let s = e.state.lock().unwrap();
+                e.live.load(Ordering::Relaxed) > 0
+                    || s.last_seen.elapsed() < Duration::from_secs(30)
+                    || (!matches!(s.decision, Decision::Allow) && s.next_check > Instant::now())
+            });
+            all.values()
+                .filter_map(|e| {
+                    let s = e.state.lock().unwrap();
+                    ((e.live.load(Ordering::Relaxed) > 0
+                        || s.last_seen.elapsed() < Duration::from_secs(30))
+                        && s.next_check <= Instant::now()
+                        && matches!(s.decision, Decision::Allow | Decision::Unknown))
+                    .then_some((s.next_check, e.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        due.sort_by_key(|(time, _)| *time);
+        stream::iter(
+            due.into_iter()
+                .take(128)
+                .map(|(_, e)| async move { self.refresh(&e).await }),
+        )
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+    }
+    pub fn invalidate(&self, policy_for: impl Fn(&str) -> Option<Policy>) {
+        for e in self.entries.lock().unwrap().values() {
+            let mut s = e.state.lock().unwrap();
+            let policy = policy_for(&s.request.name);
+            if policy.as_ref() == Some(&s.policy) {
+                continue;
+            }
+            s.cancel.cancel();
+            s.generation += 1;
+            if let Some(policy) = policy {
+                s.policy = policy;
+                s.decision = Decision::Unknown;
+                s.next_check = Instant::now();
+                // Replacement grants use a fresh cancellation generation; existing bodies stay cancelled.
+                s.cancel = CancellationToken::new();
+            } else {
+                s.decision = Decision::Deny;
+                s.next_check = Instant::now() + Duration::from_secs(180);
+            }
+        }
+    }
+    pub fn revoke(&self, id: &str) -> bool {
+        let all = self.entries.lock().unwrap();
+        let Some(e) = all.values().find(|e| e.id == id) else {
+            return false;
+        };
+        let mut s = e.state.lock().unwrap();
+        s.cancel.cancel();
+        s.decision = Decision::Deny;
+        s.next_check = Instant::now() + Duration::from_secs(180);
+        s.generation += 1;
+        true
+    }
+    pub fn force_reauth(&self, name: &str) -> usize {
+        let all = self.entries.lock().unwrap();
+        let mut count = 0;
+        for e in all.values().filter(|e| e.occupied()) {
+            let mut s = e.state.lock().unwrap();
+            if s.request.name == name {
+                s.next_check = Instant::now();
+                s.generation += 1;
+                count += 1;
+            }
+        }
+        count
+    }
+    pub fn snapshot(&self, id: &str) -> Option<Value> {
+        self.entries
+            .lock()
+            .unwrap()
+            .values()
+            .find(|e| e.id == id)
+            .map(|e| Self::describe(e))
+    }
+    fn describe(e: &Entry) -> Value {
+        let s = e.state.lock().unwrap();
+        json!({"id":e.id,"name":s.request.name,"proto":s.request.proto,"ip":s.request.ip,"user_id":s.user_id,"duration":s.created.elapsed().as_secs(),"bytes":e.bytes.load(Ordering::Relaxed),"is_open":matches!(s.decision, Decision::Allow)})
+    }
     pub fn active(&self) -> u64 {
         self.entries
             .lock()
@@ -438,12 +532,52 @@ impl PlaybackAuth {
             .count() as u64
     }
     pub fn snapshots(&self) -> Vec<Value> {
-        self.entries.lock().unwrap().values().filter(|e| e.occupied()).map(|e| { let s = e.state.lock().unwrap(); json!({"id":e.id,"name":s.request.name,"proto":s.request.proto,"ip":s.request.ip,"user_id":s.user_id,"duration":s.created.elapsed().as_secs(),"bytes":e.bytes.load(Ordering::Relaxed)}) }).collect()
+        self.entries
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|e| e.occupied())
+            .map(|e| Self::describe(e))
+            .collect()
     }
     #[cfg(test)]
     pub fn age_activity(&self, seconds: u64) {
         for e in self.entries.lock().unwrap().values() {
             e.state.lock().unwrap().last_seen = Instant::now() - Duration::from_secs(seconds);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn idle_sessions_expire_but_live_grants_retain_client_slots() {
+        let auth = PlaybackAuth::new(1);
+        let policy = Policy::from_config(&json!({}), &json!({})).unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "mpegts".into(),
+            token: "first".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(grant) = auth.authorize(policy.clone(), request.clone()).await
+        else {
+            panic!("grant")
+        };
+        auth.age_activity(31);
+        auth.renew_due().await;
+        assert_eq!(auth.active(), 1);
+        let other = ViewerRequest {
+            token: "other".into(),
+            ..request
+        };
+        assert!(matches!(
+            auth.authorize(policy, other).await,
+            AuthOutcome::Denied
+        ));
+        drop(grant);
+        auth.renew_due().await;
+        assert_eq!(auth.active(), 0);
     }
 }

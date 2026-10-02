@@ -71,6 +71,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::select! {_=bg_cancel.cancelled()=>break,_=interval.tick()=>background.reconcile().await}
         }
     });
+    let auth_app = app.clone();
+    let auth_cancel = cancel.clone();
+    let authorization = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! { _=auth_cancel.cancelled()=>break, _=interval.tick()=>auth_app.playback_auth.renew_due().await }
+        }
+    });
     let serving = axum::serve(
         listener,
         router(app.clone()).into_make_service_with_connect_info::<SocketAddr>(),
@@ -81,6 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let completed = tokio::select! {result=&mut serving=>Some(result),_=shutdown()=>None};
     cancel.cancel();
     let _ = supervisor.await;
+    let _ = authorization.await;
     app.media.stop_all().await;
     if let Some(result) = completed {
         result?;
