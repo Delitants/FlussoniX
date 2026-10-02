@@ -15,6 +15,8 @@ use std::{
     },
     time::Duration,
 };
+// Bound owned FFmpeg fixtures so load does not masquerade as a metadata outage.
+static MEDIA_TESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 struct Node {
     app: Arc<App>,
     url: String,
@@ -188,6 +190,7 @@ async fn cleanup(nodes: [Node; 3]) {
 }
 #[tokio::test]
 async fn media_failure_switches_equivalent_origin_without_new_viewer_and_is_sticky() {
+    let _load = MEDIA_TESTS.acquire().await.unwrap();
     let d = tempfile::tempdir().unwrap();
     let (a, b, cdn) = setup(d.path(), "m4s").await;
     assert_eq!(play(&cdn).await.status(), 200);
@@ -256,6 +259,7 @@ async fn media_failure_switches_equivalent_origin_without_new_viewer_and_is_stic
 }
 #[tokio::test]
 async fn management_outage_switches_to_same_policy_replica() {
+    let _load = MEDIA_TESTS.acquire().await.unwrap();
     let d = tempfile::tempdir().unwrap();
     let (a, b, cdn) = setup(d.path(), "hls").await;
     assert_eq!(play(&cdn).await.status(), 200);
@@ -268,6 +272,7 @@ async fn management_outage_switches_to_same_policy_replica() {
 }
 #[tokio::test]
 async fn different_content_policy_and_group_are_not_media_failover_candidates() {
+    let _load = MEDIA_TESTS.acquire().await.unwrap();
     for mismatch in ["content", "policy", "group", "missing-id"] {
         let d = tempfile::tempdir().unwrap();
         let (a, b, cdn) = setup(d.path(), "m4s").await;
@@ -323,6 +328,7 @@ async fn different_content_policy_and_group_are_not_media_failover_candidates() 
 }
 #[tokio::test]
 async fn authoritative_disable_delete_and_invalid_policy_fail_closed() {
+    let _load = MEDIA_TESTS.acquire().await.unwrap();
     for failure in ["disabled", "absent", "invalid", "invalid-policy"] {
         let d = tempfile::tempdir().unwrap();
         let (a, b, cdn) = setup(d.path(), "m4s").await;
@@ -349,6 +355,7 @@ async fn authoritative_disable_delete_and_invalid_policy_fail_closed() {
 }
 #[tokio::test]
 async fn late_lookup_cannot_overwrite_a_newer_authoritative_denial() {
+    let _load = MEDIA_TESTS.acquire().await.unwrap();
     let d = tempfile::tempdir().unwrap();
     let (a, b, cdn) = setup(d.path(), "m4s").await;
     assert_eq!(play(&cdn).await.status(), 200);
@@ -373,6 +380,7 @@ async fn late_lookup_cannot_overwrite_a_newer_authoritative_denial() {
 }
 #[tokio::test]
 async fn local_configured_stream_keeps_precedence_over_source_groups() {
+    let _load = MEDIA_TESTS.acquire().await.unwrap();
     let d = tempfile::tempdir().unwrap();
     let (a, b, cdn) = setup(d.path(), "m4s").await;
     cdn.app
@@ -389,6 +397,7 @@ async fn local_configured_stream_keeps_precedence_over_source_groups() {
 
 #[tokio::test]
 async fn concurrent_first_viewers_share_one_private_pull_and_never_start_unused_replica() {
+    let _load = MEDIA_TESTS.acquire().await.unwrap();
     let d = tempfile::tempdir().unwrap();
     let (a, b, cdn) = setup(d.path(), "m4f").await;
     cdn.app
@@ -411,6 +420,7 @@ async fn concurrent_first_viewers_share_one_private_pull_and_never_start_unused_
 }
 #[tokio::test]
 async fn removing_source_relationships_during_lookup_cannot_resurrect_media() {
+    let _load = MEDIA_TESTS.acquire().await.unwrap();
     let d = tempfile::tempdir().unwrap();
     let (a, b, cdn) = setup(d.path(), "m4s").await;
     assert_eq!(play(&cdn).await.status(), 200);
@@ -428,4 +438,150 @@ async fn removing_source_relationships_during_lookup_cannot_resurrect_media() {
     assert_eq!(cdn.app.media.count().await, 0);
     assert!(!play(&cdn).await.status().is_success());
     cleanup([a, b, cdn]).await;
+}
+
+#[tokio::test]
+async fn authoritative_denial_survives_a_later_api_outage() {
+    let _load = MEDIA_TESTS.acquire().await.unwrap();
+    for failure in ["disabled", "absent", "invalid", "invalid-policy"] {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b, cdn) = setup(d.path(), "m4s").await;
+        assert_eq!(play(&cdn).await.status(), 200);
+        match failure {
+            "disabled" => {
+                a.app
+                    .config
+                    .put("streams", "region/news", json!({"disabled":true}))
+                    .unwrap();
+            }
+            "absent" => {
+                a.app.config.delete("streams", "region/news").unwrap();
+            }
+            "invalid-policy" => a.mode.store(4, Ordering::Relaxed),
+            _ => a.mode.store(3, Ordering::Relaxed),
+        }
+        kill_cdn_worker(&cdn).await;
+        cdn.app.reconcile().await;
+        assert_eq!(cdn.app.media.count().await, 0);
+        a.mode.store(1, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(
+            !play(&cdn).await.status().is_success(),
+            "{failure}: outage bypassed authority denial"
+        );
+        assert_eq!(cdn.app.media.count().await, 0);
+        // Only the original authority can clear its denial with valid enabled metadata.
+        a.app
+            .config
+            .put("streams", "region/news", stream("same-content-v1"))
+            .unwrap();
+        a.app
+            .config
+            .put("streams", "region/news", json!({"disabled":false}))
+            .unwrap();
+        a.mode.store(0, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(play(&cdn).await.status(), 200);
+        assert_eq!(selected(&cdn).await["stats"]["upstream_source"], "a");
+        cleanup([a, b, cdn]).await;
+    }
+}
+
+#[tokio::test]
+async fn repeated_media_failures_reach_a_healthy_third_replica() {
+    let _load = MEDIA_TESTS.acquire().await.unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let (a, b, cdn) = setup(d.path(), "m4s").await;
+    let c = node(d.path(), "c", "source", "source-c-owned-key").await;
+    c.app
+        .config
+        .put("streams", "region/news", stream("same-content-v1"))
+        .unwrap();
+    cdn.app.config.put("sources","c",json!({"api_url":c.url,"private_payload_url":c.url,"cluster_key":"source-c-owned-key","flussonix_transport":"m4s","flussonix_source_group":"owned-replicas"})).unwrap();
+    assert_eq!(play(&cdn).await.status(), 200);
+    kill_cdn_worker(&cdn).await;
+    cdn.app.reconcile().await;
+    assert_eq!(selected(&cdn).await["stats"]["upstream_source"], "b");
+    assert_eq!(play(&cdn).await.status(), 200);
+    kill_cdn_worker(&cdn).await;
+    cdn.app.reconcile().await;
+    assert_eq!(
+        selected(&cdn).await["stats"]["upstream_source"],
+        "c",
+        "failed A and B must not starve C"
+    );
+    assert_eq!(play(&cdn).await.status(), 200);
+    cleanup([a, b, cdn]).await;
+    c.app.media.stop_all().await;
+    c.task.abort();
+}
+
+#[tokio::test]
+async fn delayed_authorization_uses_the_new_origin_without_replacing_its_worker() {
+    let _load = MEDIA_TESTS.acquire().await.unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let (a, b, cdn) = setup(d.path(), "m4s").await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let callback = format!("http://{}/auth", listener.local_addr().unwrap());
+    let (e, r) = (entered.clone(), release.clone());
+    let backend = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/auth",
+                get(
+                    move |q: axum::extract::Query<std::collections::HashMap<String, String>>| {
+                        let (e, r) = (e.clone(), r.clone());
+                        async move {
+                            if q.get("token").is_some_and(|t| t == "delayed") {
+                                e.notify_one();
+                                r.notified().await;
+                            }
+                            (StatusCode::OK, [("X-AuthDuration", "120")])
+                        }
+                    },
+                ),
+            ),
+        )
+        .await
+        .unwrap()
+    });
+    for n in [&a, &b] {
+        n.app
+            .config
+            .put(
+                "streams",
+                "region/news",
+                json!({"flussonix_token_sha256":null,"on_play":callback}),
+            )
+            .unwrap();
+    }
+    assert_eq!(play(&cdn).await.status(), 200);
+    let url = cdn.url.clone();
+    let pending = tokio::spawn(async move {
+        client()
+            .get(format!("{url}/region/news/index.m3u8?token=delayed"))
+            .send()
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    kill_cdn_worker(&cdn).await;
+    cdn.app.reconcile().await;
+    let after = selected(&cdn).await;
+    assert_eq!(after["stats"]["upstream_source"], "b");
+    let pid = after["stats"]["pid"].clone();
+    release.notify_one();
+    assert_eq!(pending.await.unwrap().status(), 200);
+    assert_eq!(
+        selected(&cdn).await["stats"]["pid"],
+        pid,
+        "stale authorization route replaced the selected worker"
+    );
+    cleanup([a, b, cdn]).await;
+    backend.abort();
 }

@@ -72,6 +72,7 @@ struct Mirror {
     config: Value,
     source: Value,
     available: bool,
+    denied: bool,
     known: bool,
     serial: u64,
     switches: u64,
@@ -162,16 +163,19 @@ impl App {
             Some((config, self.config.revision()))
         })
     }
-    async fn recover_current(&self, name: &str, config: &Value, revision: u64) {
+    async fn recover_current(&self, name: &str, config: &Value, _revision: u64) {
         let signature = crate::media::media_signature(config);
-        if self.config.revision() != revision
-            && !self.media_config(name).await.is_some_and(|(c, _)| {
-                c["disabled"] != true && crate::media::media_signature(&c) == signature
-            })
-        {
+        if !self.media_config(name).await.is_some_and(|(c, _)| {
+            c["disabled"] != true && crate::media::media_signature(&c) == signature
+        }) {
             return;
         }
-        if let Ok(worker) = self.media.recover(name, config).await {
+        let check = async {
+            self.media_config(name).await.is_some_and(|(c, _)| {
+                c["disabled"] != true && crate::media::media_signature(&c) == signature
+            })
+        };
+        if let Ok(worker) = self.media.ensure_guarded(name, config, false, check).await {
             // A save can race filesystem/child startup. Stop only the exact
             // stale attempt; a later request may already have replaced it.
             if !self.media_config(name).await.is_some_and(|(c, _)| {
@@ -809,7 +813,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     let Some(resolved) = app.resolve(name).await else {
         return error(StatusCode::NOT_FOUND, "stream not found");
     };
-    let mut cfg = resolved.config;
+    let cfg = resolved.config;
     if cfg["disabled"] == true {
         return error(StatusCode::NOT_FOUND, "stream disabled");
     }
@@ -867,11 +871,15 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     if app.config.revision() != resolved.revision {
         // Re-resolve after a concurrent save. Unrelated metadata changes retain the grant,
         // while policy/source changes publish a new authority revision and cancel it.
-        let Some(current) = app.resolve(name).await else {
+        let Some(_) = app.resolve(name).await else {
             return error(StatusCode::NOT_FOUND, "stream unavailable");
         };
-        cfg = current.config;
     }
+    // Authorization can await a callback while an equivalent-origin switch
+    // changes media without changing the root revision or viewer policy.
+    let Some((cfg, _)) = app.media_config(name).await else {
+        return error(StatusCode::NOT_FOUND, "stream unavailable");
+    };
     if grant.is_cancelled() {
         return error(StatusCode::FORBIDDEN, "playback policy changed");
     }
@@ -904,10 +912,28 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             }
         }
     }
-    let worker = match app.media.ensure(name, &cfg).await {
+    let signature = crate::media::media_signature(&cfg);
+    let check = async {
+        !grant.is_cancelled()
+            && app.media_config(name).await.is_some_and(|(c, _)| {
+                c["disabled"] != true && crate::media::media_signature(&c) == signature
+            })
+    };
+    let worker = match app.media.ensure_guarded(name, &cfg, true, check).await {
         Ok(w) => w,
         Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "stream input unavailable"),
     };
+    if grant.is_cancelled()
+        || !app.media_config(name).await.is_some_and(|(c, _)| {
+            c["disabled"] != true && crate::media::media_signature(&c) == worker.signature()
+        })
+    {
+        app.media.stop_if_current(name, &worker).await;
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stream changed during startup",
+        );
+    }
     if file == "m4s" || file == "m4f" {
         let deadline = Instant::now() + Duration::from_secs(8);
         while !grant.is_cancelled()

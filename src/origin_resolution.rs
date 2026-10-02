@@ -5,6 +5,7 @@ use futures_util::{StreamExt, stream};
 enum OriginState {
     Ready,
     Unavailable,
+    Denied,
     Unresolved,
 }
 #[derive(Clone)]
@@ -25,10 +26,12 @@ impl Drop for Lookup {
 impl App {
     async fn begin_lookup(&self, name: &str, root: &Value, revision: u64) -> Option<Lookup> {
         let mut tickets = self.source_lookups.lock().await;
+        tickets.retain(|_, t| !*t.done.borrow());
         if tickets.len() >= 10000 && !tickets.contains_key(name) {
             return None;
         }
-        let mirrors = self.mirrors.lock().await;
+        let mut mirrors = self.mirrors.lock().await;
+        mirrors.retain(|_, m| m.known || m.when.elapsed() < Duration::from_secs(1));
         self.config.at_revision(revision, |_| {
             let old = mirrors
                 .get(name)
@@ -52,7 +55,21 @@ impl App {
     }
     async fn latest_lookup(&self, name: &str, lookup: &Lookup, revision: u64) -> Option<Resolved> {
         loop {
-            let ticket = self.source_lookups.lock().await.get(name)?.clone();
+            let tickets = self.source_lookups.lock().await;
+            let Some(ticket) = tickets.get(name).cloned() else {
+                let mirrors = self.mirrors.lock().await;
+                return self.config.at_revision(revision, |root| {
+                    mirrors
+                        .get(name)
+                        .filter(|m| {
+                            root["sources"]
+                                .as_array()
+                                .is_some_and(|s| s.contains(&m.source))
+                        })
+                        .and_then(|m| self.publish_resolved(name, m, root, revision))
+                })?;
+            };
+            drop(tickets);
             let mut done = ticket.done.subscribe();
             tokio::time::timeout_at(lookup.deadline, done.wait_for(|complete| *complete))
                 .await
@@ -241,6 +258,7 @@ impl App {
                 source: source.clone(),
                 config,
                 available,
+                denied: matches!(state, OriginState::Denied),
                 known,
                 serial: old.map_or(Some(1), |m| m.serial.checked_add(1))?,
                 switches,
@@ -323,7 +341,7 @@ impl App {
                                 &lookup,
                                 &m.source,
                                 c,
-                                OriginState::Unavailable,
+                                OriginState::Denied,
                                 revision,
                             )
                             .await;
@@ -335,7 +353,7 @@ impl App {
                                 &lookup,
                                 &m.source,
                                 m.config.clone(),
-                                OriginState::Unavailable,
+                                OriginState::Denied,
                                 revision,
                             )
                             .await;
@@ -348,7 +366,19 @@ impl App {
                             &lookup,
                             &m.source,
                             m.config.clone(),
-                            OriginState::Unavailable,
+                            OriginState::Denied,
+                            revision,
+                        )
+                        .await;
+                }
+                Err(LookupFailure::Unavailable) if m.denied => {
+                    return self
+                        .install_origin(
+                            name,
+                            &lookup,
+                            &m.source,
+                            m.config.clone(),
+                            OriginState::Denied,
                             revision,
                         )
                         .await;
@@ -365,8 +395,12 @@ impl App {
                     .as_ref()
                     .is_some_and(|a| a["flussonix_content_id"] == m.config["flussonix_content_id"])
             {
+                let start = sources.iter().position(|s| s == &m.source).unwrap_or(0) + 1;
                 sources
                     .iter()
+                    .cycle()
+                    .skip(start)
+                    .take(sources.len())
                     .filter(|s| {
                         *s != &m.source
                             && s["drain"] != true
@@ -415,7 +449,7 @@ impl App {
                     if available {
                         OriginState::Ready
                     } else {
-                        OriginState::Unavailable
+                        OriginState::Denied
                     },
                     revision,
                 )
@@ -455,5 +489,64 @@ impl App {
             self.playback_auth.publish(name, None);
         });
         None
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    #[tokio::test]
+    async fn completed_probe_capacity_is_reclaimed_for_new_stream_lookup() {
+        let d = tempfile::tempdir().unwrap();
+        let app = App::new(
+            d.path().join("config.json"),
+            d.path().join("media"),
+            Options {
+                admin_password: "owned-cache-admin".into(),
+                peer_key: "owned-cache-peer-key".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.config
+            .put("sources", "a", json!({"api_url":"http://127.0.0.1:19996"}))
+            .unwrap();
+        let root = app.config.snapshot();
+        let source = root["sources"][0].clone();
+        let mut tickets = app.source_lookups.lock().await;
+        let mut mirrors = app.mirrors.lock().await;
+        for n in 0..10000 {
+            let name = format!("missing-{n}");
+            tickets.insert(
+                name.clone(),
+                Ticket {
+                    id: uuid::Uuid::new_v4(),
+                    done: tokio::sync::watch::channel(true).0,
+                },
+            );
+            mirrors.insert(
+                name.clone(),
+                Mirror {
+                    when: Instant::now() - Duration::from_secs(2),
+                    config: json!({"name":name,"disabled":true}),
+                    source: source.clone(),
+                    available: false,
+                    denied: false,
+                    known: false,
+                    serial: 1,
+                    switches: 0,
+                },
+            );
+        }
+        drop(mirrors);
+        drop(tickets);
+        assert!(
+            app.begin_lookup("real-stream", &root, app.config.revision())
+                .await
+                .is_some(),
+            "failed probes permanently exhausted discovery"
+        );
+        assert!(app.source_lookups.lock().await.len() < 10000);
+        assert!(app.mirrors.lock().await.len() < 10000);
     }
 }

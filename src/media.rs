@@ -101,18 +101,26 @@ impl Engine {
             .join(format!("{:x}", Sha256::digest(name.as_bytes())))
     }
     pub async fn ensure(&self, name: &str, cfg: &Value) -> Result<Arc<Worker>, String> {
-        self.ensure_inner(name, cfg, true).await
+        self.ensure_guarded(name, cfg, true, std::future::ready(true))
+            .await
     }
     pub async fn recover(&self, name: &str, cfg: &Value) -> Result<Arc<Worker>, String> {
-        self.ensure_inner(name, cfg, false).await
+        self.ensure_guarded(name, cfg, false, std::future::ready(true))
+            .await
     }
-    async fn ensure_inner(
+    pub async fn ensure_guarded(
         &self,
         name: &str,
         cfg: &Value,
         touch_demand: bool,
+        current: impl std::future::Future<Output = bool>,
     ) -> Result<Arc<Worker>, String> {
         let mut workers = self.workers.lock().await;
+        // Recheck after waiting for another stream startup/replacement. A stale
+        // route must not cancel an already-published replacement worker.
+        if !current.await {
+            return Err("media route changed".into());
+        }
         if cfg["disabled"] == true {
             return Err("stream disabled".into());
         }
@@ -564,6 +572,43 @@ mod lifecycle_tests {
             tokio::task::yield_now().await;
         }
     }
+    #[tokio::test]
+    async fn queued_stale_start_cannot_replace_the_current_worker() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        let current_cfg = json!({"inputs":[{"url":"testsrc://"}],"flussonix_input_timeout":20});
+        let stale_cfg = json!({"inputs":[{"url":"testsrc://"}],"flussonix_input_timeout":15});
+        let current = app.media.ensure("owned", &current_cfg).await.unwrap();
+        let blocked = app.media.workers.lock().await;
+        let allowed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = allowed.clone();
+        let a = app.clone();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let pending = tokio::spawn(async move {
+            entered.send(()).unwrap();
+            a.media
+                .ensure_guarded("owned", &stale_cfg, true, async move {
+                    flag.load(Ordering::SeqCst)
+                })
+                .await
+        });
+        waiting.await.unwrap();
+        allowed.store(false, Ordering::SeqCst);
+        drop(blocked);
+        let result = pending.await.unwrap();
+        let pid = app.media.stats("owned").await["pid"].clone();
+        app.media.stop_all().await;
+        assert!(
+            result.is_err(),
+            "stale route passed the engine startup fence"
+        );
+        assert_eq!(
+            pid,
+            current.pid(),
+            "queued stale startup replaced the current worker"
+        );
+    }
+
     #[tokio::test]
     async fn active_continuous_body_prevents_idle_retirement() {
         let d = tempfile::tempdir().unwrap();
