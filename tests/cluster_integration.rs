@@ -41,19 +41,18 @@ async fn launch(
     });
     (app, url, task)
 }
-#[tokio::test]
-async fn source_cdn_balancer_auth_and_private_pull_decode_real_hls() {
+async fn check_source_cdn_balancer(transport: &str) {
     let d = tempfile::tempdir().unwrap();
     let (source, source_url, source_task) = launch(d.path(), "source", "source").await;
     let (cdn, cdn_url, cdn_task) = launch(d.path(), "cdn", "cdn").await;
     let (lb, lb_url, lb_task) = launch(d.path(), "lb", "lb").await;
-    source.config.put("streams","region/news",json!({"static":false,"inputs":[{"url":"testsrc://"}],"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"viewer-test-token"))})).unwrap();
+    source.config.put("streams","region/news",json!({"static":false,"inputs":[{"url":"testsrc://"}],"transcoder":{"encoder":"libx264","vb":1200},"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"viewer-test-token"))})).unwrap();
     for app in [&cdn, &lb] {
         app.config
             .put(
                 "sources",
                 "origin",
-                json!({"api_url":source_url,"private_payload_url":source_url}),
+                json!({"api_url":source_url,"private_payload_url":source_url,"flussonix_transport":transport}),
             )
             .unwrap();
     }
@@ -81,6 +80,32 @@ async fn source_cdn_balancer_auth_and_private_pull_decode_real_hls() {
     );
     assert_eq!(source.media.count().await, 0);
     assert_eq!(cdn.media.count().await, 0);
+    // Startup samples can be unknown: wait for real admissible telemetry before
+    // asserting selection, rather than assuming an immediate interval has CPU ticks.
+    let mut eligible = false;
+    for _ in 0..40 {
+        let n = client
+            .get(format!("{cdn_url}/flussonix/api/v1/node"))
+            .header("X-Flussonix-Peer", "cluster-peer-key")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        if n["cpu"].as_f64().is_some_and(|v| v < 0.9)
+            && n["ram"].as_f64().is_some_and(|v| v < 0.95)
+            && n["uplink"].as_f64().is_some_and(|v| v < 0.8)
+        {
+            eligible = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        eligible,
+        "test node must have a measured interval and admission capacity"
+    );
     let response = client
         .get(format!(
             "{lb_url}/region/news/index.m3u8?token=viewer-test-token"
@@ -88,7 +113,23 @@ async fn source_cdn_balancer_auth_and_private_pull_decode_real_hls() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 302);
+    if response.status() != 302 {
+        let telemetry = client
+            .get(format!("{cdn_url}/flussonix/api/v1/node"))
+            .header("X-Flussonix-Peer", "cluster-peer-key")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        panic!(
+            "balancer {} rejection {}: peer telemetry {}",
+            transport,
+            response.status(),
+            telemetry
+        );
+    }
     let location = response.headers()["location"].to_str().unwrap().to_owned();
     assert!(location.starts_with(&cdn_url));
     assert!(!location.contains("cluster-peer-key"));
@@ -112,6 +153,37 @@ async fn source_cdn_balancer_auth_and_private_pull_decode_real_hls() {
     assert!(playlist.contains("token=viewer-test-token"));
     assert_eq!(source.media.count().await, 1);
     assert_eq!(cdn.media.count().await, 1);
+    assert_eq!(
+        cdn.media.stats("region/news").await["input_protocol"],
+        transport
+    );
+    if transport == "m4f" {
+        let input =
+            flussonix::cluster::source_input_url(&source_url, "region/news", transport).unwrap();
+        let edge=cdn.media.ensure("region/news",&json!({"inputs":[{"url":input}],"static":false,"flussonix_peer_key":"cluster-peer-key"})).await.unwrap();
+        let origin = source
+            .media
+            .ensure(
+                "region/news",
+                &source.config.effective("region/news").unwrap(),
+            )
+            .await
+            .unwrap();
+        let (initial, _) = edge.wire.signal_subscribe();
+        let line = String::from_utf8_lossy(initial.last().unwrap());
+        let stamp = line
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .split('-')
+            .next()
+            .unwrap();
+        assert_eq!(
+            edge.wire.segment(&format!("{stamp}.m4f")),
+            origin.wire.segment(&format!("{stamp}.m4f")),
+            "source encoding must not be applied a second time at the CDN"
+        );
+    }
     assert_eq!(
         client.get(&location).send().await.unwrap().status(),
         503,
@@ -452,4 +524,17 @@ async fn packed_gop_http_ingest_preserves_record_extensions_and_decodes_hls() {
     engine.stop_all().await;
     assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
     task.abort();
+}
+
+#[tokio::test]
+async fn source_cdn_balancer_auth_and_private_pull_decode_real_hls() {
+    check_source_cdn_balancer("hls").await;
+}
+#[tokio::test]
+async fn source_cdn_balancer_over_m4s_preserves_auth_and_one_worker() {
+    check_source_cdn_balancer("m4s").await;
+}
+#[tokio::test]
+async fn source_cdn_balancer_over_m4f_preserves_segments_and_source_timeline() {
+    check_source_cdn_balancer("m4f").await;
 }

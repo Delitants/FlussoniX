@@ -59,8 +59,8 @@ test('cluster source fields preserve endpoints and mask the peer key',async({pag
  await page.getByRole('button',{name:'Cluster',exact:true}).click();await page.getByRole('button',{name:'Source servers',exact:true}).click();
  await page.getByRole('button',{name:'Add source',exact:true}).click();await page.getByLabel('Node name',{exact:true}).fill('friendly-source');
  await page.getByLabel('Management URL',{exact:true}).fill('http://127.0.0.1:19998');await page.getByLabel('Private media URL',{exact:true}).fill('http://127.0.0.1:19998');
- await page.getByLabel('Cluster key',{exact:true}).fill('owned-test-peer-key');await expect(page.getByLabel('Cluster key',{exact:true})).toHaveAttribute('type','password');
+ await page.getByLabel('Source transport',{exact:true}).selectOption('m4f');await page.getByLabel('Cluster key',{exact:true}).fill('owned-test-peer-key');await expect(page.getByLabel('Cluster key',{exact:true})).toHaveAttribute('type','password');
  await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('cell',{name:'friendly-source',exact:true})).toBeVisible();
- const source=await (await request.get('/streamer/api/v3/cluster/sources/friendly-source',{headers})).json();expect(source.private_payload_url).toBe('http://127.0.0.1:19998');
+ const source=await (await request.get('/streamer/api/v3/cluster/sources/friendly-source',{headers})).json();expect(source.private_payload_url).toBe('http://127.0.0.1:19998');expect(source.flussonix_transport).toBe('m4f');
  await expect(page.locator('textarea')).toHaveCount(0);
 });

@@ -31,6 +31,7 @@ pub struct Worker {
     started: Instant,
     signature: String,
     input_index: usize,
+    input_protocol: String,
     pub bytes: AtomicU64,
     pub viewers: AtomicU64,
     pub alive: std::sync::atomic::AtomicBool,
@@ -61,7 +62,7 @@ impl Worker {
         self.last_access.lock().unwrap().elapsed().as_secs()
     }
     pub fn stats(&self) -> Value {
-        json!({"status":if self.alive.load(Ordering::Relaxed){if self.bytes.load(Ordering::Relaxed)>0{"running"}else{"starting"}}else{"error"},"pid":self.pid,"bytes_in":self.bytes.load(Ordering::Relaxed),"online_clients":self.viewers.load(Ordering::Relaxed),"uptime":self.started.elapsed().as_secs()})
+        json!({"status":if self.alive.load(Ordering::Relaxed){if self.bytes.load(Ordering::Relaxed)>0{"running"}else{"starting"}}else{"error"},"pid":self.pid,"bytes_in":self.bytes.load(Ordering::Relaxed),"online_clients":self.viewers.load(Ordering::Relaxed),"uptime":self.started.elapsed().as_secs(),"input_protocol":self.input_protocol})
     }
 }
 impl Engine {
@@ -218,6 +219,7 @@ impl Engine {
             started: Instant::now(),
             signature,
             input_index: index,
+            input_protocol: input.split("://").next().unwrap_or("unknown").into(),
             bytes: AtomicU64::new(0),
             viewers: AtomicU64::new(0),
             alive: std::sync::atomic::AtomicBool::new(true),

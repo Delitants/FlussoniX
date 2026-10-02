@@ -340,7 +340,14 @@ impl App {
                 if !c.is_object() {
                     continue;
                 }
-                c["inputs"] = json!([{"url":format!("{}/{}/index.m3u8",private.trim_end_matches('/'),encoded_path(name))}]);
+                let transport = source["flussonix_transport"].as_str().unwrap_or("hls");
+                let Ok(input) = crate::cluster::source_input_url(private, name, transport) else {
+                    continue;
+                };
+                c["inputs"] = json!([{"url":input}]);
+                // Source processing is already in the media being pulled. Only local explicit
+                // stream configuration may request an additional CDN encode.
+                c.as_object_mut().unwrap().remove("transcoder");
                 c["static"] = json!(false);
                 c["flussonix_peer_key"] = json!(key);
                 let mut mirrors = self.mirrors.lock().await;
@@ -672,7 +679,7 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
     }
     if tail == "capabilities" && request.method() == "GET" {
         return json_response(
-            json!({"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","srt","m4s (H.264/AAC frame mode)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["hls","mpegts","fmp4-hls","m4s (H.264/AAC frame mode)","m4f (single-chunk H.264/AAC)"],"unimplemented":["m4s packed GOP mode","rtsps","rtp","srtp","dvr","push"],"transcoding":{"cpu":"libx264 / AAC","gpu":"h264_nvenc, requires supported NVIDIA hardware and runtime"},"cluster":"native HLS source discovery and reserved HTTP redirects"}),
+            json!({"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","srt","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["hls","mpegts","fmp4-hls","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["rtsps","rtp","srtp","dvr","push"],"transcoding":{"cpu":"libx264 / AAC","gpu":"h264_nvenc, requires supported NVIDIA hardware and runtime"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP redirects"}),
         );
     }
     if let Some(name) = tail.strip_prefix("stream/") {

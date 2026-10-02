@@ -244,6 +244,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "private_payload_url",
                     "cluster_key",
                     "drain",
+                    "flussonix_transport",
                 ],
                 "auth_backends" => &["name", "url"],
                 _ => &[],
@@ -279,6 +280,15 @@ fn validate_root(root: &Value) -> Result<(), String> {
                 }
                 if item.get("drain").is_some_and(|v| !v.is_boolean()) {
                     return Err("drain must be boolean".into());
+                }
+                if let Some(transport) = item.get("flussonix_transport") {
+                    if *kind != "sources"
+                        || !transport
+                            .as_str()
+                            .is_some_and(|t| ["hls", "m4s", "m4f"].contains(&t))
+                    {
+                        return Err("flussonix_transport is source-only: hls, m4s or m4f".into());
+                    }
                 }
                 if *kind != "auth_backends" && item["api_url"].as_str().is_none() {
                     return Err("api_url required".into());

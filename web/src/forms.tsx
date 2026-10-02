@@ -48,6 +48,7 @@ export function ConfigurationFields({kind,value,onChange,templates,backends,lock
   <Field label="Public delivery URL" help="Viewer redirects use this address."><input placeholder="https://cdn.example" value={value.public_payload_url||''} onChange={e=>set('public_payload_url',e.target.value)}/></Field>
   <Field label="Private media URL" help="Use the LAN endpoint for source pulls. Defaults to management URL."><input placeholder="http://172.16.0.7:18210" value={value.private_payload_url||''} onChange={e=>set('private_payload_url',e.target.value)}/></Field>
   <Field label="Cluster key" help="Optional per-node key; otherwise uses this node's startup peer key."><input type="password" autoComplete="off" value={value.cluster_key||''} onChange={e=>set('cluster_key',e.target.value)}/></Field>
+  {kind==='sources'&&<Field label="Source transport" help="Protocol used for media pulls over the private connection."><select value={value.flussonix_transport||'hls'} onChange={e=>set('flussonix_transport',e.target.value)}><option value="hls">HLS (existing default)</option><option value="m4s">M4S · persistent media</option><option value="m4f">M4F · source segments</option></select></Field>}
   {kind==='peers'&&<Field label="New viewer admission"><select value={value.drain?'drain':'accept'} onChange={e=>set('drain',e.target.value==='drain')}><option value="accept">Accept new viewers</option><option value="drain">Drain (stop new viewers)</option></select></Field>}
  </div></fieldset>}
  </>;

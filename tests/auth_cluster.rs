@@ -106,3 +106,27 @@ async fn admission_rejects_unknown_warmup_metrics() {
         "unsampled NIC and CPU cannot admit a viewer as zero load"
     );
 }
+
+#[test]
+fn private_source_urls_preserve_prefix_secure_scheme_and_encoded_stream_names() {
+    use flussonix::cluster::source_input_url;
+    assert_eq!(
+        source_input_url(
+            "https://origin.example/media/?routing=owned",
+            "region/news",
+            "m4s"
+        )
+        .unwrap(),
+        "m4ss://origin.example/media/region/news?routing=owned"
+    );
+    assert_eq!(
+        source_input_url("http://origin.example/prefix", "live/café HD", "m4f").unwrap(),
+        "m4f://origin.example/prefix/live/caf%C3%A9%20HD"
+    );
+    assert_eq!(
+        source_input_url("https://origin.example", "one", "hls").unwrap(),
+        "hlss://origin.example/one/index.m3u8"
+    );
+    assert!(source_input_url("file:///etc", "one", "m4f").is_err());
+    assert!(source_input_url("http://origin.example", "../bad", "m4s").is_err());
+}

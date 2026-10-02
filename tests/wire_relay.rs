@@ -159,3 +159,25 @@ fn signal_parser_bounds_partial_lines_and_preserves_exact_notification() {
     let many = line.repeat(500);
     assert_eq!(Signals::default().push(&many).unwrap().len(), 500);
 }
+
+#[test]
+fn bootstrap_overflow_waits_for_a_new_video_keyframe() {
+    let h = Hub::new();
+    let info = Bytes::from(encode_info(&tracks()));
+    h.relay_info(tracks(), info.clone());
+    for i in 0..4 {
+        let mut f = frame(i == 0, 90000 + i * 3600);
+        f.body = vec![0; 9 * 1024 * 1024];
+        let wire = Bytes::from(encode_frame(&tracks()[0], &f));
+        h.relay_frame(f, wire).unwrap();
+    }
+    assert_eq!(h.m4s_subscribe().0, vec![info.clone()]);
+    let f = frame(false, 110000);
+    h.relay_frame(f.clone(), Bytes::from(encode_frame(&tracks()[0], &f)))
+        .unwrap();
+    assert_eq!(h.m4s_subscribe().0, vec![info.clone()]);
+    let f = frame(true, 180000);
+    let wire = Bytes::from(encode_frame(&tracks()[0], &f));
+    h.relay_frame(f, wire.clone()).unwrap();
+    assert_eq!(h.m4s_subscribe().0, vec![info, wire]);
+}
