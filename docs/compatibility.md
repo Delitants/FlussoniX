@@ -139,3 +139,7 @@ The independent supervisor adds bounded configured-input retry/fallback and medi
 ## Implemented v0.5 native origin failover
 
 Explicit source-group/content identities and exact normalized policy matching add bounded sticky fallback among configured replicas. These extension names and failure rules are native FlussoniX behavior; they are not a claim of matching undocumented Flussonic source groups, retry timing or cluster credentials. An authoritative denial is never bypassed by another replica. Whole-cluster blackout still requires a later playback request after source rediscovery. Existing M4/HLS qualified subsets and missing protocol roles remain unchanged.
+
+## Implemented v0.6 RTSP TCP playback
+
+An optional separate listener serves the bounded RTSP 1.0 H.264/AAC-LC TCP-interleaved playback profile with URL-token/callback authorization and existing native CDN private pulls. Independent FFmpeg decoding and RTSP-input-to-HLS tests are recorded in [qualification](qualification.md). This adds a specific output direction; UDP/publication/push, RTSPS, direct RTP/SRTP, Basic/Digest viewer credentials and exact vendor dialects remain open. Protocol direction coverage is not inferred from interleaved RTP or HTTP redirects.

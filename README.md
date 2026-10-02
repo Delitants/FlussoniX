@@ -2,7 +2,7 @@
 
 An independently written Rust media server with a React admin interface and a Flussonic v3 API compatibility layer.
 
-**Status: v0.5 preview, for testing. It is not a complete Flussonic replacement or migration-ready release.**
+**Status: v0.6 preview, for testing. It is not a complete Flussonic replacement or migration-ready release.**
 
 This build implements persisted Streams/Templates configuration, authenticated management, playback authorization, CPU transcoding, shared stream workers, native source/CDN discovery and an adaptive HTTP redirect balancer. M4F and M4S have independent wire adapters for the qualified H.264/AAC subset. Generic fMP4 HLS remains a separate format.
 
@@ -12,12 +12,18 @@ This build implements persisted Streams/Templates configuration, authenticated m
 | API | `/streamer/api/v3` subset; CRUD, partial updates, reset, inheritance, validation without applying, collection cursors |
 | Authentication | Separate edit/view credentials; Basic and legacy base64 Bearer; structured/string `on_play` callbacks; scheduled renewal, revocation and local limits across streams; separate peer key |
 | Input | HLS/HLSS, TSHTTP/TSHTTPS, M4S AVC/AAC frame and packed-GOP modes, M4F single-chunk AVC/AAC sample tables; FFmpeg RTSP pull and SRT receive adapters |
-| Output | HLS with TS or fMP4 segments, HTTP MPEG-TS, Original M4S frame/GOP relay, generated frame output; M4F signals with original or generated live segments |
+| Output | HLS with TS or fMP4 segments, HTTP MPEG-TS, Original M4S frame/GOP relay, generated frame output; M4F signals with original or generated live segments; optional RTSP 1.0 TCP-interleaved H.264/AAC-LC playback |
 | Recovery | Startup/media watchdog, capped retries through ordered inputs, background local/CDN recovery, new HLS sequences/segment/init identities after restart |
 | Transcoding | One supervised FFmpeg worker per stream; CPU H.264/AAC; `h264_nvenc` configuration requires NVIDIA hardware and runtime |
 | Native cluster | Separate public/private endpoints, source discovery, explicit equivalent-origin failover, LAN pull, uplink/CPU/RAM selection, readiness, drain/stale exclusion, expiring capacity reservations |
 
-Required later work includes complete API/schema parity; Flussonic cluster discovery and credential compatibility; additional M4 codec/metadata modes; publisher authentication; RTSP serving/publication/push; RTSPS, RTP/SRTP inbound and outbound; SRT output/push; HTTPS serving or reverse-proxy integration; full transcoder profiles, GPU qualification, DVR, distributed session ownership and complete failure/scale qualification. Unsupported saved options return errors. See [qualification](docs/qualification.md) for evidence and limits.
+Required later work includes complete API/schema parity; Flussonic cluster discovery and credential compatibility; additional M4 codec/metadata modes; publisher authentication; RTSP UDP/publication/push and Basic/Digest viewer authentication; RTSPS, RTP/SRTP inbound and outbound; SRT output/push; HTTPS serving or reverse-proxy integration; full transcoder profiles, GPU qualification, DVR, distributed session ownership and complete failure/scale qualification. Unsupported saved options return errors. See [qualification](docs/qualification.md) for evidence and limits.
+
+## RTSP playback preview
+
+Enable a separate unused listener with `--rtsp-listen 127.0.0.1:18554`. Its default is disabled. A configured stream is available at `rtsp://127.0.0.1:18554/STREAM?token=VIEWER_TOKEN`. For an owned synthetic test without a token policy, use `ffmpeg -rtsp_transport tcp -i rtsp://127.0.0.1:18554/owned -t 5 -f null -`.
+
+This profile serves RTSP 1.0 playback over TCP interleaving, with H.264 single NAL/FU-A, AAC-LC MPEG4-GENERIC and RTCP sender reports. It reuses one shared worker and packetizer, URL-token/on_play authorization (`proto=rtsp`), revocation and local admission accounting. Native CDNs can expose RTSP while pulling authenticated LAN HLS/M4S/M4F; the HTTP balancer does not redirect RTSP. Independent FFmpeg clients decode both tracks, and RTSP pull to HLS is exercised. Unsupported codecs return 415; worker or codec replacement closes the session and requires reconnecting. See [tested profile and bounds](docs/rtsp-rtp-support.md#implemented-v06-tcp-playback-profile). This does not establish every vendor RTSP dialect or the remaining direction matrix.
 
 ## Replica failover
 
@@ -61,11 +67,11 @@ Sources and peers use `hostname`, `api_url`, `private_payload_url`, `public_payl
 
 For a protected test stream, use an HTTP `on_play` endpoint or native `flussonix_token_sha256`. The token extension is not a Flussonic authentication algorithm. Every playlist, segment, initialization file and wire endpoint checks viewer policy before returning media. Query credentials are preserved in HLS URIs.
 
-Use `--uplink-interface auto` (the default) to sample aggregate TX traffic on the Linux default-route interface, or choose the public delivery NIC by name. `--uplink-interface process` explicitly uses only this daemon’s HTTP media bytes. `http_egress_mbps` stays separate from interface `egress_mbps`. Startup, missing/reset counters and samples older than three seconds are unknown and prevent new cluster admissions. Shared LAN/public NIC traffic is aggregate traffic, not a WAN-only estimate.
+Use `--uplink-interface auto` (the default) to sample aggregate TX traffic on the Linux default-route interface, or choose the public delivery NIC by name. `--uplink-interface process` explicitly uses only this daemon’s HTTP and RTSP media bytes. `http_egress_mbps` and `rtsp_egress_mbps` remain separate; `media_egress_mbps` reports their sum. Interface `egress_mbps` remains aggregate NIC traffic. Startup, missing/reset counters and samples older than three seconds are unknown and prevent new cluster admissions. Shared LAN/public NIC traffic is aggregate traffic, not a WAN-only estimate.
 
 `on_play` accepts a URL string or `{"url":"auth://billing","session_keys":["name","proto","ip","token"],"max_sessions":2}` with a configured `auth_backends` entry. Supported keys are literal ordered `name`, `proto`, `ip`, `token`; name/proto are required. Callback sessions use UUIDs and report actual protocol, request number/type, duration and bytes. Default renewal is 180 seconds; `X-AuthDuration` is bounded to 1–3600 seconds. A backend timeout/5xx preserves a previous decision and retries after ten seconds; a new viewer fails closed. `X-UserId`, `X-Max-Sessions`, `X-Unique` and validated HTTP(S) 302 redirects are supported. Limits apply on one node across streams, not globally across a cluster. Unsupported auth options fail validation.
 
-`GET /streamer/api/v3/sessions` and `GET /sessions/{id}` expose local sessions without tokens/raw queries. Edit credentials permit `DELETE /sessions/{id}` (204) and `POST /sessions/reauth?name=STREAM` (`estimated_count`). Deletion cancels continuous TS/M4 bodies and caches denial for 180 seconds. The stream Auth tab uses these APIs. Metadata-only edits preserve session identity; changes to authorization policy invalidate old grants. Native peer pulls use separate credentials and do not create viewer sessions.
+`GET /streamer/api/v3/sessions` and `GET /sessions/{id}` expose local sessions without tokens/raw queries. Edit credentials permit `DELETE /sessions/{id}` (204) and `POST /sessions/reauth?name=STREAM` (`estimated_count`). Deletion cancels continuous TS/M4/RTSP bodies and caches denial for 180 seconds. The stream Auth tab uses these APIs. Metadata-only edits preserve session identity; changes to authorization policy invalidate old grants. Native peer pulls use separate credentials and do not create viewer sessions.
 
 ## Verification
 

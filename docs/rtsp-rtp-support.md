@@ -1,6 +1,6 @@
 # RTSP/RTSPS and RTP/SRTP — inbound and outbound
 
-First-release requirement added by the user. Status: designed; not implemented or interoperability-tested.
+First-release requirement added by the user. Status: v0.6 implements the TCP playback profile below and exercises an independent FFmpeg RTSP pull roundtrip. The full direction matrix remains required; other cells are designed, not qualified.
 
 ## Direction matrix
 
@@ -59,3 +59,17 @@ Expose verified RTSP/RTP settings through Streams, Templates and Config. Put add
 Exercise all direction-matrix cells with independent lab peers, with and without transcoding. RTSP cases cover UDP, interleaved TCP, TLS, credentials, multitrack SDP, on-demand startup, publication and teardown. RTP cases cover unicast/multicast, bounded jitter, packet loss/reordering, clock changes and packet pacing.
 
 SRTP cases cover both directions, SRTCP, agreed keying/profile combinations, rekey/restart, wrong-key rejection and replay handling. Verify that selecting encrypted UDP media never silently produces plaintext output. Measure per-session encryption cost in the fan-out benchmark.
+
+## Implemented v0.6 TCP playback profile
+
+An optional `--rtsp-listen ADDRESS:PORT` starts a separate listener; it is disabled by default. RTSP 1.0 OPTIONS/DESCRIBE/SETUP/PLAY/GET_PARAMETER/TEARDOWN support live TCP-interleaved RTP/RTCP. Explicit decimal-zero and `now` live ranges are accepted; seeking and PAUSE are not implemented. Session and channel pairs are bound to one authorized stream. Queryless track/control URLs retain that connection's authorized identity; an explicit changed query is rejected. Management Basic/Bearer credentials do not authorize viewers.
+
+One packetizer per worker produces H.264 single NAL/FU-A and AAC-LC MPEG4-GENERIC, including fragmented AAC access units. H.264 AVCC length widths 1/2/4, SPS/PPS in SDP, signed composition offsets, clock/sequence wrapping, atomic late-join snapshots and RTP-Info are supported. At most one H.264 and one AAC-LC track are accepted. HEVC, HE-AAC, camera audio variants and vendor-specific SDP/control behavior remain unqualified. RTCP sender reports use shared media/wall-clock mapping and actual per-client packet/payload counts. Malformed codec metadata or access units suppress this RTSP profile; existing native relay is not rewritten.
+
+The shared live queue is bounded to 4096 records/16 MiB, packet length to 1200 bytes, and bootstrap to 32 MiB/100000 records. Video joins begin at a keyframe; audio-only bootstrap rolls over two seconds. A slow client disconnects on lag or a two-second socket-write timeout. Control headers/body/interleaved input are limited to 16 KiB/64 KiB/8 KiB, at most 64 headers and eight queued requests. There are at most 256 control connections. Initial control, media readiness and established keepalive deadlines are 30, 8 and 60 seconds. Shutdown cancels listeners/clients and bounds connection drain. These are safety bounds, not performance qualification.
+
+Viewer URL tokens and existing on_play callbacks run before worker startup with `proto=rtsp` and the remote IP. Existing local limits, callback renewal, grant revocation and source/worker generation guards apply. Worker or codec replacement ends current RTSP playback; clients must reconnect. RTSP egress has separate telemetry; process-mode capacity uses HTTP plus RTSP media bytes. LB-role playback returns 501; native source discovery/private pulls are reused by CDN output.
+
+Independent tests decode two tracks for two concurrent viewers sharing one worker; decode native M4S/M4F source pulls through CDN RTSP output; and decode RTSP input repackaged as HLS. The RTSP stream-copy input adapter allows initial audio packets without key flags (`-copyinkf:a`), as FFmpeg MPEG4-GENERIC depacketization can omit those flags. The input adapter remains independently installed FFmpeg. No official Flussonic package is loaded.
+
+UDP/multicast, RTSP ANNOUNCE/RECORD or outbound publication, Basic/Digest viewer credentials, RTSPS, direct RTP/SRTP, pause/seek and RTSP load-balancer redirects remain separate implementation gates. Interleaved RTP does not establish direct-RTP compatibility. Continuous-session behavior across source changes, camera interoperability, B-frame end-to-end roundtrips, TLS, GPU and production-scale load remain to be qualified.
