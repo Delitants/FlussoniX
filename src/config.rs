@@ -236,6 +236,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "transcoder",
                     "on_play",
                     "flussonix_token_sha256",
+                    "flussonix_input_timeout",
                 ],
                 "peers" | "sources" => &[
                     "hostname",
@@ -303,6 +304,17 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     valid_name(template)?;
                     if *kind == "templates" {
                         return Err("nested templates are not implemented".into());
+                    }
+                }
+                if let Some(timeout) = item.get("flussonix_input_timeout") {
+                    if !timeout
+                        .as_u64()
+                        .is_some_and(|value| (1..=300).contains(&value))
+                    {
+                        return Err(
+                            "flussonix_input_timeout must be an integer from 1 to 300 seconds"
+                                .into(),
+                        );
                     }
                 }
                 crate::playback_auth::Policy::from_config(item, root)?;

@@ -221,3 +221,51 @@ fn native_source_transport_is_explicit_source_only_and_validated() {
         .is_err()
     );
 }
+
+#[test]
+fn media_stall_timeout_is_native_validated_and_inherited() {
+    let d = tempfile::tempdir().unwrap();
+    let c = flussonix::config::ConfigStore::open(d.path().join("config.json")).unwrap();
+    c.put(
+        "templates",
+        "protected",
+        serde_json::json!({"inputs":[{"url":"testsrc://"}],"flussonix_input_timeout":30}),
+    )
+    .unwrap();
+    c.put(
+        "streams",
+        "owned",
+        serde_json::json!({"template":"protected"}),
+    )
+    .unwrap();
+    assert_eq!(c.effective("owned").unwrap()["flussonix_input_timeout"], 30);
+    for invalid in [
+        serde_json::json!(0),
+        serde_json::json!(301),
+        serde_json::json!(1.5),
+        serde_json::json!("15"),
+    ] {
+        assert!(
+            c.put(
+                "streams",
+                "owned",
+                serde_json::json!({"flussonix_input_timeout":invalid})
+            )
+            .is_err()
+        );
+    }
+    c.put(
+        "streams",
+        "owned",
+        serde_json::json!({"flussonix_input_timeout":1}),
+    )
+    .unwrap();
+    assert_eq!(c.effective("owned").unwrap()["flussonix_input_timeout"], 1);
+    c.put(
+        "streams",
+        "owned",
+        serde_json::json!({"flussonix_input_timeout":null}),
+    )
+    .unwrap();
+    assert_eq!(c.effective("owned").unwrap()["flussonix_input_timeout"], 30);
+}

@@ -9,7 +9,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::AsyncReadExt,
@@ -32,6 +32,8 @@ pub struct Worker {
     signature: String,
     input_index: usize,
     input_protocol: String,
+    restart_count: u64,
+    recovery: std::sync::Mutex<crate::recovery::Recovery>,
     pub bytes: AtomicU64,
     pub viewers: AtomicU64,
     pub alive: std::sync::atomic::AtomicBool,
@@ -64,8 +66,23 @@ impl Worker {
     pub fn idle_seconds(&self) -> u64 {
         self.last_access.lock().unwrap().elapsed().as_secs()
     }
+    fn failed(&self, reason: &'static str) {
+        self.recovery.lock().unwrap().fail(reason);
+    }
     pub fn stats(&self) -> Value {
-        json!({"status":if self.alive.load(Ordering::Relaxed){if self.bytes.load(Ordering::Relaxed)>0{"running"}else{"starting"}}else{"error"},"pid":self.pid,"bytes_in":self.bytes.load(Ordering::Relaxed),"online_clients":self.viewers.load(Ordering::Relaxed),"uptime":self.started.elapsed().as_secs(),"input_protocol":self.input_protocol})
+        let recovery = self.recovery.lock().unwrap();
+        let status = if self.alive.load(Ordering::Relaxed) {
+            if self.bytes.load(Ordering::Relaxed) > 0 {
+                "running"
+            } else {
+                "starting"
+            }
+        } else if recovery.last_error().is_some() {
+            "retrying"
+        } else {
+            "stopped"
+        };
+        json!({"status":status,"pid":self.pid,"bytes_in":self.bytes.load(Ordering::Relaxed),"online_clients":self.viewers.load(Ordering::Relaxed),"uptime":self.started.elapsed().as_secs(),"input_protocol":self.input_protocol,"input_index":self.input_index,"restart_count":self.restart_count,"retry_in_ms":recovery.retry_in().map(|d|d.as_millis()),"last_error":recovery.last_error(),"media_age_ms":recovery.media_age_ms()})
     }
 }
 impl Engine {
@@ -81,22 +98,43 @@ impl Engine {
             .join(format!("{:x}", Sha256::digest(name.as_bytes())))
     }
     pub async fn ensure(&self, name: &str, cfg: &Value) -> Result<Arc<Worker>, String> {
+        self.ensure_inner(name, cfg, true).await
+    }
+    pub async fn recover(&self, name: &str, cfg: &Value) -> Result<Arc<Worker>, String> {
+        self.ensure_inner(name, cfg, false).await
+    }
+    async fn ensure_inner(
+        &self,
+        name: &str,
+        cfg: &Value,
+        touch_demand: bool,
+    ) -> Result<Arc<Worker>, String> {
         let mut workers = self.workers.lock().await;
         if cfg["disabled"] == true {
             return Err("stream disabled".into());
         }
         let signature = media_signature(cfg);
         let mut index = 0;
+        let mut restart_count = 0;
+        let mut streak = 0;
+        let mut last_access = Instant::now();
         if let Some(w) = workers.get(name) {
-            if w.alive.load(Ordering::Relaxed) && w.signature == signature {
+            if touch_demand {
                 w.touch();
+            }
+            last_access = *w.last_access.lock().unwrap();
+            let running = w.alive.load(Ordering::Relaxed) && !w.is_closed();
+            if running && w.signature == signature {
                 return Ok(w.clone());
             }
-            if !w.alive.load(Ordering::Relaxed) && w.signature == signature {
-                if w.started.elapsed().as_secs() < 5 {
+            if !running && w.signature == signature {
+                let recovery = w.recovery.lock().unwrap();
+                if recovery.retry_in().is_some_and(|delay| !delay.is_zero()) {
                     return Err("input retry backoff".into());
                 }
                 index = w.input_index + 1;
+                restart_count = w.restart_count.saturating_add(1);
+                streak = recovery.next_streak();
             }
             w.cancel.cancel();
             if let Some(done) = w.done.lock().await.take() {
@@ -231,11 +269,13 @@ impl Engine {
             signature,
             input_index: index,
             input_protocol: input.split("://").next().unwrap_or("unknown").into(),
+            restart_count,
+            recovery: std::sync::Mutex::new(crate::recovery::Recovery::new(streak)),
             bytes: AtomicU64::new(0),
             viewers: AtomicU64::new(0),
             alive: std::sync::atomic::AtomicBool::new(true),
             wire: Hub::new(),
-            last_access: std::sync::Mutex::new(Instant::now()),
+            last_access: std::sync::Mutex::new(last_access),
         });
         let original_wire = (m4s_input || m4f_input)
             && (cfg.get("transcoder").is_none() || cfg["transcoder"]["encoder"] == "copy");
@@ -270,6 +310,7 @@ impl Engine {
                 if let Some(mut stdin) = stdin.take() {
                     let result = tokio::select! {_=cancel.cancelled()=>Ok(()),result=crate::m4_ingest::pull(&url,key.as_deref(),&mut stdin,if original_wire {Some(&w.wire)}else{None})=>result};
                     if let Err(reason) = result {
+                        w.failed("input_closed");
                         tracing::warn!(error = %reason, "wire input stopped");
                     }
                 }
@@ -278,10 +319,42 @@ impl Engine {
         }
         workers.insert(name.into(), worker.clone());
         let w = worker.clone();
+        let timeout = Duration::from_secs(
+            cfg["flussonix_input_timeout"]
+                .as_u64()
+                .unwrap_or(15)
+                .clamp(1, 300),
+        );
         tokio::spawn(async move {
             let mut buffer = vec![0u8; 188 * 64];
             loop {
-                tokio::select! {_ = cancel.cancelled()=>{let _=child.kill().await;break},r=stdout.read(&mut buffer)=>{match r{Ok(0)|Err(_)=>break,Ok(n)=>{w.bytes.fetch_add(n as u64,Ordering::Relaxed);let _=w.tx.send(Bytes::copy_from_slice(&buffer[..n]));}}}}
+                let read = tokio::select! { biased;
+                    _ = cancel.cancelled() => break,
+                    result = tokio::time::timeout(timeout, stdout.read(&mut buffer)) => result,
+                };
+                match read {
+                    Ok(Ok(0)) => {
+                        w.failed("input_closed");
+                        break;
+                    }
+                    Ok(Err(_)) => {
+                        w.failed("packaging_failed");
+                        break;
+                    }
+                    Err(_) => {
+                        w.failed(if w.bytes.load(Ordering::Relaxed) == 0 {
+                            "startup_timeout"
+                        } else {
+                            "input_stalled"
+                        });
+                        break;
+                    }
+                    Ok(Ok(n)) => {
+                        w.recovery.lock().unwrap().progress();
+                        w.bytes.fetch_add(n as u64, Ordering::Relaxed);
+                        let _ = w.tx.send(Bytes::copy_from_slice(&buffer[..n]));
+                    }
+                }
             }
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -414,5 +487,5 @@ pub fn translate_input(input: &str) -> Result<String, String> {
 }
 
 pub fn media_signature(cfg: &Value) -> String {
-    format!("{:x}",Sha256::digest(serde_json::to_vec(&json!({"inputs":cfg["inputs"],"transcoder":cfg["transcoder"],"peer":cfg["flussonix_peer_key"]})).unwrap()))
+    format!("{:x}",Sha256::digest(serde_json::to_vec(&json!({"inputs":cfg["inputs"],"transcoder":cfg["transcoder"],"peer":cfg["flussonix_peer_key"],"timeout":cfg["flussonix_input_timeout"]})).unwrap()))
 }
