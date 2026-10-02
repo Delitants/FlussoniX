@@ -1,0 +1,27 @@
+# Equivalent-origin cluster failover
+
+Continue the user-approved streaming/cluster product, Linux/CDN qualification and GitHub publication. Execute inline in an owned worktree; preserve the approved UI and friendly controls. Installed Flussonic remains an optional reverse-engineering reference, never a build, normal-test or runtime dependency. Production/demo services are not modified or used for failure injection.
+
+## Source authority and equivalence
+
+Add source-only `flussonix_source_group` and inherited stream/template `flussonix_content_id`: optional identifiers of 1..128 ASCII letters, digits, dot, underscore or hyphen. Operator-configured groups declare permitted replica relationships; matching content identity and normalized viewer Policy prove a candidate is acceptable for an already selected stream. Same names alone are insufficient. Each failover group contains at most eight sources. Preserve local configured stream precedence and initial configured-order discovery.
+
+A selected origin stays selected while healthy. On transport failure after the existing worker cooldown, inspect equivalent alternatives even when the origin management API remains alive. On selected-origin management unavailability, permit alternatives with the same configured group, content identity and normalized Policy. Every candidate must be enabled and have valid policy. An authoritative disabled response, invalid policy or 404 from a previously selected origin fails closed; it must not be bypassed by a permissive replica. Different policy/content/group candidates are not used. A recovered preferred origin does not displace a healthy fallback; operator reconfiguration can select it again.
+
+Use the source-specific peer key and private endpoint for each selected route; never use a public delivery URL as media fallback. Preserve original HLS/M4S/M4F behavior and do not repeat origin transcoding. Source processing has already happened upstream. Do not weaken viewer authorization, renew demand during background discovery, or copy credentials into status.
+
+## Resolution and lifecycle
+
+Extract bounded metadata fetching into a small independent source-directory module. Query at most four sources concurrently, each within 750ms, with a three-second total discovery budget and a 1MiB response limit. Reject redirects and malformed/non-object metadata. Groups are limited to eight sources. Initial ungrouped discovery retains a bounded configured-order search; no unbounded fan-out is introduced.
+
+Mirrors retain selected source, effective configuration, monotonic publication serial, availability, timestamp and source-switch count. Compare the observed mirror serial and current root-config revision before publishing fetched metadata: stale lookups cannot overwrite newer routes/policies or resurrect removed relationships. Retain a failed known mirror as unavailable authority for subsequent discovery; media_config excludes unavailable mirrors, and viewer policy is revoked on authoritative/unavailable failure without a qualified alternative. Concurrent initial lookups and policy-denial publication must be fenced by publication serials/tombstones. Cached unavailable lookups wait one second before rediscovery.
+
+Reconciliation discovers alternatives for failed workers after cooldown and refreshes existing mirrors every ten seconds. Background replacement preserves actual demand and existing v0.4 lifecycle/config fences. Same-policy switches retain viewer session identity; changed policies invalidate grants through the existing Policy publisher. Continuous TS/M4 bodies close at worker replacement and reconnect. HLS replacements preserve the v0.4 generation/window semantics; no gapless claim.
+
+Expose only source identity, group and switch count in runtime stream stats. Cluster's active-pulls table reports source, transport, state and switches. Source/stream/template editors use labeled optional fields with inheritance intact.
+
+## Qualification
+
+Pin configuration validation/inheritance, three-origin equivalence rejection, API outage and media-only outage, sticky fallback, strict disabled/policy mismatch handling, different per-source keys, local precedence, private paths, concurrent first viewers and stale asynchronous publications. Decode delivered HLS after failover and verify original M4 relay remains intact. Use owned fixture servers and OS-allocated ports; one temporary replica instance may run on an unused CDN-host port under independent resource limits. Only owned FlussoniX test units/workers may receive failure signals; preserve production PIDs/listeners and restore temporary test configuration.
+
+Run full Rust/browser checks, one fresh whole-branch review and exact static candidate qualification. Publish v0.5 as a qualified preview; GPU/new protocol roles, full parity, consensus/global ownership and production-scale behavior remain open requirements.
