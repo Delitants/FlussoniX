@@ -66,10 +66,15 @@ struct Reservation {
     stream: String,
     expires: Instant,
 }
+#[derive(Clone)]
 struct Mirror {
     when: Instant,
     config: Value,
     source: Value,
+    available: bool,
+    known: bool,
+    serial: u64,
+    switches: u64,
 }
 struct Resolved {
     config: Value,
@@ -88,6 +93,7 @@ pub struct App {
     telemetry: crate::telemetry::Sampler,
     pub started: Instant,
     mirrors: Mutex<HashMap<String, Mirror>>,
+    source_queries: tokio::sync::Semaphore,
 }
 impl App {
     pub fn new(
@@ -132,6 +138,7 @@ impl App {
             telemetry: crate::telemetry::Sampler::new(&options.uplink_interface)?,
             started: Instant::now(),
             mirrors: Mutex::new(HashMap::new()),
+            source_queries: tokio::sync::Semaphore::new(64),
         });
         app.sample_metrics();
         Ok(app)
@@ -143,9 +150,10 @@ impl App {
                 mirrors
                     .get(name)
                     .filter(|m| {
-                        root["sources"]
-                            .as_array()
-                            .is_some_and(|sources| sources.contains(&m.source))
+                        m.available
+                            && root["sources"]
+                                .as_array()
+                                .is_some_and(|sources| sources.contains(&m.source))
                     })
                     .map(|m| m.config.clone())
             })?;
@@ -220,8 +228,12 @@ impl App {
                     .is_some_and(|sources| sources.contains(&m.source))
             });
             self.playback_auth.invalidate(|name| {
-                let cfg = crate::config::effective(root, name)
-                    .or_else(|| mirrors.get(name).map(|m| m.config.clone()))?;
+                let cfg = crate::config::effective(root, name).or_else(|| {
+                    mirrors
+                        .get(name)
+                        .filter(|m| m.available)
+                        .map(|m| m.config.clone())
+                })?;
                 if cfg["disabled"] == true {
                     return None;
                 }
@@ -249,9 +261,9 @@ impl App {
                     .cloned()
                     .collect::<Vec<_>>(),
             )
-            .collect::<Vec<_>>();
+            .collect::<std::collections::BTreeSet<_>>();
         for name in names {
-            streams.push(json!({"name":name,"ready":self.media.ready(&name).await,"stats":self.media.stats(&name).await}));
+            streams.push(json!({"name":name,"ready":self.media.ready(&name).await,"stats":self.stream_stats(&name).await}));
         }
         let mut metrics = self.telemetry.snapshot(self.options.uplink_mbps);
         let mut reservations = self.reservations.lock().await;
@@ -285,152 +297,11 @@ impl App {
                 })
         })?
     }
-    async fn refresh_sources(&self) {
-        use futures_util::{StreamExt, stream};
-        let workers = self
-            .media
-            .workers()
-            .await
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect::<std::collections::HashSet<_>>();
-        let sessions = self
-            .playback_auth
-            .snapshots()
-            .into_iter()
-            .filter_map(|s| s["name"].as_str().map(str::to_owned))
-            .collect::<std::collections::HashSet<_>>();
-        let mut due = self
-            .mirrors
-            .lock()
-            .await
-            .iter()
-            .filter(|(name, m)| {
-                m.when.elapsed() >= Duration::from_secs(10)
-                    && (workers.contains(*name) || sessions.contains(*name))
-            })
-            .map(|(name, m)| (m.when, name.clone()))
-            .collect::<Vec<_>>();
-        due.sort_by_key(|(when, _)| *when);
-        stream::iter(due.into_iter().take(64).map(|(_, name)| async move {
-            self.resolve(&name).await;
-        }))
-        .buffer_unordered(16)
-        .collect::<Vec<_>>()
-        .await;
-    }
-    async fn resolve(&self, name: &str) -> Option<Resolved> {
-        let revision = self.config.revision();
-        if let Some(c) = self.config.effective(name) {
-            return self.resolved(name, c, revision);
-        }
-        let root = self.config.snapshot();
-        {
-            let mirrors = self.mirrors.lock().await;
-            if let Some(m) = mirrors.get(name) {
-                if m.when.elapsed() < Duration::from_secs(10)
-                    && root["sources"]
-                        .as_array()
-                        .is_some_and(|sources| sources.contains(&m.source))
-                {
-                    return self.resolved(name, m.config.clone(), revision);
-                }
-            }
-        }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        for source in root["sources"].as_array()? {
-            let api = source["api_url"].as_str()?;
-            let private = source["private_payload_url"].as_str().unwrap_or(api);
-            let key = source["cluster_key"]
-                .as_str()
-                .unwrap_or(&self.options.peer_key);
-            let response = tokio::time::timeout_at(deadline, async {
-                let response = self
-                    .client
-                    .get(format!(
-                        "{}/flussonix/api/v1/stream/{}",
-                        api.trim_end_matches('/'),
-                        encoded_path(name)
-                    ))
-                    .header("X-Flussonix-Peer", key)
-                    .send()
-                    .await
-                    .ok()?;
-                if !response.status().is_success() {
-                    return None;
-                }
-                response.json::<Value>().await.ok()
-            })
-            .await
-            .ok()
-            .flatten();
-            if let Some(mut c) = response {
-                if !c.is_object() {
-                    continue;
-                }
-                let transport = source["flussonix_transport"].as_str().unwrap_or("hls");
-                let Ok(input) = crate::cluster::source_input_url(private, name, transport) else {
-                    continue;
-                };
-                c["inputs"] = json!([{"url":input}]);
-                // Source processing is already in the media being pulled. Only local explicit
-                // stream configuration may request an additional CDN encode.
-                c.as_object_mut().unwrap().remove("transcoder");
-                c["static"] = json!(false);
-                c["flussonix_peer_key"] = json!(key);
-                let mut mirrors = self.mirrors.lock().await;
-                return self.config.at_revision(revision, |current| {
-                    if !current["sources"]
-                        .as_array()
-                        .is_some_and(|sources| sources.contains(source))
-                        || mirrors.len() >= 10000 && !mirrors.contains_key(name)
-                    {
-                        return None;
-                    }
-                    let policy = if c["disabled"] == true {
-                        None
-                    } else {
-                        Policy::from_config(&c, current).ok()
-                    };
-                    let published = self.playback_auth.publish(name, policy);
-                    mirrors.insert(
-                        name.into(),
-                        Mirror {
-                            when: Instant::now(),
-                            config: c.clone(),
-                            source: source.clone(),
-                        },
-                    );
-                    published.map(|policy| Resolved {
-                        config: c,
-                        policy,
-                        revision,
-                    })
-                })?;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-        }
-        let mut mirrors = self.mirrors.lock().await;
-        self.config.at_revision(revision, |_| {
-            mirrors.remove(name);
-            self.playback_auth.publish(name, None);
-        });
-        None
-    }
 }
 fn header<'a>(h: &'a HeaderMap, key: &str) -> Option<&'a str> {
     h.get(key).and_then(|v| v.to_str().ok())
 }
-fn encoded_path(name: &str) -> String {
-    name.split('/')
-        .map(|s| {
-            percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
+
 fn error(code: StatusCode, message: &str) -> Response {
     (code, axum::Json(json!({"errors":[{"message":message}]}))).into_response()
 }
@@ -578,7 +449,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
             return match item {
                 Some(mut v) => {
                     if kind == "streams" {
-                        v["stats"] = app.media.stats(name).await;
+                        v["stats"] = app.stream_stats(name).await;
                     }
                     json_response(v)
                 }
@@ -602,7 +473,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
                         app.reconcile().await;
                         if kind == "streams" {
                             v = app.config.effective(name).unwrap_or(v);
-                            v["stats"] = app.media.stats(name).await;
+                            v["stats"] = app.stream_stats(name).await;
                         }
                     }
                     json_response(v)
@@ -638,7 +509,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         for item in &mut items {
             if let Some(name) = item["name"].as_str().map(str::to_owned) {
                 *item = app.config.effective(&name).unwrap_or(item.clone());
-                item["stats"] = app.media.stats(&name).await;
+                item["stats"] = app.stream_stats(&name).await;
             }
         }
     }
@@ -1273,3 +1144,6 @@ mod continuous_session_tests {
         app.media.stop_all().await;
     }
 }
+
+#[path = "origin_resolution.rs"]
+mod origin_resolution;
