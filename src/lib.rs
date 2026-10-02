@@ -17,3 +17,5 @@ pub mod peer_hls;
 pub mod recovery;
 
 mod hls_generation;
+
+pub mod source_directory;

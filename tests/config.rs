@@ -269,3 +269,78 @@ fn media_stall_timeout_is_native_validated_and_inherited() {
     .unwrap();
     assert_eq!(c.effective("owned").unwrap()["flussonix_input_timeout"], 30);
 }
+
+#[test]
+fn native_content_identity_and_replica_groups_are_validated_and_inherited() {
+    use serde_json::json;
+    let d = tempfile::tempdir().unwrap();
+    let c = flussonix::config::ConfigStore::open(d.path().join("config.json")).unwrap();
+    c.put(
+        "templates",
+        "replica",
+        json!({"inputs":[{"url":"testsrc://"}],"flussonix_content_id":"owned-news-v1"}),
+    )
+    .unwrap();
+    c.put("streams", "news", json!({"template":"replica"}))
+        .unwrap();
+    assert_eq!(
+        c.effective("news").unwrap()["flussonix_content_id"],
+        "owned-news-v1"
+    );
+    for bad in [
+        json!(""),
+        json!("a/b"),
+        json!("a b"),
+        json!("x".repeat(129)),
+        json!(42),
+    ] {
+        assert!(
+            c.put("streams", "news", json!({"flussonix_content_id":bad}))
+                .is_err()
+        );
+        assert!(
+            c.put(
+                "sources",
+                "bad",
+                json!({"api_url":"http://127.0.0.1","flussonix_source_group":bad})
+            )
+            .is_err()
+        );
+    }
+    for i in 0..8 {
+        c.put(
+            "sources",
+            &format!("origin{i}"),
+            json!({"api_url":"http://127.0.0.1","flussonix_source_group":"replicas"}),
+        )
+        .unwrap();
+    }
+    assert!(
+        c.put(
+            "sources",
+            "overflow",
+            json!({"api_url":"http://127.0.0.1","flussonix_source_group":"replicas"})
+        )
+        .is_err()
+    );
+    assert!(
+        c.put(
+            "peers",
+            "edge",
+            json!({"api_url":"http://127.0.0.1","flussonix_source_group":"replicas"})
+        )
+        .is_err()
+    );
+    c.put(
+        "streams",
+        "news",
+        json!({"flussonix_content_id":"override"}),
+    )
+    .unwrap();
+    c.put("streams", "news", json!({"flussonix_content_id":null}))
+        .unwrap();
+    assert_eq!(
+        c.effective("news").unwrap()["flussonix_content_id"],
+        "owned-news-v1"
+    );
+}

@@ -195,6 +195,19 @@ pub fn valid_name(name: &str) -> Result<(), String> {
     }
     Ok(())
 }
+pub fn valid_identity(value: &Value) -> Result<(), String> {
+    if value.as_str().is_some_and(|id| {
+        !id.is_empty()
+            && id.len() <= 128
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    }) {
+        Ok(())
+    } else {
+        Err("identity must contain 1..128 ASCII letters, digits, dot, underscore or hyphen".into())
+    }
+}
 fn validate_root(root: &Value) -> Result<(), String> {
     if !root.is_object() {
         return Err("configuration must be an object".into());
@@ -204,6 +217,16 @@ fn validate_root(root: &Value) -> Result<(), String> {
             return Err(format!(
                 "server option {key} is not implemented; listener/auth/limits are startup options"
             ));
+        }
+    }
+    let mut groups = std::collections::HashMap::new();
+    for source in root["sources"].as_array().into_iter().flatten() {
+        if let Some(group) = source["flussonix_source_group"].as_str() {
+            let count = groups.entry(group).or_insert(0usize);
+            *count += 1;
+            if *count > 8 {
+                return Err("a failover group supports at most eight sources".into());
+            }
         }
     }
     for kind in KINDS {
@@ -237,6 +260,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "on_play",
                     "flussonix_token_sha256",
                     "flussonix_input_timeout",
+                    "flussonix_content_id",
                 ],
                 "peers" | "sources" => &[
                     "hostname",
@@ -246,6 +270,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "cluster_key",
                     "drain",
                     "flussonix_transport",
+                    "flussonix_source_group",
                 ],
                 "auth_backends" => &["name", "url"],
                 _ => &[],
@@ -254,6 +279,15 @@ fn validate_root(root: &Value) -> Result<(), String> {
                 if !allowed.contains(&key.as_str()) {
                     return Err(format!("{kind} option {key} is not implemented"));
                 }
+            }
+            if let Some(id) = item.get("flussonix_content_id") {
+                valid_identity(id)?;
+            }
+            if let Some(group) = item.get("flussonix_source_group") {
+                if *kind != "sources" {
+                    return Err("flussonix_source_group is source-only".into());
+                }
+                valid_identity(group)?;
             }
             if matches!(*kind, "peers" | "sources" | "auth_backends") {
                 for field in [
