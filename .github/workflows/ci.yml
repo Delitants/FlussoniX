@@ -20,3 +20,20 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci --prefix web && npm run build --prefix web
+      - name: Install browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+      - name: Verify admin against live daemon
+        run: |
+          export FLUSSONIX_ADMIN_USER=admin
+          export FLUSSONIX_ADMIN_PASSWORD="$(openssl rand -hex 24)"
+          export FLUSSONIX_PEER_KEY="$(openssl rand -hex 32)"
+          mkdir -p .runtime
+          ./target/debug/flussonix --config .runtime/config.json --media-dir .runtime/media > .runtime/server.log 2>&1 &
+          flussonix_ci_pid=$!
+          trap 'kill "$flussonix_ci_pid"; wait "$flussonix_ci_pid" || true' EXIT
+          for attempt in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:18210/health > /dev/null; then break; fi
+            sleep 0.25
+          done
+          npm test --prefix web

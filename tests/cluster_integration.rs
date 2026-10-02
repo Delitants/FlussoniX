@@ -77,8 +77,22 @@ async fn source_cdn_balancer_auth_and_private_pull_decode_real_hls() {
     assert!(location.starts_with(&cdn_url));
     assert!(!location.contains("cluster-peer-key"));
     let playlist = client.get(&location).send().await.unwrap();
+    assert_eq!(
+        playlist.status(),
+        302,
+        "redeem ticket to a clean reload URL"
+    );
+    let canonical = playlist.headers()["location"].to_str().unwrap().to_owned();
+    assert!(!canonical.contains("flussonix_ticket"));
+    let canonical = format!("{cdn_url}{canonical}");
+    let playlist = client.get(&canonical).send().await.unwrap();
     assert_eq!(playlist.status(), 200);
     let playlist = playlist.text().await.unwrap();
+    assert_eq!(
+        client.get(&canonical).send().await.unwrap().status(),
+        200,
+        "playlist reload must succeed"
+    );
     assert!(playlist.contains("token=viewer-test-token"));
     assert_eq!(source.media.count().await, 1);
     assert_eq!(cdn.media.count().await, 1);
@@ -224,4 +238,70 @@ async fn independent_m4f_and_m4s_http_outputs_can_be_ingested_and_decoded() {
     cdn.media.stop_all().await;
     task.abort();
     cdn_task.abort();
+}
+
+#[tokio::test]
+async fn named_source_auth_policy_is_portable_and_cannot_use_a_different_edge_backend() {
+    let d = tempfile::tempdir().unwrap();
+    let auth_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let auth_url = format!("http://{}/auth", auth_listener.local_addr().unwrap());
+    let auth_task = tokio::spawn(async move {
+        axum::serve(
+            auth_listener,
+            axum::Router::new().route(
+                "/auth",
+                axum::routing::get(|| async { axum::http::StatusCode::OK }),
+            ),
+        )
+        .await
+        .unwrap()
+    });
+    let (source, source_url, source_task) = launch(d.path(), "policy-source", "source").await;
+    let (cdn, cdn_url, cdn_task) = launch(d.path(), "policy-cdn", "cdn").await;
+    source
+        .config
+        .put("auth_backends", "billing", json!({"url":auth_url}))
+        .unwrap();
+    source
+        .config
+        .put(
+            "streams",
+            "owned",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}],"on_play":"auth://billing"}),
+        )
+        .unwrap();
+    cdn.config
+        .put(
+            "auth_backends",
+            "billing",
+            json!({"url":"http://127.0.0.1:1/wrong"}),
+        )
+        .unwrap();
+    cdn.config
+        .put(
+            "sources",
+            "origin",
+            json!({"api_url":source_url,"private_payload_url":source_url}),
+        )
+        .unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    assert_eq!(
+        client
+            .get(format!("{cdn_url}/owned/index.m3u8"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    for app in [&source, &cdn] {
+        app.media.stop_all().await;
+    }
+    for task in [source_task, cdn_task, auth_task] {
+        task.abort();
+    }
 }

@@ -15,3 +15,6 @@ __pycache__/
 
 /.superdesign/
 *.dump
+
+/runtime/
+/config.json

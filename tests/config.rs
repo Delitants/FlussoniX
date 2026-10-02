@@ -112,3 +112,22 @@ fn m4f_input_can_be_saved_after_sample_table_adapter_is_available() {
         .is_ok()
     );
 }
+
+#[test]
+fn invalid_auth_settings_never_save_or_disable_inherited_protection() {
+    let d = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(d.path().join("c.json")).unwrap();
+    for kind in ["streams", "templates"] {
+        for policy in [
+            json!({"on_play":[]}),
+            json!({"on_play":"file:///auth"}),
+            json!({"on_play":"auth://missing"}),
+            json!({"flussonix_token_sha256":true}),
+            json!({"flussonix_token_sha256":"not-a-digest"}),
+        ] {
+            let before = store.snapshot();
+            assert!(store.put(kind, "bad", policy).is_err());
+            assert_eq!(store.snapshot(), before);
+        }
+    }
+}

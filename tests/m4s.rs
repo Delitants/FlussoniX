@@ -90,3 +90,37 @@ fn m4f_roundtrip_preserves_samples_timestamps_and_rejects_truncation() {
     assert_eq!(decoded[1].body, frames[1].body);
     assert!(unpack(&b[..b.len() - 1]).is_err());
 }
+
+#[test]
+fn malformed_m4f_tracks_and_empty_compositions_return_errors_without_amplification() {
+    use flussonix::{
+        m4f::{Frame, pack, unpack},
+        m4s::{Track, boxes},
+    };
+    let track = Track {
+        id: 1,
+        codec: "h264".into(),
+        config: vec![1, 100, 0, 40],
+    };
+    let frame = Frame {
+        track_id: 1,
+        dts: 0,
+        pts_offset: 0,
+        key: true,
+        body: vec![0; 1024],
+    };
+    let input = pack(&[track], &[frame], 3600).unwrap();
+    let root = boxes(&input).unwrap();
+    let moov = boxes(root[0].1).unwrap();
+    let segm = atom(b"segm", moov[0].1);
+    let trak = atom(b"trak", moov[1].1);
+    let many = [segm.clone(), trak.repeat(100)].concat();
+    assert!(unpack(&[atom(b"moov", &many), atom(b"mdat", root[1].1)].concat()).is_err());
+    let empty_ctts = [moov[1].1.to_vec(), atom(b"ctts", &[])].concat();
+    let malformed = [
+        atom(b"moov", &[segm, atom(b"trak", &empty_ctts)].concat()),
+        atom(b"mdat", root[1].1),
+    ]
+    .concat();
+    assert!(unpack(&malformed).is_err());
+}

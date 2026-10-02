@@ -178,13 +178,21 @@ pub fn unpack(data: &[u8]) -> Result<(Vec<Track>, Vec<Frame>), String> {
         / scale;
     let mut tracks = Vec::new();
     let mut frames = Vec::new();
+    let mut decoded_bytes = 0usize;
+    let mut ids = std::collections::HashSet::new();
     for (k, body) in &moov {
         if *k != b"trak" {
             continue;
         }
+        if tracks.len() >= 2 {
+            return Err("M4F supports at most two AVC/AAC tracks".into());
+        }
         let fields = boxes(body)?;
         let h = field(&fields, b"hdlr")?;
         let id = read32(h, 4)?;
+        if !ids.insert(id) {
+            return Err("duplicate M4F track id".into());
+        }
         let codec = String::from_utf8_lossy(h.get(12..).ok_or("short handler")?)
             .trim_end_matches('\0')
             .to_owned();
@@ -200,11 +208,13 @@ pub fn unpack(data: &[u8]) -> Result<(Vec<Track>, Vec<Frame>), String> {
             return Err("invalid track timescale".into());
         }
         let shift = read32(shft, 12)? as i32 as i64;
-        let mut dts = i64::try_from(base).map_err(|_| "timestamp overflow")?
-            + shift * 90000 / track_scale as i64;
+        let mut dts = i64::try_from(base)
+            .map_err(|_| "timestamp overflow")?
+            .checked_add(shift * 90000 / track_scale as i64)
+            .ok_or("timestamp overflow")?;
         let stsz = field(&fields, b"stsz")?;
         let count = read32(stsz, 8)? as usize;
-        if count > 100000 || count == 0 {
+        if frames.len() + count > 100000 || count == 0 {
             return Err("invalid sample count".into());
         }
         let fixed_size = read32(stsz, 4)? as usize;
@@ -227,7 +237,7 @@ pub fn unpack(data: &[u8]) -> Result<(Vec<Track>, Vec<Frame>), String> {
             return Err("duration count mismatch".into());
         }
         let compositions = if let Ok(c) = field(&fields, b"ctts") {
-            runs(c, c[0] == 1, count)?
+            runs(c, *c.first().ok_or("short composition table")? == 1, count)?
         } else {
             vec![0; count]
         };
@@ -250,6 +260,12 @@ pub fn unpack(data: &[u8]) -> Result<(Vec<Track>, Vec<Frame>), String> {
             } else {
                 read32(stsz, 12 + i * 4)? as usize
             };
+            decoded_bytes = decoded_bytes
+                .checked_add(size)
+                .ok_or("decoded payload overflow")?;
+            if decoded_bytes > 32 * 1024 * 1024 {
+                return Err("decoded M4F payload exceeds limit".into());
+            }
             let end = offset.checked_add(size).ok_or("payload overflow")?;
             let body = payload
                 .get(offset..end)

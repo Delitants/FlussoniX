@@ -11,7 +11,7 @@ Spec: architecture.md, compatibility.md, cluster-loadbalancing.md, rtsp-rtp-supp
 5. Qualification: run Rust checks and real decoded-media integration tests; produce a per-feature capability report, start a test instance on an unused port, perform a fresh final code review and fix important findings.
 6. Publish: exclude local state, credentials, toolchains, vendor binaries/source extracts and generated media; create the authorized GitHub repository and push the reviewable first working copy. Publication is already authorized by the user.
 
-M4F/M4S wire adapters are the highest-priority remaining compatibility gate. Generic fMP4 output is never labelled M4F/M4S interoperability. No production/demo configuration will be changed.
+M4F/M4S wire adapters remain the highest-priority compatibility gate; the independently implemented AVC/AAC subset and current qualification are recorded in qualification.md. Generic fMP4 output is never labelled M4F/M4S interoperability. No production/demo configuration will be changed.
 
 Execution: inline. New repository starts on develop in the requested workspace; there is no existing branch/worktree to protect. Rust and FFmpeg are independent build/runtime dependencies, not vendor package dependencies.
 

@@ -65,6 +65,7 @@ struct Session {
     user_id: String,
     valid_until: Instant,
     last_seen: Instant,
+    live: Arc<AtomicU64>,
 }
 struct Reservation {
     stream: String,
@@ -173,9 +174,18 @@ impl App {
             }
         }
     }
+    async fn invalidate_sessions(&self) {
+        let mut sessions = self.sessions.lock().await;
+        sessions.retain(|_, s| s.live.load(Ordering::Relaxed) > 0);
+        for s in sessions.values_mut() {
+            s.valid_until = Instant::now();
+        }
+    }
     async fn active(&self) -> u64 {
         let mut s = self.sessions.lock().await;
-        s.retain(|_, v| v.last_seen.elapsed() < Duration::from_secs(30));
+        s.retain(|_, v| {
+            v.live.load(Ordering::Relaxed) > 0 || v.last_seen.elapsed() < Duration::from_secs(30)
+        });
         s.len() as u64
     }
     async fn node(&self) -> Value {
@@ -263,6 +273,22 @@ impl App {
         }
         None
     }
+    async fn hold_session(
+        &self,
+        name: &str,
+        cfg: &Value,
+        headers: &HeaderMap,
+        query: &HashMap<String, String>,
+        ip: &str,
+    ) -> Option<SessionLease> {
+        let sessions = self.sessions.lock().await;
+        let live = sessions
+            .get(&viewer_identity(name, cfg, headers, query, ip))?
+            .live
+            .clone();
+        live.fetch_add(1, Ordering::Relaxed);
+        Some(SessionLease(live))
+    }
     async fn authorize_viewer(
         &self,
         name: &str,
@@ -275,11 +301,7 @@ impl App {
             return true;
         }
         let token = query.get("token").map(String::as_str).unwrap_or("");
-        let identity = format!(
-            "{name}\0{ip}\0{token}\0{}\0{cfg}",
-            header(headers, "authorization").unwrap_or("")
-        );
-        let id = format!("{:x}", Sha256::digest(identity.as_bytes()));
+        let id = viewer_identity(name, cfg, headers, query, ip);
         {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.get_mut(&id) {
@@ -289,15 +311,21 @@ impl App {
                 }
             }
         }
-        if let Some(hash) = cfg["flussonix_token_sha256"].as_str() {
-            if format!("{:x}", Sha256::digest(token.as_bytes())) != hash {
+        if let Some(hash) = cfg.get("flussonix_token_sha256") {
+            let Some(hash) = hash.as_str() else {
+                return false;
+            };
+            if !format!("{:x}", Sha256::digest(token.as_bytes())).eq_ignore_ascii_case(hash) {
                 return false;
             }
         }
         let mut duration = 10u64;
         let mut user_id = id.clone();
         let mut max_sessions = None;
-        if let Some(backend) = cfg["on_play"].as_str() {
+        if let Some(backend) = cfg.get("on_play") {
+            let Some(backend) = backend.as_str() else {
+                return false;
+            };
             let backend = if let Some(backend) = backend.strip_prefix("auth://") {
                 self.config.snapshot()["auth_backends"]
                     .as_array()
@@ -340,7 +368,9 @@ impl App {
                 header(r.headers(), "x-maxsessions").and_then(|v| v.parse::<usize>().ok());
         }
         let mut sessions = self.sessions.lock().await;
-        sessions.retain(|_, v| v.last_seen.elapsed() < Duration::from_secs(30));
+        sessions.retain(|_, v| {
+            v.live.load(Ordering::Relaxed) > 0 || v.last_seen.elapsed() < Duration::from_secs(30)
+        });
         if let Some(limit) = max_sessions {
             if !sessions.contains_key(&id)
                 && sessions
@@ -355,6 +385,10 @@ impl App {
         if sessions.len() >= self.options.client_limit as usize && !sessions.contains_key(&id) {
             return false;
         }
+        let live = sessions
+            .get(&id)
+            .map(|s| s.live.clone())
+            .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
         sessions.insert(
             id,
             Session {
@@ -362,10 +396,31 @@ impl App {
                 user_id,
                 valid_until: Instant::now() + Duration::from_secs(duration),
                 last_seen: Instant::now(),
+                live,
             },
         );
         true
     }
+}
+struct SessionLease(Arc<AtomicU64>);
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+fn viewer_identity(
+    name: &str,
+    cfg: &Value,
+    headers: &HeaderMap,
+    query: &HashMap<String, String>,
+    ip: &str,
+) -> String {
+    let token = query.get("token").map(String::as_str).unwrap_or("");
+    let identity = format!(
+        "{name}\0{ip}\0{token}\0{}\0{cfg}",
+        header(headers, "authorization").unwrap_or("")
+    );
+    format!("{:x}", Sha256::digest(identity.as_bytes()))
 }
 fn header<'a>(h: &'a HeaderMap, key: &str) -> Option<&'a str> {
     h.get(key).and_then(|v| v.to_str().ok())
@@ -477,7 +532,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         return match result {
             Ok(v) => {
                 if method == "PUT" {
-                    app.sessions.lock().await.clear();
+                    app.invalidate_sessions().await;
                     app.mirrors.lock().await.clear();
                     app.reconcile().await;
                 }
@@ -539,13 +594,13 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
             };
             return match app.config.put(kind, name, body) {
                 Ok(mut v) => {
-                    app.sessions.lock().await.clear();
+                    app.invalidate_sessions().await;
                     if kind == "sources" {
                         app.mirrors.lock().await.clear();
                         app.reconcile().await;
                     }
                     if matches!(kind, "streams" | "templates") {
-                        app.sessions.lock().await.clear();
+                        app.invalidate_sessions().await;
                         app.reconcile().await;
                         if kind == "streams" {
                             v = app.config.effective(name).unwrap_or(v);
@@ -560,9 +615,13 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         if method == "DELETE" {
             return match app.config.delete(kind, name) {
                 Ok(true) => {
-                    app.sessions.lock().await.clear();
+                    app.invalidate_sessions().await;
                     if kind == "streams" {
                         app.media.stop(name).await;
+                    }
+                    if kind == "sources" {
+                        app.mirrors.lock().await.clear();
+                        app.reconcile().await;
                     }
                     StatusCode::NO_CONTENT.into_response()
                 }
@@ -656,7 +715,27 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
     if let Some(name) = tail.strip_prefix("stream/") {
         if request.method() == "GET" && peer {
             return match app.config.effective(name) {
-                Some(c) => json_response(c),
+                Some(mut c) => {
+                    if let Some(backend) = c["on_play"]
+                        .as_str()
+                        .and_then(|p| p.strip_prefix("auth://"))
+                    {
+                        let root = app.config.snapshot();
+                        let url = root["auth_backends"]
+                            .as_array()
+                            .and_then(|b| b.iter().find(|b| b["name"] == backend))
+                            .and_then(|b| b["url"].as_str())
+                            .map(str::to_owned);
+                        let Some(url) = url else {
+                            return error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "source authentication policy unavailable",
+                            );
+                        };
+                        c["on_play"] = json!(url);
+                    }
+                    json_response(c)
+                }
                 None => error(StatusCode::NOT_FOUND, "stream not found"),
             };
         }
@@ -799,6 +878,27 @@ async fn balance(
     error(StatusCode::SERVICE_UNAVAILABLE, "no available CDN node")
 }
 async fn media_request(State(app): State<Arc<App>>, request: Request) -> Response {
+    let mut response = if request.method() == "OPTIONS" {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        serve_media_request(app, request).await
+    };
+    let headers = response.headers_mut();
+    headers.insert(
+        "access-control-allow-origin",
+        axum::http::HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        "access-control-allow-methods",
+        axum::http::HeaderValue::from_static("GET, OPTIONS"),
+    );
+    headers.insert(
+        "access-control-allow-headers",
+        axum::http::HeaderValue::from_static("Authorization, Range"),
+    );
+    response
+}
+async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     if request.method() != "GET" {
         return error(StatusCode::METHOD_NOT_ALLOWED, "playback requires GET");
     }
@@ -861,7 +961,21 @@ async fn media_request(State(app): State<Arc<App>>, request: Request) -> Respons
     if let Some(ticket) = query.get("flussonix_ticket") {
         let mut reservations = app.reservations.lock().await;
         match reservations.remove(ticket) {
-            Some(r) if r.stream == name && r.expires > Instant::now() => {}
+            Some(r) if r.stream == name && r.expires > Instant::now() => {
+                let clean = url::form_urlencoded::Serializer::new(String::new())
+                    .extend_pairs(
+                        query
+                            .iter()
+                            .filter(|(k, _)| k.as_str() != "flussonix_ticket"),
+                    )
+                    .finish();
+                let location = if clean.is_empty() {
+                    raw_path.to_owned()
+                } else {
+                    format!("{raw_path}?{clean}")
+                };
+                return (StatusCode::FOUND, [("location", location)]).into_response();
+            }
             _ => {
                 return error(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -899,7 +1013,11 @@ async fn media_request(State(app): State<Arc<App>>, request: Request) -> Respons
             );
         };
         worker.viewers.fetch_add(1, Ordering::Relaxed);
-        let guard = ViewerGuard(worker.clone());
+        let guard = ViewerGuard(
+            worker.clone(),
+            app.hold_session(name, &cfg, request.headers(), &query, &ip)
+                .await,
+        );
         let egress = app.egress.clone();
         let live = futures_util::stream::unfold(
             (rx, guard, egress.clone()),
@@ -938,7 +1056,11 @@ async fn media_request(State(app): State<Arc<App>>, request: Request) -> Respons
     if file == "mpegts" {
         let rx = worker.subscribe();
         worker.viewers.fetch_add(1, Ordering::Relaxed);
-        let guard = ViewerGuard(worker.clone());
+        let guard = ViewerGuard(
+            worker.clone(),
+            app.hold_session(name, &cfg, request.headers(), &query, &ip)
+                .await,
+        );
         let egress = app.egress.clone();
         let stream = futures_util::stream::unfold(
             (rx, guard, egress),
@@ -1005,7 +1127,7 @@ async fn media_request(State(app): State<Arc<App>>, request: Request) -> Respons
     )
         .into_response()
 }
-struct ViewerGuard(Arc<Worker>);
+struct ViewerGuard(Arc<Worker>, #[allow(dead_code)] Option<SessionLease>);
 impl Drop for ViewerGuard {
     fn drop(&mut self) {
         self.0.viewers.fetch_sub(1, Ordering::Relaxed);
@@ -1034,4 +1156,73 @@ pub fn rewrite_playlist(text: &str, query: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
         + "\n"
+}
+
+#[cfg(test)]
+mod continuous_session_tests {
+    use super::*;
+    use tower::ServiceExt;
+    #[tokio::test]
+    async fn live_http_body_keeps_viewer_counted_after_inactivity_window() {
+        let d = tempfile::tempdir().unwrap();
+        let app = App::new(
+            d.path().join("c.json"),
+            d.path().join("media"),
+            Options {
+                admin_password: "test-admin".into(),
+                peer_key: "test-peer-secret".into(),
+                client_limit: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.config
+            .put(
+                "streams",
+                "owned",
+                json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+            )
+            .unwrap();
+        let response = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/owned/mpegts?token=first")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        for session in app.sessions.lock().await.values_mut() {
+            session.last_seen = Instant::now() - Duration::from_secs(31);
+        }
+        assert_eq!(
+            app.node().await["active"],
+            1,
+            "an open live response is still an active viewer"
+        );
+        let second = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/owned/index.m3u8?token=second")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.status(),
+            403,
+            "live viewers retain their client slots"
+        );
+        app.invalidate_sessions().await;
+        assert_eq!(
+            app.node().await["active"],
+            1,
+            "config changes still account for open bodies"
+        );
+        drop(response);
+        assert_eq!(app.node().await["active"], 0);
+        app.media.stop_all().await;
+    }
 }

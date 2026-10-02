@@ -170,3 +170,45 @@ async fn metadata_edit_does_not_restart_unrelated_stream_workers() {
     assert_eq!(first.pid(), after.pid());
     app.media.stop_all().await;
 }
+
+#[tokio::test]
+async fn media_redirects_and_errors_allow_cross_origin_players_without_cookie_credentials() {
+    let d = tempfile::tempdir().unwrap();
+    let app = App::new(d.path().join("c.json"), d.path().join("media"), options()).unwrap();
+    let response = router(app.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/missing/index.m3u8")
+                .header("origin", "https://player.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|h| h.to_str().ok()),
+        Some("*")
+    );
+    assert!(
+        response
+            .headers()
+            .get("access-control-allow-credentials")
+            .is_none()
+    );
+    let preflight = router(app)
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/owned/index.m3u8")
+                .header("origin", "https://player.example")
+                .header("access-control-request-headers", "authorization,range")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+}

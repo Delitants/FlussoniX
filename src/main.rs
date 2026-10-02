@@ -1,6 +1,6 @@
 use clap::Parser;
 use flussonix::server::{App, Options, router};
-use std::{net::SocketAddr, path::PathBuf};
+use std::{future::IntoFuture, net::SocketAddr, path::PathBuf, time::Duration};
 #[derive(Parser)]
 #[command(name = "flussonix", version, about = "Independent live media server")]
 struct Args {
@@ -71,15 +71,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::select! {_=bg_cancel.cancelled()=>break,_=interval.tick()=>background.reconcile().await}
         }
     });
-    axum::serve(
+    let serving = axum::serve(
         listener,
         router(app.clone()).into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown())
-    .await?;
+    .with_graceful_shutdown(cancel.clone().cancelled_owned())
+    .into_future();
+    tokio::pin!(serving);
+    let completed = tokio::select! {result=&mut serving=>Some(result),_=shutdown()=>None};
     cancel.cancel();
     let _ = supervisor.await;
     app.media.stop_all().await;
+    if let Some(result) = completed {
+        result?;
+    } else if tokio::time::timeout(Duration::from_secs(5), &mut serving)
+        .await
+        .is_err()
+    {
+        tracing::warn!("connection drain exceeded five seconds");
+    }
     Ok(())
 }
 async fn shutdown() {

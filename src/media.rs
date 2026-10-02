@@ -237,7 +237,8 @@ impl Engine {
                     match read {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            if decoder.push(&buffer[..n], &w.wire).is_err() {
+                            if let Err(reason) = decoder.push(&buffer[..n], &w.wire) {
+                                tracing::warn!(error = %reason, "wire output stopped");
                                 break;
                             }
                         }
@@ -251,7 +252,10 @@ impl Engine {
             let cancel = cancel.clone();
             tokio::spawn(async move {
                 if let Some(mut stdin) = stdin.take() {
-                    let _ = tokio::select! {_=cancel.cancelled()=>Ok(()),result=wire_ingest(&url,key.as_deref(),&mut stdin)=>result};
+                    let result = tokio::select! {_=cancel.cancelled()=>Ok(()),result=wire_ingest(&url,key.as_deref(),&mut stdin)=>result};
+                    if let Err(reason) = result {
+                        tracing::warn!(error = %reason, "wire input stopped");
+                    }
                 }
                 cancel.cancel();
             });

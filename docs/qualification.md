@@ -12,22 +12,29 @@ This milestone is an executable subset of the product design, not complete Fluss
 - An owned M4F segment produced by the Rust adapter was fed to the installed Flussonic decoder in an isolated Erlang process: 144 frames decoded. This is a container check, not proof of every Flussonic playback/cluster behavior.
 - The user-authorized live M4S source produced H.264/AAC HLS; FFmpeg decoded the delivered segment. Its URL and token are retained only in ignored private test configuration.
 - The authorized production M4F signal endpoint returned live notifications. Downloads of its `.m4f` segments with the supplied viewer token returned HTTP 403, so that source's M4F ingestion is not qualified. No production configuration was changed to work around it.
-- Browser tests cover stream creation/persistence, config validation without saving, Templates and Cluster views.
+- Browser tests cover stream creation/persistence, config validation without saving, Templates and Cluster views, and preserving template inheritance after a title edit.
+- Review regressions cover bounded SIGTERM shutdown with an open MPEG-TS response, portable named source auth backends, clean CDN playlist reload URLs, strict auth policy validation and keeping live bodies in admission accounting.
 
 ## Limits
 
-M4F currently supports one contiguous chunk per H.264/AAC track, 90 kHz normalization and bounded segments. M4S supports MDin/FRam AVC/AAC frames, not packed GOP mode, HEVC, subtitles, SCTE/ad metadata or full legacy control messages. These modes must be qualified separately before migration.
+M4F currently supports up to two uniquely identified H.264/AAC tracks with one contiguous chunk each, 90 kHz normalization, at most 100,000 decoded samples and 32 MiB of aggregate decoded payload per segment. M4S supports MDin/FRam AVC/AAC frames, not packed GOP mode, HEVC, subtitles, SCTE/ad metadata or full legacy control messages. These modes must be qualified separately before migration.
 
 CPU encoding uses libx264 plus AAC. NVIDIA configuration is exposed, but no GPU success is claimed without a real supported device and decoder test. FFmpeg transport adapters do not establish serving/publishing parity for RTSP or SRT. RTSPS, RTP/SRTP and push roles are not implemented.
 
 HLS and M4 windows are bounded; live subscribers use bounded shared queues and disconnect on lag. There is a 256-worker implementation limit. This build has not been benchmarked for production stream/viewer counts. Metrics use Linux CPU/RAM and this daemon's actual HTTP media egress, not aggregate interface traffic from other processes. Balancing applies resource headroom and authoritative CDN reservations; it does not promise perfect uplink prediction.
 
-API compatibility is a subset. Collection default ordering is by name; `sort=-name` and literal substring `q` are implemented, while full projection/filter/sort semantics, configuration-text formats and many operations remain open. API credentials/listeners/resource limits are startup settings rather than the complete vendor config contract. Unknown saved options fail validation. Viewer session counts use 30 seconds of inactivity; revocation and global cross-node session ownership remain open.
+API compatibility is a subset. Collection default ordering is by name; `sort=-name` and literal substring `q` are implemented, while full projection/filter/sort semantics, configuration-text formats and many operations remain open. API credentials/listeners/resource limits are startup settings rather than the complete vendor config contract. Unknown saved options fail validation. Viewer session counts expire after 30 seconds of inactivity when no continuous response remains open; revocation and global cross-node session ownership remain open.
 
 For testing, keep management endpoints on a trusted interface or reach them through SSH forwarding. The daemon currently serves HTTP, so HTTPS delivery requires a separately configured TLS terminator. The dedicated test instances must use separate directories, accounts, units and unused ports; never replace or restart existing Flussonic services.
 
 ## CDN test deployment
 
-The user authorized installations on cdn4-uk.ott.pink and cdn5-uk.ott.pink. Read-only inspection verified Ubuntu 24.04 x86_64, independent `/usr/bin/ffmpeg`, unused TCP 18210, and a shared private network. Intended isolated prefix/unit: `/opt/flussonix-test` / `flussonix-test.service`. Release artifacts are built for x86_64 Linux with musl so no host libc upgrade is required.
+The user authorized installations on cdn4-uk.ott.pink and cdn5-uk.ott.pink. Read-only inspection verified Ubuntu 24.04 x86_64, independent `/usr/bin/ffmpeg`, unused TCP 18210, and a shared private network. Installed isolated prefix/unit: `/opt/flussonix-test` / `flussonix-test.service`. Release artifacts are built for x86_64 Linux with musl so no host libc upgrade is required.
 
-Remote qualification results will be recorded here after installation. Production stream tokens, API passwords, peer keys, key files and source URLs are excluded from this repository.
+Qualification completed 2026-10-01 HST on the same x86_64 musl binary at both nodes (SHA256 `b3678fb1dde7a4856cc37bfd1a1f9e78802f4187a5557708da358a2487465e87`). cdn4 ran the source role, receiving the authorized Flussonic M4S AVC/AAC stream over HTTPS. cdn5 ran the CDN role and its FFmpeg input was verified to use cdn4's private address, 172.16.0.7. The local LB ran on 127.0.0.1:18211 and queried management through SSH forwards (18214/18215). It returned a 302 to cdn5; ticket redemption returned a clean reload URL. Delivered 1920x1080 H.264/AAC MPEG-TS passed FFprobe and an actual FFmpeg decode. Anonymous entry and segment requests were denied, and a later playlist reload succeeded.
+
+A Chromium HLS player followed the LB/CDN redirect flow through the SSH forwards and sustained playback beyond the initial playlist: 11 manifest loads, 10 buffered fragments, no fatal HLS errors. The test temporarily set the LB's public delivery endpoint to the CDN SSH forward and restored the cdn5 host endpoint afterward. Direct public access to test port 18210 was unavailable from the development host; no firewall or production listener was changed. Use SSH forwarding to access the remote test UI.
+
+The dedicated systemd units run as `flussonix-test`, with Nice 10, CPUQuota 100%, MemoryMax 512 MiB, a separate writable runtime directory and control-group cleanup. They are started for testing, not enabled at boot. Production Flussonic process IDs and port 80/443 listeners were checked before and after; neither production service was restarted or reconfigured. These checks are bounded functional qualification, not a throughput benchmark.
+
+Production stream tokens, API passwords, peer keys, key files and source URLs are excluded from this repository.

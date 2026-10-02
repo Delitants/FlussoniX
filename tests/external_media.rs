@@ -5,6 +5,7 @@ use std::time::Duration;
 #[tokio::test]
 #[ignore = "requires an authorized FLUSSONIX_M4S_URL"]
 async fn authorized_m4s_ingest_produces_decodable_hls_and_relay() {
+    let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
     let url = std::env::var("FLUSSONIX_M4S_URL").expect("authorized source URL required");
     let d = tempfile::tempdir().unwrap();
     let engine = Engine::new(d.path(), "ffmpeg");

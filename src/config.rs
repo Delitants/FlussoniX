@@ -250,6 +250,17 @@ fn validate_root(root: &Value) -> Result<(), String> {
                         }
                     }
                 }
+                if let Some(key) = item.get("cluster_key") {
+                    if !key
+                        .as_str()
+                        .is_some_and(|k| k.len() >= 12 && !k.contains(['\r', '\n']))
+                    {
+                        return Err("cluster_key must be a string of at least 12 characters".into());
+                    }
+                }
+                if item.get("drain").is_some_and(|v| !v.is_boolean()) {
+                    return Err("drain must be boolean".into());
+                }
                 if *kind != "auth_backends" && item["api_url"].as_str().is_none() {
                     return Err("api_url required".into());
                 }
@@ -258,6 +269,42 @@ fn validate_root(root: &Value) -> Result<(), String> {
                 }
             }
             if matches!(*kind, "streams" | "templates") {
+                if let Some(template) = item.get("template") {
+                    let template = template.as_str().ok_or("template must be a name string")?;
+                    valid_name(template)?;
+                    if *kind == "templates" {
+                        return Err("nested templates are not implemented".into());
+                    }
+                }
+                if let Some(policy) = item.get("on_play") {
+                    let policy = policy.as_str().ok_or("on_play must be a URL string")?;
+                    if let Some(name) = policy.strip_prefix("auth://") {
+                        valid_name(name)?;
+                        if !root["auth_backends"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|b| b["name"] == name)
+                        {
+                            return Err("auth backend not found".into());
+                        }
+                    } else {
+                        let url = url::Url::parse(policy).map_err(|_| "invalid on_play URL")?;
+                        if !["http", "https"].contains(&url.scheme()) || url.host_str().is_none() {
+                            return Err("on_play must use HTTP(S) or auth://backend".into());
+                        }
+                    }
+                }
+                if let Some(hash) = item.get("flussonix_token_sha256") {
+                    if !hash
+                        .as_str()
+                        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                    {
+                        return Err(
+                            "flussonix_token_sha256 must be a 64-digit SHA256 hex string".into(),
+                        );
+                    }
+                }
                 for flag in ["static", "disabled"] {
                     if let Some(v) = item.get(flag) {
                         if !v.is_boolean() {

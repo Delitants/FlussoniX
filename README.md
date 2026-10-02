@@ -18,6 +18,10 @@ This build implements persisted Streams/Templates configuration, authenticated m
 
 Required later work includes complete API/schema parity; Flussonic cluster discovery and credential compatibility; M4S packed GOP and additional codec/metadata modes; publisher authentication; RTSP serving/publication/push; RTSPS, RTP/SRTP inbound and outbound; SRT output/push; HTTPS serving or reverse-proxy integration; full transcoder profiles, GPU qualification, DVR, session reauthorization/revocation and scale/failover qualification. Unsupported saved options return errors. See [qualification](docs/qualification.md) for evidence and limits.
 
+## Preview package
+
+The GitHub prerelease includes an x86_64 Linux static binary, the compiled admin UI and an owned synthetic example configuration. FFmpeg/FFprobe remain host dependencies. After extracting it, set the three `FLUSSONIX_*` environment variables below, then run `./bin/flussonix --config runtime/config.json --media-dir runtime/media --web-dir web/dist`. The default listener is 127.0.0.1:18210.
+
 ## Build and run
 
 Dependencies: Rust (the pinned toolchain), Node.js 22+, and an independently installed FFmpeg/FFprobe with libx264 and AAC. No Flussonic package is needed to build or run.
