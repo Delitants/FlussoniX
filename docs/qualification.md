@@ -69,4 +69,4 @@ Shared wire queues cap both record count (256) and bytes (16 MiB). Bootstrap cap
 
 Source-only `flussonix_transport` selects HLS/M4S/M4F over the configured LAN endpoint, preserving endpoint prefixes and encoded names; default remains HLS. Secure endpoint URLs choose secure input aliases. Source processing is not reapplied at the CDN. Local topology tests cover all three source transports with token denial, clean redirects, one shared worker and actual media decoding. Worker stats report upstream protocol.
 
-Local checks passed 67 Rust tests (one authorized-source test opt-in) and seven browser cases. Build/test/runtime depend on independent Rust/JavaScript dependencies and FFmpeg, not the installed Flussonic reference. CI asserts the reference package is absent. Optional isolated reference probes inform the wire specification only.
+Local checks passed 67 Rust tests (one authorized-source test opt-in) and eight browser cases. Build/test/runtime depend on independent Rust/JavaScript dependencies and FFmpeg, not the installed Flussonic reference. CI asserts the reference package is absent. Optional isolated reference probes inform the wire specification only.

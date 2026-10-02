@@ -64,3 +64,15 @@ test('cluster source fields preserve endpoints and mask the peer key',async({pag
  const source=await (await request.get('/streamer/api/v3/cluster/sources/friendly-source',{headers})).json();expect(source.private_payload_url).toBe('http://127.0.0.1:19998');expect(source.flussonix_transport).toBe('m4f');
  await expect(page.locator('textarea')).toHaveCount(0);
 });
+
+test('changing authorization mode preserves the existing session limits and identity',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-auth-policy';
+ expect((await request.put('/streamer/api/v3/auth_backends/ui-policy-backend',{headers,data:{url:'http://127.0.0.1:19999/check'}})).ok()).toBeTruthy();
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,static:false,inputs:[{url:'testsrc://'}],on_play:{url:'auth://ui-policy-backend',max_sessions:3,session_keys:['name','proto','token','token']}}})).ok()).toBeTruthy();
+ await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+ await page.getByLabel('Authorization policy',{exact:true}).selectOption('url');await page.getByLabel('Callback URL',{exact:true}).fill('http://127.0.0.1:19999/new-check');
+ await expect(page.getByLabel('Maximum viewer sessions',{exact:true})).toHaveValue('3');
+ await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('status')).toContainText('Saved.');
+ const result=await (await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(result.on_play.max_sessions).toBe(3);expect(result.on_play.session_keys).toEqual(['name','proto','token','token']);
+});
