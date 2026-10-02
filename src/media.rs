@@ -497,7 +497,7 @@ async fn wire_ingest(
                 let (info, frames) = crate::m4f::unpack(&b)?;
                 events.push(Event::Info {
                     tracks: info,
-                    wire: Vec::new(),
+                    wire: Bytes::new(),
                 });
                 for f in frames {
                     events.push(Event::Frame {
@@ -506,7 +506,7 @@ async fn wire_ingest(
                         pts_offset: f.pts_offset,
                         key: f.key,
                         body: f.body,
-                        wire: Vec::new(),
+                        wire: Bytes::new(),
                     });
                 }
             }
@@ -542,6 +542,30 @@ async fn wire_ingest(
                         .write_all(&flv_frame(track, dts, pts_offset, key, &body, o)?)
                         .await
                         .map_err(|_| "media pipe closed")?;
+                }
+                Event::Gop {
+                    tracks: new,
+                    frames,
+                    ..
+                } => {
+                    for track in &new {
+                        stdin
+                            .write_all(&flv_config(track)?)
+                            .await
+                            .map_err(|_| "media pipe closed")?;
+                    }
+                    tracks = new;
+                    for f in frames {
+                        let track = tracks
+                            .iter()
+                            .find(|t| t.id == f.track_id)
+                            .ok_or("unknown track")?;
+                        let o = *origin.get_or_insert(f.dts);
+                        stdin
+                            .write_all(&flv_frame(track, f.dts, f.pts_offset, f.key, &f.body, o)?)
+                            .await
+                            .map_err(|_| "media pipe closed")?;
+                    }
                 }
                 Event::Other { .. } => {}
             }

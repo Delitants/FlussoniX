@@ -124,3 +124,89 @@ fn malformed_m4f_tracks_and_empty_compositions_return_errors_without_amplificati
     .concat();
     assert!(unpack(&malformed).is_err());
 }
+
+fn packed_record(dts: f64, duration: f64, extra: &[u8]) -> Vec<u8> {
+    use flussonix::{
+        m4f::{Frame, pack},
+        m4s::Track,
+    };
+    let body = pack(
+        &[Track {
+            id: 1,
+            codec: "h264".into(),
+            config: vec![1, 100, 0, 40],
+        }],
+        &[Frame {
+            track_id: 1,
+            dts: 90000,
+            pts_offset: -3600,
+            key: true,
+            body: vec![0, 0, 0, 1, 101],
+        }],
+        3600,
+    )
+    .unwrap();
+    let h = [
+        atom(b" utc", &1700000000u32.to_be_bytes()),
+        atom(b" dts", &dts.to_be_bytes()),
+        atom(b" num", &7u32.to_be_bytes()),
+        atom(b" dur", &duration.to_be_bytes()),
+        extra.to_vec(),
+    ]
+    .concat();
+    let p = atom(b"Fgop", &[atom(b"goph", &h), atom(b"body", &body)].concat());
+    [(p.len() as u32).to_be_bytes().to_vec(), p].concat()
+}
+#[test]
+fn fragmented_packed_gop_preserves_source_metadata_payload_and_composition() {
+    let packet = packed_record(1000.0, 40.0, &[]);
+    let mut decoder = Decoder::default();
+    let mut events = Vec::new();
+    for chunk in packet.chunks(7) {
+        events.extend(decoder.push(chunk).expect("packed GOP should decode"));
+    }
+    match &events[0] {
+        Event::Gop {
+            gop,
+            tracks,
+            frames,
+            wire,
+        } => {
+            assert_eq!(gop.utc, 1700000000);
+            assert_eq!(gop.dts_ms, 1000.0);
+            assert_eq!(gop.sequence, 7);
+            assert_eq!(gop.duration_ms, 40.0);
+            assert_eq!(wire.as_ref(), packet.as_slice());
+            assert_eq!(tracks[0].id, 1);
+            assert_eq!(frames[0].dts, 90000);
+            assert_eq!(frames[0].pts_offset, -3600);
+            assert!(gop.body.windows(4).any(|w| w == b"mdat"));
+        }
+        _ => panic!("expected packed GOP"),
+    }
+}
+#[test]
+fn malformed_gop_numbers_and_duplicate_required_fields_fail_closed() {
+    for (dts, duration) in [
+        (f64::NAN, 40.0),
+        (f64::INFINITY, 40.0),
+        (-1.0, 40.0),
+        (1.0, 0.0),
+        (1.0, f64::INFINITY),
+    ] {
+        assert!(
+            Decoder::default()
+                .push(&packed_record(dts, duration, &[]))
+                .is_err()
+        );
+    }
+    assert!(
+        Decoder::default()
+            .push(&packed_record(
+                1.0,
+                40.0,
+                &atom(b" utc", &1u32.to_be_bytes())
+            ))
+            .is_err()
+    );
+}

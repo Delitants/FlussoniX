@@ -1,17 +1,26 @@
 //! Independent decoder for the observed M4S length-prefixed media records.
-//! Supports AVC/AAC MDin + FRam records; other codecs/GOP packing are not qualified.
-use bytes::{Buf, BytesMut};
+//! Supports observed AVC/AAC MDin, FRam and packed Fgop records.
+use crate::m4f::Frame;
+use bytes::{Buf, Bytes, BytesMut};
 #[derive(Debug, Clone)]
 pub struct Track {
     pub id: u32,
     pub codec: String,
     pub config: Vec<u8>,
 }
+#[derive(Debug, Clone)]
+pub struct PackedGop {
+    pub utc: u32,
+    pub dts_ms: f64,
+    pub sequence: u32,
+    pub duration_ms: f64,
+    pub body: Bytes,
+}
 #[derive(Debug)]
 pub enum Event {
     Info {
         tracks: Vec<Track>,
-        wire: Vec<u8>,
+        wire: Bytes,
     },
     Frame {
         track_id: u32,
@@ -19,10 +28,16 @@ pub enum Event {
         pts_offset: i64,
         key: bool,
         body: Vec<u8>,
-        wire: Vec<u8>,
+        wire: Bytes,
+    },
+    Gop {
+        gop: PackedGop,
+        tracks: Vec<Track>,
+        frames: Vec<Frame>,
+        wire: Bytes,
     },
     Other {
-        wire: Vec<u8>,
+        wire: Bytes,
     },
 }
 #[derive(Default)]
@@ -44,7 +59,7 @@ impl Decoder {
             if self.buffer.len() < n + 4 {
                 break;
             }
-            let wire = self.buffer.split_to(n + 4).to_vec();
+            let wire = self.buffer.split_to(n + 4).freeze();
             let packet = &wire[4..];
             let atoms = boxes(packet)?;
             if atoms.len() != 1 {
@@ -73,6 +88,12 @@ impl Decoder {
                         let config = find(&fields, b"cnfg").ok_or("missing codec configuration")?;
                         if config.len() < 5 {
                             return Err("short codec configuration".into());
+                        }
+                        if tracks.len() >= 2
+                            || tracks.iter().any(|t: &Track| t.id == id)
+                            || config.len() > 1024 * 1024
+                        {
+                            return Err("invalid or excessive M4S tracks/configuration".into());
                         }
                         tracks.push(Track {
                             id,
@@ -107,7 +128,42 @@ impl Decoder {
                         wire,
                     }
                 }
-                b"Fgop" => return Err("M4S packed GOP mode is not implemented".into()),
+                b"Fgop" => {
+                    let fields = boxes(body)?;
+                    let header = boxes(required(&fields, b"goph")?)?;
+                    let utc = u32::from_be_bytes(exact(required(&header, b" utc")?)?);
+                    let dts_ms = f64::from_be_bytes(exact(required(&header, b" dts")?)?);
+                    let sequence = u32::from_be_bytes(exact(required(&header, b" num")?)?);
+                    let duration_ms = f64::from_be_bytes(exact(required(&header, b" dur")?)?);
+                    if !dts_ms.is_finite()
+                        || dts_ms < 0.0
+                        || dts_ms > (u64::MAX / 90) as f64
+                        || !duration_ms.is_finite()
+                        || duration_ms <= 0.0
+                        || duration_ms > 3600000.0
+                    {
+                        return Err("invalid M4S GOP timing".into());
+                    }
+                    let payload = required(&fields, b"body")?;
+                    let (tracks, frames) = crate::m4f::unpack(payload)?;
+                    if frames.is_empty() {
+                        return Err("empty M4S GOP".into());
+                    }
+                    let offset = payload.as_ptr() as usize - wire.as_ptr() as usize;
+                    let payload = wire.slice(offset..offset + payload.len());
+                    Event::Gop {
+                        gop: PackedGop {
+                            utc,
+                            dts_ms,
+                            sequence,
+                            duration_ms,
+                            body: payload,
+                        },
+                        tracks,
+                        frames,
+                        wire,
+                    }
+                }
                 _ => Event::Other { wire },
             };
             events.push(event);
@@ -189,4 +245,18 @@ pub fn flv_frame(
     };
     b.extend_from_slice(body);
     flv_tag(if track.codec == "h264" { 9 } else { 8 }, ts, &b)
+}
+
+fn required<'a>(fields: &[BoxView<'a>], name: &[u8]) -> Result<&'a [u8], String> {
+    let mut found = fields.iter().filter(|(k, _)| *k == name);
+    let value = found.next().ok_or("missing M4S field")?.1;
+    if found.next().is_some() {
+        return Err("duplicate M4S field".into());
+    }
+    Ok(value)
+}
+fn exact<const N: usize>(bytes: &[u8]) -> Result<[u8; N], String> {
+    bytes
+        .try_into()
+        .map_err(|_| "invalid M4S field width".into())
 }
