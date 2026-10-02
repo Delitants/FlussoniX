@@ -887,3 +887,38 @@ async fn stale_policy_is_rejected_before_any_session_entry_exists() {
     ));
     assert_eq!(auth.active(), 0);
 }
+#[tokio::test]
+async fn unrelated_metadata_save_during_auth_does_not_deny_viewer() {
+    let (_d, app, b, task, _) = setup().await;
+    let other = app.clone();
+    let pending =
+        tokio::spawn(async move { media(&other, "/owned/mpegts?token=metadata-in-flight").await });
+    for _ in 0..100 {
+        if b.calls.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert!(b.calls.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        api(
+            &app,
+            "PUT",
+            "streams/other",
+            json!({"title":"unrelated edit"}),
+            false
+        )
+        .await
+        .status(),
+        200
+    );
+    let response = pending.await.unwrap();
+    let status = response.status();
+    drop(response);
+    app.media.stop_all().await;
+    task.abort();
+    assert_eq!(
+        status, 200,
+        "a metadata save on another stream does not invalidate this viewer policy"
+    );
+}

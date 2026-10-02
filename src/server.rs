@@ -901,7 +901,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     let Some(resolved) = app.resolve(name).await else {
         return error(StatusCode::NOT_FOUND, "stream not found");
     };
-    let cfg = resolved.config;
+    let mut cfg = resolved.config;
     if cfg["disabled"] == true {
         return error(StatusCode::NOT_FOUND, "stream disabled");
     }
@@ -956,7 +956,15 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             }
         }
     };
-    if grant.is_cancelled() || app.config.revision() != resolved.revision {
+    if app.config.revision() != resolved.revision {
+        // Re-resolve after a concurrent save. Unrelated metadata changes retain the grant,
+        // while policy/source changes publish a new authority revision and cancel it.
+        let Some(current) = app.resolve(name).await else {
+            return error(StatusCode::NOT_FOUND, "stream unavailable");
+        };
+        cfg = current.config;
+    }
+    if grant.is_cancelled() {
         return error(StatusCode::FORBIDDEN, "playback policy changed");
     }
     if app.options.role == "lb" {
