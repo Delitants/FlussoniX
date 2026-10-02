@@ -171,7 +171,7 @@ impl Engine {
             "-map",
             if synthetic { "1:a:0?" } else { "0:a:0?" },
         ]);
-        if synthetic || cfg.get("transcoder").is_some() {
+        if synthetic || cfg.get("transcoder").is_some() && cfg["transcoder"]["encoder"] != "copy" {
             let t = &cfg["transcoder"];
             let encoder = t["encoder"].as_str().unwrap_or("libx264");
             if !["libx264", "h264_nvenc"].contains(&encoder) {

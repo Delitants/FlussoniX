@@ -351,9 +351,9 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     if let Some(e) = t.get("encoder") {
                         if !e
                             .as_str()
-                            .is_some_and(|e| ["libx264", "h264_nvenc"].contains(&e))
+                            .is_some_and(|e| ["copy", "libx264", "h264_nvenc"].contains(&e))
                         {
-                            return Err("supported encoders: libx264, h264_nvenc".into());
+                            return Err("supported encoders: copy, libx264, h264_nvenc".into());
                         }
                     }
                 }

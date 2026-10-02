@@ -184,3 +184,20 @@ fn portable_policy_rejects_malformed_native_token_guards() {
         );
     }
 }
+
+#[test]
+fn explicit_copy_encoder_overrides_template_transcoding() {
+    let d = tempfile::tempdir().unwrap();
+    let s = flussonix::config::ConfigStore::open(d.path().join("config.json")).unwrap();
+    s.put(
+        "templates",
+        "cpu",
+        serde_json::json!({"transcoder":{"encoder":"libx264","vb":1200}}),
+    )
+    .unwrap();
+    s.put("streams","copy",serde_json::json!({"template":"cpu","transcoder":{"encoder":"copy"},"inputs":[{"url":"testsrc://"}]})).expect("copy must be accepted as an explicit override");
+    assert_eq!(
+        s.effective("copy").unwrap()["transcoder"]["encoder"],
+        "copy"
+    );
+}
