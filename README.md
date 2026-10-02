@@ -21,7 +21,7 @@ Required later work includes complete API/schema parity; Flussonic cluster disco
 
 ## Preview package
 
-The GitHub prerelease includes an x86_64 Linux static binary, the compiled admin UI and an owned synthetic example configuration. FFmpeg/FFprobe remain host dependencies. After extracting it, set the three `FLUSSONIX_*` environment variables below, then run `./bin/flussonix --config runtime/config.json --media-dir runtime/media --web-dir web/dist`. The default listener is 127.0.0.1:18210.
+The GitHub prerelease includes an x86_64 Linux static binary, the compiled admin UI and an owned synthetic example configuration. FFmpeg/FFprobe remain host dependencies. After extracting it, set the three `FLUSSONIX_*` environment variables below, then run `./bin/flussonix --config runtime/config.json --media-dir runtime/media --web-dir web`. The default listener is 127.0.0.1:18210.
 
 ## Build and run
 
