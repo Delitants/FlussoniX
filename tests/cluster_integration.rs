@@ -230,6 +230,27 @@ async fn independent_m4f_and_m4s_http_outputs_can_be_ingested_and_decoded() {
             .unwrap();
         assert!(decode.status.success(), "{protocol} input must decode");
         assert!(worker.wire.has_info());
+        if protocol == "m4f" {
+            let (signals, _) = worker.wire.signal_subscribe();
+            let line = String::from_utf8_lossy(signals.last().unwrap());
+            let stamp = line
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .split('-')
+                .next()
+                .unwrap();
+            let origin = source
+                .media
+                .ensure("owned", &source.config.effective("owned").unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                worker.wire.segment(&format!("{stamp}.m4f")),
+                origin.wire.segment(&format!("{stamp}.m4f")),
+                "source segment bytes and UTC path must survive the edge relay"
+            );
+        }
         cdn.media.stop(protocol).await;
     }
     if let Ok(path) = std::env::var("FLUSSONIX_EXPORT_OWNED_M4F") {
@@ -320,4 +341,115 @@ async fn named_source_auth_policy_is_portable_and_cannot_use_a_different_edge_ba
     for task in [source_task, cdn_task, auth_task] {
         task.abort();
     }
+}
+
+#[tokio::test]
+async fn packed_gop_http_ingest_preserves_record_extensions_and_decodes_hls() {
+    use bytes::Bytes;
+    use flussonix::{
+        m4_ingest::Signals,
+        m4s::{Decoder, Event, PackedGop, atom, boxes},
+        media::Engine,
+    };
+    let d = tempfile::tempdir().unwrap();
+    let engine = Engine::new(d.path().join("media"), "ffmpeg");
+    let source = engine
+        .ensure("source", &json!({"inputs":[{"url":"testsrc://"}]}))
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("m4s://{}/packed", listener.local_addr().unwrap());
+    let origin = source.clone();
+    let router = axum::Router::new().route(
+        "/packed/m4s",
+        axum::routing::get(move || {
+            let origin = origin.clone();
+            async move {
+                let (initial, rx) = origin.wire.signal_subscribe();
+                let stream = futures_util::stream::unfold(
+                    (std::collections::VecDeque::from(initial), rx, origin),
+                    |(mut boot, mut rx, origin)| async move {
+                        let line = if let Some(line) = boot.pop_front() {
+                            line
+                        } else {
+                            rx.recv().await.ok()?
+                        };
+                        let n = Signals::default().push(&line).ok()?.remove(0);
+                        let body = origin.wire.segment(&n.name)?;
+                        let (_, frames) = flussonix::m4f::unpack(&body).ok()?;
+                        let gop = PackedGop {
+                            utc: n.utc,
+                            dts_ms: frames.iter().map(|f| f.dts).min()? as f64 / 90.0,
+                            sequence: n.sequence,
+                            duration_ms: n.duration_ms,
+                            body,
+                        };
+                        let wire = flussonix::m4s::encode_gop(&gop).ok()?;
+                        // Authored optional extension pins actual raw relay, beyond a same-format roundtrip.
+                        let fields = boxes(&wire[4..]).ok()?;
+                        let packet = atom(
+                            b"Fgop",
+                            &[fields[0].1.to_vec(), atom(b"ownr", b"independent fixture")].concat(),
+                        );
+                        let wire = Bytes::from(
+                            [(packet.len() as u32).to_be_bytes().to_vec(), packet].concat(),
+                        );
+                        Some((Ok::<Bytes, std::io::Error>(wire), (boot, rx, origin)))
+                    },
+                );
+                axum::body::Body::from_stream(stream)
+            }
+        }),
+    );
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let edge = engine
+        .ensure("edge", &json!({"inputs":[{"url":url}]}))
+        .await
+        .unwrap();
+    for _ in 0..180 {
+        if engine.read("edge", "index.m3u8").await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let manifest = engine
+        .read("edge", "index.m3u8")
+        .await
+        .expect("packed input must yield HLS");
+    let manifest = String::from_utf8_lossy(&manifest);
+    let file = manifest
+        .lines()
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .unwrap();
+    let path = d.path().join("gop.ts");
+    tokio::fs::write(&path, engine.read("edge", file).await.unwrap())
+        .await
+        .unwrap();
+    let result = tokio::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-t", "1", "-f", "null", "-"])
+        .output()
+        .await
+        .unwrap();
+    assert!(result.status.success());
+    let (boot, _) = edge.wire.m4s_subscribe();
+    let mut decoder = Decoder::default();
+    let mut found = false;
+    for wire in boot {
+        for e in decoder.push(&wire).unwrap() {
+            if let Event::Gop { gop, wire, .. } = e {
+                assert!(wire.windows(19).any(|b| b == b"independent fixture"));
+                let date = chrono::DateTime::from_timestamp(gop.utc as i64, 0).unwrap();
+                let name = date.format("%Y/%m/%d/%H/%M/%S.m4f").to_string();
+                assert_eq!(source.wire.segment(&name), Some(gop.body));
+                found = true;
+            }
+        }
+    }
+    assert!(found);
+    let pid = edge.pid();
+    engine.stop_all().await;
+    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    task.abort();
 }

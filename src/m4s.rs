@@ -2,7 +2,7 @@
 //! Supports observed AVC/AAC MDin, FRam and packed Fgop records.
 use crate::m4f::Frame;
 use bytes::{Buf, Bytes, BytesMut};
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
     pub id: u32,
     pub codec: String,
@@ -182,6 +182,9 @@ pub type BoxView<'a> = (&'a [u8], &'a [u8]);
 pub fn boxes(mut data: &[u8]) -> Result<Vec<BoxView<'_>>, String> {
     let mut out = Vec::new();
     while !data.is_empty() {
+        if out.len() >= 1024 {
+            return Err("too many container boxes".into());
+        }
         if data.len() < 8 {
             return Err("truncated box header".into());
         }
@@ -259,4 +262,24 @@ fn exact<const N: usize>(bytes: &[u8]) -> Result<[u8; N], String> {
     bytes
         .try_into()
         .map_err(|_| "invalid M4S field width".into())
+}
+
+pub fn encode_gop(gop: &PackedGop) -> Result<Bytes, String> {
+    let header = [
+        atom(b" utc", &gop.utc.to_be_bytes()),
+        atom(b" dts", &gop.dts_ms.to_be_bytes()),
+        atom(b" num", &gop.sequence.to_be_bytes()),
+        atom(b" dur", &gop.duration_ms.to_be_bytes()),
+    ]
+    .concat();
+    let packet = atom(
+        b"Fgop",
+        &[atom(b"goph", &header), atom(b"body", &gop.body)].concat(),
+    );
+    if packet.len() > 16 * 1024 * 1024 {
+        return Err("GOP exceeds M4S record limit".into());
+    }
+    Ok(Bytes::from(
+        [(packet.len() as u32).to_be_bytes().to_vec(), packet].concat(),
+    ))
 }

@@ -1,0 +1,284 @@
+//! Independent M4 HTTP ingest. Native peer credentials never follow redirects.
+use crate::{
+    m4s::{Decoder, Event, PackedGop, Track, flv_config, flv_frame, flv_header},
+    wire::{Hub, Segment},
+};
+use bytes::{Bytes, BytesMut};
+use futures_util::StreamExt;
+use std::{collections::VecDeque, time::Duration};
+use tokio::io::AsyncWriteExt;
+
+pub struct Notification {
+    pub name: String,
+    pub stamp: String,
+    pub utc: u32,
+    pub sequence: u32,
+    pub duration_ms: f64,
+    pub wire: Bytes,
+}
+#[derive(Default)]
+pub struct Signals {
+    pending: BytesMut,
+}
+impl Signals {
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<Notification>, String> {
+        let mut out = Vec::new();
+        for part in bytes.split_inclusive(|b| *b == b'\n') {
+            if self.pending.len() + part.len() > 8192 {
+                return Err("M4F signal exceeds limit".into());
+            }
+            self.pending.extend_from_slice(part);
+            if part.last() == Some(&b'\n') {
+                let wire = self.pending.split().freeze();
+                let line = std::str::from_utf8(&wire).map_err(|_| "invalid M4F signal")?;
+                let mut fields = line.split_whitespace();
+                let sequence = fields
+                    .next()
+                    .ok_or("missing M4F sequence")?
+                    .parse::<u32>()
+                    .map_err(|_| "invalid M4F sequence")?;
+                let path = fields.next().ok_or("missing M4F segment path")?;
+                if fields.next().is_some() {
+                    return Err("unsupported M4F signal fields".into());
+                }
+                let (stamp, duration) = path.split_once('-').ok_or("missing M4F duration")?;
+                let date = chrono::NaiveDateTime::parse_from_str(stamp, "%Y/%m/%d/%H/%M/%S")
+                    .map_err(|_| "invalid M4F segment path")?;
+                // Reject noncanonical paths before constructing any fetch URL.
+                if date.format("%Y/%m/%d/%H/%M/%S").to_string() != stamp {
+                    return Err("noncanonical M4F segment path".into());
+                }
+                let utc =
+                    u32::try_from(date.and_utc().timestamp()).map_err(|_| "invalid M4F UTC")?;
+                let duration_ms = duration
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|d| *d > 0 && *d <= 3600000)
+                    .ok_or("invalid M4F duration")? as f64;
+                out.push(Notification {
+                    name: format!("{stamp}.m4f"),
+                    stamp: stamp.into(),
+                    utc,
+                    sequence,
+                    duration_ms,
+                    wire,
+                });
+            }
+        }
+        Ok(out)
+    }
+}
+async fn configs(
+    stdin: &mut tokio::process::ChildStdin,
+    tracks: &mut Vec<Track>,
+    new: Vec<Track>,
+) -> Result<(), String> {
+    if *tracks != new {
+        for t in &new {
+            stdin
+                .write_all(&flv_config(t)?)
+                .await
+                .map_err(|_| "media pipe closed")?;
+        }
+        *tracks = new;
+    }
+    Ok(())
+}
+async fn write_frame(
+    stdin: &mut tokio::process::ChildStdin,
+    tracks: &[Track],
+    origin: &mut Option<u64>,
+    frame: &crate::m4f::Frame,
+) -> Result<(), String> {
+    let t = tracks
+        .iter()
+        .find(|t| t.id == frame.track_id)
+        .ok_or("unknown track")?;
+    let origin = *origin.get_or_insert(frame.dts);
+    stdin
+        .write_all(&flv_frame(
+            t,
+            frame.dts,
+            frame.pts_offset,
+            frame.key,
+            &frame.body,
+            origin,
+        )?)
+        .await
+        .map_err(|_| "media pipe closed".into())
+}
+pub async fn pull(
+    input: &str,
+    key: Option<&str>,
+    stdin: &mut tokio::process::ChildStdin,
+    hub: Option<&Hub>,
+) -> Result<(), String> {
+    let is_m4f = input.starts_with("m4f");
+    let suffix = if is_m4f { "/m4f" } else { "/m4s" };
+    let scheme = if input.starts_with("m4ss://") || input.starts_with("m4fs://") {
+        "https"
+    } else {
+        "http"
+    };
+    let mut base = url::Url::parse(&format!(
+        "{scheme}://{}",
+        input.split_once("://").ok_or("invalid URL")?.1
+    ))
+    .map_err(|_| "invalid media URL")?;
+    let path = base
+        .path()
+        .trim_end_matches('/')
+        .strip_suffix(suffix)
+        .unwrap_or(base.path().trim_end_matches('/'))
+        .to_owned();
+    base.set_path(&path);
+    let mut control = base.clone();
+    control.set_path(&format!("{}{suffix}", base.path()));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(5))
+        .redirect(if key.is_some() {
+            reqwest::redirect::Policy::none()
+        } else {
+            reqwest::redirect::Policy::limited(3)
+        })
+        .build()
+        .map_err(|_| "cannot build input client")?;
+    let mut request = client
+        .get(control)
+        .header("X-Supported", "prepush,drop_status");
+    if let Some(key) = key {
+        request = request.header("X-Flussonix-Peer", key)
+    }
+    let response = tokio::time::timeout(Duration::from_secs(10), request.send())
+        .await
+        .map_err(|_| "media setup timed out")?
+        .map_err(|_| "media connection failed")?;
+    if !response.status().is_success() {
+        return Err("source rejected input".into());
+    }
+    let mut stream = response.bytes_stream();
+    let mut decoder = Decoder::default();
+    let mut signals = Signals::default();
+    let mut tracks = Vec::new();
+    let mut origin = None;
+    let mut seen: VecDeque<String> = VecDeque::new();
+    stdin
+        .write_all(&flv_header())
+        .await
+        .map_err(|_| "media pipe closed")?;
+    loop {
+        let bytes = tokio::time::timeout(Duration::from_secs(15), stream.next())
+            .await
+            .map_err(|_| "source timed out")?
+            .ok_or("source closed")?
+            .map_err(|_| "transport failed")?;
+        if is_m4f {
+            for n in signals.push(&bytes)? {
+                if seen.contains(&n.name) {
+                    continue;
+                }
+                let mut url = base.clone();
+                url.set_path(&format!("{}/{}", base.path(), n.name));
+                let mut request = client.get(url).timeout(Duration::from_secs(10));
+                if let Some(key) = key {
+                    request = request.header("X-Flussonix-Peer", key)
+                }
+                let response = request.send().await.map_err(|_| "M4F fetch failed")?;
+                if !response.status().is_success() {
+                    return Err("M4F segment denied".into());
+                }
+                let mut body = BytesMut::new();
+                let mut chunks = response.bytes_stream();
+                while let Some(chunk) = chunks.next().await {
+                    let chunk = chunk.map_err(|_| "M4F fetch failed")?;
+                    if body.len() + chunk.len() > 16 * 1024 * 1024 {
+                        return Err("M4F segment too large".into());
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                let body = body.freeze();
+                let (new, frames) = crate::m4f::unpack(&body)?;
+                if frames.is_empty() {
+                    return Err("empty M4F segment".into());
+                }
+                if let Some(hub) = hub {
+                    let gop = PackedGop {
+                        utc: n.utc,
+                        dts_ms: frames.iter().map(|f| f.dts).min().unwrap() as f64 / 90.0,
+                        sequence: n.sequence,
+                        duration_ms: n.duration_ms,
+                        body: body.clone(),
+                    };
+                    hub.relay_segment(
+                        Segment {
+                            name: n.name.clone(),
+                            signal: n.wire,
+                            bytes: body,
+                        },
+                        new.clone(),
+                        gop,
+                    )?;
+                }
+                configs(stdin, &mut tracks, new).await?;
+                for f in &frames {
+                    write_frame(stdin, &tracks, &mut origin, f).await?;
+                }
+                seen.push_back(n.name);
+                if seen.len() > 16 {
+                    seen.pop_front();
+                }
+            }
+        } else {
+            for event in decoder.push(&bytes)? {
+                match event {
+                    Event::Info { tracks: new, wire } => {
+                        if let Some(h) = hub {
+                            h.relay_info(new.clone(), wire)
+                        }
+                        configs(stdin, &mut tracks, new).await?;
+                    }
+                    Event::Frame {
+                        track_id,
+                        dts,
+                        pts_offset,
+                        key,
+                        body,
+                        wire,
+                    } => {
+                        let f = crate::m4f::Frame {
+                            track_id,
+                            dts,
+                            pts_offset,
+                            key,
+                            body,
+                        };
+                        if let Some(h) = hub {
+                            h.relay_frame(f.clone(), wire)?;
+                        }
+                        write_frame(stdin, &tracks, &mut origin, &f).await?;
+                    }
+                    Event::Gop {
+                        gop,
+                        tracks: new,
+                        frames,
+                        wire,
+                    } => {
+                        if let Some(h) = hub {
+                            h.relay_gop(gop, new.clone(), wire)?;
+                        }
+                        configs(stdin, &mut tracks, new).await?;
+                        for f in &frames {
+                            write_frame(stdin, &tracks, &mut origin, f).await?;
+                        }
+                    }
+                    Event::Other { wire } => {
+                        if let Some(h) = hub {
+                            h.m4s.send(wire)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

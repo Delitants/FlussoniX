@@ -210,3 +210,8 @@ fn malformed_gop_numbers_and_duplicate_required_fields_fail_closed() {
             .is_err()
     );
 }
+
+#[test]
+fn excessive_empty_boxes_are_rejected_before_container_allocation_amplifies() {
+    assert!(flussonix::m4s::boxes(&atom(b"junk", &[]).repeat(1025)).is_err());
+}

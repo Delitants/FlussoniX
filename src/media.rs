@@ -1,7 +1,5 @@
-use crate::m4s::{Decoder, Event, flv_config, flv_frame, flv_header};
 use crate::wire::{FlvDecoder, Hub};
 use bytes::Bytes;
-use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -14,7 +12,7 @@ use std::{
     time::Instant,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncReadExt,
     process::Command,
     sync::{Mutex, broadcast, oneshot},
 };
@@ -50,7 +48,7 @@ impl Worker {
     pub fn pid(&self) -> u32 {
         self.pid
     }
-    pub fn m4s_subscribe(&self) -> Option<(Vec<Bytes>, broadcast::Receiver<Bytes>)> {
+    pub fn m4s_subscribe(&self) -> Option<(Vec<Bytes>, crate::media_queue::Receiver)> {
         Some(self.wire.m4s_subscribe())
     }
     pub async fn closed(&self) {
@@ -226,6 +224,8 @@ impl Engine {
             wire: Hub::new(),
             last_access: std::sync::Mutex::new(Instant::now()),
         });
+        let original_wire = (m4s_input || m4f_input)
+            && (cfg.get("transcoder").is_none() || cfg["transcoder"]["encoder"] == "copy");
         if let Some(mut flv) = child.stderr.take() {
             let w = worker.clone();
             let c = cancel.clone();
@@ -237,9 +237,11 @@ impl Engine {
                     match read {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            if let Err(reason) = decoder.push(&buffer[..n], &w.wire) {
-                                tracing::warn!(error = %reason, "wire output stopped");
-                                break;
+                            if !original_wire {
+                                if let Err(reason) = decoder.push(&buffer[..n], &w.wire) {
+                                    tracing::warn!(error = %reason, "wire output stopped");
+                                    break;
+                                }
                             }
                         }
                     }
@@ -250,9 +252,10 @@ impl Engine {
             let url = input.to_owned();
             let key = cfg["flussonix_peer_key"].as_str().map(str::to_owned);
             let cancel = cancel.clone();
+            let w = worker.clone();
             tokio::spawn(async move {
                 if let Some(mut stdin) = stdin.take() {
-                    let result = tokio::select! {_=cancel.cancelled()=>Ok(()),result=wire_ingest(&url,key.as_deref(),&mut stdin)=>result};
+                    let result = tokio::select! {_=cancel.cancelled()=>Ok(()),result=crate::m4_ingest::pull(&url,key.as_deref(),&mut stdin,if original_wire {Some(&w.wire)}else{None})=>result};
                     if let Err(reason) = result {
                         tracing::warn!(error = %reason, "wire input stopped");
                     }
@@ -394,183 +397,6 @@ pub fn translate_input(input: &str) -> Result<String, String> {
         _ => return Err(format!("unsupported input protocol: {scheme}")),
     };
     Ok(format!("{scheme}://{rest}"))
-}
-
-async fn wire_ingest(
-    input: &str,
-    key: Option<&str>,
-    stdin: &mut tokio::process::ChildStdin,
-) -> Result<(), String> {
-    let scheme = if input.starts_with("m4ss://") || input.starts_with("m4fs://") {
-        "https"
-    } else {
-        "http"
-    };
-    let full = format!(
-        "{}://{}",
-        scheme,
-        input.split_once("://").ok_or("invalid URL")?.1
-    );
-    let mut base = url::Url::parse(&full).map_err(|_| "invalid media URL")?;
-    let is_m4f = input.starts_with("m4f");
-    let suffix = if is_m4f { "/m4f" } else { "/m4s" };
-    base.set_path(
-        base.path()
-            .trim_end_matches(suffix)
-            .trim_end_matches('/')
-            .to_owned()
-            .as_str(),
-    );
-    let mut control = base.clone();
-    control.set_path(&format!("{}{suffix}", base.path()));
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|_| "cannot build input client")?;
-    let mut request = client
-        .get(control)
-        .header("X-Supported", "prepush,drop_status");
-    if let Some(k) = key {
-        request = request.header("X-Flussonix-Peer", k)
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|_| "media connection failed")?;
-    if !response.status().is_success() {
-        return Err("source rejected input".into());
-    }
-    let mut stream = response.bytes_stream();
-    let mut decoder = Decoder::default();
-    let mut tracks = Vec::new();
-    let mut origin = None;
-    let mut signal = Vec::new();
-    stdin
-        .write_all(&flv_header())
-        .await
-        .map_err(|_| "media pipe closed")?;
-    loop {
-        let bytes = tokio::time::timeout(std::time::Duration::from_secs(15), stream.next())
-            .await
-            .map_err(|_| "source timed out")?
-            .ok_or("source closed")?
-            .map_err(|_| "transport failed")?;
-        let events = if is_m4f {
-            signal.extend_from_slice(&bytes);
-            if signal.len() > 8192 {
-                return Err("M4F signal exceeds limit".into());
-            }
-            let mut events = Vec::new();
-            while let Some(end) = signal.iter().position(|b| *b == b'\n') {
-                let line = String::from_utf8(signal.drain(..=end).collect())
-                    .map_err(|_| "invalid M4F signal")?;
-                let stamp = line
-                    .split_whitespace()
-                    .nth(1)
-                    .ok_or("missing M4F timestamp")?
-                    .split('-')
-                    .next()
-                    .ok_or("missing M4F timestamp")?;
-                if chrono::NaiveDateTime::parse_from_str(stamp, "%Y/%m/%d/%H/%M/%S").is_err() {
-                    return Err("invalid M4F segment path".into());
-                }
-                let mut url = base.clone();
-                url.set_path(&format!("{}/{}.m4f", base.path(), stamp));
-                let mut request = client.get(url).timeout(std::time::Duration::from_secs(10));
-                if let Some(k) = key {
-                    request = request.header("X-Flussonix-Peer", k)
-                }
-                let r = request.send().await.map_err(|_| "M4F fetch failed")?;
-                if !r.status().is_success() {
-                    return Err("M4F segment denied".into());
-                }
-                let mut b = Vec::new();
-                let mut chunks = r.bytes_stream();
-                while let Some(chunk) = chunks.next().await {
-                    let chunk = chunk.map_err(|_| "M4F fetch failed")?;
-                    if b.len() + chunk.len() > 32 * 1024 * 1024 {
-                        return Err("M4F segment too large".into());
-                    }
-                    b.extend_from_slice(&chunk)
-                }
-                let (info, frames) = crate::m4f::unpack(&b)?;
-                events.push(Event::Info {
-                    tracks: info,
-                    wire: Bytes::new(),
-                });
-                for f in frames {
-                    events.push(Event::Frame {
-                        track_id: f.track_id,
-                        dts: f.dts,
-                        pts_offset: f.pts_offset,
-                        key: f.key,
-                        body: f.body,
-                        wire: Bytes::new(),
-                    });
-                }
-            }
-            events
-        } else {
-            decoder.push(&bytes)?
-        };
-        for event in events {
-            match event {
-                Event::Info { tracks: new, .. } => {
-                    for track in &new {
-                        stdin
-                            .write_all(&flv_config(track)?)
-                            .await
-                            .map_err(|_| "media pipe closed")?;
-                    }
-                    tracks = new;
-                }
-                Event::Frame {
-                    track_id,
-                    dts,
-                    pts_offset,
-                    key,
-                    body,
-                    ..
-                } => {
-                    let track = tracks
-                        .iter()
-                        .find(|t| t.id == track_id)
-                        .ok_or("unknown track")?;
-                    let o = *origin.get_or_insert(dts);
-                    stdin
-                        .write_all(&flv_frame(track, dts, pts_offset, key, &body, o)?)
-                        .await
-                        .map_err(|_| "media pipe closed")?;
-                }
-                Event::Gop {
-                    tracks: new,
-                    frames,
-                    ..
-                } => {
-                    for track in &new {
-                        stdin
-                            .write_all(&flv_config(track)?)
-                            .await
-                            .map_err(|_| "media pipe closed")?;
-                    }
-                    tracks = new;
-                    for f in frames {
-                        let track = tracks
-                            .iter()
-                            .find(|t| t.id == f.track_id)
-                            .ok_or("unknown track")?;
-                        let o = *origin.get_or_insert(f.dts);
-                        stdin
-                            .write_all(&flv_frame(track, f.dts, f.pts_offset, f.key, &f.body, o)?)
-                            .await
-                            .map_err(|_| "media pipe closed")?;
-                    }
-                }
-                Event::Other { .. } => {}
-            }
-        }
-    }
 }
 
 pub fn media_signature(cfg: &Value) -> String {

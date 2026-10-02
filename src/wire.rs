@@ -1,11 +1,12 @@
 //! Shared bounded M4S frame fan-out and M4F live segment window.
 use crate::{
     m4f::{Frame, pack},
-    m4s::{Track, atom},
+    m4s::{PackedGop, Track, atom, encode_gop},
+    media_queue::{Channel, Receiver},
 };
 use bytes::{Buf, Bytes, BytesMut};
 use std::{collections::VecDeque, sync::Mutex};
-use tokio::sync::broadcast;
+
 #[derive(Clone)]
 pub struct Segment {
     pub name: String,
@@ -20,10 +21,15 @@ struct State {
     segments: VecDeque<Segment>,
     sequence: u64,
     utc: i64,
+    origin: Option<u64>,
+    bootstrap_bytes: usize,
+    frame_bytes: usize,
+    bootstrap_ready: bool,
+    segment_ready: bool,
 }
 pub struct Hub {
-    pub m4s: broadcast::Sender<Bytes>,
-    pub signals: broadcast::Sender<Bytes>,
+    pub m4s: Channel,
+    pub signals: Channel,
     state: Mutex<State>,
 }
 impl Default for Hub {
@@ -34,8 +40,8 @@ impl Default for Hub {
 impl Hub {
     pub fn new() -> Self {
         Self {
-            m4s: broadcast::channel(256).0,
-            signals: broadcast::channel(16).0,
+            m4s: Channel::new(256, 16 * 1024 * 1024),
+            signals: Channel::new(16, 8192),
             state: Mutex::new(State {
                 tracks: vec![],
                 info: None,
@@ -44,83 +50,196 @@ impl Hub {
                 segments: VecDeque::new(),
                 sequence: 0,
                 utc: chrono::Utc::now().timestamp_millis(),
+                origin: None,
+                bootstrap_bytes: 0,
+                frame_bytes: 0,
+                bootstrap_ready: false,
+                segment_ready: false,
             }),
         }
     }
     pub fn info(&self, tracks: Vec<Track>) {
         let wire = Bytes::from(encode_info(&tracks));
+        self.relay_info(tracks, wire)
+    }
+    pub fn relay_info(&self, tracks: Vec<Track>, wire: Bytes) {
         let mut s = self.state.lock().unwrap();
+        if s.tracks != tracks {
+            s.frames.clear();
+            s.frame_bytes = 0;
+            s.bootstrap_ready = false;
+            s.segment_ready = false;
+        }
         s.tracks = tracks;
         s.info = Some(wire.clone());
+        s.bootstrap_bytes = wire.len();
         s.bootstrap = vec![wire.clone()];
         let _ = self.m4s.send(wire);
     }
     pub fn frame(&self, frame: Frame) -> Result<(), String> {
-        let mut s = self.state.lock().unwrap();
-        let track = s
-            .tracks
+        let tracks = self.state.lock().unwrap().tracks.clone();
+        let track = tracks
             .iter()
             .find(|t| t.id == frame.track_id)
             .ok_or("unknown wire track")?;
-        let video = track.codec == "h264";
         let wire = Bytes::from(encode_frame(track, &frame));
+        self.relay_frame(frame, wire)
+    }
+    pub fn relay_frame(&self, frame: Frame, wire: Bytes) -> Result<(), String> {
+        let mut s = self.state.lock().unwrap();
+        let video = s
+            .tracks
+            .iter()
+            .find(|t| t.id == frame.track_id)
+            .ok_or("unknown wire track")?
+            .codec
+            == "h264";
+        let origin = *s.origin.get_or_insert(frame.dts);
         if video && frame.key {
-            s.bootstrap.clear();
-            if let Some(i) = s.info.clone() {
-                s.bootstrap.push(i)
-            }
-            if !s.frames.is_empty() && frame.dts.saturating_sub(s.frames[0].dts) >= 90000 {
-                let duration = frame.dts - s.frames[0].dts;
+            s.bootstrap = s.info.clone().into_iter().collect();
+            s.bootstrap_bytes = s.bootstrap.iter().map(Bytes::len).sum();
+            s.bootstrap_ready = true;
+            if s.segment_ready
+                && !s.frames.is_empty()
+                && frame.dts.saturating_sub(s.frames[0].dts) >= 90000
+            {
+                let start = s.frames.iter().map(|f| f.dts).min().unwrap();
+                let duration = frame
+                    .dts
+                    .checked_sub(start)
+                    .ok_or("invalid segment timeline")?;
                 let bytes = Bytes::from(pack(&s.tracks, &s.frames, duration)?);
-                let ms = s.utc + s.frames[0].dts as i64 / 90;
+                let offset = start.saturating_sub(origin) / 90;
+                let ms = s
+                    .utc
+                    .checked_add(i64::try_from(offset).map_err(|_| "invalid segment timeline")?)
+                    .ok_or("invalid segment timeline")?;
                 let date =
                     chrono::DateTime::from_timestamp_millis(ms).ok_or("invalid UTC timestamp")?;
                 let stamp = date.format("%Y/%m/%d/%H/%M/%S").to_string();
                 s.sequence += 1;
                 let signal =
                     Bytes::from(format!("{} {}-{:05}\n", s.sequence, stamp, duration / 90));
-                let segment = Segment {
-                    name: format!("{stamp}.m4f"),
-                    signal: signal.clone(),
-                    bytes,
-                };
-                s.segments.push_back(segment);
+                Self::cache(
+                    &mut s,
+                    Segment {
+                        name: format!("{stamp}.m4f"),
+                        signal: signal.clone(),
+                        bytes,
+                    },
+                );
                 s.frames.clear();
-                while s.segments.len() > 8
-                    || s.segments.iter().map(|v| v.bytes.len()).sum::<usize>() > 64 * 1024 * 1024
-                {
-                    s.segments.pop_front();
-                }
-                let _ = self.signals.send(signal);
+                s.frame_bytes = 0;
+                self.signals.send(signal)?;
             }
+            s.segment_ready = true;
         }
-        if s.bootstrap.iter().map(Bytes::len).sum::<usize>() + wire.len() <= 8 * 1024 * 1024 {
-            s.bootstrap.push(wire.clone())
-        } else {
-            s.bootstrap.clear();
-            if let Some(i) = s.info.clone() {
-                s.bootstrap.push(i)
-            }
+        if !s.tracks.iter().any(|t| t.codec == "h264") {
+            s.bootstrap_ready = true;
+            s.segment_ready = true;
         }
-        let _ = self.m4s.send(wire);
-        if s.frames.len() < 100000
-            && s.frames.iter().map(|v| v.body.len()).sum::<usize>() + frame.body.len()
-                <= 32 * 1024 * 1024
-        {
+        if s.bootstrap_ready && s.bootstrap_bytes + wire.len() <= 32 * 1024 * 1024 {
+            s.bootstrap_bytes += wire.len();
+            s.bootstrap.push(wire.clone());
+        } else if s.bootstrap_ready {
+            s.bootstrap = s.info.clone().into_iter().collect();
+            s.bootstrap_bytes = s.bootstrap.iter().map(Bytes::len).sum();
+            s.bootstrap_ready = false;
+        }
+        self.m4s.send(wire)?;
+        if s.frames.len() < 100000 && s.frame_bytes + frame.body.len() <= 32 * 1024 * 1024 {
+            s.frame_bytes += frame.body.len();
             s.frames.push(frame)
         } else {
             s.frames.clear();
+            s.frame_bytes = 0;
+            s.segment_ready = false;
         }
+        Ok(())
+    }
+    fn cache(s: &mut State, segment: Segment) {
+        s.segments.push_back(segment);
+        while s.segments.len() > 8
+            || s.segments.iter().map(|v| v.bytes.len()).sum::<usize>() > 64 * 1024 * 1024
+        {
+            s.segments.pop_front();
+        }
+    }
+    pub fn relay_gop(&self, gop: PackedGop, tracks: Vec<Track>, wire: Bytes) -> Result<(), String> {
+        let date = chrono::DateTime::from_timestamp(gop.utc as i64, 0).ok_or("invalid GOP UTC")?;
+        let stamp = date.format("%Y/%m/%d/%H/%M/%S").to_string();
+        let signal = Bytes::from(format!(
+            "{} {}-{:05}\n",
+            gop.sequence,
+            stamp,
+            gop.duration_ms.round() as u64
+        ));
+        self.segment_with_wire(
+            Segment {
+                name: format!("{stamp}.m4f"),
+                signal,
+                bytes: gop.body.clone(),
+            },
+            tracks,
+            wire,
+        )
+    }
+    pub fn relay_segment(
+        &self,
+        segment: Segment,
+        tracks: Vec<Track>,
+        gop: PackedGop,
+    ) -> Result<(), String> {
+        if segment.bytes != gop.body {
+            return Err("segment/body identity mismatch".into());
+        }
+        let wire = encode_gop(&gop)?;
+        self.segment_with_wire(segment, tracks, wire)
+    }
+    fn segment_with_wire(
+        &self,
+        segment: Segment,
+        tracks: Vec<Track>,
+        wire: Bytes,
+    ) -> Result<(), String> {
+        if segment.bytes.len() > 16 * 1024 * 1024
+            || wire.len() > 16 * 1024 * 1024
+            || segment.signal.len() > 8192
+        {
+            return Err("relay segment exceeds limit".into());
+        }
+        let mut s = self.state.lock().unwrap();
+        if let Some(old) = s.segments.iter().find(|v| v.name == segment.name) {
+            return if old.bytes == segment.bytes {
+                Ok(())
+            } else {
+                Err("segment path reused with different payload".into())
+            };
+        }
+        if s.tracks != tracks {
+            s.tracks = tracks;
+            s.info = Some(Bytes::from(encode_info(&s.tracks)));
+            s.frames.clear();
+            s.frame_bytes = 0;
+        }
+        s.bootstrap = s.info.clone().into_iter().collect();
+        s.bootstrap.push(wire.clone());
+        s.bootstrap_bytes = s.bootstrap.iter().map(Bytes::len).sum();
+        s.bootstrap_ready = false;
+        let signal = segment.signal.clone();
+        Self::cache(&mut s, segment);
+        self.m4s.send(wire)?;
+        self.signals.send(signal)?;
         Ok(())
     }
     pub fn has_info(&self) -> bool {
         self.state.lock().unwrap().info.is_some()
     }
-    pub fn m4s_subscribe(&self) -> (Vec<Bytes>, broadcast::Receiver<Bytes>) {
+    pub fn m4s_subscribe(&self) -> (Vec<Bytes>, Receiver) {
         let s = self.state.lock().unwrap();
         (s.bootstrap.clone(), self.m4s.subscribe())
     }
-    pub fn signal_subscribe(&self) -> (Vec<Bytes>, broadcast::Receiver<Bytes>) {
+    pub fn signal_subscribe(&self) -> (Vec<Bytes>, Receiver) {
         let s = self.state.lock().unwrap();
         (
             s.segments

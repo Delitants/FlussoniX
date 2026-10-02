@@ -8,3 +8,6 @@ pub mod playback_auth;
 pub mod server;
 pub mod telemetry;
 pub mod wire;
+
+pub mod m4_ingest;
+pub mod media_queue;
