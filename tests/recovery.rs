@@ -113,3 +113,59 @@ async fn output_stalling_after_progress_has_a_distinct_sanitized_reason() {
     assert_eq!(stats["last_error"], "input_stalled");
     assert!(stats["bytes_in"].as_u64().unwrap() > 0);
 }
+
+#[tokio::test]
+async fn on_demand_reconcile_recovers_without_a_new_playback_request_or_demand_touch() {
+    use flussonix::server::{App, Options};
+    let d = tempfile::tempdir().unwrap();
+    let app = App::new(
+        d.path().join("config.json"),
+        d.path().join("media"),
+        Options {
+            admin_password: "owned-admin-secret".into(),
+            peer_key: "owned-peer-secret".into(),
+            uplink_interface: "process".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    app.config
+        .put(
+            "streams",
+            "owned",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    let cfg = app.config.effective("owned").unwrap();
+    let first = app.media.ensure("owned", &cfg).await.unwrap();
+    let mut rx = first.subscribe();
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-KILL", &first.pid().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    ended(&first).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let age = first.idle_seconds();
+    app.reconcile().await;
+    let stats = app.media.stats("owned").await;
+    assert_ne!(
+        stats["pid"],
+        first.pid(),
+        "background reconciliation did not replace the failed attempt"
+    );
+    let second = app.media.recover("owned", &cfg).await.unwrap();
+    let preserved = second.idle_seconds();
+    app.media.stop_all().await;
+    assert!(
+        age >= 2 && preserved >= age,
+        "background retry extended actual viewer demand"
+    );
+}

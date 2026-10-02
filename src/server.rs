@@ -136,42 +136,43 @@ impl App {
         app.sample_metrics();
         Ok(app)
     }
+    async fn media_config(&self, name: &str) -> Option<(Value, u64)> {
+        let mirrors = self.mirrors.lock().await;
+        self.config.read(|root| {
+            let config = crate::config::effective(root, name).or_else(|| {
+                mirrors
+                    .get(name)
+                    .filter(|m| {
+                        root["sources"]
+                            .as_array()
+                            .is_some_and(|sources| sources.contains(&m.source))
+                    })
+                    .map(|m| m.config.clone())
+            })?;
+            Some((config, self.config.revision()))
+        })
+    }
+    async fn recover_current(&self, name: &str, config: &Value, revision: u64) {
+        let signature = crate::media::media_signature(config);
+        if self.config.revision() != revision
+            && !self.media_config(name).await.is_some_and(|(c, _)| {
+                c["disabled"] != true && crate::media::media_signature(&c) == signature
+            })
+        {
+            return;
+        }
+        if let Ok(worker) = self.media.recover(name, config).await {
+            // A save can race filesystem/child startup. Stop only the exact
+            // stale attempt; a later request may already have replaced it.
+            if !self.media_config(name).await.is_some_and(|(c, _)| {
+                c["disabled"] != true && crate::media::media_signature(&c) == signature
+            }) {
+                self.media.stop_if_current(name, &worker).await;
+            }
+        }
+    }
     pub async fn reconcile(&self) {
-        self.refresh_sources().await;
-        for (name, signature) in self.media.workers().await {
-            let config = self.config.effective(&name).or(self
-                .mirrors
-                .lock()
-                .await
-                .get(&name)
-                .map(|m| m.config.clone()));
-            if let Some(c) = config {
-                if c["disabled"] == true {
-                    self.media.stop(&name).await;
-                } else if crate::media::media_signature(&c) != signature {
-                    self.media.stop(&name).await;
-                    let _ = self.media.ensure(&name, &c).await;
-                }
-            } else {
-                self.media.stop(&name).await;
-            }
-        }
-
-        let root = self.config.snapshot();
-        if let Some(streams) = root["streams"].as_array() {
-            for disk in streams {
-                if let Some(name) = disk["name"].as_str() {
-                    if let Some(c) = self.config.effective(name) {
-                        if c["disabled"] != true
-                            && c["static"] != false
-                            && self.options.role != "lb"
-                        {
-                            let _ = self.media.ensure(name, &c).await;
-                        }
-                    }
-                }
-            }
-        }
+        // Retirement comes first: a background retry must not extend demand.
         for name in self.media.idle().await {
             if self
                 .config
@@ -179,6 +180,33 @@ impl App {
                 .is_none_or(|c| c["static"] == false)
             {
                 self.media.stop(&name).await;
+            }
+        }
+        self.refresh_sources().await;
+        for (name, _) in self.media.workers().await {
+            if let Some((config, revision)) = self.media_config(&name).await {
+                if config["disabled"] == true {
+                    self.media.stop(&name).await;
+                } else {
+                    self.recover_current(&name, &config, revision).await;
+                }
+            } else {
+                self.media.stop(&name).await;
+            }
+        }
+        let root = self.config.snapshot();
+        if let Some(streams) = root["streams"].as_array() {
+            for disk in streams {
+                if let Some(name) = disk["name"].as_str() {
+                    if let Some((config, revision)) = self.media_config(name).await {
+                        if config["disabled"] != true
+                            && config["static"] != false
+                            && self.options.role != "lb"
+                        {
+                            self.recover_current(name, &config, revision).await;
+                        }
+                    }
+                }
             }
         }
     }

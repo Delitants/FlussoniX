@@ -392,15 +392,24 @@ impl Engine {
             tokio::fs::read(path).await.map_err(|_| "media not ready")?,
         ))
     }
+    async fn stop_worker(&self, name: &str, w: Arc<Worker>) {
+        w.cancel.cancel();
+        if let Some(done) = w.done.lock().await.take() {
+            let _ = done.await;
+        }
+        let _ = tokio::fs::remove_dir_all(self.directory(name)).await;
+    }
     pub async fn stop(&self, name: &str) {
         let mut workers = self.workers.lock().await;
-        let w = workers.remove(name);
-        if let Some(w) = w {
-            w.cancel.cancel();
-            if let Some(done) = w.done.lock().await.take() {
-                let _ = done.await;
-            }
-            let _ = tokio::fs::remove_dir_all(self.directory(name)).await;
+        if let Some(w) = workers.remove(name) {
+            self.stop_worker(name, w).await;
+        }
+    }
+    pub async fn stop_if_current(&self, name: &str, expected: &Arc<Worker>) {
+        let mut workers = self.workers.lock().await;
+        if workers.get(name).is_some_and(|w| Arc::ptr_eq(w, expected)) {
+            let worker = workers.remove(name).unwrap();
+            self.stop_worker(name, worker).await;
         }
     }
     pub async fn stop_all(&self) {
@@ -461,7 +470,7 @@ impl Engine {
             .lock()
             .await
             .iter()
-            .filter(|(_, w)| w.idle_seconds() > 60 && w.viewers.load(Ordering::Relaxed) == 0)
+            .filter(|(_, w)| w.idle_seconds() >= 60 && w.viewers.load(Ordering::Relaxed) == 0)
             .map(|(n, _)| n.clone())
             .collect()
     }
@@ -488,4 +497,141 @@ pub fn translate_input(input: &str) -> Result<String, String> {
 
 pub fn media_signature(cfg: &Value) -> String {
     format!("{:x}",Sha256::digest(serde_json::to_vec(&json!({"inputs":cfg["inputs"],"transcoder":cfg["transcoder"],"peer":cfg["flussonix_peer_key"],"timeout":cfg["flussonix_input_timeout"]})).unwrap()))
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::server::{App, Options, router};
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    fn app(d: &std::path::Path) -> Arc<App> {
+        App::new(
+            d.join("config.json"),
+            d.join("media"),
+            Options {
+                admin_password: "owned-lifecycle-admin".into(),
+                peer_key: "owned-lifecycle-peer".into(),
+                uplink_interface: "process".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+    async fn kill(w: &Worker) {
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-KILL", &w.pid().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        tokio::time::timeout(Duration::from_secs(3), w.closed())
+            .await
+            .unwrap();
+        while w.alive.load(Ordering::Relaxed) {
+            tokio::task::yield_now().await;
+        }
+    }
+    #[tokio::test]
+    async fn active_continuous_body_prevents_idle_retirement() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        app.config
+            .put(
+                "streams",
+                "owned",
+                json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+            )
+            .unwrap();
+        let cfg = app.config.effective("owned").unwrap();
+        let w = app.media.ensure("owned", &cfg).await.unwrap();
+        let response = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/owned/mpegts")
+                    .header("X-Flussonix-Peer", "owned-lifecycle-peer")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(w.viewers.load(Ordering::Relaxed), 1);
+        *w.last_access.lock().unwrap() = Instant::now() - Duration::from_secs(61);
+        app.reconcile().await;
+        let alive = w.alive.load(Ordering::Relaxed);
+        drop(response);
+        app.media.stop_all().await;
+        assert!(alive, "a held continuous playback body was retired as idle");
+    }
+    #[tokio::test]
+    async fn expired_on_demand_failure_is_retired_before_retry() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        app.config
+            .put(
+                "streams",
+                "owned",
+                json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+            )
+            .unwrap();
+        let w = app
+            .media
+            .ensure("owned", &app.config.effective("owned").unwrap())
+            .await
+            .unwrap();
+        kill(&w).await;
+        *w.last_access.lock().unwrap() = Instant::now() - Duration::from_secs(61);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        app.reconcile().await;
+        assert!(app.media.workers().await.is_empty());
+        assert_eq!(app.media.count().await, 0);
+    }
+    #[tokio::test]
+    async fn removal_or_disable_during_async_retry_cannot_resurrect_a_worker() {
+        for disable in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let app = app(d.path());
+            app.config
+                .put(
+                    "streams",
+                    "owned",
+                    json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+                )
+                .unwrap();
+            let old = app
+                .media
+                .ensure("owned", &app.config.effective("owned").unwrap())
+                .await
+                .unwrap();
+            kill(&old).await;
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            let (tx, rx) = oneshot::channel();
+            *old.done.lock().await = Some(rx);
+            let a = app.clone();
+            let retry = tokio::spawn(async move { a.reconcile().await });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if old.done.try_lock().is_err() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if disable {
+                app.config
+                    .put("streams", "owned", json!({"disabled":true}))
+                    .unwrap();
+            } else {
+                app.config.delete("streams", "owned").unwrap();
+            }
+            tx.send(()).unwrap();
+            retry.await.unwrap();
+            assert_eq!(app.media.count().await, 0);
+            assert!(app.media.workers().await.is_empty());
+        }
+    }
 }

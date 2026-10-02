@@ -547,3 +547,83 @@ async fn source_cdn_balancer_over_m4s_preserves_auth_and_one_worker() {
 async fn source_cdn_balancer_over_m4f_preserves_segments_and_source_timeline() {
     check_source_cdn_balancer("m4f").await;
 }
+
+#[tokio::test]
+async fn native_cdn_recovers_a_failed_pull_without_a_new_viewer_request() {
+    let d = tempfile::tempdir().unwrap();
+    let (source, url, source_task) = launch(d.path(), "recovery-source", "source").await;
+    let (cdn, cdn_url, cdn_task) = launch(d.path(), "recovery-edge", "cdn").await;
+    source.config.put("streams","owned",json!({"static":false,"inputs":[{"url":"testsrc://"}],"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"owned-viewer-token"))})).unwrap();
+    cdn.config
+        .put(
+            "sources",
+            "origin",
+            json!({"api_url":url,"private_payload_url":url,"flussonix_transport":"m4s"}),
+        )
+        .unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    assert_eq!(
+        client
+            .get(format!(
+                "{cdn_url}/owned/index.m3u8?token=owned-viewer-token"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let first = cdn.media.stats("owned").await;
+    let pid = first["pid"].as_u64().unwrap();
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    for _ in 0..100 {
+        if cdn.media.stats("owned").await["status"] == "retrying" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    cdn.reconcile().await;
+    let next = cdn.media.stats("owned").await;
+    assert_ne!(
+        next["pid"], first["pid"],
+        "CDN relied on another playback request to recover"
+    );
+    assert_eq!(next["restart_count"], 1);
+    assert_eq!(next["input_protocol"], "m4s");
+    assert_eq!(
+        client
+            .get(format!("{cdn_url}/owned/index.m3u8"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        client
+            .get(format!(
+                "{cdn_url}/owned/index.m3u8?token=owned-viewer-token"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(cdn.media.count().await, 1);
+    source.media.stop_all().await;
+    cdn.media.stop_all().await;
+    source_task.abort();
+    cdn_task.abort();
+}
