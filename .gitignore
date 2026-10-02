@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+/target/
+/node_modules/
+/reference-private/
+/.env
+/.env.*
+/.superdesign/tmp/
+/.tools/
+/.runtime/
+/.superpowers/
+/web/node_modules/
+/web/dist/
+/test-results/

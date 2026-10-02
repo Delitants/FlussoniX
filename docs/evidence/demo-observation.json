@@ -1,0 +1,150 @@
+{
+  "config_counts": {
+    "auth_backends": 1,
+    "streams": 176
+  },
+  "config_flags": {
+    "auth_token": false,
+    "cluster_key": false,
+    "config_external": false,
+    "edit_auth": true,
+    "view_auth": false
+  },
+  "config_keys_present": [
+    "auth_backends",
+    "edit_auth",
+    "iptv",
+    "listeners",
+    "server_id",
+    "session_log",
+    "stats",
+    "streams"
+  ],
+  "input_cluster_keys_present": 0,
+  "input_count_per_stream": {
+    "1": 175,
+    "2": 1
+  },
+  "input_remote_dvr_present": 0,
+  "input_schemes": {
+    "": 10,
+    "hlss": 3,
+    "m4f": 56,
+    "rtsp": 18,
+    "tshttp": 90
+  },
+  "input_url_userinfo_present": 18,
+  "limitations": [
+    "A point-in-time inventory is not peak capacity evidence.",
+    "Pagination is not an atomic configuration snapshot.",
+    "Stream names, source URLs, backend URLs, tokens, credentials and config bodies are omitted."
+  ],
+  "method": "Authenticated GET configuration and stream metadata only; sequential pagination; no media requests",
+  "observed_at_utc": "2026-09-15T03:46:00.391701+00:00",
+  "pagination": {
+    "complete": true,
+    "estimated_count": 176,
+    "rows": 176,
+    "unique_stream_names": 176
+  },
+  "play_auth_distinct_values": 1,
+  "play_auth_field_names": [
+    "url"
+  ],
+  "play_auth_schemes": {
+    "iptv": 175
+  },
+  "primary_input_schemes": {
+    "": 10,
+    "hlss": 3,
+    "m4f": 55,
+    "rtsp": 18,
+    "tshttp": 90
+  },
+  "purpose": "Functionality demo only. Not a migration source or a sizing baseline.",
+  "reads": [
+    {
+      "method": "GET",
+      "path": "/streamer/api/v3/config",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/streamer/api/v3/streams",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/streamer/api/v3/streams",
+      "status": 200
+    }
+  ],
+  "reference_origin": "http://192.168.20.98:8080",
+  "server_version": "26.04.1",
+  "source_field_names": [],
+  "source_schemes": {},
+  "stats_snapshot": {
+    "cpu_usage": 41,
+    "input_kbit": 154925,
+    "memory_usage": 31,
+    "online_streams": 5,
+    "opened_files": 0,
+    "output_kbit": 8658,
+    "total_clients": 4,
+    "total_streams": 176,
+    "uptime": 250858
+  },
+  "stream_field_names": [
+    "disabled",
+    "inputs",
+    "name",
+    "named_by",
+    "on_play",
+    "static",
+    "stats",
+    "transcoder"
+  ],
+  "stream_flags": {
+    "cluster_ingest": 0,
+    "disabled": 10,
+    "dvr": 0,
+    "on_play": 175,
+    "on_publish": 0,
+    "static": 4,
+    "transcoder": 6
+  },
+  "stream_named_by": {
+    "config": 176
+  },
+  "stream_stats_field_names": [
+    "alive",
+    "bitrate",
+    "bytes_out",
+    "dvr_enabled",
+    "input",
+    "input_bitrate",
+    "inputs",
+    "last_access_at",
+    "last_dts",
+    "last_dts_at",
+    "lifetime",
+    "media_info",
+    "online_clients",
+    "play",
+    "running_transcoder",
+    "status",
+    "transcoder",
+    "ts_delay"
+  ],
+  "stream_statuses": {
+    "None": 10,
+    "running": 5,
+    "waiting": 161
+  },
+  "transcoder_device_summary": [
+    {
+      "name": "CPU Encoder",
+      "type": "cpu"
+    }
+  ]
+}

@@ -1,0 +1,95 @@
+{
+  "auth_backend_rule_field_names": [
+    "backends",
+    "name"
+  ],
+  "empty_primary_input_and_disabled": 0,
+  "iptv_database_configured": false,
+  "method": "One authenticated GET /config?full=true; sanitized configuration fields only",
+  "observed_at_utc": "2026-09-15T03:48:03.968195+00:00",
+  "purpose": "Functionality demo only. Not a migration source or a sizing baseline.",
+  "transcoder_profiles": [
+    {
+      "audio": {
+        "bitrate": 128000,
+        "codec": "aac",
+        "sample_rate": 0
+      },
+      "decoder": {},
+      "global": {},
+      "tracks": [
+        {
+          "content": "<omitted>"
+        }
+      ]
+    },
+    {
+      "audio": {
+        "bitrate": 128000,
+        "codec": "aac",
+        "sample_rate": 0
+      },
+      "decoder": {},
+      "global": {},
+      "tracks": [
+        {
+          "content": "<omitted>"
+        }
+      ]
+    },
+    {
+      "audio": {
+        "bitrate": 128000,
+        "codec": "aac"
+      },
+      "decoder": {},
+      "global": {},
+      "tracks": [
+        {
+          "content": "<omitted>"
+        }
+      ]
+    },
+    {
+      "audio": {
+        "bitrate": 64000,
+        "codec": "aac"
+      },
+      "decoder": {},
+      "global": {},
+      "tracks": [
+        {
+          "content": "<omitted>"
+        }
+      ]
+    },
+    {
+      "audio": {
+        "avol": "<omitted>",
+        "bitrate": 64000,
+        "codec": "aac"
+      },
+      "decoder": {},
+      "global": {},
+      "tracks": [
+        {
+          "content": "<omitted>"
+        }
+      ]
+    },
+    {
+      "audio": {
+        "avol": "<omitted>",
+        "bitrate": 10000,
+        "codec": "aac"
+      },
+      "decoder": {},
+      "global": {},
+      "tracks": [
+        {
+          "content": "<omitted>"
+        }
+      ]
+    }
+  ]
+}

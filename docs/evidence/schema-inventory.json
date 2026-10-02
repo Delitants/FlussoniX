@@ -1,0 +1,127 @@
+{
+  "comparisons": [
+    {
+      "common_schema_names": 453,
+      "common_schemas_with_different_json": 207,
+      "installed": "installed-management-public",
+      "installed_only_operations": [],
+      "note": "JSON differences include descriptions and metadata; counts do not prove behavioral incompatibility.",
+      "published": "published-management",
+      "published_only_operations": []
+    },
+    {
+      "common_schema_names": 58,
+      "common_schemas_with_different_json": 8,
+      "installed": "installed-streaming",
+      "installed_only_operations": [
+        {
+          "method": "GET",
+          "path": "/{name}/images-{dimensions}/dvr-{from}-{offset}.m4v.jpg"
+        },
+        {
+          "method": "GET",
+          "path": "/{name}/images-{dimensions}/seg-{from}-{offset}.hls.jpg"
+        },
+        {
+          "method": "PUT",
+          "path": "/{name}/sessions/{id}"
+        },
+        {
+          "method": "PUT",
+          "path": "/{name}/sessions/{id}/request_tracks"
+        }
+      ],
+      "note": "JSON differences include descriptions and metadata; counts do not prove behavioral incompatibility.",
+      "published": "published-streaming",
+      "published_only_operations": []
+    }
+  ],
+  "generated_at_utc": "2026-09-15T03:56:10.868997+00:00",
+  "purpose": "Design inventory; no operation has been implemented or behaviorally verified.",
+  "sources": [
+    {
+      "bytes": 901459,
+      "component_schemas": 508,
+      "id": "installed-management-public",
+      "info_version": "1.2.3",
+      "operations": 139,
+      "paths": 74,
+      "server_base_urls": [
+        "http://localhost:8080/streamer/api/v3"
+      ],
+      "sha256": "8a2b9b603664a3bcc0b7605c686c8673a292095e0803ab3b340bc2921a4389cc",
+      "source_path": "/opt/flussonic/lib/web-1/priv/schema-v3-public.json",
+      "source_url": null
+    },
+    {
+      "bytes": 1045601,
+      "component_schemas": 560,
+      "id": "installed-management-private",
+      "info_version": "1.2.3",
+      "operations": 172,
+      "paths": 96,
+      "server_base_urls": [
+        "http://localhost:8080/streamer/api/v3"
+      ],
+      "sha256": "ac583b33fb44fd1fdd1174bbf57d888752a594ad98da84a77c008cff00813569",
+      "source_path": "/opt/flussonic/lib/web-1/priv/schema-v3-private.json",
+      "source_url": null
+    },
+    {
+      "bytes": 239570,
+      "component_schemas": 73,
+      "id": "installed-streaming",
+      "info_version": "1.2.3",
+      "operations": 58,
+      "paths": 57,
+      "server_base_urls": [
+        "http://localhost:8080"
+      ],
+      "sha256": "a0456a80ef2d279dc56ace282872d2c31d7414d67008e83f8943bb2cd5f1730a",
+      "source_path": "/opt/flussonic/lib/web-1/priv/streaming-private.json",
+      "source_url": null
+    },
+    {
+      "bytes": 1121267,
+      "component_schemas": 461,
+      "id": "published-management",
+      "info_version": "26.03-499",
+      "operations": 139,
+      "paths": 74,
+      "server_base_urls": [
+        "http://localhost:8080/streamer/api/v3"
+      ],
+      "sha256": "6da70bcec572046ed7309f449a1f8e987bd466d0581b09ca8e5afbe204ea6b63",
+      "source_path": "/tmp/flussonix-reference-current.json",
+      "source_url": "https://flussonic.com/doc/api/reference.json"
+    },
+    {
+      "bytes": 200667,
+      "component_schemas": 58,
+      "id": "published-streaming",
+      "info_version": "26.03-499",
+      "operations": 54,
+      "paths": 53,
+      "server_base_urls": [
+        "http://localhost:8080"
+      ],
+      "sha256": "de5115cb40a60fec740c4d64ceb20ee063b1cd210482fd85b13e83543898c9e4",
+      "source_path": "/tmp/flussonix-streaming-current.json",
+      "source_url": "https://flussonic.com/doc/api/streaming.json"
+    },
+    {
+      "bytes": 27122,
+      "component_schemas": 3,
+      "id": "published-authorization",
+      "info_version": "21.12.1",
+      "operations": 2,
+      "paths": 2,
+      "server_base_urls": [
+        "http://localhost:8080/streamer/api/v3"
+      ],
+      "sha256": "c164fc88c0bb0153fb180447eb8ebe2795a8dbd3a9107533f344cc524cb20062",
+      "source_path": "/tmp/flussonix-authorization-current.json",
+      "source_url": "https://flussonic.com/doc/api/authorization.json"
+    }
+  ]
+}
