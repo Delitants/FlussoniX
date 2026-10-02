@@ -1,4 +1,4 @@
-# First working copy qualification
+# Preview qualification
 
 This milestone is an executable subset of the product design, not complete Flussonic parity. Baseline reference: installed Flussonic 26.04.1. The native cluster uses FlussoniX peer authentication and source discovery; a mixed Flussonic cluster is not qualified.
 
@@ -21,9 +21,9 @@ M4F currently supports up to two uniquely identified H.264/AAC tracks with one c
 
 CPU encoding uses libx264 plus AAC. NVIDIA configuration is exposed, but no GPU success is claimed without a real supported device and decoder test. FFmpeg transport adapters do not establish serving/publishing parity for RTSP or SRT. RTSPS, RTP/SRTP and push roles are not implemented.
 
-HLS and M4 windows are bounded; live subscribers use bounded shared queues and disconnect on lag. There is a 256-worker implementation limit. This build has not been benchmarked for production stream/viewer counts. Metrics use Linux CPU/RAM and this daemon's actual HTTP media egress, not aggregate interface traffic from other processes. Balancing applies resource headroom and authoritative CDN reservations; it does not promise perfect uplink prediction.
+HLS and M4 windows are bounded; live subscribers use bounded shared queues and disconnect on lag. There is a 256-worker implementation limit. This build has not been benchmarked for production stream/viewer counts. v0.2 samples Linux CPU/RAM and aggregate TX bytes on the selected interface independently of management requests. HTTP media egress is reported separately; explicit process mode is available. Unknown/warmup/reset/stale metrics exclude new admissions. Balancing applies resource headroom and authoritative CDN reservations; it does not promise perfect uplink prediction.
 
-API compatibility is a subset. Collection default ordering is by name; `sort=-name` and literal substring `q` are implemented, while full projection/filter/sort semantics, configuration-text formats and many operations remain open. API credentials/listeners/resource limits are startup settings rather than the complete vendor config contract. Unknown saved options fail validation. Viewer session counts expire after 30 seconds of inactivity when no continuous response remains open; revocation and global cross-node session ownership remain open.
+API compatibility is a subset. Collection default ordering is by name; `sort=-name` and literal substring `q` are implemented, while full projection/filter/sort semantics, configuration-text formats and many operations remain open. API credentials/listeners/resource limits are startup settings rather than the complete vendor config contract. Unknown saved options fail validation. Viewer session counts expire after 30 seconds of inactivity when no continuous response remains open; global cross-node session ownership remains open.
 
 For testing, keep management endpoints on a trusted interface or reach them through SSH forwarding. The daemon currently serves HTTP, so HTTPS delivery requires a separately configured TLS terminator. The dedicated test instances must use separate directories, accounts, units and unused ports; never replace or restart existing Flussonic services.
 
@@ -38,3 +38,11 @@ A Chromium HLS player followed the LB/CDN redirect flow through the SSH forwards
 The dedicated systemd units run as `flussonix-test`, with Nice 10, CPUQuota 100%, MemoryMax 512 MiB, a separate writable runtime directory and control-group cleanup. They are started for testing, not enabled at boot. Production Flussonic process IDs and port 80/443 listeners were checked before and after; neither production service was restarted or reconfigured. These checks are bounded functional qualification, not a throughput benchmark.
 
 Production stream tokens, API passwords, peer keys, key files and source URLs are excluded from this repository.
+
+## v0.2 authorization and telemetry
+
+The callback/session tests exercise structured template policy, UUID and protocol fields, concurrent-request coalescing, user limits across streams, cached redirect without worker startup, edit/view session API permissions, denial caching, live body cancellation, renewal retaining the session ID, backend-outage behavior and configuration/manual-revoke races. A real daemon renews a held MPEG-TS connection without another playback request and closes it on backend denial. Inactive sessions expire while live bodies retain their client slots. Ordered identity keys use an independent hash; byte-for-byte vendor session hashing is not claimed.
+
+Telemetry fixtures exercise default-route selection, explicit interface validation, rate conversion including other-process TX traffic, separate HTTP bytes, first interval, stale samples, counter reset and missing/reappearing counters. The topology test waits for a valid sampling interval rather than treating startup as idle. Browser qualification includes actual session reauthorization/deletion and verifies subsequent playback is denied.
+
+Object `on_play` currently supports URL, literal session keys and max sessions only. Geography/domain/soft-limit/query-key policies, publisher auth and full session history/projection/pagination are not implemented. Renewal runs in bounded batches; outages retain an existing decision with a ten-second retry. Admission and user limits are authoritative locally; cluster-wide revocation and global user limits require further work. Redirect auth backends must return absolute HTTP(S) locations. Remote-source policy changes are discovered through the existing ten-second configuration cache when resolving playback, not a distributed invalidation bus.

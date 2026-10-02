@@ -834,7 +834,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             .into(),
             ip,
             token: query.get("token").cloned().unwrap_or_default(),
-            qs: qs.into(),
+            qs,
             user_agent: header(request.headers(), "user-agent").unwrap_or("").into(),
             referer: header(request.headers(), "referer").unwrap_or("").into(),
             host: header(request.headers(), "host").unwrap_or("").into(),

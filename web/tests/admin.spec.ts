@@ -16,3 +16,16 @@ test('editing a title preserves template inheritance',async({page,request})=>{
  expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{inputs:[{url:'hls://example.net/updated.m3u8'}]}})).ok()).toBeTruthy();
  const effective=await (await request.get('/streamer/api/v3/streams/'+stream,{headers})).json(); expect(effective.inputs[0].url).toBe('hls://example.net/updated.m3u8'); expect(effective.config_on_disk.inputs).toBeUndefined();
 });
+test('auth tab reauthorizes and closes an actual viewer session',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-session-'+Date.now();
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,static:false,inputs:[{url:'testsrc://'}]}})).ok()).toBeTruthy();
+ const media=await request.get('/'+name+'/index.m3u8?token=browser-viewer');expect(media.status()).toBe(200);
+ await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Auth',exact:true}).click();
+ await expect(page.getByRole('heading',{name:'Viewer sessions',exact:true})).toBeVisible();
+ await expect(page.getByRole('cell',{name:'hls',exact:true})).toBeVisible();
+ await page.getByRole('button',{name:'Reauthorize sessions',exact:true}).click();await expect(page.getByRole('status')).toContainText('Reauthorized 1 session');
+ await page.getByRole('button',{name:'Close session',exact:true}).click();await expect(page.getByRole('status')).toContainText('Session closed');
+ await expect(page.getByText('No active viewer sessions', {exact:true})).toBeVisible();
+ expect((await request.get('/'+name+'/index.m3u8?token=browser-viewer')).status()).toBe(403);
+});

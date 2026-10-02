@@ -96,6 +96,8 @@ impl Policy {
                 "token" => &r.token,
                 _ => unreachable!(),
             };
+            h.update((key.len() as u64).to_be_bytes());
+            h.update(key.as_bytes());
             h.update((value.len() as u64).to_be_bytes());
             h.update(value.as_bytes());
         }
@@ -551,6 +553,25 @@ impl PlaybackAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn session_key_order_is_distinct_even_when_values_are_equal() {
+        let a = Policy::from_config(
+            &json!({"on_play":{"url":"https://auth.example/play","session_keys":["name","proto"]}}),
+            &json!({}),
+        )
+        .unwrap();
+        let b = Policy::from_config(
+            &json!({"on_play":{"url":"https://auth.example/play","session_keys":["proto","name"]}}),
+            &json!({}),
+        )
+        .unwrap();
+        let r = ViewerRequest {
+            name: "hls".into(),
+            proto: "hls".into(),
+            ..Default::default()
+        };
+        assert_ne!(a.identity(&r), b.identity(&r));
+    }
     #[tokio::test]
     async fn idle_sessions_expire_but_live_grants_retain_client_slots() {
         let auth = PlaybackAuth::new(1);
