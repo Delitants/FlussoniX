@@ -345,6 +345,8 @@ pub fn encode_frame(track: &Track, frame: &Frame) -> Vec<u8> {
 pub struct FlvDecoder {
     buffer: BytesMut,
     header: bool,
+    expected: u8,
+    published: bool,
     tracks: Vec<Track>,
 }
 impl FlvDecoder {
@@ -360,6 +362,7 @@ impl FlvDecoder {
             if &self.buffer[..3] != b"FLV" {
                 return Err("invalid FLV header".into());
             }
+            self.expected = self.buffer[4] & 5;
             self.buffer.advance(13);
             self.header = true;
         }
@@ -398,14 +401,25 @@ impl FlvDecoder {
                     continue;
                 };
             if config {
+                // FFmpeg can send placeholder sequence headers before codec
+                // extradata is available. Never advertise an incomplete input.
+                if payload.len() < if codec == "h264" { 7 } else { 2 } {
+                    continue;
+                }
                 self.tracks.retain(|t| t.id != id);
                 self.tracks.push(Track {
                     id,
                     codec: codec.into(),
                     config: payload.to_vec(),
                 });
-                hub.info(self.tracks.clone());
-            } else if !payload.is_empty() {
+                let complete = (self.expected & 1 == 0
+                    || self.tracks.iter().any(|t| t.codec == "h264"))
+                    && (self.expected & 4 == 0 || self.tracks.iter().any(|t| t.codec == "aac"));
+                if complete {
+                    hub.info(self.tracks.clone());
+                    self.published = true;
+                }
+            } else if self.published && !payload.is_empty() {
                 hub.frame(Frame {
                     track_id: id,
                     dts: ts * 90,

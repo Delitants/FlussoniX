@@ -6,6 +6,9 @@ use std::{future::IntoFuture, net::SocketAddr, path::PathBuf, time::Duration};
 struct Args {
     #[arg(long, default_value = "127.0.0.1:18210")]
     listen: SocketAddr,
+    /// Optional RTSP/1.0 TCP playback listener (disabled by default).
+    #[arg(long)]
+    rtsp_listen: Option<SocketAddr>,
     #[arg(long, default_value = "config.json")]
     config: PathBuf,
     #[arg(long, default_value = "runtime/media")]
@@ -60,13 +63,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let app = App::new(a.config, a.media_dir, options)?;
     let listener = tokio::net::TcpListener::bind(a.listen).await?;
+    let rtsp_listener = match a.rtsp_listen {
+        Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
+        None => None,
+    };
     println!(
         "{}",
-        serde_json::json!({"service":"FlussoniX","listen":listener.local_addr()?.to_string(),"version":env!("CARGO_PKG_VERSION")})
+        serde_json::json!({"service":"FlussoniX","listen":listener.local_addr()?.to_string(),"rtsp_listen":rtsp_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"version":env!("CARGO_PKG_VERSION")})
     );
     app.reconcile().await;
     let background = app.clone();
     let cancel = tokio_util::sync::CancellationToken::new();
+    let mut rtsp_task = rtsp_listener.map(|listener| {
+        tokio::spawn(flussonix::rtsp::serve(
+            listener,
+            app.clone(),
+            cancel.clone(),
+        ))
+    });
     let bg_cancel = cancel.clone();
     let supervisor = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -97,12 +111,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_graceful_shutdown(cancel.clone().cancelled_owned())
     .into_future();
     tokio::pin!(serving);
-    let completed = tokio::select! {result=&mut serving=>Some(result),_=shutdown()=>None};
+    let mut rtsp_result = None;
+    let completed = tokio::select! {
+        result=&mut serving=>Some(result),
+        result=async{match rtsp_task.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{rtsp_result=Some(result);None},
+        _=shutdown()=>None
+    };
     cancel.cancel();
     let _ = supervisor.await;
     let _ = authorization.await;
     let _ = telemetry.await;
     app.media.stop_all().await;
+    if rtsp_result.is_none() {
+        if let Some(task) = rtsp_task {
+            rtsp_result = Some(task.await);
+        }
+    }
     if let Some(result) = completed {
         result?;
     } else if tokio::time::timeout(Duration::from_secs(5), &mut serving)
@@ -110,6 +134,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .is_err()
     {
         tracing::warn!("connection drain exceeded five seconds");
+    }
+    if let Some(result) = rtsp_result {
+        result??;
     }
     Ok(())
 }

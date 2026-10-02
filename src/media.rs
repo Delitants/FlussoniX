@@ -258,6 +258,11 @@ impl Engine {
             cmd.args(["-c:a", "aac", "-b:a", "96k"]);
         } else {
             cmd.args(["-c", "copy"]);
+            // The AAC RTP depacketizer can omit key flags. AAC-LC access
+            // units are independently decodable; do not discard their copy.
+            if input.starts_with("rtsp://") {
+                cmd.arg("-copyinkf:a");
+            }
         }
         // One encode/mux source feeds both HLS variants and shared live TS fan-out.
         let output = format!(

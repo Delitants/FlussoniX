@@ -11,6 +11,7 @@ struct Sample {
     interface: Option<String>,
     bytes: Option<u64>,
     process: u64,
+    rtsp: u64,
     cpu: Option<(u64, u64)>,
 }
 struct History {
@@ -22,6 +23,7 @@ struct Measurement {
     interface: Option<String>,
     mbps: Option<f64>,
     http_mbps: Option<f64>,
+    rtsp_mbps: Option<f64>,
     cpu: Option<f64>,
     ram: Option<f64>,
     bytes: u64,
@@ -61,7 +63,13 @@ impl Sampler {
     pub fn sample(&self, bytes: u64) {
         self.sample_at(Instant::now(), bytes)
     }
+    pub fn sample_media(&self, http: u64, rtsp: u64) {
+        self.sample_media_at(Instant::now(), http, rtsp)
+    }
     pub fn sample_at(&self, at: Instant, process: u64) {
+        self.sample_media_at(at, process, 0)
+    }
+    pub fn sample_media_at(&self, at: Instant, process: u64, rtsp: u64) {
         let interface = match self.selection.as_str() {
             "process" => None,
             "auto" => std::fs::read_to_string(self.proc_root.join("net/route"))
@@ -70,7 +78,7 @@ impl Sampler {
             name => Some(name.into()),
         };
         let bytes = if self.selection == "process" {
-            Some(process)
+            Some(process.saturating_add(rtsp))
         } else {
             interface.as_ref().and_then(|name| {
                 std::fs::read_to_string(
@@ -94,13 +102,19 @@ impl Sampler {
         let mut h = self.history.lock().unwrap();
         let mut mbps = None;
         let mut http_mbps = None;
+        let mut rtsp_mbps = None;
         let mut fraction = None;
         if let Some(prev) = &h.previous {
             let elapsed = at.saturating_duration_since(prev.at).as_secs_f64();
             if elapsed > 0.0 && elapsed <= 3.0 {
                 http_mbps = rate(Some(process), Some(prev.process), elapsed);
+                rtsp_mbps = rate(Some(rtsp), Some(prev.rtsp), elapsed);
                 if interface == prev.interface {
-                    mbps = rate(bytes, prev.bytes, elapsed);
+                    mbps = if self.selection == "process" {
+                        http_mbps.zip(rtsp_mbps).map(|(http, rtsp)| http + rtsp)
+                    } else {
+                        rate(bytes, prev.bytes, elapsed)
+                    };
                 }
                 if let (Some((total, idle)), Some((old_total, old_idle))) = (cpu, prev.cpu) {
                     if total > old_total && idle >= old_idle && idle - old_idle <= total - old_total
@@ -116,6 +130,7 @@ impl Sampler {
             interface: interface.clone(),
             bytes,
             process,
+            rtsp,
             cpu,
         });
         h.measured = Some(Measurement {
@@ -123,9 +138,10 @@ impl Sampler {
             interface,
             mbps,
             http_mbps,
+            rtsp_mbps,
             cpu: fraction,
             ram,
-            bytes: process,
+            bytes: process.saturating_add(rtsp),
         });
     }
     pub fn snapshot(&self, capacity: f64) -> Value {
@@ -134,12 +150,12 @@ impl Sampler {
     pub fn snapshot_at(&self, at: Instant, capacity: f64) -> Value {
         let h = self.history.lock().unwrap();
         let Some(m) = &h.measured else {
-            return json!({"cpu":null,"ram":null,"uplink":null,"egress_mbps":null,"http_egress_mbps":null,"uplink_source":if self.selection=="process" {"process"}else{"interface"},"uplink_interface":null,"age_ms":null,"bytes_out":0});
+            return json!({"cpu":null,"ram":null,"uplink":null,"egress_mbps":null,"http_egress_mbps":null,"rtsp_egress_mbps":null,"media_egress_mbps":null,"uplink_source":if self.selection=="process" {"process"}else{"interface"},"uplink_interface":null,"age_ms":null,"bytes_out":0});
         };
         let age = at.saturating_duration_since(m.at);
         let fresh = age <= STALE;
         let mbps = if fresh { m.mbps } else { None };
-        json!({"cpu":if fresh {m.cpu}else{None},"ram":if fresh {m.ram}else{None},"uplink":mbps.map(|v|v/capacity),"egress_mbps":mbps,"http_egress_mbps":if fresh {m.http_mbps}else{None},"uplink_source":if self.selection=="process" {"process"}else{"interface"},"uplink_interface":m.interface,"age_ms":age.as_millis() as u64,"bytes_out":m.bytes})
+        json!({"cpu":if fresh {m.cpu}else{None},"ram":if fresh {m.ram}else{None},"uplink":mbps.map(|v|v/capacity),"egress_mbps":mbps,"http_egress_mbps":if fresh {m.http_mbps}else{None},"rtsp_egress_mbps":if fresh {m.rtsp_mbps}else{None},"media_egress_mbps":if fresh {m.http_mbps.zip(m.rtsp_mbps).map(|(h,r)|h+r)}else{None},"uplink_source":if self.selection=="process" {"process"}else{"interface"},"uplink_interface":m.interface,"age_ms":age.as_millis() as u64,"bytes_out":m.bytes})
     }
 }
 fn rate(current: Option<u64>, previous: Option<u64>, elapsed: f64) -> Option<f64> {

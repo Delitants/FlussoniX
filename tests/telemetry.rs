@@ -85,3 +85,30 @@ fn explicit_interface_is_validated_and_process_mode_is_labelled() {
     assert!(v["uplink_interface"].is_null());
     assert_eq!(v["egress_mbps"], 0.8);
 }
+#[test]
+fn rtsp_output_is_separate_and_included_in_process_capacity() {
+    let d = fixture();
+    let sampler =
+        Sampler::with_roots("process", d.path().join("proc"), d.path().join("sys")).unwrap();
+    let t = Instant::now();
+    sampler.sample_media_at(t, 100, 200);
+    sampler.sample_media_at(t + Duration::from_secs(1), 100100, 250200);
+    let v = sampler.snapshot_at(t + Duration::from_secs(1), 1000.0);
+    assert_eq!(v["http_egress_mbps"], 0.8);
+    assert_eq!(v["rtsp_egress_mbps"], 2.0);
+    assert_eq!(v["egress_mbps"], 2.8);
+    assert_eq!(v["bytes_out"], 350300);
+}
+#[test]
+fn reset_of_either_media_counter_invalidates_process_capacity() {
+    let d = fixture();
+    let sampler =
+        Sampler::with_roots("process", d.path().join("proc"), d.path().join("sys")).unwrap();
+    let t = Instant::now();
+    sampler.sample_media_at(t, 100000, 0);
+    sampler.sample_media_at(t + Duration::from_secs(1), 0, 200000);
+    let v = sampler.snapshot_at(t + Duration::from_secs(1), 1000.0);
+    assert!(v["egress_mbps"].is_null());
+    assert!(v["uplink"].is_null());
+    assert_eq!(v["rtsp_egress_mbps"], 1.6);
+}

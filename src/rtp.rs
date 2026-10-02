@@ -56,6 +56,12 @@ struct State {
     ready: bool,
     origin: Option<(u64, Instant)>,
 }
+pub struct PlaySnapshot {
+    pub description: Description,
+    pub packets: Vec<Bytes>,
+    pub receiver: Receiver,
+    pub positions: Vec<(u32, u16, u32)>,
+}
 pub struct Hub {
     q: Channel,
     state: Mutex<State>,
@@ -118,6 +124,42 @@ impl Hub {
             s.bootstrap.iter().map(|(_, b)| b.clone()).collect(),
             self.q.subscribe(),
         ))
+    }
+    pub fn play_snapshot(&self) -> Result<PlaySnapshot, String> {
+        let s = self.state.lock().unwrap();
+        let description = describe(&s)?;
+        let packets: Vec<Bytes> = s.bootstrap.iter().map(|(_, b)| b.clone()).collect();
+        let positions =
+            s.tracks
+                .iter()
+                .map(|t| {
+                    if let Some(packet) = packets.iter().find(|b| {
+                        u32::from_be_bytes(b[..4].try_into().unwrap()) == t.description.id
+                    }) {
+                        (
+                            t.description.id,
+                            u16::from_be_bytes(packet[6..8].try_into().unwrap()),
+                            u32::from_be_bytes(packet[8..12].try_into().unwrap()),
+                        )
+                    } else {
+                        (
+                            t.description.id,
+                            t.sequence,
+                            s.origin
+                                .map(|(dts, _)| {
+                                    ((dts as u128 * t.description.clock as u128) / 90000) as u32
+                                })
+                                .unwrap_or(0),
+                        )
+                    }
+                })
+                .collect();
+        Ok(PlaySnapshot {
+            description,
+            packets,
+            receiver: self.q.subscribe(),
+            positions,
+        })
     }
     pub fn clock(&self, id: u32) -> Option<u32> {
         let s = self.state.lock().unwrap();

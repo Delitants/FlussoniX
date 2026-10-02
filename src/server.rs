@@ -91,6 +91,7 @@ pub struct App {
     pub playback_auth: PlaybackAuth,
     reservations: Mutex<HashMap<String, Reservation>>,
     pub egress: Arc<AtomicU64>,
+    pub rtsp_egress: Arc<AtomicU64>,
     telemetry: crate::telemetry::Sampler,
     pub started: Instant,
     mirrors: Mutex<HashMap<String, Mirror>>,
@@ -137,6 +138,7 @@ impl App {
             playback_auth: PlaybackAuth::new(options.client_limit as usize),
             reservations: Mutex::new(HashMap::new()),
             egress: Arc::new(AtomicU64::new(0)),
+            rtsp_egress: Arc::new(AtomicU64::new(0)),
             telemetry: crate::telemetry::Sampler::new(&options.uplink_interface)?,
             started: Instant::now(),
             mirrors: Mutex::new(HashMap::new()),
@@ -284,7 +286,10 @@ impl App {
         metrics
     }
     pub fn sample_metrics(&self) {
-        self.telemetry.sample(self.egress.load(Ordering::Relaxed));
+        self.telemetry.sample_media(
+            self.egress.load(Ordering::Relaxed),
+            self.rtsp_egress.load(Ordering::Relaxed),
+        );
     }
 
     fn resolved(&self, name: &str, config: Value, revision: u64) -> Option<Resolved> {
@@ -584,7 +589,7 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
     }
     if tail == "capabilities" && request.method() == "GET" {
         return json_response(
-            json!({"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","srt","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["hls","mpegts","fmp4-hls","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["rtsps","rtp","srtp","dvr","push"],"transcoding":{"cpu":"libx264 / AAC","gpu":"h264_nvenc, requires supported NVIDIA hardware and runtime"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP redirects"}),
+            json!({"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","srt","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["hls","mpegts","fmp4-hls","rtsp (TCP playback, H.264/AAC-LC; optional listener)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["rtsps","direct rtp","srtp","rtsp UDP / publication / push","rtsp Basic / Digest viewer auth","dvr","push"],"transcoding":{"cpu":"libx264 / AAC","gpu":"h264_nvenc, requires supported NVIDIA hardware and runtime"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP redirects"}),
         );
     }
     if let Some(name) = tail.strip_prefix("stream/") {
@@ -1175,3 +1180,5 @@ mod continuous_session_tests {
 
 #[path = "origin_resolution.rs"]
 mod origin_resolution;
+
+pub(crate) mod rtsp_access;

@@ -163,3 +163,75 @@ async fn shared_queue_is_bounded_and_reports_lag() {
             .is_ok_and(|r| r.is_err())
     );
 }
+#[test]
+fn rtp_sequence_wrap_and_play_positions_match_the_saved_packets() {
+    let h = Hub::new();
+    h.configure(&[audio()]);
+    h.frame(&frame(9, vec![1; 16], true, 0, 0));
+    let first = h.subscribe().unwrap().1[0].clone();
+    let sequence = u16::from_be_bytes(first[6..8].try_into().unwrap());
+    for i in 1..=65540 {
+        h.frame(&frame(9, vec![1; 16], true, i * 1024, 0));
+    }
+    let snapshot = h.play_snapshot().unwrap();
+    let last = snapshot.packets.last().unwrap();
+    assert_eq!(
+        u16::from_be_bytes(last[6..8].try_into().unwrap()),
+        sequence.wrapping_add(4)
+    );
+    let first = &snapshot.packets[0];
+    assert_eq!(
+        snapshot.positions[0],
+        (
+            9,
+            u16::from_be_bytes(first[6..8].try_into().unwrap()),
+            u32::from_be_bytes(first[8..12].try_into().unwrap())
+        )
+    );
+}
+#[test]
+fn all_supported_avcc_length_widths_work_and_reserved_width_is_denied() {
+    for width in [1, 2, 4] {
+        let h = Hub::new();
+        let mut t = video();
+        t.config[4] = 0xfc | (width - 1) as u8;
+        h.configure(&[t]);
+        let mut body = vec![0; width];
+        body[width - 1] = 2;
+        body.extend([0x65, 42]);
+        h.frame(&frame(7, body, true, 0, 0));
+        assert_eq!(&h.subscribe().unwrap().1[0][16..], &[0x65, 42]);
+    }
+    let h = Hub::new();
+    let mut t = video();
+    t.config[4] = 0xfe;
+    h.configure(&[t]);
+    assert!(h.subscribe().is_err());
+}
+#[test]
+fn generated_flv_waits_for_declared_tracks_and_ignores_placeholder_headers() {
+    use flussonix::wire::{FlvDecoder, Hub as WireHub};
+    fn tag(kind: u8, body: &[u8]) -> Vec<u8> {
+        let mut t = vec![kind, 0, 0, body.len() as u8, 0, 0, 0, 0, 0, 0, 0];
+        t.extend(body);
+        t.extend(((body.len() + 11) as u32).to_be_bytes());
+        t
+    }
+    let hub = WireHub::new();
+    let mut decoder = FlvDecoder::default();
+    decoder
+        .push(b"FLV\x01\x05\0\0\0\x09\0\0\0\0", &hub)
+        .unwrap();
+    decoder.push(&tag(8, &[0xaf, 0, 0x12, 0x10]), &hub).unwrap();
+    assert!(
+        !hub.has_info(),
+        "audio-only interim metadata must not describe a declared two-track stream"
+    );
+    decoder.push(&tag(8, &[0xaf, 1, 1, 2, 3]), &hub).unwrap();
+    decoder.push(&tag(9, &[0x17, 0, 0, 0, 0]), &hub).unwrap();
+    assert!(!hub.has_info());
+    let mut data = vec![0x17, 0, 0, 0, 0];
+    data.extend(video().config);
+    decoder.push(&tag(9, &data), &hub).unwrap();
+    assert_eq!(hub.rtp.description().unwrap().unwrap().tracks.len(), 2);
+}
