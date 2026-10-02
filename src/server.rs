@@ -1,0 +1,1037 @@
+use crate::{
+    auth::{Credentials, Role},
+    cluster::{NodeLoad, select},
+    config::{ConfigStore, KINDS, valid_name},
+    media::{Engine, Worker},
+};
+use axum::{
+    Router,
+    body::Body,
+    extract::{ConnectInfo, Request, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use bytes::Bytes;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
+use tokio::sync::Mutex;
+
+#[derive(Clone)]
+pub struct Options {
+    pub admin_user: String,
+    pub admin_password: String,
+    pub view_user: Option<String>,
+    pub view_password: Option<String>,
+    pub peer_key: String,
+    pub ffmpeg: String,
+    pub role: String,
+    pub node_name: String,
+    pub uplink_mbps: f64,
+    pub client_limit: u64,
+    pub web_dir: PathBuf,
+    pub drain: bool,
+}
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            admin_user: "admin".into(),
+            admin_password: String::new(),
+            view_user: None,
+            view_password: None,
+            peer_key: String::new(),
+            ffmpeg: "ffmpeg".into(),
+            role: "standalone".into(),
+            node_name: "local".into(),
+            uplink_mbps: 1000.0,
+            client_limit: 1000,
+            web_dir: "web/dist".into(),
+            drain: false,
+        }
+    }
+}
+struct Session {
+    stream: String,
+    user_id: String,
+    valid_until: Instant,
+    last_seen: Instant,
+}
+struct Reservation {
+    stream: String,
+    expires: Instant,
+}
+pub struct App {
+    pub config: ConfigStore,
+    pub media: Engine,
+    credentials: Credentials,
+    pub options: Options,
+    client: reqwest::Client,
+    sessions: Mutex<HashMap<String, Session>>,
+    reservations: Mutex<HashMap<String, Reservation>>,
+    pub egress: Arc<AtomicU64>,
+    meter: Mutex<(Instant, u64, u64, u64)>,
+    pub started: Instant,
+    mirrors: Mutex<HashMap<String, (Instant, Value)>>,
+}
+impl App {
+    pub fn new(
+        config: impl AsRef<Path>,
+        media: impl AsRef<Path>,
+        options: Options,
+    ) -> Result<Arc<Self>, String> {
+        if options.admin_password.is_empty() || options.peer_key.len() < 12 {
+            return Err("admin password required; peer key must be at least 12 characters".into());
+        }
+        if !["standalone", "source", "cdn", "lb"].contains(&options.role.as_str()) {
+            return Err("unknown node role".into());
+        }
+        if !(options.uplink_mbps > 0.0 && options.uplink_mbps.is_finite())
+            || options.client_limit == 0
+        {
+            return Err("positive uplink and client limit required".into());
+        }
+        let credentials = Credentials::new(
+            &options.admin_user,
+            &options.admin_password,
+            options
+                .view_user
+                .as_deref()
+                .zip(options.view_password.as_deref()),
+            &options.peer_key,
+        );
+        Ok(Arc::new(Self {
+            config: ConfigStore::open(config)?,
+            media: Engine::new(media, &options.ffmpeg),
+            credentials,
+            options,
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| e.to_string())?,
+            sessions: Mutex::new(HashMap::new()),
+            reservations: Mutex::new(HashMap::new()),
+            egress: Arc::new(AtomicU64::new(0)),
+            meter: Mutex::new((Instant::now(), 0, 0, 0)),
+            started: Instant::now(),
+            mirrors: Mutex::new(HashMap::new()),
+        }))
+    }
+    pub async fn reconcile(&self) {
+        for (name, signature) in self.media.workers().await {
+            let config = self.config.effective(&name).or(self
+                .mirrors
+                .lock()
+                .await
+                .get(&name)
+                .map(|(_, c)| c.clone()));
+            if let Some(c) = config {
+                if c["disabled"] == true {
+                    self.media.stop(&name).await;
+                } else if crate::media::media_signature(&c) != signature {
+                    self.media.stop(&name).await;
+                    let _ = self.media.ensure(&name, &c).await;
+                }
+            } else {
+                self.media.stop(&name).await;
+            }
+        }
+
+        let root = self.config.snapshot();
+        if let Some(streams) = root["streams"].as_array() {
+            for disk in streams {
+                if let Some(name) = disk["name"].as_str() {
+                    if let Some(c) = self.config.effective(name) {
+                        if c["disabled"] != true
+                            && c["static"] != false
+                            && self.options.role != "lb"
+                        {
+                            let _ = self.media.ensure(name, &c).await;
+                        }
+                    }
+                }
+            }
+        }
+        for name in self.media.idle().await {
+            if self
+                .config
+                .effective(&name)
+                .is_none_or(|c| c["static"] == false)
+            {
+                self.media.stop(&name).await;
+            }
+        }
+    }
+    async fn active(&self) -> u64 {
+        let mut s = self.sessions.lock().await;
+        s.retain(|_, v| v.last_seen.elapsed() < Duration::from_secs(30));
+        s.len() as u64
+    }
+    async fn node(&self) -> Value {
+        let cfg = self.config.snapshot();
+        let mut streams = Vec::new();
+        let names = cfg["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .map(str::to_owned)
+            .chain(
+                self.mirrors
+                    .lock()
+                    .await
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+            .collect::<Vec<_>>();
+        for name in names {
+            streams.push(json!({"name":name,"ready":self.media.ready(&name).await,"stats":self.media.stats(&name).await}));
+        }
+        let (total, idle) = cpu_ticks();
+        let bytes = self.egress.load(Ordering::Relaxed);
+        let mut m = self.meter.lock().await;
+        let elapsed = m.0.elapsed().as_secs_f64();
+        let cpu = if total > m.2 && m.2 > 0 {
+            1.0 - (idle.saturating_sub(m.3) as f64 / (total - m.2) as f64)
+        } else {
+            0.0
+        };
+        let mbps = (bytes.saturating_sub(m.1) as f64 * 8.0 / 1_000_000.0) / elapsed.max(0.1);
+        if elapsed >= 1.0 {
+            *m = (Instant::now(), bytes, total, idle)
+        }
+        drop(m);
+        let mut reservations = self.reservations.lock().await;
+        reservations.retain(|_, v| v.expires > Instant::now());
+        let reserved = reservations.len() as u64;
+        drop(reservations);
+        json!({"name":self.options.node_name,"role":self.options.role,"uptime":self.started.elapsed().as_secs(),"streams":streams,"cpu":cpu.clamp(0.0,1.0),"ram":ram_fraction(),"uplink":mbps/self.options.uplink_mbps,"egress_mbps":mbps,"uplink_mbps":self.options.uplink_mbps,"bytes_out":bytes,"active":self.active().await,"reserved":reserved,"limit":self.options.client_limit,"drain":self.options.drain,"age_ms":0})
+    }
+    async fn resolve(&self, name: &str) -> Option<Value> {
+        if let Some(c) = self.config.effective(name) {
+            return Some(c);
+        }
+        if let Some((when, c)) = self.mirrors.lock().await.get(name) {
+            if when.elapsed() < Duration::from_secs(10) {
+                return Some(c.clone());
+            }
+        }
+        let root = self.config.snapshot();
+        for source in root["sources"].as_array()? {
+            let api = source["api_url"].as_str()?;
+            let private = source["private_payload_url"].as_str().unwrap_or(api);
+            let key = source["cluster_key"]
+                .as_str()
+                .unwrap_or(&self.options.peer_key);
+            let url = format!(
+                "{}/flussonix/api/v1/stream/{}",
+                api.trim_end_matches('/'),
+                encoded_path(name)
+            );
+            if let Ok(resp) = self
+                .client
+                .get(url)
+                .header("X-Flussonix-Peer", key)
+                .send()
+                .await
+            {
+                if resp.status().is_success() {
+                    if let Ok(mut c) = resp.json::<Value>().await {
+                        c["inputs"] = json!([{"url":format!("{}/{}/index.m3u8",private.trim_end_matches('/'),encoded_path(name))}]);
+                        c["static"] = json!(false);
+                        c["flussonix_peer_key"] = json!(key);
+                        let mut mirrors = self.mirrors.lock().await;
+                        if mirrors.len() < 10000 {
+                            mirrors.insert(name.into(), (Instant::now(), c.clone()));
+                        }
+                        return Some(c);
+                    }
+                }
+            }
+        }
+        None
+    }
+    async fn authorize_viewer(
+        &self,
+        name: &str,
+        cfg: &Value,
+        headers: &HeaderMap,
+        query: &HashMap<String, String>,
+        ip: &str,
+    ) -> bool {
+        if self.credentials.peer(header(headers, "x-flussonix-peer")) {
+            return true;
+        }
+        let token = query.get("token").map(String::as_str).unwrap_or("");
+        let identity = format!(
+            "{name}\0{ip}\0{token}\0{}\0{cfg}",
+            header(headers, "authorization").unwrap_or("")
+        );
+        let id = format!("{:x}", Sha256::digest(identity.as_bytes()));
+        {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(s) = sessions.get_mut(&id) {
+                if s.valid_until > Instant::now() {
+                    s.last_seen = Instant::now();
+                    return true;
+                }
+            }
+        }
+        if let Some(hash) = cfg["flussonix_token_sha256"].as_str() {
+            if format!("{:x}", Sha256::digest(token.as_bytes())) != hash {
+                return false;
+            }
+        }
+        let mut duration = 10u64;
+        let mut user_id = id.clone();
+        let mut max_sessions = None;
+        if let Some(backend) = cfg["on_play"].as_str() {
+            let backend = if let Some(backend) = backend.strip_prefix("auth://") {
+                self.config.snapshot()["auth_backends"]
+                    .as_array()
+                    .and_then(|a| a.iter().find(|a| a["name"] == backend))
+                    .and_then(|a| a["url"].as_str())
+                    .map(str::to_owned)
+            } else {
+                Some(backend.to_owned())
+            };
+            let Some(backend) = backend else { return false };
+            if !backend.starts_with("http://") && !backend.starts_with("https://") {
+                return false;
+            }
+            let Ok(r) = self
+                .client
+                .get(backend)
+                .query(&[
+                    ("name", name),
+                    ("ip", ip),
+                    ("token", token),
+                    ("type", "hls"),
+                    ("request_type", "new_session"),
+                    ("referer", header(headers, "referer").unwrap_or("")),
+                    ("user_agent", header(headers, "user-agent").unwrap_or("")),
+                ])
+                .send()
+                .await
+            else {
+                return false;
+            };
+            if !r.status().is_success() {
+                return false;
+            }
+            duration = header(r.headers(), "x-authduration")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10)
+                .min(3600);
+            user_id = header(r.headers(), "x-userid").unwrap_or(&id).to_owned();
+            max_sessions =
+                header(r.headers(), "x-maxsessions").and_then(|v| v.parse::<usize>().ok());
+        }
+        let mut sessions = self.sessions.lock().await;
+        sessions.retain(|_, v| v.last_seen.elapsed() < Duration::from_secs(30));
+        if let Some(limit) = max_sessions {
+            if !sessions.contains_key(&id)
+                && sessions
+                    .values()
+                    .filter(|s| s.stream == name && s.user_id == user_id)
+                    .count()
+                    >= limit
+            {
+                return false;
+            }
+        }
+        if sessions.len() >= self.options.client_limit as usize && !sessions.contains_key(&id) {
+            return false;
+        }
+        sessions.insert(
+            id,
+            Session {
+                stream: name.into(),
+                user_id,
+                valid_until: Instant::now() + Duration::from_secs(duration),
+                last_seen: Instant::now(),
+            },
+        );
+        true
+    }
+}
+fn header<'a>(h: &'a HeaderMap, key: &str) -> Option<&'a str> {
+    h.get(key).and_then(|v| v.to_str().ok())
+}
+fn cpu_ticks() -> (u64, u64) {
+    let data = std::fs::read_to_string("/proc/stat").unwrap_or_default();
+    let values = data
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|v| v.parse::<u64>().ok())
+        .take(8)
+        .collect::<Vec<_>>();
+    (
+        values.iter().sum(),
+        values.get(3).copied().unwrap_or(0) + values.get(4).copied().unwrap_or(0),
+    )
+}
+fn ram_fraction() -> f64 {
+    let data = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let value = |key: &str| {
+        data.lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    let total = value("MemTotal:");
+    if total > 0.0 {
+        1.0 - value("MemAvailable:") / total
+    } else {
+        0.0
+    }
+}
+fn encoded_path(name: &str) -> String {
+    name.split('/')
+        .map(|s| {
+            percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+fn error(code: StatusCode, message: &str) -> Response {
+    (code, axum::Json(json!({"errors":[{"message":message}]}))).into_response()
+}
+fn json_response(value: Value) -> Response {
+    axum::Json(value).into_response()
+}
+fn parse_query(q: Option<&str>) -> HashMap<String, String> {
+    url::form_urlencoded::parse(q.unwrap_or("").as_bytes())
+        .into_owned()
+        .collect()
+}
+pub fn router(app: Arc<App>) -> Router {
+    Router::new().route("/health",axum::routing::get(||async{axum::Json(json!({"status":"ok","service":"FlussoniX","version":env!("CARGO_PKG_VERSION")}))}))
+ .route("/streamer/api/v3/{*tail}",axum::routing::any(management))
+ .route("/flussonix/api/v1/{*tail}",axum::routing::any(native))
+ .nest_service("/admin",tower_http::services::ServeDir::new(&app.options.web_dir).append_index_html_on_directories(true))
+ .fallback(media_request).with_state(app).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024))
+}
+async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
+    let role = app
+        .credentials
+        .authorize(header(request.headers(), "authorization"));
+    let Some(role) = role else {
+        let mut r = error(StatusCode::UNAUTHORIZED, "management credentials required");
+        r.headers_mut().insert(
+            "www-authenticate",
+            "Basic realm=\"FlussoniX\"".parse().unwrap(),
+        );
+        return r;
+    };
+    let method = request.method().clone();
+    if method != axum::http::Method::GET && role != Role::Edit {
+        return error(StatusCode::FORBIDDEN, "edit credentials required");
+    }
+    let tail = percent_encoding::percent_decode_str(
+        request.uri().path().trim_start_matches("/streamer/api/v3/"),
+    )
+    .decode_utf8_lossy()
+    .to_string();
+    let query = parse_query(request.uri().query());
+    let mut parts = tail.splitn(2, '/');
+    let resource = parts.next().unwrap_or("");
+    let name = parts.next();
+    if resource == "config" {
+        if name == Some("stats") && method == "GET" {
+            return json_response(app.node().await);
+        }
+        if name.is_some() {
+            return error(StatusCode::NOT_FOUND, "unknown config operation");
+        }
+        if method == "GET" {
+            return json_response(app.config.snapshot());
+        }
+        let body = match read_json(request).await {
+            Ok(b) => b,
+            Err((code, message)) => return error(code, &message),
+        };
+        let result = if method == "POST" {
+            app.config.validate(body)
+        } else if method == "PUT" {
+            app.config.replace(body)
+        } else {
+            return error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+        };
+        return match result {
+            Ok(v) => {
+                if method == "PUT" {
+                    app.sessions.lock().await.clear();
+                    app.mirrors.lock().await.clear();
+                    app.reconcile().await;
+                }
+                json_response(v)
+            }
+            Err(e) => error(StatusCode::BAD_REQUEST, &e),
+        };
+    }
+    let (kind, name) = if resource == "cluster" {
+        let Some(n) = name else {
+            return error(StatusCode::NOT_FOUND, "collection required");
+        };
+        let mut p = n.splitn(2, '/');
+        (p.next().unwrap(), p.next())
+    } else {
+        (resource, name)
+    };
+    if kind == "sessions" && method == "GET" {
+        let sessions = app.sessions.lock().await;
+        return json_response(
+            json!({"sessions":sessions.iter().map(|(id,s)|json!({"id":id,"name":s.stream,"user_id":s.user_id})).collect::<Vec<_>>(),"estimated_count":sessions.len()}),
+        );
+    }
+    if !KINDS.contains(&kind) {
+        return error(StatusCode::NOT_FOUND, "API operation not implemented");
+    }
+    if let Some(name) = name {
+        if kind == "streams" && method == "POST" && name.ends_with("/stop") {
+            app.media.stop(name.trim_end_matches("/stop")).await;
+            return json_response(json!({"status":"stopped"}));
+        }
+        if method == "GET" {
+            let root = app.config.snapshot();
+            let item = if kind == "streams" {
+                app.config.effective(name)
+            } else {
+                root[kind]
+                    .as_array()
+                    .and_then(|v| {
+                        v.iter()
+                            .find(|v| v["name"] == name || v["hostname"] == name)
+                    })
+                    .cloned()
+            };
+            return match item {
+                Some(mut v) => {
+                    if kind == "streams" {
+                        v["stats"] = app.media.stats(name).await;
+                    }
+                    json_response(v)
+                }
+                None => error(StatusCode::NOT_FOUND, "not found"),
+            };
+        }
+        if method == "PUT" {
+            let body = match read_json(request).await {
+                Ok(b) => b,
+                Err((code, message)) => return error(code, &message),
+            };
+            return match app.config.put(kind, name, body) {
+                Ok(mut v) => {
+                    app.sessions.lock().await.clear();
+                    if kind == "sources" {
+                        app.mirrors.lock().await.clear();
+                        app.reconcile().await;
+                    }
+                    if matches!(kind, "streams" | "templates") {
+                        app.sessions.lock().await.clear();
+                        app.reconcile().await;
+                        if kind == "streams" {
+                            v = app.config.effective(name).unwrap_or(v);
+                            v["stats"] = app.media.stats(name).await;
+                        }
+                    }
+                    json_response(v)
+                }
+                Err(e) => error(StatusCode::BAD_REQUEST, &e),
+            };
+        }
+        if method == "DELETE" {
+            return match app.config.delete(kind, name) {
+                Ok(true) => {
+                    app.sessions.lock().await.clear();
+                    if kind == "streams" {
+                        app.media.stop(name).await;
+                    }
+                    StatusCode::NO_CONTENT.into_response()
+                }
+                Ok(false) => error(StatusCode::NOT_FOUND, "not found"),
+                Err(e) => error(StatusCode::BAD_REQUEST, &e),
+            };
+        }
+        return error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if method != "GET" {
+        return error(StatusCode::METHOD_NOT_ALLOWED, "collection is read only");
+    }
+    let root = app.config.snapshot();
+    let mut items = root[kind].as_array().cloned().unwrap_or_default();
+    if kind == "streams" {
+        for item in &mut items {
+            if let Some(name) = item["name"].as_str().map(str::to_owned) {
+                *item = app.config.effective(&name).unwrap_or(item.clone());
+                item["stats"] = app.media.stats(&name).await;
+            }
+        }
+    }
+    if let Some(q) = query.get("q") {
+        items.retain(|v| v.to_string().to_lowercase().contains(&q.to_lowercase()));
+    }
+    items.sort_by_key(|v| {
+        v["name"]
+            .as_str()
+            .or(v["hostname"].as_str())
+            .unwrap_or("")
+            .to_owned()
+    });
+    if query.get("sort").is_some_and(|s| s == "-name") {
+        items.reverse()
+    }
+    let total = items.len();
+    let offset = query
+        .get("cursor")
+        .and_then(|s| STANDARD.decode(s).ok())
+        .and_then(|b| String::from_utf8(b).ok())
+        .map(|s| parse_query(Some(&s)))
+        .and_then(|p| p.get("$position_gt").and_then(|v| v.parse::<usize>().ok()))
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let limit = query
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 1000);
+    let page = items
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let mut result = json!({"estimated_count":total,"timing":{},"next":if offset+page.len()<total{Some(STANDARD.encode(format!("%24position_gt={}",offset+page.len()-1)))}else{None::<String>},"prev":null});
+    result[kind] = json!(page);
+    json_response(result)
+}
+async fn read_json(request: Request) -> Result<Value, (StatusCode, String)> {
+    let bytes = axum::body::to_bytes(request.into_body(), 2 * 1024 * 1024)
+        .await
+        .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "body exceeds limit".into()))?;
+    serde_json::from_slice(&bytes).map_err(|_| (StatusCode::BAD_REQUEST, "invalid JSON".into()))
+}
+async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
+    let tail = percent_encoding::percent_decode_str(
+        request
+            .uri()
+            .path()
+            .trim_start_matches("/flussonix/api/v1/"),
+    )
+    .decode_utf8_lossy()
+    .to_string();
+    let peer = app
+        .credentials
+        .peer(header(request.headers(), "x-flussonix-peer"));
+    let role = app
+        .credentials
+        .authorize(header(request.headers(), "authorization"));
+    if !peer && role.is_none() {
+        return error(StatusCode::UNAUTHORIZED, "credentials required");
+    }
+    if tail == "node" && request.method() == "GET" {
+        return json_response(app.node().await);
+    }
+    if tail == "capabilities" && request.method() == "GET" {
+        return json_response(
+            json!({"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","srt","m4s (H.264/AAC frame mode)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["hls","mpegts","fmp4-hls","m4s (H.264/AAC frame mode)","m4f (single-chunk H.264/AAC)"],"unimplemented":["m4s packed GOP mode","rtsps","rtp","srtp","dvr","push"],"transcoding":{"cpu":"libx264 / AAC","gpu":"h264_nvenc, requires supported NVIDIA hardware and runtime"},"cluster":"native HLS source discovery and reserved HTTP redirects"}),
+        );
+    }
+    if let Some(name) = tail.strip_prefix("stream/") {
+        if request.method() == "GET" && peer {
+            return match app.config.effective(name) {
+                Some(c) => json_response(c),
+                None => error(StatusCode::NOT_FOUND, "stream not found"),
+            };
+        }
+    }
+    if tail == "admit" && request.method() == "POST" && peer {
+        let b = match read_json(request).await {
+            Ok(b) => b,
+            Err((code, message)) => return error(code, &message),
+        };
+        let Some(name) = b["name"].as_str() else {
+            return error(StatusCode::BAD_REQUEST, "name required");
+        };
+        if valid_name(name).is_err() {
+            return error(StatusCode::BAD_REQUEST, "invalid name");
+        }
+        let n = app.node().await;
+        let expected =
+            b["bitrate_mbps"].as_f64().unwrap_or(2.0).clamp(0.1, 100.0) / app.options.uplink_mbps;
+        let mut reservations = app.reservations.lock().await;
+        reservations.retain(|_, v| v.expires > Instant::now());
+        if app.options.drain
+            || n["active"].as_u64().unwrap_or(0) + reservations.len() as u64
+                >= app.options.client_limit
+            || n["uplink"].as_f64().unwrap_or(1.0) + expected * (reservations.len() + 1) as f64
+                >= 0.9
+            || n["cpu"].as_f64().unwrap_or(1.0) >= 0.9
+            || n["ram"].as_f64().unwrap_or(1.0) >= 0.95
+        {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "node has no capacity");
+        }
+        let ticket = uuid::Uuid::new_v4().to_string();
+        reservations.insert(
+            ticket.clone(),
+            Reservation {
+                stream: name.into(),
+                expires: Instant::now() + Duration::from_secs(5),
+            },
+        );
+        return json_response(json!({"ticket":ticket,"expires_in":5}));
+    }
+    error(StatusCode::NOT_FOUND, "operation not implemented")
+}
+async fn balance(
+    app: &Arc<App>,
+    name: &str,
+    path: &str,
+    query: &HashMap<String, String>,
+) -> Response {
+    let root = app.config.snapshot();
+    let peers = root["peers"].as_array().cloned().unwrap_or_default();
+    let mut nodes = Vec::new();
+    let mut valid = HashMap::new();
+    let calls = peers.into_iter().map(|p| {
+        let app = app.clone();
+        let name = name.to_owned();
+        async move {
+            let api = p["api_url"].as_str()?;
+            let key = p["cluster_key"].as_str().unwrap_or(&app.options.peer_key);
+            let r = app
+                .client
+                .get(format!(
+                    "{}/flussonix/api/v1/node",
+                    api.trim_end_matches('/')
+                ))
+                .header("X-Flussonix-Peer", key)
+                .send()
+                .await
+                .ok()?;
+            if !r.status().is_success() {
+                return None;
+            }
+            let n = r.json::<Value>().await.ok()?;
+            let ready = n["streams"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|s| s["name"] == name && s["ready"] == true));
+            let id = p["hostname"].as_str()?.to_owned();
+            let limit = n["limit"].as_u64()?;
+            let load = NodeLoad {
+                name: id.clone(),
+                uplink: n["uplink"].as_f64()?
+                    + n["reserved"].as_u64().unwrap_or(0) as f64 * 2.0
+                        / n["uplink_mbps"].as_f64()?.max(1.0),
+                cpu: n["cpu"].as_f64()?,
+                ram: n["ram"].as_f64()?,
+                ready,
+                drain: n["drain"].as_bool().unwrap_or(true) || p["drain"] == true,
+                age_ms: 0,
+                active: n["active"].as_u64()? + n["reserved"].as_u64().unwrap_or(0),
+                limit,
+            };
+            Some((load, p))
+        }
+    });
+    for (load, p) in futures_util::future::join_all(calls)
+        .await
+        .into_iter()
+        .flatten()
+    {
+        valid.insert(load.name.clone(), p);
+        nodes.push(load)
+    }
+    while let Some(id) = select(&nodes, 0.01) {
+        let p = &valid[&id];
+        let api = p["api_url"].as_str().unwrap_or("");
+        let key = p["cluster_key"].as_str().unwrap_or(&app.options.peer_key);
+        let response = app
+            .client
+            .post(format!(
+                "{}/flussonix/api/v1/admit",
+                api.trim_end_matches('/')
+            ))
+            .header("X-Flussonix-Peer", key)
+            .json(&json!({"name":name,"bitrate_mbps":2.0}))
+            .send()
+            .await;
+        if let Ok(r) = response {
+            if r.status().is_success() {
+                if let Ok(body) = r.json::<Value>().await {
+                    if let (Some(public), Some(ticket)) =
+                        (p["public_payload_url"].as_str(), body["ticket"].as_str())
+                    {
+                        let mut q = query.clone();
+                        q.insert("flussonix_ticket".into(), ticket.into());
+                        let query = url::form_urlencoded::Serializer::new(String::new())
+                            .extend_pairs(q.iter())
+                            .finish();
+                        let url = format!(
+                            "{}/{}?{}",
+                            public.trim_end_matches('/'),
+                            path.trim_start_matches('/'),
+                            query
+                        );
+                        return (StatusCode::FOUND, [("location", url)]).into_response();
+                    }
+                }
+            }
+        }
+        nodes.retain(|n| n.name != id);
+    }
+    error(StatusCode::SERVICE_UNAVAILABLE, "no available CDN node")
+}
+async fn media_request(State(app): State<Arc<App>>, request: Request) -> Response {
+    if request.method() != "GET" {
+        return error(StatusCode::METHOD_NOT_ALLOWED, "playback requires GET");
+    }
+    let raw_path = request.uri().path();
+    let path = percent_encoding::percent_decode_str(raw_path.trim_start_matches('/'))
+        .decode_utf8_lossy()
+        .to_string();
+    let special = if path.ends_with(".m4f") {
+        let p = path.rsplitn(7, '/').collect::<Vec<_>>();
+        if p.len() == 7 {
+            Some((
+                p[6].to_owned(),
+                p[..6].iter().rev().copied().collect::<Vec<_>>().join("/"),
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let (name, file) = if let Some((n, f)) = &special {
+        (n.as_str(), f.as_str())
+    } else if let Some(n) = path.strip_suffix("/m4f") {
+        (n, "m4f")
+    } else if let Some(n) = path.strip_suffix("/m4s") {
+        (n, "m4s")
+    } else if let Some(n) = path.strip_suffix("/mpegts") {
+        (n, "mpegts")
+    } else if let Some((n, _f)) = path.split_once("/fmp4/") {
+        (n, &path[n.len() + 1..])
+    } else if let Some((n, f)) = path.rsplit_once('/') {
+        (n, f)
+    } else {
+        return error(StatusCode::NOT_FOUND, "media path required");
+    };
+    if valid_name(name).is_err() {
+        return error(StatusCode::BAD_REQUEST, "invalid stream name");
+    }
+    let Some(cfg) = app.resolve(name).await else {
+        return error(StatusCode::NOT_FOUND, "stream not found");
+    };
+    if cfg["disabled"] == true {
+        return error(StatusCode::NOT_FOUND, "stream disabled");
+    }
+    let query = parse_query(request.uri().query());
+    let ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|v| v.0.ip().to_string())
+        .unwrap_or_else(|| "127.0.0.1".into());
+    if !app
+        .authorize_viewer(name, &cfg, request.headers(), &query, &ip)
+        .await
+    {
+        return error(StatusCode::FORBIDDEN, "playback denied");
+    }
+    if app.options.role == "lb" {
+        return balance(&app, name, raw_path, &query).await;
+    }
+    if let Some(ticket) = query.get("flussonix_ticket") {
+        let mut reservations = app.reservations.lock().await;
+        match reservations.remove(ticket) {
+            Some(r) if r.stream == name && r.expires > Instant::now() => {}
+            _ => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "admission ticket invalid or expired",
+                );
+            }
+        }
+    }
+    let worker = match app.media.ensure(name, &cfg).await {
+        Ok(w) => w,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "stream input unavailable"),
+    };
+    if file == "m4s" || file == "m4f" {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !worker.wire.has_info()
+            && worker.alive.load(Ordering::Relaxed)
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if !worker.wire.has_info() {
+            return error(
+                StatusCode::NOT_IMPLEMENTED,
+                "wire outputs require H.264/AAC media",
+            );
+        }
+        let Some((initial, rx)) = (if file == "m4f" {
+            Some(worker.wire.signal_subscribe())
+        } else {
+            worker.m4s_subscribe()
+        }) else {
+            return error(
+                StatusCode::NOT_IMPLEMENTED,
+                "M4S relay requires an M4S input",
+            );
+        };
+        worker.viewers.fetch_add(1, Ordering::Relaxed);
+        let guard = ViewerGuard(worker.clone());
+        let egress = app.egress.clone();
+        let live = futures_util::stream::unfold(
+            (rx, guard, egress.clone()),
+            |(mut rx, guard, egress)| async move {
+                match tokio::select! {_=guard.0.closed()=>Err(tokio::sync::broadcast::error::RecvError::Closed),result=rx.recv()=>result}
+                {
+                    Ok(bytes) => {
+                        egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        Some((Ok::<Bytes, std::io::Error>(bytes), (rx, guard, egress)))
+                    }
+                    Err(_) => None,
+                }
+            },
+        );
+        let boot = futures_util::stream::iter(initial.into_iter().map(move |b| {
+            egress.fetch_add(b.len() as u64, Ordering::Relaxed);
+            Ok::<Bytes, std::io::Error>(b)
+        }));
+        use futures_util::StreamExt;
+        return (
+            [
+                (
+                    "content-type",
+                    if file == "m4f" {
+                        "application/x-video-m4f-signal"
+                    } else {
+                        "application/x-video-m4s"
+                    },
+                ),
+                ("cache-control", "no-store"),
+            ],
+            Body::from_stream(boot.chain(live)),
+        )
+            .into_response();
+    }
+    if file == "mpegts" {
+        let rx = worker.subscribe();
+        worker.viewers.fetch_add(1, Ordering::Relaxed);
+        let guard = ViewerGuard(worker.clone());
+        let egress = app.egress.clone();
+        let stream = futures_util::stream::unfold(
+            (rx, guard, egress),
+            |(mut rx, guard, egress)| async move {
+                match tokio::select! {_=guard.0.closed()=>Err(tokio::sync::broadcast::error::RecvError::Closed),result=rx.recv()=>result}
+                {
+                    Ok(bytes) => {
+                        egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        Some((Ok::<Bytes, std::io::Error>(bytes), (rx, guard, egress)))
+                    }
+                    Err(_) => None,
+                }
+            },
+        );
+        return (
+            [
+                ("Content-Type".to_owned(), "video/mp2t".to_owned()),
+                ("Cache-Control".into(), "no-store".into()),
+            ],
+            Body::from_stream(stream),
+        )
+            .into_response();
+    }
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let bytes = loop {
+        match app.media.read(name, file).await {
+            Ok(b) => break b,
+            Err(_)
+                if file.ends_with(".m3u8")
+                    && Instant::now() < deadline
+                    && worker.alive.load(Ordering::Relaxed) =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await
+            }
+            Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "media not ready"),
+        }
+    };
+    let bytes = if file.ends_with(".m3u8") {
+        let mut q = query.clone();
+        q.remove("flussonix_ticket");
+        let suffix = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(q.iter())
+            .finish();
+        Bytes::from(rewrite_playlist(&String::from_utf8_lossy(&bytes), &suffix))
+    } else {
+        bytes
+    };
+    app.egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    let content_type = if file.ends_with(".m3u8") {
+        "application/vnd.apple.mpegurl"
+    } else if file.ends_with(".ts") {
+        "video/mp2t"
+    } else if file.ends_with(".m4f") {
+        "application/x-video-m4f"
+    } else {
+        "video/mp4"
+    };
+    (
+        [
+            ("content-type", content_type),
+            ("cache-control", "no-store"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+struct ViewerGuard(Arc<Worker>);
+impl Drop for ViewerGuard {
+    fn drop(&mut self) {
+        self.0.viewers.fetch_sub(1, Ordering::Relaxed);
+        self.0.touch();
+    }
+}
+pub fn rewrite_playlist(text: &str, query: &str) -> String {
+    if query.is_empty() {
+        return text.to_owned();
+    }
+    let append = |u: &str| format!("{}{}{}", u, if u.contains('?') { "&" } else { "?" }, query);
+    text.lines()
+        .map(|line| {
+            if !line.starts_with('#') && !line.is_empty() {
+                append(line)
+            } else if let Some((before, after)) = line.split_once("URI=\"") {
+                if let Some((uri, rest)) = after.split_once('"') {
+                    format!("{before}URI=\"{}\"{rest}", append(uri))
+                } else {
+                    line.into()
+                }
+            } else {
+                line.into()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}

@@ -1,0 +1,64 @@
+use base64::{Engine, engine::general_purpose::STANDARD};
+use flussonix::{
+    auth::{Credentials, Role},
+    cluster::{NodeLoad, select},
+};
+#[test]
+fn edit_view_and_peer_credentials_are_separate() {
+    let c = Credentials::new(
+        "admin",
+        "edit-secret",
+        Some(("viewer", "view-secret")),
+        "peer-secret",
+    );
+    let basic = |u: &str, p: &str| format!("Basic {}", STANDARD.encode(format!("{u}:{p}")));
+    assert_eq!(
+        c.authorize(Some(&basic("admin", "edit-secret"))),
+        Some(Role::Edit)
+    );
+    assert_eq!(
+        c.authorize(Some(&basic("viewer", "view-secret"))),
+        Some(Role::View)
+    );
+    assert_eq!(
+        c.authorize(Some(&format!(
+            "Bearer {}",
+            STANDARD.encode("admin:edit-secret")
+        ))),
+        Some(Role::Edit)
+    );
+    assert_eq!(c.authorize(Some(&basic("admin", "wrong"))), None);
+    assert_eq!(c.authorize(Some("peer-secret")), None);
+    assert!(!c.peer(Some("edit-secret")));
+    assert!(c.peer(Some("peer-secret")));
+}
+fn node(name: &str, uplink: f64, ready: bool) -> NodeLoad {
+    NodeLoad {
+        name: name.into(),
+        uplink,
+        cpu: 0.1,
+        ram: 0.2,
+        ready,
+        drain: false,
+        age_ms: 0,
+        active: 0,
+        limit: 100,
+    }
+}
+#[test]
+fn balancer_excludes_stale_drained_full_and_saturated_nodes() {
+    let mut stale = node("stale", 0.0, true);
+    stale.age_ms = 15000;
+    let mut drained = node("drain", 0.0, true);
+    drained.drain = true;
+    let mut full = node("full", 0.0, true);
+    full.active = 100;
+    let busy = node("busy", 0.99, true);
+    let cached = node("cached", 0.3, true);
+    let free = node("free", 0.1, false);
+    assert_eq!(
+        select(&[stale, drained, full, busy, cached, free], 0.02).unwrap(),
+        "cached"
+    );
+    assert_eq!(select(&[node("saturated", 0.99, true)], 0.02), None);
+}
