@@ -4,5 +4,6 @@ pub mod config;
 pub mod m4f;
 pub mod m4s;
 pub mod media;
+pub mod playback_auth;
 pub mod server;
 pub mod wire;

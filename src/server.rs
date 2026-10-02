@@ -3,6 +3,7 @@ use crate::{
     cluster::{NodeLoad, select},
     config::{ConfigStore, KINDS, valid_name},
     media::{Engine, Worker},
+    playback_auth::{AuthOutcome, Grant, PlaybackAuth, Policy, ViewerRequest},
 };
 use axum::{
     Router,
@@ -14,7 +15,6 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -60,13 +60,6 @@ impl Default for Options {
         }
     }
 }
-struct Session {
-    stream: String,
-    user_id: String,
-    valid_until: Instant,
-    last_seen: Instant,
-    live: Arc<AtomicU64>,
-}
 struct Reservation {
     stream: String,
     expires: Instant,
@@ -77,7 +70,7 @@ pub struct App {
     credentials: Credentials,
     pub options: Options,
     client: reqwest::Client,
-    sessions: Mutex<HashMap<String, Session>>,
+    pub playback_auth: PlaybackAuth,
     reservations: Mutex<HashMap<String, Reservation>>,
     pub egress: Arc<AtomicU64>,
     meter: Mutex<(Instant, u64, u64, u64)>,
@@ -114,14 +107,14 @@ impl App {
             config: ConfigStore::open(config)?,
             media: Engine::new(media, &options.ffmpeg),
             credentials,
-            options,
+            options: options.clone(),
             client: reqwest::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(3))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| e.to_string())?,
-            sessions: Mutex::new(HashMap::new()),
+            playback_auth: PlaybackAuth::new(options.client_limit as usize),
             reservations: Mutex::new(HashMap::new()),
             egress: Arc::new(AtomicU64::new(0)),
             meter: Mutex::new((Instant::now(), 0, 0, 0)),
@@ -174,19 +167,9 @@ impl App {
             }
         }
     }
-    async fn invalidate_sessions(&self) {
-        let mut sessions = self.sessions.lock().await;
-        sessions.retain(|_, s| s.live.load(Ordering::Relaxed) > 0);
-        for s in sessions.values_mut() {
-            s.valid_until = Instant::now();
-        }
-    }
+    async fn invalidate_sessions(&self) {}
     async fn active(&self) -> u64 {
-        let mut s = self.sessions.lock().await;
-        s.retain(|_, v| {
-            v.live.load(Ordering::Relaxed) > 0 || v.last_seen.elapsed() < Duration::from_secs(30)
-        });
-        s.len() as u64
+        self.playback_auth.active()
     }
     async fn node(&self) -> Value {
         let cfg = self.config.snapshot();
@@ -273,154 +256,6 @@ impl App {
         }
         None
     }
-    async fn hold_session(
-        &self,
-        name: &str,
-        cfg: &Value,
-        headers: &HeaderMap,
-        query: &HashMap<String, String>,
-        ip: &str,
-    ) -> Option<SessionLease> {
-        let sessions = self.sessions.lock().await;
-        let live = sessions
-            .get(&viewer_identity(name, cfg, headers, query, ip))?
-            .live
-            .clone();
-        live.fetch_add(1, Ordering::Relaxed);
-        Some(SessionLease(live))
-    }
-    async fn authorize_viewer(
-        &self,
-        name: &str,
-        cfg: &Value,
-        headers: &HeaderMap,
-        query: &HashMap<String, String>,
-        ip: &str,
-    ) -> bool {
-        if self.credentials.peer(header(headers, "x-flussonix-peer")) {
-            return true;
-        }
-        let token = query.get("token").map(String::as_str).unwrap_or("");
-        let id = viewer_identity(name, cfg, headers, query, ip);
-        {
-            let mut sessions = self.sessions.lock().await;
-            if let Some(s) = sessions.get_mut(&id) {
-                if s.valid_until > Instant::now() {
-                    s.last_seen = Instant::now();
-                    return true;
-                }
-            }
-        }
-        if let Some(hash) = cfg.get("flussonix_token_sha256") {
-            let Some(hash) = hash.as_str() else {
-                return false;
-            };
-            if !format!("{:x}", Sha256::digest(token.as_bytes())).eq_ignore_ascii_case(hash) {
-                return false;
-            }
-        }
-        let mut duration = 10u64;
-        let mut user_id = id.clone();
-        let mut max_sessions = None;
-        if let Some(backend) = cfg.get("on_play") {
-            let Some(backend) = backend.as_str() else {
-                return false;
-            };
-            let backend = if let Some(backend) = backend.strip_prefix("auth://") {
-                self.config.snapshot()["auth_backends"]
-                    .as_array()
-                    .and_then(|a| a.iter().find(|a| a["name"] == backend))
-                    .and_then(|a| a["url"].as_str())
-                    .map(str::to_owned)
-            } else {
-                Some(backend.to_owned())
-            };
-            let Some(backend) = backend else { return false };
-            if !backend.starts_with("http://") && !backend.starts_with("https://") {
-                return false;
-            }
-            let Ok(r) = self
-                .client
-                .get(backend)
-                .query(&[
-                    ("name", name),
-                    ("ip", ip),
-                    ("token", token),
-                    ("type", "hls"),
-                    ("request_type", "new_session"),
-                    ("referer", header(headers, "referer").unwrap_or("")),
-                    ("user_agent", header(headers, "user-agent").unwrap_or("")),
-                ])
-                .send()
-                .await
-            else {
-                return false;
-            };
-            if !r.status().is_success() {
-                return false;
-            }
-            duration = header(r.headers(), "x-authduration")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10)
-                .min(3600);
-            user_id = header(r.headers(), "x-userid").unwrap_or(&id).to_owned();
-            max_sessions =
-                header(r.headers(), "x-maxsessions").and_then(|v| v.parse::<usize>().ok());
-        }
-        let mut sessions = self.sessions.lock().await;
-        sessions.retain(|_, v| {
-            v.live.load(Ordering::Relaxed) > 0 || v.last_seen.elapsed() < Duration::from_secs(30)
-        });
-        if let Some(limit) = max_sessions {
-            if !sessions.contains_key(&id)
-                && sessions
-                    .values()
-                    .filter(|s| s.stream == name && s.user_id == user_id)
-                    .count()
-                    >= limit
-            {
-                return false;
-            }
-        }
-        if sessions.len() >= self.options.client_limit as usize && !sessions.contains_key(&id) {
-            return false;
-        }
-        let live = sessions
-            .get(&id)
-            .map(|s| s.live.clone())
-            .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
-        sessions.insert(
-            id,
-            Session {
-                stream: name.into(),
-                user_id,
-                valid_until: Instant::now() + Duration::from_secs(duration),
-                last_seen: Instant::now(),
-                live,
-            },
-        );
-        true
-    }
-}
-struct SessionLease(Arc<AtomicU64>);
-impl Drop for SessionLease {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-fn viewer_identity(
-    name: &str,
-    cfg: &Value,
-    headers: &HeaderMap,
-    query: &HashMap<String, String>,
-    ip: &str,
-) -> String {
-    let token = query.get("token").map(String::as_str).unwrap_or("");
-    let identity = format!(
-        "{name}\0{ip}\0{token}\0{}\0{cfg}",
-        header(headers, "authorization").unwrap_or("")
-    );
-    format!("{:x}", Sha256::digest(identity.as_bytes()))
 }
 fn header<'a>(h: &'a HeaderMap, key: &str) -> Option<&'a str> {
     h.get(key).and_then(|v| v.to_str().ok())
@@ -551,10 +386,8 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         (resource, name)
     };
     if kind == "sessions" && method == "GET" {
-        let sessions = app.sessions.lock().await;
-        return json_response(
-            json!({"sessions":sessions.iter().map(|(id,s)|json!({"id":id,"name":s.stream,"user_id":s.user_id})).collect::<Vec<_>>(),"estimated_count":sessions.len()}),
-        );
+        let sessions = app.playback_auth.snapshots();
+        return json_response(json!({"estimated_count":sessions.len(),"sessions":sessions}));
     }
     if !KINDS.contains(&kind) {
         return error(StatusCode::NOT_FOUND, "API operation not implemented");
@@ -716,23 +549,21 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
         if request.method() == "GET" && peer {
             return match app.config.effective(name) {
                 Some(mut c) => {
-                    if let Some(backend) = c["on_play"]
-                        .as_str()
-                        .and_then(|p| p.strip_prefix("auth://"))
-                    {
-                        let root = app.config.snapshot();
-                        let url = root["auth_backends"]
-                            .as_array()
-                            .and_then(|b| b.iter().find(|b| b["name"] == backend))
-                            .and_then(|b| b["url"].as_str())
-                            .map(str::to_owned);
-                        let Some(url) = url else {
-                            return error(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "source authentication policy unavailable",
-                            );
+                    if let Some(value) = c.get("on_play").cloned() {
+                        let policy = match Policy::from_config(&c, &app.config.snapshot()) {
+                            Ok(p) => p,
+                            Err(_) => {
+                                return error(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "source authentication policy unavailable",
+                                );
+                            }
                         };
-                        c["on_play"] = json!(url);
+                        if value.is_object() {
+                            c["on_play"]["url"] = json!(policy.url);
+                        } else {
+                            c["on_play"] = json!(policy.url);
+                        }
                     }
                     json_response(c)
                 }
@@ -949,12 +780,44 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         .get::<ConnectInfo<SocketAddr>>()
         .map(|v| v.0.ip().to_string())
         .unwrap_or_else(|| "127.0.0.1".into());
-    if !app
-        .authorize_viewer(name, &cfg, request.headers(), &query, &ip)
-        .await
+    let grant = if app
+        .credentials
+        .peer(header(request.headers(), "x-flussonix-peer"))
     {
-        return error(StatusCode::FORBIDDEN, "playback denied");
-    }
+        Grant::peer()
+    } else {
+        let policy = match Policy::from_config(&cfg, &app.config.snapshot()) {
+            Ok(p) => p,
+            Err(_) => return error(StatusCode::FORBIDDEN, "invalid playback policy"),
+        };
+        let qs = request.uri().query().unwrap_or("");
+        let viewer = ViewerRequest {
+            name: name.into(),
+            proto: if file == "mpegts" {
+                "mpegts"
+            } else if file == "m4s" {
+                "m4s"
+            } else if file == "m4f" || file.ends_with(".m4f") {
+                "m4f"
+            } else {
+                "hls"
+            }
+            .into(),
+            ip,
+            token: query.get("token").cloned().unwrap_or_default(),
+            qs: qs.into(),
+            user_agent: header(request.headers(), "user-agent").unwrap_or("").into(),
+            referer: header(request.headers(), "referer").unwrap_or("").into(),
+            host: header(request.headers(), "host").unwrap_or("").into(),
+        };
+        match app.playback_auth.authorize(policy, viewer).await {
+            AuthOutcome::Allowed(g) => g,
+            AuthOutcome::Denied => return error(StatusCode::FORBIDDEN, "playback denied"),
+            AuthOutcome::Redirect(url) => {
+                return (StatusCode::FOUND, [("location", url)]).into_response();
+            }
+        }
+    };
     if app.options.role == "lb" {
         return balance(&app, name, raw_path, &query).await;
     }
@@ -1013,11 +876,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             );
         };
         worker.viewers.fetch_add(1, Ordering::Relaxed);
-        let guard = ViewerGuard(
-            worker.clone(),
-            app.hold_session(name, &cfg, request.headers(), &query, &ip)
-                .await,
-        );
+        let guard = ViewerGuard(worker.clone(), grant);
         let egress = app.egress.clone();
         let live = futures_util::stream::unfold(
             (rx, guard, egress.clone()),
@@ -1056,11 +915,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     if file == "mpegts" {
         let rx = worker.subscribe();
         worker.viewers.fetch_add(1, Ordering::Relaxed);
-        let guard = ViewerGuard(
-            worker.clone(),
-            app.hold_session(name, &cfg, request.headers(), &query, &ip)
-                .await,
-        );
+        let guard = ViewerGuard(worker.clone(), grant);
         let egress = app.egress.clone();
         let stream = futures_util::stream::unfold(
             (rx, guard, egress),
@@ -1127,7 +982,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     )
         .into_response()
 }
-struct ViewerGuard(Arc<Worker>, #[allow(dead_code)] Option<SessionLease>);
+struct ViewerGuard(Arc<Worker>, #[allow(dead_code)] Grant);
 impl Drop for ViewerGuard {
     fn drop(&mut self) {
         self.0.viewers.fetch_sub(1, Ordering::Relaxed);
@@ -1193,9 +1048,7 @@ mod continuous_session_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
-        for session in app.sessions.lock().await.values_mut() {
-            session.last_seen = Instant::now() - Duration::from_secs(31);
-        }
+        app.playback_auth.age_activity(31);
         assert_eq!(
             app.node().await["active"],
             1,

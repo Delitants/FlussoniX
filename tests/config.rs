@@ -131,3 +131,41 @@ fn invalid_auth_settings_never_save_or_disable_inherited_protection() {
         }
     }
 }
+
+#[test]
+fn structured_auth_policy_validates_keys_and_preserves_template_options() {
+    let d = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(d.path().join("c.json")).unwrap();
+    store
+        .put(
+            "auth_backends",
+            "billing",
+            json!({"url":"https://middleware.example/auth"}),
+        )
+        .unwrap();
+    assert!(store.put("templates","secure",json!({"on_play":{"url":"auth://billing","session_keys":["name","proto","token"],"max_sessions":2}})).is_ok());
+    store
+        .put(
+            "streams",
+            "owned",
+            json!({"template":"secure","static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    assert_eq!(
+        store.effective("owned").unwrap()["on_play"]["session_keys"],
+        json!(["name", "proto", "token"])
+    );
+    for policy in [
+        json!({"url":"file:///auth"}),
+        json!({"url":"auth://missing"}),
+        json!({"url":"https://middleware.example","domains":["example.org"]}),
+        json!({"url":"https://middleware.example","session_keys":["token"]}),
+        json!({"url":"https://middleware.example","max_sessions":-1}),
+    ] {
+        assert!(
+            store
+                .put("streams", "bad", json!({"on_play":policy}))
+                .is_err()
+        );
+    }
+}

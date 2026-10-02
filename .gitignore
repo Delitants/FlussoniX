@@ -1,15 +1,15 @@
 __pycache__/
 *.pyc
-/target/
+/target
 /node_modules/
 /reference-private/
 /.env
 /.env.*
 /.superdesign/tmp/
-/.tools/
+/.tools
 /.runtime/
 /.superpowers/
-/web/node_modules/
+/web/node_modules
 /web/dist/
 /test-results/
 

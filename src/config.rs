@@ -276,25 +276,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                         return Err("nested templates are not implemented".into());
                     }
                 }
-                if let Some(policy) = item.get("on_play") {
-                    let policy = policy.as_str().ok_or("on_play must be a URL string")?;
-                    if let Some(name) = policy.strip_prefix("auth://") {
-                        valid_name(name)?;
-                        if !root["auth_backends"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .any(|b| b["name"] == name)
-                        {
-                            return Err("auth backend not found".into());
-                        }
-                    } else {
-                        let url = url::Url::parse(policy).map_err(|_| "invalid on_play URL")?;
-                        if !["http", "https"].contains(&url.scheme()) || url.host_str().is_none() {
-                            return Err("on_play must use HTTP(S) or auth://backend".into());
-                        }
-                    }
-                }
+                crate::playback_auth::Policy::from_config(item, root)?;
                 if let Some(hash) = item.get("flussonix_token_sha256") {
                     if !hash
                         .as_str()
