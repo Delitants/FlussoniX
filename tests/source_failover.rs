@@ -168,7 +168,17 @@ async fn kill_cdn_worker(cdn: &Node) {
             .unwrap()
             .success()
     );
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let stats = cdn.app.media.stats("region/news").await;
+            if stats["status"] == "retrying" && stats["retry_in_ms"] == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
 }
 async fn cleanup(nodes: [Node; 3]) {
     for n in nodes {

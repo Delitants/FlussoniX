@@ -94,6 +94,7 @@ pub struct App {
     pub started: Instant,
     mirrors: Mutex<HashMap<String, Mirror>>,
     source_queries: tokio::sync::Semaphore,
+    source_lookups: Mutex<HashMap<String, origin_resolution::Ticket>>,
 }
 impl App {
     pub fn new(
@@ -139,6 +140,7 @@ impl App {
             started: Instant::now(),
             mirrors: Mutex::new(HashMap::new()),
             source_queries: tokio::sync::Semaphore::new(64),
+            source_lookups: Mutex::new(HashMap::new()),
         });
         app.sample_metrics();
         Ok(app)

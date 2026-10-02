@@ -10,7 +10,7 @@
 ## Global constraints
 
 - Optional native identities:1..128 ASCII letters/digits/dot/underscore/hyphen; eight sources per failover group.
-- Four concurrent metadata requests;750ms each;3s total;1MiB JSON; no redirects.
+- Four concurrent metadata requests per lookup,64 per node;750ms each including concurrency wait;3s total;1MiB JSON; no redirects.
 - Same group/content identity/normalized viewer Policy required for an existing route switch. Disabled/invalid/404 known authority fails closed.
 - Local precedence, source-specific peer keys/private paths, actual demand/config fences and original wire relay preserved.
 - Never mutate or signal production/demo services. Standing user authorization covers isolated test copies and GitHub publication.

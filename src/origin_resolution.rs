@@ -7,7 +7,78 @@ enum OriginState {
     Unavailable,
     Unresolved,
 }
+#[derive(Clone)]
+pub(super) struct Ticket {
+    id: uuid::Uuid,
+    done: tokio::sync::watch::Sender<bool>,
+}
+struct Lookup {
+    old: Option<Mirror>,
+    ticket: Ticket,
+    deadline: tokio::time::Instant,
+}
+impl Drop for Lookup {
+    fn drop(&mut self) {
+        self.ticket.done.send_replace(true);
+    }
+}
 impl App {
+    async fn begin_lookup(&self, name: &str, root: &Value, revision: u64) -> Option<Lookup> {
+        let mut tickets = self.source_lookups.lock().await;
+        if tickets.len() >= 10000 && !tickets.contains_key(name) {
+            return None;
+        }
+        let mirrors = self.mirrors.lock().await;
+        self.config.at_revision(revision, |_| {
+            let old = mirrors
+                .get(name)
+                .filter(|m| {
+                    root["sources"]
+                        .as_array()
+                        .is_some_and(|s| s.contains(&m.source))
+                })
+                .cloned();
+            let ticket = Ticket {
+                id: uuid::Uuid::new_v4(),
+                done: tokio::sync::watch::channel(false).0,
+            };
+            tickets.insert(name.into(), ticket.clone());
+            Lookup {
+                old,
+                ticket,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(3),
+            }
+        })
+    }
+    async fn latest_lookup(&self, name: &str, lookup: &Lookup, revision: u64) -> Option<Resolved> {
+        loop {
+            let ticket = self.source_lookups.lock().await.get(name)?.clone();
+            let mut done = ticket.done.subscribe();
+            tokio::time::timeout_at(lookup.deadline, done.wait_for(|complete| *complete))
+                .await
+                .ok()?
+                .ok()?;
+            let tickets = self.source_lookups.lock().await;
+            if tickets
+                .get(name)
+                .is_none_or(|latest| latest.id != ticket.id)
+            {
+                continue;
+            }
+            let mirrors = self.mirrors.lock().await;
+            return self.config.at_revision(revision, |root| {
+                mirrors
+                    .get(name)
+                    .filter(|m| {
+                        root["sources"]
+                            .as_array()
+                            .is_some_and(|s| s.contains(&m.source))
+                    })
+                    .and_then(|m| self.publish_resolved(name, m, root, revision))
+            })?;
+        }
+    }
+
     async fn query_source(&self, source: &Value, name: &str) -> Result<Value, LookupFailure> {
         tokio::time::timeout(Duration::from_millis(750), async {
             let _permit = self
@@ -121,12 +192,21 @@ impl App {
     async fn install_origin(
         &self,
         name: &str,
-        old: Option<&Mirror>,
+        lookup: &Lookup,
         source: &Value,
         config: Value,
         state: OriginState,
         revision: u64,
     ) -> Option<Resolved> {
+        let tickets = self.source_lookups.lock().await;
+        if tickets
+            .get(name)
+            .is_none_or(|current| current.id != lookup.ticket.id)
+        {
+            drop(tickets);
+            return self.latest_lookup(name, lookup, revision).await;
+        }
+        let old = lookup.old.as_ref();
         let available = matches!(state, OriginState::Ready);
         let known = !matches!(state, OriginState::Unresolved);
         let mut mirrors = self.mirrors.lock().await;
@@ -188,13 +268,28 @@ impl App {
         let failed = stats["status"] == "retrying" && stats["retry_in_ms"] == 0;
         if let Some(m) = old.as_ref() {
             if m.available && m.when.elapsed() < Duration::from_secs(10) && !failed {
-                return self.resolved(name, m.config.clone(), revision);
+                // Stats acquisition may yield while a newer lookup publishes a
+                // denial or switches origins. Publish the current mirror under
+                // its lock, never the snapshot taken before that await.
+                let mirrors = self.mirrors.lock().await;
+                return self.config.at_revision(revision, |root| {
+                    mirrors
+                        .get(name)
+                        .filter(|current| {
+                            root["sources"]
+                                .as_array()
+                                .is_some_and(|s| s.contains(&current.source))
+                        })
+                        .and_then(|current| self.publish_resolved(name, current, root, revision))
+                })?;
             }
             if !m.available && m.when.elapsed() < Duration::from_secs(1) {
                 return None;
             }
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let lookup = self.begin_lookup(name, &root, revision).await?;
+        let old = lookup.old.clone();
+        let deadline = lookup.deadline;
         let mut authority = None;
         let mut current = None;
         if let Some(m) = old.as_ref().filter(|m| m.known) {
@@ -210,7 +305,7 @@ impl App {
                             return self
                                 .install_origin(
                                     name,
-                                    old.as_ref(),
+                                    &lookup,
                                     &m.source,
                                     c,
                                     OriginState::Ready,
@@ -225,7 +320,7 @@ impl App {
                         return self
                             .install_origin(
                                 name,
-                                old.as_ref(),
+                                &lookup,
                                 &m.source,
                                 c,
                                 OriginState::Unavailable,
@@ -237,7 +332,7 @@ impl App {
                         return self
                             .install_origin(
                                 name,
-                                old.as_ref(),
+                                &lookup,
                                 &m.source,
                                 m.config.clone(),
                                 OriginState::Unavailable,
@@ -250,7 +345,7 @@ impl App {
                     return self
                         .install_origin(
                             name,
-                            old.as_ref(),
+                            &lookup,
                             &m.source,
                             m.config.clone(),
                             OriginState::Unavailable,
@@ -314,7 +409,7 @@ impl App {
             return self
                 .install_origin(
                     name,
-                    old.as_ref(),
+                    &lookup,
                     &source,
                     c,
                     if available {
@@ -331,7 +426,7 @@ impl App {
             return self
                 .install_origin(
                     name,
-                    old.as_ref(),
+                    &lookup,
                     &m.source,
                     current.unwrap_or_else(|| m.config.clone()),
                     if available {
@@ -348,7 +443,7 @@ impl App {
             return self
                 .install_origin(
                     name,
-                    old.as_ref(),
+                    &lookup,
                     source,
                     json!({"name":name,"disabled":true}),
                     OriginState::Unresolved,
