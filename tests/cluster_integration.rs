@@ -7,6 +7,9 @@ async fn launch(
     name: &str,
     role: &str,
 ) -> (Arc<App>, String, tokio::task::JoinHandle<()>) {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
     let app = App::new(
         dir.join(format!("{name}.json")),
         dir.join(name),
@@ -143,8 +146,14 @@ async fn check_source_cdn_balancer(transport: &str) {
     assert!(!canonical.contains("flussonix_ticket"));
     let canonical = format!("{cdn_url}{canonical}");
     let playlist = client.get(&canonical).send().await.unwrap();
-    assert_eq!(playlist.status(), 200);
+    let status = playlist.status();
     let playlist = playlist.text().await.unwrap();
+    assert_eq!(
+        status,
+        200,
+        "{transport} playlist rejection: {playlist}; edge stats: {}",
+        cdn.media.stats("region/news").await
+    );
     assert_eq!(
         client.get(&canonical).send().await.unwrap().status(),
         200,

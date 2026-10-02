@@ -64,16 +64,32 @@ impl Hub {
     }
     pub fn relay_info(&self, tracks: Vec<Track>, wire: Bytes) {
         let mut s = self.state.lock().unwrap();
-        if s.tracks != tracks {
+        let changed = s.tracks != tracks;
+        if changed {
             s.frames.clear();
             s.frame_bytes = 0;
             s.bootstrap_ready = false;
             s.segment_ready = false;
+            s.bootstrap.clear();
+            s.bootstrap_bytes = 0;
         }
         s.tracks = tracks;
         s.info = Some(wire.clone());
-        s.bootstrap_bytes = wire.len();
-        s.bootstrap = vec![wire.clone()];
+        // Unchanged codec metadata must replace only metadata, retaining the
+        // saved keyframe (and any original packed GOP) for late subscribers.
+        if let Some(info) = s.bootstrap.first_mut() {
+            let old_len = info.len();
+            *info = wire.clone();
+            s.bootstrap_bytes = s.bootstrap_bytes - old_len + wire.len();
+        } else {
+            s.bootstrap.push(wire.clone());
+            s.bootstrap_bytes = wire.len();
+        }
+        if s.bootstrap_bytes > 32 * 1024 * 1024 {
+            s.bootstrap = vec![wire.clone()];
+            s.bootstrap_bytes = wire.len();
+            s.bootstrap_ready = false;
+        }
         let _ = self.m4s.send(wire);
     }
     pub fn frame(&self, frame: Frame) -> Result<(), String> {
@@ -146,11 +162,18 @@ impl Hub {
             s.bootstrap_bytes = s.bootstrap.iter().map(Bytes::len).sum();
             s.bootstrap_ready = false;
         }
-        self.m4s.send(wire)?;
-        if s.frames.len() < 100000 && s.frame_bytes + frame.body.len() <= 32 * 1024 * 1024 {
+        // After a reset/overflow, withhold dependent samples until a keyframe.
+        // This also protects a subscriber whose bootstrap contains only info.
+        if s.bootstrap_ready {
+            self.m4s.send(wire)?;
+        }
+        if s.segment_ready
+            && s.frames.len() < 100000
+            && s.frame_bytes + frame.body.len() <= 32 * 1024 * 1024
+        {
             s.frame_bytes += frame.body.len();
             s.frames.push(frame)
-        } else {
+        } else if s.segment_ready {
             s.frames.clear();
             s.frame_bytes = 0;
             s.segment_ready = false;

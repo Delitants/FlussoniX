@@ -52,6 +52,9 @@ impl Worker {
     pub fn m4s_subscribe(&self) -> Option<(Vec<Bytes>, crate::media_queue::Receiver)> {
         Some(self.wire.m4s_subscribe())
     }
+    pub fn is_closed(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
     pub async fn closed(&self) {
         self.cancel.cancelled().await
     }
@@ -129,6 +132,7 @@ impl Engine {
             "-threads",
             "2",
         ]);
+        let mut peer_hls = None;
         let synthetic = input == "testsrc://";
         let m4s_input = input.starts_with("m4s://") || input.starts_with("m4ss://");
         let m4f_input = input.starts_with("m4f://") || input.starts_with("m4fs://");
@@ -149,7 +153,7 @@ impl Engine {
             cmd.args(["-f", "flv", "-i", "pipe:0"]);
             cmd.stdin(std::process::Stdio::piped());
         } else {
-            let translated = translate_input(input)?;
+            let mut translated = translate_input(input)?;
             if translated.starts_with("rtsp://") {
                 cmd.args(["-rtsp_transport", "tcp"]);
             }
@@ -157,10 +161,17 @@ impl Engine {
                 cmd.args(["-rw_timeout", "10000000"]);
             }
             if let Some(key) = cfg["flussonix_peer_key"].as_str() {
-                if key.contains(['\r', '\n']) {
-                    return Err("invalid peer key".into());
-                }
-                cmd.args(["-headers", &format!("X-Flussonix-Peer: {key}\r\n")]);
+                let proxy = crate::peer_hls::PeerHls::start(&translated, key).await?;
+                translated = proxy.url.clone();
+                // All remote resources are fetched inside our origin-scoped
+                // proxy; FFmpeg never receives the native peer credential.
+                cmd.args([
+                    "-allowed_extensions",
+                    "ALL",
+                    "-protocol_whitelist",
+                    "http,tcp,crypto",
+                ]);
+                peer_hls = Some(proxy);
             }
             cmd.args(["-i", &translated]);
         }
@@ -274,6 +285,7 @@ impl Engine {
             }
             let _ = child.kill().await;
             let _ = child.wait().await;
+            drop(peer_hls);
             w.cancel.cancel();
             w.alive.store(false, Ordering::Relaxed);
             let _ = done_tx.send(());

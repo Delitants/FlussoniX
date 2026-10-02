@@ -1038,7 +1038,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         let live = futures_util::stream::unfold(
             (std::collections::VecDeque::from(initial), rx, guard, egress),
             |(mut boot, mut rx, guard, egress)| async move {
-                if guard.1.is_cancelled() {
+                if guard.1.is_cancelled() || guard.0.is_closed() {
                     return None;
                 }
                 let bytes = if let Some(bytes) = boot.pop_front() {

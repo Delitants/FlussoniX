@@ -181,3 +181,76 @@ fn bootstrap_overflow_waits_for_a_new_video_keyframe() {
     h.relay_frame(f, wire.clone()).unwrap();
     assert_eq!(h.m4s_subscribe().0, vec![info, wire]);
 }
+
+#[test]
+fn repeated_identical_metadata_preserves_a_decodable_bootstrap() {
+    let h = Hub::new();
+    h.info(tracks());
+    h.frame(frame(true, 0)).unwrap();
+    h.info(tracks());
+    h.frame(frame(false, 3600)).unwrap();
+    let mut d = Decoder::default();
+    let keys: Vec<_> = h
+        .m4s_subscribe()
+        .0
+        .iter()
+        .flat_map(|b| d.push(b).unwrap())
+        .filter_map(|e| {
+            if let Event::Frame { key, .. } = e {
+                Some(key)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(keys, vec![true, false]);
+}
+
+fn overflow(h: &Hub) {
+    h.info(tracks());
+    for i in 0..4 {
+        let mut f = frame(i == 0, i * 3600);
+        f.body = vec![0; 9 * 1024 * 1024];
+        h.frame(f).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn overflow_late_join_waits_for_a_decodable_live_boundary() {
+    let h = Hub::new();
+    overflow(&h);
+    let (_, mut rx) = h.m4s_subscribe();
+    h.frame(frame(false, 14000)).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), rx.recv())
+            .await
+            .is_err()
+    );
+    h.frame(frame(true, 90000)).unwrap();
+    let next = rx.recv().await.unwrap();
+    assert!(matches!(
+        &Decoder::default().push(&next).unwrap()[0],
+        Event::Frame { key: true, .. }
+    ));
+}
+
+#[test]
+fn overflow_recovered_m4f_excludes_samples_before_the_keyframe() {
+    let h = Hub::new();
+    overflow(&h);
+    h.frame(frame(false, 14000)).unwrap();
+    h.frame(frame(true, 90000)).unwrap();
+    h.frame(frame(true, 180000)).unwrap();
+    let (signals, _) = h.signal_subscribe();
+    let line = std::str::from_utf8(&signals[0]).unwrap();
+    let stamp = line
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .split('-')
+        .next()
+        .unwrap();
+    let (_, frames) = flussonix::m4f::unpack(&h.segment(&format!("{stamp}.m4f")).unwrap()).unwrap();
+    assert!(frames[0].key);
+    assert_eq!(frames[0].dts, 90000);
+}
