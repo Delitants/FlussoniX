@@ -38,6 +38,7 @@ pub struct Options {
     pub role: String,
     pub node_name: String,
     pub uplink_mbps: f64,
+    pub uplink_interface: String,
     pub client_limit: u64,
     pub web_dir: PathBuf,
     pub drain: bool,
@@ -54,6 +55,7 @@ impl Default for Options {
             role: "standalone".into(),
             node_name: "local".into(),
             uplink_mbps: 1000.0,
+            uplink_interface: "auto".into(),
             client_limit: 1000,
             web_dir: "web/dist".into(),
             drain: false,
@@ -73,7 +75,7 @@ pub struct App {
     pub playback_auth: PlaybackAuth,
     reservations: Mutex<HashMap<String, Reservation>>,
     pub egress: Arc<AtomicU64>,
-    meter: Mutex<(Instant, u64, u64, u64)>,
+    telemetry: crate::telemetry::Sampler,
     pub started: Instant,
     mirrors: Mutex<HashMap<String, (Instant, Value)>>,
 }
@@ -103,7 +105,7 @@ impl App {
                 .zip(options.view_password.as_deref()),
             &options.peer_key,
         );
-        Ok(Arc::new(Self {
+        let app = Arc::new(Self {
             config: ConfigStore::open(config)?,
             media: Engine::new(media, &options.ffmpeg),
             credentials,
@@ -117,10 +119,12 @@ impl App {
             playback_auth: PlaybackAuth::new(options.client_limit as usize),
             reservations: Mutex::new(HashMap::new()),
             egress: Arc::new(AtomicU64::new(0)),
-            meter: Mutex::new((Instant::now(), 0, 0, 0)),
+            telemetry: crate::telemetry::Sampler::new(&options.uplink_interface)?,
             started: Instant::now(),
             mirrors: Mutex::new(HashMap::new()),
-        }))
+        });
+        app.sample_metrics();
+        Ok(app)
     }
     pub async fn reconcile(&self) {
         for (name, signature) in self.media.workers().await {
@@ -205,26 +209,22 @@ impl App {
         for name in names {
             streams.push(json!({"name":name,"ready":self.media.ready(&name).await,"stats":self.media.stats(&name).await}));
         }
-        let (total, idle) = cpu_ticks();
-        let bytes = self.egress.load(Ordering::Relaxed);
-        let mut m = self.meter.lock().await;
-        let elapsed = m.0.elapsed().as_secs_f64();
-        let cpu = if total > m.2 && m.2 > 0 {
-            1.0 - (idle.saturating_sub(m.3) as f64 / (total - m.2) as f64)
-        } else {
-            0.0
-        };
-        let mbps = (bytes.saturating_sub(m.1) as f64 * 8.0 / 1_000_000.0) / elapsed.max(0.1);
-        if elapsed >= 1.0 {
-            *m = (Instant::now(), bytes, total, idle)
-        }
-        drop(m);
+        let mut metrics = self.telemetry.snapshot(self.options.uplink_mbps);
         let mut reservations = self.reservations.lock().await;
         reservations.retain(|_, v| v.expires > Instant::now());
         let reserved = reservations.len() as u64;
         drop(reservations);
-        json!({"name":self.options.node_name,"role":self.options.role,"uptime":self.started.elapsed().as_secs(),"streams":streams,"cpu":cpu.clamp(0.0,1.0),"ram":ram_fraction(),"uplink":mbps/self.options.uplink_mbps,"egress_mbps":mbps,"uplink_mbps":self.options.uplink_mbps,"bytes_out":bytes,"active":self.active().await,"reserved":reserved,"limit":self.options.client_limit,"drain":self.options.drain,"age_ms":0})
+        let node = json!({"name":self.options.node_name,"role":self.options.role,"uptime":self.started.elapsed().as_secs(),"streams":streams,"uplink_mbps":self.options.uplink_mbps,"active":self.active().await,"reserved":reserved,"limit":self.options.client_limit,"drain":self.options.drain});
+        metrics
+            .as_object_mut()
+            .unwrap()
+            .extend(node.as_object().unwrap().clone());
+        metrics
     }
+    pub fn sample_metrics(&self) {
+        self.telemetry.sample(self.egress.load(Ordering::Relaxed));
+    }
+
     async fn resolve(&self, name: &str) -> Option<Value> {
         if let Some(c) = self.config.effective(name) {
             return Some(c);
@@ -272,38 +272,6 @@ impl App {
 }
 fn header<'a>(h: &'a HeaderMap, key: &str) -> Option<&'a str> {
     h.get(key).and_then(|v| v.to_str().ok())
-}
-fn cpu_ticks() -> (u64, u64) {
-    let data = std::fs::read_to_string("/proc/stat").unwrap_or_default();
-    let values = data
-        .lines()
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .skip(1)
-        .filter_map(|v| v.parse::<u64>().ok())
-        .take(8)
-        .collect::<Vec<_>>();
-    (
-        values.iter().sum(),
-        values.get(3).copied().unwrap_or(0) + values.get(4).copied().unwrap_or(0),
-    )
-}
-fn ram_fraction() -> f64 {
-    let data = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let value = |key: &str| {
-        data.lines()
-            .find(|l| l.starts_with(key))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0)
-    };
-    let total = value("MemTotal:");
-    if total > 0.0 {
-        1.0 - value("MemAvailable:") / total
-    } else {
-        0.0
-    }
 }
 fn encoded_path(name: &str) -> String {
     name.split('/')
@@ -703,7 +671,7 @@ async fn balance(
                 ram: n["ram"].as_f64()?,
                 ready,
                 drain: n["drain"].as_bool().unwrap_or(true) || p["drain"] == true,
-                age_ms: 0,
+                age_ms: n["age_ms"].as_u64().unwrap_or(u64::MAX),
                 active: n["active"].as_u64()? + n["reserved"].as_u64().unwrap_or(0),
                 limit,
             };

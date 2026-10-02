@@ -62,3 +62,47 @@ fn balancer_excludes_stale_drained_full_and_saturated_nodes() {
     );
     assert_eq!(select(&[node("saturated", 0.99, true)], 0.02), None);
 }
+#[tokio::test]
+async fn admission_rejects_unknown_warmup_metrics() {
+    use axum::{body::Body, http::Request};
+    use flussonix::server::{App, Options, router};
+    use serde_json::json;
+    use tower::ServiceExt;
+    let d = tempfile::tempdir().unwrap();
+    let app = App::new(
+        d.path().join("c.json"),
+        d.path().join("media"),
+        Options {
+            admin_password: "test-admin".into(),
+            peer_key: "test-peer-secret".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    app.config
+        .put(
+            "streams",
+            "owned",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    let response = router(app)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/flussonix/api/v1/admit")
+                .header("X-Flussonix-Peer", "test-peer-secret")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"name":"owned","bitrate_mbps":2}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        503,
+        "unsampled NIC and CPU cannot admit a viewer as zero load"
+    );
+}

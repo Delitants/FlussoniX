@@ -32,6 +32,8 @@ struct Args {
     uplink_mbps: f64,
     #[arg(long, default_value_t = 1000)]
     client_limit: u64,
+    #[arg(long, default_value = "auto")]
+    uplink_interface: String,
     #[arg(long)]
     drain: bool,
 }
@@ -51,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         role: a.role,
         node_name: a.node_name,
         uplink_mbps: a.uplink_mbps,
+        uplink_interface: a.uplink_interface,
         client_limit: a.client_limit,
         web_dir: a.web_dir,
         drain: a.drain,
@@ -79,6 +82,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::select! { _=auth_cancel.cancelled()=>break, _=interval.tick()=>auth_app.playback_auth.renew_due().await }
         }
     });
+    let telemetry_app = app.clone();
+    let telemetry_cancel = cancel.clone();
+    let telemetry = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! { _=telemetry_cancel.cancelled()=>break, _=interval.tick()=>telemetry_app.sample_metrics() }
+        }
+    });
     let serving = axum::serve(
         listener,
         router(app.clone()).into_make_service_with_connect_info::<SocketAddr>(),
@@ -90,6 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     cancel.cancel();
     let _ = supervisor.await;
     let _ = authorization.await;
+    let _ = telemetry.await;
     app.media.stop_all().await;
     if let Some(result) = completed {
         result?;

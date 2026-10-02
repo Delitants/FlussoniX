@@ -13,16 +13,32 @@ async fn launch(
         Options {
             node_name: name.into(),
             role: role.into(),
+            uplink_interface: "process".into(),
             admin_password: "management-secret".into(),
             peer_key: "cluster-peer-key".into(),
             ..Default::default()
         },
     )
     .unwrap();
+    // These in-process routers do not run main's sampler task; warm up an actual interval.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    app.sample_metrics();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let a = app.clone();
-    let task = tokio::spawn(async move { axum::serve(listener, router(a)).await.unwrap() });
+    let task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        use std::future::IntoFuture;
+        let server = axum::serve(listener, router(a.clone())).into_future();
+        tokio::pin!(server);
+        let sampling = async {
+            loop {
+                interval.tick().await;
+                a.sample_metrics();
+            }
+        };
+        tokio::select! {result=server=>result.unwrap(),_=sampling=>{}}
+    });
     (app, url, task)
 }
 #[tokio::test]
