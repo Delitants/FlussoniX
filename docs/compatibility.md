@@ -135,3 +135,7 @@ The current preview adds observed packed AVC/AAC M4S GOP ingest, original-wire/s
 ## Implemented v0.4 recovery subset
 
 The independent supervisor adds bounded configured-input retry/fallback and media-stall detection, background local/CDN recovery and generated HLS restart identities. `flussonix_input_timeout` and recovery stats are native extensions. This does not establish the reference's precise retry timing, seamless recovery, origin equivalence or new transport-direction support. Existing peer/viewer credentials and policy publication remain distinct.
+
+## Implemented v0.5 native origin failover
+
+Explicit source-group/content identities and exact normalized policy matching add bounded sticky fallback among configured replicas. These extension names and failure rules are native FlussoniX behavior; they are not a claim of matching undocumented Flussonic source groups, retry timing or cluster credentials. An authoritative denial is never bypassed by another replica. Whole-cluster blackout still requires a later playback request after source rediscovery. Existing M4/HLS qualified subsets and missing protocol roles remain unchanged.

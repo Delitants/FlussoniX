@@ -204,3 +204,13 @@ Expose separate public/private/API endpoints and source policies. Preview config
 These gates extend Gate 3 of the implementation plan. Native preview results for selected HTTP routing/source transports are recorded in [qualification](qualification.md). Full failure, scale and legacy compatibility gates remain open.
 
 Native v0.4 background recovery restores failed CDN pulls within the existing source relationship while demand remains active/recent, preserves viewer policy and retries under a bounded cooldown. It does not declare different same-name origin streams equivalent. Continuous TS/M4 connections reconnect after failure; HLS replacements signal discontinuity and use distinct media/init identities. See [qualification](qualification.md).
+
+## Implemented v0.5 equivalent-origin failover
+
+Sources may declare `flussonix_source_group`; streams/templates may declare inherited `flussonix_content_id`. Each optional identifier contains 1..128 ASCII letters, digits, dots, underscores or hyphens; each group allows eight sources. Explicit relationships, equal content identity and equal normalized viewer policy are all required to switch an existing route. Identical names alone do not establish equivalence. Local configured streams retain precedence. Each selected source uses its own peer key and private endpoint, and upstream transcoding is not repeated.
+
+A healthy source remains selected. Media failure after cooldown triggers equivalent discovery even when its API is still alive. API unavailability also permits equivalent fallback. An authoritative disabled/deleted/malformed or invalid-policy response fails closed. A recovered preferred source does not displace a healthy fallback. Operators can reconfigure relationships to select it again.
+
+Discovery limits are four concurrent requests per lookup, 64 across the node, 750ms per request including concurrency wait, three seconds per lookup and 1MiB per metadata response. The application rejects redirects. Issued lookup tickets, mirror serials and configuration revision guards prevent late results from republishing obsolete policy/routes. Runtime status exposes selected source, group, availability and source-switch count. Cluster → Sources shows active pulls; no peer credentials appear in that status.
+
+Continuous bodies reconnect and HLS signals discontinuity during replacement; gapless delivery is not promised. If every origin disappears, policy is revoked and media stops. A later playback request can restart after rediscovery; automatic media resurrection after complete blackout is not implemented. Source load ranking, distributed ownership, loop detection beyond existing configured relationships, legacy source-group semantics and production scale remain unqualified.
