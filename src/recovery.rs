@@ -36,7 +36,8 @@ impl Recovery {
         }
         let streak = if self
             .first_media
-            .is_some_and(|first| first.elapsed() >= Duration::from_secs(30))
+            .zip(self.last_media)
+            .is_some_and(|(first, last)| last.duration_since(first) >= Duration::from_secs(30))
         {
             0
         } else {
@@ -68,6 +69,16 @@ impl Recovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_long_final_stall_is_not_a_healthy_media_window() {
+        let mut state = Recovery::new(4);
+        let only_progress = Instant::now() - Duration::from_secs(31);
+        state.first_media = Some(only_progress);
+        state.last_media = Some(only_progress);
+        state.fail("input_stalled");
+        assert_eq!(state.next_streak(), 5);
+        assert!(state.retry_in().unwrap() > Duration::from_secs(15));
+    }
     #[test]
     fn short_failures_back_off_and_healthy_media_resets_the_streak() {
         let delays: Vec<_> = (0..8).map(|i| retry_delay(i).as_secs()).collect();

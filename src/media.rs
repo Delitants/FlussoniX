@@ -37,10 +37,10 @@ pub struct Worker {
     input_timeout: Duration,
     recovery: std::sync::Mutex<crate::recovery::Recovery>,
     pub bytes: AtomicU64,
-    pub viewers: AtomicU64,
+    pub viewers: Arc<AtomicU64>,
     pub alive: std::sync::atomic::AtomicBool,
     pub wire: Hub,
-    last_access: std::sync::Mutex<Instant>,
+    last_access: Arc<std::sync::Mutex<Instant>>,
 }
 impl Worker {
     pub fn subscribe(&self) -> broadcast::Receiver<Bytes> {
@@ -120,12 +120,15 @@ impl Engine {
         let mut index = 0;
         let mut restart_count = 0;
         let mut streak = 0;
-        let mut last_access = Instant::now();
+        let mut last_access = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let mut viewers = Arc::new(AtomicU64::new(0));
         if let Some(w) = workers.get(name) {
             if touch_demand {
                 w.touch();
             }
-            last_access = *w.last_access.lock().unwrap();
+            // Body guards can outlive the generation that served them.
+            last_access = w.last_access.clone();
+            viewers = w.viewers.clone();
             let running = w.alive.load(Ordering::Relaxed) && !w.is_closed();
             if running && w.signature == signature {
                 return Ok(w.clone());
@@ -290,10 +293,10 @@ impl Engine {
             input_timeout: timeout,
             recovery: std::sync::Mutex::new(crate::recovery::Recovery::new(streak)),
             bytes: AtomicU64::new(0),
-            viewers: AtomicU64::new(0),
+            viewers,
             alive: std::sync::atomic::AtomicBool::new(true),
             wire: Hub::new(),
-            last_access: std::sync::Mutex::new(last_access),
+            last_access,
         });
         let original_wire = (m4s_input || m4f_input)
             && (cfg.get("transcoder").is_none() || cfg["transcoder"]["encoder"] == "copy");
@@ -592,6 +595,67 @@ mod lifecycle_tests {
         drop(response);
         app.media.stop_all().await;
         assert!(alive, "a held continuous playback body was retired as idle");
+    }
+    #[tokio::test]
+    async fn old_body_departure_refreshes_demand_after_generation_replacement() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        app.config
+            .put(
+                "streams",
+                "owned",
+                json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+            )
+            .unwrap();
+        let old = app
+            .media
+            .ensure("owned", &app.config.effective("owned").unwrap())
+            .await
+            .unwrap();
+        let response = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/owned/mpegts")
+                    .header("X-Flussonix-Peer", "owned-lifecycle-peer")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        *old.last_access.lock().unwrap() = Instant::now() - Duration::from_secs(61);
+        kill(&old).await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        app.reconcile().await;
+        let replacement = app.media.workers.lock().await.get("owned").unwrap().clone();
+        assert_ne!(old.pid(), replacement.pid());
+        // The old body can still be held after replacement publication.
+        app.reconcile().await;
+        assert!(
+            app.media
+                .workers
+                .lock()
+                .await
+                .get("owned")
+                .is_some_and(|w| Arc::ptr_eq(w, &replacement)),
+            "held old body demand disappeared during replacement"
+        );
+        // Departure may be delayed until after the replacement is published.
+        drop(response);
+        app.reconcile().await;
+        let retained = app
+            .media
+            .workers
+            .lock()
+            .await
+            .get("owned")
+            .is_some_and(|w| Arc::ptr_eq(w, &replacement));
+        app.media.stop_all().await;
+        assert!(
+            retained,
+            "replacement lost the old body's actual departure demand"
+        );
+        assert!(replacement.idle_seconds() < 2);
     }
     #[tokio::test]
     async fn expired_on_demand_failure_is_retired_before_retry() {
