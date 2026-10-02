@@ -118,3 +118,21 @@ test('HLS viewer resumes across an owned packaging-worker failure',async({page,r
  const result=await page.evaluate(()=>(window as any).recoveryPlayback);expect(result.fatal).toEqual([]);
  await request.delete('/streamer/api/v3/streams/'+name,{headers});
 });
+
+test('content identity inherits through friendly forms and sources persist failover groups',async({page,request})=>{
+ test.setTimeout(20000);
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const template='ui-content-template',name='ui-content-stream';
+ await request.delete('/streamer/api/v3/cluster/sources/ui-replica-primary',{headers});
+ expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{static:false,inputs:[{url:'testsrc://'}],flussonix_content_id:'news-v1'}})).ok()).toBeTruthy();
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,template}})).ok()).toBeTruthy();
+ await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+ const identity=page.getByLabel('Content identity',{exact:true});await expect(identity).toHaveValue('');await identity.fill('invalid identity');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Content identity must contain');await identity.fill('stream-override');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+ let stream=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(stream.flussonix_content_id).toBe('stream-override');expect(stream.config_on_disk.inputs).toBeUndefined();
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await identity.fill('');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+ stream=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(stream.flussonix_content_id).toBe('news-v1');expect(stream.config_on_disk.flussonix_content_id).toBeUndefined();
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();await page.getByRole('button',{name:'Source servers',exact:true}).click();await page.getByRole('button',{name:'Add source',exact:true}).click();
+ await page.getByLabel('Node name',{exact:true}).fill('ui-replica-primary');await page.getByLabel('Management URL',{exact:true}).fill('http://127.0.0.1:19994');await page.getByLabel('Private media URL',{exact:true}).fill('http://127.0.0.1:19995');await page.getByLabel('Failover group',{exact:true}).fill('ui-replicas');
+ await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('cell',{name:'ui-replica-primary',exact:true})).toBeVisible();expect((await(await request.get('/streamer/api/v3/cluster/sources/ui-replica-primary',{headers})).json()).flussonix_source_group).toBe('ui-replicas');
+ await expect(page.getByRole('heading',{name:'Active source pulls',exact:true})).toBeVisible();await expect(page.locator('textarea')).toHaveCount(0);
+});
