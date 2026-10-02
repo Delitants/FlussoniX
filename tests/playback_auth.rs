@@ -527,3 +527,363 @@ async fn running_daemon_renews_open_ts_without_another_viewer_request() {
     assert_eq!(queries[1]["request_type"], "update_session");
     assert_eq!(queries[1]["session_id"], queries[0]["session_id"]);
 }
+
+#[tokio::test]
+async fn review_reauth_must_not_shorten_manual_revoke() {
+    let (_d, app, b, task, _) = setup().await;
+    let first = media(&app, "/owned/mpegts?token=review-revoke").await;
+    let id = session_id(&app).await;
+    assert_eq!(
+        api(
+            &app,
+            "DELETE",
+            &format!("sessions/{id}"),
+            json!(null),
+            false
+        )
+        .await
+        .status(),
+        204
+    );
+    let r = value(
+        api(
+            &app,
+            "POST",
+            "sessions/reauth?name=owned",
+            json!(null),
+            false,
+        )
+        .await,
+    )
+    .await;
+    let second = media(&app, "/owned/mpegts?token=review-revoke").await;
+    let actual = second.status();
+    assert_eq!(r["estimated_count"], 0);
+    assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+    println!(
+        "reauth={} callback_count={} second_status={}",
+        r,
+        b.calls.load(Ordering::SeqCst),
+        actual
+    );
+    drop(first);
+    drop(second);
+    app.media.stop_all().await;
+    task.abort();
+    assert_eq!(
+        actual, 403,
+        "manual denial must remain cached after reauth races body closure"
+    );
+}
+#[tokio::test]
+async fn review_removed_source_must_not_be_restored_by_late_discovery() {
+    let (_d, app, _b, task, _) = setup().await;
+    app.config.delete("streams", "owned").unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let e = entered.clone();
+    let r = release.clone();
+    let source = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().route(
+                "/flussonix/api/v1/stream/owned",
+                get(move || {
+                    let e = e.clone();
+                    let r = r.clone();
+                    async move {
+                        e.notify_one();
+                        r.notified().await;
+                        axum::Json(json!({"name":"owned","inputs":[{"url":"testsrc://"}]}))
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap()
+    });
+    app.config
+        .put(
+            "sources",
+            "origin",
+            json!({"api_url":url,"private_payload_url":url}),
+        )
+        .unwrap();
+    let a = app.clone();
+    let playback = tokio::spawn(async move { media(&a, "/owned/mpegts?token=discovery").await });
+    entered.notified().await;
+    assert_eq!(
+        api(&app, "DELETE", "cluster/sources/origin", json!(null), false)
+            .await
+            .status(),
+        204
+    );
+    release.notify_one();
+    let response = playback.await.unwrap();
+    let actual = response.status();
+    let second = media(&app, "/owned/mpegts?token=discovery").await.status();
+    println!(
+        "late_discovery={} subsequent_playback={} active={}",
+        actual,
+        second,
+        app.playback_auth.active()
+    );
+    drop(response);
+    app.media.stop_all().await;
+    source.abort();
+    task.abort();
+    assert_eq!(
+        actual, 404,
+        "removed source must not install a late discovery result"
+    );
+    assert_eq!(second, 404);
+}
+
+#[tokio::test]
+async fn review_discovered_policy_must_revoke_existing_grants() {
+    let (_d, app, _b, task, _) = setup().await;
+    app.config.delete("streams", "owned").unwrap();
+    let policy = Arc::new(Mutex::new(
+        json!({"name":"owned","inputs":[{"url":"testsrc://"}]}),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let config = policy.clone();
+    let source = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().route(
+                "/flussonix/api/v1/stream/owned",
+                get(move || {
+                    let config = config.clone();
+                    async move { axum::Json(config.lock().unwrap().clone()) }
+                }),
+            ),
+        )
+        .await
+        .unwrap()
+    });
+    app.config
+        .put(
+            "sources",
+            "origin",
+            json!({"api_url":url,"private_payload_url":url}),
+        )
+        .unwrap();
+    let first = media(&app, "/owned/mpegts?token=discovered").await;
+    assert_eq!(first.status(), 200);
+    let id = session_id(&app).await;
+    policy.lock().unwrap()["flussonix_token_sha256"] = json!("f".repeat(64));
+    let another = media(&app, "/owned/mpegts?token=another-viewer").await;
+    assert_eq!(another.status(), 200);
+    tokio::time::sleep(Duration::from_millis(10100)).await;
+    app.reconcile().await;
+    assert!(
+        app.playback_auth
+            .snapshots()
+            .iter()
+            .all(|s| s["is_open"] == false),
+        "background source refresh invalidates every existing viewer without a new media request"
+    );
+    drop(another);
+    let second = media(&app, "/owned/mpegts?token=discovered").await;
+    assert_eq!(second.status(), 403);
+    let snapshot = app.playback_auth.snapshot(&id).unwrap();
+    println!("discovered stricter policy rejected new request but existing session={snapshot}");
+    drop(first);
+    drop(second);
+    app.media.stop_all().await;
+    source.abort();
+    task.abort();
+    assert_eq!(
+        snapshot["is_open"], false,
+        "discovered policy must invalidate every old grant for stream"
+    );
+}
+#[tokio::test]
+async fn review_stale_policy_snapshot_must_not_restore_old_approval() {
+    use flussonix::playback_auth::{AuthOutcome, PlaybackAuth, Policy, ViewerRequest};
+    let auth = PlaybackAuth::new(10);
+    let old = Policy::from_config(&json!({}), &json!({})).unwrap();
+    let newer = Policy::from_config(
+        &json!({"flussonix_token_sha256":"f".repeat(64)}),
+        &json!({}),
+    )
+    .unwrap();
+    let request = ViewerRequest {
+        name: "owned".into(),
+        proto: "mpegts".into(),
+        token: "old".into(),
+        ..Default::default()
+    };
+    let old = auth.publish("owned", Some(old)).unwrap();
+    let AuthOutcome::Allowed(first) = auth.authorize(old.clone(), request.clone()).await else {
+        panic!("grant")
+    };
+    auth.invalidate(|_| Some(newer.clone()));
+    assert!(first.is_cancelled());
+    let restored = matches!(auth.authorize(old, request).await, AuthOutcome::Allowed(_));
+    println!("stale policy captured before save restored approval={restored}");
+    assert!(
+        !restored,
+        "an older request snapshot must not replace authoritative newer policy"
+    );
+}
+
+#[tokio::test]
+async fn review_noop_config_save_must_preserve_discovered_session() {
+    let (_d, app, _b, task, _) = setup().await;
+    app.config.delete("streams", "owned").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let source = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().route(
+                "/flussonix/api/v1/stream/owned",
+                get(|| async {
+                    axum::Json(json!({"name":"owned","inputs":[{"url":"testsrc://"}]}))
+                }),
+            ),
+        )
+        .await
+        .unwrap()
+    });
+    app.config
+        .put(
+            "sources",
+            "origin",
+            json!({"api_url":url,"private_payload_url":url}),
+        )
+        .unwrap();
+    let first = media(&app, "/owned/mpegts?token=noop").await;
+    assert_eq!(first.status(), 200);
+    assert_eq!(
+        api(&app, "PUT", "config", json!({}), false).await.status(),
+        200
+    );
+    let second = media(&app, "/owned/mpegts?token=noop").await;
+    let actual = second.status();
+    println!("unchanged config save caused subsequent playback={actual}");
+    drop(first);
+    drop(second);
+    app.media.stop_all().await;
+    source.abort();
+    task.abort();
+    assert_eq!(
+        actual, 200,
+        "no-op save must preserve discovered session policy and identity"
+    );
+}
+
+#[tokio::test]
+async fn review_concurrent_different_streams_preserve_user_limit() {
+    let (_d, app, b, task, _) = setup().await;
+    let results = futures_util::future::join_all((0..12).map(|i| {
+        let app = &app;
+        async move {
+            media(
+                app,
+                &format!(
+                    "/{}/mpegts?token={i}",
+                    if i % 2 == 0 { "owned" } else { "other" }
+                ),
+            )
+            .await
+        }
+    }))
+    .await;
+    let allowed = results.iter().filter(|r| r.status() == 200).count();
+    println!(
+        "concurrent callbacks={}, allowed={allowed}",
+        b.calls.load(Ordering::SeqCst)
+    );
+    drop(results);
+    app.media.stop_all().await;
+    task.abort();
+    assert_eq!(allowed, 1);
+}
+#[tokio::test]
+async fn review_silent_m4_bodies_close_on_revocation() {
+    use futures_util::StreamExt;
+    for protocol in ["m4s", "m4f"] {
+        let (_d, app, _b, task, _) = setup().await;
+        let response = media(&app, &format!("/owned/{protocol}?token=silent")).await;
+        assert_eq!(response.status(), 200);
+        let id = session_id(&app).await;
+        let pid = app.media.stats("owned").await["pid"].as_u64().unwrap();
+        std::process::Command::new("kill")
+            .args(["-STOP", &pid.to_string()])
+            .status()
+            .unwrap();
+        let mut stream = response.into_body().into_data_stream();
+        let mut stopped_early = false;
+        loop {
+            match tokio::time::timeout(Duration::from_millis(200), stream.next()).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => {
+                    stopped_early = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            api(
+                &app,
+                "DELETE",
+                &format!("sessions/{id}"),
+                json!(null),
+                false
+            )
+            .await
+            .status(),
+            204
+        );
+        let closes = matches!(
+            tokio::time::timeout(Duration::from_millis(500), stream.next()).await,
+            Ok(None)
+        );
+        std::process::Command::new("kill")
+            .args(["-CONT", &pid.to_string()])
+            .status()
+            .unwrap();
+        drop(stream);
+        app.media.stop_all().await;
+        task.abort();
+        println!("{protocol}: stopped_early={stopped_early}, closes_after_revoke={closes}");
+        assert!(!stopped_early);
+        assert!(closes);
+    }
+}
+
+#[tokio::test]
+async fn stale_policy_is_rejected_before_any_session_entry_exists() {
+    use flussonix::playback_auth::{AuthOutcome, PlaybackAuth, Policy, ViewerRequest};
+    let auth = PlaybackAuth::new(10);
+    let old = auth
+        .publish(
+            "owned",
+            Some(Policy::from_config(&json!({}), &json!({})).unwrap()),
+        )
+        .unwrap();
+    let newer = Policy::from_config(
+        &json!({"flussonix_token_sha256":"f".repeat(64)}),
+        &json!({}),
+    )
+    .unwrap();
+    auth.invalidate(|_| Some(newer.clone()));
+    let request = ViewerRequest {
+        name: "owned".into(),
+        proto: "mpegts".into(),
+        token: "stale".into(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        auth.authorize(old, request).await,
+        AuthOutcome::Denied
+    ));
+    assert_eq!(auth.active(), 0);
+}

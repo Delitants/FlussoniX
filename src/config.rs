@@ -3,7 +3,10 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 pub const KINDS: &[&str] = &["streams", "templates", "peers", "sources", "auth_backends"];
@@ -34,6 +37,7 @@ pub fn merge(old: &Value, patch: &Value) -> Value {
 pub struct ConfigStore {
     path: PathBuf,
     data: Mutex<Value>,
+    revision: AtomicU64,
 }
 impl ConfigStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
@@ -48,7 +52,19 @@ impl ConfigStore {
         Ok(Self {
             path,
             data: Mutex::new(data),
+            revision: AtomicU64::new(0),
         })
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+    /// Hold the config lock while installing a resolved policy, so a stale fetch cannot publish.
+    pub fn at_revision<T>(&self, revision: u64, read: impl FnOnce(&Value) -> T) -> Option<T> {
+        let root = self.data.lock().unwrap();
+        (self.revision() == revision).then(|| read(&root))
+    }
+    pub fn read<T>(&self, read: impl FnOnce(&Value) -> T) -> T {
+        read(&self.data.lock().unwrap())
     }
     pub fn snapshot(&self) -> Value {
         self.data.lock().unwrap().clone()
@@ -87,6 +103,7 @@ impl ConfigStore {
         validate_root(&next)?;
         self.save(&next)?;
         *data = next.clone();
+        self.revision.fetch_add(1, Ordering::Release);
         Ok(next)
     }
     pub fn put(&self, kind: &str, name: &str, patch: Value) -> Result<Value, String> {
@@ -120,6 +137,7 @@ impl ConfigStore {
         validate_root(&next)?;
         self.save(&next)?;
         *data = next;
+        self.revision.fetch_add(1, Ordering::Release);
         Ok(item)
     }
     pub fn delete(&self, kind: &str, name: &str) -> Result<bool, String> {
@@ -137,6 +155,7 @@ impl ConfigStore {
         validate_root(&next)?;
         self.save(&next)?;
         *data = next;
+        self.revision.fetch_add(1, Ordering::Release);
         Ok(removed)
     }
     pub fn effective(&self, name: &str) -> Option<Value> {

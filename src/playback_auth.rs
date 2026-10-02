@@ -111,6 +111,16 @@ fn validate_http(url: &str) -> Result<(), String> {
     }
     Ok(())
 }
+#[derive(Clone)]
+pub struct PolicySnapshot {
+    name: String,
+    revision: u64,
+    policy: Policy,
+}
+struct Authority {
+    revision: u64,
+    policy: Option<Policy>,
+}
 #[derive(Clone, Default)]
 pub struct ViewerRequest {
     pub name: String,
@@ -139,6 +149,8 @@ struct State {
     number: u64,
     generation: u64,
     user_id: String,
+    available: bool,
+    revoked_until: Option<Instant>,
     cancel: CancellationToken,
 }
 struct Entry {
@@ -193,6 +205,7 @@ pub enum AuthOutcome {
     Redirect(String),
 }
 pub struct PlaybackAuth {
+    authority: Mutex<HashMap<String, Authority>>,
     entries: Mutex<HashMap<String, Arc<Entry>>>,
     client: reqwest::Client,
     callbacks: Semaphore,
@@ -201,6 +214,7 @@ pub struct PlaybackAuth {
 impl PlaybackAuth {
     pub fn new(limit: usize) -> Self {
         Self {
+            authority: Mutex::new(HashMap::new()),
             entries: Mutex::new(HashMap::new()),
             client: reqwest::Client::builder()
                 .no_proxy()
@@ -212,14 +226,61 @@ impl PlaybackAuth {
             limit,
         }
     }
-    pub async fn authorize(&self, policy: Policy, request: ViewerRequest) -> AuthOutcome {
-        if policy.token_hash.as_ref().is_some_and(|h| {
-            !format!("{:x}", Sha256::digest(request.token.as_bytes())).eq_ignore_ascii_case(h)
-        }) {
+    /// Only the configuration/discovery owner publishes policies. Requests consume versioned snapshots.
+    pub fn publish(&self, name: &str, policy: Option<Policy>) -> Option<PolicySnapshot> {
+        let mut authority = self.authority.lock().unwrap();
+        if !authority.contains_key(name) && (policy.is_none() || authority.len() >= 20_000) {
+            return None;
+        }
+        let current = authority.entry(name.into()).or_insert(Authority {
+            revision: 0,
+            policy: None,
+        });
+        if current.policy != policy {
+            current.revision += 1;
+            current.policy = policy.clone();
+            for (identity, e) in self.entries.lock().unwrap().iter() {
+                let mut s = e.state.lock().unwrap();
+                if s.request.name != name {
+                    continue;
+                }
+                s.cancel.cancel();
+                s.generation += 1;
+                s.available = policy
+                    .as_ref()
+                    .is_some_and(|p| p.identity(&s.request) == *identity);
+                if let Some(policy) = &policy {
+                    s.policy = policy.clone();
+                }
+                if s.revoked_until.is_some_and(|until| until > Instant::now()) {
+                    s.decision = Decision::Deny;
+                    s.next_check = s.revoked_until.unwrap();
+                } else {
+                    s.decision = Decision::Unknown;
+                    s.next_check = Instant::now();
+                    s.cancel = CancellationToken::new();
+                }
+            }
+        }
+        current.policy.clone().map(|policy| PolicySnapshot {
+            name: name.into(),
+            revision: current.revision,
+            policy,
+        })
+    }
+    pub async fn authorize(&self, snapshot: PolicySnapshot, request: ViewerRequest) -> AuthOutcome {
+        if snapshot.name != request.name {
             return AuthOutcome::Denied;
         }
+        let policy = snapshot.policy;
         let identity = policy.identity(&request);
         let entry = {
+            let authority = self.authority.lock().unwrap();
+            if !authority.get(&request.name).is_some_and(|p| {
+                p.revision == snapshot.revision && p.policy.as_ref() == Some(&policy)
+            }) {
+                return AuthOutcome::Denied;
+            }
             let mut all = self.entries.lock().unwrap();
             all.retain(|_, e| {
                 let s = e.state.lock().unwrap();
@@ -244,6 +305,8 @@ impl PlaybackAuth {
                             number: 0,
                             generation: 0,
                             user_id: format!("{:x}", Sha256::digest(request.token.as_bytes())),
+                            available: true,
+                            revoked_until: None,
                             cancel: CancellationToken::new(),
                         }),
                         flight: AsyncMutex::new(()),
@@ -255,18 +318,20 @@ impl PlaybackAuth {
         };
         {
             let mut s = entry.state.lock().unwrap();
-            if s.policy != policy {
-                s.cancel.cancel();
-                s.cancel = CancellationToken::new();
-                s.policy = policy;
-                s.decision = Decision::Unknown;
-                s.next_check = Instant::now();
-                s.generation += 1;
+            if s.revoked_until.is_some_and(|until| until > Instant::now()) {
+                return AuthOutcome::Denied;
             }
             s.request = request;
             s.last_seen = Instant::now();
         }
         self.refresh(&entry).await;
+        let authority = self.authority.lock().unwrap();
+        if !authority
+            .get(&snapshot.name)
+            .is_some_and(|p| p.revision == snapshot.revision && p.policy.as_ref() == Some(&policy))
+        {
+            return AuthOutcome::Denied;
+        }
         let s = entry.state.lock().unwrap();
         match &s.decision {
             Decision::Allow => {
@@ -284,7 +349,10 @@ impl PlaybackAuth {
         let _flight = entry.flight.lock().await;
         let (policy, r, number, generation, duration) = {
             let s = entry.state.lock().unwrap();
-            if s.next_check > Instant::now() {
+            if !s.available
+                || s.revoked_until.is_some_and(|until| until > Instant::now())
+                || s.next_check > Instant::now()
+            {
                 return;
             }
             (
@@ -451,6 +519,7 @@ impl PlaybackAuth {
                     let s = e.state.lock().unwrap();
                     ((e.live.load(Ordering::Relaxed) > 0
                         || s.last_seen.elapsed() < Duration::from_secs(30))
+                        && s.available
                         && s.next_check <= Instant::now()
                         && matches!(s.decision, Decision::Allow | Decision::Unknown))
                     .then_some((s.next_check, e.clone()))
@@ -468,24 +537,15 @@ impl PlaybackAuth {
         .await;
     }
     pub fn invalidate(&self, policy_for: impl Fn(&str) -> Option<Policy>) {
-        for e in self.entries.lock().unwrap().values() {
-            let mut s = e.state.lock().unwrap();
-            let policy = policy_for(&s.request.name);
-            if policy.as_ref() == Some(&s.policy) {
-                continue;
-            }
-            s.cancel.cancel();
-            s.generation += 1;
-            if let Some(policy) = policy {
-                s.policy = policy;
-                s.decision = Decision::Unknown;
-                s.next_check = Instant::now();
-                // Replacement grants use a fresh cancellation generation; existing bodies stay cancelled.
-                s.cancel = CancellationToken::new();
-            } else {
-                s.decision = Decision::Deny;
-                s.next_check = Instant::now() + Duration::from_secs(180);
-            }
+        let names = self
+            .authority
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for name in names {
+            self.publish(&name, policy_for(&name));
         }
     }
     pub fn revoke(&self, id: &str) -> bool {
@@ -497,6 +557,7 @@ impl PlaybackAuth {
         s.cancel.cancel();
         s.decision = Decision::Deny;
         s.next_check = Instant::now() + Duration::from_secs(180);
+        s.revoked_until = Some(s.next_check);
         s.generation += 1;
         true
     }
@@ -505,7 +566,11 @@ impl PlaybackAuth {
         let mut count = 0;
         for e in all.values().filter(|e| e.occupied()) {
             let mut s = e.state.lock().unwrap();
-            if s.request.name == name {
+            if s.request.name == name
+                && s.available
+                && matches!(s.decision, Decision::Allow)
+                && !s.revoked_until.is_some_and(|until| until > Instant::now())
+            {
                 s.next_check = Instant::now();
                 s.generation += 1;
                 count += 1;
@@ -576,6 +641,7 @@ mod tests {
     async fn idle_sessions_expire_but_live_grants_retain_client_slots() {
         let auth = PlaybackAuth::new(1);
         let policy = Policy::from_config(&json!({}), &json!({})).unwrap();
+        let policy = auth.publish("owned", Some(policy)).unwrap();
         let request = ViewerRequest {
             name: "owned".into(),
             proto: "mpegts".into(),

@@ -3,7 +3,7 @@ use crate::{
     cluster::{NodeLoad, select},
     config::{ConfigStore, KINDS, valid_name},
     media::{Engine, Worker},
-    playback_auth::{AuthOutcome, Grant, PlaybackAuth, Policy, ViewerRequest},
+    playback_auth::{AuthOutcome, Grant, PlaybackAuth, Policy, PolicySnapshot, ViewerRequest},
 };
 use axum::{
     Router,
@@ -66,6 +66,16 @@ struct Reservation {
     stream: String,
     expires: Instant,
 }
+struct Mirror {
+    when: Instant,
+    config: Value,
+    source: Value,
+}
+struct Resolved {
+    config: Value,
+    policy: PolicySnapshot,
+    revision: u64,
+}
 pub struct App {
     pub config: ConfigStore,
     pub media: Engine,
@@ -77,7 +87,7 @@ pub struct App {
     pub egress: Arc<AtomicU64>,
     telemetry: crate::telemetry::Sampler,
     pub started: Instant,
-    mirrors: Mutex<HashMap<String, (Instant, Value)>>,
+    mirrors: Mutex<HashMap<String, Mirror>>,
 }
 impl App {
     pub fn new(
@@ -127,13 +137,14 @@ impl App {
         Ok(app)
     }
     pub async fn reconcile(&self) {
+        self.refresh_sources().await;
         for (name, signature) in self.media.workers().await {
             let config = self.config.effective(&name).or(self
                 .mirrors
                 .lock()
                 .await
                 .get(&name)
-                .map(|(_, c)| c.clone()));
+                .map(|m| m.config.clone()));
             if let Some(c) = config {
                 if c["disabled"] == true {
                     self.media.stop(&name).await;
@@ -172,17 +183,22 @@ impl App {
         }
     }
     async fn invalidate_sessions(&self) {
-        let root = self.config.snapshot();
-        let mirrors = self.mirrors.lock().await;
-        self.playback_auth.invalidate(|name| {
-            let cfg = self
-                .config
-                .effective(name)
-                .or_else(|| mirrors.get(name).map(|(_, c)| c.clone()))?;
-            if cfg["disabled"] == true {
-                return None;
-            }
-            Policy::from_config(&cfg, &root).ok()
+        let mut mirrors = self.mirrors.lock().await;
+        self.config.read(|root| {
+            // Cache eviction is not source removal: retain mirrors whose discovery endpoint is unchanged.
+            mirrors.retain(|_, m| {
+                root["sources"]
+                    .as_array()
+                    .is_some_and(|sources| sources.contains(&m.source))
+            });
+            self.playback_auth.invalidate(|name| {
+                let cfg = crate::config::effective(root, name)
+                    .or_else(|| mirrors.get(name).map(|m| m.config.clone()))?;
+                if cfg["disabled"] == true {
+                    return None;
+                }
+                Policy::from_config(&cfg, root).ok()
+            });
         });
     }
     async fn active(&self) -> u64 {
@@ -225,48 +241,147 @@ impl App {
         self.telemetry.sample(self.egress.load(Ordering::Relaxed));
     }
 
-    async fn resolve(&self, name: &str) -> Option<Value> {
+    fn resolved(&self, name: &str, config: Value, revision: u64) -> Option<Resolved> {
+        self.config.at_revision(revision, |root| {
+            let policy = if config["disabled"] == true {
+                None
+            } else {
+                Policy::from_config(&config, root).ok()
+            };
+            self.playback_auth
+                .publish(name, policy)
+                .map(|policy| Resolved {
+                    config,
+                    policy,
+                    revision,
+                })
+        })?
+    }
+    async fn refresh_sources(&self) {
+        use futures_util::{StreamExt, stream};
+        let workers = self
+            .media
+            .workers()
+            .await
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<std::collections::HashSet<_>>();
+        let sessions = self
+            .playback_auth
+            .snapshots()
+            .into_iter()
+            .filter_map(|s| s["name"].as_str().map(str::to_owned))
+            .collect::<std::collections::HashSet<_>>();
+        let mut due = self
+            .mirrors
+            .lock()
+            .await
+            .iter()
+            .filter(|(name, m)| {
+                m.when.elapsed() >= Duration::from_secs(10)
+                    && (workers.contains(*name) || sessions.contains(*name))
+            })
+            .map(|(name, m)| (m.when, name.clone()))
+            .collect::<Vec<_>>();
+        due.sort_by_key(|(when, _)| *when);
+        stream::iter(due.into_iter().take(64).map(|(_, name)| async move {
+            self.resolve(&name).await;
+        }))
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+    }
+    async fn resolve(&self, name: &str) -> Option<Resolved> {
+        let revision = self.config.revision();
         if let Some(c) = self.config.effective(name) {
-            return Some(c);
-        }
-        if let Some((when, c)) = self.mirrors.lock().await.get(name) {
-            if when.elapsed() < Duration::from_secs(10) {
-                return Some(c.clone());
-            }
+            return self.resolved(name, c, revision);
         }
         let root = self.config.snapshot();
+        {
+            let mirrors = self.mirrors.lock().await;
+            if let Some(m) = mirrors.get(name) {
+                if m.when.elapsed() < Duration::from_secs(10)
+                    && root["sources"]
+                        .as_array()
+                        .is_some_and(|sources| sources.contains(&m.source))
+                {
+                    return self.resolved(name, m.config.clone(), revision);
+                }
+            }
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         for source in root["sources"].as_array()? {
             let api = source["api_url"].as_str()?;
             let private = source["private_payload_url"].as_str().unwrap_or(api);
             let key = source["cluster_key"]
                 .as_str()
                 .unwrap_or(&self.options.peer_key);
-            let url = format!(
-                "{}/flussonix/api/v1/stream/{}",
-                api.trim_end_matches('/'),
-                encoded_path(name)
-            );
-            if let Ok(resp) = self
-                .client
-                .get(url)
-                .header("X-Flussonix-Peer", key)
-                .send()
-                .await
-            {
-                if resp.status().is_success() {
-                    if let Ok(mut c) = resp.json::<Value>().await {
-                        c["inputs"] = json!([{"url":format!("{}/{}/index.m3u8",private.trim_end_matches('/'),encoded_path(name))}]);
-                        c["static"] = json!(false);
-                        c["flussonix_peer_key"] = json!(key);
-                        let mut mirrors = self.mirrors.lock().await;
-                        if mirrors.len() < 10000 {
-                            mirrors.insert(name.into(), (Instant::now(), c.clone()));
-                        }
-                        return Some(c);
-                    }
+            let response = tokio::time::timeout_at(deadline, async {
+                let response = self
+                    .client
+                    .get(format!(
+                        "{}/flussonix/api/v1/stream/{}",
+                        api.trim_end_matches('/'),
+                        encoded_path(name)
+                    ))
+                    .header("X-Flussonix-Peer", key)
+                    .send()
+                    .await
+                    .ok()?;
+                if !response.status().is_success() {
+                    return None;
                 }
+                response.json::<Value>().await.ok()
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(mut c) = response {
+                if !c.is_object() {
+                    continue;
+                }
+                c["inputs"] = json!([{"url":format!("{}/{}/index.m3u8",private.trim_end_matches('/'),encoded_path(name))}]);
+                c["static"] = json!(false);
+                c["flussonix_peer_key"] = json!(key);
+                let mut mirrors = self.mirrors.lock().await;
+                return self.config.at_revision(revision, |current| {
+                    if !current["sources"]
+                        .as_array()
+                        .is_some_and(|sources| sources.contains(source))
+                        || mirrors.len() >= 10000 && !mirrors.contains_key(name)
+                    {
+                        return None;
+                    }
+                    let policy = if c["disabled"] == true {
+                        None
+                    } else {
+                        Policy::from_config(&c, current).ok()
+                    };
+                    let published = self.playback_auth.publish(name, policy);
+                    mirrors.insert(
+                        name.into(),
+                        Mirror {
+                            when: Instant::now(),
+                            config: c.clone(),
+                            source: source.clone(),
+                        },
+                    );
+                    published.map(|policy| Resolved {
+                        config: c,
+                        policy,
+                        revision,
+                    })
+                })?;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
             }
         }
+        let mut mirrors = self.mirrors.lock().await;
+        self.config.at_revision(revision, |_| {
+            mirrors.remove(name);
+            self.playback_auth.publish(name, None);
+        });
         None
     }
 }
@@ -348,7 +463,6 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         return match result {
             Ok(v) => {
                 if method == "PUT" {
-                    app.mirrors.lock().await.clear();
                     app.invalidate_sessions().await;
                     app.reconcile().await;
                 }
@@ -445,7 +559,6 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
                 Ok(mut v) => {
                     app.invalidate_sessions().await;
                     if kind == "sources" {
-                        app.mirrors.lock().await.clear();
                         app.invalidate_sessions().await;
                         app.reconcile().await;
                     }
@@ -470,7 +583,6 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
                         app.media.stop(name).await;
                     }
                     if kind == "sources" {
-                        app.mirrors.lock().await.clear();
                         app.invalidate_sessions().await;
                         app.reconcile().await;
                     }
@@ -786,9 +898,10 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     if valid_name(name).is_err() {
         return error(StatusCode::BAD_REQUEST, "invalid stream name");
     }
-    let Some(cfg) = app.resolve(name).await else {
+    let Some(resolved) = app.resolve(name).await else {
         return error(StatusCode::NOT_FOUND, "stream not found");
     };
+    let cfg = resolved.config;
     if cfg["disabled"] == true {
         return error(StatusCode::NOT_FOUND, "stream disabled");
     }
@@ -804,10 +917,6 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     {
         Grant::peer()
     } else {
-        let policy = match Policy::from_config(&cfg, &app.config.snapshot()) {
-            Ok(p) => p,
-            Err(_) => return error(StatusCode::FORBIDDEN, "invalid playback policy"),
-        };
         let qs = request
             .uri()
             .query()
@@ -839,7 +948,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             referer: header(request.headers(), "referer").unwrap_or("").into(),
             host: header(request.headers(), "host").unwrap_or("").into(),
         };
-        match app.playback_auth.authorize(policy, viewer).await {
+        match app.playback_auth.authorize(resolved.policy, viewer).await {
             AuthOutcome::Allowed(g) => g,
             AuthOutcome::Denied => return error(StatusCode::FORBIDDEN, "playback denied"),
             AuthOutcome::Redirect(url) => {
@@ -847,8 +956,8 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             }
         }
     };
-    if grant.is_cancelled() {
-        return error(StatusCode::FORBIDDEN, "playback revoked");
+    if grant.is_cancelled() || app.config.revision() != resolved.revision {
+        return error(StatusCode::FORBIDDEN, "playback policy changed");
     }
     if app.options.role == "lb" {
         return balance(&app, name, raw_path, &query).await;
