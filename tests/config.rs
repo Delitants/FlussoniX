@@ -169,3 +169,18 @@ fn structured_auth_policy_validates_keys_and_preserves_template_options() {
         );
     }
 }
+#[test]
+fn portable_policy_rejects_malformed_native_token_guards() {
+    use flussonix::playback_auth::Policy;
+    for invalid in [
+        json!(false),
+        json!({}),
+        json!("not-a-hash"),
+        json!("f".repeat(63)),
+    ] {
+        assert!(
+            Policy::from_config(&json!({"flussonix_token_sha256":invalid}), &json!({})).is_err(),
+            "a discovered native guard cannot silently become unprotected"
+        );
+    }
+}

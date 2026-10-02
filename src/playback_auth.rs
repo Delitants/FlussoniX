@@ -25,7 +25,16 @@ impl Policy {
             url: None,
             keys: ["name", "proto", "ip", "token"].map(str::to_owned).to_vec(),
             max_sessions: None,
-            token_hash: cfg["flussonix_token_sha256"].as_str().map(str::to_owned),
+            token_hash: cfg
+                .get("flussonix_token_sha256")
+                .map(|value| {
+                    let hash = value
+                        .as_str()
+                        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                        .ok_or("flussonix_token_sha256 must be a 64-digit SHA256 hex string")?;
+                    Ok::<String, String>(hash.to_ascii_lowercase())
+                })
+                .transpose()?,
         };
         if let Some(value) = cfg.get("on_play") {
             let raw = if let Some(url) = value.as_str() {
