@@ -15,3 +15,5 @@ pub mod media_queue;
 pub mod peer_hls;
 
 pub mod recovery;
+
+mod hls_generation;

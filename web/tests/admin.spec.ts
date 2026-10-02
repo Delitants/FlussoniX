@@ -76,3 +76,41 @@ test('changing authorization mode preserves the existing session limits and iden
  await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('status')).toContainText('Saved.');
  const result=await (await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(result.on_play.max_sessions).toBe(3);expect(result.on_play.session_keys).toEqual(['name','proto','token','token']);
 });
+
+test('media timeout forms preserve template inheritance and explicit overrides',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const template='ui-recovery-template',name='ui-recovery-timeout';
+ expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{static:false,inputs:[{url:'testsrc://'}],flussonix_input_timeout:30}})).ok()).toBeTruthy();
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,template}})).ok()).toBeTruthy();
+ await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+ const field=page.getByLabel('Media stall timeout (seconds)',{exact:true});await expect(field).toHaveValue('');await field.fill('42');
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ let state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.flussonix_input_timeout).toBe(42);expect(state.config_on_disk.inputs).toBeUndefined();
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await field.fill('');await page.getByRole('button',{name:'Save',exact:true}).click();
+ expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{flussonix_input_timeout:50}})).ok()).toBeTruthy();
+ state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.flussonix_input_timeout).toBe(50);expect(state.config_on_disk.flussonix_input_timeout).toBeUndefined();
+});
+
+test('HLS viewer resumes across an owned packaging-worker failure',async({page,request})=>{
+ test.setTimeout(60000);
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-recovery-browser';
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,static:false,inputs:[{url:'testsrc://'}]}})).ok()).toBeTruthy();
+ await page.setContent('<video muted autoplay playsinline></video>');await page.addScriptTag({path:'node_modules/hls.js/dist/hls.min.js'});
+ await page.evaluate(({name})=>{
+  const w=window as any;w.recoveryPlayback={fragments:0,lastSequence:0,endSequence:0,fatal:[]};
+  const hls=new w.Hls({maxBufferLength:6});const video=document.querySelector('video')!;
+  hls.on(w.Hls.Events.FRAG_BUFFERED,(_:unknown,d:any)=>{w.recoveryPlayback.fragments++;w.recoveryPlayback.lastSequence=d.frag.sn});
+  hls.on(w.Hls.Events.LEVEL_LOADED,(_:unknown,d:any)=>{w.recoveryPlayback.endSequence=d.details.endSN});
+  hls.on(w.Hls.Events.ERROR,(_:unknown,d:any)=>{if(d.fatal)w.recoveryPlayback.fatal.push(d.details)});
+  hls.attachMedia(video);hls.loadSource('/'+name+'/index.m3u8');video.play().catch(()=>{});
+ },{name});
+ await page.waitForFunction(()=>document.querySelector('video')!.currentTime>1);
+ const before=await page.evaluate(()=>({...((window as any).recoveryPlayback),time:document.querySelector('video')!.currentTime}));
+ const state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.stats.status).toBe('running');
+ const {execFileSync}=await import('node:child_process');execFileSync('kill',['-KILL',String(state.stats.pid)]);
+ await expect.poll(async()=>{const s=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();return s.stats.restart_count},{timeout:30000}).toBeGreaterThan(0);
+ await page.waitForFunction((previous)=>{const w=window as any;const video=document.querySelector('video')!;return w.recoveryPlayback.fragments>previous.fragments+2&&w.recoveryPlayback.lastSequence>previous.endSequence&&video.currentTime>previous.time+6&&!video.paused},before,{timeout:30000});
+ const result=await page.evaluate(()=>(window as any).recoveryPlayback);expect(result.fatal).toEqual([]);
+ await request.delete('/streamer/api/v3/streams/'+name,{headers});
+});

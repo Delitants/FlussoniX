@@ -169,3 +169,118 @@ async fn on_demand_reconcile_recovers_without_a_new_playback_request_or_demand_t
         "background retry extended actual viewer demand"
     );
 }
+
+async fn playlist(e: &Engine, file: &str) -> String {
+    for _ in 0..200 {
+        if let Ok(bytes) = e.read("owned", file).await {
+            let s = String::from_utf8_lossy(&bytes).into_owned();
+            if s.contains("#EXTINF") {
+                return s;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("owned HLS playlist did not become ready");
+}
+fn sequence(p: &str) -> u64 {
+    p.lines()
+        .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+fn media_names(p: &str) -> Vec<&str> {
+    p.lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+}
+fn init_name(p: &str) -> &str {
+    p.lines()
+        .find_map(|l| {
+            l.split_once("#EXT-X-MAP:URI=\"")
+                .map(|(_, v)| v.split('"').next().unwrap())
+        })
+        .unwrap()
+}
+#[tokio::test]
+async fn failed_worker_cannot_serve_a_stale_hls_manifest_as_ready_media() {
+    let d = tempfile::tempdir().unwrap();
+    let e = Engine::new(d.path(), "ffmpeg");
+    let cfg = json!({"inputs":[{"url":"testsrc://"}]});
+    let w = e.ensure("owned", &cfg).await.unwrap();
+    playlist(&e, "index.m3u8").await;
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-KILL", &w.pid().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    ended(&w).await;
+    let stale = e.read("owned", "index.m3u8").await.is_ok();
+    e.stop_all().await;
+    assert!(
+        !stale,
+        "dead worker delivered a fresh-looking stale manifest"
+    );
+}
+#[tokio::test]
+async fn hls_replacement_has_new_sequences_media_and_init_identity_and_decodes() {
+    let d = tempfile::tempdir().unwrap();
+    let e = Engine::new(d.path(), "ffmpeg");
+    let cfg = json!({"inputs":[{"url":"testsrc://"}]});
+    let first = e.ensure("owned", &cfg).await.unwrap();
+    let ts = playlist(&e, "index.m3u8").await;
+    let old_fmp4 = playlist(&e, "fmp4/index.m3u8").await;
+    let old_last = sequence(&ts) + media_names(&ts).len() as u64 - 1;
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-KILL", &first.pid().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    ended(&first).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    e.recover("owned", &cfg).await.unwrap();
+    let new_ts = playlist(&e, "index.m3u8").await;
+    let new_fmp4 = playlist(&e, "fmp4/index.m3u8").await;
+    assert!(
+        sequence(&new_ts) > old_last,
+        "HLS replacement sequence moved backward or reused a segment number"
+    );
+    assert!(new_ts.contains("#EXT-X-DISCONTINUITY\n"));
+    assert!(
+        !media_names(&new_ts)
+            .iter()
+            .any(|name| media_names(&ts).contains(name))
+    );
+    assert_ne!(
+        init_name(&new_fmp4),
+        init_name(&old_fmp4),
+        "init URI identified different generations"
+    );
+    let init = e
+        .read("owned", &format!("fmp4/{}", init_name(&new_fmp4)))
+        .await
+        .unwrap();
+    let fragment = e
+        .read("owned", &format!("fmp4/{}", media_names(&new_fmp4)[0]))
+        .await
+        .unwrap();
+    let file = d.path().join("new-attempt.mp4");
+    std::fs::write(&file, [init.as_ref(), fragment.as_ref()].concat()).unwrap();
+    let decode = tokio::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&file)
+        .args(["-t", "1", "-f", "null", "-"])
+        .output()
+        .await
+        .unwrap();
+    e.stop_all().await;
+    assert!(
+        decode.status.success(),
+        "new generation failed actual decode: {}",
+        String::from_utf8_lossy(&decode.stderr)
+    );
+}

@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 pub struct Engine {
     root: PathBuf,
     ffmpeg: String,
+    hls_epoch: crate::hls_generation::Epoch,
     workers: Mutex<HashMap<String, Arc<Worker>>>,
 }
 pub struct Worker {
@@ -33,6 +34,7 @@ pub struct Worker {
     input_index: usize,
     input_protocol: String,
     restart_count: u64,
+    input_timeout: Duration,
     recovery: std::sync::Mutex<crate::recovery::Recovery>,
     pub bytes: AtomicU64,
     pub viewers: AtomicU64,
@@ -90,6 +92,7 @@ impl Engine {
         Self {
             root: root.as_ref().into(),
             ffmpeg: ffmpeg.into(),
+            hls_epoch: crate::hls_generation::Epoch::new(),
             workers: Mutex::new(HashMap::new()),
         }
     }
@@ -156,6 +159,10 @@ impl Engine {
             return Err("worker limit reached".into());
         }
         let dir = self.directory(name);
+        let replaced = workers.contains_key(name);
+        let sequence = self.hls_epoch.next(&dir).await?;
+        let generation = uuid::Uuid::new_v4().simple().to_string();
+        let discontinuity = if replaced { "+discont_start" } else { "" };
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(dir.join("fmp4"))
             .await
@@ -243,8 +250,12 @@ impl Engine {
         }
         // One encode/mux source feeds both HLS variants and shared live TS fan-out.
         let output = format!(
-            "[f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:hls_flags=delete_segments+temp_file]{}|[f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:hls_segment_type=fmp4:hls_flags=delete_segments+temp_file]{}|[f=mpegts]pipe:1|[onfail=ignore:f=flv:flvflags=no_duration_filesize:bsfs/a=aac_adtstoasc]pipe:2",
+            "[f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_filename={}:hls_flags=delete_segments+temp_file{discontinuity}]{}|[f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_type=fmp4:hls_segment_filename={}:hls_fmp4_init_filename=g{generation}_init.mp4:hls_flags=delete_segments+temp_file{discontinuity}]{}|[f=mpegts]pipe:1|[onfail=ignore:f=flv:flvflags=no_duration_filesize:bsfs/a=aac_adtstoasc]pipe:2",
+            dir.join(format!("g{generation}_%d.ts")).display(),
             dir.join("index.m3u8").display(),
+            dir.join("fmp4")
+                .join(format!("g{generation}_%d.m4s"))
+                .display(),
             dir.join("fmp4/index.m3u8").display()
         );
         cmd.args(["-threads", "2", "-f", "tee", &output])
@@ -260,6 +271,12 @@ impl Engine {
         let mut stdin = child.stdin.take();
         let (done_tx, done) = oneshot::channel();
         let cancel = CancellationToken::new();
+        let timeout = Duration::from_secs(
+            cfg["flussonix_input_timeout"]
+                .as_u64()
+                .unwrap_or(15)
+                .clamp(1, 300),
+        );
         let worker = Arc::new(Worker {
             tx,
             cancel: cancel.clone(),
@@ -270,6 +287,7 @@ impl Engine {
             input_index: index,
             input_protocol: input.split("://").next().unwrap_or("unknown").into(),
             restart_count,
+            input_timeout: timeout,
             recovery: std::sync::Mutex::new(crate::recovery::Recovery::new(streak)),
             bytes: AtomicU64::new(0),
             viewers: AtomicU64::new(0),
@@ -319,12 +337,6 @@ impl Engine {
         }
         workers.insert(name.into(), worker.clone());
         let w = worker.clone();
-        let timeout = Duration::from_secs(
-            cfg["flussonix_input_timeout"]
-                .as_u64()
-                .unwrap_or(15)
-                .clamp(1, 300),
-        );
         tokio::spawn(async move {
             let mut buffer = vec![0u8; 188 * 64];
             loop {
@@ -366,6 +378,15 @@ impl Engine {
         Ok(worker)
     }
     pub async fn read(&self, name: &str, file: &str) -> Result<Bytes, String> {
+        if self
+            .workers
+            .lock()
+            .await
+            .get(name)
+            .is_none_or(|w| !w.alive.load(Ordering::Relaxed) || w.is_closed())
+        {
+            return Err("media worker unavailable".into());
+        }
         if file.ends_with(".m4f") {
             return self
                 .workers
@@ -397,6 +418,7 @@ impl Engine {
         if let Some(done) = w.done.lock().await.take() {
             let _ = done.await;
         }
+        let _ = self.hls_epoch.observe(&self.directory(name)).await;
         let _ = tokio::fs::remove_dir_all(self.directory(name)).await;
     }
     pub async fn stop(&self, name: &str) {
@@ -441,12 +463,15 @@ impl Engine {
             .unwrap_or(json!({"status":"waiting","online_clients":0}))
     }
     pub async fn ready(&self, name: &str) -> bool {
-        let alive = self
-            .workers
-            .lock()
-            .await
-            .get(name)
-            .is_some_and(|w| w.alive.load(Ordering::Relaxed));
+        let alive = self.workers.lock().await.get(name).is_some_and(|w| {
+            w.alive.load(Ordering::Relaxed)
+                && !w.is_closed()
+                && w.recovery
+                    .lock()
+                    .unwrap()
+                    .media_age_ms()
+                    .is_some_and(|age| age < w.input_timeout.as_millis())
+        });
         if !alive {
             return false;
         }
@@ -482,7 +507,10 @@ fn valid_file(file: &str) -> bool {
         && f.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
         && !f.contains("..")
-        && (f.ends_with(".ts") || f.ends_with(".m4s") || f == "init.mp4")
+        && (f.ends_with(".ts")
+            || f.ends_with(".m4s")
+            || f == "init.mp4"
+            || f.starts_with('g') && f.ends_with("_init.mp4"))
 }
 pub fn translate_input(input: &str) -> Result<String, String> {
     let (scheme, rest) = input.split_once("://").ok_or("invalid input URL")?;
