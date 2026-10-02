@@ -1,6 +1,6 @@
 # Implementation plan and release gates
 
-The current deliverable is the design, reference evidence and operation inventory. No runtime endpoints, protocol adapters or web application have been implemented. The sequence below is the development backlog; listed tests are planned, not passed.
+This document is the full-product roadmap. An executable v0.3 subset now exists; [qualification](qualification.md) records implemented behavior and actual results. The gates below remain requirements, and a partial preview does not satisfy the complete transport/API/mixed-vendor matrix.
 
 ## Gate 0 — Establish executable contracts
 

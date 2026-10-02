@@ -17,7 +17,7 @@ This milestone is an executable subset of the product design, not complete Fluss
 
 ## Limits
 
-M4F currently supports up to two uniquely identified H.264/AAC tracks with one contiguous chunk each, 90 kHz normalization, at most 100,000 decoded samples and 32 MiB of aggregate decoded payload per segment. M4S supports MDin/FRam AVC/AAC frames, not packed GOP mode, HEVC, subtitles, SCTE/ad metadata or full legacy control messages. These modes must be qualified separately before migration.
+M4F currently supports up to two uniquely identified H.264/AAC tracks with one contiguous chunk each, 90 kHz normalization, at most 100,000 decoded samples and 32 MiB of aggregate decoded payload per segment. M4S supports observed MDin/FRam AVC/AAC frames and Fgop packed AVC/AAC segments. HEVC, subtitles, SCTE/ad metadata semantics and full legacy control behavior remain unqualified. Unknown records can be forwarded live as opaque bytes without executing them. Generated audio-only M4F output and subsecond GOP timestamp-path reuse remain unqualified. These modes must be qualified separately before migration.
 
 CPU encoding uses libx264 plus AAC. NVIDIA configuration is exposed, but no GPU success is claimed without a real supported device and decoder test. FFmpeg transport adapters do not establish serving/publishing parity for RTSP or SRT. RTSPS, RTP/SRTP and push roles are not implemented.
 
@@ -58,3 +58,15 @@ A temporary backend on the source's private interface qualified structured sourc
 Both nodes auto-selected their public default-route interface `ens19`. A measured interval reported 115.8 Mb/s aggregate source TX versus 8.7 Mb/s HTTP media output, and 183.5 Mb/s CDN TX versus zero HTTP media output, demonstrating that other-process traffic contributes to admission load. These are functional measurements, not throughput benchmarks.
 
 Local qualification passed 52 Rust tests, fmt and clippy with warnings denied, plus five browser tests against the release candidate on the unused local port 18220. One live-source test remains opt-in; the authorized live M4S source was qualified through the remote topology. The native-guard and unrelated-metadata-save regressions also passed. Production Flussonic remained at PID 1346636 on cdn4 and PID 211384 on cdn5, with the same port 80/443 listeners.
+
+## v0.3 operator forms and original M4 relay
+
+The UI uses labeled forms for streams, templates, node endpoints, processing and viewer policy; configuration JSON is no longer an input requirement. Config supports staged edits/removal, validate without saving, apply and discard. Browser tests verify template inheritance, actual persisted bitrate/backend/endpoint values, source transport choice, masked peer keys, sessions and staged configuration. Existing identities are read-only to avoid accidental duplication. An explicit `copy` encoder overrides inherited transcoding; removing an override continues inheritance.
+
+The independent M4S parser accepts the observed packed-GOP wrapper with UTC, DTS, sequence, duration and complete M4F payload. It rejects nonfinite timing, duplicate required fields and excessive box counts. Native M4 inputs without transcoding feed their original wire hub directly; FFmpeg separately produces HLS/TS. Tests preserve original M4F payloads/UTC paths and M4S authored record extensions, then decode HLS with independently installed FFmpeg. This does not establish complete mixed-vendor server/publisher interoperability.
+
+Shared wire queues cap both record count (256) and bytes (16 MiB). Bootstrap caps at 32 MiB and waits for a new keyframe after overflow; segment cache caps at 8 entries / 64 MiB. M4F HTTP ingest limits fetched segment bytes to 16 MiB, caches before announcing, and skips the latest 16 duplicate segment paths. Native peer requests do not follow HTTP redirects, preventing peer-key forwarding. Stop/replacement cancels input and delivery and reaps the packaging child.
+
+Source-only `flussonix_transport` selects HLS/M4S/M4F over the configured LAN endpoint, preserving endpoint prefixes and encoded names; default remains HLS. Secure endpoint URLs choose secure input aliases. Source processing is not reapplied at the CDN. Local topology tests cover all three source transports with token denial, clean redirects, one shared worker and actual media decoding. Worker stats report upstream protocol.
+
+Local checks passed 67 Rust tests (one authorized-source test opt-in) and seven browser cases. Build/test/runtime depend on independent Rust/JavaScript dependencies and FFmpeg, not the installed Flussonic reference. CI asserts the reference package is absent. Optional isolated reference probes inform the wire specification only.

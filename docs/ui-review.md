@@ -28,3 +28,5 @@ Verification: all six drafts were read back after saving; inline JavaScript pars
 ![Cluster preview](ui-preview/cluster.png)
 
 The design system and resumable draft metadata are in `.superdesign/`. Reported generation cost: 186 Superdesign credits; precise follow-up corrections used the no-credit import workflow.
+
+The v0.3 implementation retains this visual language and replaces configuration JSON editors with labeled operator forms, ordered input rows, explicit inheritance choices and staged configuration validation/apply, as requested by the user. No vendor UI assets are loaded.

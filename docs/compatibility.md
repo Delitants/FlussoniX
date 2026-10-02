@@ -127,3 +127,7 @@ Support `X-AuthDuration`, `X-UserId`, `X-Max-Sessions` and applicable legacy `X-
 **IPTV:** implement subscriber/package authorization, existing token acceptance, expiration and channel permissions, plus the supporting management/playlists contracts. Do not infer a database layout or token algorithm from the demo's `iptv://` scheme alone.
 
 For horizontal operation, define session-limit scope and ownership explicitly. Account for reconnect races, duplicate requests and node failure; telemetry counts are not authoritative admission reservations. Any native cluster credentials or session tickets must remain outside the legacy wire adapter unless peers explicitly support them.
+
+## Implemented v0.3 subset
+
+The current preview adds observed packed AVC/AAC M4S GOP ingest, original-wire/segment relay without transcoding, and explicit native HLS/M4S/M4F LAN source selection. These add to the subset qualified in [qualification](qualification.md); they do not complete the mixed-vendor matrix above. The UI replaces raw configuration inputs with labeled forms while retaining the same API payloads. The installed reference is reverse-engineering evidence only; product build, tests and runtime are independent.

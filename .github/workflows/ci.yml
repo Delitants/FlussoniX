@@ -10,6 +10,8 @@ jobs:
         with:
           persist-credentials: false
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Verify vendor components are absent
+        run: test ! -e /opt/flussonic
       - run: rustup show
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings

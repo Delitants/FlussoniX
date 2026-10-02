@@ -201,4 +201,4 @@ Expose separate public/private/API endpoints and source policies. Preview config
 - LB-08: public viewer URLs and private source paths stay separate, including configured failure behavior.
 - LB-09: source directory changes, stream-name precedence, source equivalence and pull-loop prevention.
 
-These gates extend Gate 3 of the implementation plan. None has been executed yet.
+These gates extend Gate 3 of the implementation plan. Native preview results for selected HTTP routing/source transports are recorded in [qualification](qualification.md). Full failure, scale and legacy compatibility gates remain open.
