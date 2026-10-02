@@ -98,19 +98,23 @@ test('HLS viewer resumes across an owned packaging-worker failure',async({page,r
  expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,static:false,inputs:[{url:'testsrc://'}]}})).ok()).toBeTruthy();
  await page.setContent('<video muted autoplay playsinline></video>');await page.addScriptTag({path:'node_modules/hls.js/dist/hls.min.js'});
  await page.evaluate(({name})=>{
-  const w=window as any;w.recoveryPlayback={fragments:0,lastSequence:0,endSequence:0,fatal:[]};
+  const w=window as any;w.recoveryPlayback={fragments:0,lastSequence:0,endSequence:0,lastGeneration:null,initialGeneration:null,oldBufferEnd:0,fatal:[]};
   const hls=new w.Hls({maxBufferLength:6});const video=document.querySelector('video')!;
-  hls.on(w.Hls.Events.FRAG_BUFFERED,(_:unknown,d:any)=>{w.recoveryPlayback.fragments++;w.recoveryPlayback.lastSequence=d.frag.sn});
+  hls.on(w.Hls.Events.FRAG_BUFFERED,(_:unknown,d:any)=>{w.recoveryPlayback.fragments++;w.recoveryPlayback.lastSequence=d.frag.sn;const generation=d.frag.url.match(/\/(g[0-9a-f]{32})_/)?.[1];w.recoveryPlayback.initialGeneration??=generation;w.recoveryPlayback.lastGeneration=generation;if(generation===w.recoveryPlayback.initialGeneration)w.recoveryPlayback.oldBufferEnd=Math.max(w.recoveryPlayback.oldBufferEnd,d.frag.start+d.frag.duration)});
   hls.on(w.Hls.Events.LEVEL_LOADED,(_:unknown,d:any)=>{w.recoveryPlayback.endSequence=d.details.endSN});
   hls.on(w.Hls.Events.ERROR,(_:unknown,d:any)=>{if(d.fatal)w.recoveryPlayback.fatal.push(d.details)});
   hls.attachMedia(video);hls.loadSource('/'+name+'/index.m3u8');video.play().catch(()=>{});
  },{name});
  await page.waitForFunction(()=>document.querySelector('video')!.currentTime>1);
- const before=await page.evaluate(()=>({...((window as any).recoveryPlayback),time:document.querySelector('video')!.currentTime}));
+ const before=await page.evaluate(()=>({...((window as any).recoveryPlayback),time:document.querySelector('video')!.currentTime,bufferEnd:document.querySelector('video')!.buffered.end(document.querySelector('video')!.buffered.length-1)}));
  const state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.stats.status).toBe('running');
  const {execFileSync}=await import('node:child_process');execFileSync('kill',['-KILL',String(state.stats.pid)]);
  await expect.poll(async()=>{const s=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();return s.stats.restart_count},{timeout:30000}).toBeGreaterThan(0);
- await page.waitForFunction((previous)=>{const w=window as any;const video=document.querySelector('video')!;return w.recoveryPlayback.fragments>previous.fragments+2&&w.recoveryPlayback.lastSequence>previous.endSequence&&video.currentTime>previous.time+6&&!video.paused},before,{timeout:30000});
+ await page.waitForFunction((previous)=>{const w=window as any;const video=document.querySelector('video')!;return w.recoveryPlayback.fragments>previous.fragments+2&&w.recoveryPlayback.lastSequence>previous.endSequence&&w.recoveryPlayback.lastGeneration!==previous.lastGeneration&&video.currentTime>Math.max(previous.bufferEnd,w.recoveryPlayback.oldBufferEnd)+2&&!video.paused},before,{timeout:30000});
+ const resumedAt=await page.evaluate(()=>document.querySelector('video')!.currentTime);
+ await page.waitForTimeout(5000);
+ const advanced=await page.evaluate(()=>document.querySelector('video')!.currentTime)-resumedAt;
+ expect(advanced).toBeGreaterThan(3);expect(advanced).toBeLessThan(8);
  const result=await page.evaluate(()=>(window as any).recoveryPlayback);expect(result.fatal).toEqual([]);
  await request.delete('/streamer/api/v3/streams/'+name,{headers});
 });

@@ -14,7 +14,8 @@ impl Epoch {
             high: AtomicU64::new(0),
         }
     }
-    pub async fn observe(&self, directory: &Path) -> Result<(), String> {
+    pub async fn observe(&self, directory: &Path) -> Result<Option<u64>, String> {
+        let mut window_next: Option<u64> = None;
         for name in ["index.m3u8", "fmp4/index.m3u8"] {
             let file = match tokio::fs::File::open(directory.join(name)).await {
                 Ok(file) => file,
@@ -46,12 +47,17 @@ impl Epoch {
                     .filter(|next| *next < i64::MAX as u64)
                     .ok_or("HLS sequence exhausted")?;
                 self.high.fetch_max(next, Ordering::Relaxed);
+                window_next = Some(window_next.map_or(next, |old| old.max(next)));
             }
         }
-        Ok(())
+        Ok(window_next)
     }
     pub async fn next(&self, directory: &Path) -> Result<u64, String> {
-        self.observe(directory).await?;
+        // Sequence holes are interpreted as missing media by players. Continue
+        // this stream's own windows; unrelated streams cannot move its timeline.
+        if let Some(next) = self.observe(directory).await? {
+            return Ok(next);
+        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_micros().min(i64::MAX as u128 - 1) as u64);
@@ -62,7 +68,7 @@ impl Epoch {
         loop {
             let next = old
                 .checked_add(1)
-                .map(|next| next.max(now))
+                .map(|next| if old == 0 { next.max(now) } else { next })
                 .filter(|next| *next < i64::MAX as u64)
                 .ok_or("HLS sequence exhausted")?;
             match self
@@ -78,6 +84,32 @@ impl Epoch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn forward_clock_changes_do_not_create_sequence_holes() {
+        let epoch = Epoch::new();
+        assert_eq!(epoch.allocate_with_clock(1000).unwrap(), 1000);
+        assert_eq!(epoch.allocate_with_clock(10_000_000).unwrap(), 1001);
+    }
+    #[tokio::test]
+    async fn another_stream_cannot_create_a_replacement_sequence_hole() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let epoch = Epoch::new();
+        tokio::fs::write(
+            a.path().join("index.m3u8"),
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:1000\na0.ts\na1.ts\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            b.path().join("index.m3u8"),
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:1000000\nb0.ts\nb1.ts\n",
+        )
+        .await
+        .unwrap();
+        epoch.observe(b.path()).await.unwrap();
+        assert_eq!(epoch.next(a.path()).await.unwrap(), 1002);
+    }
     #[tokio::test]
     async fn rollback_and_old_playlist_windows_cannot_reuse_sequences() {
         let d = tempfile::tempdir().unwrap();
