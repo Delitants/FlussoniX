@@ -30,6 +30,7 @@ struct State {
 pub struct Hub {
     pub m4s: Channel,
     pub signals: Channel,
+    pub rtp: crate::rtp::Hub,
     state: Mutex<State>,
 }
 impl Default for Hub {
@@ -42,6 +43,7 @@ impl Hub {
         Self {
             m4s: Channel::new(256, 16 * 1024 * 1024),
             signals: Channel::new(16, 8192),
+            rtp: crate::rtp::Hub::new(),
             state: Mutex::new(State {
                 tracks: vec![],
                 info: None,
@@ -64,6 +66,7 @@ impl Hub {
     }
     pub fn relay_info(&self, tracks: Vec<Track>, wire: Bytes) {
         let mut s = self.state.lock().unwrap();
+        self.rtp.configure(&tracks);
         let changed = s.tracks != tracks;
         if changed {
             s.frames.clear();
@@ -110,6 +113,7 @@ impl Hub {
             .ok_or("unknown wire track")?
             .codec
             == "h264";
+        self.rtp.frame(&frame);
         let origin = *s.origin.get_or_insert(frame.dts);
         if video && frame.key {
             s.bootstrap = s.info.clone().into_iter().collect();
@@ -238,6 +242,12 @@ impl Hub {
             } else {
                 Err("segment path reused with different payload".into())
             };
+        }
+        if let Ok((decoded_tracks, frames)) = crate::m4f::unpack(&segment.bytes) {
+            self.rtp.configure(&decoded_tracks);
+            for frame in &frames {
+                self.rtp.frame(frame);
+            }
         }
         if s.tracks != tracks {
             s.tracks = tracks;
