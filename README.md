@@ -2,7 +2,7 @@
 
 An independently written Rust media server with a React admin interface and a Flussonic v3 API compatibility layer.
 
-**Status: v0.3 preview, for testing. It is not a complete Flussonic replacement or migration-ready release.**
+**Status: v0.4 preview, for testing. It is not a complete Flussonic replacement or migration-ready release.**
 
 This build implements persisted Streams/Templates configuration, authenticated management, playback authorization, CPU transcoding, shared stream workers, native source/CDN discovery and an adaptive HTTP redirect balancer. M4F and M4S have independent wire adapters for the qualified H.264/AAC subset. Generic fMP4 HLS remains a separate format.
 
@@ -13,6 +13,7 @@ This build implements persisted Streams/Templates configuration, authenticated m
 | Authentication | Separate edit/view credentials; Basic and legacy base64 Bearer; structured/string `on_play` callbacks; scheduled renewal, revocation and local limits across streams; separate peer key |
 | Input | HLS/HLSS, TSHTTP/TSHTTPS, M4S AVC/AAC frame and packed-GOP modes, M4F single-chunk AVC/AAC sample tables; FFmpeg RTSP pull and SRT receive adapters |
 | Output | HLS with TS or fMP4 segments, HTTP MPEG-TS, Original M4S frame/GOP relay, generated frame output; M4F signals with original or generated live segments |
+| Recovery | Startup/media watchdog, capped retries through ordered inputs, background local/CDN recovery, new HLS sequences/segment/init identities after restart |
 | Transcoding | One supervised FFmpeg worker per stream; CPU H.264/AAC; `h264_nvenc` configuration requires NVIDIA hardware and runtime |
 | Native cluster | Separate public/private endpoints, source discovery, LAN pull, uplink/CPU/RAM selection, readiness, drain/stale exclusion, expiring capacity reservations |
 
@@ -40,6 +41,8 @@ export FLUSSONIX_PEER_KEY="$(openssl rand -hex 32)"
 Open `http://127.0.0.1:18210/admin/` and sign in with the generated management credentials. Add `testsrc://` as an owned synthetic source, or configure your authorized input URL. Use the stream detail player to test HLS. Bind the chosen test address with `--listen`; a port conflict fails startup. Stop with SIGTERM or Ctrl-C to reap workers.
 
 The admin uses labeled fields, ordered input rows and explicit template inheritance choices. Config stages changes locally: Validate leaves saved state unchanged; Save & apply persists the staged configuration. Node keys and token hashes are masked.
+
+Stream/template `flussonix_input_timeout` sets the media stall timeout in seconds (1–300, default 15). It inherits through templates. Static streams retry continuously; on-demand streams recover within 60 seconds of actual demand, and active continuous bodies retain demand. Retries wait 1/2/4/8/16/30 seconds, capped at 30. Failed TS/M4 bodies close and need reconnecting; HLS replacements have distinct media/init names and a discontinuity. This is configured-input recovery, not seamless migration between unrelated origins.
 
 The config file is created atomically on the first successful save. API credentials, role, node name, uplink capacity/interface, client limit and drain are startup options; run `flussonix --help`. API config validation does not apply runtime changes. Native extensions live under `/flussonix/api/v1`.
 

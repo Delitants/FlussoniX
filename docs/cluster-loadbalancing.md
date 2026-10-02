@@ -1,6 +1,6 @@
 # Cluster and load balancing
 
-Design v0.1. First-release requirement. Implementation and interoperability tests are pending.
+Full-product design and first-release requirements. Selected native routing/source paths and configured-input recovery are implemented in the preview; full legacy interoperability and failure/scale gates remain open.
 
 ## Required topology
 
@@ -202,3 +202,5 @@ Expose separate public/private/API endpoints and source policies. Preview config
 - LB-09: source directory changes, stream-name precedence, source equivalence and pull-loop prevention.
 
 These gates extend Gate 3 of the implementation plan. Native preview results for selected HTTP routing/source transports are recorded in [qualification](qualification.md). Full failure, scale and legacy compatibility gates remain open.
+
+Native v0.4 background recovery restores failed CDN pulls within the existing source relationship while demand remains active/recent, preserves viewer policy and retries under a bounded cooldown. It does not declare different same-name origin streams equivalent. Continuous TS/M4 connections reconnect after failure; HLS replacements signal discontinuity and use distinct media/init identities. See [qualification](qualification.md).

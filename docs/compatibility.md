@@ -131,3 +131,7 @@ For horizontal operation, define session-limit scope and ownership explicitly. A
 ## Implemented v0.3 subset
 
 The current preview adds observed packed AVC/AAC M4S GOP ingest, original-wire/segment relay without transcoding, and explicit native HLS/M4S/M4F LAN source selection. These add to the subset qualified in [qualification](qualification.md); they do not complete the mixed-vendor matrix above. The UI replaces raw configuration inputs with labeled forms while retaining the same API payloads. The installed reference is reverse-engineering evidence only; product build, tests and runtime are independent.
+
+## Implemented v0.4 recovery subset
+
+The independent supervisor adds bounded configured-input retry/fallback and media-stall detection, background local/CDN recovery and generated HLS restart identities. `flussonix_input_timeout` and recovery stats are native extensions. This does not establish the reference's precise retry timing, seamless recovery, origin equivalence or new transport-direction support. Existing peer/viewer credentials and policy publication remain distinct.
