@@ -235,3 +235,25 @@ fn compound_reports_require_well_formed_sdes_and_reject_empty_or_bad_padding() {
     invalid.extend([0xa1, 202, 0, 2, 0, 0, 0, 99, 1, 1, b'x', 0]);
     assert!(!valid_receiver_report(&invalid, 0));
 }
+
+#[test]
+fn pacing_obeys_decode_time_and_a_refilling_byte_budget() {
+    use flussonix::rtsp::udp::Pacer;
+    let now = tokio::time::Instant::now();
+    let mut pace = Pacer::new(1.0).unwrap();
+    assert_eq!(pace.ready_at(u64::MAX - 90000, 1200, now).unwrap(), now);
+    pace.sent(32768, now);
+    let due = pace.ready_at(u64::MAX - 90000, 1200, now).unwrap();
+    assert!(due.duration_since(now) >= Duration::from_micros(9600));
+    assert!(due.duration_since(now) <= Duration::from_micros(9601));
+    assert_eq!(
+        pace.ready_at(u64::MAX, 1200, now).unwrap(),
+        now + Duration::from_secs(1)
+    );
+    let later = now + Duration::from_secs(2);
+    assert_eq!(pace.ready_at(u64::MAX, 1200, later).unwrap(), later);
+    assert!(pace.ready_at(u64::MAX, 32769, later).is_err());
+    for rate in [0.0, -1.0, f64::NAN, f64::INFINITY, 10001.0] {
+        assert!(Pacer::new(rate).is_err());
+    }
+}

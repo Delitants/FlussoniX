@@ -53,6 +53,10 @@ struct State {
     origin: Option<(u64, Instant)>,
 }
 /// Shares immutable AU/GOP batches; each viewer advances packet slices without copying.
+pub struct Packet {
+    pub bytes: Bytes,
+    pub dts: u64,
+}
 pub struct Receiver {
     inner: crate::media_queue::Receiver,
     batch: Bytes,
@@ -61,6 +65,9 @@ pub struct Receiver {
 }
 impl Receiver {
     pub async fn recv(&mut self) -> Result<Bytes, tokio::sync::broadcast::error::RecvError> {
+        self.recv_timed().await.map(|packet| packet.bytes)
+    }
+    pub async fn recv_timed(&mut self) -> Result<Packet, tokio::sync::broadcast::error::RecvError> {
         loop {
             if self.offset == self.batch.len() {
                 self.batch = self.inner.recv().await?;
@@ -71,16 +78,22 @@ impl Receiver {
             if self.batch[at + 4] != 0 {
                 self.waiting_key = false;
             }
-            self.offset += 5 + len;
+            let dts = u64::from_be_bytes(self.batch[at + 5..at + 13].try_into().unwrap());
+            self.offset += 13 + len;
             if !self.waiting_key {
-                return Ok(self.batch.slice(at + 5..self.offset));
+                return Ok(Packet {
+                    bytes: self.batch.slice(at + 13..self.offset),
+                    dts,
+                });
             }
         }
     }
 }
+
 pub struct PlaySnapshot {
     pub description: Description,
     pub packets: Vec<Bytes>,
+    pub decode_times: Vec<u64>,
     pub receiver: Receiver,
     pub positions: Vec<(u32, u16, u32)>,
 }
@@ -178,6 +191,7 @@ impl Hub {
                 .collect();
         Ok(PlaySnapshot {
             description,
+            decode_times: s.bootstrap.iter().map(|(dts, _)| *dts).collect(),
             packets,
             receiver: self.receiver(&s),
             positions,
@@ -282,7 +296,7 @@ impl Hub {
             s.ready = false;
         }
         for (i, p) in packets.into_iter().enumerate() {
-            if batch.len() + 5 + p.len() > 64 * 1024 * 1024 {
+            if batch.len() + 13 + p.len() > 64 * 1024 * 1024 {
                 s.error = Some("RTP producer batch exceeds 64 MiB".into());
                 s.generation = s.generation.wrapping_add(1);
                 s.bootstrap.clear();
@@ -293,6 +307,7 @@ impl Hub {
             }
             batch.extend((p.len() as u32).to_be_bytes());
             batch.push(u8::from(video && f.key && i == 0));
+            batch.extend(f.dts.to_be_bytes());
             batch.extend_from_slice(&p);
             if s.ready {
                 s.bytes += p.len();

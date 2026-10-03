@@ -301,3 +301,24 @@ async fn overflowing_bootstrap_preserves_live_playback_and_delays_new_join() {
     h.frame(&frame(7, avcc(&[vec![0x65, 10]]), true, 3700000, 0));
     assert_eq!(&late.recv().await.unwrap()[16..], &[0x65, 10]);
 }
+
+#[tokio::test]
+async fn timed_shared_records_preserve_decode_time_and_existing_wire_bytes() {
+    let h = Hub::new();
+    h.configure(&[video(), audio()]);
+    h.frame(&frame(
+        7,
+        avcc(&[vec![0x65, 42]]),
+        true,
+        u64::MAX - 90000,
+        -40,
+    ));
+    let snapshot = h.play_snapshot().unwrap();
+    assert_eq!(snapshot.decode_times, vec![u64::MAX - 90000]);
+    let mut receiver = snapshot.receiver;
+    h.frame(&frame(9, vec![9; 100], true, u64::MAX - 45000, 0));
+    let timed = receiver.recv_timed().await.unwrap();
+    assert_eq!(timed.dts, u64::MAX - 45000);
+    assert_eq!(&timed.bytes[20..], &[9; 100]);
+    assert_eq!(u32::from_be_bytes(timed.bytes[..4].try_into().unwrap()), 9);
+}

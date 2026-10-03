@@ -239,3 +239,61 @@ pub fn valid_receiver_report(body: &[u8], ssrc: u32) -> bool {
     }
     rr && cname
 }
+
+/// DTS spacing plus a token bucket bounds bootstrap/FU-A bursts without sleeping per packet.
+pub struct Pacer {
+    rate: f64,
+    tokens: f64,
+    refill: Option<tokio::time::Instant>,
+    origin: Option<(u64, tokio::time::Instant)>,
+}
+impl Pacer {
+    pub fn new(mbps: f64) -> Result<Self, String> {
+        if !mbps.is_finite() || !(1.0..=10000.0).contains(&mbps) {
+            return Err("UDP rate must be finite 1..10000 Mbps".into());
+        }
+        Ok(Self {
+            rate: mbps * 125000.0,
+            tokens: 32768.0,
+            refill: None,
+            origin: None,
+        })
+    }
+    fn refill(&mut self, now: tokio::time::Instant) {
+        if let Some(at) = self.refill {
+            self.tokens = (self.tokens
+                + now.saturating_duration_since(at).as_secs_f64() * self.rate)
+                .min(32768.0);
+        }
+        self.refill = Some(now);
+    }
+    pub fn ready_at(
+        &mut self,
+        dts: u64,
+        bytes: usize,
+        now: tokio::time::Instant,
+    ) -> std::io::Result<tokio::time::Instant> {
+        if bytes == 0 || bytes > 32768 {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        self.refill(now);
+        let (origin, at) = *self.origin.get_or_insert((dts, now));
+        let delta = dts.saturating_sub(origin);
+        let spacing = std::time::Duration::new(
+            delta / 90000,
+            ((delta % 90000) * 1_000_000_000 / 90000) as u32,
+        );
+        let media = at
+            .checked_add(spacing)
+            .ok_or(std::io::ErrorKind::InvalidData)?;
+        let wait = ((bytes as f64 - self.tokens) / self.rate).max(0.0);
+        let bucket = now
+            .checked_add(std::time::Duration::from_secs_f64(wait))
+            .ok_or(std::io::ErrorKind::InvalidData)?;
+        Ok(media.max(bucket).max(now))
+    }
+    pub fn sent(&mut self, bytes: usize, now: tokio::time::Instant) {
+        self.refill(now);
+        self.tokens = (self.tokens - bytes as f64).max(0.0);
+    }
+}
