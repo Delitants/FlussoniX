@@ -261,3 +261,89 @@ fn native_framing_preserves_608_and_708_caption_payloads_for_h264_and_hevc() {
         );
     }
 }
+
+async fn silent_tracks(encoder: Option<&str>, initial_cues: bool) {
+    let original = fixture::transport_for("24");
+    let mut seen = std::collections::HashSet::new();
+    let input: Vec<u8> = original
+        .chunks_exact(188)
+        .filter(|p| {
+            let id = fixture::pid(p);
+            ![0x120, 0x121].contains(&id) || initial_cues && seen.insert(id)
+        })
+        .flatten()
+        .copied()
+        .collect();
+    let d = tempfile::tempdir().unwrap();
+    let e = Engine::new(d.path(), "ffmpeg");
+    let mut cfg = json!({"inputs":[{"url":"publish://"}],"flussonix_subtitle_tracks":"preserve","flussonix_input_timeout":3});
+    if let Some(encoder) = encoder {
+        cfg["transcoder"] = json!({"encoder":encoder,"vb":300});
+    }
+    let mut p = e
+        .publish_guarded("owned", &cfg, std::future::ready(true))
+        .await
+        .unwrap();
+    let w = p.worker.clone();
+    let mut stdin = p.stdin.take().unwrap();
+    let producer = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(40));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        for packet in input.chunks_exact(188) {
+            if fixture::pid(packet) == 256 && packet[1] & 0x40 != 0 {
+                tick.tick().await;
+            }
+            if stdin.write_all(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+    let ready = tokio::time::timeout(Duration::from_secs(6), async {
+        while w.alive.load(std::sync::atomic::Ordering::Relaxed) {
+            if e.read("owned", "index.m3u8").await.is_ok()
+                && e.read("owned", "fmp4/index.m3u8").await.is_ok()
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    let before = w.bytes.load(std::sync::atomic::Ordering::Relaxed);
+    if ready {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    let alive = w.alive.load(std::sync::atomic::Ordering::Relaxed);
+    let progressed = w.bytes.load(std::sync::atomic::Ordering::Relaxed) > before;
+    let stats = w.stats();
+    producer.abort();
+    let _ = producer.await;
+    drop(p);
+    e.stop_all().await;
+    assert!(
+        ready,
+        "declared but silent subtitle tracks must not block HLS: {stats}"
+    );
+    assert!(
+        alive && progressed,
+        "AV must progress throughout subtitle silence: {stats}"
+    );
+}
+#[tokio::test]
+async fn absent_subtitle_packets_do_not_stall_copy_av() {
+    silent_tracks(None, false).await;
+}
+#[tokio::test]
+async fn absent_subtitle_packets_do_not_stall_cpu_av() {
+    silent_tracks(Some("libx264"), false).await;
+}
+#[tokio::test]
+async fn subtitle_silence_after_initial_cues_does_not_stall_copy_av() {
+    silent_tracks(None, true).await;
+}
+#[tokio::test]
+async fn subtitle_silence_after_initial_cues_does_not_stall_cpu_av() {
+    silent_tracks(Some("libx264"), true).await;
+}

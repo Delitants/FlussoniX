@@ -14,7 +14,7 @@
 
 ## Review Focus
 - Template null removal must restore inheritance: Task 1 config regression and Task 3 browser round trip.
-- More than one subtitle track must survive without breaking fMP4: Task 2 DVB plus teletext same-program fixture.
+- More than one subtitle track, including tracks silent at startup or after initial cues, must not stall AV or break fMP4: Task 2 dense DVB/teletext fixture plus paced absent/silent-cue regressions.
 - Caption SEI payloads must survive framing: Task 2 both 608/708 in H.264 and HEVC.
 - Transcoding must not transcode bitmap or teletext into an incompatible subtitle codec: Task 2 explicit copy and CPU runs.
 - CDN must inherit the output policy and policy edits must replace workers: Task 1 discovery and Task 2 lifecycle assertions.

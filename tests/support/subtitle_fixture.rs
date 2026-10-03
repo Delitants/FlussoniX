@@ -126,6 +126,9 @@ fn pes(id: u16, t: u64, body: &[u8], cc: &mut u8) -> Vec<u8> {
     packetize(id, &p, cc)
 }
 pub fn transport() -> Vec<u8> {
+    transport_for("8")
+}
+pub fn transport_for(seconds: &str) -> Vec<u8> {
     let d = tempfile::tempdir().unwrap();
     let file = d.path().join("owned.ts");
     let output = Command::new("ffmpeg")
@@ -141,7 +144,7 @@ pub fn transport() -> Vec<u8> {
             "-i",
             "sine=frequency=700:sample_rate=48000",
             "-t",
-            "8",
+            seconds,
             "-threads",
             "1",
             "-c:v",
