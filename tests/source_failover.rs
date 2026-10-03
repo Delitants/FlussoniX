@@ -574,7 +574,20 @@ async fn delayed_authorization_uses_the_new_origin_without_replacing_its_worker(
     cdn.app.reconcile().await;
     let after = selected(&cdn).await;
     assert_eq!(after["stats"]["upstream_source"], "b");
-    let pid = after["stats"]["pid"].clone();
+    // A registered native worker has no child until metadata is validated.
+    // Compare actual process identities after that startup phase completes.
+    let pid = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state = selected(&cdn).await;
+            assert_eq!(state["stats"]["upstream_source"], "b");
+            if state["stats"]["pid"].as_u64().is_some_and(|p| p != 0) {
+                break state["stats"]["pid"].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     release.notify_one();
     assert_eq!(pending.await.unwrap().status(), 200);
     assert_eq!(

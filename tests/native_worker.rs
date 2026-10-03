@@ -360,9 +360,12 @@ async fn short_native_stream_starts_without_default_five_second_ts_probe() {
     run("m4s", true).await;
 }
 
-async fn fmp4_profile(kind: &str) {
+async fn fmp4_profile(kind: &str, protocol: &str) {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
     let (mut tracks, mut frames) = fixture();
-    if kind != "mpeg" {
+    if !matches!(kind, "mpeg" | "video") {
         tracks.retain(|t| t.id == 1);
         frames.retain(|f| f.track_id == 1);
         let encoded = tokio::process::Command::new("ffmpeg")
@@ -374,7 +377,7 @@ async fn fmp4_profile(kind: &str) {
                 "-i",
                 "sine=frequency=880:sample_rate=48000",
                 "-t",
-                "6",
+                "10",
                 "-c:a",
                 "aac",
                 "-f",
@@ -409,11 +412,11 @@ async fn fmp4_profile(kind: &str) {
                 n += 1;
             }
         }
-        if kind == "mixed" {
+        if matches!(kind, "mixed" | "mixed_audio") {
             tracks[2].codec = "mp3".into();
             tracks[2].config.clear();
             frames.retain(|f| f.track_id != 3);
-            for i in 0..230 {
+            for i in 0..420 {
                 frames.push(Frame {
                     track_id: 3,
                     dts: 90000 + i * 2351,
@@ -424,26 +427,103 @@ async fn fmp4_profile(kind: &str) {
             }
         }
     }
+    if kind == "video" {
+        tracks.retain(|t| t.id == 1);
+        frames.retain(|f| f.track_id == 1);
+    }
+    if kind == "mixed_audio" {
+        tracks.retain(|t| t.id != 1);
+        frames.retain(|f| f.track_id != 1);
+    }
+    if matches!(kind, "mixed" | "mixed_audio") {
+        // Metadata order differs from the explicit video-first output mapping.
+        tracks.reverse();
+        for t in &mut tracks {
+            t.id = match t.id {
+                1 => 205,
+                2 => 88,
+                _ => 37,
+            };
+        }
+        for f in &mut frames {
+            f.track_id = match f.track_id {
+                1 => 205,
+                2 => 88,
+                _ => 37,
+            };
+        }
+    }
+    let expected_codecs: Vec<_> = tracks
+        .iter()
+        .filter(|t| t.kind().unwrap().is_video())
+        .chain(tracks.iter().filter(|t| !t.kind().unwrap().is_video()))
+        .map(|t| {
+            match t.codec.as_str() {
+                "m2a" => "mp3",
+                other => other,
+            }
+            .to_owned()
+        })
+        .collect();
     frames.sort_by_key(|f| f.dts);
     let mut bytes = wire::encode_info(&tracks).unwrap();
-    for f in frames {
+    for f in &frames {
         let t = tracks.iter().find(|t| t.id == f.track_id).unwrap();
-        bytes.extend(wire::encode_frame(t, &f).unwrap());
+        bytes.extend(wire::encode_frame(t, f).unwrap());
+    }
+    let mut segments = HashMap::new();
+    let mut signals = String::new();
+    for n in 0..5u64 {
+        let samples: Vec<_> = frames
+            .iter()
+            .filter(|f| f.dts >= 90000 + n * 180000 && f.dts < 90000 + (n + 1) * 180000)
+            .cloned()
+            .collect();
+        if samples.is_empty() {
+            continue;
+        }
+        let stamp = chrono::DateTime::from_timestamp(1700000000 + n as i64 * 2, 0)
+            .unwrap()
+            .format("%Y/%m/%d/%H/%M/%S")
+            .to_string();
+        signals += &format!("{n} {stamp}-2000\n");
+        segments.insert(
+            format!("owned/{stamp}.m4f"),
+            Bytes::from(m4f::pack(&tracks, &samples, 180000).unwrap()),
+        );
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("m4s://{}/owned", listener.local_addr().unwrap());
-    let bytes = Bytes::from(bytes);
-    let router = axum::Router::new().route(
-        "/owned/m4s",
-        axum::routing::get(move || {
-            let b = bytes.clone();
-            async move {
-                let stream = futures_util::stream::once(async move { Ok::<_, std::io::Error>(b) })
-                    .chain(futures_util::stream::pending());
-                axum::body::Body::from_stream(stream)
-            }
-        }),
-    );
+    let url = format!("{protocol}://{}/owned", listener.local_addr().unwrap());
+    let bytes = if protocol == "m4s" {
+        Bytes::from(bytes)
+    } else {
+        Bytes::from(signals)
+    };
+    let controls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = controls.clone();
+    let router = axum::Router::new()
+        .route(
+            &format!("/owned/{protocol}"),
+            axum::routing::get(move || {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let b = bytes.clone();
+                async move {
+                    let stream =
+                        futures_util::stream::once(async move { Ok::<_, std::io::Error>(b) })
+                            .chain(futures_util::stream::pending());
+                    axum::body::Body::from_stream(stream)
+                }
+            }),
+        )
+        .route(
+            "/{*path}",
+            axum::routing::get(
+                move |axum::extract::Path(path): axum::extract::Path<String>| {
+                    let b = segments.get(&path).unwrap().clone();
+                    async move { b }
+                },
+            ),
+        );
     let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(dir.path(), "ffmpeg");
@@ -459,12 +539,11 @@ async fn fmp4_profile(kind: &str) {
     })
     .await
     .unwrap();
-    if kind == "mixed" {
-        let e = engine.read("owned", "fmp4/index.m3u8").await.unwrap_err();
-        assert!(e.contains("mixed AAC/MPEG"), "{e}");
-        assert!(engine.read("owned", "index.m3u8").await.is_ok());
-    } else {
-        let playlist = engine.read("owned", "fmp4/index.m3u8").await.unwrap();
+    {
+        let playlist = engine
+            .read("owned", "fmp4/index.m3u8")
+            .await
+            .unwrap_or_else(|e| panic!("{protocol}/{kind}: {e}; {}", worker.stats()));
         let text = String::from_utf8(playlist.to_vec()).unwrap();
         assert!(!text.contains("#EXT-X-TARGETDURATION:0"));
         let map = text
@@ -506,8 +585,12 @@ async fn fmp4_profile(kind: &str) {
             .unwrap();
         assert!(r.status.success());
         let info: Value = serde_json::from_slice(&r.stdout).unwrap();
-        assert_eq!(info["streams"].as_array().unwrap().len(), 3);
-        for index in 0..3 {
+        assert_eq!(
+            info["streams"].as_array().unwrap().len(),
+            expected_codecs.len()
+        );
+        for (index, codec) in expected_codecs.iter().enumerate() {
+            assert_eq!(info["streams"][index]["codec_name"], *codec);
             assert!(
                 info["packets"]
                     .as_array()
@@ -515,6 +598,45 @@ async fn fmp4_profile(kind: &str) {
                     .iter()
                     .any(|p| p["stream_index"] == index)
             );
+        }
+        if kind == "mpeg" {
+            // MP4 uses the MPEG audio registration for both layers; inspect
+            // encoded payloads instead of relying on ffprobe's mp3 label.
+            for (index, body, codec) in [
+                (
+                    1,
+                    include_bytes!("fixtures/codecs/mp2.bin").as_slice(),
+                    flussonix::codec::Codec::M2a,
+                ),
+                (
+                    2,
+                    include_bytes!("fixtures/codecs/mp3.bin").as_slice(),
+                    flussonix::codec::Codec::Mp3,
+                ),
+            ] {
+                let extracted = tokio::process::Command::new("ffmpeg")
+                    .args(["-v", "error", "-i"])
+                    .arg(&file)
+                    .args([
+                        "-map",
+                        &format!("0:{index}"),
+                        "-c",
+                        "copy",
+                        "-f",
+                        "data",
+                        "pipe:1",
+                    ])
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(extracted.status.success());
+                assert!(!extracted.stdout.is_empty());
+                assert_eq!(extracted.stdout.len() % body.len(), 0);
+                for packet in extracted.stdout.chunks(body.len()) {
+                    assert_eq!(packet, body);
+                    flussonix::mpeg_audio::inspect(codec, packet).unwrap();
+                }
+            }
         }
         let decoded = tokio::process::Command::new("ffmpeg")
             .args(["-v", "error", "-i"])
@@ -534,20 +656,54 @@ async fn fmp4_profile(kind: &str) {
             String::from_utf8_lossy(&decoded.stderr)
         );
     }
+    assert_eq!(controls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let media_dirs: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .collect();
+    assert_eq!(media_dirs.len(), 1);
+    assert!(
+        !media_dirs[0].path().join("fmp4_aac").exists(),
+        "no duplicate fMP4 sink"
+    );
+    assert!(
+        !worker.is_closed(),
+        "stable profile must retain its worker: {}",
+        worker.stats()
+    );
     let pid = worker.pid();
+    assert_ne!(pid, 0);
     engine.stop_all().await;
     assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
     task.abort();
 }
 #[tokio::test]
 async fn native_aac_fmp4_contains_decodable_media_for_both_audio_tracks() {
-    fmp4_profile("aac").await;
+    fmp4_profile("aac", "m4s").await;
 }
 #[tokio::test]
 async fn native_mpeg_fmp4_keeps_unfiltered_audio_decodable() {
-    fmp4_profile("mpeg").await;
+    fmp4_profile("mpeg", "m4s").await;
 }
 #[tokio::test]
-async fn native_mixed_fmp4_returns_explicit_profile_error_while_ts_continues() {
-    fmp4_profile("mixed").await;
+async fn native_mixed_fmp4_decodes_aac_and_mpeg_without_duplicate_sink() {
+    fmp4_profile("mixed", "m4s").await;
+}
+
+#[tokio::test]
+async fn native_m4f_mixed_fmp4_decodes_all_tracks_without_reconnecting() {
+    fmp4_profile("mixed", "m4f").await;
+}
+#[tokio::test]
+async fn native_m4f_mpeg_fmp4_preserves_both_audio_layers() {
+    fmp4_profile("mpeg", "m4f").await;
+}
+#[tokio::test]
+async fn native_audio_only_mixed_fmp4_uses_audio_output_indices() {
+    fmp4_profile("mixed_audio", "m4s").await;
+}
+#[tokio::test]
+async fn native_video_only_fmp4_does_not_duplicate_packaging() {
+    fmp4_profile("video", "m4s").await;
 }

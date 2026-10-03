@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -34,13 +34,12 @@ impl Drop for Publication {
     }
 }
 pub struct Worker {
-    native_copy: bool,
     publisher_stdin: std::sync::Mutex<Option<tokio::process::ChildStdin>>,
     publication: bool,
     tx: broadcast::Sender<Bytes>,
     cancel: CancellationToken,
     done: Mutex<Option<oneshot::Receiver<()>>>,
-    pid: u32,
+    pid: AtomicU32,
     started: Instant,
     signature: String,
     input_index: usize,
@@ -63,7 +62,7 @@ impl Worker {
         &self.signature
     }
     pub fn pid(&self) -> u32 {
-        self.pid
+        self.pid.load(Ordering::Relaxed)
     }
     pub fn m4s_subscribe(&self) -> Option<(Vec<Bytes>, crate::media_queue::Receiver)> {
         Some(self.wire.m4s_subscribe())
@@ -98,7 +97,7 @@ impl Worker {
         } else {
             "stopped"
         };
-        json!({"status":status,"pid":self.pid,"bytes_in":self.bytes.load(Ordering::Relaxed),"online_clients":self.viewers.load(Ordering::Relaxed),"uptime":self.started.elapsed().as_secs(),"input_protocol":self.input_protocol,"input_index":self.input_index,"restart_count":self.restart_count,"retry_in_ms":recovery.retry_in().map(|d|d.as_millis()),"last_error":recovery.last_error(),"media_age_ms":recovery.media_age_ms()})
+        json!({"status":status,"pid":self.pid(),"bytes_in":self.bytes.load(Ordering::Relaxed),"online_clients":self.viewers.load(Ordering::Relaxed),"uptime":self.started.elapsed().as_secs(),"input_protocol":self.input_protocol,"input_index":self.input_index,"restart_count":self.restart_count,"retry_in_ms":recovery.retry_in().map(|d|d.as_millis()),"last_error":recovery.last_error(),"media_age_ms":recovery.media_age_ms()})
     }
 }
 impl Engine {
@@ -393,13 +392,15 @@ impl Engine {
                 "|[onfail=ignore:f=flv:flvflags=no_duration_filesize:bsfs/a=aac_adtstoasc]{wire_target}"
             )
         };
-        let fmp4_filter = if copy_publication {
+        let fmp4_filter = if native_copy {
+            "__NATIVE_FMP4_FILTER__"
+        } else if copy_publication {
             ":bsfs/a=aac_adtstoasc"
         } else {
             ""
         };
         let fmp4_failure = if native_copy { "onfail=ignore:" } else { "" };
-        let mut output = format!(
+        let output = format!(
             "[f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_filename={}:hls_flags=delete_segments+temp_file{discontinuity}]{}|[{fmp4_failure}f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_type=fmp4:hls_segment_filename={}:hls_fmp4_init_filename=g{generation}_init.mp4:hls_flags=delete_segments+temp_file{discontinuity}{fmp4_filter}]{}|[f=mpegts]pipe:1{wire_output}",
             dir.join(format!("g{generation}_%d.ts")).display(),
             dir.join("index.m3u8").display(),
@@ -408,16 +409,10 @@ impl Engine {
                 .display(),
             dir.join("fmp4/index.m3u8").display()
         );
-        if native_copy {
-            // Filtered AAC and unfiltered MPEG audio require different slaves.
-            // Only the metadata-selected directory is exposed by read().
-            let aac_dir = dir.join("fmp4_aac");
-            tokio::fs::create_dir_all(&aac_dir)
-                .await
-                .map_err(|_| "cannot create native AAC output")?;
-            output.push_str(&format!("|[onfail=ignore:f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_type=fmp4:hls_segment_filename={}:hls_fmp4_init_filename=g{generation}_init.mp4:hls_flags=delete_segments+temp_file{discontinuity}:bsfs/a=aac_adtstoasc]{}",aac_dir.join(format!("g{generation}_%d.m4s")).display(),aac_dir.join("index.m3u8").display()));
+        let native_input = m4s_input || m4f_input;
+        if !native_input {
+            cmd.args(["-threads", "2", "-f", "tee", &output]);
         }
-        cmd.args(["-threads", "2", "-f", "tee", &output]);
         if copy_publication {
             // tee stream-copy retains the MPEG-TS codec tag even with -tag:v 0,
             // which FLV rejects. A separate copy mux chooses FLV's own tags;
@@ -441,13 +436,17 @@ impl Engine {
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("cannot start FFmpeg: {e}"))?;
-        let pid = child.id().unwrap_or(0);
-        let mut stdout = child.stdout.take().ok_or("no media pipe")?;
+        let mut child = if native_input {
+            None
+        } else {
+            Some(
+                cmd.spawn()
+                    .map_err(|e| format!("cannot start FFmpeg: {e}"))?,
+            )
+        };
+        let pid = child.as_ref().and_then(|c| c.id()).unwrap_or(0);
         let (tx, _) = broadcast::channel(64);
-        let mut stdin = child.stdin.take();
+        let mut stdin = child.as_mut().and_then(|c| c.stdin.take());
         let (done_tx, done) = oneshot::channel();
         let cancel = CancellationToken::new();
         let timeout = Duration::from_secs(
@@ -457,13 +456,12 @@ impl Engine {
                 .clamp(1, 300),
         );
         let worker = Arc::new(Worker {
-            native_copy,
             publisher_stdin: std::sync::Mutex::new(if publication { stdin.take() } else { None }),
             publication,
             tx,
             cancel: cancel.clone(),
             done: Mutex::new(Some(done)),
-            pid,
+            pid: AtomicU32::new(pid),
             started: Instant::now(),
             signature,
             input_index: index,
@@ -479,119 +477,172 @@ impl Engine {
         });
         let original_wire = (m4s_input || m4f_input)
             && (cfg.get("transcoder").is_none() || cfg["transcoder"]["encoder"] == "copy");
-        let mut stderr = child.stderr.take();
-        if publish_wire.is_some() {
-            if let Some(mut stderr) = stderr.take() {
-                let c = cancel.clone();
-                tokio::spawn(async move {
-                    let mut buffer = [0; 16384];
-                    loop {
-                        match tokio::select! { biased; _=c.cancelled()=>break, r=stderr.read(&mut buffer)=>r }
-                        {
-                            Ok(n) if n > 0 => {
-                                tracing::warn!("publication packager reported a diagnostic")
-                            }
-                            _ => break,
-                        }
-                    }
-                });
-            }
-        }
-        if publish_wire.is_some() || stderr.is_some() {
-            let w = worker.clone();
-            let c = cancel.clone();
-            tokio::spawn(async move {
-                let mut flv: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if let Some(listener) =
-                    publish_wire
-                {
-                    let accepted = tokio::select! { biased; _=c.cancelled()=>return, r=tokio::time::timeout(Duration::from_secs(8),listener.accept())=>r };
-                    match accepted {
-                        Ok(Ok((socket, _))) => Box::new(socket),
-                        _ => {
-                            w.failed("wire_setup_failed");
-                            c.cancel();
-                            return;
-                        }
-                    }
-                } else if let Some(pipe) = stderr {
-                    Box::new(pipe)
-                } else {
-                    return;
-                };
-                let mut decoder = FlvDecoder::default();
-                let mut buffer = vec![0u8; 16384];
-                loop {
-                    let read = tokio::select! {_=c.cancelled()=>break,r=flv.read(&mut buffer)=>r};
-                    match read {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if !original_wire {
-                                if let Err(reason) = decoder.push(&buffer[..n], &w.wire) {
-                                    tracing::warn!(error = %reason, "wire output stopped");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        }
-        if m4s_input || m4f_input {
-            let url = input.to_owned();
-            let key = cfg["flussonix_peer_key"].as_str().map(str::to_owned);
-            let cancel = cancel.clone();
-            let w = worker.clone();
-            tokio::spawn(async move {
-                if let Some(mut stdin) = stdin.take() {
-                    let result = tokio::select! {_=cancel.cancelled()=>Ok(()),result=crate::m4_ingest::pull(&url,key.as_deref(),&mut stdin,if original_wire {Some(&w.wire)}else{None})=>result};
-                    if let Err(reason) = result {
-                        w.failed("input_closed");
-                        tracing::warn!(error = %reason, "wire input stopped");
-                    }
-                }
-                cancel.cancel();
-            });
-        }
+        let url = input.to_owned();
+        let key = cfg["flussonix_peer_key"].as_str().map(str::to_owned);
         workers.insert(name.into(), worker.clone());
         let w = worker.clone();
         tokio::spawn(async move {
-            let mut buffer = vec![0u8; 188 * 64];
-            loop {
-                let read = tokio::select! { biased;
-                    _ = cancel.cancelled() => break,
-                    result = tokio::time::timeout(timeout, stdout.read(&mut buffer)) => result,
+            let mut tasks = Vec::new();
+            // Early returns only leave this setup/run block. The owner always
+            // cancels and joins its tasks before signaling completion.
+            async {
+                let mut child = if let Some(child) = child {
+                    child
+                } else {
+                    let (mut reader, mut writer) = tokio::io::duplex(64 * 1024);
+                    let (metadata_tx, metadata_rx) = oneshot::channel();
+                    let c = cancel.clone();
+                    let input_worker = w.clone();
+                    tasks.push(tokio::spawn(async move {
+                        let result = tokio::select! { biased;
+                            _=c.cancelled()=>Ok(()),
+                            result=crate::m4_ingest::pull_ready(&url,key.as_deref(),&mut writer,if original_wire {Some(&input_worker.wire)}else{None},metadata_tx)=>result,
+                        };
+                        if let Err(reason) = result {
+                            input_worker.failed("input_closed");
+                            tracing::warn!(error = %reason, "wire input stopped");
+                        }
+                        c.cancel();
+                    }));
+                    let tracks = tokio::select! { biased;
+                        _=cancel.cancelled()=>return,
+                        result=tokio::time::timeout(timeout,metadata_rx)=>match result {
+                            Ok(Ok(tracks))=>tracks,
+                            Ok(Err(_))=>{ w.failed("input_closed"); return; },
+                            Err(_)=>{ w.failed("startup_timeout"); return; },
+                        },
+                    };
+                    let output = if native_copy {
+                        output.replace("__NATIVE_FMP4_FILTER__", &native_fmp4_filters(&tracks))
+                    } else { output };
+                    cmd.args(["-threads", "2", "-f", "tee", &output]);
+                    if cancel.is_cancelled() { return; }
+                    let mut child = match cmd.spawn() {
+                        Ok(child)=>child,
+                        Err(error)=>{ w.failed("packaging_failed"); tracing::warn!(%error,"cannot start native packager"); return; },
+                    };
+                    w.pid.store(child.id().unwrap_or(0),Ordering::Relaxed);
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let c = cancel.clone();
+                        let pipe_worker = w.clone();
+                        tasks.push(tokio::spawn(async move {
+                            let result = tokio::select! { biased;
+                                _=c.cancelled()=>return,
+                                result=tokio::io::copy(&mut reader,&mut stdin)=>result,
+                            };
+                            if result.is_err() {
+                                pipe_worker.failed("packaging_failed");
+                                c.cancel();
+                            }
+                        }));
+                    }
+                    child
                 };
-                match read {
-                    Ok(Ok(0)) => {
-                        w.failed("input_closed");
-                        break;
-                    }
-                    Ok(Err(_)) => {
-                        w.failed("packaging_failed");
-                        break;
-                    }
-                    Err(_) => {
-                        w.failed(if w.bytes.load(Ordering::Relaxed) == 0 {
-                            "startup_timeout"
-                        } else {
-                            "input_stalled"
-                        });
-                        break;
-                    }
-                    Ok(Ok(n)) => {
-                        w.recovery.lock().unwrap().progress();
-                        w.bytes.fetch_add(n as u64, Ordering::Relaxed);
-                        let _ = w.tx.send(Bytes::copy_from_slice(&buffer[..n]));
+                let Some(mut stdout) = child.stdout.take() else {
+                    w.failed("packaging_failed");
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    return;
+                };
+                let mut stderr = child.stderr.take();
+                if publish_wire.is_some() {
+                    if let Some(mut stderr) = stderr.take() {
+                        let c = cancel.clone();
+                        tasks.push(tokio::spawn(async move {
+                            let mut buffer = [0; 16384];
+                            loop {
+                                match tokio::select! { biased; _=c.cancelled()=>break, r=stderr.read(&mut buffer)=>r }
+                                {
+                                    Ok(n) if n > 0 => {
+                                        tracing::warn!("publication packager reported a diagnostic")
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }));
                     }
                 }
+                if publish_wire.is_some() || stderr.is_some() {
+                    let w = w.clone();
+                    let c = cancel.clone();
+                    tasks.push(tokio::spawn(async move {
+                        let mut flv: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if let Some(listener) =
+                            publish_wire
+                        {
+                            let accepted = tokio::select! { biased; _=c.cancelled()=>return, r=tokio::time::timeout(Duration::from_secs(8),listener.accept())=>r };
+                            match accepted {
+                                Ok(Ok((socket, _))) => Box::new(socket),
+                                _ => {
+                                    w.failed("wire_setup_failed");
+                                    c.cancel();
+                                    return;
+                                }
+                            }
+                        } else if let Some(pipe) = stderr {
+                            Box::new(pipe)
+                        } else {
+                            return;
+                        };
+                        let mut decoder = FlvDecoder::default();
+                        let mut buffer = vec![0u8; 16384];
+                        loop {
+                            let read = tokio::select! {_=c.cancelled()=>break,r=flv.read(&mut buffer)=>r};
+                            match read {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if !original_wire {
+                                        if let Err(reason) = decoder.push(&buffer[..n], &w.wire) {
+                                            tracing::warn!(error = %reason, "wire output stopped");
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }));
+                }
+                let mut buffer = vec![0u8; 188 * 64];
+                loop {
+                    let read = tokio::select! { biased;
+                        _ = cancel.cancelled() => break,
+                        result = tokio::time::timeout(timeout, stdout.read(&mut buffer)) => result,
+                    };
+                    match read {
+                        Ok(Ok(0)) => {
+                            w.failed("input_closed");
+                            break;
+                        }
+                        Ok(Err(_)) => {
+                            w.failed("packaging_failed");
+                            break;
+                        }
+                        Err(_) => {
+                            w.failed(if w.bytes.load(Ordering::Relaxed) == 0 {
+                                "startup_timeout"
+                            } else {
+                                "input_stalled"
+                            });
+                            break;
+                        }
+                        Ok(Ok(n)) => {
+                            w.recovery.lock().unwrap().progress();
+                            w.bytes.fetch_add(n as u64, Ordering::Relaxed);
+                            let _ = w.tx.send(Bytes::copy_from_slice(&buffer[..n]));
+                        }
+                    }
+                }
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }.await;
+            cancel.cancel();
+            for task in tasks {
+                task.abort();
+                let _ = task.await;
             }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
             drop(peer_hls);
             if let Some(bridge) = tls_input {
                 bridge.close().await;
             }
-            w.cancel.cancel();
             w.alive.store(false, Ordering::Relaxed);
             let _ = done_tx.send(());
         });
@@ -619,21 +670,12 @@ impl Engine {
         if !matches!(file, "index.m3u8" | "fmp4/index.m3u8") && !valid_file(file) {
             return Err("invalid media path".into());
         }
-        let mapped = if let Some(w) = self.workers.lock().await.get(name) {
+        if let Some(w) = self.workers.lock().await.get(name) {
             w.touch();
-            if w.native_copy {
-                if let Some(rest) = file.strip_prefix("fmp4/") {
-                    format!("{}/{}", w.wire.native_fmp4_directory()?, rest)
-                } else {
-                    file.to_owned()
-                }
-            } else {
-                file.to_owned()
-            }
         } else {
             return Err("media worker unavailable".into());
-        };
-        let path = self.directory(name).join(mapped);
+        }
+        let path = self.directory(name).join(file);
         let meta = tokio::fs::metadata(&path)
             .await
             .map_err(|_| "media not ready")?;
@@ -732,6 +774,19 @@ impl Engine {
             .map(|(n, _)| n.clone())
             .collect()
     }
+}
+/// FFmpeg maps the optional video first, then all audio in PMT order.
+/// Numeric stream specifiers avoid escaping colons inside tee option keys.
+fn native_fmp4_filters(tracks: &[crate::m4s::Track]) -> String {
+    let video = |t: &&crate::m4s::Track| matches!(t.codec.as_str(), "h264" | "hevc");
+    let offset = tracks.iter().filter(video).count();
+    tracks
+        .iter()
+        .filter(|t| !matches!(t.codec.as_str(), "h264" | "hevc"))
+        .enumerate()
+        .filter(|(_, t)| t.codec == "aac")
+        .map(|(i, _)| format!(":bsfs/{}=aac_adtstoasc", offset + i))
+        .collect()
 }
 fn valid_file(file: &str) -> bool {
     let f = file.strip_prefix("fmp4/").unwrap_or(file);

@@ -118,3 +118,167 @@ async fn m4s_invalid_initial_metadata_closes_handshake_before_relay() {
 async fn m4f_invalid_initial_metadata_closes_handshake_before_relay() {
     metadata_handshake("m4f", true).await;
 }
+
+struct PendingSource(Arc<std::sync::atomic::AtomicBool>);
+impl futures_util::Stream for PendingSource {
+    type Item = Result<Bytes, std::io::Error>;
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::task::Poll::Pending
+    }
+}
+impl Drop for PendingSource {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+async fn pending_source() -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<()>,
+) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let n = count.clone();
+    let c = closed.clone();
+    let router = axum::Router::new().route(
+        "/owned/m4s",
+        axum::routing::get(move || {
+            n.fetch_add(1, Ordering::SeqCst);
+            let c = c.clone();
+            async move { axum::body::Body::from_stream(PendingSource(c)) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("m4s://{}/owned", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (url, count, closed, server)
+}
+
+#[tokio::test]
+async fn pending_native_startup_is_shared_cancellable_and_does_not_block_other_streams() {
+    let (url, count, closed, server) = pending_source().await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = flussonix::media::Engine::new(dir.path(), "ffmpeg");
+    let cfg = serde_json::json!({"inputs":[{"url":url}]});
+    let worker = tokio::time::timeout(Duration::from_secs(1), engine.ensure("owned", &cfg))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(worker.pid(), 0, "no FFmpeg before validated metadata");
+    let again = engine.ensure("owned", &cfg).await.unwrap();
+    assert!(Arc::ptr_eq(&worker, &again));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while count.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let other = tokio::time::timeout(
+        Duration::from_secs(1),
+        engine.ensure(
+            "other",
+            &serde_json::json!({"inputs":[{"url":"testsrc://"}]}),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_ne!(other.pid(), 0);
+    tokio::time::timeout(Duration::from_secs(1), engine.stop("owned"))
+        .await
+        .unwrap();
+    assert!(!worker.alive.load(Ordering::SeqCst));
+    assert_eq!(worker.pid(), 0);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !closed.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    engine.stop_all().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn native_metadata_timeout_completes_cleanup_and_allows_recovery() {
+    let (url, count, closed, server) = pending_source().await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = flussonix::media::Engine::new(dir.path(), "ffmpeg");
+    let cfg = serde_json::json!({"inputs":[{"url":url}],"flussonix_input_timeout":1});
+    let worker = engine.ensure("owned", &cfg).await.unwrap();
+    assert_eq!(worker.pid(), 0);
+    tokio::time::timeout(Duration::from_secs(3), worker.closed())
+        .await
+        .unwrap();
+    assert_eq!(worker.stats()["last_error"], "startup_timeout");
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    let retry = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match engine.recover("owned", &cfg).await {
+                Ok(w) => break w,
+                Err(e) => assert_eq!(e, "input retry backoff"),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(retry.pid(), 0);
+    assert_eq!(retry.stats()["restart_count"], 1);
+    assert!(!worker.alive.load(Ordering::SeqCst));
+    engine.stop_all().await;
+    assert!(closed.load(Ordering::SeqCst));
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn native_spawn_failure_is_a_recoverable_worker_failure() {
+    let tracks = vec![Track {
+        id: 1,
+        codec: "hevc".into(),
+        config: include_bytes!("fixtures/codecs/hevc.hvcc").to_vec(),
+    }];
+    let info = Bytes::from(flussonix::wire::encode_info(&tracks).unwrap());
+    let router = axum::Router::new().route(
+        "/owned/m4s",
+        axum::routing::get(move || {
+            let b = info.clone();
+            async move {
+                axum::body::Body::from_stream(
+                    futures_util::stream::once(async move { Ok::<_, std::io::Error>(b) })
+                        .chain(futures_util::stream::pending()),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("m4s://{}/owned", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let engine = flussonix::media::Engine::new(dir.path(), "/nonexistent-owned-test-ffmpeg");
+    let worker = engine
+        .ensure("owned", &serde_json::json!({"inputs":[{"url":url}]}))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), worker.closed())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), engine.stop_all())
+        .await
+        .unwrap();
+    assert_eq!(worker.pid(), 0);
+    assert_eq!(worker.stats()["last_error"], "packaging_failed");
+    assert!(!worker.alive.load(Ordering::SeqCst));
+    server.abort();
+    let _ = server.await;
+}
