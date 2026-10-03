@@ -2,7 +2,7 @@
 
 An independently written Rust media server with a React admin interface and a Flussonic v3 API compatibility layer.
 
-**Status: v0.9 preview, for testing. It is not a complete Flussonic replacement or migration-ready release.**
+**Status: v0.10 preview, for testing. It is not a complete Flussonic replacement or migration-ready release.**
 
 This build implements persisted Streams/Templates configuration, authenticated management, playback authorization, CPU transcoding, shared stream workers, native source/CDN discovery and an adaptive HTTP redirect balancer. M4F and M4S have independent wire adapters for the qualified H.264/AAC subset. Generic fMP4 HLS remains a separate format.
 
@@ -23,7 +23,11 @@ Required later work includes complete API/schema parity; Flussonic cluster disco
 
 Choose **Receive a publication** in Streams or Templates. Set an optional **Publisher password** and **Publisher authorization** URL or named backend using normal fields. Publish MPEG-TS with HTTP POST to `http://HOST:PORT/STREAM/mpegts?password=PUBLISHER_PASSWORD&token=PUBLISHER_TOKEN`. Viewer tokens and peer/management credentials remain separate. Empty publication streams wait without starting FFmpeg; one connected publisher owns the worker, and disconnects or changed policy stop it. Reconnects are immediate.
 
-The callback receives documented publication JSON metadata with a stable session UUID, request counter, protocol, socket IP, original query and received bytes. Only HTTP 200 allows; redirects, failures and failed renewals deny. Renewal honors `X-AuthDuration` (1–3600 seconds, default30). This static HTTP H.264/AAC-LC receiving profile feeds HLS, fMP4 HLS, MPEG-TS, native M4F/M4S and the existing RTSP packetizer; CPU transcoding is exercised. HTTPS receiving needs a separately configured TLS terminator. Full publisher policy objects, user/global limits, dynamic prefix publications and other publishing protocols remain pending. See [publication profile and limits](docs/publishing.md).
+The callback receives documented publication JSON metadata with a stable session UUID, request counter, protocol, socket IP, original query and received bytes. Only HTTP 200 allows; redirects, failures and failed renewals deny. Renewal honors `X-AuthDuration` (1–3600 seconds, default30). This static HTTP H.264/AAC-LC receiving profile feeds HLS, fMP4 HLS, MPEG-TS, native M4F/M4S and the existing RTSP packetizer; CPU transcoding is exercised. Standalone HTTPS receiving and output use the optional native TLS listener; see [HTTPS delivery](docs/https-delivery.md). Full publisher policy objects, user/global limits, dynamic prefix publications and other publishing protocols remain pending. See [publication profile and limits](docs/publishing.md).
+
+## HTTPS preview
+
+Add `--https-listen 0.0.0.0:18443 --https-cert /etc/flussonix/server-chain.pem --https-key /etc/flussonix/server.key` to serve authorized HLS, MPEG-TS, M4F/M4S, publication and admin directly over TLS. Add `--https-only` to disable HTTP binding. Config shows actual listeners and startup guidance. HTTPS LB requests require HTTPS CDN public delivery URLs; plaintext backend redirects are denied. See [the profile and limits](docs/https-delivery.md). HEVC/m2a/MP3 remain upcoming work.
 
 ## RTSPS preview
 
@@ -101,4 +105,4 @@ Tests use owned synthetic media and OS-allocated ports for the real source/CDN/L
 
 The `scripts/cargo-local` wrapper supports the workspace's isolated development toolchain and falls back to system Cargo. Deployment notes and build qualification are in [docs/qualification.md](docs/qualification.md).
 
-The full product scope and design are recorded in [architecture](docs/architecture.md), [compatibility](docs/compatibility.md), [cluster/load balancing](docs/cluster-loadbalancing.md), [RTSP/RTP](docs/rtsp-rtp-support.md), [secure output and HEVC/m2a/MP3 requirements](docs/secure-output-codecs.md), and the [reviewed UI](docs/ui-review.md). Standalone HTTPS delivery and the expanded codec matrix are required upcoming work; the current native M4F/M4S and RTSP output preview remains qualified for H.264/AAC. The original supplied admin host is a read-only functionality demo, not a migration source. Reference schemas and isolated decoder checks inform interoperability; proprietary binaries/source/UI bundles are not redistributed or runtime dependencies.
+The full product scope and design are recorded in [architecture](docs/architecture.md), [compatibility](docs/compatibility.md), [cluster/load balancing](docs/cluster-loadbalancing.md), [RTSP/RTP](docs/rtsp-rtp-support.md), [secure output and HEVC/m2a/MP3 requirements](docs/secure-output-codecs.md), and the [reviewed UI](docs/ui-review.md). Standalone HTTPS delivery is implemented in the v0.10 profile; the expanded codec matrix remains required upcoming work; the current native M4F/M4S and RTSP output preview remains qualified for H.264/AAC. The original supplied admin host is a read-only functionality demo, not a migration source. Reference schemas and isolated decoder checks inform interoperability; proprietary binaries/source/UI bundles are not redistributed or runtime dependencies.

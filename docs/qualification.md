@@ -198,3 +198,9 @@ The first GitHub CI run stopped at a pre-existing UDP test-fixture handoff colli
 
 
 A later CI run passed all Rust checks and exposed the new browser case reading saved state before its asynchronous PUT completed. Adding a controlled 250 ms save delay reproduced the exact failure locally. The case now awaits a successful PUT and closed editor before each persistence assertion; all 14 cases pass with that delay. No product timeout, browser retry or runtime change was introduced.
+
+## v0.10 standalone HTTPS profile
+
+The development branch adds a native TLS1.2/1.3 HTTP/1.1 listener and HTTPS-only startup, sharing the existing router, worker map and authorization. Exact branch checks:204 Rust passed,0failed,1opt-in ignored;15 browser cases passed, including Config listener status. fmt and all-target warnings-denied Clippy pass. Eight new real TLS tests cover trust/identity rejection, bad material/busy startup ports before workers, concurrent idle/plaintext handshakes, five-second handshake expiry, cancellation, actual callback IP versus spoofed headers, secure LB/backend redirect rules, HLS/fMP4 independent decode, M4F payload identity, M4S media and HTTPS publication callback renewal/drop.
+
+Final static artifact, isolated lab deployment, GitHub CI and downloaded release checks are subsequent release gates; do not infer migration readiness or expanded codec support from these branch checks. See [HTTPS delivery](https-delivery.md) for exact remaining directions and [decisions](v010-decisions.md).

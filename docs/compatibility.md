@@ -150,3 +150,7 @@ An optional separate listener serves the bounded RTSP 1.0 H.264/AAC-LC TCP-inter
 ## Implemented v0.7 RTSP unicast UDP
 
 The opt-in UDP playback profile shares the TCP packetizer, worker and authorization while pacing datagrams to the TCP control peer. A finite prebound port range and application-payload rate limit are required; input `rtp:"udp"` is available through normal Streams/Templates forms. See [profile, bounds and remaining directions](rtsp-rtp-support.md#implemented-v07-udp-playback-profile). Exact vendor dialects, publishing/push, RTSPS, direct RTP/SRTP and RTSP LB redirects remain unqualified.
+
+## Implemented v0.10 HTTPS profile
+
+The optional standalone HTTPS listener serves existing H.264/AAC media, publication, API and admin routes with shared authorization and real socket client IPs. HTTPS-only startup skips HTTP binding. HTTPS viewer redirects exclude plaintext public CDNs/callback targets. Native codec and remaining direction boundaries remain unchanged. See [HTTPS delivery](https-delivery.md) and [qualification](qualification.md); full secure mixed-vendor roles and HEVC/m2a/MP3 are still pending.

@@ -12,10 +12,10 @@ Here `m2a` means MPEG audio Layer II, called `mp2` by FFmpeg; MP3 is Layer III. 
 
 ## Present boundary
 
-| Capability | v0.9 qualification | Required next work |
+| Capability | v0.10 profile | Required next work |
 |---|---|---|
 | RTSPS playback | Verified TLS, H.264/AAC-LC, interleaved TCP media | HEVC/MPEG audio packetization; remaining publication/push roles |
-| HTTPS stream output | No standalone HTTPS listener | Native listener shared by all HTTP media and authorization routes |
+| HTTPS stream output | Native TLS listener shares HTTP media/publication/auth routes; HTTPS-only and secure viewer redirect rules | Full private-CA input/cluster trust, secure push, certificate reload/expiry reporting |
 | Secure HTTP inputs/private endpoints | Secure aliases exist; full direction/certificate matrix incomplete | Qualify every TLS role, public/private identity and trust configuration |
 | M4F/M4S codecs | H.264/AAC subset | HEVC, m2a and MP3 in both directions, with native and reference peers |
 | CPU/GPU encoding | CPU H.264/AAC exercised; H.264 NVIDIA option hardware-gated | HEVC CPU/GPU profiles and independently selectable audio handling |

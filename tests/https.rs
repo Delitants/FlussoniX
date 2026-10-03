@@ -597,7 +597,10 @@ async fn https_publication_password_callback_renewal_decode_and_drop_are_preserv
     assert!(seen.len() >= 2, "TLS publisher callback renews");
     assert_eq!(seen[0]["ip"], "127.0.0.1");
     assert_eq!(seen[0]["token"], "owned-publisher");
-    assert_eq!(seen[0]["id"], seen[1]["id"]);
+    assert!(uuid::Uuid::parse_str(seen[0]["session_id"].as_str().unwrap()).is_ok());
+    assert_eq!(seen[0]["session_id"], seen[1]["session_id"]);
+    assert_eq!(seen[0]["request_number"], 0);
+    assert_eq!(seen[1]["request_number"], 1);
     drop(seen);
     publisher.abort();
     let _ = publisher.await;

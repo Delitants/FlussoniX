@@ -1,5 +1,16 @@
 import {test,expect} from '@playwright/test';
 test.beforeEach(async({page})=>{await page.goto('/admin/');await page.getByLabel('Username').fill(process.env.FLUSSONIX_ADMIN_USER||'admin');await page.getByLabel('Password',{exact:true}).fill(process.env.FLUSSONIX_ADMIN_PASSWORD!);await page.getByRole('button',{name:'Sign in',exact:true}).click();await expect(page.getByRole('heading',{name:'Streams',exact:true})).toBeVisible();});
+test('Config shows actual HTTP and HTTPS listeners with startup guidance',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const node=await(await request.get('/flussonix/api/v1/node',{headers})).json();
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ const delivery=page.getByRole('region',{name:'HTTP delivery'});
+ await expect(delivery).toBeVisible();
+ await expect(delivery).toContainText(node.http_delivery?.http||'Not enabled');
+ await expect(delivery).toContainText(node.http_delivery?.https||'Not enabled');
+ await expect(delivery).toContainText('startup options');
+ await expect(delivery.locator('input,textarea')).toHaveCount(0);
+});
 test('create owned stream and show persisted operational state',async({page})=>{await page.getByRole('button',{name:'Add stream'}).click();await page.getByLabel('Stream name',{exact:true}).fill('ui-test');await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('heading',{name:'ui-test',exact:true})).toBeVisible();await page.getByRole('button',{name:'← Streams'}).click();await expect(page.getByRole('button',{name:'ui-test',exact:true})).toBeVisible();await page.screenshot({path:'../.runtime/screenshots/streams.png',fullPage:true});});
 test('configuration edits can be validated without applying',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
