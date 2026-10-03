@@ -31,3 +31,5 @@ pub mod hevc;
 pub mod http_tls;
 pub mod mpeg_audio;
 pub mod publish;
+
+pub mod worker_ts;

@@ -414,7 +414,7 @@ fn parse_tracks(tracks: &[Track]) -> Result<Vec<PacketTrack>, String> {
     }
     Ok(out)
 }
-fn avcc(c: &[u8]) -> Result<(usize, Vec<&[u8]>), String> {
+pub(crate) fn avcc(c: &[u8]) -> Result<(usize, Vec<&[u8]>), String> {
     let error = || "invalid AVCDecoderConfigurationRecord".to_string();
     if c.len() < 7 || c.len() > 65536 || c[0] != 1 || c[4] & 3 == 2 {
         return Err(error());
