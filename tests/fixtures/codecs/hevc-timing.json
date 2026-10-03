@@ -1,0 +1,74 @@
+[
+  {
+    "dts": -1024,
+    "pts": 0,
+    "duration": 512,
+    "flags": "K__"
+  },
+  {
+    "dts": -512,
+    "pts": 1536,
+    "duration": 512,
+    "flags": "___"
+  },
+  {
+    "dts": 0,
+    "pts": 1024,
+    "duration": 512,
+    "flags": "___"
+  },
+  {
+    "dts": 512,
+    "pts": 512,
+    "duration": 512,
+    "flags": "___"
+  },
+  {
+    "dts": 1024,
+    "pts": 3072,
+    "duration": 512,
+    "flags": "K__"
+  },
+  {
+    "dts": 1536,
+    "pts": 2560,
+    "duration": 512,
+    "flags": "___"
+  },
+  {
+    "dts": 2048,
+    "pts": 2048,
+    "duration": 512,
+    "flags": "___"
+  },
+  {
+    "dts": 2560,
+    "pts": 4608,
+    "duration": 512,
+    "flags": "___"
+  },
+  {
+    "dts": 3072,
+    "pts": 4096,
+    "duration": 512,
+    "flags": "___"
+  },
+  {
+    "dts": 3584,
+    "pts": 3584,
+    "duration": 512,
+    "flags": "___"
+  },
+  {
+    "dts": 4096,
+    "pts": 5632,
+    "duration": 512,
+    "flags": "___"
+  },
+  {
+    "dts": 4608,
+    "pts": 5120,
+    "duration": 512,
+    "flags": "___"
+  }
+]
