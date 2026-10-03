@@ -1,6 +1,6 @@
 # Subtitle conversion and preservation contract
 
-Status: requested follow-on subsystem; not implemented or exposed as a working option by the current native startup stage.
+Status: original separate DVB/teletext track preservation is implemented for the shared MPEG-TS output; selectable HLS conversion and OCR remain pending. Embedded 608/708 payload survival is tested at native framing boundaries, not decoder or player semantics.
 
 ## User requirement
 
@@ -57,3 +57,11 @@ Preservation applies only when the target protocol/container carries that repres
 4. Implement bounded DVB bitmap decoding and independent OCR integration, language dependencies and confidence reporting. Test bitmap updates/clear cues, language glyphs and slow/failing OCR without AV interruption.
 
 Acceptance needs actual playback/cue contents and preserved original bytes/identifiers, not only a configuration save or advertised manifest. No official Flussonic binary/library is a product dependency. Record fixture provenance, independent decoder/player verification and remaining limits before release.
+
+## First runtime stage: original separate tracks
+
+Streams and Templates now accept `flussonix_subtitle_tracks`: `preserve` copies separate subtitle tracks into MPEG-TS fan-out; `drop` omits them. Omission keeps the pre-existing drop behavior. The friendly **Original subtitle tracks** select supports template inheritance and explicit override. This extension is not a claim of exact legacy subtitle API compatibility. Worker stats report the effective policy and native discovery carries it.
+
+Both HLS variants and FLV receive only video/audio, so DVB/teletext tracks do not make incompatible containers fail. Copy-mode embedded captions stay in video; the separate-track drop setting does not strip caption SEI. Owned DVB clear-page and teletext page 888 fixtures retain encoded payloads, languages and page identifiers through copy and CPU video transcoding. Remuxing may change PID numbers. Native H.264/HEVC framing tests retain both 608 and 708 packet bytes; this does not yet prove decoded caption timing, encoder retention or complete regional functionality.
+
+Selectable HLS conversion, service detection/announcements, OCR, native separate subtitle tracks, caption stripping and subtitle cluster round trips remain pending. In particular, the current AV-only HLS source pull does not carry separate DVB/teletext tracks from source to CDN. SRT/RTP subtitle delivery and GPU caption retention have not been qualified. No Convert option is exposed until its real decoder and authorized rendition path works.

@@ -189,3 +189,26 @@ test('publication forms expose masked publisher credentials and preserve templat
  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await password.fill('');await save('streams',name);s=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(s.password).toBe('owned-browser-publisher');await expect(page.locator('textarea')).toHaveCount(0);
  await request.delete('/streamer/api/v3/streams/'+name,{headers});await request.delete('/streamer/api/v3/templates/'+template,{headers});
 });
+test('subtitle track controls inherit, override and restore template policy without JSON',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const template='ui-subtitle-template',stream='ui-subtitle-stream';
+ const save=async()=>{await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);};
+ await page.getByRole('button',{name:'Templates',exact:true}).click();await page.getByRole('button',{name:'Add template',exact:true}).click();
+ await page.getByLabel('Template name',{exact:true}).fill(template);await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');
+ await page.getByLabel('Original subtitle tracks',{exact:true}).selectOption('preserve');
+ await save();
+ const savedTemplate=await(await request.get('/streamer/api/v3/templates/'+template,{headers})).json();expect(savedTemplate.flussonix_subtitle_tracks).toBe('preserve');
+ expect((await request.put('/streamer/api/v3/streams/'+stream,{headers,data:{$reset:true,template,static:false}})).ok()).toBeTruthy();
+ await page.getByRole('button',{name:'Streams',exact:true}).click();await page.getByRole('button',{name:stream,exact:true}).click();
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+ await expect(page.getByLabel('Original subtitle tracks',{exact:true})).toHaveValue('inherit');
+ await expect(page.getByRole('dialog')).toContainText('Selectable HLS conversion is not available yet');
+ await expect(page.getByRole('dialog').locator('textarea')).toHaveCount(0);
+ await page.getByLabel('Title',{exact:true}).fill('Subtitle policy inherited');await save();
+ let cfg=await(await request.get('/streamer/api/v3/streams/'+stream,{headers})).json();expect(cfg.flussonix_subtitle_tracks).toBe('preserve');expect(cfg.config_on_disk.flussonix_subtitle_tracks).toBeUndefined();
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Original subtitle tracks',{exact:true}).selectOption('drop');await save();
+ cfg=await(await request.get('/streamer/api/v3/streams/'+stream,{headers})).json();expect(cfg.flussonix_subtitle_tracks).toBe('drop');expect(cfg.config_on_disk.flussonix_subtitle_tracks).toBe('drop');
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Original subtitle tracks',{exact:true}).selectOption('inherit');await save();
+ cfg=await(await request.get('/streamer/api/v3/streams/'+stream,{headers})).json();expect(cfg.flussonix_subtitle_tracks).toBe('preserve');expect(cfg.config_on_disk.flussonix_subtitle_tracks).toBeUndefined();
+ await page.getByRole('button',{name:'Transcoder',exact:true}).click();await expect(page.getByText('Keep in MPEG-TS output',{exact:true})).toBeVisible();
+});

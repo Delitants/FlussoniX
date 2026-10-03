@@ -154,3 +154,11 @@ The opt-in UDP playback profile shares the TCP packetizer, worker and authorizat
 ## Implemented v0.10 HTTPS profile
 
 The optional standalone HTTPS listener serves existing H.264/AAC media, publication, API and admin routes with shared authorization and real socket client IPs. HTTPS-only startup skips HTTP binding. HTTPS viewer redirects exclude plaintext public CDNs/callback targets. Native codec and remaining direction boundaries remain unchanged. See [HTTPS delivery](https-delivery.md) and [qualification](qualification.md); full secure mixed-vendor roles and HEVC/m2a/MP3 are still pending.
+
+## Original subtitle track preservation stage
+
+`flussonix_subtitle_tracks` (`preserve` / `drop`, omitted default `drop`) is a native Stream/Template extension with a friendly inherited control. The shared MPEG-TS fan-out preserves original DVB subtitle and teletext PES and semantic PMT descriptors when selected. Owned fixture tests compare exact encoded payloads, language, DVB composition/ancillary page identifiers and teletext magazine/page through copy and CPU H.264 transcoding. Both HLS variants stay AV-only and readable. PID renumbering is allowed by remuxing. Policy edits replace the worker generation; authenticated discovery carries the policy without publisher credentials.
+
+Native H.264/HEVC M4S/M4F framing and native-to-TS bridge tests preserve GA94 bytes containing both 608 and 708 packets; these are payload-survival tests, not subtitle decoding/player qualification. The DVB fixture is an acquisition clear-page, not an OCR image-quality test. Teletext contains an independently authored subtitle header and visible text row. There is no official Flussonic component dependency.
+
+Pending: selectable WebVTT, CEA/teletext decoding and service metadata, DVB OCR, complete subtitle API compatibility, separate native subtitle tracks and source-to-CDN regional subtitle round trips. Current AV-only HLS source pulls omit separate subtitle PIDs. GPU caption retention, SRT/RTP subtitle delivery and exact presentation semantics remain unqualified. Dropping separate tracks does not strip embedded captions.
