@@ -17,3 +17,6 @@ The reviewer declined final release evidence because Task 3 belongs to the execu
 
 
 - CI ruling: fix the pre-existing reserve/drop/rebind collision in the shared UDP test helper, using disjoint monotonic ranges below the default ephemeral range, with a RED/GREEN nonreuse regression. Product code/listeners remain unchanged. Cost if wrong: the fixture allocation strategy needs further work; no new product capability is claimed.
+
+
+- Browser ruling: synchronize publication persistence checks with the successful save response and closed editor. A controlled 250 ms delay reproduced CI’s early GET; all 14 cases pass after synchronization. No product or timeout change. Cost if wrong: browser checks need additional synchronization coverage.

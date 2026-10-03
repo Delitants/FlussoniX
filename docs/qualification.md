@@ -195,3 +195,6 @@ The same exact binary and local LB also pass the separate authorized live-source
 
 
 The first GitHub CI run stopped at a pre-existing UDP test-fixture handoff collision before media startup. A new regression failed when released fixture ranges were reused; the shared helper now issues disjoint monotonic ranges outside the default ephemeral range. All affected RTSP/UDP/shutdown tests and the fresh full 196-test suite pass. This changes test allocation only; the product binary SHA256 and deployed qualification remain unchanged.
+
+
+A later CI run passed all Rust checks and exposed the new browser case reading saved state before its asynchronous PUT completed. Adding a controlled 250 ms save delay reproduced the exact failure locally. The case now awaits a successful PUT and closed editor before each persistence assertion; all 14 cases pass with that delay. No product timeout, browser retry or runtime change was introduced.
