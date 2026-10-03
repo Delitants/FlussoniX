@@ -634,6 +634,7 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
                         "disabled",
                         "flussonix_content_id",
                         "flussonix_input_timeout",
+                        "flussonix_subtitle_tracks",
                         "on_play",
                         "flussonix_token_sha256",
                     ];

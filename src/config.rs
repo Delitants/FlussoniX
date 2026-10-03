@@ -181,6 +181,16 @@ pub fn effective(root: &Value, name: &str) -> Option<Value> {
     result["config_on_disk"] = disk.clone();
     Some(result)
 }
+/// Separate subtitle track policy; embedded video captions are unaffected.
+pub fn subtitle_tracks(cfg: &Value) -> Result<&'static str, String> {
+    match cfg.get("flussonix_subtitle_tracks") {
+        None => Ok("drop"),
+        Some(Value::String(value)) if value == "preserve" => Ok("preserve"),
+        Some(Value::String(value)) if value == "drop" => Ok("drop"),
+        _ => Err("flussonix_subtitle_tracks must be preserve or drop; selectable HLS conversion is not implemented".into()),
+    }
+}
+
 pub fn valid_name(name: &str) -> Result<(), String> {
     if name.is_empty()
         || name.len() > 256
@@ -262,6 +272,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "password",
                     "flussonix_token_sha256",
                     "flussonix_input_timeout",
+                    "flussonix_subtitle_tracks",
                     "flussonix_content_id",
                 ],
                 "peers" | "sources" => &[
@@ -353,6 +364,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                         );
                     }
                 }
+                subtitle_tracks(item)?;
                 crate::playback_auth::Policy::from_config(item, root)?;
                 crate::publish::Policy::from_config(item, root)?;
                 if let Some(hash) = item.get("flussonix_token_sha256") {

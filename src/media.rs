@@ -44,6 +44,7 @@ pub struct Worker {
     signature: String,
     input_index: usize,
     input_protocol: String,
+    subtitle_tracks: &'static str,
     restart_count: u64,
     input_timeout: Duration,
     recovery: std::sync::Mutex<crate::recovery::Recovery>,
@@ -97,7 +98,7 @@ impl Worker {
         } else {
             "stopped"
         };
-        json!({"status":status,"pid":self.pid(),"bytes_in":self.bytes.load(Ordering::Relaxed),"online_clients":self.viewers.load(Ordering::Relaxed),"uptime":self.started.elapsed().as_secs(),"input_protocol":self.input_protocol,"input_index":self.input_index,"restart_count":self.restart_count,"retry_in_ms":recovery.retry_in().map(|d|d.as_millis()),"last_error":recovery.last_error(),"media_age_ms":recovery.media_age_ms()})
+        json!({"status":status,"pid":self.pid(),"bytes_in":self.bytes.load(Ordering::Relaxed),"online_clients":self.viewers.load(Ordering::Relaxed),"uptime":self.started.elapsed().as_secs(),"input_protocol":self.input_protocol,"input_index":self.input_index,"restart_count":self.restart_count,"retry_in_ms":recovery.retry_in().map(|d|d.as_millis()),"last_error":recovery.last_error(),"media_age_ms":recovery.media_age_ms(),"subtitle_tracks":self.subtitle_tracks})
     }
 }
 impl Engine {
@@ -152,6 +153,7 @@ impl Engine {
         current: impl std::future::Future<Output = bool>,
         publishing: bool,
     ) -> Result<Arc<Worker>, String> {
+        let subtitle_tracks = crate::config::subtitle_tracks(cfg)?;
         let mut workers = self.workers.lock().await;
         // Recheck after waiting for another stream startup/replacement. A stale
         // route must not cancel an already-published replacement worker.
@@ -464,6 +466,7 @@ impl Engine {
             pid: AtomicU32::new(pid),
             started: Instant::now(),
             signature,
+            subtitle_tracks,
             input_index: index,
             input_protocol: input.split("://").next().unwrap_or("unknown").into(),
             restart_count,
@@ -812,7 +815,7 @@ pub fn translate_input(input: &str) -> Result<String, String> {
 }
 
 pub fn media_signature(cfg: &Value) -> String {
-    format!("{:x}",Sha256::digest(serde_json::to_vec(&json!({"inputs":cfg["inputs"],"transcoder":cfg["transcoder"],"peer":cfg["flussonix_peer_key"],"timeout":cfg["flussonix_input_timeout"]})).unwrap()))
+    format!("{:x}",Sha256::digest(serde_json::to_vec(&json!({"inputs":cfg["inputs"],"transcoder":cfg["transcoder"],"peer":cfg["flussonix_peer_key"],"timeout":cfg["flussonix_input_timeout"],"subtitle_tracks":cfg["flussonix_subtitle_tracks"]})).unwrap()))
 }
 
 #[cfg(test)]
