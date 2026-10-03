@@ -15,7 +15,10 @@ jobs:
       - run: rustup show
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - name: Rust qualification and owned browser caption fixture
+        run: |
+          mkdir -p .runtime
+          FLUSSONIX_CAPTION_FIXTURE_FILE="$PWD/.runtime/owned-captions.ts" cargo test --locked
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -27,6 +30,7 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Verify admin against live daemon
         run: |
+          export FLUSSONIX_CAPTION_FIXTURE_FILE="$PWD/.runtime/owned-captions.ts"
           export FLUSSONIX_ADMIN_USER=admin
           export FLUSSONIX_ADMIN_PASSWORD="$(openssl rand -hex 24)"
           export FLUSSONIX_PEER_KEY="$(openssl rand -hex 32)"

@@ -42,11 +42,11 @@
 ### Task 3: Friendly controls and qualification
 **Files:** web/src/forms.tsx, web/src/main.tsx, web/tests/admin.spec.ts, docs/subtitle-design.md, docs/compatibility.md, docs/qualification.md.
 **Interfaces:** Consumes validated caption rows and stats; produces inheritance mode plus channel/language/name rows in existing approved form layout.
-- [ ] Add browser test for template rows, stream inheritance, explicit filter/pass modes, restore inheritance and unrelated edit; expect no JSON field.
-- [ ] Run targeted browser test against owned unused-port daemon; Expected: missing controls.
-- [ ] Implement friendly controls and summaries with honest regional capability help.
-- [ ] Run full browser suite, web build, fmt, Clippy and full Rust suite; Expected: all green.
-- [ ] Document measured behavior and remaining limits; commit `feat: expose selectable caption controls`.
+- [x] Add browser test for template rows, stream inheritance, explicit filter/pass modes, restore inheritance and unrelated edit; expect no JSON field.
+- [x] Run targeted browser test against owned unused-port daemon; Expected: missing controls.
+- [x] Implement friendly controls and summaries with honest regional capability help.
+- [x] Run full browser suite, web build, fmt, Clippy and full Rust suite; Expected: all green.
+- [x] Document measured behavior and remaining limits; commit `feat: expose selectable caption controls`.
 
 ## Self-review
 Every first-stage requirement maps to one of these tasks. Regional conversion beyond 608 remains explicit future work; this is a working decoder/rendition slice of the broader subtitle contract. Inline execution and same-head publication are already authorized. The primary remaining tradeoff is one additional held-back segment for synchronization.

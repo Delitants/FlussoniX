@@ -1,6 +1,6 @@
 # Subtitle conversion and preservation contract
 
-Status: original separate DVB/teletext track preservation is implemented for the shared MPEG-TS output; selectable HLS conversion and OCR remain pending. Embedded 608/708 payload survival is tested at native framing boundaries, not decoder or player semantics.
+Status: original separate DVB/teletext track preservation and selectable plain-text CEA-608 WebVTT are implemented. HLS offers supported embedded pass-through, conversion and filtering. CEA-708/teletext conversion and DVB OCR remain pending; see the qualification record for the measured codec/player subset.
 
 ## User requirement
 
@@ -64,6 +64,24 @@ Streams and Templates now accept `flussonix_subtitle_tracks`: `preserve` copies 
 
 Both HLS variants and FLV receive only video/audio, so DVB/teletext tracks do not make incompatible containers fail. Copy-mode embedded captions stay in video; the separate-track drop setting does not strip caption SEI. Owned DVB clear-page and teletext page 888 fixtures retain encoded payloads, languages and page identifiers through copy and CPU video transcoding. Remuxing may change PID numbers. Native H.264/HEVC framing tests retain both 608 and 708 packet bytes; this does not yet prove decoded caption timing, encoder retention or complete regional functionality.
 
-Selectable HLS conversion, service detection/announcements, OCR, native separate subtitle tracks, caption stripping and subtitle cluster round trips remain pending. In particular, the current AV-only HLS source pull does not carry separate DVB/teletext tracks from source to CDN. SRT/RTP subtitle delivery and GPU caption retention have not been qualified. No Convert option is exposed until its real decoder and authorized rendition path works.
+At that initial stage, selectable conversion, service detection, OCR, caption stripping and regional cluster round trips remained pending; the subsequent stage below implements selected 608 conversion and targeted HLS filtering. OCR, native separate subtitle tracks and regional subtitle cluster round trips are still pending. In particular, the current AV-only HLS source pull does not carry separate DVB/teletext tracks from source to CDN. SRT/RTP subtitle delivery and GPU caption retention have not been qualified. The subsequent Convert option uses the real decoder and authorized rendition path described below.
 
 Sparse subtitle qualification: continuously paced publications with declared but absent subtitle packets, and with only initial cues followed by silence, keep AV progressing and publish both HLS variants in copy and CPU modes. Preservation caps common tee and nested live-TS interleaving at 100 ms; this is a mux buffering budget, not an end-to-end latency promise. Four new regressions first reproduced startup timeouts before the fix and then passed.
+
+## HLS mode and selectable 608 stage
+
+The friendly **HLS subtitles** control on Streams and Templates supports inheritance and three explicit modes:
+
+| Mode | Delivered HLS | Other outputs |
+| --- | --- | --- |
+| Pass through supported captions | Keeps original embedded 608/708 in copy-mode H.264/HEVC video. Player support is required; separate DVB/teletext tracks are not HLS renditions. | Existing policy remains independent. |
+| Convert to selectable WebVTT | Adds configured CC1..CC4 plain-text 608 renditions to TS and fMP4 HLS. Does not remove original video captions. | Original subtitle tracks may still be preserved. |
+| Filter out HLS subtitles | Omits conversion and clears GA94 caption process/count/valid flags in delivered H.264/HEVC media. Byte lengths, unrelated SEI and encoded video/audio remain intact. | Does not strip captions from shared TS/native media. |
+
+`flussonix_hls_subtitles` accepts `passthrough`, `convert` or `drop`. Missing mode infers conversion from nonempty `flussonix_hls_captions`, otherwise pass-through, preserving earlier behavior. The selected mode can override inherited service rows without overwriting them; restoring inheritance removes local mode and rows. `flussonix_hls_captions` holds up to four distinct `{channel,language,name}` rows. Mode/service fields are native extensions, not verified legacy aliases. Conversion needs at least one selected service; empty rows previously used to disable conversion remain supported.
+
+An independent bounded Rust decoder reads private copied source video before CPU encoding through the same FFmpeg input session. It handles 608 display state, parity, duplicate controls, all four channels, basic/special/extended characters and timed erase. H.264 and HEVC registered SEI framing, B-frame presentation reordering and 33-bit timestamp wrap are tested independently. Real live copy/CPU H.264 delivery is qualified separately. Styles are reduced to plain text; 708 fallback bytes are not full 708 decoding.
+
+WebVTT uses actual AV clock anchors and sequence grids, empty silent segments and immutable one-second cue slices with generation-scoped IDs. Conversion holds back one AV segment and requires timestamp headroom before freezing cue files. All masters, AV/subtitle playlists and VTT files reuse current viewer auth, token rewriting and revocation. Decoder lag/size/clock errors and private socket failure report failure and fall back to progressing AV. Filtering fails closed for unsupported/malformed containers instead of returning captions. HLS filtering currently parses each delivered segment; this stage has no sustained scale or cache performance claim.
+
+GPU conversion, real HEVC caption player delivery, 708/teletext decoding, DVB bitmap OCR, automatic source-service discovery and separate native subtitle relay remain open. MPEG-2 caption conversion/filtering is not available. Original-track controls do not imply global embedded-caption stripping across every protocol.

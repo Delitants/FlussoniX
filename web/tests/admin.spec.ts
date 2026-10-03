@@ -202,7 +202,7 @@ test('subtitle track controls inherit, override and restore template policy with
  await page.getByRole('button',{name:'Streams',exact:true}).click();await page.getByRole('button',{name:stream,exact:true}).click();
  await page.getByRole('button',{name:'Edit stream',exact:true}).click();
  await expect(page.getByLabel('Original subtitle tracks',{exact:true})).toHaveValue('inherit');
- await expect(page.getByRole('dialog')).toContainText('Selectable HLS conversion is not available yet');
+ await expect(page.getByRole('dialog')).toContainText('708, teletext and DVB OCR conversion remain pending');
  await expect(page.getByRole('dialog').locator('textarea')).toHaveCount(0);
  await page.getByLabel('Title',{exact:true}).fill('Subtitle policy inherited');await save();
  let cfg=await(await request.get('/streamer/api/v3/streams/'+stream,{headers})).json();expect(cfg.flussonix_subtitle_tracks).toBe('preserve');expect(cfg.config_on_disk.flussonix_subtitle_tracks).toBeUndefined();
@@ -211,4 +211,19 @@ test('subtitle track controls inherit, override and restore template policy with
  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Original subtitle tracks',{exact:true}).selectOption('inherit');await save();
  cfg=await(await request.get('/streamer/api/v3/streams/'+stream,{headers})).json();expect(cfg.flussonix_subtitle_tracks).toBe('preserve');expect(cfg.config_on_disk.flussonix_subtitle_tracks).toBeUndefined();
  await page.getByRole('button',{name:'Transcoder',exact:true}).click();await expect(page.getByText('Keep in MPEG-TS output',{exact:true})).toBeVisible();
+});
+
+test('HLS subtitle controls pass through, convert, filter and inherit without JSON',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const template='ui-hls-caption-template',stream='ui-hls-caption-stream';const save=async()=>{await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);};
+ try{
+ await page.getByRole('button',{name:'Templates',exact:true}).click();await page.getByRole('button',{name:'Add template',exact:true}).click();await page.getByLabel('Template name',{exact:true}).fill(template);await page.getByLabel('Input mode',{exact:true}).selectOption('publish');await page.getByLabel('Activation',{exact:true}).selectOption('ondemand');
+ await expect(page.getByLabel('HLS subtitles',{exact:true})).toBeVisible();await page.getByLabel('HLS subtitles',{exact:true}).selectOption('convert');await page.getByLabel('Caption language 1',{exact:true}).fill('en');await page.getByLabel('Caption name 1',{exact:true}).fill('English');await page.getByRole('button',{name:'Add caption channel',exact:true}).click();await page.getByLabel('Caption channel 2',{exact:true}).selectOption('3');await page.getByLabel('Caption language 2',{exact:true}).fill('es');await page.getByLabel('Caption name 2',{exact:true}).fill('Español');await save();
+ let t=await(await request.get('/streamer/api/v3/templates/'+template,{headers})).json();expect(t.flussonix_hls_captions.map((s:any)=>s.channel)).toEqual([1,3]);expect(t.flussonix_hls_subtitles).toBe('convert');
+ expect((await request.put('/streamer/api/v3/streams/'+stream,{headers,data:{$reset:true,template}})).ok()).toBeTruthy();await page.getByRole('button',{name:'Streams',exact:true}).click();await expect(page.getByRole('button',{name:stream,exact:true})).toBeVisible();await page.getByRole('button',{name:stream,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(page.getByLabel('HLS subtitles',{exact:true})).toHaveValue('inherit');await expect(page.getByRole('dialog')).toContainText('708, teletext and DVB OCR conversion remain pending');await expect(page.getByRole('dialog').locator('textarea')).toHaveCount(0);await page.getByLabel('Title',{exact:true}).fill('Inherited HLS captions');await save();
+ const get=async()=>await(await request.get('/streamer/api/v3/streams/'+stream,{headers})).json();let cfg=await get();expect(cfg.config_on_disk.flussonix_hls_captions).toBeUndefined();expect(cfg.flussonix_hls_captions).toEqual(t.flussonix_hls_captions);
+ for(const mode of ['passthrough','drop']){await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('HLS subtitles',{exact:true}).selectOption(mode);await save();cfg=await get();expect(cfg.flussonix_hls_subtitles).toBe(mode);expect(cfg.config_on_disk.flussonix_hls_captions).toBeUndefined();}
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('HLS subtitles',{exact:true}).selectOption('convert');await page.getByLabel('Caption name 1',{exact:true}).fill('Overridden captions');await save();cfg=await get();expect(cfg.config_on_disk.flussonix_hls_captions[0].name).toBe('Overridden captions');
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('HLS subtitles',{exact:true}).selectOption('inherit');await save();cfg=await get();expect(cfg.config_on_disk.flussonix_hls_subtitles).toBeUndefined();expect(cfg.config_on_disk.flussonix_hls_captions).toBeUndefined();expect(cfg.flussonix_hls_subtitles).toBe('convert');await page.getByRole('button',{name:'Transcoder',exact:true}).click();await expect(page.getByText('CC1 · English · en',{exact:true})).toBeVisible();
+ }finally{await request.delete('/streamer/api/v3/streams/'+stream,{headers}).catch(()=>{});await request.delete('/streamer/api/v3/templates/'+template,{headers}).catch(()=>{});}
 });
