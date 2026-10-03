@@ -47,11 +47,14 @@ fn owned_regional_fixture_has_independent_codec_and_descriptor_identity() {
             .all(|p| p == &fixture::teletext_body())
     );
 }
-async fn run(encoder: Option<&str>, preserve: bool) {
+async fn run(encoder: Option<&str>, preserve: bool, passthrough: bool) {
     let input = fixture::transport();
     let d = tempfile::tempdir().unwrap();
     let e = Arc::new(Engine::new(d.path(), "ffmpeg"));
     let mut cfg = json!({"inputs":[{"url":"publish://"}],"flussonix_subtitle_tracks":if preserve {"preserve"} else {"drop"}});
+    if passthrough {
+        cfg["flussonix_hls_subtitles"] = json!("passthrough");
+    }
     if let Some(encoder) = encoder {
         cfg["transcoder"] = json!({"encoder":encoder,"vb":300});
     }
@@ -139,7 +142,39 @@ async fn run(encoder: Option<&str>, preserve: bool) {
         let segment = e.read("owned", &format!("{root}{name}")).await.unwrap();
         if root.is_empty() {
             let d = fixture::descriptors(&segment);
-            assert_eq!(d.len(), 2, "HLS must receive AV only");
+            assert_eq!(
+                d.len(),
+                if passthrough { 4 } else { 2 },
+                "TS-HLS raw track policy"
+            );
+            if passthrough {
+                for (descriptor, body) in [
+                    (fixture::DVB_DESC, fixture::DVB_BODY.to_vec()),
+                    (fixture::TTX_DESC, fixture::teletext_body()),
+                ] {
+                    let id = d
+                        .iter()
+                        .find(|(_, v)| v.windows(descriptor.len()).any(|x| x == descriptor))
+                        .map(|(id, _)| *id)
+                        .expect("TS-HLS must retain regional descriptors");
+                    let packets = fixture::pes_bodies(&segment, id);
+                    assert!(!packets.is_empty(), "TS-HLS must retain regional PES");
+                    assert!(
+                        packets.iter().all(|p| p == &body),
+                        "TS-HLS must retain encoded payloads exactly"
+                    );
+                }
+                let sequence: u64 = list
+                    .lines()
+                    .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(
+                    sequence > i32::MAX as u64,
+                    "public sequence must retain its epoch"
+                );
+            }
         } else {
             assert!(segment.windows(4).any(|w| w == b"moof"));
             let init = list
@@ -178,15 +213,15 @@ async fn run(encoder: Option<&str>, preserve: bool) {
 }
 #[tokio::test]
 async fn copy_preserves_original_dvb_and_teletext_without_breaking_hls() {
-    run(None, true).await
+    run(None, true, false).await
 }
 #[tokio::test]
 async fn cpu_transcoding_preserves_original_dvb_and_teletext_without_breaking_hls() {
-    run(Some("libx264"), true).await
+    run(Some("libx264"), true, false).await
 }
 #[tokio::test]
 async fn drop_omits_separate_tracks_without_breaking_hls() {
-    run(None, false).await
+    run(None, false, false).await
 }
 
 fn caption_nal(hevc: bool) -> (Vec<u8>, Vec<u8>) {
@@ -262,7 +297,7 @@ fn native_framing_preserves_608_and_708_caption_payloads_for_h264_and_hevc() {
     }
 }
 
-async fn silent_tracks(encoder: Option<&str>, initial_cues: bool) {
+async fn silent_tracks(encoder: Option<&str>, initial_cues: bool, passthrough: bool) {
     let original = fixture::transport_for("24");
     let mut seen = std::collections::HashSet::new();
     let input: Vec<u8> = original
@@ -277,6 +312,9 @@ async fn silent_tracks(encoder: Option<&str>, initial_cues: bool) {
     let d = tempfile::tempdir().unwrap();
     let e = Engine::new(d.path(), "ffmpeg");
     let mut cfg = json!({"inputs":[{"url":"publish://"}],"flussonix_subtitle_tracks":"preserve","flussonix_input_timeout":3});
+    if passthrough {
+        cfg["flussonix_hls_subtitles"] = json!("passthrough");
+    }
     if let Some(encoder) = encoder {
         cfg["transcoder"] = json!({"encoder":encoder,"vb":300});
     }
@@ -333,17 +371,155 @@ async fn silent_tracks(encoder: Option<&str>, initial_cues: bool) {
 }
 #[tokio::test]
 async fn absent_subtitle_packets_do_not_stall_copy_av() {
-    silent_tracks(None, false).await;
+    silent_tracks(None, false, false).await;
 }
 #[tokio::test]
 async fn absent_subtitle_packets_do_not_stall_cpu_av() {
-    silent_tracks(Some("libx264"), false).await;
+    silent_tracks(Some("libx264"), false, false).await;
 }
 #[tokio::test]
 async fn subtitle_silence_after_initial_cues_does_not_stall_copy_av() {
-    silent_tracks(None, true).await;
+    silent_tracks(None, true, false).await;
 }
 #[tokio::test]
 async fn subtitle_silence_after_initial_cues_does_not_stall_cpu_av() {
-    silent_tracks(Some("libx264"), true).await;
+    silent_tracks(Some("libx264"), true, false).await;
+}
+
+#[tokio::test]
+async fn raw_hls_copy_preserves_regional_tracks() {
+    run(None, true, true).await;
+}
+#[tokio::test]
+async fn raw_hls_cpu_preserves_regional_tracks() {
+    run(Some("libx264"), true, true).await;
+}
+#[tokio::test]
+async fn raw_hls_policy_is_independent_of_other_ts_outputs() {
+    run(None, false, true).await;
+}
+#[tokio::test]
+async fn raw_hls_silent_copy() {
+    silent_tracks(None, false, true).await;
+}
+#[tokio::test]
+async fn raw_hls_silent_cpu() {
+    silent_tracks(Some("libx264"), false, true).await;
+}
+#[tokio::test]
+async fn raw_hls_after_cues_copy() {
+    silent_tracks(None, true, true).await;
+}
+#[tokio::test]
+async fn raw_hls_after_cues_cpu() {
+    silent_tracks(Some("libx264"), true, true).await;
+}
+
+#[tokio::test]
+async fn raw_hls_window_is_bounded_and_replacement_does_not_reuse_sequences_or_files() {
+    let d = tempfile::tempdir().unwrap();
+    let e = Engine::new(d.path(), "ffmpeg");
+    let cfg = json!({"inputs":[{"url":"publish://"}],"flussonix_hls_subtitles":"passthrough","flussonix_subtitle_tracks":"drop"});
+    let input = fixture::transport_for("24");
+    let mut publisher = e
+        .publish_guarded("owned", &cfg, std::future::ready(true))
+        .await
+        .unwrap();
+    publisher
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&input)
+        .await
+        .unwrap();
+    let read = || async {
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                if let Ok(bytes) = e.read("owned", "index.m3u8").await {
+                    let list = String::from_utf8(bytes.to_vec()).unwrap();
+                    let files: Vec<_> = list
+                        .lines()
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .map(str::to_owned)
+                        .collect();
+                    let sequence: u64 = list
+                        .lines()
+                        .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    if files.len() == 6 {
+                        return (list, files, sequence);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap()
+    };
+    let (_, files, sequence) = read().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let list = String::from_utf8(e.read("owned", "index.m3u8").await.unwrap().to_vec()).unwrap();
+    let last_sequence: u64 = list
+        .lines()
+        .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(last_sequence >= sequence);
+    let directory = d.path().join("owned");
+    // Engine uses an encoded stream-directory name; locate the owned output.
+    let directory = if directory.exists() {
+        directory
+    } else {
+        std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.join("index.m3u8").exists())
+            .unwrap()
+    };
+    let retained = std::fs::read_dir(&directory)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|x| x == "ts")
+        })
+        .count();
+    assert!(retained <= 9, "raw segments leaked: {retained}");
+    let old_worker = publisher.worker.clone();
+    let mut changed = cfg.clone();
+    changed["title"] = json!("replacement");
+    changed["flussonix_subtitle_tracks"] = json!("preserve");
+    let mut replacement = e
+        .publish_guarded("owned", &changed, std::future::ready(true))
+        .await
+        .unwrap();
+    assert!(old_worker.is_closed());
+    replacement
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&input)
+        .await
+        .unwrap();
+    let (list, new_files, next) = read().await;
+    assert!(
+        next >= last_sequence + 6,
+        "replacement reused a live sequence"
+    );
+    assert!(list.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1\n"));
+    assert!(new_files.iter().all(|f| !files.contains(f)));
+    for file in files {
+        assert!(
+            e.read("owned", &file).await.is_err(),
+            "old generation still served"
+        );
+    }
+    drop(publisher);
+    drop(replacement);
+    e.stop_all().await;
 }

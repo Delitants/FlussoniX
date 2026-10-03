@@ -1,6 +1,6 @@
 # Subtitle conversion and preservation contract
 
-Status: original separate DVB/teletext track preservation and selectable plain-text CEA-608 WebVTT are implemented. HLS offers supported embedded pass-through, conversion and filtering. CEA-708/teletext conversion and DVB OCR remain pending; see the qualification record for the measured codec/player subset.
+Status: original separate DVB/teletext track preservation and selectable plain-text CEA-608 WebVTT are implemented. HLS offers original TS pass-through, conversion and filtering. CEA-708/teletext conversion and DVB OCR remain pending; see the qualification record for the measured codec/player subset.
 
 ## User requirement
 
@@ -24,7 +24,7 @@ DVB bitmap-to-text conversion requires OCR; plain codec remuxing is insufficient
 
 Streams and Templates expose two independent controls:
 
-- **HLS subtitles:** Convert to selectable WebVTT / Keep supported embedded captions / Off.
+- **HLS subtitles:** Convert to selectable WebVTT / Pass through original subtitles / Off.
 - **Other outputs:** Keep original subtitles / Off.
 
 Show detected subtitle services/pages as rows with format, language, display name, enabled state and relevant service/page selector. For bitmap conversion expose OCR language selection and capability availability. Do not require editing JSON. Keep WebVTT extraction additive to original passthrough; global caption stripping cannot implement this requirement.
@@ -74,7 +74,7 @@ The friendly **HLS subtitles** control on Streams and Templates supports inherit
 
 | Mode | Delivered HLS | Other outputs |
 | --- | --- | --- |
-| Pass through supported captions | Keeps original embedded 608/708 in copy-mode H.264/HEVC video. Player support is required; separate DVB/teletext tracks are not HLS renditions. | Existing policy remains independent. |
+| Pass through original subtitles | Explicit pass-through retains DVB/teletext descriptors and PES in TS-HLS with copy/CPU encoding, and embedded 608/708 with copy video. Original-format player support is required. fMP4 cannot carry separate DVB/teletext tracks; they are not advertised as selectable text renditions. | Existing policy remains independent. |
 | Convert to selectable WebVTT | Adds configured CC1..CC4 plain-text 608 renditions to TS and fMP4 HLS. Does not remove original video captions. | Original subtitle tracks may still be preserved. |
 | Filter out HLS subtitles | Omits conversion and clears GA94 caption process/count/valid flags in delivered H.264/HEVC media. Byte lengths, unrelated SEI and encoded video/audio remain intact. | Does not strip captions from shared TS/native media. |
 
@@ -85,3 +85,8 @@ An independent bounded Rust decoder reads private copied source video before CPU
 WebVTT uses actual AV clock anchors and sequence grids, empty silent segments and immutable one-second cue slices with generation-scoped IDs. Conversion holds back one AV segment and requires timestamp headroom before freezing cue files. All masters, AV/subtitle playlists and VTT files reuse current viewer auth, token rewriting and revocation. Decoder lag/size/clock errors and private socket failure report failure and fall back to progressing AV. Filtering fails closed for unsupported/malformed containers instead of returning captions. HLS filtering currently parses each delivered segment; this stage has no sustained scale or cache performance claim.
 
 GPU conversion, real HEVC caption player delivery, 708/teletext decoding, DVB bitmap OCR, automatic source-service discovery and separate native subtitle relay remain open. MPEG-2 caption conversion/filtering is not available. Original-track controls do not imply global embedded-caption stripping across every protocol.
+
+
+Explicit `passthrough` uses the independent MPEG-TS segment path for TS-HLS; the omitted default keeps its earlier embedded-caption behavior. The same FFmpeg input/encode supplies raw subtitle PES. All three interleaving queues are bounded for absent/silent services. A generation-owned task publishes an atomic six-segment live playlist, retains two prior finalized segments plus the current open segment, and maps the segment mux's local counter to the public 64-bit sequence epoch. Replacement invalidates old filenames and carries discontinuity history. fMP4 remains AV-only for separate tracks; filtering omits separate tracks and disables supported embedded caption flags. Raw TS carriage does not imply browser decoding of DVB bitmaps or teletext. [FFmpeg's segment mux](https://ffmpeg.org/ffmpeg-formats.html#segment_002c-stream_005fsegment_002c-ssegment) supplies finalized MPEG-TS files without its HLS mux's WebVTT subtitle routing.
+
+Post-review regressions cover captions after one and two complete 33-bit timestamp periods, stale-display clearing on truncated registered SEI and oversized GA94 counts, regional TS-HLS copy/CPU payload preservation, output-policy independence, absent packets, silence after initial cues, bounded retention and generation replacement. These are owned fixtures, not a claim of a 26-hour production soak or complete regional conversion.

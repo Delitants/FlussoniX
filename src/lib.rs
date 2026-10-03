@@ -43,3 +43,5 @@ pub mod caption_hls;
 extern crate self as flussonix;
 
 pub mod caption_filter;
+
+mod raw_hls;

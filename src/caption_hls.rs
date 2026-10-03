@@ -205,7 +205,7 @@ impl State {
                         break;
                     };
                     let source_end =
-                        first + ((clock.wrapping_sub(anchor)) & ((1 << 33) - 1)) + seg.duration;
+                        first + elapsed(clock, anchor, latest.saturating_sub(first)) + seg.duration;
                     if latest < source_end.saturating_add(90000) {
                         complete = false;
                         break;
@@ -238,7 +238,7 @@ impl State {
                             previous.clone()
                         } else {
                             let clock = clocks[&seg.sequence];
-                            let offset = ((clock.wrapping_sub(anchor)) & ((1 << 33) - 1))
+                            let offset = elapsed(clock, anchor, latest.saturating_sub(first))
                                 .saturating_add(first);
                             match webvtt(
                                 &cues,
@@ -285,6 +285,22 @@ impl State {
             }
         }
     }
+}
+// Output clocks wrap at 33 bits; the decoder retains the source epoch. Held-back
+// segments are close to the decoder head, so choose its nearest matching epoch.
+fn elapsed(clock: u64, anchor: u64, head: u64) -> u64 {
+    const PERIOD: u64 = 1 << 33;
+    let wrapped = clock.wrapping_sub(anchor) & (PERIOD - 1);
+    let candidate = (head & !(PERIOD - 1)).saturating_add(wrapped);
+    [
+        Some(candidate),
+        candidate.checked_sub(PERIOD),
+        candidate.checked_add(PERIOD),
+    ]
+    .into_iter()
+    .flatten()
+    .min_by_key(|value| value.abs_diff(head))
+    .unwrap()
 }
 async fn bounded_read(path: &Path) -> Result<Vec<u8>, String> {
     let size = tokio::fs::metadata(path)
@@ -627,5 +643,74 @@ mod identity_limits {
             })
             .collect();
         assert!(webvtt(&cues, 1, 0, 0, 0, 180000, "owned").is_err());
+    }
+}
+#[cfg(test)]
+mod full_period_tests {
+    use super::*;
+    #[tokio::test]
+    async fn rendition_uses_the_current_epoch_after_multiple_full_pts_periods() {
+        for period in [1, 2] {
+            let first = 90000;
+            let late = first + (period << 33) + 900000;
+            let mut d = Decoder::new(vec![crate::captions::Service {
+                channel: 1,
+                language: "en".into(),
+                name: "English".into(),
+            }]);
+            let parity = |b: u8| b | if b.count_ones() % 2 == 0 { 128 } else { 0 };
+            d.observe(first);
+            d.push(0, [parity(0x14), parity(0x29)], late);
+            d.push(0, [parity(b'O'), parity(b'K')], late);
+            d.observe(late + 900000);
+            let state = Arc::new(State::new(d, "owned".into(), 0));
+            let track = crate::m4s::Track {
+                id: 1,
+                codec: "h264".into(),
+                config: vec![
+                    1, 100, 0, 31, 255, 225, 0, 4, 103, 100, 0, 31, 1, 0, 2, 104, 0,
+                ],
+            };
+            let mut mux = crate::worker_ts::Muxer::new(&[track]).unwrap();
+            let mut frame = |pts| {
+                let mut b = mux.tables();
+                b.extend(
+                    mux.frame(&crate::m4f::Frame {
+                        track_id: 1,
+                        dts: pts,
+                        pts_offset: 0,
+                        key: true,
+                        body: vec![0, 0, 0, 2, 0x65, 1],
+                    })
+                    .unwrap(),
+                );
+                b
+            };
+            state.observe_ts(
+                &frame(first),
+                &mut crate::caption_transport::Transport::default(),
+                &mut Decoder::new(vec![]),
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let mut list =
+                String::from("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:100\n");
+            for i in 0..3 {
+                let name = format!("g_{}.ts", 100 + i);
+                std::fs::write(dir.path().join(&name), frame(late + i * 180000)).unwrap();
+                list += &format!("#EXTINF:2,\n{name}\n");
+            }
+            std::fs::write(dir.path().join("index.m3u8"), list).unwrap();
+            let cancel = CancellationToken::new();
+            let task = tokio::spawn(state.clone().watch(dir.path().into(), cancel.clone()));
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let vtt = state.read("cc1_gowned_100.vtt").unwrap();
+            cancel.cancel();
+            task.await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&vtt).contains("OK"),
+                "current full-period cue disappeared: {}",
+                String::from_utf8_lossy(&vtt)
+            );
+        }
     }
 }

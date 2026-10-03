@@ -315,13 +315,18 @@ fn sei(body: &[u8], hevc: bool) -> Result<Vec<Pair>, &'static str> {
             zeros = if b == 0 { zeros + 1 } else { 0 };
         }
         let mut at = 0;
-        while at + 2 <= rbsp.len() {
+        while at < rbsp.len() {
+            if rbsp[at] == 0x80 && rbsp[at + 1..].iter().all(|b| *b == 0) {
+                break;
+            }
             let mut kind = 0usize;
             while at < rbsp.len() && rbsp[at] == 255 {
                 kind += 255;
                 at += 1
             }
-            let Some(&b) = rbsp.get(at) else { break };
+            let Some(&b) = rbsp.get(at) else {
+                return Err("caption_sei_truncated");
+            };
             kind += usize::from(b);
             at += 1;
             let mut size = 0usize;
@@ -329,19 +334,27 @@ fn sei(body: &[u8], hevc: bool) -> Result<Vec<Pair>, &'static str> {
                 size += 255;
                 at += 1
             }
-            let Some(&b) = rbsp.get(at) else { break };
+            let Some(&b) = rbsp.get(at) else {
+                return Err("caption_sei_truncated");
+            };
             size += usize::from(b);
             at += 1;
             let Some(payload) = rbsp.get(at..at.saturating_add(size)) else {
-                break;
+                return Err("caption_sei_truncated");
             };
-            if kind == 4
-                && payload.len() >= 11
-                && payload[..8] == *b"\xb5\x00\x31GA94\x03"
-                && payload[8] & 0x40 != 0
-            {
+            if kind == 4 && payload.len() >= 8 && payload[..8] == *b"\xb5\x00\x31GA94\x03" {
+                if payload.len() < 11 {
+                    return Err("caption_sei_truncated");
+                }
+                if payload[8] & 0x40 == 0 {
+                    at += size;
+                    continue;
+                }
                 let count = usize::from(payload[8] & 31);
-                if 10 + 3 * count < payload.len() {
+                if 10 + 3 * count >= payload.len() {
+                    return Err("caption_sei_truncated");
+                }
+                {
                     for triple in payload[10..10 + 3 * count].chunks_exact(3) {
                         if triple[0] & 4 != 0 && triple[0] & 3 < 2 {
                             pairs.push((triple[0] & 3, [triple[1], triple[2]]));
@@ -410,5 +423,80 @@ mod nal_limit {
         t.finish(&mut d, false, 180000);
         assert_eq!(d.error, Some("caption_nal_limit"));
         assert!(t.pes.is_empty());
+    }
+}
+#[cfg(test)]
+mod malformed_registered {
+    use super::*;
+    #[test]
+    fn truncation_resets_display_and_reports_failure() {
+        for truncation in [0, 1, 2] {
+            let track = crate::m4s::Track {
+                id: 1,
+                codec: "h264".into(),
+                config: vec![
+                    1, 100, 0, 31, 255, 225, 0, 4, 103, 100, 0, 31, 1, 0, 2, 104, 0,
+                ],
+            };
+            let mut m = crate::worker_ts::Muxer::new(&[track]).unwrap();
+            let parity = |b: u8| b | if b.count_ones() % 2 == 0 { 128 } else { 0 };
+            let mut d = Decoder::new(vec![]);
+            d.observe(90000);
+            d.push(0, [parity(0x14), parity(0x29)], 90000);
+            d.push(0, [parity(b'H'), parity(b'I')], 90000);
+            let mut payload = b"\xb5\x00\x31GA94\x03".to_vec();
+            payload.extend([0x41, 255, 255]);
+            let mut nal = vec![
+                6,
+                4,
+                if truncation == 1 {
+                    30
+                } else {
+                    payload.len() as u8
+                },
+            ];
+            nal.extend(payload);
+            nal.push(128);
+            if truncation == 2 {
+                assert!(
+                    sei(&[0, 0, 1, 6, 4, 255], false).is_err(),
+                    "truncated SEI size header must report failure"
+                );
+                nal = vec![6, 4, 255];
+            }
+            let mut body = (nal.len() as u32).to_be_bytes().to_vec();
+            body.extend(nal);
+            body.extend([0, 0, 0, 2, 0x65, 1]);
+            let mut bytes = m.tables();
+            bytes.extend(
+                m.frame(&crate::m4f::Frame {
+                    track_id: 1,
+                    dts: 180000,
+                    pts_offset: 0,
+                    key: true,
+                    body,
+                })
+                .unwrap(),
+            );
+            bytes.extend(
+                m.frame(&crate::m4f::Frame {
+                    track_id: 1,
+                    dts: 270000,
+                    pts_offset: 0,
+                    key: true,
+                    body: vec![0, 0, 0, 2, 0x65, 1],
+                })
+                .unwrap(),
+            );
+            Transport::default().push(&bytes, &mut d);
+            assert!(
+                d.error.is_some(),
+                "malformed recognized captions must report failure"
+            );
+            assert!(
+                d.snapshot().iter().all(|c| c.end.is_some()),
+                "malformed captions must close stale display"
+            );
+        }
     }
 }

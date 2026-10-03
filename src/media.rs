@@ -416,9 +416,10 @@ impl Engine {
                 cmd.arg("-copyinkf:a");
             }
         }
+        let raw_hls = cfg["flussonix_hls_subtitles"] == "passthrough";
         // Separate DVB/teletext tracks belong on TS-based delivery. Copy their
         // encoded PES; AV-only slaves below never receive incompatible codecs.
-        if subtitle_tracks == "preserve" {
+        if subtitle_tracks == "preserve" || raw_hls {
             cmd.args(["-map", "0:s?", "-c:s", "copy"]);
             // Broadcast subtitle services can be silent indefinitely. Bound the
             // common tee queue before its AV-only slaves select their streams.
@@ -450,10 +451,26 @@ impl Engine {
         } else {
             ""
         };
+        let ts_hls = if raw_hls {
+            format!(
+                "[select='v,a,s':f=segment:max_interleave_delta=100000:segment_format=mpegts:segment_format_options=max_interleave_delta=100000:segment_time=2:segment_list_size=6:segment_list_flags=live:segment_list_type=m3u8:segment_list={}]{}",
+                dir.join("passthrough.m3u8").display(),
+                dir.join(format!("g{generation}_p%d.ts")).display()
+            )
+        } else {
+            format!(
+                "[select='v,a':f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_filename={}:hls_flags=delete_segments+temp_file{discontinuity}]{}",
+                dir.join(format!("g{generation}_%d.ts")).display(),
+                dir.join("index.m3u8").display()
+            )
+        };
+        let live_select = if subtitle_tracks == "preserve" {
+            ""
+        } else {
+            "select='v,a':"
+        };
         let output = format!(
-            "[select='v,a':f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_filename={}:hls_flags=delete_segments+temp_file{discontinuity}]{}|[{fmp4_failure}select='v,a':f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_type=fmp4:hls_segment_filename={}:hls_fmp4_init_filename=g{generation}_init.mp4:hls_flags=delete_segments+temp_file{discontinuity}{fmp4_filter}]{}|[f=mpegts{ts_interleave}]pipe:1{wire_output}",
-            dir.join(format!("g{generation}_%d.ts")).display(),
-            dir.join("index.m3u8").display(),
+            "{ts_hls}|[{fmp4_failure}select='v,a':f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_type=fmp4:hls_segment_filename={}:hls_fmp4_init_filename=g{generation}_init.mp4:hls_flags=delete_segments+temp_file{discontinuity}{fmp4_filter}]{}|[{live_select}f=mpegts{ts_interleave}]pipe:1{wire_output}",
             dir.join("fmp4")
                 .join(format!("g{generation}_%d.m4s"))
                 .display(),
@@ -597,6 +614,14 @@ impl Engine {
                     }
                     child
                 };
+                if raw_hls {
+                    let dir = dir.clone(); let c = cancel.clone(); let worker = w.clone();
+                    tasks.push(tokio::spawn(async move {
+                        if crate::raw_hls::watch(dir, generation, sequence, replaced, c.clone()).await.is_err() {
+                            worker.failed("packaging_failed"); c.cancel();
+                        }
+                    }));
+                }
                 if let (Some(listener),Some(state))=(caption_listener,w.captions.clone()) {
                     let c=cancel.clone();let decoder_state=state.clone();let (sender,mut receiver)=tokio::sync::mpsc::channel::<Bytes>(32);
                     tasks.push(tokio::spawn(async move {let mut transport=crate::caption_transport::Transport::default();loop {let data=tokio::select!{biased;_=c.cancelled()=>break,data=receiver.recv()=>match data{Some(data)=>data,None=>break}};if decoder_state.failed.load(Ordering::Relaxed){let mut decoder=decoder_state.decoder.lock().unwrap();let pts=decoder.latest_pts;decoder.reset(pts);break}let mut decoder=decoder_state.decoder.lock().unwrap();transport.push(&data,&mut decoder);if matches!(decoder.error,Some("caption_clock_discontinuity"|"caption_reorder_limit"|"caption_video_codec_unsupported"|"caption_nal_limit"|"caption_pes_limit")){decoder_state.failed.store(true,Ordering::Relaxed);}}}));

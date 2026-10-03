@@ -225,7 +225,7 @@ Sparse subtitle qualification: continuously paced publications with declared but
 
 ## HLS subtitle selection and CEA-608 conversion stage
 
-Native `flussonix_hls_subtitles` selects supported embedded pass-through, plain-text 608 WebVTT conversion, or HLS filtering; omitted mode preserves prior behavior. Friendly Stream/Template controls expose CC1..CC4, language and display name without JSON, distinct names/channels, inherited overrides and restoration. Separate original DVB/teletext preservation remains independent.
+Native `flussonix_hls_subtitles` selects original TS-HLS pass-through, plain-text 608 WebVTT conversion, or HLS filtering; omitted mode preserves prior behavior. Friendly Stream/Template controls expose CC1..CC4, language and display name without JSON, distinct names/channels, inherited overrides and restoration. Separate original DVB/teletext preservation remains independent.
 
 Independent owned H.264 registered T35 fixtures display **USA 608** at source-local 1.160..3.000 seconds, then **LIVE**, followed by silence. The independent FFmpeg decoder agrees with the first pop-on cue. Real copy and CPU workers publish TS/fMP4 selectable renditions, silent VTT segments, stable overlapping one-second display slices and generation-scoped IDs. Owned mixed DVB/teletext fixtures simultaneously retain descriptors and exact PES payloads in shared TS. Token propagation/revocation, grouped paths, MIME type, moving playlists, live AV progress, replacement and old-generation removal are tested.
 
@@ -235,4 +235,7 @@ Native decoder tests cover all four channels, exact display/erase timing, pop-on
 
 Limits: conversion is plain-text CEA-608, with approximately one additional HLS segment of latency. 708 decoding, teletext conversion, DVB bitmap OCR, source-service discovery, GPU extraction, separate native subtitle tracks, regional cluster relay, exact legacy aliases, real HEVC caption player delivery and sustained performance/scale remain pending. Filtering is specific to HLS and parses bounded delivered segments; original policy on other protocols is independent.
 
-Local completion checks:293 Rust tests passed,0failed,1existing external opt-in skipped;22 browser cases passed. Formatting, all-target Clippy with warnings denied and frontend build pass. Fresh review and exact-head GitHub CI remain publication gates.
+Final local completion checks:304 Rust tests passed,0failed,1existing external opt-in skipped;22 browser cases passed. Formatting, all-target Clippy with warnings denied and frontend build pass. Fresh review found three Important issues; each was reproduced and fixed with a fresh full green suite. Publication requires GitHub CI on the identical commit before fast-forwarding main. See [decisions and tradeoffs](hls-subtitle-decisions.md).
+
+
+Post-review TS-HLS qualification adds original DVB/teletext carriage for explicit pass-through. Owned copy and CPU tests compare descriptors and exact encoded PES; a separate test drops other TS outputs while retaining raw HLS subtitles. Four paced cases cover absent subtitle packets and silence after initial cues in copy/CPU. A 24-second owned source exercises bounded raw segment retention, public 64-bit sequences, generation replacement, discontinuity history and unavailable old filenames. fMP4 raw DVB/teletext remains unsupported and the UI says so. Timestamp epoch tests cover one and two full 33-bit periods; malformed SEI/GA94 truncation closes stale display. These tests do not establish sustained production scale or a 26-hour soak.
