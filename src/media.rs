@@ -382,6 +382,11 @@ impl Engine {
                 cmd.arg("-copyinkf:a");
             }
         }
+        // Separate DVB/teletext tracks belong on TS-based delivery. Copy their
+        // encoded PES; AV-only slaves below never receive incompatible codecs.
+        if subtitle_tracks == "preserve" {
+            cmd.args(["-map", "0:s?", "-c:s", "copy"]);
+        }
         // One encode/mux source feeds both HLS variants and shared live TS fan-out.
         let copy_publication = publication
             && (cfg.get("transcoder").is_none() || cfg["transcoder"]["encoder"] == "copy");
@@ -391,7 +396,7 @@ impl Engine {
             String::new()
         } else {
             format!(
-                "|[onfail=ignore:f=flv:flvflags=no_duration_filesize:bsfs/a=aac_adtstoasc]{wire_target}"
+                "|[onfail=ignore:select='v,a':f=flv:flvflags=no_duration_filesize:bsfs/a=aac_adtstoasc]{wire_target}"
             )
         };
         let fmp4_filter = if native_copy {
@@ -403,7 +408,7 @@ impl Engine {
         };
         let fmp4_failure = if native_copy { "onfail=ignore:" } else { "" };
         let output = format!(
-            "[f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_filename={}:hls_flags=delete_segments+temp_file{discontinuity}]{}|[{fmp4_failure}f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_type=fmp4:hls_segment_filename={}:hls_fmp4_init_filename=g{generation}_init.mp4:hls_flags=delete_segments+temp_file{discontinuity}{fmp4_filter}]{}|[f=mpegts]pipe:1{wire_output}",
+            "[select='v,a':f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_filename={}:hls_flags=delete_segments+temp_file{discontinuity}]{}|[{fmp4_failure}select='v,a':f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_type=fmp4:hls_segment_filename={}:hls_fmp4_init_filename=g{generation}_init.mp4:hls_flags=delete_segments+temp_file{discontinuity}{fmp4_filter}]{}|[f=mpegts]pipe:1{wire_output}",
             dir.join(format!("g{generation}_%d.ts")).display(),
             dir.join("index.m3u8").display(),
             dir.join("fmp4")
