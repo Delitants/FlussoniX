@@ -617,7 +617,24 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
                             c["on_play"] = json!(policy.url);
                         }
                     }
-                    json_response(c)
+                    // Discovery conveys playback policy and identity, never publisher
+                    // credentials, source inputs or raw saved configuration.
+                    let fields = [
+                        "name",
+                        "title",
+                        "comment",
+                        "position",
+                        "disabled",
+                        "flussonix_content_id",
+                        "flussonix_input_timeout",
+                        "on_play",
+                        "flussonix_token_sha256",
+                    ];
+                    let discovery = fields
+                        .into_iter()
+                        .filter_map(|key| c.get(key).cloned().map(|value| (key.to_owned(), value)))
+                        .collect();
+                    json_response(Value::Object(discovery))
                 }
                 None => error(StatusCode::NOT_FOUND, "stream not found"),
             };

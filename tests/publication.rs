@@ -825,3 +825,65 @@ async fn publication_is_an_authenticated_private_native_cluster_source() {
     a.media.stop_all().await;
     server.abort();
 }
+
+#[tokio::test]
+async fn peer_discovery_never_discloses_explicit_or_inherited_publisher_secrets() {
+    let d = tempfile::tempdir().unwrap();
+    let a = app(d.path());
+    a.config
+        .put(
+            "auth_backends",
+            "viewers",
+            json!({"url":"https://viewer.example/check"}),
+        )
+        .unwrap();
+    let publisher = json!({"inputs":[{"url":"publish://"}], "password":"owned-private-publisher", "on_publish":"https://publisher.example/check?secret=owned-private-callback", "on_play":"auth://viewers", "flussonix_content_id":"owned-content", "flussonix_token_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"});
+    a.config
+        .put("templates", "receive", publisher.clone())
+        .unwrap();
+    a.config.put("streams", "explicit", publisher).unwrap();
+    a.config
+        .put("streams", "inherited", json!({"template":"receive"}))
+        .unwrap();
+    for name in ["explicit", "inherited"] {
+        let request = Request::builder()
+            .uri(format!("/flussonix/api/v1/stream/{name}"))
+            .header("x-flussonix-peer", "owned-peer-secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(a.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let discovery: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            discovery.get("password").is_none(),
+            "peer cannot learn publisher password"
+        );
+        assert!(
+            discovery.get("on_publish").is_none(),
+            "publisher callback is private"
+        );
+        assert!(
+            discovery.get("config_on_disk").is_none(),
+            "raw saved configuration is private"
+        );
+        assert!(!String::from_utf8_lossy(&bytes).contains("owned-private"));
+        assert_eq!(discovery["name"], name);
+        assert_eq!(discovery["flussonix_content_id"], "owned-content");
+        assert_eq!(discovery["on_play"], "https://viewer.example/check");
+        assert_eq!(discovery["flussonix_token_sha256"], "a".repeat(64));
+        let response = router(a.clone())
+            .oneshot(post(&format!("/{name}/mpegts"), Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        assert_eq!(
+            a.config.effective(name).unwrap()["password"],
+            "owned-private-publisher",
+            "management config retains policy"
+        );
+    }
+    assert_eq!(a.media.count().await, 0);
+}
