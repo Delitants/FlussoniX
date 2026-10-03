@@ -109,6 +109,15 @@ fn wire_caption(
     pts: u64,
     mux: &mut flussonix::worker_ts::Muxer,
 ) -> Vec<u8> {
+    wire_caption_offset(hevc, pairs, pts, 0, mux)
+}
+fn wire_caption_offset(
+    hevc: bool,
+    pairs: &[(u8, u8, u8)],
+    pts: u64,
+    offset: i64,
+    mux: &mut flussonix::worker_ts::Muxer,
+) -> Vec<u8> {
     let mut data = b"\xb5\x00\x31GA94\x03".to_vec();
     data.extend([0x40 | pairs.len() as u8, 0xff]);
     for (f, a, b) in pairs {
@@ -125,7 +134,7 @@ fn wire_caption(
     mux.frame(&flussonix::m4f::Frame {
         track_id: 1,
         dts: pts,
-        pts_offset: 0,
+        pts_offset: offset,
         key: true,
         body,
     })
@@ -178,6 +187,7 @@ fn cue_history_is_bounded_and_old_state_expires() {
     let mut d = decoder();
     send(&mut d, 0, 0x14, 0x29, 0);
     for i in 0..5000 {
+        send(&mut d, 0, 0x14, 0x60, i * 90000);
         send(&mut d, 0, b'A', b'B', i * 90000);
         send(&mut d, 0, 0x14, 0x2c, i * 90000 + 45000);
     }
@@ -239,4 +249,90 @@ fn transport_sync_loss_closes_stale_caption() {
     t.push(&[0; 188], &mut d);
     assert!(d.error.is_some());
     assert!(d.snapshot().iter().all(|c| c.end.is_some()));
+}
+
+#[test]
+fn b_frame_captions_follow_presentation_order() {
+    let track = flussonix::m4s::Track {
+        id: 1,
+        codec: "h264".into(),
+        config: vec![
+            1, 100, 0, 31, 255, 225, 0, 4, 103, 100, 0, 31, 1, 0, 2, 104, 0,
+        ],
+    };
+    let mut mux = flussonix::worker_ts::Muxer::new(&[track]).unwrap();
+    let mut bytes = mux.tables();
+    for (dts, off, pairs) in [
+        (90000, 0, vec![]),
+        (93600, 14400, vec![(0, 0x14, 0x29), (0, b'O', b'K')]),
+        (97200, 3600, vec![(0, 0x14, 0x2c)]),
+        (100800, 3600, vec![]),
+        (108000, 3600, vec![]),
+        (115200, 3600, vec![]),
+    ] {
+        bytes.extend(wire_caption_offset(false, &pairs, dts, off, &mut mux));
+    }
+    let mut d = decoder();
+    let mut t = flussonix::caption_transport::Transport::default();
+    t.push(&bytes, &mut d);
+    assert!(
+        d.snapshot()
+            .iter()
+            .any(|c| c.text == "OK" && c.start == 108000 && c.end.is_none())
+    );
+}
+#[test]
+fn field_two_miscellaneous_controls_select_cc3_and_cc4() {
+    let mut d = decoder();
+    send(&mut d, 1, 0x15, 0x29, 90000);
+    send(&mut d, 1, b'C', b'C', 180000);
+    send(&mut d, 1, 0x1d, 0x29, 270000);
+    send(&mut d, 1, b'D', b'D', 360000);
+    let cues = d.snapshot();
+    assert!(
+        cues.iter()
+            .any(|c| c.channel == 3 && c.text == "CC" && c.end.is_none())
+    );
+    assert!(
+        cues.iter()
+            .any(|c| c.channel == 4 && c.text == "DD" && c.end.is_none())
+    );
+}
+#[test]
+fn full_rows_and_extended_replacement_do_not_overwrite_the_wrong_column() {
+    let mut d = decoder();
+    send(&mut d, 0, 0x14, 0x29, 0);
+    for _ in 0..16 {
+        send(&mut d, 0, b'A', b'B', 90000)
+    }
+    send(&mut d, 0, b'Z', b'Z', 180000);
+    assert!(
+        d.snapshot()
+            .iter()
+            .any(|c| c.end.is_none() && c.text == "AB".repeat(16))
+    );
+    send(&mut d, 0, 0x12, 0x30, 270000);
+    assert!(
+        d.snapshot()
+            .iter()
+            .any(|c| c.end.is_none() && c.text == format!("{}AÀ", "AB".repeat(15)))
+    );
+}
+#[test]
+fn repeated_control_retransmissions_do_not_toggle_pop_on_display() {
+    let mut d = decoder();
+    send(&mut d, 0, 0x14, 0x20, 0);
+    send(&mut d, 0, b'H', b'I', 90000);
+    for t in [180000, 183000, 186000] {
+        send(&mut d, 0, 0x14, 0x2f, t)
+    }
+    assert!(
+        d.snapshot()
+            .iter()
+            .any(|c| c.end.is_none() && c.text == "HI")
+    );
+}
+#[test]
+fn rendition_names_must_be_unique_in_the_caption_group() {
+    assert!(configuration(&json!({"flussonix_hls_captions":[{"channel":1,"language":"en","name":"English"},{"channel":2,"language":"en","name":"English"}]})).is_err());
 }

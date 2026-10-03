@@ -635,6 +635,8 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
                         "flussonix_content_id",
                         "flussonix_input_timeout",
                         "flussonix_subtitle_tracks",
+                        "flussonix_hls_captions",
+                        "flussonix_hls_subtitles",
                         "on_play",
                         "flussonix_token_sha256",
                     ];
@@ -1120,6 +1122,8 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     app.egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
     let content_type = if file.ends_with(".m3u8") {
         "application/vnd.apple.mpegurl"
+    } else if file.ends_with(".vtt") {
+        "text/vtt; charset=utf-8"
     } else if file.ends_with(".ts") {
         "video/mp2t"
     } else if file.ends_with(".m4f") {

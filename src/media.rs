@@ -45,6 +45,8 @@ pub struct Worker {
     input_index: usize,
     input_protocol: String,
     subtitle_tracks: &'static str,
+    hls_subtitles: &'static str,
+    captions: Option<Arc<crate::caption_hls::State>>,
     restart_count: u64,
     input_timeout: Duration,
     recovery: std::sync::Mutex<crate::recovery::Recovery>,
@@ -98,7 +100,7 @@ impl Worker {
         } else {
             "stopped"
         };
-        json!({"status":status,"pid":self.pid(),"bytes_in":self.bytes.load(Ordering::Relaxed),"online_clients":self.viewers.load(Ordering::Relaxed),"uptime":self.started.elapsed().as_secs(),"input_protocol":self.input_protocol,"input_index":self.input_index,"restart_count":self.restart_count,"retry_in_ms":recovery.retry_in().map(|d|d.as_millis()),"last_error":recovery.last_error(),"media_age_ms":recovery.media_age_ms(),"subtitle_tracks":self.subtitle_tracks})
+        json!({"status":status,"pid":self.pid(),"bytes_in":self.bytes.load(Ordering::Relaxed),"online_clients":self.viewers.load(Ordering::Relaxed),"uptime":self.started.elapsed().as_secs(),"input_protocol":self.input_protocol,"input_index":self.input_index,"restart_count":self.restart_count,"retry_in_ms":recovery.retry_in().map(|d|d.as_millis()),"last_error":recovery.last_error(),"media_age_ms":recovery.media_age_ms(),"subtitle_tracks":self.subtitle_tracks,"hls_subtitles":self.hls_subtitles,"hls_captions":self.captions.as_ref().map(|c|c.stats())})
     }
 }
 impl Engine {
@@ -154,6 +156,19 @@ impl Engine {
         publishing: bool,
     ) -> Result<Arc<Worker>, String> {
         let subtitle_tracks = crate::config::subtitle_tracks(cfg)?;
+        let hls_subtitles = crate::config::hls_subtitles(cfg)?;
+        let caption_services = crate::captions::configuration(cfg)?;
+        if hls_subtitles == "convert" && caption_services.is_empty() {
+            return Err("Choose at least one HLS caption channel for conversion".into());
+        }
+        if !caption_services.is_empty()
+            && (cfg["inputs"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|i| i["url"] == "testsrc://"))
+                || cfg["transcoder"]["encoder"] == "h264_nvenc")
+        {
+            return Err("HLS caption conversion requires a real H.264/HEVC video source; GPU conversion is not qualified".into());
+        }
         let mut workers = self.workers.lock().await;
         // Recheck after waiting for another stream startup/replacement. A stale
         // route must not cancel an already-published replacement worker.
@@ -244,6 +259,25 @@ impl Engine {
             ),
             None => "pipe:2".into(),
         };
+        let caption_listener = if caption_services.is_empty() {
+            None
+        } else {
+            Some(
+                tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .map_err(|_| "caption listener unavailable")?,
+            )
+        };
+        let caption_target = caption_listener
+            .as_ref()
+            .map(|l| format!("tcp://{}", l.local_addr().unwrap()));
+        let captions = (!caption_services.is_empty()).then(|| {
+            Arc::new(crate::caption_hls::State::new(
+                crate::captions::Decoder::new(caption_services),
+                generation.clone(),
+                sequence,
+            ))
+        });
         let mut cmd = Command::new(&self.ffmpeg);
         cmd.args([
             "-hide_banner",
@@ -449,6 +483,11 @@ impl Engine {
                 &wire_target,
             ]);
         }
+        if !native_input {
+            if let Some(target) = caption_target.as_deref() {
+                caption_output(&mut cmd, target);
+            }
+        }
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
@@ -481,6 +520,8 @@ impl Engine {
             started: Instant::now(),
             signature,
             subtitle_tracks,
+            hls_subtitles,
+            captions,
             input_index: index,
             input_protocol: input.split("://").next().unwrap_or("unknown").into(),
             restart_count,
@@ -533,6 +574,7 @@ impl Engine {
                         output.replace("__NATIVE_FMP4_FILTER__", &native_fmp4_filters(&tracks))
                     } else { output };
                     cmd.args(["-threads", "2", "-f", "tee", &output]);
+                    if let Some(target)=caption_target.as_deref(){caption_output(&mut cmd,target);}
                     if cancel.is_cancelled() { return; }
                     let mut child = match cmd.spawn() {
                         Ok(child)=>child,
@@ -555,6 +597,12 @@ impl Engine {
                     }
                     child
                 };
+                if let (Some(listener),Some(state))=(caption_listener,w.captions.clone()) {
+                    let c=cancel.clone();let decoder_state=state.clone();let (sender,mut receiver)=tokio::sync::mpsc::channel::<Bytes>(32);
+                    tasks.push(tokio::spawn(async move {let mut transport=crate::caption_transport::Transport::default();loop {let data=tokio::select!{biased;_=c.cancelled()=>break,data=receiver.recv()=>match data{Some(data)=>data,None=>break}};if decoder_state.failed.load(Ordering::Relaxed){let mut decoder=decoder_state.decoder.lock().unwrap();let pts=decoder.latest_pts;decoder.reset(pts);break}let mut decoder=decoder_state.decoder.lock().unwrap();transport.push(&data,&mut decoder);if matches!(decoder.error,Some("caption_clock_discontinuity"|"caption_reorder_limit"|"caption_video_codec_unsupported"|"caption_nal_limit"|"caption_pes_limit")){decoder_state.failed.store(true,Ordering::Relaxed);}}}));
+                    let c=cancel.clone();let drain_state=state.clone();tasks.push(tokio::spawn(async move {let Ok(Ok((mut socket,_)))=(tokio::select!{biased;_=c.cancelled()=>return,r=tokio::time::timeout(Duration::from_secs(5),listener.accept())=>r})else{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");return};let mut buffer=[0;16384];loop{let read=tokio::select!{biased;_=c.cancelled()=>break,r=socket.read(&mut buffer)=>r};match read{Ok(n)if n>0=>{if sender.try_send(Bytes::copy_from_slice(&buffer[..n])).is_err(){drain_state.failed.store(true,Ordering::Relaxed);}},_=>{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");break}}}}));
+                    tasks.push(tokio::spawn(state.watch(dir.clone(),cancel.clone())));
+                }
                 let Some(mut stdout) = child.stdout.take() else {
                     w.failed("packaging_failed");
                     let _ = child.kill().await;
@@ -618,6 +666,8 @@ impl Engine {
                         }
                     }));
                 }
+                let mut output_clock=crate::caption_transport::Transport::default();
+                let mut output_decoder=crate::captions::Decoder::new(vec![]);
                 let mut buffer = vec![0u8; 188 * 64];
                 loop {
                     let read = tokio::select! { biased;
@@ -642,6 +692,7 @@ impl Engine {
                             break;
                         }
                         Ok(Ok(n)) => {
+                            if let Some(state)=&w.captions{state.observe_ts(&buffer[..n],&mut output_clock,&mut output_decoder);}
                             w.recovery.lock().unwrap().progress();
                             w.bytes.fetch_add(n as u64, Ordering::Relaxed);
                             let _ = w.tx.send(Bytes::copy_from_slice(&buffer[..n]));
@@ -675,6 +726,18 @@ impl Engine {
         {
             return Err("media worker unavailable".into());
         }
+        if let Some(state) = self
+            .workers
+            .lock()
+            .await
+            .get(name)
+            .and_then(|w| w.captions.clone())
+        {
+            let logical = file.strip_prefix("fmp4/").unwrap_or(file);
+            if logical == "index.m3u8" || logical == "av.m3u8" || logical.starts_with("cc") {
+                return state.read(file).ok_or("caption media not ready".into());
+            }
+        }
         if file.ends_with(".m4f") {
             return self
                 .workers
@@ -699,9 +762,45 @@ impl Engine {
         if meta.len() > 32 * 1024 * 1024 {
             return Err("segment exceeds size limit".into());
         }
-        Ok(Bytes::from(
-            tokio::fs::read(path).await.map_err(|_| "media not ready")?,
-        ))
+        let mut data = tokio::fs::read(&path)
+            .await
+            .map_err(|_| "media not ready")?;
+        let drop_captions = self
+            .workers
+            .lock()
+            .await
+            .get(name)
+            .is_some_and(|w| w.hls_subtitles == "drop");
+        if drop_captions {
+            if file.ends_with(".ts") {
+                crate::caption_filter::ts(&mut data)?;
+            } else if file.ends_with(".m4s") {
+                let dir = path.parent().ok_or("media not ready")?;
+                let list = tokio::fs::read_to_string(dir.join("index.m3u8"))
+                    .await
+                    .map_err(|_| "media not ready")?;
+                let init = list
+                    .lines()
+                    .find_map(|l| l.strip_prefix("#EXT-X-MAP:URI=\""))
+                    .and_then(|l| l.split('"').next())
+                    .filter(|l| valid_file(l) && l.ends_with(".mp4"))
+                    .ok_or("caption initialization unavailable")?;
+                let init_path = dir.join(init);
+                if tokio::fs::metadata(&init_path)
+                    .await
+                    .map_err(|_| "media not ready")?
+                    .len()
+                    > 2 * 1024 * 1024
+                {
+                    return Err("caption initialization exceeds limit".into());
+                }
+                let init = tokio::fs::read(init_path)
+                    .await
+                    .map_err(|_| "media not ready")?;
+                crate::caption_filter::mp4(&init, &mut data)?;
+            }
+        }
+        Ok(Bytes::from(data))
     }
     async fn stop_worker(&self, name: &str, w: Arc<Worker>) {
         w.cancel.cancel();
@@ -792,6 +891,13 @@ impl Engine {
             .collect()
     }
 }
+fn caption_output(cmd: &mut Command, target: &str) {
+    // Include one optional audio stream for the null fallback: an audio-only
+    // source must not lose AV because an optional caption output has no video.
+    cmd.args(["-map","0:v:0?","-map","0:a:0?","-c","copy","-sn",
+        "-max_interleave_delta","100000","-flush_packets","1","-f","tee",
+        &format!("[select='v':onfail=ignore:f=mpegts:max_interleave_delta=100000:flush_packets=1]{target}|[f=null]pipe:2")]);
+}
 /// FFmpeg maps the optional video first, then all audio in PMT order.
 /// Numeric stream specifiers avoid escaping colons inside tee option keys.
 fn native_fmp4_filters(tracks: &[crate::m4s::Track]) -> String {
@@ -829,7 +935,7 @@ pub fn translate_input(input: &str) -> Result<String, String> {
 }
 
 pub fn media_signature(cfg: &Value) -> String {
-    format!("{:x}",Sha256::digest(serde_json::to_vec(&json!({"inputs":cfg["inputs"],"transcoder":cfg["transcoder"],"peer":cfg["flussonix_peer_key"],"timeout":cfg["flussonix_input_timeout"],"subtitle_tracks":cfg["flussonix_subtitle_tracks"],"hls_captions":cfg["flussonix_hls_captions"]})).unwrap()))
+    format!("{:x}",Sha256::digest(serde_json::to_vec(&json!({"inputs":cfg["inputs"],"transcoder":cfg["transcoder"],"peer":cfg["flussonix_peer_key"],"timeout":cfg["flussonix_input_timeout"],"subtitle_tracks":cfg["flussonix_subtitle_tracks"],"hls_captions":cfg["flussonix_hls_captions"],"hls_subtitles":cfg["flussonix_hls_subtitles"]})).unwrap()))
 }
 
 #[cfg(test)]
@@ -1064,5 +1170,44 @@ mod lifecycle_tests {
             assert_eq!(app.media.count().await, 0);
             assert!(app.media.workers().await.is_empty());
         }
+    }
+}
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../tests/support/caption_fixture.rs"]
+mod caption_sink_fixture;
+#[cfg(test)]
+mod caption_sink_tests {
+    use super::caption_sink_fixture as fixture;
+    use super::*;
+    #[tokio::test]
+    async fn optional_caption_sink_failure_does_not_stop_av() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("owned.ts");
+        std::fs::write(&path, fixture::transport()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("tcp://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-v", "error", "-re", "-i"]).arg(&path).args([
+            "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-f", "mpegts", "pipe:1",
+        ]);
+        caption_output(&mut cmd, &target);
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut buffer = [0; 188 * 64];
+        let read = tokio::time::timeout(Duration::from_secs(4), stdout.read(&mut buffer)).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let status = child.try_wait().unwrap();
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        assert!(matches!(read,Ok(Ok(n))if n>0));
+        assert!(
+            status.is_none(),
+            "optional caption connection failure must retain AV: {status:?}"
+        );
     }
 }

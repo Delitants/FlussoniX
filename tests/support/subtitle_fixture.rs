@@ -169,6 +169,9 @@ pub fn transport_for(seconds: &str) -> Vec<u8> {
         String::from_utf8_lossy(&output.stderr)
     );
     let data = std::fs::read(file).unwrap();
+    inject(&data)
+}
+pub fn inject(data: &[u8]) -> Vec<u8> {
     let mut out = vec![];
     let mut dc = 0;
     let mut tc = 0;

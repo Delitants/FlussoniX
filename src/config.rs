@@ -187,10 +187,32 @@ pub fn subtitle_tracks(cfg: &Value) -> Result<&'static str, String> {
         None => Ok("drop"),
         Some(Value::String(value)) if value == "preserve" => Ok("preserve"),
         Some(Value::String(value)) if value == "drop" => Ok("drop"),
-        _ => Err("flussonix_subtitle_tracks must be preserve or drop; selectable HLS conversion is not implemented".into()),
+        _ => Err("flussonix_subtitle_tracks must be preserve or drop".into()),
     }
 }
 
+/// HLS-only subtitle mode; older caption rows imply conversion.
+pub fn hls_subtitles(cfg: &Value) -> Result<&'static str, String> {
+    match cfg.get("flussonix_hls_subtitles") {
+        None => Ok(
+            if cfg["flussonix_hls_captions"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty())
+            {
+                "convert"
+            } else {
+                "passthrough"
+            },
+        ),
+        Some(Value::String(v)) => match v.as_str() {
+            "passthrough" => Ok("passthrough"),
+            "convert" => Ok("convert"),
+            "drop" => Ok("drop"),
+            _ => Err("HLS subtitle mode must be passthrough, convert or drop".into()),
+        },
+        _ => Err("HLS subtitle mode must be passthrough, convert or drop".into()),
+    }
+}
 pub fn valid_name(name: &str) -> Result<(), String> {
     if name.is_empty()
         || name.len() > 256
@@ -274,6 +296,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "flussonix_input_timeout",
                     "flussonix_subtitle_tracks",
                     "flussonix_hls_captions",
+                    "flussonix_hls_subtitles",
                     "flussonix_content_id",
                 ],
                 "peers" | "sources" => &[
@@ -366,6 +389,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     }
                 }
                 subtitle_tracks(item)?;
+                hls_subtitles(item)?;
                 crate::captions::configuration(item)?;
                 crate::playback_auth::Policy::from_config(item, root)?;
                 crate::publish::Policy::from_config(item, root)?;

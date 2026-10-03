@@ -36,3 +36,10 @@ pub mod worker_ts;
 
 pub mod caption_transport;
 pub mod captions;
+
+pub mod caption_hls;
+
+#[cfg(test)]
+extern crate self as flussonix;
+
+pub mod caption_filter;

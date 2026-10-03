@@ -24,25 +24,25 @@
 ### Task 1: Native bounded caption decoder and typed configuration
 **Files:** src/captions.rs, src/caption_transport.rs, src/config.rs, src/lib.rs, tests/hls_captions.rs.
 **Interfaces:** Produces `captions::configuration(&Value)->Result<Vec<Service>,String>`, `captions::Decoder::new(services)`, `Decoder::push(channel,pair,pts)`, `Decoder::snapshot`, and `caption_transport::Transport::push(bytes,decoder)`. Cue times use unwrapped 90 kHz source PTS; decoder exposes first video PTS.
-- [ ] Write failing tests for strict config limits, inherited rows, exact pop-on/paint-on/roll-up text and timing, all four channels, parity/duplicate controls, wrap, H.264/HEVC registered SEI and continuity/oversize reset.
-- [ ] Run `cargo test --locked --test hls_captions`; Expected: FAIL because decoder/config are absent.
-- [ ] Implement bounded independent decoder, transport parser, strict validation and module exports. Keep private input parsing separate from display semantics.
-- [ ] Run the same test command; Expected: PASS.
-- [ ] Commit `feat: decode bounded native CEA-608 caption state`.
+- [x] Write failing tests for strict config limits, inherited rows, exact pop-on/paint-on/roll-up text and timing, all four channels, parity/duplicate controls, wrap, H.264/HEVC registered SEI and continuity/oversize reset.
+- [x] Run `cargo test --locked --test hls_captions`; Expected: FAIL because decoder/config are absent.
+- [x] Implement bounded independent decoder, transport parser, strict validation and module exports. Keep private input parsing separate from display semantics.
+- [x] Run the same test command; Expected: PASS.
+- [x] Commit `feat: decode bounded native CEA-608 caption state`.
 
 ### Task 2: Live worker and authorized HLS renditions
-**Files:** src/caption_hls.rs, src/media.rs, src/server.rs, tests/hls_captions_delivery.rs, tests/support/caption_fixture.rs.
+**Files:** src/caption_hls.rs, src/caption_filter.rs, src/media.rs, src/server.rs, tests/hls_captions_delivery.rs, tests/hls_subtitle_policy.rs, tests/support/caption_fixture.rs.
 **Interfaces:** Consumes Task 1 decoder; produces generation-owned caption state/clock anchors and `caption_hls::render` bytes for flat master, AV, caption playlist and VTT filenames in each HLS variant. Uses existing Engine read and server auth routes.
-- [ ] Write failing real worker tests using owned known-word timed captions: copy and CPU extraction, TS/fMP4 clocks, empty segments, live AV progress, policy replacement and original-track independence. Router tests cover grouped stream token propagation and revocation. Add sliding playlist/clock/overlap unit cases.
-- [ ] Run `cargo test --locked --test hls_captions_delivery`; Expected: missing master/renditions or captions.
-- [ ] Add private video TS copy sink to existing source process, bounded drain/decoder ownership, clock watcher, stats, signature/discovery, HLS rendering and VTT content type. Tasks cancel/join before generation completion. Preserve all existing AV slaves.
-- [ ] Run delivery tests and full `cargo test --locked`; Expected: green, only existing external opt-in ignored.
-- [ ] Commit `feat: serve authorized selectable HLS caption renditions`.
+- [x] Write failing real worker tests using owned known-word timed captions: copy and CPU extraction, TS/fMP4 clocks, empty segments, live AV progress, policy replacement and original-track independence. Router tests cover grouped stream token propagation and revocation. Add sliding playlist/clock/overlap unit cases.
+- [x] Run `cargo test --locked --test hls_captions_delivery`; Expected: missing master/renditions or captions.
+- [x] Add private video TS copy sink to existing source process, bounded drain/decoder ownership, clock watcher, stats, signature/discovery, HLS rendering and VTT content type. Tasks cancel/join before generation completion. Preserve all existing AV slaves.
+- [x] Run delivery tests and full `cargo test --locked`; Expected: green, only existing external opt-in ignored.
+- [x] Commit `feat: serve authorized selectable HLS caption renditions`.
 
 ### Task 3: Friendly controls and qualification
 **Files:** web/src/forms.tsx, web/src/main.tsx, web/tests/admin.spec.ts, docs/subtitle-design.md, docs/compatibility.md, docs/qualification.md.
 **Interfaces:** Consumes validated caption rows and stats; produces inheritance mode plus channel/language/name rows in existing approved form layout.
-- [ ] Add browser test for template rows, stream inheritance, explicit empty off, restore inheritance and unrelated edit; expect no JSON field.
+- [ ] Add browser test for template rows, stream inheritance, explicit filter/pass modes, restore inheritance and unrelated edit; expect no JSON field.
 - [ ] Run targeted browser test against owned unused-port daemon; Expected: missing controls.
 - [ ] Implement friendly controls and summaries with honest regional capability help.
 - [ ] Run full browser suite, web build, fmt, Clippy and full Rust suite; Expected: all green.

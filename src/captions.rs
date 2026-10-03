@@ -18,8 +18,12 @@ pub fn configuration(cfg: &Value) -> Result<Vec<Service>, String> {
     if services.len() > 4 {
         return Err("at most four HLS caption channels are supported".into());
     }
+    let mut names = std::collections::HashSet::new();
     let mut seen = 0u8;
     for s in &services {
+        if !names.insert(&s.name) {
+            return Err("caption display names must be unique".into());
+        }
         if !(1..=4).contains(&s.channel) || seen & (1 << s.channel) != 0 {
             return Err("caption channels must be distinct CC1..CC4".into());
         }
@@ -40,7 +44,11 @@ pub fn configuration(cfg: &Value) -> Result<Vec<Service>, String> {
             );
         }
     }
-    Ok(services)
+    Ok(if crate::config::hls_subtitles(cfg)? == "convert" {
+        services
+    } else {
+        vec![]
+    })
 }
 #[derive(Clone, Debug)]
 pub struct Cue {
@@ -87,15 +95,18 @@ impl Channel {
         }
     }
     fn put(&mut self, c: char) {
-        if self.mode == Mode::Text {
+        if self.mode == Mode::Text || self.col >= 32 {
             return;
         }
         let (r, col) = (self.row, self.col);
         self.screen()[r][col] = c;
-        self.col = (col + 1).min(31)
+        self.col = col + 1
     }
     fn backspace(&mut self) {
-        self.col = self.col.saturating_sub(1);
+        if self.col == 0 {
+            return;
+        }
+        self.col -= 1;
         let (r, c) = (self.row, self.col);
         self.screen()[r][c] = ' '
     }
@@ -129,7 +140,7 @@ impl Channel {
             }
             return;
         }
-        if a == 0x14 && (0x20..=0x2f).contains(&b) {
+        if (a == 0x14 || a == 0x15) && (0x20..=0x2f).contains(&b) {
             match b {
                 0x20 => self.mode = Mode::Pop,
                 0x21 => self.backspace(),
@@ -270,7 +281,6 @@ impl Decoder {
         let channel = &mut self.channels[index];
         if control {
             if channel.last == Some([a, b]) {
-                channel.last = None;
                 return;
             }
             channel.last = Some([a, b]);

@@ -1,6 +1,11 @@
 //! Bounded TS/PES/SEI caption extraction; no video decode or upstream subscription.
 use crate::captions::Decoder;
 const LIMIT: usize = 2 * 1024 * 1024;
+type Pair = (u8, [u8; 2]);
+struct Timed {
+    pts: u64,
+    pairs: Vec<Pair>,
+}
 const MASK: u64 = (1 << 33) - 1;
 #[derive(Default)]
 pub struct Transport {
@@ -13,6 +18,7 @@ pub struct Transport {
     pes_pts: Option<u64>,
     counter: Option<u8>,
     last_pts: Option<u64>,
+    events: Vec<Timed>,
 }
 impl Transport {
     pub fn push(&mut self, data: &[u8], decoder: &mut Decoder) {
@@ -22,10 +28,14 @@ impl Transport {
             self.pending.extend(part);
             while self.pending.len() >= 188 {
                 if self.pending[0] != 0x47 {
-                    self.pending.remove(0);
+                    let skip = self
+                        .pending
+                        .iter()
+                        .position(|b| *b == 0x47)
+                        .unwrap_or(self.pending.len());
+                    self.pending.drain(..skip);
+                    self.gap(decoder);
                     decoder.error = Some("caption_transport_sync");
-                    self.pes.clear();
-                    decoder.reset(decoder.latest_pts);
                     continue;
                 }
                 let packet: [u8; 188] = self.pending[..188].try_into().unwrap();
@@ -87,7 +97,7 @@ impl Transport {
                 return;
             }
             let n = 3 + ((usize::from(section[1] & 15) << 8) | usize::from(section[2]));
-            if n < 12 || n > 4096 || section.len() < n {
+            if !(12..=4096).contains(&n) || section.len() < n {
                 return;
             }
             let s = section[..n].to_vec();
@@ -106,6 +116,10 @@ impl Transport {
                 let mut at = 12 + ((usize::from(s[10] & 15) << 8) | usize::from(s[11]));
                 while at + 5 <= n - 4 {
                     let kind = s[at];
+                    if kind == 2 || kind == 0x10 {
+                        d.error = Some("caption_video_codec_unsupported");
+                        return;
+                    }
                     if kind == 0x1b || kind == 0x24 {
                         let video = (
                             (u16::from(s[at + 1] & 31) << 8) | u16::from(s[at + 2]),
@@ -137,14 +151,13 @@ impl Transport {
         }
         self.counter = Some(cc);
         if start {
-            self.finish(d, hevc);
-            self.pes.clear();
-            self.pes_pts = None;
             if bytes.len() < 14 || bytes[..3] != [0, 0, 1] || bytes[7] & 0x80 == 0 {
+                self.gap(d);
                 d.error = Some("caption_pes_header");
                 return;
             }
             let Some(raw) = pts(&bytes[9..14]) else {
+                self.gap(d);
                 d.error = Some("caption_pes_timestamp");
                 return;
             };
@@ -155,6 +168,27 @@ impl Transport {
             } else {
                 raw
             };
+            let watermark = if bytes[7] & 0xc0 == 0xc0 {
+                pts(bytes.get(14..19).unwrap_or(&[]))
+                    .map(|raw| {
+                        t.saturating_add_signed(
+                            ((raw.wrapping_sub(t & MASK).wrapping_add(1 << 32)) & MASK) as i64
+                                - (1 << 32),
+                        )
+                    })
+                    .unwrap_or(t)
+            } else {
+                t
+            };
+            self.finish(d, hevc, watermark);
+            self.pes.clear();
+            self.pes_pts = None;
+            if self.last_pts.is_some_and(|last| {
+                t.saturating_add(180000) < last || t > last.saturating_add(30 * 90000)
+            }) {
+                self.gap(d);
+                d.error = Some("caption_clock_discontinuity");
+            }
             self.last_pts = Some(t);
             d.observe(t);
             self.pes_pts = Some(t);
@@ -170,19 +204,45 @@ impl Transport {
     }
     fn gap(&mut self, d: &mut Decoder) {
         self.pes.clear();
+        self.events.clear();
         self.pes_pts = None;
         self.counter = None;
         d.reset(d.latest_pts);
         d.error = Some("caption_transport_gap")
     }
-    fn finish(&mut self, d: &mut Decoder, hevc: bool) {
+    fn finish(&mut self, d: &mut Decoder, hevc: bool, watermark: u64) {
         let Some(t) = self.pes_pts else { return };
         let Some(&n) = self.pes.get(8) else { return };
         let off = 9 + usize::from(n);
         let Some(body) = self.pes.get(off..) else {
             return;
         };
-        sei(body, hevc, t, d)
+        let pairs = match sei(body, hevc) {
+            Ok(pairs) => pairs,
+            Err(reason) => {
+                self.gap(d);
+                d.error = Some(reason);
+                return;
+            }
+        };
+        if pairs.len() > 512
+            || self.events.len() >= 64
+            || self.events.iter().map(|e| e.pairs.len()).sum::<usize>() + pairs.len() > 4096
+        {
+            self.gap(d);
+            d.error = Some("caption_reorder_limit");
+            return;
+        }
+        if !pairs.is_empty() {
+            self.events.push(Timed { pts: t, pairs });
+            self.events.sort_by_key(|e| e.pts);
+        }
+        while self.events.first().is_some_and(|e| e.pts <= watermark) {
+            let event = self.events.remove(0);
+            for (field, pair) in event.pairs {
+                d.push(field, pair, event.pts);
+            }
+        }
     }
 }
 pub fn pts(b: &[u8]) -> Option<u64> {
@@ -207,12 +267,16 @@ fn crc(b: &[u8]) -> u32 {
     }
     c
 }
-fn sei(body: &[u8], hevc: bool, pts: u64, d: &mut Decoder) {
+fn sei(body: &[u8], hevc: bool) -> Result<Vec<Pair>, &'static str> {
+    let mut pairs = vec![];
     let mut boundaries = vec![];
     let mut i = 0;
     while i + 3 <= body.len() {
         if body[i..i + 3] == [0, 0, 1] {
             boundaries.push(i + 3);
+            if boundaries.len() > 4096 {
+                return Err("caption_nal_limit");
+            }
             i += 3
         } else {
             i += 1
@@ -280,12 +344,71 @@ fn sei(body: &[u8], hevc: bool, pts: u64, d: &mut Decoder) {
                 if 10 + 3 * count < payload.len() {
                     for triple in payload[10..10 + 3 * count].chunks_exact(3) {
                         if triple[0] & 4 != 0 && triple[0] & 3 < 2 {
-                            d.push(triple[0] & 3, [triple[1], triple[2]], pts)
+                            pairs.push((triple[0] & 3, [triple[1], triple[2]]));
+                            if pairs.len() > 512 {
+                                return Err("caption_reorder_limit");
+                            }
                         }
                     }
                 }
             }
             at += size;
         }
+    }
+    Ok(pairs)
+}
+#[cfg(test)]
+mod limits {
+    use super::*;
+    #[test]
+    fn oversized_pes_resets_display_without_retaining_unbounded_data() {
+        let track = crate::m4s::Track {
+            id: 1,
+            codec: "h264".into(),
+            config: vec![
+                1, 100, 0, 31, 255, 225, 0, 4, 103, 100, 0, 31, 1, 0, 2, 104, 0,
+            ],
+        };
+        let mut mux = crate::worker_ts::Muxer::new(&[track]).unwrap();
+        let mut d = Decoder::new(vec![]);
+        let parity = |b: u8| b | if b.count_ones() % 2 == 0 { 128 } else { 0 };
+        d.push(0, [parity(0x14), parity(0x29)], 0);
+        d.push(0, [parity(b'H'), parity(b'I')], 90000);
+        let mut body = ((LIMIT + 1024) as u32).to_be_bytes().to_vec();
+        body.extend(vec![0x65; LIMIT + 1024]);
+        let frame = crate::m4f::Frame {
+            track_id: 1,
+            dts: 180000,
+            pts_offset: 0,
+            key: true,
+            body,
+        };
+        let mut t = Transport::default();
+        t.push(&mux.tables(), &mut d);
+        t.push(&mux.frame(&frame).unwrap(), &mut d);
+        assert!(t.pes.len() <= LIMIT);
+        assert!(t.pending.len() < 188);
+        assert_eq!(d.error, Some("caption_pes_limit"));
+        assert!(d.snapshot().iter().all(|c| c.end.is_some()));
+    }
+}
+#[cfg(test)]
+mod nal_limit {
+    use super::*;
+    #[test]
+    fn excessive_nals_reset_stale_display_and_report_the_limit() {
+        let mut d = Decoder::new(vec![]);
+        let mut t = Transport {
+            pes: vec![0, 0, 1, 0xe0, 0, 0, 0x80, 0x80, 5, 0x21, 0, 1, 0, 1],
+            pes_pts: Some(90000),
+            ..Default::default()
+        };
+        for _ in 0..4200 {
+            t.pes.extend([0, 0, 0, 1, 0x65, 0x88]);
+        }
+        t.pes_pts = Some(90000);
+        t.finish(&mut d, false, 180000);
+        assert_eq!(d.error, Some("caption_nal_limit"));
+        assert!(t.pes.is_empty());
     }
 }
