@@ -174,7 +174,7 @@ The final binary and local load balancer also regress all three private native H
 
 ## v0.9 HTTP MPEG-TS publication qualification
 
-The final candidate passes 195 Rust tests, zero failures and one opt-in authorized-source test ignored, plus fmt, all-target warnings-denied Clippy, the compiled UI build and all 14 Chromium cases. Tests cover independent publisher policy/template inheritance, denied requests without body consumption or workers, exclusive admission, stale startup/callback fences, 64 pending callbacks, renewal metadata/denial, malformed/partial/large uploads, stalls, cancellation, reconnect and private native pulls. Copy and CPU cases independently decode both HLS variants. Normal checks require no installed Flussonic component.
+The final candidate passes 196 Rust tests, zero failures and one opt-in authorized-source test ignored, plus fmt, all-target warnings-denied Clippy, the compiled UI build and all 14 Chromium cases. Tests cover independent publisher policy/template inheritance, denied requests without body consumption or workers, exclusive admission, stale startup/callback fences, 64 pending callbacks, renewal metadata/denial, malformed/partial/large uploads, stalls, cancellation, reconnect and private native pulls. Copy and CPU cases independently decode both HLS variants. Normal checks require no installed Flussonic component.
 
 Fresh whole-branch review confirmed native peer discovery exposing publisher credentials and identified a template endpoint that did not exist. Both received failing regressions before one fix pass. Discovery now allowlists playback policy, media identity and display metadata, excluding publisher password/callback, upstream inputs and raw saved configuration. Receive templates give setup guidance and inheriting stream forms display their actual publication URL. No review finding remains deferred; [implementation decisions](v09-decisions.md) record the judgments and profile limits.
 
@@ -192,3 +192,6 @@ Production Flussonic PIDs remained1346636/211384 and 80/443 listeners were uncha
 
 
 The same exact binary and local LB also pass the separate authorized live-source regression in native private HLS, M4S and M4F modes. Protected redirects, clean ticket redemption/reload, anonymous segment denial, H.264/AAC probing and independent FFmpeg decoding pass in each mode. Original M4F segment bytes and UTC path are preserved. M4S is restored as the dedicated CDN source transport; the authorized production input/configuration is unchanged.
+
+
+The first GitHub CI run stopped at a pre-existing UDP test-fixture handoff collision before media startup. A new regression failed when released fixture ranges were reused; the shared helper now issues disjoint monotonic ranges outside the default ephemeral range. All affected RTSP/UDP/shutdown tests and the fresh full 196-test suite pass. This changes test allocation only; the product binary SHA256 and deployed qualification remain unchanged.

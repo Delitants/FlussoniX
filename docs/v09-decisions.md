@@ -14,3 +14,6 @@ The reviewer declined final release evidence because Task 3 belongs to the execu
 
 
 - Lab ruling: publication upload and source API requests use separate owned SSH forwarding connections for qualification. Sharing one WAN connection caused bounded lookups to time out under upload; quiet roundtrip measured 559 ms against the unchanged 750 ms deadline. Unique fixture names avoid previous test-policy caches. Cost if wrong: deployments with WAN lookup paths require separate performance qualification. Initial wrong-content-type harness requests were corrected; no product timeout workaround was added.
+
+
+- CI ruling: fix the pre-existing reserve/drop/rebind collision in the shared UDP test helper, using disjoint monotonic ranges below the default ephemeral range, with a RED/GREEN nonreuse regression. Product code/listeners remain unchanged. Cost if wrong: the fixture allocation strategy needs further work; no new product capability is claimed.

@@ -1092,3 +1092,18 @@ async fn udp_pending_packet_does_not_hide_queue_eviction() {
     t.await.unwrap().unwrap();
     app.media.stop_all().await;
 }
+
+#[test]
+fn released_udp_fixture_ranges_are_not_reused_during_parallel_handoffs() {
+    let mut issued = std::collections::HashSet::new();
+    for _ in 0..1024 {
+        let (_, held) = udp_fixture::reserved(2);
+        for socket in &held {
+            assert!(
+                issued.insert(socket.local_addr().unwrap().port()),
+                "a released fixture port can be stolen before its pool binds"
+            );
+        }
+        drop(held);
+    }
+}
