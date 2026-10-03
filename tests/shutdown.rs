@@ -264,3 +264,124 @@ async fn occupied_udp_pool_prevents_static_worker_startup() {
     assert!(!d.path().join("media/owned").exists());
     drop(occupied);
 }
+
+#[path = "support/tls.rs"]
+mod tls_fixture;
+#[tokio::test]
+async fn rtsps_listener_with_stalled_client_drains_on_sigterm() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let d = tempfile::tempdir().unwrap();
+    let cert = tls_fixture::Certificates::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_flussonix"))
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--rtsps-listen",
+            &addr.to_string(),
+            "--rtsps-cert",
+        ])
+        .arg(&cert.cert)
+        .arg("--rtsps-key")
+        .arg(&cert.key)
+        .arg("--config")
+        .arg(d.path().join("c.json"))
+        .arg("--media-dir")
+        .arg(d.path().join("media"))
+        .env("FLUSSONIX_ADMIN_PASSWORD", "owned-admin")
+        .env("FLUSSONIX_PEER_KEY", "owned-peer-secret")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut socket = None;
+    for _ in 0..100 {
+        if let Ok(s) = tokio::net::TcpStream::connect(addr).await {
+            socket = Some(s);
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "daemon must accept RTSPS listener flags"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let mut stalled = socket.unwrap();
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut tls = tokio_rustls::TlsConnector::from(cert.client())
+        .connect(
+            tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            stream,
+        )
+        .await
+        .unwrap();
+    tls.write_all(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+        .await
+        .unwrap();
+    let mut reply = [0; 1024];
+    let n = tls.read(&mut reply).await.unwrap();
+    assert!(reply[..n].starts_with(b"RTSP/1.0 200"));
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-TERM", &child.id().unwrap().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(8), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    let closed = tokio::time::timeout(Duration::from_secs(2), stalled.read(&mut reply))
+        .await
+        .unwrap();
+    assert!(
+        matches!(closed, Ok(0))
+            || matches!(closed, Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset)
+    );
+    assert!(std::net::TcpListener::bind(addr).is_ok());
+}
+#[tokio::test]
+async fn invalid_tls_material_and_occupied_listener_prevent_static_workers() {
+    let d = tempfile::tempdir().unwrap();
+    let cert = tls_fixture::Certificates::new();
+    let config = d.path().join("c.json");
+    std::fs::write(&config,json!({"streams":[{"name":"owned","static":true,"inputs":[{"url":"testsrc://"}]}],"templates":[],"peers":[],"sources":[],"auth_backends":[]}).to_string()).unwrap();
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    for (addr, key) in [
+        ("127.0.0.1:0".to_owned(), cert.dir.path().join("ca.key")),
+        (held.local_addr().unwrap().to_string(), cert.key.clone()),
+    ] {
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_flussonix"))
+            .args([
+                "--listen",
+                "127.0.0.1:0",
+                "--rtsps-listen",
+                &addr,
+                "--rtsps-cert",
+            ])
+            .arg(&cert.cert)
+            .arg("--rtsps-key")
+            .arg(key)
+            .arg("--config")
+            .arg(&config)
+            .arg("--media-dir")
+            .arg(d.path().join("media"))
+            .env("FLUSSONIX_ADMIN_PASSWORD", "owned-admin")
+            .env("FLUSSONIX_PEER_KEY", "owned-peer-secret")
+            .kill_on_drop(true)
+            .output();
+        let out = tokio::time::timeout(Duration::from_secs(3), out)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(!d.path().join("media/owned").exists());
+    }
+}

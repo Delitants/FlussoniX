@@ -1,5 +1,6 @@
 //! RTSP/1.0 live playback, TCP-interleaved H.264/AAC only.
 pub mod protocol;
+pub mod tls;
 pub mod udp;
 use crate::{
     playback_auth::ViewerRequest,
@@ -15,7 +16,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync::{Semaphore, mpsc},
     task::{JoinHandle, JoinSet},
     time::Instant,
@@ -89,12 +90,40 @@ pub async fn serve_with_udp(
     pool: Option<Arc<udp::Pool>>,
     rate: f64,
 ) -> std::io::Result<()> {
+    serve_connections(listener, app, cancel, pool, rate, None).await
+}
+/// Optional TLS listener; media stays encrypted through TCP interleaving.
+pub async fn serve_tls(
+    listener: TcpListener,
+    app: Arc<App>,
+    cancel: CancellationToken,
+    config: Arc<tokio_rustls::rustls::ServerConfig>,
+) -> std::io::Result<()> {
+    serve_connections(
+        listener,
+        app,
+        cancel,
+        None,
+        100.0,
+        Some(tokio_rustls::TlsAcceptor::from(config)),
+    )
+    .await
+}
+async fn serve_connections(
+    listener: TcpListener,
+    app: Arc<App>,
+    cancel: CancellationToken,
+    pool: Option<Arc<udp::Pool>>,
+    rate: f64,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+) -> std::io::Result<()> {
     udp::Pacer::new(rate).map_err(std::io::Error::other)?;
     let udp = pool.map(|pool| UdpOptions { pool, rate });
     let permits = Arc::new(Semaphore::new(256));
     let mut clients = JoinSet::new();
     let result = loop {
-        tokio::select! {biased;_=cancel.cancelled()=>break Ok(()),Some(_)=clients.join_next(),if !clients.is_empty()=>{},accepted=listener.accept()=>{match accepted{Ok((socket,peer))=>{if let Ok(permit)=permits.clone().try_acquire_owned(){let app=app.clone();let cancel=cancel.clone();let udp=udp.clone();clients.spawn(async move{let _permit=permit;let _=connection(socket,peer,app,cancel,udp).await;});}},Err(e)=>break Err(e)}}}
+        tokio::select! {biased;_=cancel.cancelled()=>break Ok(()),Some(_)=clients.join_next(),if !clients.is_empty()=>{},accepted=listener.accept()=>{match accepted{Ok((socket,peer))=>{if let Ok(permit)=permits.clone().try_acquire_owned(){let app=app.clone();let cancel=cancel.clone();let udp=udp.clone();let tls=tls.clone();clients.spawn(async move{let _permit=permit;if socket.set_nodelay(true).is_err(){return;}
+if let Some(tls)=tls{let accepted=tokio::select!{biased;_=cancel.cancelled()=>return,result=tokio::time::timeout(Duration::from_secs(8),tls.accept(socket))=>result};if let Ok(Ok(stream))=accepted{let _=connection(stream,peer,app,cancel,udp,true).await;}}else{let _=connection(socket,peer,app,cancel,udp,false).await;}});}},Err(e)=>break Err(e)}}}
     };
     cancel.cancel();
     let drain = async { while clients.join_next().await.is_some() {} };
@@ -115,15 +144,15 @@ enum Next {
     Report,
     Close,
 }
-async fn connection(
-    socket: TcpStream,
+async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>(
+    socket: S,
     peer: SocketAddr,
     app: Arc<App>,
     cancel: CancellationToken,
     udp: Option<UdpOptions>,
+    secure: bool,
 ) -> std::io::Result<()> {
-    socket.set_nodelay(true)?;
-    let (read, mut write) = socket.into_split();
+    let (read, mut write) = tokio::io::split(socket);
     let (tx, mut controls) = mpsc::channel(8);
     let _reader = ReaderTask(tokio::spawn(async move {
         let mut read = BufReader::new(read);
@@ -252,7 +281,7 @@ async fn connection(
             }
             Next::Control(Some(Ok(Event::Request(request)))) => {
                 last_control = Instant::now();
-                let reply = tokio::select! {biased;_=cancel.cancelled()=>break,reply=handle(&request,&mut session,&app,peer,udp.as_ref())=>reply};
+                let reply = tokio::select! {biased;_=cancel.cancelled()=>break,reply=handle(&request,&mut session,&app,peer,udp.as_ref(),secure)=>reply};
                 let bytes =
                     protocol::response(reply.code, request.cseq, &reply.headers, &reply.body);
                 bounded_write(&mut write, &bytes, &cancel, session.as_ref()).await?;
@@ -406,7 +435,7 @@ async fn bounded_write<W: tokio::io::AsyncWrite + Unpin>(
 }
 fn location(uri: &str) -> Result<(url::Url, String), u16> {
     let url = url::Url::parse(uri).map_err(|_| 400u16)?;
-    if url.scheme() != "rtsp"
+    if !matches!(url.scheme(), "rtsp" | "rtsps")
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -462,7 +491,11 @@ async fn handle(
     app: &Arc<App>,
     peer: SocketAddr,
     udp: Option<&UdpOptions>,
+    secure: bool,
 ) -> Reply {
+    if !secure && url::Url::parse(&r.uri).is_ok_and(|url| url.scheme() == "rtsps") {
+        return Reply::code(400);
+    }
     if r.headers.contains_key("require") || r.headers.contains_key("proxy-require") {
         return Reply::code(551);
     }

@@ -9,6 +9,13 @@ struct Args {
     /// Optional RTSP/1.0 TCP playback listener (disabled by default).
     #[arg(long)]
     rtsp_listen: Option<SocketAddr>,
+    /// Optional RTSPS playback listener; control and interleaved media use TLS.
+    #[arg(long, requires_all = ["rtsps_cert", "rtsps_key"])]
+    rtsps_listen: Option<SocketAddr>,
+    #[arg(long, requires = "rtsps_listen")]
+    rtsps_cert: Option<PathBuf>,
+    #[arg(long, requires = "rtsps_listen")]
+    rtsps_key: Option<PathBuf>,
     /// Opt-in inclusive UDP RTP/RTCP port range (even-first/odd-last, 2..256 ports).
     #[arg(long, requires = "rtsp_listen")]
     rtsp_udp_ports: Option<flussonix::rtsp::udp::PortRange>,
@@ -54,6 +61,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a = Args::parse();
     let udp_rate = a.rtsp_udp_mbps.unwrap_or(100.0);
     flussonix::rtsp::udp::Pacer::new(udp_rate)?;
+    let tls_config = match (&a.rtsps_cert, &a.rtsps_key) {
+        (Some(cert), Some(key)) => Some(flussonix::rtsp::tls::server(cert, key)?),
+        _ => None,
+    };
     let options = Options {
         admin_user: a.admin_user,
         admin_password: a.admin_password,
@@ -75,6 +86,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
         None => None,
     };
+    let tls_listener = match a.rtsps_listen {
+        Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
+        None => None,
+    };
     let udp_pool = match (a.rtsp_udp_ports, rtsp_listener.as_ref()) {
         (Some(range), Some(listener)) => {
             Some(flussonix::rtsp::udp::Pool::bind(listener.local_addr()?.ip(), range).await?)
@@ -83,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     println!(
         "{}",
-        serde_json::json!({"service":"FlussoniX","listen":listener.local_addr()?.to_string(),"rtsp_listen":rtsp_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"rtsp_udp_ports":a.rtsp_udp_ports.map(|p|p.to_string()),"rtsp_udp_mbps":a.rtsp_udp_ports.map(|_|udp_rate),"version":env!("CARGO_PKG_VERSION")})
+        serde_json::json!({"service":"FlussoniX","listen":listener.local_addr()?.to_string(),"rtsp_listen":rtsp_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"rtsps_listen":tls_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"rtsp_udp_ports":a.rtsp_udp_ports.map(|p|p.to_string()),"rtsp_udp_mbps":a.rtsp_udp_ports.map(|_|udp_rate),"version":env!("CARGO_PKG_VERSION")})
     );
     app.reconcile().await;
     let background = app.clone();
@@ -95,6 +110,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cancel.clone(),
             udp_pool,
             udp_rate,
+        ))
+    });
+    let mut tls_task = tls_listener.map(|listener| {
+        tokio::spawn(flussonix::rtsp::serve_tls(
+            listener,
+            app.clone(),
+            cancel.clone(),
+            tls_config.unwrap(),
         ))
     });
     let bg_cancel = cancel.clone();
@@ -128,9 +151,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .into_future();
     tokio::pin!(serving);
     let mut rtsp_result = None;
+    let mut tls_result = None;
     let completed = tokio::select! {
         result=&mut serving=>Some(result),
         result=async{match rtsp_task.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{rtsp_result=Some(result);None},
+        result=async{match tls_task.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{tls_result=Some(result);None},
         _=shutdown()=>None
     };
     cancel.cancel();
@@ -143,6 +168,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rtsp_result = Some(task.await);
         }
     }
+    if tls_result.is_none() {
+        if let Some(task) = tls_task {
+            tls_result = Some(task.await);
+        }
+    }
     if let Some(result) = completed {
         result?;
     } else if tokio::time::timeout(Duration::from_secs(5), &mut serving)
@@ -152,6 +182,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("connection drain exceeded five seconds");
     }
     if let Some(result) = rtsp_result {
+        result??;
+    }
+    if let Some(result) = tls_result {
         result??;
     }
     Ok(())
