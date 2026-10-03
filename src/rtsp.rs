@@ -123,7 +123,7 @@ async fn serve_connections(
     let mut clients = JoinSet::new();
     let result = loop {
         tokio::select! {biased;_=cancel.cancelled()=>break Ok(()),Some(_)=clients.join_next(),if !clients.is_empty()=>{},accepted=listener.accept()=>{match accepted{Ok((socket,peer))=>{if let Ok(permit)=permits.clone().try_acquire_owned(){let app=app.clone();let cancel=cancel.clone();let udp=udp.clone();let tls=tls.clone();clients.spawn(async move{let _permit=permit;if socket.set_nodelay(true).is_err(){return;}
-if let Some(tls)=tls{let accepted=tokio::select!{biased;_=cancel.cancelled()=>return,result=tokio::time::timeout(Duration::from_secs(8),tls.accept(socket))=>result};if let Ok(Ok(stream))=accepted{let _=connection(stream,peer,app,cancel,udp,true).await;}}else{let _=connection(socket,peer,app,cancel,udp,false).await;}});}},Err(e)=>break Err(e)}}}
+        if let Some(tls)=tls{let accepted=tokio::select!{biased;_=cancel.cancelled()=>return,result=tokio::time::timeout(Duration::from_secs(8),tls.accept(socket))=>result};if let Ok(Ok(stream))=accepted{let _=connection(stream,peer,app,cancel,udp,true).await;}}else{let _=connection(socket,peer,app,cancel,udp,false).await;}});}},Err(e)=>break Err(e)}}}
     };
     cancel.cancel();
     let drain = async { while clients.join_next().await.is_some() {} };
