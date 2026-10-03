@@ -279,6 +279,21 @@ impl Hub {
         self.signals.send(signal)?;
         Ok(())
     }
+    pub(crate) fn native_fmp4_directory(&self) -> Result<&'static str, String> {
+        let s = self.state.lock().unwrap();
+        if s.tracks.is_empty() {
+            return Err("native metadata not ready".into());
+        }
+        let aac = s.tracks.iter().any(|t| t.codec == "aac");
+        let mpeg = s
+            .tracks
+            .iter()
+            .any(|t| matches!(t.codec.as_str(), "m2a" | "mp3"));
+        if aac && mpeg {
+            return Err("fMP4 mixed AAC/MPEG audio profile is not qualified".into());
+        }
+        Ok(if aac { "fmp4_aac" } else { "fmp4" })
+    }
     pub fn has_info(&self) -> bool {
         self.state.lock().unwrap().info.is_some()
     }

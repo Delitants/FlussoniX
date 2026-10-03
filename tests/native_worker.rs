@@ -359,3 +359,195 @@ async fn invalid_first_worker_metadata_never_reaches_native_hub() {
 async fn short_native_stream_starts_without_default_five_second_ts_probe() {
     run("m4s", true).await;
 }
+
+async fn fmp4_profile(kind: &str) {
+    let (mut tracks, mut frames) = fixture();
+    if kind != "mpeg" {
+        tracks.retain(|t| t.id == 1);
+        frames.retain(|f| f.track_id == 1);
+        let encoded = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=880:sample_rate=48000",
+                "-t",
+                "6",
+                "-c:a",
+                "aac",
+                "-f",
+                "adts",
+                "pipe:1",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(encoded.status.success());
+        for id in [2, 3] {
+            tracks.push(Track {
+                id,
+                codec: "aac".into(),
+                config: vec![0x11, 0x88, 0x56, 0xe5, 0],
+            });
+            let mut at = 0;
+            let mut n = 0;
+            while at < encoded.stdout.len() {
+                let h = &encoded.stdout[at..];
+                let size = (usize::from(h[3] & 3) << 11)
+                    | (usize::from(h[4]) << 3)
+                    | usize::from(h[5] >> 5);
+                frames.push(Frame {
+                    track_id: id,
+                    dts: 90000 + n * 1920,
+                    pts_offset: 0,
+                    key: true,
+                    body: h[7..size].to_vec(),
+                });
+                at += size;
+                n += 1;
+            }
+        }
+        if kind == "mixed" {
+            tracks[2].codec = "mp3".into();
+            tracks[2].config.clear();
+            frames.retain(|f| f.track_id != 3);
+            for i in 0..230 {
+                frames.push(Frame {
+                    track_id: 3,
+                    dts: 90000 + i * 2351,
+                    pts_offset: 0,
+                    key: true,
+                    body: include_bytes!("fixtures/codecs/mp3.bin").to_vec(),
+                });
+            }
+        }
+    }
+    frames.sort_by_key(|f| f.dts);
+    let mut bytes = wire::encode_info(&tracks).unwrap();
+    for f in frames {
+        let t = tracks.iter().find(|t| t.id == f.track_id).unwrap();
+        bytes.extend(wire::encode_frame(t, &f).unwrap());
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("m4s://{}/owned", listener.local_addr().unwrap());
+    let bytes = Bytes::from(bytes);
+    let router = axum::Router::new().route(
+        "/owned/m4s",
+        axum::routing::get(move || {
+            let b = bytes.clone();
+            async move {
+                let stream = futures_util::stream::once(async move { Ok::<_, std::io::Error>(b) })
+                    .chain(futures_util::stream::pending());
+                axum::body::Body::from_stream(stream)
+            }
+        }),
+    );
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "ffmpeg");
+    let worker = engine
+        .ensure("owned", &json!({"inputs":[{"url":url}]}))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while !engine.ready("owned").await {
+            assert!(!worker.is_closed());
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    if kind == "mixed" {
+        let e = engine.read("owned", "fmp4/index.m3u8").await.unwrap_err();
+        assert!(e.contains("mixed AAC/MPEG"), "{e}");
+        assert!(engine.read("owned", "index.m3u8").await.is_ok());
+    } else {
+        let playlist = engine.read("owned", "fmp4/index.m3u8").await.unwrap();
+        let text = String::from_utf8(playlist.to_vec()).unwrap();
+        assert!(!text.contains("#EXT-X-TARGETDURATION:0"));
+        let map = text
+            .lines()
+            .find(|l| l.starts_with("#EXT-X-MAP:"))
+            .unwrap()
+            .split('"')
+            .nth(1)
+            .unwrap();
+        let fragment = text
+            .lines()
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+            .unwrap();
+        let mut mp4 = engine
+            .read("owned", &format!("fmp4/{map}"))
+            .await
+            .unwrap()
+            .to_vec();
+        mp4.extend(
+            engine
+                .read("owned", &format!("fmp4/{fragment}"))
+                .await
+                .unwrap(),
+        );
+        let file = dir.path().join("decode.mp4");
+        tokio::fs::write(&file, mp4).await.unwrap();
+        let r = tokio::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_streams",
+                "-show_packets",
+                "-of",
+                "json",
+            ])
+            .arg(&file)
+            .output()
+            .await
+            .unwrap();
+        assert!(r.status.success());
+        let info: Value = serde_json::from_slice(&r.stdout).unwrap();
+        assert_eq!(info["streams"].as_array().unwrap().len(), 3);
+        for index in 0..3 {
+            assert!(
+                info["packets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["stream_index"] == index)
+            );
+        }
+        let decoded = tokio::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(file)
+            .args(["-map", "0", "-f", "null", "-"])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            decoded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+        assert!(
+            decoded.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+    }
+    let pid = worker.pid();
+    engine.stop_all().await;
+    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    task.abort();
+}
+#[tokio::test]
+async fn native_aac_fmp4_contains_decodable_media_for_both_audio_tracks() {
+    fmp4_profile("aac").await;
+}
+#[tokio::test]
+async fn native_mpeg_fmp4_keeps_unfiltered_audio_decodable() {
+    fmp4_profile("mpeg").await;
+}
+#[tokio::test]
+async fn native_mixed_fmp4_returns_explicit_profile_error_while_ts_continues() {
+    fmp4_profile("mixed").await;
+}

@@ -34,6 +34,7 @@ impl Drop for Publication {
     }
 }
 pub struct Worker {
+    native_copy: bool,
     publisher_stdin: std::sync::Mutex<Option<tokio::process::ChildStdin>>,
     publication: bool,
     tx: broadcast::Sender<Bytes>,
@@ -398,7 +399,7 @@ impl Engine {
             ""
         };
         let fmp4_failure = if native_copy { "onfail=ignore:" } else { "" };
-        let output = format!(
+        let mut output = format!(
             "[f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_filename={}:hls_flags=delete_segments+temp_file{discontinuity}]{}|[{fmp4_failure}f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_type=fmp4:hls_segment_filename={}:hls_fmp4_init_filename=g{generation}_init.mp4:hls_flags=delete_segments+temp_file{discontinuity}{fmp4_filter}]{}|[f=mpegts]pipe:1{wire_output}",
             dir.join(format!("g{generation}_%d.ts")).display(),
             dir.join("index.m3u8").display(),
@@ -407,6 +408,15 @@ impl Engine {
                 .display(),
             dir.join("fmp4/index.m3u8").display()
         );
+        if native_copy {
+            // Filtered AAC and unfiltered MPEG audio require different slaves.
+            // Only the metadata-selected directory is exposed by read().
+            let aac_dir = dir.join("fmp4_aac");
+            tokio::fs::create_dir_all(&aac_dir)
+                .await
+                .map_err(|_| "cannot create native AAC output")?;
+            output.push_str(&format!("|[onfail=ignore:f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_type=fmp4:hls_segment_filename={}:hls_fmp4_init_filename=g{generation}_init.mp4:hls_flags=delete_segments+temp_file{discontinuity}:bsfs/a=aac_adtstoasc]{}",aac_dir.join(format!("g{generation}_%d.m4s")).display(),aac_dir.join("index.m3u8").display()));
+        }
         cmd.args(["-threads", "2", "-f", "tee", &output]);
         if copy_publication {
             // tee stream-copy retains the MPEG-TS codec tag even with -tag:v 0,
@@ -447,6 +457,7 @@ impl Engine {
                 .clamp(1, 300),
         );
         let worker = Arc::new(Worker {
+            native_copy,
             publisher_stdin: std::sync::Mutex::new(if publication { stdin.take() } else { None }),
             publication,
             tx,
@@ -608,10 +619,21 @@ impl Engine {
         if !matches!(file, "index.m3u8" | "fmp4/index.m3u8") && !valid_file(file) {
             return Err("invalid media path".into());
         }
-        if let Some(w) = self.workers.lock().await.get(name) {
-            w.touch()
-        }
-        let path = self.directory(name).join(file);
+        let mapped = if let Some(w) = self.workers.lock().await.get(name) {
+            w.touch();
+            if w.native_copy {
+                if let Some(rest) = file.strip_prefix("fmp4/") {
+                    format!("{}/{}", w.wire.native_fmp4_directory()?, rest)
+                } else {
+                    file.to_owned()
+                }
+            } else {
+                file.to_owned()
+            }
+        } else {
+            return Err("media worker unavailable".into());
+        };
+        let path = self.directory(name).join(mapped);
         let meta = tokio::fs::metadata(&path)
             .await
             .map_err(|_| "media not ready")?;
