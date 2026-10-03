@@ -887,7 +887,7 @@ async fn paced_udp_waits_keep_control_responsive_and_revocation_stops_counted_me
                 if track_id == target {
                     worker.wire.rtp.frame(&flussonix::m4f::Frame {
                         track_id,
-                        dts: dts + 9_000_000,
+                        dts: dts + 900_000,
                         pts_offset,
                         key,
                         body,
@@ -969,6 +969,125 @@ async fn paced_udp_waits_keep_control_responsive_and_revocation_stops_counted_me
         .await
         .unwrap();
     drop(lease);
+    c.cancel();
+    t.await.unwrap().unwrap();
+    app.media.stop_all().await;
+}
+
+#[tokio::test]
+async fn forward_udp_timestamp_jump_closes_the_session_with_a_live_source() {
+    let (_d, app, url, c, t, pool) = fixture_udp("standalone", 1, 100.0).await;
+    let clients = udp_clients(2);
+    let mut s = connect(&url).await;
+    let tracks = describe_tracks(&mut s, &url).await;
+    let (_, h, _) = setup_udp(&mut s, &url, &tracks[0], &clients[0], None).await;
+    let id = session(&h);
+    assert_eq!(
+        request(&mut s, "PLAY", &url, &format!("Session: {id}\r\n"))
+            .await
+            .0,
+        200
+    );
+    let mut body = [0; 1500];
+    tokio::time::timeout(Duration::from_secs(3), clients[0].recv(&mut body))
+        .await
+        .unwrap()
+        .unwrap();
+    let worker = app
+        .media
+        .ensure("owned", &app.config.effective("owned").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        request(&mut s, "GET_PARAMETER", &url, &format!("Session: {id}\r\n"))
+            .await
+            .0,
+        200
+    );
+    worker.wire.rtp.frame(&flussonix::m4f::Frame {
+        track_id: tracks[0].parse().unwrap(),
+        dts: u64::MAX,
+        pts_offset: 0,
+        key: false,
+        body: vec![0, 0, 0, 2, 0x41, 0],
+    });
+    let mut control = vec![];
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut control))
+            .await
+            .is_ok(),
+        "forward discontinuity must disconnect despite live worker and recent control"
+    );
+    assert_eq!(worker.viewers.load(Ordering::Relaxed), 0);
+    let p = clients[0].local_addr().unwrap().port();
+    drop(
+        pool.lease(
+            "127.0.0.1".parse().unwrap(),
+            rtsp::protocol::ClientPorts {
+                rtp: p,
+                rtcp: p + 1,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    c.cancel();
+    t.await.unwrap().unwrap();
+    app.media.stop_all().await;
+}
+
+#[tokio::test]
+async fn udp_pending_packet_does_not_hide_queue_eviction() {
+    let (_d, app, url, c, t, _pool) = fixture_udp("standalone", 1, 100.0).await;
+    let clients = udp_clients(2);
+    let mut s = connect(&url).await;
+    let tracks = describe_tracks(&mut s, &url).await;
+    let (_, h, _) = setup_udp(&mut s, &url, &tracks[0], &clients[0], None).await;
+    let id = session(&h);
+    assert_eq!(
+        request(&mut s, "PLAY", &url, &format!("Session: {id}\r\n"))
+            .await
+            .0,
+        200
+    );
+    let mut body = [0; 1500];
+    tokio::time::timeout(Duration::from_secs(3), clients[0].recv(&mut body))
+        .await
+        .unwrap()
+        .unwrap();
+    let worker = app
+        .media
+        .ensure("owned", &app.config.effective("owned").unwrap())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut frame = flussonix::m4f::Frame {
+        track_id: tracks[0].parse().unwrap(),
+        dts: 1_000_000,
+        pts_offset: 0,
+        key: false,
+        body: vec![0, 0, 0, 2, 0x41, 0],
+    };
+    worker.wire.rtp.frame(&frame);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        request(&mut s, "GET_PARAMETER", &url, &format!("Session: {id}\r\n"))
+            .await
+            .0,
+        200
+    );
+    frame.dts = 9000;
+    for _ in 0..5000 {
+        worker.wire.rtp.frame(&frame);
+    }
+    let mut control = vec![];
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut control))
+            .await
+            .is_ok(),
+        "pending wait must detect shared queue eviction"
+    );
+    assert_eq!(worker.viewers.load(Ordering::Relaxed), 0);
     c.cancel();
     t.await.unwrap().unwrap();
     app.media.stop_all().await;

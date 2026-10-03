@@ -187,9 +187,11 @@ async fn recycled_udp_pair_discards_old_reports_and_filters_other_endpoints() {
         .await
         .unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_millis(20), lease.recv_rtcp(&mut buffer))
+        tokio::time::timeout(Duration::from_secs(1), lease.recv_rtcp(&mut buffer))
             .await
-            .is_err()
+            .unwrap()
+            .unwrap()
+            .is_none()
     );
     clients[1]
         .send_to(b"current-report", (ip(), server.1))
@@ -235,4 +237,140 @@ fn pacing_obeys_decode_time_and_a_refilling_byte_budget() {
     for rate in [0.0, -1.0, f64::NAN, f64::INFINITY, 10001.0] {
         assert!(Pacer::new(rate).is_err());
     }
+}
+
+#[tokio::test]
+async fn wildcard_pool_reselects_route_after_loopback_lease() {
+    let (range, held) = reserved(2);
+    drop(held);
+    let pool = Pool::bind("0.0.0.0".parse().unwrap(), range).await.unwrap();
+    let ports = ClientPorts {
+        rtp: 30000,
+        rtcp: 30001,
+    };
+    let local = pool.lease(ip(), ports).await.unwrap();
+    let reserved = local.server_ports();
+    drop(local);
+    // Connect only: no test traffic is sent to this documentation-only destination.
+    let routed = pool
+        .lease("192.0.2.1".parse().unwrap(), ports)
+        .await
+        .expect("wildcard lease must select a new local route");
+    assert_eq!(routed.server_ports(), reserved);
+    assert!(!routed.source_ip().is_loopback());
+    drop(routed);
+    let local = pool.lease(ip(), ports).await.unwrap();
+    assert_eq!(local.source_ip(), ip());
+    assert_eq!(local.server_ports(), reserved);
+}
+#[tokio::test]
+async fn excessive_old_reports_make_reuse_fail_until_the_queue_is_drained() {
+    let (range, held) = reserved(2);
+    drop(held);
+    let pool = Pool::bind(ip(), range).await.unwrap();
+    let (_, clients) = reserved(2);
+    let ports = ClientPorts {
+        rtp: clients[0].local_addr().unwrap().port(),
+        rtcp: clients[1].local_addr().unwrap().port(),
+    };
+    let old = pool.lease(ip(), ports).await.unwrap();
+    let server = old.server_ports();
+    let mut report = vec![0x81, 201, 0, 7, 0, 0, 0, 99, 0x11, 0x22, 0x33, 0x44];
+    report.extend([0; 20]);
+    report.extend([0x81, 202, 0, 2, 0, 0, 0, 99, 1, 1, b'x', 0]);
+    assert!(valid_receiver_report(&report, 0x11223344));
+    for _ in 0..100 {
+        clients[1].send_to(&report, (ip(), server.1)).unwrap();
+    }
+    drop(old);
+    assert!(
+        pool.lease(ip(), ports).await.is_err(),
+        "reuse must reject a queue beyond its bounded drain"
+    );
+    let lease = pool.lease(ip(), ports).await.unwrap();
+    let mut body = [0; 8193];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), lease.recv_rtcp(&mut body))
+            .await
+            .is_err()
+    );
+}
+#[test]
+fn forward_timestamp_discontinuity_is_rejected_instead_of_scheduled_indefinitely() {
+    use flussonix::rtsp::udp::Pacer;
+    let now = tokio::time::Instant::now();
+    let mut p = Pacer::new(100.0).unwrap();
+    p.ready_at(0, 100, now).unwrap();
+    assert!(p.ready_at(u64::MAX, 100, now).is_err());
+    assert!(p.ready_at(31 * 90000, 100, now).is_err());
+    assert_eq!(
+        p.ready_at(30 * 90000, 100, now).unwrap(),
+        now + Duration::from_secs(30)
+    );
+}
+
+#[tokio::test]
+async fn busy_replacement_keeps_the_previous_udp_destination() {
+    let (range, held) = reserved(2);
+    drop(held);
+    let pool = Pool::bind(ip(), range).await.unwrap();
+    let (_, clients) = reserved(4);
+    let ports = ClientPorts {
+        rtp: clients[0].local_addr().unwrap().port(),
+        rtcp: clients[1].local_addr().unwrap().port(),
+    };
+    let mut lease = pool.lease(ip(), ports).await.unwrap();
+    for _ in 0..100 {
+        clients[1]
+            .send_to(b"queued", (ip(), lease.server_ports().1))
+            .unwrap();
+    }
+    let next = clients[2].local_addr().unwrap().port();
+    assert!(
+        lease
+            .set_client_ports(ClientPorts {
+                rtp: next,
+                rtcp: next + 1
+            })
+            .is_err()
+    );
+    lease.send_rtp(b"still-old-peer").await.unwrap();
+    let mut body = [0; 64];
+    clients[0]
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let (n, _) = clients[0].recv_from(&mut body).unwrap();
+    assert_eq!(&body[..n], b"still-old-peer");
+    clients[2].set_nonblocking(true).unwrap();
+    assert_eq!(
+        clients[2].recv_from(&mut body).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+#[tokio::test]
+async fn ipv6_udp_binding_filters_family_and_preserves_reserved_source_ports() {
+    let (range, held) = reserved(2);
+    drop(held);
+    let pool = Pool::bind("::1".parse().unwrap(), range).await.unwrap();
+    let (_, held) = reserved(2);
+    let port = held[0].local_addr().unwrap().port();
+    let clients = [
+        UdpSocket::bind(("::1", port)).await.unwrap(),
+        UdpSocket::bind(("::1", port + 1)).await.unwrap(),
+    ];
+    let ports = ClientPorts {
+        rtp: port,
+        rtcp: port + 1,
+    };
+    assert!(pool.lease(ip(), ports).await.is_err());
+    let lease = pool.lease("::1".parse().unwrap(), ports).await.unwrap();
+    lease.send_rtp(b"ipv6-owned").await.unwrap();
+    let mut body = [0; 64];
+    let (n, peer) = tokio::time::timeout(Duration::from_secs(1), clients[0].recv_from(&mut body))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&body[..n], b"ipv6-owned");
+    assert_eq!(peer.port(), lease.server_ports().0);
+    assert_eq!(lease.source_ip(), "::1".parse::<IpAddr>().unwrap());
 }

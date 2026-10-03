@@ -64,6 +64,9 @@ pub struct Receiver {
     waiting_key: bool,
 }
 impl Receiver {
+    pub fn is_lagged(&self) -> bool {
+        self.inner.is_lagged()
+    }
     pub async fn recv(&mut self) -> Result<Bytes, tokio::sync::broadcast::error::RecvError> {
         self.recv_timed().await.map(|packet| packet.bytes)
     }

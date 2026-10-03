@@ -57,6 +57,7 @@ pub struct Lease {
     pool: Arc<Pool>,
     peer_rtcp: SocketAddr,
     client_ports: ClientPorts,
+    source_ip: IpAddr,
 }
 impl Pool {
     /// Keep every successfully bound socket; failure drops all preceding bindings.
@@ -92,31 +93,37 @@ impl Pool {
             .pop()
             .ok_or(std::io::ErrorKind::WouldBlock)?;
         let peer_rtcp = SocketAddr::new(peer, ports.rtcp);
-        let setup = || -> std::io::Result<ActivePair> {
-            pair.rtp.connect(SocketAddr::new(peer, ports.rtp))?;
-            pair.rtcp.connect(peer_rtcp)?;
-            let mut buffer = [0; 8193];
-            for socket in [&pair.rtp, &pair.rtcp] {
-                let _ = socket.take_error()?;
-                // Raw nonblocking reads observe queued kernel bytes without waiting for reactor readiness.
-                for _ in 0..64 {
-                    if socket.recv_from(&mut buffer).is_err() {
-                        break;
-                    }
-                }
+        let setup = || -> std::io::Result<(ActivePair, IpAddr)> {
+            let bound = pair.rtp.local_addr()?.ip();
+            if bound.is_ipv4() != peer.is_ipv4() {
+                return Err(std::io::ErrorKind::InvalidInput.into());
             }
-            Ok(ActivePair {
-                rtp: UdpSocket::from_std(pair.rtp.try_clone()?)?,
-                rtcp: UdpSocket::from_std(pair.rtcp.try_clone()?)?,
-            })
+            // Retained pool sockets stay unconnected: Linux connect pins a wildcard
+            // socket to its first selected interface even after it returns to the pool.
+            let source_ip = if bound.is_unspecified() {
+                let probe = std::net::UdpSocket::bind((bound, 0))?;
+                probe.connect(SocketAddr::new(peer, ports.rtp))?;
+                probe.local_addr()?.ip()
+            } else {
+                bound
+            };
+            drain(&pair)?;
+            Ok((
+                ActivePair {
+                    rtp: UdpSocket::from_std(pair.rtp.try_clone()?)?,
+                    rtcp: UdpSocket::from_std(pair.rtcp.try_clone()?)?,
+                },
+                source_ip,
+            ))
         };
         match setup() {
-            Ok(active) => Ok(Lease {
+            Ok((active, source_ip)) => Ok(Lease {
                 pair: Some(pair),
                 active: Some(active),
                 pool: self.clone(),
                 peer_rtcp,
                 client_ports: ports,
+                source_ip,
             }),
             Err(error) => {
                 self.idle.lock().unwrap().push(pair);
@@ -124,6 +131,31 @@ impl Pool {
             }
         }
     }
+}
+/// Reuse is permitted only after observing an empty kernel queue. Work is bounded;
+/// exhaustion returns a retryable setup failure rather than accepting old traffic.
+fn drain(pair: &Pair) -> std::io::Result<()> {
+    let mut buffer = [0; 8193];
+    for socket in [&pair.rtp, &pair.rtcp] {
+        let _ = socket.take_error()?;
+        let mut empty = false;
+        for _ in 0..=64 {
+            match socket.recv_from(&mut buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    empty = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+                Ok(_) => {}
+            }
+        }
+        if !empty {
+            return Err(std::io::Error::other(
+                "UDP receive queue exceeds bounded drain",
+            ));
+        }
+    }
+    Ok(())
 }
 impl Drop for Lease {
     fn drop(&mut self) {
@@ -139,25 +171,9 @@ impl Lease {
             return Err(std::io::ErrorKind::InvalidInput.into());
         }
         let pair = self.pair.as_ref().unwrap();
+        // A failed drain leaves the previous destination and lease intact.
+        drain(pair)?;
         let ip = self.peer_rtcp.ip();
-        let connected = pair
-            .rtp
-            .connect(SocketAddr::new(ip, ports.rtp))
-            .and_then(|_| pair.rtcp.connect(SocketAddr::new(ip, ports.rtcp)));
-        if let Err(error) = connected {
-            let _ = pair.rtp.connect(SocketAddr::new(ip, self.client_ports.rtp));
-            let _ = pair.rtcp.connect(self.peer_rtcp);
-            return Err(error);
-        }
-        let mut buffer = [0; 8193];
-        for socket in [&pair.rtp, &pair.rtcp] {
-            let _ = socket.take_error();
-            for _ in 0..64 {
-                if socket.recv_from(&mut buffer).is_err() {
-                    break;
-                }
-            }
-        }
         self.client_ports = ports;
         self.peer_rtcp = SocketAddr::new(ip, ports.rtcp);
         Ok(())
@@ -170,13 +186,26 @@ impl Lease {
         )
     }
     pub fn source_ip(&self) -> IpAddr {
-        self.pair.as_ref().unwrap().rtp.local_addr().unwrap().ip()
+        self.source_ip
     }
     pub async fn send_rtp(&self, body: &[u8]) -> std::io::Result<usize> {
-        self.active.as_ref().unwrap().rtp.send(body).await
+        self.active
+            .as_ref()
+            .unwrap()
+            .rtp
+            .send_to(
+                body,
+                SocketAddr::new(self.peer_rtcp.ip(), self.client_ports.rtp),
+            )
+            .await
     }
     pub async fn send_rtcp(&self, body: &[u8]) -> std::io::Result<usize> {
-        self.active.as_ref().unwrap().rtcp.send(body).await
+        self.active
+            .as_ref()
+            .unwrap()
+            .rtcp
+            .send_to(body, self.peer_rtcp)
+            .await
     }
     pub async fn recv_rtcp(&self, body: &mut [u8]) -> std::io::Result<Option<usize>> {
         let (n, source) = self.active.as_ref().unwrap().rtcp.recv_from(body).await?;
@@ -320,7 +349,11 @@ impl Pacer {
         let bucket = now
             .checked_add(std::time::Duration::from_secs_f64(wait))
             .ok_or(std::io::ErrorKind::InvalidData)?;
-        Ok(media.max(bucket).max(now))
+        let due = media.max(bucket).max(now);
+        if due.saturating_duration_since(now) > std::time::Duration::from_secs(30) {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        Ok(due)
     }
     pub fn sent(&mut self, bytes: usize, now: tokio::time::Instant) {
         self.refill(now);

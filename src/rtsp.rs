@@ -219,7 +219,9 @@ async fn connection(
             Next::Close => break,
             Next::Check => {
                 if let Some(s) = &session {
-                    if !app.rtsp_current(&s.playback).await {
+                    if s.receiver.as_ref().is_some_and(Receiver::is_lagged)
+                        || !app.rtsp_current(&s.playback).await
+                    {
                         break;
                     }
                 }

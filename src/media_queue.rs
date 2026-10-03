@@ -72,6 +72,16 @@ impl Channel {
     }
 }
 impl Receiver {
+    /// Inspect eviction without consuming a record during an outstanding paced send.
+    pub fn is_lagged(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .records
+            .front()
+            .is_some_and(|(first, _)| self.next < *first)
+    }
     pub async fn recv(&mut self) -> Result<Bytes, RecvError> {
         loop {
             let notified = self.inner.changed.notified();
