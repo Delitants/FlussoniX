@@ -211,7 +211,7 @@ impl Engine {
             cmd.stdin(std::process::Stdio::piped());
         } else {
             let mut translated = if input.starts_with("rtsps://") {
-                let bridge = crate::tls_input::Bridge::prepare(
+                let bridge = crate::tls_input::Bridge::start(
                     input,
                     inputs[index]["flussonix_tls_ca"].as_str().map(Path::new),
                 )
