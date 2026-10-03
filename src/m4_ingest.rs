@@ -7,7 +7,10 @@ use crate::{
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use std::{collections::VecDeque, time::Duration};
-use tokio::io::AsyncWriteExt;
+use tokio::{
+    io::{AsyncWrite, AsyncWriteExt},
+    sync::oneshot,
+};
 
 pub struct Notification {
     pub name: String,
@@ -69,11 +72,12 @@ impl Signals {
         Ok(out)
     }
 }
-async fn configs(
-    stdin: &mut tokio::process::ChildStdin,
+async fn configs<W: AsyncWrite + Unpin>(
+    stdin: &mut W,
     tracks: &mut Vec<Track>,
     muxer: &mut Option<Muxer>,
     new: Vec<Track>,
+    metadata: &mut Option<oneshot::Sender<Vec<Track>>>,
 ) -> Result<(), String> {
     if muxer.is_some() {
         if *tracks != new {
@@ -82,6 +86,11 @@ async fn configs(
         return Ok(());
     }
     let mut next = Muxer::new(&new)?;
+    if let Some(sender) = metadata.take() {
+        sender
+            .send(new.clone())
+            .map_err(|_| "native startup cancelled")?;
+    }
     stdin
         .write_all(&next.tables())
         .await
@@ -94,8 +103,8 @@ async fn configs(
 pub fn validate_bridge(tracks: &[Track]) -> Result<(), String> {
     Muxer::new(tracks).map(|_| ())
 }
-async fn write_frame(
-    stdin: &mut tokio::process::ChildStdin,
+async fn write_frame<W: AsyncWrite + Unpin>(
+    stdin: &mut W,
     muxer: &mut Option<Muxer>,
     frame: &crate::m4f::Frame,
 ) -> Result<(), String> {
@@ -113,6 +122,25 @@ pub async fn pull(
     key: Option<&str>,
     stdin: &mut tokio::process::ChildStdin,
     hub: Option<&Hub>,
+) -> Result<(), String> {
+    pull_inner(input, key, stdin, hub, None).await
+}
+/// Supply validated metadata before the first TS write, on the same input session.
+pub async fn pull_ready<W: AsyncWrite + Unpin>(
+    input: &str,
+    key: Option<&str>,
+    output: &mut W,
+    hub: Option<&Hub>,
+    metadata: oneshot::Sender<Vec<Track>>,
+) -> Result<(), String> {
+    pull_inner(input, key, output, hub, Some(metadata)).await
+}
+async fn pull_inner<W: AsyncWrite + Unpin>(
+    input: &str,
+    key: Option<&str>,
+    stdin: &mut W,
+    hub: Option<&Hub>,
+    mut metadata: Option<oneshot::Sender<Vec<Track>>>,
 ) -> Result<(), String> {
     let is_m4f = input.starts_with("m4f");
     let suffix = if is_m4f { "/m4f" } else { "/m4s" };
@@ -199,7 +227,7 @@ pub async fn pull(
                 if frames.is_empty() {
                     return Err("empty M4F segment".into());
                 }
-                configs(stdin, &mut tracks, &mut muxer, new.clone()).await?;
+                configs(stdin, &mut tracks, &mut muxer, new.clone(), &mut metadata).await?;
                 for f in &frames {
                     write_frame(stdin, &mut muxer, f).await?;
                 }
@@ -230,7 +258,7 @@ pub async fn pull(
             for event in decoder.push(&bytes)? {
                 match event {
                     Event::Info { tracks: new, wire } => {
-                        configs(stdin, &mut tracks, &mut muxer, new.clone()).await?;
+                        configs(stdin, &mut tracks, &mut muxer, new.clone(), &mut metadata).await?;
                         if let Some(h) = hub {
                             h.relay_info(new.clone(), wire)?;
                         }
@@ -261,7 +289,7 @@ pub async fn pull(
                         frames,
                         wire,
                     } => {
-                        configs(stdin, &mut tracks, &mut muxer, new.clone()).await?;
+                        configs(stdin, &mut tracks, &mut muxer, new.clone(), &mut metadata).await?;
                         for f in &frames {
                             write_frame(stdin, &mut muxer, f).await?;
                         }
