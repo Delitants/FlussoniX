@@ -1,6 +1,6 @@
 # Native codec foundation
 
-The native media library now represents H.264, HEVC, AAC, MPEG audio Layer II (`m2a`) and Layer III (`mp3`). This is preparation for end-to-end codec support. The v0.10 daemon's worker bridge and RTSP/RTP profile remain H.264/AAC; HEVC/MPEG input is explicitly rejected by that bridge, and multiple audio tracks are rejected there rather than silently lost. No new runtime preview or codec capability is advertised by this source stage.
+The native media library now represents H.264, HEVC, AAC, MPEG audio Layer II (`m2a`) and Layer III (`mp3`). This is preparation for end-to-end codec support. The installed v0.10 preview's worker bridge and RTSP/RTP profile remain H.264/AAC; HEVC/MPEG input is explicitly rejected by that bridge, and multiple audio tracks are rejected there rather than silently lost. No new runtime preview or codec capability is advertised by this source stage.
 
 ## Implemented
 
@@ -19,9 +19,9 @@ A disposable local Erlang process using the installed reference accepted indepen
 
 Native metadata currently retains the earlier Track layout: ID, codec and opaque configuration. Full sample-rate/channel/clock metadata qualification, Main10, parameter-set changes during playback, multiple live audio tracks, live mixed-vendor paths and complete codec/container/security combinations remain pending. An empty MPEG configuration can be represented; that does not establish a complete reference playback metadata contract.
 
-The next media stage must replace the single AVC/AAC FLV worker channel with a specified representation that carries all requested codecs, multiple tracks, configuration revisions and decode/composition clocks. Container remuxing, HEVC RTP, secure publication/push, CPU/GPU profiles and full migration qualification remain required by [the codec contract](secure-output-codecs.md). The current installed v0.10 instances are kept running during this source-stage work.
+The follow-on [native worker source stage](native-worker.md) replaces the ingress AVC/AAC FLV channel with MPEG-TS and qualifies owned HEVC/MPEG copy paths. Configuration transitions, new native origination and complete decode/composition clock contracts remain to be qualified. Container remuxing, HEVC RTP, secure publication/push, CPU/GPU profiles and full migration qualification remain required by [the codec contract](secure-output-codecs.md). The current installed v0.10 instances are kept running during this source-stage work.
 
-Source-stage validation:222 Rust tests passed, zero failed and one opt-in test ignored;18 new codec cases included. Formatting and all-target Clippy passed. The existing15-case browser suite passed against an owned current-source daemon with HTTP/HTTPS enabled, and the temporary daemon was stopped after testing. Public GitHub CI remains the source publication gate.
+Foundation-stage validation:222 Rust tests passed, zero failed and one opt-in test ignored;18 new codec cases included. Formatting and all-target Clippy passed. The existing15-case browser suite passed against an owned current-source daemon with HTTP/HTTPS enabled, and the temporary daemon was stopped after testing. Public GitHub CI remains the source publication gate.
 
 ## Review and qualification decisions
 

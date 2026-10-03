@@ -234,3 +234,52 @@ fn unsupported_configuration_and_adts_size_fail_explicitly() {
     .unwrap();
     assert!(mux.frame(&frame(1, 0, vec![0; 8192])).is_err());
 }
+
+#[test]
+fn aac_lc_accepts_explicit_disabled_sbr_extension_and_rejects_other_tails() {
+    let track = Track {
+        id: 1,
+        codec: "aac".into(),
+        config: vec![0x11, 0x90, 0x56, 0xe5, 0],
+    };
+    assert!(Muxer::new(std::slice::from_ref(&track)).is_ok());
+    for tail in [vec![0x56, 0xe5, 0x80], vec![0, 0, 0], vec![0x56, 0xe5]] {
+        let mut bad = track.clone();
+        bad.config = vec![0x11, 0x90];
+        bad.config.extend(tail);
+        assert!(Muxer::new(&[bad]).is_err());
+    }
+}
+
+#[test]
+fn negative_composition_offset_is_explicitly_preserved_in_pes() {
+    let sample = Frame {
+        pts_offset: -3600,
+        ..frame(
+            1,
+            90000,
+            include_bytes!("fixtures/codecs/hevc-00.bin").to_vec(),
+        )
+    };
+    let bytes = write_mux(&[video()], &[sample]);
+    let packet = bytes
+        .chunks_exact(188)
+        .find(|p| p[1] & 0x40 != 0 && p[1] & 31 == 1 && p[2] == 0)
+        .unwrap();
+    let start = if packet[3] & 0x20 != 0 {
+        5 + usize::from(packet[4])
+    } else {
+        4
+    };
+    let pes = &packet[start..];
+    assert_eq!(&pes[..4], &[0, 0, 1, 0xe0]);
+    let decode = |b: &[u8]| {
+        (u64::from((b[0] >> 1) & 7) << 30)
+            | (u64::from(b[1]) << 22)
+            | (u64::from(b[2] >> 1) << 15)
+            | (u64::from(b[3]) << 7)
+            | u64::from(b[4] >> 1)
+    };
+    assert_eq!(decode(&pes[9..14]), 86400);
+    assert_eq!(decode(&pes[14..19]), 90000);
+}

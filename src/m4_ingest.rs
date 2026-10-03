@@ -1,7 +1,8 @@
 //! Independent M4 HTTP ingest. Native peer credentials never follow redirects.
 use crate::{
-    m4s::{Decoder, Event, PackedGop, Track, flv_config, flv_frame, flv_header},
+    m4s::{Decoder, Event, PackedGop, Track},
     wire::{Hub, Segment},
+    worker_ts::Muxer,
 };
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
@@ -71,57 +72,39 @@ impl Signals {
 async fn configs(
     stdin: &mut tokio::process::ChildStdin,
     tracks: &mut Vec<Track>,
+    muxer: &mut Option<Muxer>,
     new: Vec<Track>,
 ) -> Result<(), String> {
-    validate_bridge(&new)?;
-    if *tracks != new {
-        for t in &new {
-            stdin
-                .write_all(&flv_config(t)?)
-                .await
-                .map_err(|_| "media pipe closed")?;
+    if muxer.is_some() {
+        if *tracks != new {
+            return Err("native metadata changed; worker restart required".into());
         }
-        *tracks = new;
+        return Ok(());
     }
+    let mut next = Muxer::new(&new)?;
+    stdin
+        .write_all(&next.tables())
+        .await
+        .map_err(|_| "media pipe closed")?;
+    *tracks = new;
+    *muxer = Some(next);
     Ok(())
 }
-/// The current FLV worker accepts exactly one AVC video and one AAC audio.
-/// Native wire capacity is deliberately wider than this adapter.
+/// Validate the bounded native-to-MPEG-TS worker representation.
 pub fn validate_bridge(tracks: &[Track]) -> Result<(), String> {
-    crate::m4s::validate_tracks(tracks)?;
-    let mut audio = 0;
-    for track in tracks {
-        match track.kind()? {
-            crate::codec::Codec::H264 => (),
-            crate::codec::Codec::Aac => audio += 1,
-            _ => return Err("codec requires the pending generalized worker bridge".into()),
-        }
-    }
-    if audio > 1 {
-        return Err("multiple audio tracks require the pending generalized worker bridge".into());
-    }
-    Ok(())
+    Muxer::new(tracks).map(|_| ())
 }
 async fn write_frame(
     stdin: &mut tokio::process::ChildStdin,
-    tracks: &[Track],
-    origin: &mut Option<u64>,
+    muxer: &mut Option<Muxer>,
     frame: &crate::m4f::Frame,
 ) -> Result<(), String> {
-    let t = tracks
-        .iter()
-        .find(|t| t.id == frame.track_id)
-        .ok_or("unknown track")?;
-    let origin = *origin.get_or_insert(frame.dts);
+    let bytes = muxer
+        .as_mut()
+        .ok_or("native frame before metadata")?
+        .frame(frame)?;
     stdin
-        .write_all(&flv_frame(
-            t,
-            frame.dts,
-            frame.pts_offset,
-            frame.key,
-            &frame.body,
-            origin,
-        )?)
+        .write_all(&bytes)
         .await
         .map_err(|_| "media pipe closed".into())
 }
@@ -179,12 +162,8 @@ pub async fn pull(
     let mut decoder = Decoder::default();
     let mut signals = Signals::default();
     let mut tracks = Vec::new();
-    let mut origin = None;
+    let mut muxer = None;
     let mut seen: VecDeque<String> = VecDeque::new();
-    stdin
-        .write_all(&flv_header())
-        .await
-        .map_err(|_| "media pipe closed")?;
     loop {
         let bytes = tokio::time::timeout(Duration::from_secs(15), stream.next())
             .await
@@ -217,9 +196,12 @@ pub async fn pull(
                 }
                 let body = body.freeze();
                 let (new, frames) = crate::m4f::unpack(&body)?;
-                validate_bridge(&new)?;
                 if frames.is_empty() {
                     return Err("empty M4F segment".into());
+                }
+                configs(stdin, &mut tracks, &mut muxer, new.clone()).await?;
+                for f in &frames {
+                    write_frame(stdin, &mut muxer, f).await?;
                 }
                 if let Some(hub) = hub {
                     let gop = PackedGop {
@@ -239,10 +221,6 @@ pub async fn pull(
                         gop,
                     )?;
                 }
-                configs(stdin, &mut tracks, new).await?;
-                for f in &frames {
-                    write_frame(stdin, &tracks, &mut origin, f).await?;
-                }
                 seen.push_back(n.name);
                 if seen.len() > 16 {
                     seen.pop_front();
@@ -252,11 +230,10 @@ pub async fn pull(
             for event in decoder.push(&bytes)? {
                 match event {
                     Event::Info { tracks: new, wire } => {
-                        validate_bridge(&new)?;
+                        configs(stdin, &mut tracks, &mut muxer, new.clone()).await?;
                         if let Some(h) = hub {
                             h.relay_info(new.clone(), wire)?;
                         }
-                        configs(stdin, &mut tracks, new).await?;
                     }
                     Event::Frame {
                         track_id,
@@ -273,10 +250,10 @@ pub async fn pull(
                             key,
                             body,
                         };
+                        write_frame(stdin, &mut muxer, &f).await?;
                         if let Some(h) = hub {
                             h.relay_frame(f.clone(), wire)?;
                         }
-                        write_frame(stdin, &tracks, &mut origin, &f).await?;
                     }
                     Event::Gop {
                         gop,
@@ -284,13 +261,12 @@ pub async fn pull(
                         frames,
                         wire,
                     } => {
-                        validate_bridge(&new)?;
+                        configs(stdin, &mut tracks, &mut muxer, new.clone()).await?;
+                        for f in &frames {
+                            write_frame(stdin, &mut muxer, f).await?;
+                        }
                         if let Some(h) = hub {
                             h.relay_gop(gop, new.clone(), wire)?;
-                        }
-                        configs(stdin, &mut tracks, new).await?;
-                        for f in &frames {
-                            write_frame(stdin, &tracks, &mut origin, f).await?;
                         }
                     }
                     Event::Other { wire } => {

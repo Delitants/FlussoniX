@@ -415,11 +415,13 @@ fn native_metadata_bounds_ids_kinds_and_worker_bridge_fail_closed() {
         assert!(flussonix::m4s::flv_config(&track).is_err());
         assert!(flussonix::m4s::flv_frame(&track, 0, 0, true, &[1, 2, 3], 0).is_err());
     }
-    assert!(flussonix::m4_ingest::validate_bridge(&native_tracks()).is_err());
+    assert!(flussonix::m4_ingest::validate_bridge(&native_tracks()).is_ok());
     let baseline = Track {
         id: 1,
         codec: "h264".into(),
-        config: vec![1, 100, 0, 40],
+        config: vec![
+            1, 100, 0, 40, 255, 225, 0, 4, 103, 100, 0, 40, 1, 0, 2, 104, 0,
+        ],
     };
     assert!(flussonix::m4_ingest::validate_bridge(&[baseline]).is_ok());
     let audio = Track {
@@ -428,7 +430,7 @@ fn native_metadata_bounds_ids_kinds_and_worker_bridge_fail_closed() {
         config: vec![0x11, 0x90],
     };
     assert!(
-        flussonix::m4_ingest::validate_bridge(&[audio.clone(), Track { id: 3, ..audio }]).is_err()
+        flussonix::m4_ingest::validate_bridge(&[audio.clone(), Track { id: 3, ..audio }]).is_ok()
     );
 }
 

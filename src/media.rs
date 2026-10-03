@@ -285,7 +285,16 @@ impl Engine {
             ]);
             cmd.stdin(std::process::Stdio::piped());
         } else if m4s_input || m4f_input {
-            cmd.args(["-f", "flv", "-i", "pipe:0"]);
+            cmd.args([
+                "-probesize",
+                "1048576",
+                "-analyzeduration",
+                "1000000",
+                "-f",
+                "mpegts",
+                "-i",
+                "pipe:0",
+            ]);
             cmd.stdin(std::process::Stdio::piped());
         } else {
             let mut translated = if input.starts_with("rtsps://") {
@@ -332,7 +341,13 @@ impl Engine {
             "-map",
             "0:v:0?",
             "-map",
-            if synthetic { "1:a:0?" } else { "0:a:0?" },
+            if synthetic {
+                "1:a:0?"
+            } else if m4s_input || m4f_input {
+                "0:a?"
+            } else {
+                "0:a:0?"
+            },
         ]);
         if synthetic || cfg.get("transcoder").is_some() && cfg["transcoder"]["encoder"] != "copy" {
             let t = &cfg["transcoder"];
@@ -357,14 +372,20 @@ impl Engine {
             cmd.args(["-c", "copy"]);
             // The AAC RTP depacketizer can omit key flags. AAC-LC access
             // units are independently decodable; do not discard their copy.
-            if input.starts_with("rtsp://") || input.starts_with("rtsps://") {
+            if m4s_input
+                || m4f_input
+                || input.starts_with("rtsp://")
+                || input.starts_with("rtsps://")
+            {
                 cmd.arg("-copyinkf:a");
             }
         }
         // One encode/mux source feeds both HLS variants and shared live TS fan-out.
         let copy_publication = publication
             && (cfg.get("transcoder").is_none() || cfg["transcoder"]["encoder"] == "copy");
-        let wire_output = if copy_publication {
+        let native_copy = (m4s_input || m4f_input)
+            && (cfg.get("transcoder").is_none() || cfg["transcoder"]["encoder"] == "copy");
+        let wire_output = if copy_publication || native_copy {
             String::new()
         } else {
             format!(
@@ -376,8 +397,9 @@ impl Engine {
         } else {
             ""
         };
+        let fmp4_failure = if native_copy { "onfail=ignore:" } else { "" };
         let output = format!(
-            "[f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_filename={}:hls_flags=delete_segments+temp_file{discontinuity}]{}|[f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_type=fmp4:hls_segment_filename={}:hls_fmp4_init_filename=g{generation}_init.mp4:hls_flags=delete_segments+temp_file{discontinuity}{fmp4_filter}]{}|[f=mpegts]pipe:1{wire_output}",
+            "[f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_filename={}:hls_flags=delete_segments+temp_file{discontinuity}]{}|[{fmp4_failure}f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_type=fmp4:hls_segment_filename={}:hls_fmp4_init_filename=g{generation}_init.mp4:hls_flags=delete_segments+temp_file{discontinuity}{fmp4_filter}]{}|[f=mpegts]pipe:1{wire_output}",
             dir.join(format!("g{generation}_%d.ts")).display(),
             dir.join("index.m3u8").display(),
             dir.join("fmp4")

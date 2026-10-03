@@ -45,8 +45,11 @@ impl Muxer {
                 Codec::Hevc => Format::Hevc(crate::hevc::Configuration::parse(&t.config)?),
                 Codec::Aac => {
                     let c = &t.config;
-                    if c.len() != 2 || c[0] >> 3 != 2 {
-                        return Err("worker requires two-byte AAC-LC ASC".into());
+                    if !matches!(c.len(), 2 | 5)
+                        || c[0] >> 3 != 2
+                        || (c.len() == 5 && c[2..] != [0x56, 0xe5, 0])
+                    {
+                        return Err("worker requires AAC-LC ASC with optional disabled SBR".into());
                     }
                     let rate = ((c[0] & 7) << 1) | (c[1] >> 7);
                     let channels = (c[1] >> 3) & 15;
