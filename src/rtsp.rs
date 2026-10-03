@@ -1,5 +1,6 @@
 //! RTSP/1.0 live playback, TCP-interleaved H.264/AAC only.
 pub mod protocol;
+pub mod udp;
 use crate::{
     playback_auth::ViewerRequest,
     rtp::Receiver,

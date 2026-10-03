@@ -184,3 +184,72 @@ pub fn response(code: u16, cseq: u32, headers: &[(&str, String)], body: &[u8]) -
     bytes.extend(body);
     bytes
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientPorts {
+    pub rtp: u16,
+    pub rtcp: u16,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Offer {
+    Tcp(Transport),
+    Udp(ClientPorts),
+}
+impl ClientPorts {
+    pub fn valid(self) -> bool {
+        self.rtp >= 1024 && self.rtp % 2 == 0 && self.rtp.checked_add(1) == Some(self.rtcp)
+    }
+}
+impl Offer {
+    pub fn parse(value: &str) -> Result<Self, u16> {
+        let mut parts = value.split(';');
+        let protocol = parts.next().unwrap_or("").trim();
+        if protocol.eq_ignore_ascii_case("RTP/AVP/TCP") {
+            return Transport::parse(value).map(Self::Tcp);
+        }
+        if !["RTP/AVP", "RTP/AVP/UDP"]
+            .iter()
+            .any(|p| protocol.eq_ignore_ascii_case(p))
+        {
+            return Err(461);
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut ports = None;
+        let mut unicast = false;
+        for part in parts {
+            let (key, value) = part.trim().split_once('=').unwrap_or((part.trim(), ""));
+            let key = key.to_ascii_lowercase();
+            if !seen.insert(key.clone()) {
+                return Err(461);
+            }
+            match key.as_str() {
+                "unicast" if value.is_empty() => unicast = true,
+                "mode"
+                    if value.eq_ignore_ascii_case("PLAY")
+                        || value.eq_ignore_ascii_case("\"PLAY\"") => {}
+                "client_port" => {
+                    let (a, b) = value.split_once('-').ok_or(461u16)?;
+                    if a.is_empty()
+                        || b.is_empty()
+                        || !a.bytes().chain(b.bytes()).all(|c| c.is_ascii_digit())
+                    {
+                        return Err(461);
+                    }
+                    let p = ClientPorts {
+                        rtp: a.parse().map_err(|_| 461u16)?,
+                        rtcp: b.parse().map_err(|_| 461u16)?,
+                    };
+                    if !p.valid() {
+                        return Err(461);
+                    }
+                    ports = Some(p);
+                }
+                _ => return Err(461),
+            }
+        }
+        if !unicast {
+            return Err(461);
+        }
+        ports.map(Self::Udp).ok_or(461)
+    }
+}
