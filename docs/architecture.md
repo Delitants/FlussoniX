@@ -71,6 +71,8 @@ Proposed workspace boundaries:
 
 RTSP/RTSPS and RTP/SRTP are first-release requirements in both inbound and outbound directions. The [transport contract](rtsp-rtp-support.md) defines client/server roles, direct media flows, keying and reference-version boundaries. Use libsrtp for the SRTP/SRTCP adapter; control-session TLS and media protection remain explicit settings.
 
+The [secure-output and codec contract](secure-output-codecs.md) adds standalone HTTPS for all HTTP media/publication endpoints, verified secure cluster paths, HEVC/m2a/MP3 in native M4F/M4S and HEVC across eligible transports. Extend codec descriptions and the worker frame channel rather than treating every video track as AVC or every audio track as AAC. TLS shares application state and authorization with plaintext; it does not require official Flussonic components or an external terminator.
+
 ## Encoded media model
 
 Each stream owns a generation and a timeline. Each encoded access unit carries track identity, codec configuration revision, DTS, PTS, duration, keyframe status, rational timescale, payload reference and optional UTC association. Use checked integer arithmetic; avoid floating-point timestamp accumulation.

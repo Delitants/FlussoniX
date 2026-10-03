@@ -1,6 +1,6 @@
 # Implementation plan and release gates
 
-This document is the full-product roadmap. An executable v0.3 subset now exists; [qualification](qualification.md) records implemented behavior and actual results. The gates below remain requirements, and a partial preview does not satisfy the complete transport/API/mixed-vendor matrix.
+This document is the full-product roadmap. The v0.9 preview is executable; [qualification](qualification.md) records implemented behavior and actual results. The gates below remain requirements, and a partial preview does not satisfy the complete transport/API/mixed-vendor matrix. The next sequence is standalone HTTPS delivery, then HEVC/m2a/MP3 native transport and compatible output expansion under the [secure-output and codec contract](secure-output-codecs.md).
 
 ## Gate 0 — Establish executable contracts
 
@@ -22,6 +22,8 @@ Implement Streams/Templates CRUD, configuration validation, API credentials, que
 
 Implement HLS/HLSS and TSHTTP/TSHTTPS ingest, bounded encoded timeline, HLS/MPEG-TS playback, and SRT adapter. Implement RTSP/RTSPS client and server roles for inbound pull/publication and outbound playback/push, plus direct RTP/SRTP receive and transmit. Include on-demand start/idle shutdown, source failover, TLS, normal publish/push paths and requested URL aliases.
 
+Provide standalone HTTPS listeners for every HTTP media endpoint and publication handler. Reuse authorization and shared workers; validate TLS identity/trust on inputs and private pulls. Qualify secure public LB redirects separately from private media connections. Carry HEVC through every supported container/payload path without implicit video conversion; HEVC HLS uses a qualified fMP4 profile. The current RTSPS listener does not satisfy standalone HTTPS or SRTP requirements.
+
 Build shared RTP/RTCP packetization, SDP handling, UDP and TCP-interleaved transports, bounded jitter queues and sender-report clock mapping. Add libsrtp with provisioned-key and protected-SDES profiles; track DTLS-SRTP as a separately verified negotiation profile. RTSPS listener/client TLS and SRTP media protection have independent configuration and tests.
 
 Connect viewer/publisher auth, configured backend rules and IPTV authorization. Add session visibility and revocation. Implement the first Streams and Templates UI pages against working APIs.
@@ -32,6 +34,8 @@ Connect viewer/publisher auth, configured backend rules and IPTV authorization. 
 
 Implement receiving and serving/publishing roles, then source discovery, peers, source filters, credential behavior and balancing. Finish all four interoperability rows in the compatibility matrix.
 
+Extend native M4F/M4S beyond H.264/AAC to HEVC, m2a and MP3. Independently establish codec metadata/configuration and sample/GOP framing, then replace AVC/AAC-only worker, bootstrap and packetization assumptions. Qualify all required roles in plaintext and TLS, including audio-only streams, multiple audio tracks and original payload/timestamp preservation.
+
 Implement the user's LB → CDN → source-over-LAN flow, with separate public/private endpoints and reuse of fresh local streams. Add source discovery/candidate resolution, native uplink/CPU/RAM selection, per-edge admission reservations, stream-start coalescing, affinity, draining and source/CDN/LB failure handling. Keep the four reference balancing modes separately testable. See the [detailed cluster plan](cluster-loadbalancing.md).
 
 Native cluster coordination adds placement leases, explicit authority, fencing, health, routing and resource reservations. Build the Config and Cluster UI surfaces. Native consensus compatibility does not imply compatibility with legacy peer control messages.
@@ -41,6 +45,8 @@ Native cluster coordination adds placement leases, explicit authority, fencing, 
 ## Gate 4 — CPU/GPU transcoding
 
 Deliver the isolated codec-worker protocol, CPU pipelines, NVIDIA GPU backend, device inventory, admission control and failure recovery. Integrate video ladders, GOP alignment, audio conversion and volume controls with HLS/TSHTTP/M4F/M4S/SRT/RTSP/RTSPS/RTP/SRTP in both inbound and outbound pipelines.
+
+Expose explicit H.264/HEVC video profiles and independent audio copy/AAC/m2a/MP3 choices where supported. Test HEVC CPU encoding and a named GPU/driver profile; report unsupported hardware/container combinations accurately. Encoder availability alone does not qualify transport support.
 
 These capabilities are first-release requirements; Gate 4 is an implementation order, not a decision to defer transcoding beyond the first release. Additional GPU vendor support is hardware-gated.
 
@@ -75,6 +81,11 @@ Validate interoperability on every supported reference version. A future migrati
 | M4-01 | Mixed-node transport | Both directions, pull and push, plain and TLS |
 | M4-02 | Identity and clocks | Original segment hashes, ordering, track metadata, DTS/PTS/UTC |
 | M4-03 | Lifecycle | Late join, normal disconnect, codec change and restart |
+| M4-04 | HEVC/m2a/MP3 native codecs | Both directions/roles and TLS variants; audio-only, multitrack, original samples and DTS/PTS |
+| TLS-01 | Standalone HTTPS delivery/publication | All HTTP media routes, valid/invalid certificate cases, admission bounds, shutdown and no auth bypass |
+| TLS-02 | Secure cluster routing | Public HTTPS redirect without downgrade; private identity/CA verification; clean tickets and token revocation |
+| CODEC-01 | HEVC across eligible transports | Independent decode for each requested input/output role, container/payload and security mode |
+| CODEC-02 | MPEG audio integrity | Layer II/III metadata, frame duration, track changes, audio-only and A/V synchronization |
 | AUTH-01 | API credentials | Basic/Bearer and view/edit capabilities |
 | AUTH-02 | External decisions | Allow/deny/redirect, renewal, expiry, outage and parallel rules |
 | AUTH-03 | IPTV | Existing token/package/subscriber semantics and playlist access |
@@ -92,6 +103,7 @@ Validate interoperability on every supported reference version. A future migrati
 | LB-09 | Source directory | Updates, precedence, equivalent alternatives and loop prevention |
 | TC-01 | CPU | Audio/video output profiles, alignment, latency and A/V synchronization |
 | TC-02 | GPU | Named device/driver, real-time ladder, admission and recovery |
+| TC-03 | HEVC and independent audio profiles | Explicit CPU/GPU HEVC, audio copy/conversion, truthful capability errors and template inheritance |
 | UI-01 | Required screens | Streams/Templates/Config/Cluster with accurate persisted/runtime state |
 | PERF-01 | Fan-out | Throughput, CPU/Gbit/s, RAM, connection count, queue delays and TLS overhead |
 | PERF-02 | Sustained load | Provisional 24-hour soak, no growth after warm-up and quantified reconnect gaps |

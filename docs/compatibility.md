@@ -63,6 +63,8 @@ RTSP/RTSPS and RTP/SRTP support is mandatory in **both directions**. See the [de
 
 HLSS and TSHTTPS are the secure scheme variants in Flussonic configuration. End-user HTTPS delivery uses ordinary HTTPS URLs. The installed schema also recognizes selected HTTP/HTTPS aliases, SRT1/SRT2 aliases and HLS2 variants; implement those required by the profile, with explicit reporting for any deferred variant.
 
+Standalone secure output is mandatory: the daemon must serve HLS, MPEG-TS, M4F and M4S over TLS, with the same authorization as plaintext, secure public redirects and independently verified private source connections. M4F/M4S must support HEVC, MPEG audio Layer II (`m2a`) and MP3 in both directions; HEVC is required across all other requested inputs/outputs that support it. See the [secure-output and codec contract](secure-output-codecs.md) for the implementation boundaries and acceptance matrix. These requirements extend beyond the current H.264/AAC preview.
+
 M4F and M4S are **not equivalent to generic fMP4 packaging or a .m4s filename extension**. A standards-only HLS/DASH implementation cannot satisfy inter-server compatibility.
 
 HLS input fetches require bounded playlist/segment state, live sliding-window handling, discontinuities, changing init data, multitrack/variant selection and relative URL resolution. Distinguish HLS encryption from authentication; encrypted input support is a separately recorded capability. First playback paths include `index.m3u8`, `index.ts.m3u8`, `index.fmp4.m3u8` and track playlists; LL-HLS is an explicit extension rather than an implied promise.
@@ -104,7 +106,7 @@ For each M4F and M4S secure/plain variant, exercise:
 | FlussoniX | FlussoniX | Native transfer plus restart and failover |
 | Flussonic → FlussoniX → Flussonic | Chained relay | Preserved identity/timing where pass-through requires it |
 
-Use controlled streams in a separate lab. Cover audio-only/video-only, H.264/H.265/AAC, B-frames, multiple audio tracks, codec revisions, discontinuities, TLS, normal rejection, intentional source outage, reconnect and late join. The supplied demo is not the place to run load, mutation or failover tests.
+Use controlled streams in a separate lab. Cover audio-only/video-only, H.264 and HEVC paired with AAC, m2a and MP3, B-frames, multiple audio tracks, codec revisions, discontinuities, TLS, normal rejection, intentional source outage, reconnect and late join. The supplied demo is not the place to run load, mutation or failover tests.
 
 Compare transport bytes for unchanged relayed segments; compare track/frame/timestamp semantics after legitimate container conversion; compare codec settings and decoded quality after transcoding. Full native DVR archive writing/reading is a separate compatibility dimension.
 
