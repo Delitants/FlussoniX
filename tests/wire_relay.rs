@@ -58,10 +58,10 @@ async fn waiting_receiver_wakes_after_send_without_losing_notification() {
 #[tokio::test]
 async fn original_records_and_segments_are_preserved_and_cached_before_signal() {
     let h = Hub::new();
-    let info = Bytes::from(encode_info(&tracks()));
-    h.relay_info(tracks(), info.clone());
+    let info = Bytes::from(encode_info(&tracks()).unwrap());
+    h.relay_info(tracks(), info.clone()).unwrap();
     let f = frame(true, 900000000);
-    let wire = Bytes::from(encode_frame(&tracks()[0], &f));
+    let wire = Bytes::from(encode_frame(&tracks()[0], &f).unwrap());
     h.relay_frame(f, wire.clone()).unwrap();
     let (boot, _) = h.m4s_subscribe();
     assert_eq!(boot, vec![info.clone(), wire.clone()]);
@@ -124,14 +124,18 @@ async fn original_records_and_segments_are_preserved_and_cached_before_signal() 
 #[test]
 fn new_codec_information_discards_old_keyframe_bootstrap() {
     let h = Hub::new();
-    h.relay_info(tracks(), Bytes::from(encode_info(&tracks())));
-    let f = frame(true, 90000);
-    h.relay_frame(f.clone(), Bytes::from(encode_frame(&tracks()[0], &f)))
+    h.relay_info(tracks(), Bytes::from(encode_info(&tracks()).unwrap()))
         .unwrap();
+    let f = frame(true, 90000);
+    h.relay_frame(
+        f.clone(),
+        Bytes::from(encode_frame(&tracks()[0], &f).unwrap()),
+    )
+    .unwrap();
     let mut new = tracks();
     new[0].config = vec![1, 77, 0, 30];
-    let info = Bytes::from(encode_info(&new));
-    h.relay_info(new, info.clone());
+    let info = Bytes::from(encode_info(&new).unwrap());
+    h.relay_info(new, info.clone()).unwrap();
     assert_eq!(h.m4s_subscribe().0, vec![info]);
 }
 
@@ -163,21 +167,24 @@ fn signal_parser_bounds_partial_lines_and_preserves_exact_notification() {
 #[test]
 fn bootstrap_overflow_waits_for_a_new_video_keyframe() {
     let h = Hub::new();
-    let info = Bytes::from(encode_info(&tracks()));
-    h.relay_info(tracks(), info.clone());
+    let info = Bytes::from(encode_info(&tracks()).unwrap());
+    h.relay_info(tracks(), info.clone()).unwrap();
     for i in 0..4 {
         let mut f = frame(i == 0, 90000 + i * 3600);
         f.body = vec![0; 9 * 1024 * 1024];
-        let wire = Bytes::from(encode_frame(&tracks()[0], &f));
+        let wire = Bytes::from(encode_frame(&tracks()[0], &f).unwrap());
         h.relay_frame(f, wire).unwrap();
     }
     assert_eq!(h.m4s_subscribe().0, vec![info.clone()]);
     let f = frame(false, 110000);
-    h.relay_frame(f.clone(), Bytes::from(encode_frame(&tracks()[0], &f)))
-        .unwrap();
+    h.relay_frame(
+        f.clone(),
+        Bytes::from(encode_frame(&tracks()[0], &f).unwrap()),
+    )
+    .unwrap();
     assert_eq!(h.m4s_subscribe().0, vec![info.clone()]);
     let f = frame(true, 180000);
-    let wire = Bytes::from(encode_frame(&tracks()[0], &f));
+    let wire = Bytes::from(encode_frame(&tracks()[0], &f).unwrap());
     h.relay_frame(f, wire.clone()).unwrap();
     assert_eq!(h.m4s_subscribe().0, vec![info, wire]);
 }
@@ -185,9 +192,9 @@ fn bootstrap_overflow_waits_for_a_new_video_keyframe() {
 #[test]
 fn repeated_identical_metadata_preserves_a_decodable_bootstrap() {
     let h = Hub::new();
-    h.info(tracks());
+    h.info(tracks()).unwrap();
     h.frame(frame(true, 0)).unwrap();
-    h.info(tracks());
+    h.info(tracks()).unwrap();
     h.frame(frame(false, 3600)).unwrap();
     let mut d = Decoder::default();
     let keys: Vec<_> = h
@@ -207,7 +214,7 @@ fn repeated_identical_metadata_preserves_a_decodable_bootstrap() {
 }
 
 fn overflow(h: &Hub) {
-    h.info(tracks());
+    h.info(tracks()).unwrap();
     for i in 0..4 {
         let mut f = frame(i == 0, i * 3600);
         f.body = vec![0; 9 * 1024 * 1024];

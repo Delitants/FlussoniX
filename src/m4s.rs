@@ -1,5 +1,6 @@
 //! Independent decoder for the observed M4S length-prefixed media records.
 //! Supports observed AVC/AAC MDin, FRam and packed Fgop records.
+use crate::codec::Codec;
 use crate::m4f::Frame;
 use bytes::{Buf, Bytes, BytesMut};
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7,6 +8,53 @@ pub struct Track {
     pub id: u32,
     pub codec: String,
     pub config: Vec<u8>,
+}
+impl Track {
+    pub fn kind(&self) -> Result<Codec, String> {
+        Codec::parse(&self.codec)
+    }
+}
+pub fn validate_tracks(tracks: &[Track]) -> Result<(), String> {
+    if tracks.is_empty() || tracks.len() > 16 {
+        return Err("invalid native track count".into());
+    }
+    let mut ids = std::collections::HashSet::new();
+    let mut videos = 0;
+    for t in tracks {
+        let codec = t.kind()?;
+        videos += usize::from(codec.is_video());
+        if !ids.insert(t.id) || videos > 1 || t.config.len() > 1024 * 1024 {
+            return Err("invalid native tracks/configuration".into());
+        }
+        if t.config.is_empty() && !matches!(codec, Codec::M2a | Codec::Mp3 | Codec::Hevc) {
+            return Err("missing native codec configuration".into());
+        }
+    }
+    Ok(())
+}
+pub(crate) fn decode_track(fields: &[BoxView<'_>]) -> Result<Track, String> {
+    let h = required(fields, b"hdlr")?;
+    if h.len() < 16 || h.last() != Some(&0) {
+        return Err("invalid native track handler".into());
+    }
+    let codec = std::str::from_utf8(&h[12..h.len() - 1])
+        .map_err(|_| "invalid native codec name")?
+        .to_owned();
+    let kind = Codec::parse(&codec)?;
+    if &h[8..12] != if kind.is_video() { b"vide" } else { b"soun" } {
+        return Err("native handler/codec kind mismatch".into());
+    }
+    let config = required(fields, b"cnfg")?
+        .get(4..)
+        .ok_or("short codec configuration")?;
+    if config.len() > 1024 * 1024 {
+        return Err("native codec configuration exceeds limit".into());
+    }
+    Ok(Track {
+        id: u32::from_be_bytes(h[4..8].try_into().unwrap()),
+        codec,
+        config: config.to_vec(),
+    })
 }
 #[derive(Debug, Clone)]
 pub struct PackedGop {
@@ -43,6 +91,7 @@ pub enum Event {
 #[derive(Default)]
 pub struct Decoder {
     buffer: BytesMut,
+    tracks: Vec<Track>,
 }
 impl Decoder {
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<Event>, String> {
@@ -74,36 +123,13 @@ impl Decoder {
                             continue;
                         }
                         let fields = boxes(body)?;
-                        let h = find(&fields, b"hdlr").ok_or("missing track handler")?;
-                        if h.len() < 16 {
-                            return Err("short track handler".into());
+                        if tracks.len() >= 16 {
+                            return Err("too many M4S tracks".into());
                         }
-                        let id = u32::from_be_bytes(h[4..8].try_into().unwrap());
-                        let codec = String::from_utf8_lossy(&h[12..])
-                            .trim_end_matches('\0')
-                            .to_string();
-                        if !["h264", "aac"].contains(&codec.as_str()) {
-                            return Err(format!("unsupported M4S codec: {codec}"));
-                        }
-                        let config = find(&fields, b"cnfg").ok_or("missing codec configuration")?;
-                        if config.len() < 5 {
-                            return Err("short codec configuration".into());
-                        }
-                        if tracks.len() >= 2
-                            || tracks.iter().any(|t: &Track| t.id == id)
-                            || config.len() > 1024 * 1024
-                        {
-                            return Err("invalid or excessive M4S tracks/configuration".into());
-                        }
-                        tracks.push(Track {
-                            id,
-                            codec,
-                            config: config[4..].to_vec(),
-                        });
+                        tracks.push(decode_track(&fields)?);
                     }
-                    if tracks.is_empty() {
-                        return Err("M4S media information has no supported tracks".into());
-                    }
+                    validate_tracks(&tracks)?;
+                    self.tracks = tracks.clone();
                     Event::Info { tracks, wire }
                 }
                 b"FRam" => {
@@ -113,6 +139,21 @@ impl Decoder {
                         return Err("short frame header".into());
                     }
                     let track_id = u32::from_be_bytes(h[..4].try_into().unwrap());
+                    let name = if h[8] == b' ' { &h[9..12] } else { &h[8..12] };
+                    let codec = Codec::parse(
+                        std::str::from_utf8(name).map_err(|_| "invalid native frame codec")?,
+                    )?;
+                    if h[4] != if codec.is_video() { 1 } else { 2 } || !matches!(h[5], 2 | 3) {
+                        return Err("native frame codec/kind mismatch".into());
+                    }
+                    if !self.tracks.is_empty()
+                        && !self
+                            .tracks
+                            .iter()
+                            .any(|t| t.id == track_id && t.kind() == Ok(codec))
+                    {
+                        return Err("native frame does not match advertised track".into());
+                    }
                     let dts = u64::from_be_bytes(h[12..20].try_into().unwrap());
                     let pts_offset = i64::from_be_bytes(h[20..28].try_into().unwrap());
                     let key = h[5] == 2;
@@ -146,6 +187,7 @@ impl Decoder {
                     }
                     let payload = required(&fields, b"body")?;
                     let (tracks, frames) = crate::m4f::unpack(payload)?;
+                    self.tracks = tracks.clone();
                     if frames.is_empty() {
                         return Err("empty M4S GOP".into());
                     }
@@ -218,6 +260,9 @@ pub fn flv_tag(kind: u8, timestamp: u32, data: &[u8]) -> Result<Vec<u8>, String>
     Ok(b)
 }
 pub fn flv_config(track: &Track) -> Result<Vec<u8>, String> {
+    if !matches!(track.kind()?, Codec::H264 | Codec::Aac) {
+        return Err("codec requires the pending generalized worker bridge".into());
+    }
     let mut body = if track.codec == "h264" {
         vec![0x17, 0, 0, 0, 0]
     } else {
@@ -234,6 +279,9 @@ pub fn flv_frame(
     body: &[u8],
     origin: u64,
 ) -> Result<Vec<u8>, String> {
+    if !matches!(track.kind()?, Codec::H264 | Codec::Aac) {
+        return Err("codec requires the pending generalized worker bridge".into());
+    }
     let ts = (dts.saturating_sub(origin) / 90).min(u32::MAX as u64) as u32;
     let mut b = if track.codec == "h264" {
         let cts = offset / 90;

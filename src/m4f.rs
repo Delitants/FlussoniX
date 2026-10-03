@@ -1,5 +1,8 @@
 //! Independent AVC/AAC M4F sample-table adapter. No vendor runtime dependency.
-use crate::m4s::{Track, atom, boxes};
+use crate::{
+    codec::Codec,
+    m4s::{Track, atom, boxes, decode_track, validate_tracks},
+};
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub track_id: u32,
@@ -34,8 +37,15 @@ fn read64(b: &[u8], at: usize) -> Result<u64, String> {
     ))
 }
 pub fn pack(tracks: &[Track], frames: &[Frame], duration: u64) -> Result<Vec<u8>, String> {
+    validate_tracks(tracks)?;
     if frames.is_empty() || frames.len() > 100000 {
         return Err("invalid M4F sample count".into());
+    }
+    if frames
+        .iter()
+        .any(|f| !tracks.iter().any(|t| t.id == f.track_id))
+    {
+        return Err("sample has unknown native track".into());
     }
     let start = frames.iter().map(|f| f.dts).min().unwrap();
     let mut segm = vec![0; 4];
@@ -45,15 +55,16 @@ pub fn pack(tracks: &[Track], frames: &[Frame], duration: u64) -> Result<Vec<u8>
     let mut moov = atom(b"segm", &segm);
     let mut payload = Vec::new();
     for track in tracks {
-        if !["h264", "aac"].contains(&track.codec.as_str()) {
-            return Err("unsupported M4F codec".into());
-        }
+        let kind = track.kind()?;
         let samples = frames
             .iter()
             .filter(|f| f.track_id == track.id)
             .collect::<Vec<_>>();
         if samples.is_empty() {
             continue;
+        }
+        if samples.windows(2).any(|pair| pair[1].dts < pair[0].dts) {
+            return Err("native track DTS goes backwards".into());
         }
         let shift =
             i32::try_from(samples[0].dts - start).map_err(|_| "track offset exceeds limit")?;
@@ -64,11 +75,9 @@ pub fn pack(tracks: &[Track], frames: &[Frame], duration: u64) -> Result<Vec<u8>
         let mut t = atom(b"shft", &shft);
         let mut handler = vec![0; 4];
         handler.extend_from_slice(&track.id.to_be_bytes());
-        handler.extend_from_slice(if track.codec == "h264" {
-            b"videh264\0"
-        } else {
-            b"sounaac\0"
-        });
+        handler.extend_from_slice(if kind.is_video() { b"vide" } else { b"soun" });
+        handler.extend_from_slice(track.codec.as_bytes());
+        handler.push(0);
         t.extend(atom(b"hdlr", &handler));
         t.extend(atom(b"cnfg", &[vec![0; 4], track.config.clone()].concat()));
         t.extend(atom(
@@ -93,16 +102,25 @@ pub fn pack(tracks: &[Track], frames: &[Frame], duration: u64) -> Result<Vec<u8>
             .into_iter()
             .flat_map(u32b)
             .collect::<Vec<_>>();
-        let mut ctts = [0x01000000u32, samples.len() as u32]
+        // Native M4F uses signed offsets in a version-zero table. Its
+        // reference decoder ignores ISO-BMFF's signed version-one table.
+        let mut ctts = [0u32, samples.len() as u32]
             .into_iter()
             .flat_map(u32b)
             .collect::<Vec<_>>();
         let mut keys = Vec::new();
         for (i, s) in samples.iter().enumerate() {
+            let last_duration = match kind {
+                Codec::M2a | Codec::Mp3 => {
+                    u64::from(crate::mpeg_audio::inspect(kind, &s.body)?.duration_90k())
+                }
+                Codec::H264 | Codec::Hevc => 3600,
+                Codec::Aac => 1920,
+            };
             let delta = samples
                 .get(i + 1)
                 .map(|next| next.dts.saturating_sub(s.dts))
-                .unwrap_or(if track.codec == "h264" { 3600 } else { 1920 });
+                .unwrap_or(last_duration);
             stts.extend_from_slice(&1u32.to_be_bytes());
             stts.extend_from_slice(&(delta as u32).to_be_bytes());
             stsz.extend_from_slice(&(s.body.len() as u32).to_be_bytes());
@@ -184,24 +202,17 @@ pub fn unpack(data: &[u8]) -> Result<(Vec<Track>, Vec<Frame>), String> {
         if *k != b"trak" {
             continue;
         }
-        if tracks.len() >= 2 {
-            return Err("M4F supports at most two AVC/AAC tracks".into());
+        if tracks.len() >= 16 {
+            return Err("too many M4F tracks".into());
         }
         let fields = boxes(body)?;
-        let h = field(&fields, b"hdlr")?;
-        let id = read32(h, 4)?;
+        let track = decode_track(&fields)?;
+        let id = track.id;
         if !ids.insert(id) {
             return Err("duplicate M4F track id".into());
         }
-        let codec = String::from_utf8_lossy(h.get(12..).ok_or("short handler")?)
-            .trim_end_matches('\0')
-            .to_owned();
-        if !["h264", "aac"].contains(&codec.as_str()) {
-            return Err("unsupported M4F codec".into());
-        }
-        let cnfg = field(&fields, b"cnfg")?;
-        let config = cnfg.get(4..).ok_or("short configuration")?.to_vec();
-        tracks.push(Track { id, codec, config });
+        let kind = track.kind()?;
+        tracks.push(track);
         let shft = field(&fields, b"shft")?;
         let track_scale = read32(shft, 4)? as u64;
         if track_scale == 0 {
@@ -237,7 +248,10 @@ pub fn unpack(data: &[u8]) -> Result<(Vec<Track>, Vec<Frame>), String> {
             return Err("duration count mismatch".into());
         }
         let compositions = if let Ok(c) = field(&fields, b"ctts") {
-            runs(c, *c.first().ok_or("short composition table")? == 1, count)?
+            if !matches!(c.first(), Some(0 | 1)) {
+                return Err("unsupported native composition version".into());
+            }
+            runs(c, true, count)?
         } else {
             vec![0; count]
         };
@@ -275,7 +289,7 @@ pub fn unpack(data: &[u8]) -> Result<(Vec<Track>, Vec<Frame>), String> {
                 track_id: id,
                 dts: u64::try_from(dts).map_err(|_| "negative timestamp")?,
                 pts_offset: compositions[i] * 90000 / track_scale as i64,
-                key: tracks.last().unwrap().codec == "aac" || key_samples.contains(&(i + 1)),
+                key: !kind.is_video() || key_samples.contains(&(i + 1)),
                 body,
             });
             offset = end;
@@ -285,8 +299,6 @@ pub fn unpack(data: &[u8]) -> Result<(Vec<Track>, Vec<Frame>), String> {
         }
     }
     frames.sort_by_key(|f| f.dts);
-    if tracks.is_empty() {
-        return Err("no supported M4F tracks".into());
-    }
+    validate_tracks(&tracks)?;
     Ok((tracks, frames))
 }

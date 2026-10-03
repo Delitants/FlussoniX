@@ -1,7 +1,7 @@
 //! Shared bounded M4S frame fan-out and M4F live segment window.
 use crate::{
     m4f::{Frame, pack},
-    m4s::{PackedGop, Track, atom, encode_gop},
+    m4s::{PackedGop, Track, atom, encode_gop, validate_tracks},
     media_queue::{Channel, Receiver},
 };
 use bytes::{Buf, Bytes, BytesMut};
@@ -60,11 +60,15 @@ impl Hub {
             }),
         }
     }
-    pub fn info(&self, tracks: Vec<Track>) {
-        let wire = Bytes::from(encode_info(&tracks));
+    pub fn info(&self, tracks: Vec<Track>) -> Result<(), String> {
+        let wire = Bytes::from(encode_info(&tracks)?);
         self.relay_info(tracks, wire)
     }
-    pub fn relay_info(&self, tracks: Vec<Track>, wire: Bytes) {
+    pub fn relay_info(&self, tracks: Vec<Track>, wire: Bytes) -> Result<(), String> {
+        validate_tracks(&tracks)?;
+        if wire.len() > 16 * 1024 * 1024 {
+            return Err("native metadata record exceeds queue limit".into());
+        }
         let mut s = self.state.lock().unwrap();
         self.rtp.configure(&tracks);
         let changed = s.tracks != tracks;
@@ -93,7 +97,7 @@ impl Hub {
             s.bootstrap_bytes = wire.len();
             s.bootstrap_ready = false;
         }
-        let _ = self.m4s.send(wire);
+        self.m4s.send(wire)
     }
     pub fn frame(&self, frame: Frame) -> Result<(), String> {
         let tracks = self.state.lock().unwrap().tracks.clone();
@@ -101,7 +105,7 @@ impl Hub {
             .iter()
             .find(|t| t.id == frame.track_id)
             .ok_or("unknown wire track")?;
-        let wire = Bytes::from(encode_frame(track, &frame));
+        let wire = Bytes::from(encode_frame(track, &frame)?);
         self.relay_frame(frame, wire)
     }
     pub fn relay_frame(&self, frame: Frame, wire: Bytes) -> Result<(), String> {
@@ -111,17 +115,28 @@ impl Hub {
             .iter()
             .find(|t| t.id == frame.track_id)
             .ok_or("unknown wire track")?
-            .codec
-            == "h264";
+            .kind()?
+            .is_video();
+        let has_video = s
+            .tracks
+            .iter()
+            .any(|t| t.kind().is_ok_and(|k| k.is_video()));
         self.rtp.frame(&frame);
         let origin = *s.origin.get_or_insert(frame.dts);
-        if video && frame.key {
+        let audio_boundary = !has_video
+            && (!s.segment_ready
+                || !s.bootstrap_ready
+                || s.frames
+                    .first()
+                    .is_some_and(|f| frame.dts.saturating_sub(f.dts) >= 180000));
+        if video && frame.key || audio_boundary {
             s.bootstrap = s.info.clone().into_iter().collect();
             s.bootstrap_bytes = s.bootstrap.iter().map(Bytes::len).sum();
             s.bootstrap_ready = true;
             if s.segment_ready
                 && !s.frames.is_empty()
-                && frame.dts.saturating_sub(s.frames[0].dts) >= 90000
+                && frame.dts.saturating_sub(s.frames[0].dts)
+                    >= if has_video { 90000 } else { 180000 }
             {
                 let start = s.frames.iter().map(|f| f.dts).min().unwrap();
                 let duration = frame
@@ -154,7 +169,7 @@ impl Hub {
             }
             s.segment_ready = true;
         }
-        if !s.tracks.iter().any(|t| t.codec == "h264") {
+        if !has_video {
             s.bootstrap_ready = true;
             s.segment_ready = true;
         }
@@ -229,6 +244,7 @@ impl Hub {
         tracks: Vec<Track>,
         wire: Bytes,
     ) -> Result<(), String> {
+        validate_tracks(&tracks)?;
         if segment.bytes.len() > 16 * 1024 * 1024
             || wire.len() > 16 * 1024 * 1024
             || segment.signal.len() > 8192
@@ -249,7 +265,7 @@ impl Hub {
         }
         if s.tracks != tracks {
             s.tracks = tracks;
-            s.info = Some(Bytes::from(encode_info(&s.tracks)));
+            s.info = Some(Bytes::from(encode_info(&s.tracks)?));
             s.frames.clear();
             s.frame_bytes = 0;
         }
@@ -293,16 +309,27 @@ impl Hub {
 fn packet(body: Vec<u8>) -> Vec<u8> {
     [(body.len() as u32).to_be_bytes().to_vec(), body].concat()
 }
-pub fn encode_info(tracks: &[Track]) -> Vec<u8> {
+pub fn encode_info(tracks: &[Track]) -> Result<Vec<u8>, String> {
+    validate_tracks(tracks)?;
+    let total = 12
+        + tracks
+            .iter()
+            .map(|t| 65 + t.codec.len() + t.config.len())
+            .sum::<usize>();
+    if total > 16 * 1024 * 1024 {
+        return Err("native metadata record exceeds queue limit".into());
+    }
     let mut body = Vec::new();
     for t in tracks {
         let mut handler = vec![0; 4];
         handler.extend_from_slice(&t.id.to_be_bytes());
-        handler.extend_from_slice(if t.codec == "h264" {
-            b"videh264\0"
+        handler.extend_from_slice(if t.kind()?.is_video() {
+            b"vide"
         } else {
-            b"sounaac\0"
+            b"soun"
         });
+        handler.extend_from_slice(t.codec.as_bytes());
+        handler.push(0);
         let mut shft = vec![0; 4];
         shft.extend_from_slice(&90000u32.to_be_bytes());
         shft.extend_from_slice(&0u64.to_be_bytes());
@@ -316,28 +343,31 @@ pub fn encode_info(tracks: &[Track]) -> Vec<u8> {
             .concat(),
         ));
     }
-    packet(atom(b"MDin", &body))
+    Ok(packet(atom(b"MDin", &body)))
 }
-pub fn encode_frame(track: &Track, frame: &Frame) -> Vec<u8> {
+pub fn encode_frame(track: &Track, frame: &Frame) -> Result<Vec<u8>, String> {
+    let kind = track.kind()?;
+    if track.id != frame.track_id {
+        return Err("native frame/track id mismatch".into());
+    }
+    if frame.body.len() > 16 * 1024 * 1024 - 60 {
+        return Err("native frame record exceeds queue limit".into());
+    }
     let mut h = frame.track_id.to_be_bytes().to_vec();
     h.extend_from_slice(&[
-        if track.codec == "h264" { 1 } else { 2 },
+        if kind.is_video() { 1 } else { 2 },
         if frame.key { 2 } else { 3 },
-        u8::from(frame.key && track.codec == "h264"),
+        u8::from(frame.key && kind.is_video()),
         0,
     ]);
-    h.extend_from_slice(if track.codec == "h264" {
-        b"h264"
-    } else {
-        b" aac"
-    });
+    h.extend_from_slice(&kind.tag());
     h.extend_from_slice(&frame.dts.to_be_bytes());
     h.extend_from_slice(&frame.pts_offset.to_be_bytes());
     h.extend_from_slice(&0u32.to_be_bytes());
-    packet(atom(
+    Ok(packet(atom(
         b"FRam",
         &[atom(b"fhdr", &h), atom(b"body", &frame.body)].concat(),
-    ))
+    )))
 }
 #[derive(Default)]
 pub struct FlvDecoder {
@@ -414,7 +444,7 @@ impl FlvDecoder {
                     || self.tracks.iter().any(|t| t.codec == "h264"))
                     && (self.expected & 4 == 0 || self.tracks.iter().any(|t| t.codec == "aac"));
                 if complete {
-                    hub.info(self.tracks.clone());
+                    hub.info(self.tracks.clone())?;
                     self.published = true;
                 }
             } else if self.published && !payload.is_empty() {

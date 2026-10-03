@@ -73,6 +73,7 @@ async fn configs(
     tracks: &mut Vec<Track>,
     new: Vec<Track>,
 ) -> Result<(), String> {
+    validate_bridge(&new)?;
     if *tracks != new {
         for t in &new {
             stdin
@@ -81,6 +82,23 @@ async fn configs(
                 .map_err(|_| "media pipe closed")?;
         }
         *tracks = new;
+    }
+    Ok(())
+}
+/// The current FLV worker accepts exactly one AVC video and one AAC audio.
+/// Native wire capacity is deliberately wider than this adapter.
+pub fn validate_bridge(tracks: &[Track]) -> Result<(), String> {
+    crate::m4s::validate_tracks(tracks)?;
+    let mut audio = 0;
+    for track in tracks {
+        match track.kind()? {
+            crate::codec::Codec::H264 => (),
+            crate::codec::Codec::Aac => audio += 1,
+            _ => return Err("codec requires the pending generalized worker bridge".into()),
+        }
+    }
+    if audio > 1 {
+        return Err("multiple audio tracks require the pending generalized worker bridge".into());
     }
     Ok(())
 }
@@ -199,6 +217,7 @@ pub async fn pull(
                 }
                 let body = body.freeze();
                 let (new, frames) = crate::m4f::unpack(&body)?;
+                validate_bridge(&new)?;
                 if frames.is_empty() {
                     return Err("empty M4F segment".into());
                 }
@@ -233,8 +252,9 @@ pub async fn pull(
             for event in decoder.push(&bytes)? {
                 match event {
                     Event::Info { tracks: new, wire } => {
+                        validate_bridge(&new)?;
                         if let Some(h) = hub {
-                            h.relay_info(new.clone(), wire)
+                            h.relay_info(new.clone(), wire)?;
                         }
                         configs(stdin, &mut tracks, new).await?;
                     }
@@ -264,6 +284,7 @@ pub async fn pull(
                         frames,
                         wire,
                     } => {
+                        validate_bridge(&new)?;
                         if let Some(h) = hub {
                             h.relay_gop(gop, new.clone(), wire)?;
                         }
