@@ -1,33 +1,88 @@
 //! Independent, bounded CEA-608 display state. Times are source video PTS (90 kHz).
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::VecDeque;
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+use std::collections::{BTreeMap, VecDeque};
+#[derive(Clone, Debug)]
 pub struct Service {
     pub channel: u8,
     pub language: String,
     pub name: String,
 }
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Row {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channel: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    service: Option<u8>,
+    language: String,
+    name: String,
+}
+impl<'de> Deserialize<'de> for Service {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let row = Row::deserialize(d)?;
+        let channel = match (row.channel, row.service) {
+            (Some(c), None) if (1..=4).contains(&c) => c,
+            (None, Some(s)) if (1..=63).contains(&s) => 64 + s,
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "choose channel 1..4 OR service 1..63",
+                ));
+            }
+        };
+        Ok(Self {
+            channel,
+            language: row.language,
+            name: row.name,
+        })
+    }
+}
+impl Serialize for Service {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        Row {
+            channel: (self.channel <= 4).then_some(self.channel),
+            service: if self.channel > 64 {
+                Some(self.channel - 64)
+            } else {
+                None
+            },
+            language: self.language.clone(),
+            name: self.name.clone(),
+        }
+        .serialize(s)
+    }
+}
+impl Service {
+    pub fn key(&self) -> String {
+        key(self.channel)
+    }
+}
+pub fn key(channel: u8) -> String {
+    if channel > 64 {
+        format!("s{}", channel - 64)
+    } else {
+        format!("cc{channel}")
+    }
+}
 pub fn configuration(cfg: &Value) -> Result<Vec<Service>, String> {
     let Some(rows) = cfg.get("flussonix_hls_captions") else {
         return Ok(vec![]);
     };
-    let services: Vec<Service> = serde_json::from_value(rows.clone())
-        .map_err(|_| "HLS captions require rows with channel, language and name")?;
+    let services: Vec<Service> = serde_json::from_value(rows.clone()).map_err(
+        |_| "HLS captions require rows with channel 1..4 OR service 1..63, language and name",
+    )?;
     if services.len() > 4 {
-        return Err("at most four HLS caption channels are supported".into());
+        return Err("at most four HLS caption renditions are supported".into());
     }
     let mut names = std::collections::HashSet::new();
-    let mut seen = 0u8;
+    let mut seen = std::collections::HashSet::new();
     for s in &services {
         if !names.insert(&s.name) {
             return Err("caption display names must be unique".into());
         }
-        if !(1..=4).contains(&s.channel) || seen & (1 << s.channel) != 0 {
-            return Err("caption channels must be distinct CC1..CC4".into());
+        if !seen.insert(s.channel) {
+            return Err("caption selectors must be distinct".into());
         }
-        seen |= 1 << s.channel;
         if !(2..=3).contains(&s.language.len())
             || !s.language.bytes().all(|b| b.is_ascii_lowercase())
         {
@@ -236,13 +291,22 @@ pub struct Decoder {
     channels: [Channel; 4],
     selected: [usize; 2],
     history: VecDeque<Cue>,
+    digital: crate::cea708::Decoder,
+    digital_open: BTreeMap<u8, Cue>,
     pub first_pts: Option<u64>,
     pub latest_pts: u64,
     pub error: Option<&'static str>,
 }
 impl Decoder {
     pub fn new(services: Vec<Service>) -> Self {
+        let digital = crate::cea708::Decoder::new(
+            services
+                .iter()
+                .filter_map(|s| (s.channel > 64).then_some(s.channel.wrapping_sub(64))),
+        );
         Self {
+            digital,
+            digital_open: BTreeMap::new(),
             services,
             channels: std::array::from_fn(|_| Channel::default()),
             selected: [0, 2],
@@ -252,7 +316,37 @@ impl Decoder {
             error: None,
         }
     }
+    fn digital_changes(&mut self, changes: Vec<crate::cea708::Change>) {
+        for change in changes {
+            let id = 64 + change.service;
+            if let Some(mut cue) = self.digital_open.remove(&id) {
+                cue.end = Some(change.pts.max(cue.start));
+                if cue.end != Some(cue.start) {
+                    self.history.push_back(cue);
+                }
+            }
+            if !change.text.is_empty() {
+                self.digital_open.insert(
+                    id,
+                    Cue {
+                        channel: id,
+                        start: change.pts,
+                        end: None,
+                        text: change.text,
+                    },
+                );
+            }
+        }
+        while self.history.len() > 4096 {
+            self.history.pop_front();
+        }
+        if self.digital.error.is_some() {
+            self.error = self.digital.error;
+        }
+    }
     pub fn observe(&mut self, pts: u64) {
+        let changes = self.digital.advance(pts);
+        self.digital_changes(changes);
         self.first_pts.get_or_insert(pts);
         self.latest_pts = self.latest_pts.max(pts);
         while self
@@ -264,6 +358,12 @@ impl Decoder {
         }
     }
     pub fn push(&mut self, field: u8, pair: [u8; 2], pts: u64) {
+        if field == 2 || field == 3 {
+            self.observe(pts);
+            let changes = self.digital.push(field, pair, pts);
+            self.digital_changes(changes);
+            return;
+        }
         if field > 1 || pair.iter().any(|b| b.count_ones() % 2 != 1) {
             return;
         }
@@ -315,6 +415,8 @@ impl Decoder {
         }
     }
     pub fn reset(&mut self, pts: u64) {
+        let changes = self.digital.reset(pts);
+        self.digital_changes(changes);
         for i in 0..4 {
             self.channels[i].visible = [[' '; 32]; 15];
             self.update(i, pts);
@@ -327,6 +429,7 @@ impl Decoder {
             .iter()
             .cloned()
             .chain(self.channels.iter().filter_map(|c| c.open.clone()))
+            .chain(self.digital_open.values().cloned())
             .collect()
     }
 }

@@ -356,7 +356,7 @@ fn sei(body: &[u8], hevc: bool) -> Result<Vec<Pair>, &'static str> {
                 }
                 {
                     for triple in payload[10..10 + 3 * count].chunks_exact(3) {
-                        if triple[0] & 4 != 0 && triple[0] & 3 < 2 {
+                        if triple[0] & 4 != 0 {
                             pairs.push((triple[0] & 3, [triple[1], triple[2]]));
                             if pairs.len() > 512 {
                                 return Err("caption_reorder_limit");

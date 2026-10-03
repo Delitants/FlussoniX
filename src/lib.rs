@@ -36,6 +36,7 @@ pub mod worker_ts;
 
 pub mod caption_transport;
 pub mod captions;
+mod cea708;
 
 pub mod caption_hls;
 
