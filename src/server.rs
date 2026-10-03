@@ -83,6 +83,7 @@ struct Resolved {
     revision: u64,
 }
 pub struct App {
+    http_delivery: std::sync::Mutex<Value>,
     pub config: ConfigStore,
     pub media: Engine,
     credentials: Credentials,
@@ -127,6 +128,9 @@ impl App {
             &options.peer_key,
         );
         let app = Arc::new(Self {
+            http_delivery: std::sync::Mutex::new(
+                json!({"http":null,"https":null,"https_only":false}),
+            ),
             config: ConfigStore::open(config)?,
             media: Engine::new(media, &options.ffmpeg),
             credentials,
@@ -151,6 +155,9 @@ impl App {
         });
         app.sample_metrics();
         Ok(app)
+    }
+    pub fn set_http_delivery(&self, http: Option<SocketAddr>, https: Option<SocketAddr>) {
+        *self.http_delivery.lock().unwrap() = json!({"http":http.map(|a|a.to_string()),"https":https.map(|a|a.to_string()),"https_only":http.is_none() && https.is_some()});
     }
     async fn media_config(&self, name: &str) -> Option<(Value, u64)> {
         let mirrors = self.mirrors.lock().await;
@@ -283,7 +290,7 @@ impl App {
         reservations.retain(|_, v| v.expires > Instant::now());
         let reserved = reservations.len() as u64;
         drop(reservations);
-        let node = json!({"name":self.options.node_name,"role":self.options.role,"uptime":self.started.elapsed().as_secs(),"streams":streams,"uplink_mbps":self.options.uplink_mbps,"active":self.active().await,"reserved":reserved,"limit":self.options.client_limit,"drain":self.options.drain});
+        let node = json!({"name":self.options.node_name,"role":self.options.role,"uptime":self.started.elapsed().as_secs(),"streams":streams,"uplink_mbps":self.options.uplink_mbps,"active":self.active().await,"reserved":reserved,"limit":self.options.client_limit,"drain":self.options.drain,"http_delivery":self.http_delivery.lock().unwrap().clone()});
         metrics
             .as_object_mut()
             .unwrap()
@@ -683,6 +690,7 @@ async fn balance(
     name: &str,
     path: &str,
     query: &HashMap<String, String>,
+    secure: bool,
 ) -> Response {
     let root = app.config.snapshot();
     let peers = root["peers"].as_array().cloned().unwrap_or_default();
@@ -692,6 +700,19 @@ async fn balance(
         let app = app.clone();
         let name = name.to_owned();
         async move {
+            if secure
+                && !p["public_payload_url"]
+                    .as_str()
+                    .and_then(|u| url::Url::parse(u).ok())
+                    .is_some_and(|u| {
+                        u.scheme() == "https"
+                            && u.host_str().is_some()
+                            && u.username().is_empty()
+                            && u.password().is_none()
+                    })
+            {
+                return None;
+            }
             let api = p["api_url"].as_str()?;
             let key = p["cluster_key"].as_str().unwrap_or(&app.options.peer_key);
             let r = app
@@ -801,6 +822,10 @@ async fn media_request(State(app): State<Arc<App>>, request: Request) -> Respons
     response
 }
 async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
+    let secure = request
+        .extensions()
+        .get::<crate::http_tls::SecureHttp>()
+        .is_some();
     if request.method() != "GET" {
         return error(StatusCode::METHOD_NOT_ALLOWED, "playback requires GET");
     }
@@ -893,6 +918,12 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             AuthOutcome::Allowed(g) => g,
             AuthOutcome::Denied => return error(StatusCode::FORBIDDEN, "playback denied"),
             AuthOutcome::Redirect(url) => {
+                if secure && !url::Url::parse(&url).is_ok_and(|u| u.scheme() == "https") {
+                    return error(
+                        StatusCode::FORBIDDEN,
+                        "secure playback redirect cannot downgrade",
+                    );
+                }
                 return (StatusCode::FOUND, [("location", url)]).into_response();
             }
         }
@@ -913,7 +944,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         return error(StatusCode::FORBIDDEN, "playback policy changed");
     }
     if app.options.role == "lb" {
-        return balance(&app, name, raw_path, &query).await;
+        return balance(&app, name, raw_path, &query, secure).await;
     }
     if let Some(ticket) = query.get("flussonix_ticket") {
         let mut reservations = app.reservations.lock().await;

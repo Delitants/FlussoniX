@@ -1,11 +1,22 @@
 use clap::Parser;
 use flussonix::server::{App, Options, router};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{future::IntoFuture, net::SocketAddr, path::PathBuf, time::Duration};
 #[derive(Parser)]
 #[command(name = "flussonix", version, about = "Independent live media server")]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:18210")]
     listen: SocketAddr,
+    /// Optional HTTPS listener for media, publication, APIs and admin.
+    #[arg(long, requires_all = ["https_cert", "https_key"])]
+    https_listen: Option<SocketAddr>,
+    #[arg(long, requires = "https_listen")]
+    https_cert: Option<PathBuf>,
+    #[arg(long, requires = "https_listen")]
+    https_key: Option<PathBuf>,
+    /// Disable plaintext HTTP binding; requires an HTTPS listener.
+    #[arg(long, requires = "https_listen")]
+    https_only: bool,
     /// Optional RTSP/1.0 TCP playback listener (disabled by default).
     #[arg(long)]
     rtsp_listen: Option<SocketAddr>,
@@ -60,6 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     let a = Args::parse();
     let udp_rate = a.rtsp_udp_mbps.unwrap_or(100.0);
+    let https_config = match (&a.https_cert, &a.https_key) {
+        (Some(cert), Some(key)) => Some(flussonix::rtsp::tls::server(cert, key)?),
+        _ => None,
+    };
     flussonix::rtsp::udp::Pacer::new(udp_rate)?;
     let tls_config = match (&a.rtsps_cert, &a.rtsps_key) {
         (Some(cert), Some(key)) => Some(flussonix::rtsp::tls::server(cert, key)?),
@@ -81,7 +96,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         drain: a.drain,
     };
     let app = App::new(a.config, a.media_dir, options)?;
-    let listener = tokio::net::TcpListener::bind(a.listen).await?;
+    let listener = if a.https_only {
+        None
+    } else {
+        Some(tokio::net::TcpListener::bind(a.listen).await?)
+    };
+    let https_listener = match a.https_listen {
+        Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
+        None => None,
+    };
     let rtsp_listener = match a.rtsp_listen {
         Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
         None => None,
@@ -96,9 +119,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => None,
     };
+    let http_address = listener.as_ref().map(|l| l.local_addr()).transpose()?;
+    let https_address = https_listener
+        .as_ref()
+        .map(|l| l.local_addr())
+        .transpose()?;
+    app.set_http_delivery(http_address, https_address);
     println!(
         "{}",
-        serde_json::json!({"service":"FlussoniX","listen":listener.local_addr()?.to_string(),"rtsp_listen":rtsp_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"rtsps_listen":tls_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"rtsp_udp_ports":a.rtsp_udp_ports.map(|p|p.to_string()),"rtsp_udp_mbps":a.rtsp_udp_ports.map(|_|udp_rate),"version":env!("CARGO_PKG_VERSION")})
+        serde_json::json!({"service":"FlussoniX","listen":http_address.map(|a|a.to_string()),"https_listen":https_address.map(|a|a.to_string()),"rtsp_listen":rtsp_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"rtsps_listen":tls_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"rtsp_udp_ports":a.rtsp_udp_ports.map(|p|p.to_string()),"rtsp_udp_mbps":a.rtsp_udp_ports.map(|_|udp_rate),"version":env!("CARGO_PKG_VERSION")})
     );
     app.reconcile().await;
     let background = app.clone();
@@ -143,17 +172,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::select! { _=telemetry_cancel.cancelled()=>break, _=interval.tick()=>telemetry_app.sample_metrics() }
         }
     });
-    let serving = axum::serve(
-        listener,
-        router(app.clone()).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(cancel.clone().cancelled_owned())
-    .into_future();
-    tokio::pin!(serving);
+    type Server = std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
+    let mut serving = FuturesUnordered::<Server>::new();
+    if let Some(listener) = listener {
+        serving.push(Box::pin(
+            axum::serve(
+                listener,
+                router(app.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(cancel.clone().cancelled_owned())
+            .into_future(),
+        ));
+    }
+    if let Some(listener) = https_listener {
+        serving.push(Box::pin(flussonix::http_tls::serve(
+            listener,
+            https_config.unwrap(),
+            app.clone(),
+            cancel.clone(),
+        )));
+    }
     let mut rtsp_result = None;
     let mut tls_result = None;
     let completed = tokio::select! {
-        result=&mut serving=>Some(result),
+        result=serving.next()=>result,
         result=async{match rtsp_task.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{rtsp_result=Some(result);None},
         result=async{match tls_task.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{tls_result=Some(result);None},
         _=shutdown()=>None
@@ -173,13 +215,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tls_result = Some(task.await);
         }
     }
+    let drain = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(result) = serving.next().await {
+            result?;
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
+    if let Ok(result) = drain {
+        result?;
+    } else {
+        tracing::warn!("connection drain exceeded five seconds");
+    }
     if let Some(result) = completed {
         result?;
-    } else if tokio::time::timeout(Duration::from_secs(5), &mut serving)
-        .await
-        .is_err()
-    {
-        tracing::warn!("connection drain exceeded five seconds");
     }
     if let Some(result) = rtsp_result {
         result??;

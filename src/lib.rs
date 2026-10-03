@@ -26,4 +26,5 @@ pub mod rtsp;
 
 pub mod tls_input;
 
+pub mod http_tls;
 pub mod publish;
