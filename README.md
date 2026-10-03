@@ -2,7 +2,7 @@
 
 An independently written Rust media server with a React admin interface and a Flussonic v3 API compatibility layer.
 
-**Status: v0.7 preview, for testing. It is not a complete Flussonic replacement or migration-ready release.**
+**Status: v0.8 preview, for testing. It is not a complete Flussonic replacement or migration-ready release.**
 
 This build implements persisted Streams/Templates configuration, authenticated management, playback authorization, CPU transcoding, shared stream workers, native source/CDN discovery and an adaptive HTTP redirect balancer. M4F and M4S have independent wire adapters for the qualified H.264/AAC subset. Generic fMP4 HLS remains a separate format.
 
@@ -11,13 +11,19 @@ This build implements persisted Streams/Templates configuration, authenticated m
 | Admin UI | Labeled forms for Streams, Templates, Config and Cluster; staged validation/apply; no JSON input required |
 | API | `/streamer/api/v3` subset; CRUD, partial updates, reset, inheritance, validation without applying, collection cursors |
 | Authentication | Separate edit/view credentials; Basic and legacy base64 Bearer; structured/string `on_play` callbacks; scheduled renewal, revocation and local limits across streams; separate peer key |
-| Input | HLS/HLSS, TSHTTP/TSHTTPS, M4S AVC/AAC frame and packed-GOP modes, M4F single-chunk AVC/AAC sample tables; FFmpeg RTSP pull and SRT receive adapters |
-| Output | HLS with TS or fMP4 segments, HTTP MPEG-TS, Original M4S frame/GOP relay, generated frame output; M4F signals with original or generated live segments; optional RTSP 1.0 TCP-interleaved or opt-in unicast UDP H.264/AAC-LC playback |
+| Input | HLS/HLSS, TSHTTP/TSHTTPS, M4S AVC/AAC frame and packed-GOP modes, M4F single-chunk AVC/AAC sample tables; RTSP pull, verified RTSPS TCP pull and SRT receive adapters |
+| Output | HLS with TS or fMP4 segments, HTTP MPEG-TS, Original M4S frame/GOP relay, generated frame output; M4F signals with original or generated live segments; optional RTSP 1.0 TCP-interleaved or opt-in unicast UDP H.264/AAC-LC playback; optional RTSPS TLS TCP playback |
 | Recovery | Startup/media watchdog, capped retries through ordered inputs, background local/CDN recovery, new HLS sequences/segment/init identities after restart |
 | Transcoding | One supervised FFmpeg worker per stream; CPU H.264/AAC; `h264_nvenc` configuration requires NVIDIA hardware and runtime |
 | Native cluster | Separate public/private endpoints, source discovery, explicit equivalent-origin failover, LAN pull, uplink/CPU/RAM selection, readiness, drain/stale exclusion, expiring capacity reservations |
 
-Required later work includes complete API/schema parity; Flussonic cluster discovery and credential compatibility; additional M4 codec/metadata modes; publisher authentication; RTSP publication/push and Basic/Digest viewer authentication; RTSPS, RTP/SRTP inbound and outbound; SRT output/push; HTTPS serving or reverse-proxy integration; full transcoder profiles, GPU qualification, DVR, distributed session ownership and complete failure/scale qualification. Unsupported saved options return errors. See [qualification](docs/qualification.md) for evidence and limits.
+Required later work includes complete API/schema parity; Flussonic cluster discovery and credential compatibility; additional M4 codec/metadata modes; publisher authentication; RTSP publication/push and Basic/Digest viewer authentication; RTSPS publication/push and SRTP-protected UDP; direct RTP/SRTP inbound and outbound; SRT output/push; HTTPS serving or reverse-proxy integration; full transcoder profiles, GPU qualification, DVR, distributed session ownership and complete failure/scale qualification. Unsupported saved options return errors. See [qualification](docs/qualification.md) for evidence and limits.
+
+## RTSPS preview
+
+Enable encrypted playback on an unused port using `--rtsps-listen 127.0.0.1:18555 --rtsps-cert /etc/flussonix/server-chain.pem --rtsps-key /etc/flussonix/server.key`. Certificates and keys must be readable by the service account. Certificate/key parsing and matching complete before any worker starts. Playback uses `rtsps://HOST:18555/STREAM?token=VIEWER_TOKEN` with the existing stream token/callback policy. TLS protects both control and TCP-interleaved RTP/RTCP; UDP SETUP is rejected. The plaintext listener stays separate and optional.
+
+For input, enter an `rtsps://` URL in the normal form. Set **Trusted CA file** to an absolute server-side PEM path for a private CA, or leave it empty for bundled public CAs. Certificate chain, validity and the original DNS/IP identity are always verified before any application data. Its API extension is per-input `flussonix_tls_ca`. The worker uses an owned loopback bridge after verification; no unverified FFmpeg reconnect or plaintext fallback occurs. The default RTSPS source port is 322. See [the exact profile and remaining directions](docs/rtsp-rtp-support.md).
 
 ## RTSP playback preview
 

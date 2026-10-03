@@ -1,6 +1,6 @@
 # RTSP/RTSPS and RTP/SRTP — inbound and outbound
 
-First-release requirement added by the user. Status: v0.7 implements TCP and opt-in unicast UDP playback below and exercises an independent FFmpeg RTSP pull roundtrip. The full direction matrix remains required; other cells are designed, not qualified.
+First-release requirement added by the user. Status: v0.8 adds encrypted RTSPS TCP playback and strictly verified RTSPS pull to v0.7 TCP and opt-in unicast UDP playback. The full direction matrix remains required; other cells are designed, not qualified.
 
 ## Direction matrix
 
@@ -86,3 +86,14 @@ Shared RTP records retain decode timestamps outside the unchanged wire bytes. Ea
 RTSP input defaults to TCP. The normal input form selects TCP or UDP; UDP is saved as `{"url":"rtsp://...","rtp":"udp"}` and inherited through templates. Changing the URL to another protocol clears the option. Independent FFmpeg UDP clients decode H.264 and AAC together; UDP input is repackaged to independently decoded HLS, and native M4S/M4F private CDN pulls feed UDP output without an additional encoder.
 
 RTSPS, direct RTP, SRTP, RTSP publication/push, multicast, Basic/Digest viewer authentication, RTSP LB redirects, retransmission and migration/large-scale performance qualification remain pending.
+
+
+## v0.8 encrypted TCP profile
+
+The optional RTSPS listener uses Rustls/ring TLS 1.2/1.3, with separate PEM chain/key CLI flags. Parsing, chain size (1..16 certificates), key matching and port binding complete before static worker startup. TLS handshakes consume the existing 256-connection-per-listener permits and expire after eight seconds. Cancellation interrupts the handshake and drains listener tasks. All existing RTSP framing, per-session channel/path/token binding, viewer authorization, revocation, media readiness, write deadlines and queue bounds apply. Authorization retains `proto=rtsp` for callback compatibility. No client certificate is required. UDP transport returns 461 on TLS; plaintext RTSPS URI requests are rejected. RTSP URI aliases inside an already encrypted connection support the input bridge.
+
+RTSPS input validates the actual forwarded TLS connection against bundled Mozilla roots or an explicitly configured replacement CA store. CA PEMs are absolute regular-file paths, bounded to 1 MiB and 128 certificates; malformed, missing, untrusted, expired and wrong-name certificates fail closed. Original DNS/IP identity supplies Rustls verification and SNI where applicable. Connect plus handshake expire after ten seconds, before any application request or credential is forwarded. A single-client loopback listener expires after eight seconds if no decoder arrives; fixed copy buffers apply backpressure. Its guard aborts on failed startup or dropped prepare, and worker shutdown aborts and joins the bridge. Input statistics retain `rtsps`, while total RTSP egress includes encrypted playback media.
+
+The independent FFmpeg decoder checks encrypted playback interoperability; its RTSP demuxer does not expose private TLS trust options through ordinary input CLI flags. Product input always performs verification in Rustls. Local owned tests use independent OpenSSL certificate generation and FFmpeg 7.1.1 (GnuTLS); peer versions are recorded separately in qualification. No official Flussonic runtime, codec library, asset or Erlang code is linked, copied or required.
+
+Qualified codec scope remains H.264 and AAC-LC. ANNOUNCE/RECORD/publication, push, Basic/Digest viewer authentication, separately encrypted UDP/SRTP, direct RTP/SRTP, RTSP LB redirection, exact vendor authority/digest dialects and scale/GPU/migration qualification remain open. URI authority-sensitive third-party servers may require a future adapter; successful local/source/CDN playback does not establish universal RTSPS dialect compatibility.

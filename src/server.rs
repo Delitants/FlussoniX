@@ -592,7 +592,7 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
     }
     if tail == "capabilities" && request.method() == "GET" {
         return json_response(
-            json!({"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","srt","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["hls","mpegts","fmp4-hls","rtsp (TCP / opt-in unicast UDP playback, H.264/AAC-LC)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["rtsps","direct rtp","srtp","rtsp publication / push","rtsp Basic / Digest viewer auth","dvr","push"],"transcoding":{"cpu":"libx264 / AAC","gpu":"h264_nvenc, requires supported NVIDIA hardware and runtime"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP redirects"}),
+            json!({"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","rtsps (verified TLS, interleaved TCP)","srt","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["hls","mpegts","fmp4-hls","rtsp (TCP / opt-in unicast UDP playback, H.264/AAC-LC)","rtsps (opt-in TLS TCP playback, H.264/AAC-LC)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["direct rtp","srtp","rtsp publication / push","rtsp Basic / Digest viewer auth","dvr","push"],"transcoding":{"cpu":"libx264 / AAC","gpu":"h264_nvenc, requires supported NVIDIA hardware and runtime"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP redirects"}),
         );
     }
     if let Some(name) = tail.strip_prefix("stream/") {
