@@ -150,3 +150,14 @@ test('RTSP input transport uses a friendly selector and clears UDP when changing
  state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].rtp).toBeUndefined();await expect(page.locator('textarea')).toHaveCount(0);
  await request.delete('/streamer/api/v3/streams/'+name,{headers});
 });
+
+
+test('RTSPS trust uses a friendly CA path field and clears it when changing protocol',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};const name='ui-rtsps-trust';
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,static:false,inputs:[{url:'rtsp://127.0.0.1:19990/camera'}]}})).ok()).toBeTruthy();
+ await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Input URL',{exact:true}).fill('rtsps://localhost:19990/camera');
+ const ca=page.getByLabel('Trusted CA file',{exact:true});await expect(ca).toBeVisible();await expect(page.getByLabel('RTSP transport',{exact:true})).toHaveCount(0);await ca.fill('relative.pem');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByText('Trusted CA file must be an absolute server path.',{exact:true})).toBeVisible();
+ await ca.fill(process.env.FLUSSONIX_TEST_CA_FILE!);await page.getByRole('button',{name:'Save',exact:true}).click();let state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_tls_ca).toBe(process.env.FLUSSONIX_TEST_CA_FILE);
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(ca).toHaveValue(process.env.FLUSSONIX_TEST_CA_FILE!);await ca.fill('');await page.getByRole('button',{name:'Save',exact:true}).click();state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_tls_ca).toBeUndefined();
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await ca.fill(process.env.FLUSSONIX_TEST_CA_FILE!);await page.getByLabel('Input URL',{exact:true}).fill('hls://example.net/camera/index.m3u8');await expect(ca).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_tls_ca).toBeUndefined();await expect(page.locator('textarea')).toHaveCount(0);await request.delete('/streamer/api/v3/streams/'+name,{headers});
+});

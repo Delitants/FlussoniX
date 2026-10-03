@@ -53,7 +53,7 @@ fn invalid_protocol_does_not_change_saved_config() {
             .put(
                 "streams",
                 "bad",
-                json!({"inputs":[{"url":"rtsps://example.net/news"}]})
+                json!({"inputs":[{"url":"unsupported://example.net/news"}]})
             )
             .is_err()
     );
@@ -380,3 +380,48 @@ fn rtsp_udp_input_option_is_validated_inherited_and_persisted() {
     let store = ConfigStore::open(path).unwrap();
     assert_eq!(store.effective("owned").unwrap()["inputs"][0]["rtp"], "udp");
 }
+
+#[test]
+fn rtsps_ca_input_is_persisted_inherited_and_rejects_unsafe_options() {
+    let d = tempfile::tempdir().unwrap();
+    let c = tls_fixture::Certificates::new();
+    let path = d.path().join("c.json");
+    let store = ConfigStore::open(&path).unwrap();
+    store
+        .put(
+            "templates",
+            "secure",
+            json!({"inputs":[{"url":"rtsps://localhost:322/owned","flussonix_tls_ca":c.ca}]}),
+        )
+        .unwrap();
+    store
+        .put(
+            "streams",
+            "owned",
+            json!({"template":"secure","static":false}),
+        )
+        .unwrap();
+    let saved = store.snapshot();
+    drop(store);
+    let store = ConfigStore::open(&path).unwrap();
+    assert_eq!(
+        store.effective("owned").unwrap()["inputs"][0]["flussonix_tls_ca"],
+        json!(c.ca)
+    );
+    for input in [
+        json!({"url":"rtsps://localhost/owned","rtp":"udp"}),
+        json!({"url":"rtsp://localhost/owned","flussonix_tls_ca":c.ca}),
+        json!({"url":"rtsps://localhost/owned","flussonix_tls_ca":"relative.pem"}),
+        json!({"url":"rtsps://localhost/owned","flussonix_tls_ca":true}),
+        json!({"url":"rtsps://localhost/owned","flussonix_tls_ca":"/no-owned-ca.pem"}),
+    ] {
+        assert!(
+            store
+                .put("streams", "owned", json!({"inputs":[input]}))
+                .is_err()
+        );
+        assert_eq!(store.snapshot(), saved);
+    }
+}
+#[path = "support/tls.rs"]
+mod tls_fixture;

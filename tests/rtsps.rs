@@ -329,3 +329,62 @@ async fn plain_listener_does_not_accept_rtsps_uri_or_tls_fallback() {
     plain.await.unwrap().unwrap();
     app.media.stop_all().await;
 }
+
+#[tokio::test]
+async fn verified_rtsps_input_can_be_ingested_by_an_independent_worker_to_hls() {
+    let (_d, cert, app, url, c, t) = fixture().await;
+    let relay_dir = tempfile::tempdir().unwrap();
+    let relay = flussonix::media::Engine::new(relay_dir.path(), "ffmpeg");
+    let worker = relay
+        .ensure(
+            "roundtrip",
+            &json!({"inputs":[{"url":format!("{url}?token=owned-token"),"flussonix_tls_ca":cert.ca}]}),
+        )
+        .await
+        .unwrap();
+    let mut file = None;
+    for _ in 0..180 {
+        if let Ok(data) = relay.read("roundtrip", "index.m3u8").await {
+            let manifest = String::from_utf8_lossy(&data);
+            if let Some(name) = manifest
+                .lines()
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+            {
+                file = Some(name.to_string());
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        file.is_some(),
+        "RTSP input HLS becomes ready: relay={} source={} egress={}",
+        worker.stats(),
+        app.media.stats("owned").await,
+        app.rtsp_egress.load(Ordering::Relaxed)
+    );
+    let media = relay.read("roundtrip", &file.unwrap()).await.unwrap();
+    let path = relay_dir.path().join("decode.ts");
+    std::fs::write(&path, media).unwrap();
+    let output = tokio::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-map", "0:v:0", "-map", "0:a:0", "-threads", "1", "-f", "null", "-",
+        ])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(worker.stats()["input_protocol"], "rtsps");
+    relay.stop_all().await;
+    c.cancel();
+    t.await.unwrap().unwrap();
+    app.media.stop_all().await;
+}

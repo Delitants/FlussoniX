@@ -93,6 +93,31 @@ impl Certificates {
             dir,
         }
     }
+    pub fn expire(&self) {
+        let p = self.dir.path();
+        std::fs::create_dir(p.join("issued")).unwrap();
+        std::fs::write(p.join("index.txt"), "").unwrap();
+        std::fs::write(p.join("serial"), "01\n").unwrap();
+        std::fs::write(p.join("ca.cnf"), "[ca]\ndefault_ca=owned\n[owned]\ndatabase=index.txt\nnew_certs_dir=issued\ncertificate=ca.pem\nprivate_key=ca.key\nserial=serial\ndefault_md=sha256\npolicy=policy\nx509_extensions=server\n[policy]\ncommonName=supplied\n[server]\nsubjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n").unwrap();
+        openssl(
+            p,
+            &[
+                "ca",
+                "-batch",
+                "-config",
+                "ca.cnf",
+                "-startdate",
+                "200101000000Z",
+                "-enddate",
+                "210101000000Z",
+                "-in",
+                "server.csr",
+                "-out",
+                "server.pem",
+                "-notext",
+            ],
+        );
+    }
     pub fn server(&self) -> Arc<rustls::ServerConfig> {
         let certs = CertificateDer::pem_file_iter(&self.cert)
             .unwrap()

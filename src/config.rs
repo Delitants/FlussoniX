@@ -372,11 +372,11 @@ fn validate_root(root: &Value) -> Result<(), String> {
                 if let Some(inputs) = item.get("inputs") {
                     let inputs = inputs.as_array().ok_or("inputs must be array")?;
                     for input in inputs {
-                        if input
-                            .as_object()
-                            .is_none_or(|v| v.keys().any(|k| k != "url" && k != "rtp"))
-                        {
-                            return Err("only input url and RTSP rtp=udp are implemented".into());
+                        if input.as_object().is_none_or(|v| {
+                            v.keys()
+                                .any(|k| k != "url" && k != "rtp" && k != "flussonix_tls_ca")
+                        }) {
+                            return Err("only input url, RTSP rtp=udp and RTSPS flussonix_tls_ca are implemented".into());
                         }
                         let u = input["url"].as_str().ok_or("input url required")?;
                         let scheme = u.split("://").next().unwrap_or("");
@@ -384,9 +384,23 @@ fn validate_root(root: &Value) -> Result<(), String> {
                         {
                             return Err("rtp input option requires RTSP and value udp".into());
                         }
+                        if let Some(ca) = input.get("flussonix_tls_ca") {
+                            if scheme != "rtsps" {
+                                return Err("TLS CA input option requires RTSPS".into());
+                            }
+                            let path =
+                                ca.as_str().ok_or("RTSPS CA must be an absolute PEM path")?;
+                            crate::tls_input::client(Some(std::path::Path::new(path)))?;
+                        }
+                        if scheme == "rtsps" {
+                            let parsed = url::Url::parse(u).map_err(|_| "invalid RTSPS URL")?;
+                            if parsed.host_str().is_none() || parsed.fragment().is_some() {
+                                return Err("RTSPS host required and fragments forbidden".into());
+                            }
+                        }
                         if ![
                             "testsrc", "http", "https", "hls", "hlss", "tshttp", "tshttps", "rtsp",
-                            "srt", "m4s", "m4ss", "m4f", "m4fs",
+                            "rtsps", "srt", "m4s", "m4ss", "m4f", "m4fs",
                         ]
                         .contains(&scheme)
                         {

@@ -189,6 +189,7 @@ impl Engine {
             "2",
         ]);
         let mut peer_hls = None;
+        let mut tls_input = None;
         let synthetic = input == "testsrc://";
         let m4s_input = input.starts_with("m4s://") || input.starts_with("m4ss://");
         let m4f_input = input.starts_with("m4f://") || input.starts_with("m4fs://");
@@ -209,7 +210,18 @@ impl Engine {
             cmd.args(["-f", "flv", "-i", "pipe:0"]);
             cmd.stdin(std::process::Stdio::piped());
         } else {
-            let mut translated = translate_input(input)?;
+            let mut translated = if input.starts_with("rtsps://") {
+                let bridge = crate::tls_input::Bridge::prepare(
+                    input,
+                    inputs[index]["flussonix_tls_ca"].as_str().map(Path::new),
+                )
+                .await?;
+                let local = bridge.local_url().to_owned();
+                tls_input = Some(bridge);
+                local
+            } else {
+                translate_input(input)?
+            };
             if translated.starts_with("rtsp://") {
                 cmd.args([
                     "-rtsp_transport",
@@ -267,7 +279,7 @@ impl Engine {
             cmd.args(["-c", "copy"]);
             // The AAC RTP depacketizer can omit key flags. AAC-LC access
             // units are independently decodable; do not discard their copy.
-            if input.starts_with("rtsp://") {
+            if input.starts_with("rtsp://") || input.starts_with("rtsps://") {
                 cmd.arg("-copyinkf:a");
             }
         }
@@ -394,6 +406,9 @@ impl Engine {
             let _ = child.kill().await;
             let _ = child.wait().await;
             drop(peer_hls);
+            if let Some(bridge) = tls_input {
+                bridge.close().await;
+            }
             w.cancel.cancel();
             w.alive.store(false, Ordering::Relaxed);
             let _ = done_tx.send(());
