@@ -136,3 +136,17 @@ test('content identity inherits through friendly forms and sources persist failo
  await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('cell',{name:'ui-replica-primary',exact:true})).toBeVisible();expect((await(await request.get('/streamer/api/v3/cluster/sources/ui-replica-primary',{headers})).json()).flussonix_source_group).toBe('ui-replicas');
  await expect(page.getByRole('heading',{name:'Active source pulls',exact:true})).toBeVisible();await expect(page.locator('textarea')).toHaveCount(0);
 });
+
+test('RTSP input transport uses a friendly selector and clears UDP when changing protocol',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-rtsp-transport';
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,static:false,inputs:[{url:'rtsp://127.0.0.1:19990/camera'}]}})).ok()).toBeTruthy();
+ await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+ const transport=page.getByLabel('RTSP transport',{exact:true});await expect(transport).toHaveValue('tcp');await transport.selectOption('udp');await page.getByRole('button',{name:'Save',exact:true}).click();
+ let state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].rtp).toBe('udp');
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(transport).toHaveValue('udp');await transport.selectOption('tcp');await page.getByRole('button',{name:'Save',exact:true}).click();
+ state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].rtp).toBeUndefined();
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await transport.selectOption('udp');await page.getByLabel('Input URL',{exact:true}).fill('hls://example.net/camera/index.m3u8');await expect(transport).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();
+ state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].rtp).toBeUndefined();await expect(page.locator('textarea')).toHaveCount(0);
+ await request.delete('/streamer/api/v3/streams/'+name,{headers});
+});

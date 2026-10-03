@@ -143,3 +143,8 @@ Explicit source-group/content identities and exact normalized policy matching ad
 ## Implemented v0.6 RTSP TCP playback
 
 An optional separate listener serves the bounded RTSP 1.0 H.264/AAC-LC TCP-interleaved playback profile with URL-token/callback authorization and existing native CDN private pulls. Independent FFmpeg decoding and RTSP-input-to-HLS tests are recorded in [qualification](qualification.md). This adds a specific output direction; UDP/publication/push, RTSPS, direct RTP/SRTP, Basic/Digest viewer credentials and exact vendor dialects remain open. Protocol direction coverage is not inferred from interleaved RTP or HTTP redirects.
+
+
+## Implemented v0.7 RTSP unicast UDP
+
+The opt-in UDP playback profile shares the TCP packetizer, worker and authorization while pacing datagrams to the TCP control peer. A finite prebound port range and application-payload rate limit are required; input `rtp:"udp"` is available through normal Streams/Templates forms. See [profile, bounds and remaining directions](rtsp-rtp-support.md#implemented-v07-udp-playback-profile). Exact vendor dialects, publishing/push, RTSPS, direct RTP/SRTP and RTSP LB redirects remain unqualified.

@@ -1,6 +1,6 @@
 # RTSP/RTSPS and RTP/SRTP — inbound and outbound
 
-First-release requirement added by the user. Status: v0.6 implements the TCP playback profile below and exercises an independent FFmpeg RTSP pull roundtrip. The full direction matrix remains required; other cells are designed, not qualified.
+First-release requirement added by the user. Status: v0.7 implements TCP and opt-in unicast UDP playback below and exercises an independent FFmpeg RTSP pull roundtrip. The full direction matrix remains required; other cells are designed, not qualified.
 
 ## Direction matrix
 
@@ -73,3 +73,16 @@ Viewer URL tokens and existing on_play callbacks run before worker startup with 
 Independent tests decode two tracks for two concurrent viewers sharing one worker; decode native M4S/M4F source pulls through CDN RTSP output; and decode RTSP input repackaged as HLS. The RTSP stream-copy input adapter allows initial audio packets without key flags (`-copyinkf:a`), as FFmpeg MPEG4-GENERIC depacketization can omit those flags. The input adapter remains independently installed FFmpeg. No official Flussonic package is loaded.
 
 UDP/multicast, RTSP ANNOUNCE/RECORD or outbound publication, Basic/Digest viewer credentials, RTSPS, direct RTP/SRTP, pause/seek and RTSP load-balancer redirects remain separate implementation gates. Interleaved RTP does not establish direct-RTP compatibility. Continuous-session behavior across source changes, camera interoperability, B-frame end-to-end roundtrips, TLS, GPU and production-scale load remain to be qualified.
+
+
+## Implemented v0.7 UDP playback profile
+
+The v0.6 codec, authentication, worker, bootstrap and control bounds still apply. An explicit `--rtsp-udp-ports FIRST-LAST` enables RTSP-controlled unicast RTP/RTCP; otherwise UDP SETUP returns 461. Every port is prebound to the RTSP listener IP before workers start. The range is inclusive, 2–256 ports, even first/odd last, all at least 1024. Occupied pools fail startup; exhaustion returns 453 while TCP remains available. Each negotiated track owns a consecutive pair until teardown, control EOF, cancellation or shutdown. Before PLAY, repeating SETUP for the same track can change its client pair without acquiring another lease. TCP and UDP cannot mix in one session.
+
+UDP offers accept RTP/AVP or RTP/AVP/UDP with explicit unicast, consecutive even/odd client ports >=1024, and optional PLAY mode. Multicast, destination/source overrides, mux, RECORD, ambiguous alternatives and unknown parameters are rejected. The destination is always the authenticated TCP control peer's IP. Replies advertise client/server ports, source address and SSRC. Incoming RTCP must come from that exact negotiated endpoint, fit 8192 bytes, and be a structurally valid compound RR plus SDES/CNAME reporting the negotiated SSRC; stale, malformed and foreign reports do not renew the session. No per-viewer receive task survives the connection.
+
+Shared RTP records retain decode timestamps outside the unchanged wire bytes. Each UDP session holds at most one pending packet and paces it using decode time plus a token bucket: `--rtsp-udp-mbps` is finite 1–10000 Mbps (default 100) with a 32 KiB burst. Control, grant revocation, worker replacement and shutdown remain responsive during paced waits and RTCP flood. Successful application datagram bytes increment viewer accounting and total RTSP output; `rtsp_udp_bytes_out` reports the UDP subset and is never added twice to capacity. UDP send deadlines remain two seconds. This is payload pacing, not an Ethernet/IP bandwidth guarantee or a loss-recovery protocol.
+
+RTSP input defaults to TCP. The normal input form selects TCP or UDP; UDP is saved as `{"url":"rtsp://...","rtp":"udp"}` and inherited through templates. Changing the URL to another protocol clears the option. Independent FFmpeg UDP clients decode H.264 and AAC together; UDP input is repackaged to independently decoded HLS, and native M4S/M4F private CDN pulls feed UDP output without an additional encoder.
+
+RTSPS, direct RTP, SRTP, RTSP publication/push, multicast, Basic/Digest viewer authentication, RTSP LB redirects, retransmission and migration/large-scale performance qualification remain pending.

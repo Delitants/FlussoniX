@@ -2,7 +2,7 @@
 
 An independently written Rust media server with a React admin interface and a Flussonic v3 API compatibility layer.
 
-**Status: v0.6 preview, for testing. It is not a complete Flussonic replacement or migration-ready release.**
+**Status: v0.7 preview, for testing. It is not a complete Flussonic replacement or migration-ready release.**
 
 This build implements persisted Streams/Templates configuration, authenticated management, playback authorization, CPU transcoding, shared stream workers, native source/CDN discovery and an adaptive HTTP redirect balancer. M4F and M4S have independent wire adapters for the qualified H.264/AAC subset. Generic fMP4 HLS remains a separate format.
 
@@ -12,18 +12,20 @@ This build implements persisted Streams/Templates configuration, authenticated m
 | API | `/streamer/api/v3` subset; CRUD, partial updates, reset, inheritance, validation without applying, collection cursors |
 | Authentication | Separate edit/view credentials; Basic and legacy base64 Bearer; structured/string `on_play` callbacks; scheduled renewal, revocation and local limits across streams; separate peer key |
 | Input | HLS/HLSS, TSHTTP/TSHTTPS, M4S AVC/AAC frame and packed-GOP modes, M4F single-chunk AVC/AAC sample tables; FFmpeg RTSP pull and SRT receive adapters |
-| Output | HLS with TS or fMP4 segments, HTTP MPEG-TS, Original M4S frame/GOP relay, generated frame output; M4F signals with original or generated live segments; optional RTSP 1.0 TCP-interleaved H.264/AAC-LC playback |
+| Output | HLS with TS or fMP4 segments, HTTP MPEG-TS, Original M4S frame/GOP relay, generated frame output; M4F signals with original or generated live segments; optional RTSP 1.0 TCP-interleaved or opt-in unicast UDP H.264/AAC-LC playback |
 | Recovery | Startup/media watchdog, capped retries through ordered inputs, background local/CDN recovery, new HLS sequences/segment/init identities after restart |
 | Transcoding | One supervised FFmpeg worker per stream; CPU H.264/AAC; `h264_nvenc` configuration requires NVIDIA hardware and runtime |
 | Native cluster | Separate public/private endpoints, source discovery, explicit equivalent-origin failover, LAN pull, uplink/CPU/RAM selection, readiness, drain/stale exclusion, expiring capacity reservations |
 
-Required later work includes complete API/schema parity; Flussonic cluster discovery and credential compatibility; additional M4 codec/metadata modes; publisher authentication; RTSP UDP/publication/push and Basic/Digest viewer authentication; RTSPS, RTP/SRTP inbound and outbound; SRT output/push; HTTPS serving or reverse-proxy integration; full transcoder profiles, GPU qualification, DVR, distributed session ownership and complete failure/scale qualification. Unsupported saved options return errors. See [qualification](docs/qualification.md) for evidence and limits.
+Required later work includes complete API/schema parity; Flussonic cluster discovery and credential compatibility; additional M4 codec/metadata modes; publisher authentication; RTSP publication/push and Basic/Digest viewer authentication; RTSPS, RTP/SRTP inbound and outbound; SRT output/push; HTTPS serving or reverse-proxy integration; full transcoder profiles, GPU qualification, DVR, distributed session ownership and complete failure/scale qualification. Unsupported saved options return errors. See [qualification](docs/qualification.md) for evidence and limits.
 
 ## RTSP playback preview
 
 Enable a separate unused listener with `--rtsp-listen 127.0.0.1:18554`. Its default is disabled. A configured stream is available at `rtsp://127.0.0.1:18554/STREAM?token=VIEWER_TOKEN`. For an owned synthetic test without a token policy, use `ffmpeg -rtsp_transport tcp -i rtsp://127.0.0.1:18554/owned -t 5 -f null -`.
 
-This profile serves RTSP 1.0 playback over TCP interleaving, with H.264 single NAL/FU-A, AAC-LC MPEG4-GENERIC and RTCP sender reports. It reuses one shared worker and packetizer, URL-token/on_play authorization (`proto=rtsp`), revocation and local admission accounting. Native CDNs can expose RTSP while pulling authenticated LAN HLS/M4S/M4F; the HTTP balancer does not redirect RTSP. Independent FFmpeg clients decode both tracks, and RTSP pull to HLS is exercised. Unsupported codecs return 415; worker or codec replacement closes the session and requires reconnecting. See [tested profile and bounds](docs/rtsp-rtp-support.md#implemented-v06-tcp-playback-profile). This does not establish every vendor RTSP dialect or the remaining direction matrix.
+To enable UDP on unused ports, add `--rtsp-udp-ports 42000-42031 --rtsp-udp-mbps 100`. All ports bind to the RTSP listener address before workers start. The inclusive range must have 2–256 ports, an even first port, an odd last port, and no port below 1024; each negotiated track leases two ports. `--rtsp-udp-mbps` caps application payload per viewer (1–10000 Mbps, default 100) with a 32 KiB burst. Select `-rtsp_transport udp` in an independent FFmpeg client. The control connection remains TCP; datagrams go only to its peer IP. UDP is disabled without the range. The normal **RTSP transport** field selects TCP or UDP for RTSP inputs; UDP persists as `rtp:"udp"`, and TCP uses the default absent option.
+
+This profile serves RTSP 1.0 playback over TCP interleaving or opt-in unicast UDP, with H.264 single NAL/FU-A, AAC-LC MPEG4-GENERIC and RTCP sender reports. It reuses one shared worker and packetizer, URL-token/on_play authorization (`proto=rtsp`), revocation and local admission accounting. Native CDNs can expose RTSP while pulling authenticated LAN HLS/M4S/M4F; the HTTP balancer does not redirect RTSP. Independent FFmpeg clients decode both tracks, and RTSP pull to HLS is exercised. Unsupported codecs return 415; worker or codec replacement closes the session and requires reconnecting. See [tested profile and bounds](docs/rtsp-rtp-support.md#implemented-v07-udp-playback-profile). This does not establish every vendor RTSP dialect or the remaining direction matrix.
 
 ## Replica failover
 
