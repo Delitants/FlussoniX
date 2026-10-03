@@ -24,7 +24,18 @@ pub struct Engine {
     hls_epoch: crate::hls_generation::Epoch,
     workers: Mutex<HashMap<String, Arc<Worker>>>,
 }
+pub struct Publication {
+    pub worker: Arc<Worker>,
+    pub stdin: Option<tokio::process::ChildStdin>,
+}
+impl Drop for Publication {
+    fn drop(&mut self) {
+        self.worker.cancel.cancel();
+    }
+}
 pub struct Worker {
+    publisher_stdin: std::sync::Mutex<Option<tokio::process::ChildStdin>>,
+    publication: bool,
     tx: broadcast::Sender<Bytes>,
     cancel: CancellationToken,
     done: Mutex<Option<oneshot::Receiver<()>>>,
@@ -79,6 +90,8 @@ impl Worker {
             } else {
                 "starting"
             }
+        } else if self.publication {
+            "waiting"
         } else if recovery.last_error().is_some() {
             "retrying"
         } else {
@@ -100,6 +113,19 @@ impl Engine {
         self.root
             .join(format!("{:x}", Sha256::digest(name.as_bytes())))
     }
+    pub async fn publish_guarded(
+        &self,
+        name: &str,
+        cfg: &Value,
+        current: impl std::future::Future<Output = bool>,
+    ) -> Result<Publication, String> {
+        if !crate::publish::is_input(cfg) {
+            return Err("stream does not accept publications".into());
+        }
+        let worker = self.ensure_mode(name, cfg, true, current, true).await?;
+        let stdin = worker.publisher_stdin.lock().unwrap().take();
+        Ok(Publication { worker, stdin })
+    }
     pub async fn ensure(&self, name: &str, cfg: &Value) -> Result<Arc<Worker>, String> {
         self.ensure_guarded(name, cfg, true, std::future::ready(true))
             .await
@@ -114,6 +140,17 @@ impl Engine {
         cfg: &Value,
         touch_demand: bool,
         current: impl std::future::Future<Output = bool>,
+    ) -> Result<Arc<Worker>, String> {
+        self.ensure_mode(name, cfg, touch_demand, current, false)
+            .await
+    }
+    async fn ensure_mode(
+        &self,
+        name: &str,
+        cfg: &Value,
+        touch_demand: bool,
+        current: impl std::future::Future<Output = bool>,
+        publishing: bool,
     ) -> Result<Arc<Worker>, String> {
         let mut workers = self.workers.lock().await;
         // Recheck after waiting for another stream startup/replacement. A stale
@@ -139,11 +176,14 @@ impl Engine {
             viewers = w.viewers.clone();
             let running = w.alive.load(Ordering::Relaxed) && !w.is_closed();
             if running && w.signature == signature {
+                if publishing {
+                    return Err("publisher already connected".into());
+                }
                 return Ok(w.clone());
             }
             if !running && w.signature == signature {
                 let recovery = w.recovery.lock().unwrap();
-                if recovery.retry_in().is_some_and(|delay| !delay.is_zero()) {
+                if !publishing && recovery.retry_in().is_some_and(|delay| !delay.is_zero()) {
                     return Err("input retry backoff".into());
                 }
                 index = w.input_index + 1;
@@ -168,6 +208,10 @@ impl Engine {
             >= 256
         {
             return Err("worker limit reached".into());
+        }
+        let publication = crate::publish::is_input(cfg);
+        if publication && !publishing {
+            return Err("waiting for publisher".into());
         }
         let dir = self.directory(name);
         let replaced = workers.contains_key(name);
@@ -206,6 +250,16 @@ impl Engine {
                 "-i",
                 "sine=frequency=440:sample_rate=48000",
             ]);
+        } else if publication {
+            cmd.args([
+                "-protocol_whitelist",
+                "pipe",
+                "-f",
+                "mpegts",
+                "-i",
+                "pipe:0",
+            ]);
+            cmd.stdin(std::process::Stdio::piped());
         } else if m4s_input || m4f_input {
             cmd.args(["-f", "flv", "-i", "pipe:0"]);
             cmd.stdin(std::process::Stdio::piped());
@@ -313,6 +367,8 @@ impl Engine {
                 .clamp(1, 300),
         );
         let worker = Arc::new(Worker {
+            publisher_stdin: std::sync::Mutex::new(if publication { stdin.take() } else { None }),
+            publication,
             tx,
             cancel: cancel.clone(),
             done: Mutex::new(Some(done)),
@@ -533,7 +589,9 @@ impl Engine {
             .lock()
             .await
             .iter()
-            .filter(|(_, w)| w.idle_seconds() >= 60 && w.viewers.load(Ordering::Relaxed) == 0)
+            .filter(|(_, w)| {
+                !w.publication && w.idle_seconds() >= 60 && w.viewers.load(Ordering::Relaxed) == 0
+            })
             .map(|(n, _)| n.clone())
             .collect()
     }

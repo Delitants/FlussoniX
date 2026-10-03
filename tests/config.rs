@@ -425,3 +425,45 @@ fn rtsps_ca_input_is_persisted_inherited_and_rejects_unsafe_options() {
 }
 #[path = "support/tls.rs"]
 mod tls_fixture;
+
+#[test]
+fn publication_inputs_credentials_and_callbacks_persist_and_inherit() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("c.json");
+    let store = ConfigStore::open(&p).unwrap();
+    store
+        .put(
+            "auth_backends",
+            "publisher",
+            json!({"url":"https://auth.example/publish"}),
+        )
+        .unwrap();
+    store.put("templates", "published", json!({"inputs":[{"url":"publish://"}],"password":"owned-publisher","on_publish":"auth://publisher"})).expect("publication template must be supported");
+    store
+        .put("streams", "owned", json!({"template":"published"}))
+        .unwrap();
+    let effective = store.effective("owned").unwrap();
+    assert_eq!(effective["inputs"][0]["url"], "publish://");
+    assert_eq!(effective["password"], "owned-publisher");
+    assert_eq!(effective["on_publish"], "auth://publisher");
+    assert!(effective["config_on_disk"].get("password").is_none());
+    drop(store);
+    let store = ConfigStore::open(p).unwrap();
+    assert_eq!(
+        store.effective("owned").unwrap()["password"],
+        "owned-publisher"
+    );
+    for patch in [
+        json!({"inputs":[{"url":"publish://extra"}]}),
+        json!({"inputs":[{"url":"publish://"},{"url":"testsrc://"}]}),
+        json!({"password":12}),
+        json!({"password":""}),
+        json!({"on_publish":{ "url":"http://example/publish" }}),
+        json!({"on_publish":"auth://missing"}),
+        json!({"on_publish":"file:///publish"}),
+    ] {
+        let before = store.snapshot();
+        assert!(store.put("streams", "invalid", patch).is_err());
+        assert_eq!(store.snapshot(), before);
+    }
+}

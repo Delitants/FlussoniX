@@ -258,6 +258,8 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "inputs",
                     "transcoder",
                     "on_play",
+                    "on_publish",
+                    "password",
                     "flussonix_token_sha256",
                     "flussonix_input_timeout",
                     "flussonix_content_id",
@@ -352,6 +354,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     }
                 }
                 crate::playback_auth::Policy::from_config(item, root)?;
+                crate::publish::Policy::from_config(item, root)?;
                 if let Some(hash) = item.get("flussonix_token_sha256") {
                     if !hash
                         .as_str()
@@ -380,6 +383,15 @@ fn validate_root(root: &Value) -> Result<(), String> {
                         }
                         let u = input["url"].as_str().ok_or("input url required")?;
                         let scheme = u.split("://").next().unwrap_or("");
+                        if scheme == "publish"
+                            && (u != "publish://"
+                                || inputs.len() != 1
+                                || input.as_object().unwrap().len() != 1)
+                        {
+                            return Err(
+                                "publish:// must be the exact sole input without options".into()
+                            );
+                        }
                         if input.get("rtp").is_some() && (scheme != "rtsp" || input["rtp"] != "udp")
                         {
                             return Err("rtp input option requires RTSP and value udp".into());
@@ -400,7 +412,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                         }
                         if ![
                             "testsrc", "http", "https", "hls", "hlss", "tshttp", "tshttps", "rtsp",
-                            "rtsps", "srt", "m4s", "m4ss", "m4f", "m4fs",
+                            "rtsps", "srt", "m4s", "m4ss", "m4f", "m4fs", "publish",
                         ]
                         .contains(&scheme)
                         {
