@@ -714,3 +714,45 @@ fn generated_native_records_respect_the_decoders_total_record_bound() {
     frame.body = vec![0; 16 * 1024 * 1024];
     assert!(wire::encode_frame(&native_tracks()[0], &frame).is_err());
 }
+
+#[test]
+fn native_m4f_segment_bounds_include_metadata_tables_and_payload_together() {
+    use flussonix::{
+        m4f::{Frame, pack, unpack},
+        m4s::Track,
+    };
+    let tracks: Vec<_> = (0..15)
+        .map(|id| Track {
+            id,
+            codec: "m2a".into(),
+            config: vec![0; 1024 * 1024],
+        })
+        .collect();
+    let frames: Vec<_> = (0..32768u64)
+        .map(|i| Frame {
+            track_id: (i % 15) as u32,
+            dts: i / 15 * 2160,
+            pts_offset: 0,
+            key: true,
+            body: include_bytes!("fixtures/codecs/mp2.bin").to_vec(),
+        })
+        .collect();
+    assert!(
+        pack(&tracks, &frames, 5000000).is_err(),
+        "whole segment exceeds 32 MiB despite separate bounds"
+    );
+    let accepted = pack(&tracks, &frames[..16000], 5000000).unwrap();
+    assert!(accepted.len() <= 32 * 1024 * 1024);
+    let (decoded, samples) = unpack(&accepted).unwrap();
+    assert_eq!(decoded, tracks);
+    assert_eq!(samples.len(), 16000);
+}
+
+#[test]
+fn native_sample_gaps_that_do_not_fit_the_table_fail_instead_of_truncating() {
+    let track = native_tracks()[0].clone();
+    let first = native_frames()[0].clone();
+    let mut second = first.clone();
+    second.dts = first.dts + u64::from(u32::MAX) + 1;
+    assert!(flussonix::m4f::pack(&[track], &[first, second], 3600).is_err());
+}

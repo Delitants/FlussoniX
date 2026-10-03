@@ -546,11 +546,23 @@ async fn fixture_udp(
     )
     .unwrap();
     app.config.put("streams","owned",json!({"static":false,"inputs":[{"url":"testsrc://"}],"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"owned-token"))})).unwrap();
-    let (range, held) = udp_fixture::reserved(pairs * 2);
-    drop(held);
-    let pool = rtsp::udp::Pool::bind("127.0.0.1".parse().unwrap(), range)
-        .await
-        .unwrap();
+    // Independent FFmpeg clients can take a released port during this
+    // test-only handoff. Choose another disjoint range on that exact error;
+    // production Pool::bind still reports every occupied configured port.
+    let mut selected = None;
+    for _ in 0..8 {
+        let (range, held) = udp_fixture::reserved(pairs * 2);
+        drop(held);
+        match rtsp::udp::Pool::bind("127.0.0.1".parse().unwrap(), range).await {
+            Ok(pool) => {
+                selected = Some(pool);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => panic!("UDP fixture setup failed: {error}"),
+        }
+    }
+    let pool = selected.expect("no fixture UDP range survived the bounded handoff");
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("rtsp://{}/owned", l.local_addr().unwrap());
     let cancel = CancellationToken::new();

@@ -1,4 +1,4 @@
-//! Independent AVC/AAC M4F sample-table adapter. No vendor runtime dependency.
+//! Independent native M4F sample-table adapter. No vendor runtime dependency.
 use crate::{
     codec::Codec,
     m4s::{Track, atom, boxes, decode_track, validate_tracks},
@@ -47,15 +47,11 @@ pub fn pack(tracks: &[Track], frames: &[Frame], duration: u64) -> Result<Vec<u8>
     {
         return Err("sample has unknown native track".into());
     }
-    let start = frames.iter().map(|f| f.dts).min().unwrap();
-    let mut segm = vec![0; 4];
-    segm.extend_from_slice(&90000u32.to_be_bytes());
-    segm.extend_from_slice(&start.to_be_bytes());
-    segm.extend_from_slice(&duration.to_be_bytes());
-    let mut moov = atom(b"segm", &segm);
-    let mut payload = Vec::new();
+    // Budget the complete container before copying configurations or samples.
+    // Track tables and opaque metadata can be as large as the payload itself.
+    let mut groups = Vec::new();
+    let mut total = 48usize; // moov + segm + mdat headers
     for track in tracks {
-        let kind = track.kind()?;
         let samples = frames
             .iter()
             .filter(|f| f.track_id == track.id)
@@ -63,6 +59,38 @@ pub fn pack(tracks: &[Track], frames: &[Frame], duration: u64) -> Result<Vec<u8>
         if samples.is_empty() {
             continue;
         }
+        let tables = 165
+            + track.codec.len()
+            + track.config.len()
+            + 12 * samples.len()
+            + 4 * samples.iter().filter(|f| f.key).count()
+            + if samples.iter().any(|f| f.pts_offset != 0) {
+                16 + 8 * samples.len()
+            } else {
+                0
+            };
+        total = total
+            .checked_add(tables)
+            .ok_or("M4F segment size overflow")?;
+        for sample in &samples {
+            total = total
+                .checked_add(sample.body.len())
+                .ok_or("M4F segment size overflow")?;
+        }
+        if total > 32 * 1024 * 1024 {
+            return Err("M4F segment exceeds size limit".into());
+        }
+        groups.push((track, samples));
+    }
+    let start = frames.iter().map(|f| f.dts).min().unwrap();
+    let mut segm = vec![0; 4];
+    segm.extend_from_slice(&90000u32.to_be_bytes());
+    segm.extend_from_slice(&start.to_be_bytes());
+    segm.extend_from_slice(&duration.to_be_bytes());
+    let mut moov = atom(b"segm", &segm);
+    let mut payload = Vec::new();
+    for (track, samples) in groups {
+        let kind = track.kind()?;
         if samples.windows(2).any(|pair| pair[1].dts < pair[0].dts) {
             return Err("native track DTS goes backwards".into());
         }
@@ -122,7 +150,11 @@ pub fn pack(tracks: &[Track], frames: &[Frame], duration: u64) -> Result<Vec<u8>
                 .map(|next| next.dts.saturating_sub(s.dts))
                 .unwrap_or(last_duration);
             stts.extend_from_slice(&1u32.to_be_bytes());
-            stts.extend_from_slice(&(delta as u32).to_be_bytes());
+            stts.extend_from_slice(
+                &u32::try_from(delta)
+                    .map_err(|_| "sample duration exceeds native table limit")?
+                    .to_be_bytes(),
+            );
             stsz.extend_from_slice(&(s.body.len() as u32).to_be_bytes());
             ctts.extend_from_slice(&1u32.to_be_bytes());
             ctts.extend_from_slice(
