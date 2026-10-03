@@ -232,7 +232,18 @@ impl Window {
     }
     fn put(&mut self, c: char) {
         if !self.bounds() && self.wrap {
+            let mut word = Vec::new();
+            if self.print == 0 && c != ' ' && self.row >= 0 && (self.row as usize) < self.rows {
+                let row = &mut self.cells[self.row as usize];
+                if let Some(space) = row[..self.cols].iter().rposition(|v| *v == ' ') {
+                    word.extend_from_slice(&row[space + 1..self.cols]);
+                    row[space..self.cols].fill(' ');
+                }
+            }
             self.carriage();
+            for ch in word {
+                self.put(ch);
+            }
         }
         if self.bounds() {
             self.cells[self.row as usize][self.col as usize] = c;

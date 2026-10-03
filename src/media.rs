@@ -759,7 +759,12 @@ impl Engine {
             .and_then(|w| w.captions.clone())
         {
             let logical = file.strip_prefix("fmp4/").unwrap_or(file);
-            if logical == "index.m3u8" || logical == "av.m3u8" || logical.starts_with("cc") {
+            if logical == "index.m3u8"
+                || logical == "av.m3u8"
+                || logical.starts_with("cc")
+                || (logical.starts_with('s')
+                    && logical.as_bytes().get(1).is_some_and(u8::is_ascii_digit))
+            {
                 return state.read(file).ok_or("caption media not ready".into());
             }
         }

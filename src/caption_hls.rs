@@ -77,7 +77,7 @@ impl State {
             let mut text = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
             for s in &d.services {
                 text += &format!(
-                    "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"captions\",NAME=\"{}\",LANGUAGE=\"{}\",DEFAULT={},AUTOSELECT=YES,FORCED=NO,URI=\"cc{}.m3u8\"\n",
+                    "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"captions\",NAME=\"{}\",LANGUAGE=\"{}\",DEFAULT={},AUTOSELECT=YES,FORCED=NO,URI=\"{}.m3u8\"\n",
                     s.name,
                     s.language,
                     if s.channel == d.services[0].channel {
@@ -85,7 +85,7 @@ impl State {
                     } else {
                         "NO"
                     },
-                    s.channel
+                    s.key()
                 )
             }
             text += &format!(
@@ -184,8 +184,10 @@ impl State {
                 let mut complete = true;
                 for seg in segments {
                     let first_name = format!(
-                        "cc{}_g{}_{}.vtt",
-                        services[0].channel, self.generation, seg.sequence
+                        "{}_g{}_{}.vtt",
+                        services[0].key(),
+                        self.generation,
+                        seg.sequence
                     );
                     if previous.contains_key(&first_name) {
                         continue;
@@ -224,13 +226,15 @@ impl State {
                         .iter()
                         .map(|seg| {
                             format!(
-                                "cc{}_g{}_{}.vtt",
-                                service.channel, self.generation, seg.sequence
+                                "{}_g{}_{}.vtt",
+                                service.key(),
+                                self.generation,
+                                seg.sequence
                             )
                         })
                         .collect();
                     lists.insert(
-                        format!("cc{}.m3u8", service.channel),
+                        format!("{}.m3u8", service.key()),
                         Bytes::from(grid.playlist(segments, Some(&files))),
                     );
                     for (seg, file) in segments.iter().zip(files) {
@@ -346,8 +350,8 @@ fn webvtt(
             }
             if finish > start {
                 out += &format!(
-                    "cc{}-{}-{}-{}\n{} --> {}\n{}\n\n",
-                    channel,
+                    "{}-{}-{}-{}\n{} --> {}\n{}\n\n",
+                    crate::captions::key(channel),
                     generation,
                     c.start,
                     slice,

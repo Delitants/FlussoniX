@@ -303,3 +303,19 @@ fn digital_transport_preserves_raw_bytes_for_h264_hevc_and_clock_wrap() {
         assert_eq!(q[0].end, Some(base + 180000));
     }
 }
+#[test]
+fn word_wrap_moves_the_whole_trailing_word_to_next_row() {
+    let mut d = digital(&[1]);
+    packet(
+        &mut d,
+        0,
+        &[(
+            1,
+            &[
+                0x98, 0x20, 0, 0, 1, 3, 0, 0x97, 0, 0, 0x4c, 0, b'A', b'B', b' ', b'C', b'D',
+            ],
+        )],
+        90000,
+    );
+    assert_eq!(open(&d, 65).as_deref(), Some("AB\nCD"));
+}
