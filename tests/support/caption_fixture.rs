@@ -103,7 +103,7 @@ fn make(digital: bool) -> Vec<u8> {
                 if blocks.len() % 2 == 0 {
                     blocks.push(0);
                 }
-                let mut triples = vec![(3, (seq << 6) | ((blocks.len() + 1) / 2) as u8, blocks[0])];
+                let mut triples = vec![(3, (seq << 6) | blocks.len().div_ceil(2) as u8, blocks[0])];
                 for b in blocks[1..].chunks_exact(2) {
                     triples.push((2, b[0], b[1]));
                 }

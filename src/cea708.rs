@@ -508,7 +508,7 @@ impl State {
                             }
                         } else if let Some(w) = &mut self.windows[i] {
                             match t[0] {
-                                0x88 => w.clear(),
+                                0x88 => w.cells = [[' '; 42]; 16],
                                 0x89 => w.visible = true,
                                 0x8a => w.visible = false,
                                 _ => w.visible = !w.visible,
@@ -556,11 +556,11 @@ impl State {
                 }
                 let style = (t[6] >> 3) & 7;
                 if !existed || style != 0 {
-                    w.print = 0;
-                    w.scroll = 3;
+                    w.print = if style == 7 { 2 } else { 0 };
+                    w.scroll = if style == 7 { 1 } else { 3 };
                     w.wrap = matches!(style, 4..=6);
                 }
-                if !existed || t[6] & 7 != 0 {
+                if !existed {
                     w.row = 0;
                     w.col = 0;
                 }

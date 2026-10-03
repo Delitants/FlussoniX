@@ -112,11 +112,10 @@ async fn run(cpu: bool) {
         .unwrap();
         let mut words = String::new();
         for file in list.lines().filter(|f| f.ends_with(".vtt")) {
-            words += &String::from_utf8(
-                e.read("group/owned", &format!("{prefix}{file}"))
+            words += std::str::from_utf8(
+                &e.read("group/owned", &format!("{prefix}{file}"))
                     .await
-                    .unwrap()
-                    .to_vec(),
+                    .unwrap(),
             )
             .unwrap();
         }

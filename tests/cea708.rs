@@ -27,7 +27,7 @@ fn packet(d: &mut Decoder, seq: u8, blocks: &[(u8, &[u8])], pts: u64) {
         b.push(0);
     }
     assert!(b.len() < 128);
-    d.push(3, [(seq << 6) | ((b.len() + 1) / 2) as u8, b[0]], pts);
+    d.push(3, [(seq << 6) | b.len().div_ceil(2) as u8, b[0]], pts);
     for p in b[1..].chunks_exact(2) {
         d.push(2, [p[0], p[1]], pts);
     }
@@ -166,7 +166,7 @@ fn duplicate_toggle_is_suppressed_and_sequence_gaps_clear_only_digital() {
     assert_eq!(open(&d, 65), None);
     packet(&mut d, 2, &[(1, &[0x89, 1])], 270000);
     assert!(open(&d, 65).is_some());
-    packet(&mut d, 0, &[(1, &[b'X'])], 360000);
+    packet(&mut d, 0, &[(1, b"X")], 360000);
     assert_eq!(open(&d, 65), None);
     assert_eq!(open(&d, 1).as_deref(), Some("CC"));
     assert_eq!(d.error, Some("caption_708_packet_gap"));
@@ -318,4 +318,54 @@ fn word_wrap_moves_the_whole_trailing_word_to_next_row() {
         90000,
     );
     assert_eq!(open(&d, 65).as_deref(), Some("AB\nCD"));
+}
+#[test]
+fn clearing_memory_and_redefining_pen_style_keep_existing_pen_location() {
+    let mut d = digital(&[1]);
+    packet(
+        &mut d,
+        0,
+        &[(1, &[0x98, 0x20, 0, 0, 0, 10, 0, b'A', b'B'])],
+        0,
+    );
+    packet(&mut d, 1, &[(1, &[0x88, 1, b'C'])], 90000);
+    assert_eq!(open(&d, 65).as_deref(), Some("  C"));
+    packet(
+        &mut d,
+        2,
+        &[(1, &[0x98, 0x20, 0, 0, 0, 10, 1, b'D'])],
+        180000,
+    );
+    assert_eq!(open(&d, 65).as_deref(), Some("  CD"));
+}
+#[test]
+fn zero_packet_size_means_full_128_bytes_and_waits_for_last_pair() {
+    let mut d = digital(&[1]);
+    let mut bytes = vec![0x3f, 0x98, 0x20, 0, 0, 0, 41, 0];
+    bytes.extend([b'A'; 24]);
+    bytes.resize(127, 0);
+    d.push(3, [0, bytes[0]], 0);
+    for p in bytes[1..125].chunks_exact(2) {
+        d.push(2, [p[0], p[1]], 90000);
+    }
+    assert_eq!(open(&d, 65), None);
+    d.push(2, [bytes[125], bytes[126]], 180000);
+    assert_eq!(open(&d, 65).as_deref(), Some("AAAAAAAAAAAAAAAAAAAAAAAA"));
+    assert_eq!(d.error, None);
+}
+#[test]
+fn unselected_command_bytes_are_not_interpreted_and_vertical_style_seven_advances_rows() {
+    let mut d = digital(&[1]);
+    packet(
+        &mut d,
+        0,
+        &[
+            (63, &[0x8f, 0x10, 0x98]),
+            (1, &[0x98, 0x20, 0, 0, 2, 2, 0x38, b'A', b'B', b'C']),
+        ],
+        90000,
+    );
+    assert_eq!(open(&d, 65).as_deref(), Some("A\nB\nC"));
+    packet(&mut d, 1, &[(1, &[0x0d, b'D'])], 180000);
+    assert_eq!(open(&d, 65).as_deref(), Some("AD\nB\nC"));
 }
