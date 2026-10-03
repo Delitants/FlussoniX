@@ -161,6 +161,7 @@ pub fn response(code: u16, cseq: u32, headers: &[(&str, String)], body: &[u8]) -
         408 => "Request Timeout",
         413 => "Request Entity Too Large",
         415 => "Unsupported Media Type",
+        453 => "Not Enough Bandwidth",
         454 => "Session Not Found",
         455 => "Method Not Valid in This State",
         457 => "Invalid Range",

@@ -211,7 +211,14 @@ impl Engine {
         } else {
             let mut translated = translate_input(input)?;
             if translated.starts_with("rtsp://") {
-                cmd.args(["-rtsp_transport", "tcp"]);
+                cmd.args([
+                    "-rtsp_transport",
+                    if inputs[index]["rtp"] == "udp" {
+                        "udp"
+                    } else {
+                        "tcp"
+                    },
+                ]);
             }
             if translated.starts_with("http") {
                 cmd.args(["-rw_timeout", "10000000"]);

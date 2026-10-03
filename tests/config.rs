@@ -344,3 +344,39 @@ fn native_content_identity_and_replica_groups_are_validated_and_inherited() {
         "owned-news-v1"
     );
 }
+
+#[test]
+fn rtsp_udp_input_option_is_validated_inherited_and_persisted() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("c.json");
+    let store = ConfigStore::open(&path).unwrap();
+    store
+        .put(
+            "templates",
+            "camera",
+            json!({"inputs":[{"url":"rtsp://camera/live","rtp":"udp"}]}),
+        )
+        .unwrap();
+    store
+        .put(
+            "streams",
+            "owned",
+            json!({"template":"camera","static":false}),
+        )
+        .unwrap();
+    assert_eq!(store.effective("owned").unwrap()["inputs"][0]["rtp"], "udp");
+    for input in [
+        json!({"url":"hls://example/live","rtp":"udp"}),
+        json!({"url":"rtsp://camera/live","rtp":"quic"}),
+        json!({"url":"rtsp://camera/live","rtp":true}),
+    ] {
+        assert!(
+            store
+                .put("streams", "owned", json!({"inputs":[input]}))
+                .is_err()
+        );
+    }
+    drop(store);
+    let store = ConfigStore::open(path).unwrap();
+    assert_eq!(store.effective("owned").unwrap()["inputs"][0]["rtp"], "udp");
+}

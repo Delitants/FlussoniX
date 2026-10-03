@@ -56,6 +56,7 @@ pub struct Lease {
     active: Option<ActivePair>,
     pool: Arc<Pool>,
     peer_rtcp: SocketAddr,
+    client_ports: ClientPorts,
 }
 impl Pool {
     /// Keep every successfully bound socket; failure drops all preceding bindings.
@@ -115,6 +116,7 @@ impl Pool {
                 active: Some(active),
                 pool: self.clone(),
                 peer_rtcp,
+                client_ports: ports,
             }),
             Err(error) => {
                 self.idle.lock().unwrap().push(pair);
@@ -132,6 +134,34 @@ impl Drop for Lease {
     }
 }
 impl Lease {
+    pub fn set_client_ports(&mut self, ports: ClientPorts) -> std::io::Result<()> {
+        if !ports.valid() {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        let pair = self.pair.as_ref().unwrap();
+        let ip = self.peer_rtcp.ip();
+        let connected = pair
+            .rtp
+            .connect(SocketAddr::new(ip, ports.rtp))
+            .and_then(|_| pair.rtcp.connect(SocketAddr::new(ip, ports.rtcp)));
+        if let Err(error) = connected {
+            let _ = pair.rtp.connect(SocketAddr::new(ip, self.client_ports.rtp));
+            let _ = pair.rtcp.connect(self.peer_rtcp);
+            return Err(error);
+        }
+        let mut buffer = [0; 8193];
+        for socket in [&pair.rtp, &pair.rtcp] {
+            let _ = socket.take_error();
+            for _ in 0..64 {
+                if socket.recv_from(&mut buffer).is_err() {
+                    break;
+                }
+            }
+        }
+        self.client_ports = ports;
+        self.peer_rtcp = SocketAddr::new(ip, ports.rtcp);
+        Ok(())
+    }
     pub fn server_ports(&self) -> (u16, u16) {
         let p = self.pair.as_ref().unwrap();
         (

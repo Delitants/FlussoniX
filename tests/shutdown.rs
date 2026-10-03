@@ -137,3 +137,130 @@ async fn optional_rtsp_listener_is_supervised_and_drained_on_sigterm() {
         0
     );
 }
+
+#[path = "support/udp.rs"]
+mod udp_fixture;
+#[tokio::test]
+async fn udp_pool_is_bound_before_workers_and_released_on_sigterm() {
+    let d = tempfile::tempdir().unwrap();
+    let (range, held) = udp_fixture::reserved(4);
+    drop(held);
+    let http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let http_addr = http.local_addr().unwrap();
+    drop(http);
+    let rtsp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let rtsp_addr = rtsp.local_addr().unwrap();
+    drop(rtsp);
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_flussonix"))
+        .args([
+            "--listen",
+            &http_addr.to_string(),
+            "--rtsp-listen",
+            &rtsp_addr.to_string(),
+            "--rtsp-udp-ports",
+            &range.to_string(),
+            "--config",
+        ])
+        .arg(d.path().join("c.json"))
+        .arg("--media-dir")
+        .arg(d.path().join("media"))
+        .env("FLUSSONIX_ADMIN_PASSWORD", "owned-admin")
+        .env("FLUSSONIX_PEER_KEY", "owned-peer-secret")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut ready = false;
+    for _ in 0..100 {
+        if let Ok(mut socket) = tokio::net::TcpStream::connect(rtsp_addr).await {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            socket
+                .write_all(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+                .await
+                .unwrap();
+            let mut reply = [0; 1024];
+            let n = tokio::time::timeout(Duration::from_secs(2), socket.read(&mut reply))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&reply[..n]).starts_with("RTSP/1.0 200"));
+            ready = true;
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "daemon must accept opt-in UDP flags"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(ready);
+    let ports: Vec<u16> = range
+        .to_string()
+        .split('-')
+        .map(|s| s.parse().unwrap())
+        .collect();
+    assert!(std::net::UdpSocket::bind(("127.0.0.1", ports[0])).is_err());
+    assert!(std::net::UdpSocket::bind(("127.0.0.1", ports[1])).is_err());
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-TERM", &child.id().unwrap().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(8), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    for port in ports {
+        assert!(std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok());
+    }
+}
+#[tokio::test]
+async fn occupied_udp_pool_prevents_static_worker_startup() {
+    let d = tempfile::tempdir().unwrap();
+    let (range, mut held) = udp_fixture::reserved(2);
+    let occupied = held.pop().unwrap();
+    drop(held);
+    let http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let http_addr = http.local_addr().unwrap();
+    drop(http);
+    let rtsp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let rtsp_addr = rtsp.local_addr().unwrap();
+    drop(rtsp);
+    let config = d.path().join("c.json");
+    std::fs::write(&config,json!({"streams":[{"name":"owned","static":true,"inputs":[{"url":"testsrc://"}]}],"templates":[],"sources":[],"peers":[],"auth_backends":[]}).to_string()).unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_flussonix"))
+        .args([
+            "--listen",
+            &http_addr.to_string(),
+            "--rtsp-listen",
+            &rtsp_addr.to_string(),
+            "--rtsp-udp-ports",
+            &range.to_string(),
+            "--config",
+        ])
+        .arg(config)
+        .arg("--media-dir")
+        .arg(d.path().join("media"))
+        .env("FLUSSONIX_ADMIN_PASSWORD", "owned-admin")
+        .env("FLUSSONIX_PEER_KEY", "owned-peer-secret")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(3), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert!(!d.path().join("media/owned").exists());
+    drop(occupied);
+}

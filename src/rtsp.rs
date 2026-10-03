@@ -3,10 +3,9 @@ pub mod protocol;
 pub mod udp;
 use crate::{
     playback_auth::ViewerRequest,
-    rtp::Receiver,
+    rtp::{Packet, Receiver},
     server::{App, rtsp_access::Playback},
 };
-use bytes::Bytes;
 use protocol::{Event, Request, Transport};
 use std::{
     collections::{HashMap, VecDeque},
@@ -29,8 +28,21 @@ impl Drop for ReaderTask {
         self.0.abort();
     }
 }
+enum Delivery {
+    Tcp(Transport),
+    Udp {
+        lease: udp::Lease,
+        ports: protocol::ClientPorts,
+    },
+}
+#[derive(Clone)]
+struct UdpOptions {
+    pool: Arc<udp::Pool>,
+    rate: f64,
+}
 struct Sender {
-    transport: Transport,
+    delivery: Delivery,
+    ssrc: u32,
     packets: u32,
     octets: u32,
 }
@@ -40,7 +52,9 @@ struct Session {
     id: String,
     senders: HashMap<u32, Sender>,
     playing: bool,
-    initial: VecDeque<Bytes>,
+    initial: VecDeque<Packet>,
+    pending: Option<Packet>,
+    pacer: Option<udp::Pacer>,
     receiver: Option<Receiver>,
     rtp_info: String,
 }
@@ -66,10 +80,21 @@ pub async fn serve(
     app: Arc<App>,
     cancel: CancellationToken,
 ) -> std::io::Result<()> {
+    serve_with_udp(listener, app, cancel, None, 100.0).await
+}
+pub async fn serve_with_udp(
+    listener: TcpListener,
+    app: Arc<App>,
+    cancel: CancellationToken,
+    pool: Option<Arc<udp::Pool>>,
+    rate: f64,
+) -> std::io::Result<()> {
+    udp::Pacer::new(rate).map_err(std::io::Error::other)?;
+    let udp = pool.map(|pool| UdpOptions { pool, rate });
     let permits = Arc::new(Semaphore::new(256));
     let mut clients = JoinSet::new();
     let result = loop {
-        tokio::select! {biased;_=cancel.cancelled()=>break Ok(()),Some(_)=clients.join_next(),if !clients.is_empty()=>{},accepted=listener.accept()=>{match accepted{Ok((socket,peer))=>{if let Ok(permit)=permits.clone().try_acquire_owned(){let app=app.clone();let cancel=cancel.clone();clients.spawn(async move{let _permit=permit;let _=connection(socket,peer,app,cancel).await;});}},Err(e)=>break Err(e)}}}
+        tokio::select! {biased;_=cancel.cancelled()=>break Ok(()),Some(_)=clients.join_next(),if !clients.is_empty()=>{},accepted=listener.accept()=>{match accepted{Ok((socket,peer))=>{if let Ok(permit)=permits.clone().try_acquire_owned(){let app=app.clone();let cancel=cancel.clone();let udp=udp.clone();clients.spawn(async move{let _permit=permit;let _=connection(socket,peer,app,cancel,udp).await;});}},Err(e)=>break Err(e)}}}
     };
     cancel.cancel();
     let drain = async { while clients.join_next().await.is_some() {} };
@@ -84,7 +109,8 @@ pub async fn serve(
 }
 enum Next {
     Control(Option<Result<Event, protocol::Error>>),
-    Media(Result<Bytes, tokio::sync::broadcast::error::RecvError>),
+    Media(Result<Option<Packet>, tokio::sync::broadcast::error::RecvError>),
+    Feedback(bool),
     Check,
     Report,
     Close,
@@ -94,6 +120,7 @@ async fn connection(
     peer: SocketAddr,
     app: Arc<App>,
     cancel: CancellationToken,
+    udp: Option<UdpOptions>,
 ) -> std::io::Result<()> {
     socket.set_nodelay(true)?;
     let (read, mut write) = socket.into_split();
@@ -120,15 +147,26 @@ async fn connection(
             } else {
                 30
             });
+        let due = match session
+            .as_mut()
+            .and_then(|s| s.pending.as_ref().zip(s.pacer.as_mut()))
+        {
+            Some((packet, pacer)) => {
+                Some(pacer.ready_at(packet.dts, packet.bytes.len() - 4, Instant::now())?)
+            }
+            None => None,
+        };
         let next = {
-            let (playback, initial, receiver, playing) = match session.as_mut() {
+            let (playback, initial, receiver, playing, pending, senders) = match session.as_mut() {
                 Some(s) => (
                     Some(&s.playback),
                     Some(&mut s.initial),
                     Some(&mut s.receiver),
                     s.playing,
+                    s.pending.is_some(),
+                    Some(&s.senders),
                 ),
-                None => (None, None, None, false),
+                None => (None, None, None, false, false, None),
             };
             let grant = async {
                 if let Some(p) = playback {
@@ -146,18 +184,36 @@ async fn connection(
             };
             let media = async {
                 if playing {
+                    if pending {
+                        if let Some(at) = due {
+                            tokio::time::sleep_until(at).await;
+                        }
+                        return Ok(None);
+                    }
                     if let Some(initial) = initial {
-                        if let Some(p) = initial.pop_front() {
-                            return Ok(p);
+                        if let Some(packet) = initial.pop_front() {
+                            return Ok(Some(packet));
                         }
                     }
                     if let Some(Some(rx)) = receiver {
-                        return rx.recv().await;
+                        return rx.recv_timed().await.map(Some);
                     }
                 }
                 std::future::pending().await
             };
-            tokio::select! {biased;_=cancel.cancelled()=>Next::Close,_=grant=>Next::Close,_=closed=>Next::Close,_=tokio::time::sleep_until(deadline)=>Next::Close,event=controls.recv()=>Next::Control(event),_=tick.tick()=>Next::Check,_=reports.tick()=>Next::Report,packet=media=>Next::Media(packet)}
+            let feedback = async {
+                if let Some(senders) = senders {
+                    receive_reports(senders).await
+                } else {
+                    std::future::pending().await
+                }
+            };
+            tokio::select! {biased;
+                _=cancel.cancelled()=>Next::Close,_=grant=>Next::Close,_=closed=>Next::Close,
+                _=tokio::time::sleep_until(deadline)=>Next::Close,
+                event=controls.recv()=>Next::Control(event),_=tick.tick()=>Next::Check,
+                _=reports.tick()=>Next::Report,packet=media=>Next::Media(packet),accepted=feedback=>Next::Feedback(accepted)
+            }
         };
         match next {
             Next::Close => break,
@@ -168,6 +224,8 @@ async fn connection(
                     }
                 }
             }
+            Next::Feedback(true) => last_control = Instant::now(),
+            Next::Feedback(false) => {}
             Next::Control(None) => break,
             Next::Control(Some(Err(error))) => {
                 let _ = bounded_write(
@@ -180,10 +238,11 @@ async fn connection(
                 break;
             }
             Next::Control(Some(Ok(Event::Interleaved(channel, body)))) => {
-                if !session
-                    .as_ref()
-                    .is_some_and(|s| s.senders.values().any(|t| t.transport.rtcp == channel))
-                    || !valid_rtcp(&body)
+                if !session.as_ref().is_some_and(|s| {
+                    s.senders
+                        .values()
+                        .any(|t| matches!(&t.delivery,Delivery::Tcp(p) if p.rtcp==channel))
+                }) || !valid_rtcp(&body)
                 {
                     break;
                 }
@@ -191,7 +250,7 @@ async fn connection(
             }
             Next::Control(Some(Ok(Event::Request(request)))) => {
                 last_control = Instant::now();
-                let reply = tokio::select! {biased;_=cancel.cancelled()=>break,reply=handle(&request,&mut session,&app,peer)=>reply};
+                let reply = tokio::select! {biased;_=cancel.cancelled()=>break,reply=handle(&request,&mut session,&app,peer,udp.as_ref())=>reply};
                 let bytes =
                     protocol::response(reply.code, request.cseq, &reply.headers, &reply.body);
                 bounded_write(&mut write, &bytes, &cancel, session.as_ref()).await?;
@@ -204,41 +263,59 @@ async fn connection(
                 let Some(s) = &mut session else {
                     continue;
                 };
-                let id = u32::from_be_bytes(packet[..4].try_into().unwrap());
-                let Some(sender) = s.senders.get_mut(&id) else {
+                let packet = match packet {
+                    Some(packet) => {
+                        let id = u32::from_be_bytes(packet.bytes[..4].try_into().unwrap());
+                        if !s.senders.contains_key(&id) {
+                            continue;
+                        }
+                        if s.pacer.is_some() {
+                            s.pending = Some(packet);
+                            continue;
+                        }
+                        packet
+                    }
+                    None => s.pending.take().unwrap(),
+                };
+                let id = u32::from_be_bytes(packet.bytes[..4].try_into().unwrap());
+                let Some(sender) = s.senders.get(&id) else {
                     continue;
                 };
-                let rtp = &packet[4..];
-                let mut data = vec![b'$', sender.transport.rtp];
-                data.extend((rtp.len() as u16).to_be_bytes());
-                data.extend(rtp);
-                // Sending is cancelled before draining any queued obsolete generation.
-                bounded_write(&mut write, &data, &cancel, Some(s)).await?;
+                let body = &packet.bytes[4..];
+                let bytes = deliver(sender, &mut write, body, false, &cancel, s).await?;
+                let is_udp = matches!(sender.delivery, Delivery::Udp { .. });
                 let sender = s.senders.get_mut(&id).unwrap();
                 sender.packets = sender.packets.wrapping_add(1);
-                sender.octets = sender.octets.wrapping_add((rtp.len() - 12) as u32);
-                s.playback.grant.add_bytes(data.len());
-                app.rtsp_egress
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+                sender.octets = sender.octets.wrapping_add((body.len() - 12) as u32);
+                if let Some(pacer) = &mut s.pacer {
+                    pacer.sent(body.len(), Instant::now());
+                }
+                s.playback.grant.add_bytes(bytes);
+                app.rtsp_egress.fetch_add(bytes as u64, Ordering::Relaxed);
+                if is_udp {
+                    app.rtsp_udp_egress
+                        .fetch_add(bytes as u64, Ordering::Relaxed);
+                }
             }
             Next::Report => {
                 if let Some(s) = &session {
                     if s.playing {
-                        for t in &s.playback.description.tracks {
-                            if let Some(sender) = s.senders.get(&t.id) {
+                        for track in &s.playback.description.tracks {
+                            if let Some(sender) = s.senders.get(&track.id) {
                                 if sender.packets == 0 {
                                     continue;
                                 }
-                                let stamp = s.playback.worker.wire.rtp.clock(t.id).unwrap_or(0);
+                                let stamp = s.playback.worker.wire.rtp.clock(track.id).unwrap_or(0);
                                 let body =
-                                    sender_report(t.ssrc, stamp, sender.packets, sender.octets);
-                                let mut data = vec![b'$', sender.transport.rtcp];
-                                data.extend((body.len() as u16).to_be_bytes());
-                                data.extend(body);
-                                bounded_write(&mut write, &data, &cancel, Some(s)).await?;
-                                app.rtsp_egress
-                                    .fetch_add(data.len() as u64, Ordering::Relaxed);
-                                s.playback.grant.add_bytes(data.len());
+                                    sender_report(track.ssrc, stamp, sender.packets, sender.octets);
+                                let bytes =
+                                    deliver(sender, &mut write, &body, true, &cancel, s).await?;
+                                app.rtsp_egress.fetch_add(bytes as u64, Ordering::Relaxed);
+                                s.playback.grant.add_bytes(bytes);
+                                if matches!(sender.delivery, Delivery::Udp { .. }) {
+                                    app.rtsp_udp_egress
+                                        .fetch_add(bytes as u64, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
@@ -247,6 +324,61 @@ async fn connection(
         }
     }
     Ok(())
+}
+async fn receive_reports(senders: &HashMap<u32, Sender>) -> bool {
+    async fn receive(lease: &udp::Lease, ssrc: u32) -> bool {
+        let mut buffer = [0; 8193];
+        match lease.recv_rtcp(&mut buffer).await {
+            Ok(Some(n)) => udp::valid_receiver_report(&buffer[..n], ssrc),
+            _ => false,
+        }
+    }
+    let mut tracks = senders
+        .values()
+        .filter_map(|sender| match &sender.delivery {
+            Delivery::Udp { lease, .. } => Some((lease, sender.ssrc)),
+            _ => None,
+        });
+    match (tracks.next(), tracks.next()) {
+        (Some((a, id)), Some((b, other))) => {
+            tokio::select! {result=receive(a,id)=>result,result=receive(b,other)=>result}
+        }
+        (Some((a, id)), None) => receive(a, id).await,
+        _ => std::future::pending().await,
+    }
+}
+async fn deliver<W: tokio::io::AsyncWrite + Unpin>(
+    sender: &Sender,
+    writer: &mut W,
+    body: &[u8],
+    rtcp: bool,
+    cancel: &CancellationToken,
+    session: &Session,
+) -> std::io::Result<usize> {
+    match &sender.delivery {
+        Delivery::Tcp(transport) => {
+            let mut data = vec![b'$', if rtcp { transport.rtcp } else { transport.rtp }];
+            data.extend((body.len() as u16).to_be_bytes());
+            data.extend(body);
+            bounded_write(writer, &data, cancel, Some(session)).await?;
+            Ok(data.len())
+        }
+        Delivery::Udp { lease, .. } => {
+            let send = async {
+                if rtcp {
+                    lease.send_rtcp(body).await
+                } else {
+                    lease.send_rtp(body).await
+                }
+            };
+            let result = tokio::select! {biased;_=cancel.cancelled()=>return Err(std::io::ErrorKind::Interrupted.into()),_=session.playback.grant.cancelled()=>return Err(std::io::ErrorKind::Interrupted.into()),_=session.playback.worker.closed()=>return Err(std::io::ErrorKind::Interrupted.into()),result=tokio::time::timeout(Duration::from_secs(2),send)=>result.unwrap_or_else(|_|Err(std::io::ErrorKind::TimedOut.into()))};
+            let n = result?;
+            if n != body.len() {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            Ok(n)
+        }
+    }
 }
 async fn bounded_write<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
@@ -327,6 +459,7 @@ async fn handle(
     session: &mut Option<Session>,
     app: &Arc<App>,
     peer: SocketAddr,
+    udp: Option<&UdpOptions>,
 ) -> Reply {
     if r.headers.contains_key("require") || r.headers.contains_key("proxy-require") {
         return Reply::code(551);
@@ -381,6 +514,8 @@ async fn handle(
             senders: HashMap::new(),
             playing: false,
             initial: VecDeque::new(),
+            pending: None,
+            pacer: None,
             receiver: None,
             rtp_info: String::new(),
         });
@@ -426,20 +561,35 @@ async fn handle(
         if let Err(code) = bound(s, r, Some(id)) {
             return Reply::code(code);
         }
-        let transport = match r
+        let offer = match r
             .headers
             .get("transport")
             .ok_or(461u16)
-            .and_then(|v| Transport::parse(v))
+            .and_then(|v| protocol::Offer::parse(v))
         {
-            Ok(t) => t,
+            Ok(v) => v,
             Err(code) => return Reply::code(code),
         };
-        if s.senders.iter().any(|(old, t)| {
+        if s.senders.iter().any(|(old, sender)| {
             *old != id
-                && [t.transport.rtp, t.transport.rtcp]
-                    .iter()
-                    .any(|c| *c == transport.rtp || *c == transport.rtcp)
+                && match (&sender.delivery, offer) {
+                    (Delivery::Tcp(a), protocol::Offer::Tcp(b)) => {
+                        [a.rtp, a.rtcp].iter().any(|c| *c == b.rtp || *c == b.rtcp)
+                    }
+                    (Delivery::Udp { ports: a, .. }, protocol::Offer::Udp(b)) => {
+                        [a.rtp, a.rtcp].iter().any(|p| *p == b.rtp || *p == b.rtcp)
+                    }
+                    _ => true,
+                }
+        }) {
+            return Reply::code(461);
+        }
+        if s.senders.get(&id).is_some_and(|sender| {
+            matches!(
+                (&sender.delivery, offer),
+                (Delivery::Tcp(_), protocol::Offer::Udp(_))
+                    | (Delivery::Udp { .. }, protocol::Offer::Tcp(_))
+            )
         }) {
             return Reply::code(461);
         }
@@ -451,27 +601,57 @@ async fn handle(
             .find(|t| t.id == id)
             .unwrap()
             .ssrc;
+        let delivery = match offer {
+            protocol::Offer::Tcp(transport) => Delivery::Tcp(transport),
+            protocol::Offer::Udp(ports) => {
+                let Some(options) = udp else {
+                    return Reply::code(461);
+                };
+                if let Some(Sender {
+                    delivery: Delivery::Udp { lease, ports: old },
+                    ..
+                }) = s.senders.get_mut(&id)
+                {
+                    if lease.set_client_ports(ports).is_err() {
+                        return Reply::code(503);
+                    }
+                    *old = ports;
+                    let mut reply = Reply::code(200);
+                    reply.headers = vec![
+                        session_header(s),
+                        ("Transport", transport_header(&s.senders[&id])),
+                    ];
+                    return reply;
+                }
+                match options.pool.lease(peer.ip(), ports).await {
+                    Ok(lease) => Delivery::Udp { lease, ports },
+                    Err(e) => {
+                        return Reply::code(if e.kind() == std::io::ErrorKind::WouldBlock {
+                            453
+                        } else {
+                            503
+                        });
+                    }
+                }
+            }
+        };
         s.senders.insert(
             id,
             Sender {
-                transport,
+                delivery,
                 packets: 0,
                 octets: 0,
+                ssrc,
             },
         );
         let mut reply = Reply::code(200);
         reply.headers = vec![
             session_header(s),
-            (
-                "Transport",
-                format!(
-                    "RTP/AVP/TCP;unicast;interleaved={}-{};ssrc={ssrc:08X}",
-                    transport.rtp, transport.rtcp
-                ),
-            ),
+            ("Transport", transport_header(&s.senders[&id])),
         ];
         return reply;
     }
+
     if !session_matches(s, r) {
         return Reply::code(454);
     }
@@ -508,7 +688,18 @@ async fn handle(
                 })
                 .collect::<Vec<_>>()
                 .join(",");
-            s.initial = snapshot.packets.into();
+            s.initial = snapshot
+                .packets
+                .into_iter()
+                .zip(snapshot.decode_times)
+                .map(|(bytes, dts)| Packet { bytes, dts })
+                .collect();
+            if s.senders
+                .values()
+                .any(|sender| matches!(sender.delivery, Delivery::Udp { .. }))
+            {
+                s.pacer = Some(udp::Pacer::new(udp.unwrap().rate).unwrap());
+            }
             s.receiver = Some(snapshot.receiver);
             s.playback.attach();
             s.playing = true;
@@ -528,6 +719,24 @@ async fn handle(
         reply.close = true;
     }
     reply
+}
+fn transport_header(sender: &Sender) -> String {
+    match &sender.delivery {
+        Delivery::Tcp(t) => format!(
+            "RTP/AVP/TCP;unicast;interleaved={}-{};ssrc={:08X}",
+            t.rtp, t.rtcp, sender.ssrc
+        ),
+        Delivery::Udp { ports, lease } => {
+            let (a, b) = lease.server_ports();
+            format!(
+                "RTP/AVP/UDP;unicast;client_port={}-{};server_port={a}-{b};source={};ssrc={:08X}",
+                ports.rtp,
+                ports.rtcp,
+                lease.source_ip(),
+                sender.ssrc
+            )
+        }
+    }
 }
 fn valid_rtcp(body: &[u8]) -> bool {
     let mut cursor = 0;

@@ -9,6 +9,12 @@ struct Args {
     /// Optional RTSP/1.0 TCP playback listener (disabled by default).
     #[arg(long)]
     rtsp_listen: Option<SocketAddr>,
+    /// Opt-in inclusive UDP RTP/RTCP port range (even-first/odd-last, 2..256 ports).
+    #[arg(long, requires = "rtsp_listen")]
+    rtsp_udp_ports: Option<flussonix::rtsp::udp::PortRange>,
+    /// Per-viewer RTP application-data cap in Mbps (1..10000; default 100).
+    #[arg(long, requires = "rtsp_udp_ports")]
+    rtsp_udp_mbps: Option<f64>,
     #[arg(long, default_value = "config.json")]
     config: PathBuf,
     #[arg(long, default_value = "runtime/media")]
@@ -46,6 +52,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let a = Args::parse();
+    let udp_rate = a.rtsp_udp_mbps.unwrap_or(100.0);
+    flussonix::rtsp::udp::Pacer::new(udp_rate)?;
     let options = Options {
         admin_user: a.admin_user,
         admin_password: a.admin_password,
@@ -67,18 +75,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
         None => None,
     };
+    let udp_pool = match (a.rtsp_udp_ports, rtsp_listener.as_ref()) {
+        (Some(range), Some(listener)) => {
+            Some(flussonix::rtsp::udp::Pool::bind(listener.local_addr()?.ip(), range).await?)
+        }
+        _ => None,
+    };
     println!(
         "{}",
-        serde_json::json!({"service":"FlussoniX","listen":listener.local_addr()?.to_string(),"rtsp_listen":rtsp_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"version":env!("CARGO_PKG_VERSION")})
+        serde_json::json!({"service":"FlussoniX","listen":listener.local_addr()?.to_string(),"rtsp_listen":rtsp_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"rtsp_udp_ports":a.rtsp_udp_ports.map(|p|p.to_string()),"rtsp_udp_mbps":a.rtsp_udp_ports.map(|_|udp_rate),"version":env!("CARGO_PKG_VERSION")})
     );
     app.reconcile().await;
     let background = app.clone();
     let cancel = tokio_util::sync::CancellationToken::new();
     let mut rtsp_task = rtsp_listener.map(|listener| {
-        tokio::spawn(flussonix::rtsp::serve(
+        tokio::spawn(flussonix::rtsp::serve_with_udp(
             listener,
             app.clone(),
             cancel.clone(),
+            udp_pool,
+            udp_rate,
         ))
     });
     let bg_cancel = cancel.clone();

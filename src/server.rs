@@ -92,6 +92,7 @@ pub struct App {
     reservations: Mutex<HashMap<String, Reservation>>,
     pub egress: Arc<AtomicU64>,
     pub rtsp_egress: Arc<AtomicU64>,
+    pub rtsp_udp_egress: Arc<AtomicU64>,
     telemetry: crate::telemetry::Sampler,
     pub started: Instant,
     mirrors: Mutex<HashMap<String, Mirror>>,
@@ -139,6 +140,7 @@ impl App {
             reservations: Mutex::new(HashMap::new()),
             egress: Arc::new(AtomicU64::new(0)),
             rtsp_egress: Arc::new(AtomicU64::new(0)),
+            rtsp_udp_egress: Arc::new(AtomicU64::new(0)),
             telemetry: crate::telemetry::Sampler::new(&options.uplink_interface)?,
             started: Instant::now(),
             mirrors: Mutex::new(HashMap::new()),
@@ -274,6 +276,7 @@ impl App {
             streams.push(json!({"name":name,"ready":self.media.ready(&name).await,"stats":self.stream_stats(&name).await}));
         }
         let mut metrics = self.telemetry.snapshot(self.options.uplink_mbps);
+        metrics["rtsp_udp_bytes_out"] = json!(self.rtsp_udp_egress.load(Ordering::Relaxed));
         let mut reservations = self.reservations.lock().await;
         reservations.retain(|_, v| v.expires > Instant::now());
         let reserved = reservations.len() as u64;

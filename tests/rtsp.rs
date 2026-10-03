@@ -215,6 +215,9 @@ async fn setup_binds_session_stream_token_and_channel_pairs() {
     app.media.stop_all().await;
 }
 async fn decode(url: &str) -> std::process::Output {
+    decode_transport(url, "tcp").await
+}
+async fn decode_transport(url: &str, transport: &str) -> std::process::Output {
     tokio::time::timeout(
         Duration::from_secs(25),
         tokio::process::Command::new("ffmpeg")
@@ -223,7 +226,7 @@ async fn decode(url: &str) -> std::process::Output {
                 "-v",
                 "error",
                 "-rtsp_transport",
-                "tcp",
+                transport,
                 "-i",
                 url,
                 "-t",
@@ -513,5 +516,460 @@ async fn long_stream_name_can_setup_its_advertised_track() {
     );
     cancel.cancel();
     task.await.unwrap().unwrap();
+    app.media.stop_all().await;
+}
+
+#[path = "support/udp.rs"]
+mod udp_fixture;
+async fn fixture_udp(
+    role: &str,
+    pairs: u16,
+    rate: f64,
+) -> (
+    tempfile::TempDir,
+    Arc<App>,
+    String,
+    CancellationToken,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+    Arc<rtsp::udp::Pool>,
+) {
+    let d = tempfile::tempdir().unwrap();
+    let app = App::new(
+        d.path().join("c.json"),
+        d.path().join("media"),
+        Options {
+            admin_password: "owned-admin".into(),
+            peer_key: "owned-peer-secret".into(),
+            role: role.into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    app.config.put("streams","owned",json!({"static":false,"inputs":[{"url":"testsrc://"}],"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"owned-token"))})).unwrap();
+    let (range, held) = udp_fixture::reserved(pairs * 2);
+    drop(held);
+    let pool = rtsp::udp::Pool::bind("127.0.0.1".parse().unwrap(), range)
+        .await
+        .unwrap();
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("rtsp://{}/owned", l.local_addr().unwrap());
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(rtsp::serve_with_udp(
+        l,
+        app.clone(),
+        cancel.clone(),
+        Some(pool.clone()),
+        rate,
+    ));
+    (d, app, url, cancel, task, pool)
+}
+fn udp_clients(count: u16) -> Vec<tokio::net::UdpSocket> {
+    let (_, held) = udp_fixture::reserved(count);
+    held.into_iter()
+        .map(|s| {
+            s.set_nonblocking(true).unwrap();
+            tokio::net::UdpSocket::from_std(s).unwrap()
+        })
+        .collect()
+}
+async fn describe_tracks(s: &mut BufReader<TcpStream>, url: &str) -> Vec<String> {
+    let (code, _, body) = request(s, "DESCRIBE", &format!("{url}?token=owned-token"), "").await;
+    assert_eq!(code, 200);
+    String::from_utf8(body)
+        .unwrap()
+        .lines()
+        .filter_map(|l| l.strip_prefix("a=control:trackID=").map(str::to_owned))
+        .collect()
+}
+async fn setup_udp(
+    s: &mut BufReader<TcpStream>,
+    url: &str,
+    id: &str,
+    client: &tokio::net::UdpSocket,
+    session_id: Option<&str>,
+) -> (u16, String, Vec<u8>) {
+    let port = client.local_addr().unwrap().port();
+    let h = format!(
+        "Transport: RTP/AVP;unicast;client_port={port}-{}\r\n{}",
+        port + 1,
+        session_id
+            .map(|id| format!("Session: {id}\r\n"))
+            .unwrap_or_default()
+    );
+    request(s, "SETUP", &format!("{url}/trackID={id}"), &h).await
+}
+#[tokio::test]
+async fn udp_pool_and_track_binding_survive_failed_replacement_and_teardown() {
+    let (_d, app, url, c, t, pool) = fixture_udp("standalone", 2, 100.0).await;
+    let clients = udp_clients(6);
+    let mut a = connect(&url).await;
+    let tracks = describe_tracks(&mut a, &url).await;
+    let (code, h, _) = setup_udp(&mut a, &url, &tracks[0], &clients[0], None).await;
+    assert_eq!(code, 200);
+    let id = session(&h);
+    assert!(h.contains("server_port="));
+    assert!(h.contains("source=127.0.0.1"));
+    assert_eq!(
+        setup_udp(&mut a, &url, &tracks[1], &clients[0], Some(&id))
+            .await
+            .0,
+        461
+    );
+    assert_eq!(
+        request(
+            &mut a,
+            "SETUP",
+            &format!("{url}/trackID={}", tracks[1]),
+            &format!("Session: {id}\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n")
+        )
+        .await
+        .0,
+        461
+    );
+    assert_eq!(
+        setup_udp(&mut a, &url, &tracks[1], &clients[2], Some(&id))
+            .await
+            .0,
+        200
+    );
+    let mut b = connect(&url).await;
+    let other = describe_tracks(&mut b, &url).await;
+    assert_eq!(
+        setup_udp(&mut b, &url, &other[0], &clients[0], None)
+            .await
+            .0,
+        453
+    );
+    // Replacing the same track succeeds even with every pair occupied.
+    assert_eq!(
+        setup_udp(&mut a, &url, &tracks[0], &clients[4], Some(&id))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        request(&mut a, "TEARDOWN", &url, &format!("Session: {id}\r\n"))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        setup_udp(&mut b, &url, &other[0], &clients[0], None)
+            .await
+            .0,
+        200
+    );
+    drop(b);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let p = clients[0].local_addr().unwrap().port();
+    let one = pool
+        .lease(
+            "127.0.0.1".parse().unwrap(),
+            rtsp::protocol::ClientPorts {
+                rtp: p,
+                rtcp: p + 1,
+            },
+        )
+        .await
+        .unwrap();
+    let two = pool
+        .lease(
+            "127.0.0.1".parse().unwrap(),
+            rtsp::protocol::ClientPorts {
+                rtp: p,
+                rtcp: p + 1,
+            },
+        )
+        .await
+        .unwrap();
+    drop(one);
+    drop(two);
+    c.cancel();
+    t.await.unwrap().unwrap();
+    app.media.stop_all().await;
+}
+#[tokio::test]
+async fn udp_denial_precedes_workers_and_play_precedes_any_datagram() {
+    let (_d, app, url, c, t, _pool) = fixture_udp("standalone", 1, 100.0).await;
+    let clients = udp_clients(2);
+    let mut s = connect(&url).await;
+    assert_eq!(request(&mut s, "DESCRIBE", &url, "").await.0, 403);
+    assert_eq!(app.media.count().await, 0);
+    assert_eq!(
+        request(
+            &mut s,
+            "SETUP",
+            &format!("{url}/trackID=1"),
+            "Transport: RTP/AVP;unicast;client_port=20000-20001\r\n"
+        )
+        .await
+        .0,
+        454
+    );
+    let tracks = describe_tracks(&mut s, &url).await;
+    let (code, h, _) = setup_udp(&mut s, &url, &tracks[0], &clients[0], None).await;
+    assert_eq!(code, 200);
+    let id = session(&h);
+    let mut packet = [0; 1500];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), clients[0].recv(&mut packet))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        request(&mut s, "PLAY", &url, &format!("Session: {id}\r\n"))
+            .await
+            .0,
+        200
+    );
+    let n = tokio::time::timeout(Duration::from_secs(3), clients[0].recv(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(n >= 12);
+    assert_eq!(packet[0] >> 6, 2);
+    assert_ne!(packet[0], b'$');
+    c.cancel();
+    t.await.unwrap().unwrap();
+    app.media.stop_all().await;
+}
+#[tokio::test]
+async fn udp_and_tcp_clients_decode_both_tracks_using_one_worker() {
+    let (_d, app, url, c, t, _pool) = fixture_udp("standalone", 4, 100.0).await;
+    let playback = format!("{url}?token=owned-token");
+    let (a, b, tcp) = tokio::join!(
+        decode_transport(&playback, "udp"),
+        decode_transport(&playback, "udp"),
+        decode(&playback)
+    );
+    assert_decoded(&a);
+    assert_decoded(&b);
+    assert_decoded(&tcp);
+    assert_eq!(app.media.count().await, 1);
+    assert!(app.rtsp_udp_egress.load(Ordering::Relaxed) > 100000);
+    assert!(app.rtsp_egress.load(Ordering::Relaxed) > app.rtsp_udp_egress.load(Ordering::Relaxed));
+    let worker = app
+        .media
+        .ensure("owned", &app.config.effective("owned").unwrap())
+        .await
+        .unwrap();
+    for _ in 0..20 {
+        if worker.viewers.load(Ordering::Relaxed) == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(worker.viewers.load(Ordering::Relaxed), 0);
+    c.cancel();
+    t.await.unwrap().unwrap();
+    app.media.stop_all().await;
+}
+#[tokio::test]
+async fn udp_input_repackages_both_tracks_into_independently_decoded_hls() {
+    let (_d, app, url, c, t, _pool) = fixture_udp("standalone", 2, 100.0).await;
+    let d = tempfile::tempdir().unwrap();
+    let relay = flussonix::media::Engine::new(d.path(), "ffmpeg");
+    let worker = relay
+        .ensure(
+            "roundtrip",
+            &json!({"inputs":[{"url":format!("{url}?token=owned-token"),"rtp":"udp"}]}),
+        )
+        .await
+        .unwrap();
+    let mut path = None;
+    for _ in 0..180 {
+        if let Ok(data) = relay.read("roundtrip", "index.m3u8").await {
+            if let Some(name) = String::from_utf8_lossy(&data)
+                .lines()
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+            {
+                path = Some(name.to_owned());
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        path.is_some(),
+        "UDP input should produce HLS: {}",
+        worker.stats()
+    );
+    let media = relay.read("roundtrip", &path.unwrap()).await.unwrap();
+    let file = d.path().join("decode.ts");
+    std::fs::write(&file, media).unwrap();
+    let output = tokio::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(file)
+        .args([
+            "-map", "0:v:0", "-map", "0:a:0", "-threads", "1", "-f", "framemd5", "-",
+        ])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert_decoded(&output);
+    assert!(
+        app.rtsp_udp_egress.load(Ordering::Relaxed) > 100000,
+        "rtp=udp must select UDP, not TCP"
+    );
+    relay.stop_all().await;
+    c.cancel();
+    t.await.unwrap().unwrap();
+    app.media.stop_all().await;
+}
+#[tokio::test]
+async fn cdn_udp_output_reuses_private_m4s_and_m4f_pulls() {
+    for transport in ["m4s", "m4f"] {
+        let (_sd, source, _url, sc, st) = fixture("source").await;
+        let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", http.local_addr().unwrap());
+        let source_app = source.clone();
+        let ht = tokio::spawn(async move {
+            axum::serve(http, flussonix::server::router(source_app))
+                .await
+                .unwrap()
+        });
+        let (_cd, cdn, url, cc, ct, _pool) = fixture_udp("cdn", 2, 100.0).await;
+        cdn.config.delete("streams", "owned").unwrap();
+        cdn.config.put("sources","origin",json!({"api_url":endpoint,"private_payload_url":endpoint,"flussonix_transport":transport})).unwrap();
+        assert_decoded(&decode_transport(&format!("{url}?token=owned-token"), "udp").await);
+        assert_eq!(cdn.media.stats("owned").await["input_protocol"], transport);
+        assert!(cdn.rtsp_udp_egress.load(Ordering::Relaxed) > 100000);
+        cc.cancel();
+        ct.await.unwrap().unwrap();
+        cdn.media.stop_all().await;
+        sc.cancel();
+        st.await.unwrap().unwrap();
+        source.media.stop_all().await;
+        ht.abort();
+    }
+}
+#[tokio::test]
+async fn paced_udp_waits_keep_control_responsive_and_revocation_stops_counted_media() {
+    let (_d, app, url, c, t, pool) = fixture_udp("standalone", 1, 1.0).await;
+    let clients = udp_clients(2);
+    let mut s = connect(&url).await;
+    let tracks = describe_tracks(&mut s, &url).await;
+    let (code, h, _) = setup_udp(&mut s, &url, &tracks[0], &clients[0], None).await;
+    assert_eq!(code, 200);
+    let id = session(&h);
+    assert_eq!(
+        request(&mut s, "PLAY", &url, &format!("Session: {id}\r\n"))
+            .await
+            .0,
+        200
+    );
+    let mut data = [0; 1500];
+    let mut received = tokio::time::timeout(Duration::from_secs(3), clients[0].recv(&mut data))
+        .await
+        .unwrap()
+        .unwrap();
+    let worker = app
+        .media
+        .ensure("owned", &app.config.effective("owned").unwrap())
+        .await
+        .unwrap();
+    let mut decoder = flussonix::m4s::Decoder::default();
+    let (track, _) = worker.wire.m4s_subscribe();
+    let target = tracks[0].parse::<u32>().unwrap();
+    let mut injected = false;
+    for wire in track {
+        for event in decoder.push(&wire).unwrap() {
+            if let flussonix::m4s::Event::Frame {
+                track_id,
+                dts,
+                pts_offset,
+                key,
+                body,
+                ..
+            } = event
+            {
+                if track_id == target {
+                    worker.wire.rtp.frame(&flussonix::m4f::Frame {
+                        track_id,
+                        dts: dts + 9_000_000,
+                        pts_offset,
+                        key,
+                        body,
+                    });
+                    injected = true;
+                    break;
+                }
+            }
+        }
+        if injected {
+            break;
+        }
+    }
+    assert!(injected, "use a real encoded AU for the long paced wait");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for _ in 0..64 {
+        clients[1]
+            .send_to(
+                &[0x80, 201, 0, 0],
+                (
+                    "127.0.0.1",
+                    h.split("server_port=")
+                        .nth(1)
+                        .unwrap()
+                        .split('-')
+                        .nth(1)
+                        .unwrap()
+                        .split(';')
+                        .next()
+                        .unwrap()
+                        .trim()
+                        .parse::<u16>()
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            request(&mut s, "GET_PARAMETER", &url, &format!("Session: {id}\r\n"))
+        )
+        .await
+        .unwrap()
+        .0,
+        200
+    );
+    let auth = app.playback_auth.snapshots()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(app.playback_auth.revoke(&auth));
+    let mut control = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut control))
+        .await
+        .unwrap()
+        .unwrap();
+    while let Ok(Ok(n)) =
+        tokio::time::timeout(Duration::from_millis(30), clients[0].recv(&mut data)).await
+    {
+        received += n;
+    }
+    assert_eq!(app.rtsp_udp_egress.load(Ordering::Relaxed), received as u64);
+    assert_eq!(
+        app.playback_auth.snapshot(&auth).unwrap()["bytes"],
+        received as u64
+    );
+    assert_eq!(worker.viewers.load(Ordering::Relaxed), 0);
+    let p = clients[0].local_addr().unwrap().port();
+    let lease = pool
+        .lease(
+            "127.0.0.1".parse().unwrap(),
+            rtsp::protocol::ClientPorts {
+                rtp: p,
+                rtcp: p + 1,
+            },
+        )
+        .await
+        .unwrap();
+    drop(lease);
+    c.cancel();
+    t.await.unwrap().unwrap();
     app.media.stop_all().await;
 }

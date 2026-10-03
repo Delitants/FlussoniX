@@ -374,12 +374,16 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     for input in inputs {
                         if input
                             .as_object()
-                            .is_none_or(|v| v.keys().any(|k| k != "url"))
+                            .is_none_or(|v| v.keys().any(|k| k != "url" && k != "rtp"))
                         {
-                            return Err("only input url is implemented".into());
+                            return Err("only input url and RTSP rtp=udp are implemented".into());
                         }
                         let u = input["url"].as_str().ok_or("input url required")?;
                         let scheme = u.split("://").next().unwrap_or("");
+                        if input.get("rtp").is_some() && (scheme != "rtsp" || input["rtp"] != "udp")
+                        {
+                            return Err("rtp input option requires RTSP and value udp".into());
+                        }
                         if ![
                             "testsrc", "http", "https", "hls", "hlss", "tshttp", "tshttps", "rtsp",
                             "srt", "m4s", "m4ss", "m4f", "m4fs",
