@@ -2,7 +2,7 @@
 
 An independently written Rust media server with a React admin interface and a Flussonic v3 API compatibility layer.
 
-**Status: v0.8 preview, for testing. It is not a complete Flussonic replacement or migration-ready release.**
+**Status: v0.9 preview, for testing. It is not a complete Flussonic replacement or migration-ready release.**
 
 This build implements persisted Streams/Templates configuration, authenticated management, playback authorization, CPU transcoding, shared stream workers, native source/CDN discovery and an adaptive HTTP redirect balancer. M4F and M4S have independent wire adapters for the qualified H.264/AAC subset. Generic fMP4 HLS remains a separate format.
 
@@ -10,14 +10,20 @@ This build implements persisted Streams/Templates configuration, authenticated m
 |---|---|
 | Admin UI | Labeled forms for Streams, Templates, Config and Cluster; staged validation/apply; no JSON input required |
 | API | `/streamer/api/v3` subset; CRUD, partial updates, reset, inheritance, validation without applying, collection cursors |
-| Authentication | Separate edit/view credentials; Basic and legacy base64 Bearer; structured/string `on_play` callbacks; scheduled renewal, revocation and local limits across streams; separate peer key |
-| Input | HLS/HLSS, TSHTTP/TSHTTPS, M4S AVC/AAC frame and packed-GOP modes, M4F single-chunk AVC/AAC sample tables; RTSP pull, verified RTSPS TCP pull and SRT receive adapters |
+| Authentication | Separate edit/view credentials; Basic and legacy base64 Bearer; structured/string `on_play` callbacks; scheduled viewer renewal, revocation and local limits across streams; publication password and POST on_publish renewal; separate peer key |
+| Input | HLS/HLSS, TSHTTP/TSHTTPS, M4S AVC/AAC frame and packed-GOP modes, M4F single-chunk AVC/AAC sample tables; HTTP MPEG-TS publication to publish:// streams; RTSP pull, verified RTSPS TCP pull and SRT receive adapters |
 | Output | HLS with TS or fMP4 segments, HTTP MPEG-TS, Original M4S frame/GOP relay, generated frame output; M4F signals with original or generated live segments; optional RTSP 1.0 TCP-interleaved or opt-in unicast UDP H.264/AAC-LC playback; optional RTSPS TLS TCP playback |
 | Recovery | Startup/media watchdog, capped retries through ordered inputs, background local/CDN recovery, new HLS sequences/segment/init identities after restart |
 | Transcoding | One supervised FFmpeg worker per stream; CPU H.264/AAC; `h264_nvenc` configuration requires NVIDIA hardware and runtime |
 | Native cluster | Separate public/private endpoints, source discovery, explicit equivalent-origin failover, LAN pull, uplink/CPU/RAM selection, readiness, drain/stale exclusion, expiring capacity reservations |
 
-Required later work includes complete API/schema parity; Flussonic cluster discovery and credential compatibility; additional M4 codec/metadata modes; publisher authentication; RTSP publication/push and Basic/Digest viewer authentication; RTSPS publication/push and SRTP-protected UDP; direct RTP/SRTP inbound and outbound; SRT output/push; HTTPS serving or reverse-proxy integration; full transcoder profiles, GPU qualification, DVR, distributed session ownership and complete failure/scale qualification. Unsupported saved options return errors. See [qualification](docs/qualification.md) for evidence and limits.
+Required later work includes complete API/schema parity; Flussonic cluster discovery and credential compatibility; additional M4 codec/metadata modes; full publisher policy/session parity; RTSP publication/push and Basic/Digest viewer authentication; RTSPS publication/push and SRTP-protected UDP; direct RTP/SRTP inbound and outbound; SRT output/push; HTTPS serving or reverse-proxy integration; full transcoder profiles, GPU qualification, DVR, distributed session ownership and complete failure/scale qualification. Unsupported saved options return errors. See [qualification](docs/qualification.md) for evidence and limits.
+
+## Publication preview
+
+Choose **Receive a publication** in Streams or Templates. Set an optional **Publisher password** and **Publisher authorization** URL or named backend using normal fields. Publish MPEG-TS with HTTP POST to `http://HOST:PORT/STREAM/mpegts?password=PUBLISHER_PASSWORD&token=PUBLISHER_TOKEN`. Viewer tokens and peer/management credentials remain separate. Empty publication streams wait without starting FFmpeg; one connected publisher owns the worker, and disconnects or changed policy stop it. Reconnects are immediate.
+
+The callback receives documented publication JSON metadata with a stable session UUID, request counter, protocol, socket IP, original query and received bytes. Only HTTP 200 allows; redirects, failures and failed renewals deny. Renewal honors `X-AuthDuration` (1–3600 seconds, default30). This static HTTP H.264/AAC-LC receiving profile feeds HLS, fMP4 HLS, MPEG-TS, native M4F/M4S and the existing RTSP packetizer; CPU transcoding is exercised. HTTPS receiving needs a separately configured TLS terminator. Full publisher policy objects, user/global limits, dynamic prefix publications and other publishing protocols remain pending. See [publication profile and limits](docs/publishing.md).
 
 ## RTSPS preview
 

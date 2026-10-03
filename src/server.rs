@@ -97,6 +97,7 @@ pub struct App {
     pub started: Instant,
     mirrors: Mutex<HashMap<String, Mirror>>,
     source_queries: tokio::sync::Semaphore,
+    publishers: tokio::sync::Semaphore,
     source_lookups: Mutex<HashMap<String, origin_resolution::Ticket>>,
 }
 impl App {
@@ -145,6 +146,7 @@ impl App {
             started: Instant::now(),
             mirrors: Mutex::new(HashMap::new()),
             source_queries: tokio::sync::Semaphore::new(64),
+            publishers: tokio::sync::Semaphore::new(64),
             source_lookups: Mutex::new(HashMap::new()),
         });
         app.sample_metrics();
@@ -592,7 +594,7 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
     }
     if tail == "capabilities" && request.method() == "GET" {
         return json_response(
-            json!({"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","rtsps (verified TLS, interleaved TCP)","srt","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["hls","mpegts","fmp4-hls","rtsp (TCP / opt-in unicast UDP playback, H.264/AAC-LC)","rtsps (opt-in TLS TCP playback, H.264/AAC-LC)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["direct rtp","srtp","rtsp publication / push","rtsp Basic / Digest viewer auth","dvr","push"],"transcoding":{"cpu":"libx264 / AAC","gpu":"h264_nvenc, requires supported NVIDIA hardware and runtime"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP redirects"}),
+            json!({"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","rtsps (verified TLS, interleaved TCP)","srt","publish:// (HTTP MPEG-TS receive)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["hls","mpegts","fmp4-hls","rtsp (TCP / opt-in unicast UDP playback, H.264/AAC-LC)","rtsps (opt-in TLS TCP playback, H.264/AAC-LC)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["direct rtp","srtp","rtsp publication / push","rtsp Basic / Digest viewer auth","dvr","push"],"transcoding":{"cpu":"libx264 / AAC","gpu":"h264_nvenc, requires supported NVIDIA hardware and runtime"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP redirects"}),
         );
     }
     if let Some(name) = tail.strip_prefix("stream/") {
@@ -761,6 +763,8 @@ async fn balance(
 async fn media_request(State(app): State<Arc<App>>, request: Request) -> Response {
     let mut response = if request.method() == "OPTIONS" {
         StatusCode::NO_CONTENT.into_response()
+    } else if request.method() == "POST" {
+        publication::receive(app, request).await
     } else {
         serve_media_request(app, request).await
     };
@@ -771,7 +775,7 @@ async fn media_request(State(app): State<Arc<App>>, request: Request) -> Respons
     );
     headers.insert(
         "access-control-allow-methods",
-        axum::http::HeaderValue::from_static("GET, OPTIONS"),
+        axum::http::HeaderValue::from_static("GET, POST, OPTIONS"),
     );
     headers.insert(
         "access-control-allow-headers",
@@ -1185,3 +1189,5 @@ mod continuous_session_tests {
 mod origin_resolution;
 
 pub(crate) mod rtsp_access;
+
+mod publication;

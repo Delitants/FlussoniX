@@ -222,6 +222,26 @@ impl Engine {
         tokio::fs::create_dir_all(dir.join("fmp4"))
             .await
             .map_err(|e| e.to_string())?;
+        // Published MPEG-TS can provoke diagnostics during format probing.
+        // Give binary wire media its own connection, isolated from stderr.
+        let publish_wire = if publication {
+            Some(
+                tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .map_err(|_| "cannot bind publication wire pipe")?,
+            )
+        } else {
+            None
+        };
+        let wire_target = match &publish_wire {
+            Some(listener) => format!(
+                "tcp://{}",
+                listener
+                    .local_addr()
+                    .map_err(|_| "publication wire address unavailable")?
+            ),
+            None => "pipe:2".into(),
+        };
         let mut cmd = Command::new(&self.ffmpeg);
         cmd.args([
             "-hide_banner",
@@ -254,6 +274,10 @@ impl Engine {
             cmd.args([
                 "-protocol_whitelist",
                 "pipe",
+                "-probesize",
+                "1048576",
+                "-analyzeduration",
+                "1000000",
                 "-f",
                 "mpegts",
                 "-i",
@@ -338,8 +362,22 @@ impl Engine {
             }
         }
         // One encode/mux source feeds both HLS variants and shared live TS fan-out.
+        let copy_publication = publication
+            && (cfg.get("transcoder").is_none() || cfg["transcoder"]["encoder"] == "copy");
+        let wire_output = if copy_publication {
+            String::new()
+        } else {
+            format!(
+                "|[onfail=ignore:f=flv:flvflags=no_duration_filesize:bsfs/a=aac_adtstoasc]{wire_target}"
+            )
+        };
+        let fmp4_filter = if copy_publication {
+            ":bsfs/a=aac_adtstoasc"
+        } else {
+            ""
+        };
         let output = format!(
-            "[f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_filename={}:hls_flags=delete_segments+temp_file{discontinuity}]{}|[f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_type=fmp4:hls_segment_filename={}:hls_fmp4_init_filename=g{generation}_init.mp4:hls_flags=delete_segments+temp_file{discontinuity}]{}|[f=mpegts]pipe:1|[onfail=ignore:f=flv:flvflags=no_duration_filesize:bsfs/a=aac_adtstoasc]pipe:2",
+            "[f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_filename={}:hls_flags=delete_segments+temp_file{discontinuity}]{}|[f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_type=fmp4:hls_segment_filename={}:hls_fmp4_init_filename=g{generation}_init.mp4:hls_flags=delete_segments+temp_file{discontinuity}{fmp4_filter}]{}|[f=mpegts]pipe:1{wire_output}",
             dir.join(format!("g{generation}_%d.ts")).display(),
             dir.join("index.m3u8").display(),
             dir.join("fmp4")
@@ -347,8 +385,28 @@ impl Engine {
                 .display(),
             dir.join("fmp4/index.m3u8").display()
         );
-        cmd.args(["-threads", "2", "-f", "tee", &output])
-            .stdout(std::process::Stdio::piped())
+        cmd.args(["-threads", "2", "-f", "tee", &output]);
+        if copy_publication {
+            // tee stream-copy retains the MPEG-TS codec tag even with -tag:v 0,
+            // which FLV rejects. A separate copy mux chooses FLV's own tags;
+            // the input is still demuxed once and no extra encode occurs.
+            cmd.args([
+                "-map",
+                "0:v:0?",
+                "-map",
+                "0:a:0?",
+                "-c",
+                "copy",
+                "-bsf:a",
+                "aac_adtstoasc",
+                "-f",
+                "flv",
+                "-flvflags",
+                "no_duration_filesize",
+                &wire_target,
+            ]);
+        }
+        cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         let mut child = cmd
@@ -388,10 +446,45 @@ impl Engine {
         });
         let original_wire = (m4s_input || m4f_input)
             && (cfg.get("transcoder").is_none() || cfg["transcoder"]["encoder"] == "copy");
-        if let Some(mut flv) = child.stderr.take() {
+        let mut stderr = child.stderr.take();
+        if publish_wire.is_some() {
+            if let Some(mut stderr) = stderr.take() {
+                let c = cancel.clone();
+                tokio::spawn(async move {
+                    let mut buffer = [0; 16384];
+                    loop {
+                        match tokio::select! { biased; _=c.cancelled()=>break, r=stderr.read(&mut buffer)=>r }
+                        {
+                            Ok(n) if n > 0 => {
+                                tracing::warn!("publication packager reported a diagnostic")
+                            }
+                            _ => break,
+                        }
+                    }
+                });
+            }
+        }
+        if publish_wire.is_some() || stderr.is_some() {
             let w = worker.clone();
             let c = cancel.clone();
             tokio::spawn(async move {
+                let mut flv: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if let Some(listener) =
+                    publish_wire
+                {
+                    let accepted = tokio::select! { biased; _=c.cancelled()=>return, r=tokio::time::timeout(Duration::from_secs(8),listener.accept())=>r };
+                    match accepted {
+                        Ok(Ok((socket, _))) => Box::new(socket),
+                        _ => {
+                            w.failed("wire_setup_failed");
+                            c.cancel();
+                            return;
+                        }
+                    }
+                } else if let Some(pipe) = stderr {
+                    Box::new(pipe)
+                } else {
+                    return;
+                };
                 let mut decoder = FlvDecoder::default();
                 let mut buffer = vec![0u8; 16384];
                 loop {
