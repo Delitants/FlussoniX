@@ -829,7 +829,7 @@ pub fn translate_input(input: &str) -> Result<String, String> {
 }
 
 pub fn media_signature(cfg: &Value) -> String {
-    format!("{:x}",Sha256::digest(serde_json::to_vec(&json!({"inputs":cfg["inputs"],"transcoder":cfg["transcoder"],"peer":cfg["flussonix_peer_key"],"timeout":cfg["flussonix_input_timeout"],"subtitle_tracks":cfg["flussonix_subtitle_tracks"]})).unwrap()))
+    format!("{:x}",Sha256::digest(serde_json::to_vec(&json!({"inputs":cfg["inputs"],"transcoder":cfg["transcoder"],"peer":cfg["flussonix_peer_key"],"timeout":cfg["flussonix_input_timeout"],"subtitle_tracks":cfg["flussonix_subtitle_tracks"],"hls_captions":cfg["flussonix_hls_captions"]})).unwrap()))
 }
 
 #[cfg(test)]

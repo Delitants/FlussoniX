@@ -33,3 +33,6 @@ pub mod mpeg_audio;
 pub mod publish;
 
 pub mod worker_ts;
+
+pub mod caption_transport;
+pub mod captions;

@@ -273,6 +273,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "flussonix_token_sha256",
                     "flussonix_input_timeout",
                     "flussonix_subtitle_tracks",
+                    "flussonix_hls_captions",
                     "flussonix_content_id",
                 ],
                 "peers" | "sources" => &[
@@ -365,6 +366,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     }
                 }
                 subtitle_tracks(item)?;
+                crate::captions::configuration(item)?;
                 crate::playback_auth::Policy::from_config(item, root)?;
                 crate::publish::Policy::from_config(item, root)?;
                 if let Some(hash) = item.get("flussonix_token_sha256") {
