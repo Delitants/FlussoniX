@@ -62,6 +62,7 @@ pub struct Store {
     pages: BTreeMap<u16, Page>,
     jobs: VecDeque<Job>,
     next: u64,
+    changes: tokio::sync::watch::Sender<()>,
 }
 impl Store {
     pub fn new(services: &[Service]) -> Self {
@@ -84,6 +85,7 @@ impl Store {
                 .collect(),
             jobs: VecDeque::new(),
             next: 0,
+            changes: tokio::sync::watch::Sender::new(()),
         }
     }
     pub fn ingest(&mut self, f: Frame, now: Instant) {
@@ -154,6 +156,18 @@ impl Store {
             p.records.pop_front();
         }
         self.prune_jobs();
+        self.changes.send_replace(());
+    }
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changes.subscribe()
+    }
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.pages
+            .values()
+            .flat_map(|p| &p.records)
+            .filter(|r| r.pending)
+            .map(|r| r.deadline)
+            .min()
     }
     fn prune_jobs(&mut self) {
         let pages = &self.pages;
@@ -192,12 +206,15 @@ impl Store {
             p.error = error;
             p.confidence = confidence;
         }
+        self.changes.send_replace(());
     }
     pub fn reset(&mut self, pages: &[u16], pts: u64, reason: &'static str) {
+        let mut changed = false;
         for page in pages {
             if let Some(p) = self.pages.get_mut(page) {
                 for r in &mut p.records {
                     if r.pending {
+                        changed = true;
                         r.pending = false;
                         r.text.clear();
                         r.accepted = false
@@ -211,11 +228,16 @@ impl Store {
             }
         }
         self.prune_jobs();
+        if changed {
+            self.changes.send_replace(());
+        }
     }
     pub fn expire(&mut self, now: Instant) {
+        let mut changed = false;
         for p in self.pages.values_mut() {
             for r in &mut p.records {
                 if r.pending && now >= r.deadline {
+                    changed = true;
                     r.pending = false;
                     if r.token == p.latest_token {
                         p.error = Some("dvb_ocr_timeout");
@@ -225,6 +247,9 @@ impl Store {
             }
         }
         self.prune_jobs();
+        if changed {
+            self.changes.send_replace(());
+        }
     }
     pub fn frontier(&self, latest: u64) -> u64 {
         self.pages

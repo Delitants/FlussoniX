@@ -9,7 +9,7 @@
 | Initially750ms, revised to1500ms before implementation | German probe519ms under concurrent tests needed headroom; OCR failures can add up to1.5seconds subtitle-publication delay. |
 | At most two OCR processes per daemon, one OpenMP thread each | Bound recognition CPU; accelerated high-concurrency bursts may suppress intervals. |
 | Eight valid pending images and64intervals per service | Source timing survives asynchronous completion with bounded memory; canceled workers may briefly retain two additional images during cleanup. |
-| Two generation-owned20ms polling workers | Simple prompt token cancellation; idle DVB streams generate100wakeups/second and need eventual capacity tuning. |
+| Two generation-owned workers, initially20ms polling, now event-driven | Broadcast work/reset/expiry changes and wait for actual pending deadlines; idle OCR workers have no periodic timer. The separate100ms HLS playlist watcher and production capacity still need tuning. |
 | Mean word confidence60; low scores emit no text | Avoid presenting weak recognition as conversion success; faint/unusual fonts may lose intervals. |
 | Original-track policy separate from HLS conversion | Keeps compatible outputs intact; original-format players remain necessary for pass-through. |
 | Serialize accelerated OCR delivery fixtures | Qualify nominal text/timing without artificial process overload; this is not a concurrency/soak result. |

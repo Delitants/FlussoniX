@@ -29,6 +29,9 @@ pub struct State {
     pub failed: AtomicBool,
     generation: String,
 }
+#[cfg(test)]
+#[path = "ocr_deadline_tests.rs"]
+mod ocr_deadline_tests;
 impl State {
     pub fn new(decoder: Decoder, generation: String, _sequence: u64) -> Self {
         Self {
@@ -123,24 +126,31 @@ impl State {
         v.lists.get(file).or_else(|| v.segments.get(file)).cloned()
     }
     pub async fn ocr(self: Arc<Self>, executable: String, cancel: CancellationToken) {
-        if !self
-            .decoder
-            .lock()
-            .unwrap()
-            .services
-            .iter()
-            .any(|s| s.channel >= 65536)
-        {
-            return;
-        }
+        let mut changes = {
+            let d = self.decoder.lock().unwrap();
+            if !d.services.iter().any(|s| s.channel >= 65536) {
+                return;
+            }
+            d.dvb_ocr.subscribe()
+        };
         loop {
-            let job = {
+            let (job, deadline) = {
                 let mut d = self.decoder.lock().unwrap();
+                // Acknowledge before inspecting state: changes racing after this
+                // check stay observable even before changed() is polled.
+                changes.borrow_and_update();
                 d.dvb_ocr.expire(std::time::Instant::now());
-                d.dvb_ocr.take_job()
+                (d.dvb_ocr.take_job(), d.dvb_ocr.next_deadline())
             };
             let Some(job) = job else {
-                tokio::select! {biased;_=cancel.cancelled()=>return,_=tokio::time::sleep(Duration::from_millis(20))=>{}}
+                let due = async {
+                    if let Some(deadline) = deadline {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                tokio::select! {biased;_=cancel.cancelled()=>return,r=changes.changed()=>{if r.is_err(){return}},_=due=>{}}
                 continue;
             };
             let stop = cancel.child_token();
@@ -153,10 +163,20 @@ impl State {
             );
             tokio::pin!(future);
             let result = loop {
+                if !self
+                    .decoder
+                    .lock()
+                    .unwrap()
+                    .dvb_ocr
+                    .pending(job.page, job.token)
+                {
+                    stop.cancel();
+                    break future.await;
+                }
                 tokio::select! {biased;
                     _=cancel.cancelled()=>{stop.cancel();let _=future.await;return},
                     r=&mut future=>break r,
-                    _=tokio::time::sleep(Duration::from_millis(20))=>{if !self.decoder.lock().unwrap().dvb_ocr.pending(job.page,job.token){stop.cancel();break future.await}}
+                    r=changes.changed()=>{if r.is_err(){stop.cancel();let _=future.await;return}}
                 }
             };
             self.decoder
