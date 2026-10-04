@@ -332,12 +332,26 @@ pub struct Decoder {
     teletext: crate::teletext::Decoder,
     dvb: crate::dvb::Decoder,
     dvb_frames: VecDeque<crate::dvb::Frame>,
+    pub(crate) dvb_ocr: crate::dvb_ocr::Store,
     digital_open: BTreeMap<u32, Cue>,
     pub first_pts: Option<u64>,
     pub latest_pts: u64,
     pub error: Option<&'static str>,
 }
 impl Decoder {
+    pub(crate) fn process_dvb_frames(&mut self) {
+        for frame in self.take_dvb_frames() {
+            self.dvb_ocr.ingest(frame, std::time::Instant::now());
+        }
+    }
+    pub(crate) fn publication_frontier(&mut self) -> u64 {
+        self.dvb_ocr.expire(std::time::Instant::now());
+        self.dvb_ocr.frontier(self.latest_pts)
+    }
+    fn reset_dvb_ocr(&mut self, pages: &[u16], pts: u64, reason: &'static str) {
+        self.dvb_frames.retain(|f| !pages.contains(&f.page));
+        self.dvb_ocr.reset(pages, pts, reason);
+    }
     pub fn take_dvb_frames(&mut self) -> Vec<crate::dvb::Frame> {
         self.dvb_frames.drain(..).collect()
     }
@@ -350,6 +364,8 @@ impl Decoder {
     fn dvb_changes(&mut self, frames: Vec<crate::dvb::Frame>) {
         for f in frames {
             if self.dvb_frames.len() >= 8 {
+                let pages = self.dvb.pages();
+                self.reset_dvb_ocr(&pages, f.pts, "dvb_image_queue_limit");
                 self.dvb_frames.clear();
                 self.error = Some("dvb_image_queue_limit");
             }
@@ -361,14 +377,30 @@ impl Decoder {
     }
     pub(crate) fn dvb_bindings(&mut self, b: &BTreeMap<u16, (u16, u16)>, pts: u64) {
         let frames = self.dvb.bindings(b, pts);
+        let pages = frames.iter().map(|f| f.page).collect::<Vec<_>>();
+        self.reset_dvb_ocr(&pages, pts, "dvb_page_rebound");
         self.dvb_changes(frames);
     }
     pub(crate) fn dvb_gap(&mut self, pid: u16, pts: u64) {
         let frames = self.dvb.reset_pid(pid, pts);
+        let pages = frames.iter().map(|f| f.page).collect::<Vec<_>>();
+        self.reset_dvb_ocr(&pages, pts, "dvb_transport_gap");
         self.dvb_changes(frames);
     }
     pub(crate) fn push_dvb(&mut self, pid: u16, body: &[u8], pts: u64) {
         let frames = self.dvb.push(pid, body, pts);
+        let bad = self
+            .dvb
+            .stats()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["pid"].as_u64() == Some(u64::from(pid)) && p["last_error"].is_string())
+            .filter_map(|p| p["page"].as_u64().map(|p| p as u16))
+            .collect::<Vec<_>>();
+        if !bad.is_empty() {
+            self.reset_dvb_ocr(&bad, pts, self.dvb.error.unwrap_or("dvb_decode_failed"));
+        }
         self.dvb_changes(frames);
     }
 
@@ -391,6 +423,7 @@ impl Decoder {
                 .map(|s| (s.channel - 65536) as u16),
         );
         Self {
+            dvb_ocr: crate::dvb_ocr::Store::new(&services),
             dvb,
             dvb_frames: VecDeque::new(),
             teletext,
@@ -560,6 +593,7 @@ impl Decoder {
         }
     }
     pub fn reset(&mut self, pts: u64) {
+        self.reset_dvb_ocr(&self.dvb.pages(), pts, "dvb_clock_reset");
         let frames = self.dvb.reset(pts);
         self.dvb_changes(frames);
         let changes = self.teletext.reset(pts);
@@ -579,6 +613,7 @@ impl Decoder {
             .cloned()
             .chain(self.channels.iter().filter_map(|c| c.open.clone()))
             .chain(self.digital_open.values().cloned())
+            .chain(self.dvb_ocr.snapshot())
             .collect()
     }
 }

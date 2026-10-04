@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 pub struct Engine {
     root: PathBuf,
     ffmpeg: String,
+    tesseract: String,
     hls_epoch: crate::hls_generation::Epoch,
     workers: Mutex<HashMap<String, Arc<Worker>>>,
 }
@@ -105,9 +106,17 @@ impl Worker {
 }
 impl Engine {
     pub fn new(root: impl AsRef<Path>, ffmpeg: &str) -> Self {
+        Self::new_with_ocr(
+            root,
+            ffmpeg,
+            &std::env::var("FLUSSONIX_TESSERACT").unwrap_or_else(|_| "tesseract".into()),
+        )
+    }
+    pub fn new_with_ocr(root: impl AsRef<Path>, ffmpeg: &str, tesseract: &str) -> Self {
         Self {
             root: root.as_ref().into(),
             ffmpeg: ffmpeg.into(),
+            tesseract: tesseract.into(),
             hls_epoch: crate::hls_generation::Epoch::new(),
             workers: Mutex::new(HashMap::new()),
         }
@@ -158,7 +167,7 @@ impl Engine {
         let subtitle_tracks = crate::config::subtitle_tracks(cfg)?;
         let hls_subtitles = crate::config::hls_subtitles(cfg)?;
         let caption_services = crate::captions::configuration(cfg)?;
-        let caption_teletext = caption_services.iter().any(|s| s.channel >= 1124);
+        let caption_separate = caption_services.iter().any(|s| s.channel >= 1124);
         if hls_subtitles == "convert" && caption_services.is_empty() {
             return Err("Choose at least one HLS caption channel for conversion".into());
         }
@@ -503,7 +512,7 @@ impl Engine {
         }
         if !native_input {
             if let Some(target) = caption_target.as_deref() {
-                caption_output(&mut cmd, target, caption_teletext);
+                caption_output(&mut cmd, target, caption_separate);
             }
         }
         cmd.stdout(std::process::Stdio::piped())
@@ -557,6 +566,7 @@ impl Engine {
         let key = cfg["flussonix_peer_key"].as_str().map(str::to_owned);
         workers.insert(name.into(), worker.clone());
         let w = worker.clone();
+        let tesseract = self.tesseract.clone();
         tokio::spawn(async move {
             let mut tasks = Vec::new();
             // Early returns only leave this setup/run block. The owner always
@@ -592,7 +602,7 @@ impl Engine {
                         output.replace("__NATIVE_FMP4_FILTER__", &native_fmp4_filters(&tracks))
                     } else { output };
                     cmd.args(["-threads", "2", "-f", "tee", &output]);
-                    if let Some(target)=caption_target.as_deref(){caption_output(&mut cmd,target,caption_teletext);}
+                    if let Some(target)=caption_target.as_deref(){caption_output(&mut cmd,target,caption_separate);}
                     if cancel.is_cancelled() { return; }
                     let mut child = match cmd.spawn() {
                         Ok(child)=>child,
@@ -625,8 +635,12 @@ impl Engine {
                 }
                 if let (Some(listener),Some(state))=(caption_listener,w.captions.clone()) {
                     let c=cancel.clone();let decoder_state=state.clone();let (sender,mut receiver)=tokio::sync::mpsc::channel::<Bytes>(32);
-                    tasks.push(tokio::spawn(async move {let mut transport=crate::caption_transport::Transport::default();loop {let data=tokio::select!{biased;_=c.cancelled()=>break,data=receiver.recv()=>match data{Some(data)=>data,None=>break}};if decoder_state.failed.load(Ordering::Relaxed){let mut decoder=decoder_state.decoder.lock().unwrap();let pts=decoder.latest_pts;decoder.reset(pts);break}let mut decoder=decoder_state.decoder.lock().unwrap();transport.push(&data,&mut decoder);if matches!(decoder.error,Some("caption_clock_discontinuity"|"caption_reorder_limit"|"caption_video_codec_unsupported"|"caption_nal_limit"|"caption_pes_limit")){decoder_state.failed.store(true,Ordering::Relaxed);}}}));
+                    tasks.push(tokio::spawn(async move {
+                        let mut transport=crate::caption_transport::Transport::default();
+                        loop{let data=tokio::select!{biased;_=c.cancelled()=>break,data=receiver.recv()=>match data{Some(data)=>data,None=>break}};decoder_state.push_source(&data,&mut transport);if decoder_state.failed.load(Ordering::Relaxed){break}}
+                    }));
                     let c=cancel.clone();let drain_state=state.clone();tasks.push(tokio::spawn(async move {let Ok(Ok((mut socket,_)))=(tokio::select!{biased;_=c.cancelled()=>return,r=tokio::time::timeout(Duration::from_secs(5),listener.accept())=>r})else{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");return};let mut buffer=[0;16384];loop{let read=tokio::select!{biased;_=c.cancelled()=>break,r=socket.read(&mut buffer)=>r};match read{Ok(n)if n>0=>{if sender.try_send(Bytes::copy_from_slice(&buffer[..n])).is_err(){drain_state.failed.store(true,Ordering::Relaxed);}},_=>{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");break}}}}));
+                    for _ in 0..2{tasks.push(tokio::spawn(state.clone().ocr(tesseract.clone(),cancel.clone())));}
                     tasks.push(tokio::spawn(state.watch(dir.clone(),cancel.clone())));
                 }
                 let Some(mut stdout) = child.stdout.take() else {
@@ -765,6 +779,8 @@ impl Engine {
                 || logical.starts_with("cc")
                 || (logical.starts_with('s')
                     && logical.as_bytes().get(1).is_some_and(u8::is_ascii_digit))
+                || (logical.starts_with("dvb")
+                    && logical.as_bytes().get(3).is_some_and(u8::is_ascii_digit))
                 || (logical.starts_with("ttx")
                     && logical.as_bytes().get(3).is_some_and(u8::is_ascii_digit))
             {

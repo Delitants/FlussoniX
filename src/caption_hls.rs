@@ -38,6 +38,28 @@ impl State {
             generation,
         }
     }
+    pub fn push_source(&self, data: &[u8], transport: &mut crate::caption_transport::Transport) {
+        let mut d = self.decoder.lock().unwrap();
+        if self.failed.load(Ordering::Relaxed) {
+            let pts = d.latest_pts;
+            d.reset(pts);
+            return;
+        }
+        transport.push(data, &mut d);
+        d.process_dvb_frames();
+        if matches!(
+            d.error,
+            Some(
+                "caption_clock_discontinuity"
+                    | "caption_reorder_limit"
+                    | "caption_video_codec_unsupported"
+                    | "caption_nal_limit"
+                    | "caption_pes_limit"
+            )
+        ) {
+            self.failed.store(true, Ordering::Relaxed);
+        }
+    }
     pub fn observe_ts(
         &self,
         bytes: &[u8],
@@ -54,7 +76,7 @@ impl State {
     pub fn stats(&self) -> serde_json::Value {
         let ready = self.variants.lock().unwrap().iter().all(|v| v.av.is_some());
         let d = self.decoder.lock().unwrap();
-        serde_json::json!({"status":if self.failed.load(Ordering::Relaxed){"failed"}else if d.error.is_some(){"degraded"}else if d.first_pts.is_some()&&ready{"running"}else{"starting"},"last_error":if self.failed.load(Ordering::Relaxed){d.error.or(Some("caption_decoder_lag"))}else{d.error},"channels":d.services,"teletext_pages":d.teletext_stats(),"cues":d.snapshot().len()})
+        serde_json::json!({"status":if self.failed.load(Ordering::Relaxed){"failed"}else if d.error.or(d.dvb_ocr.error()).is_some(){"degraded"}else if d.first_pts.is_some()&&ready{"running"}else{"starting"},"last_error":if self.failed.load(Ordering::Relaxed){d.error.or(Some("caption_decoder_lag"))}else{d.error.or(d.dvb_ocr.error())},"channels":d.services,"teletext_pages":d.teletext_stats(),"dvb_pages":d.dvb_stats(),"dvb_ocr":d.dvb_ocr.stats(),"cues":d.snapshot().len()})
     }
     pub fn read(&self, file: &str) -> Option<Bytes> {
         let (index, file) = if let Some(f) = file.strip_prefix("fmp4/") {
@@ -98,6 +120,50 @@ impl State {
             return Some(Bytes::from(v.av.clone().unwrap()));
         }
         v.lists.get(file).or_else(|| v.segments.get(file)).cloned()
+    }
+    pub async fn ocr(self: Arc<Self>, executable: String, cancel: CancellationToken) {
+        if !self
+            .decoder
+            .lock()
+            .unwrap()
+            .services
+            .iter()
+            .any(|s| s.channel >= 65536)
+        {
+            return;
+        }
+        loop {
+            let job = {
+                let mut d = self.decoder.lock().unwrap();
+                d.dvb_ocr.expire(std::time::Instant::now());
+                d.dvb_ocr.take_job()
+            };
+            let Some(job) = job else {
+                tokio::select! {biased;_=cancel.cancelled()=>return,_=tokio::time::sleep(Duration::from_millis(20))=>{}}
+                continue;
+            };
+            let stop = cancel.child_token();
+            let future = crate::dvb_ocr::recognize_cancellable(
+                &executable,
+                &job.image,
+                &job.language,
+                job.deadline,
+                stop.clone(),
+            );
+            tokio::pin!(future);
+            let result = loop {
+                tokio::select! {biased;
+                    _=cancel.cancelled()=>{stop.cancel();let _=future.await;return},
+                    r=&mut future=>break r,
+                    _=tokio::time::sleep(Duration::from_millis(20))=>{if !self.decoder.lock().unwrap().dvb_ocr.pending(job.page,job.token){stop.cancel();break future.await}}
+                }
+            };
+            self.decoder
+                .lock()
+                .unwrap()
+                .dvb_ocr
+                .complete(job.page, job.token, result);
+        }
     }
     pub async fn watch(self: Arc<Self>, dir: std::path::PathBuf, cancel: CancellationToken) {
         let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -156,10 +222,16 @@ impl State {
                             .rem_euclid(1 << 33)) as u64,
                     );
                 }
-                let (first, latest, cues, services) = {
-                    let d = self.decoder.lock().unwrap();
+                let (first, latest, frontier, cues, services) = {
+                    let mut d = self.decoder.lock().unwrap();
                     let Some(first) = d.first_pts else { continue };
-                    (first, d.latest_pts, d.snapshot(), d.services.clone())
+                    (
+                        first,
+                        d.latest_pts,
+                        d.publication_frontier(),
+                        d.snapshot(),
+                        d.services.clone(),
+                    )
                 };
                 let (anchor, previous, mut bandwidth) = {
                     let v = self.variants.lock().unwrap();
@@ -208,7 +280,7 @@ impl State {
                     };
                     let source_end =
                         first + elapsed(clock, anchor, latest.saturating_sub(first)) + seg.duration;
-                    if latest < source_end.saturating_add(90000) {
+                    if frontier < source_end.saturating_add(90000) {
                         complete = false;
                         break;
                     }

@@ -498,3 +498,13 @@ fn cache_churn_cannot_exceed_region_object_or_palette_bounds() {
         assert!(out.iter().all(|f| f.image.is_none()));
     }
 }
+#[test]
+fn owned_broadcast_glyph_pixels_match_the_independent_rendered_mask() {
+    let expected = f::glyph("GRÜSSE");
+    let mut d = flussonix::dvb::Decoder::new([1]);
+    d.bindings(&std::collections::BTreeMap::from([(1, (0x121, 11))]), 0);
+    let frames = d.push(0x121, &f::bitmap(1, "GRÜSSE"), 100000);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].image.as_ref().unwrap(), &expected);
+    assert_eq!((frames[0].pts, frames[0].expires), (100000, 280000));
+}

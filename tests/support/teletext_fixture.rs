@@ -154,7 +154,7 @@ pub fn program_pmt(program: u16, pages: &[(u16, u16)], version: u8) -> Vec<u8> {
     }
     section(4096, s, &mut (version & 15))
 }
-fn pts(t: u64, prefix: u8) -> [u8; 5] {
+pub fn pts(t: u64, prefix: u8) -> [u8; 5] {
     [
         prefix | ((t >> 29) as u8 & 14) | 1,
         (t >> 22) as u8,

@@ -51,5 +51,6 @@ mod teletext;
 mod teletext_transport;
 
 pub mod dvb;
+pub mod dvb_ocr;
 
 mod subtitle_transport;
