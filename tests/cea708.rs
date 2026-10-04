@@ -5,7 +5,7 @@ fn digital(numbers: &[u8]) -> Decoder {
         numbers
             .iter()
             .map(|n| Service {
-                channel: 64 + n,
+                channel: 64 + u16::from(*n),
                 language: "en".into(),
                 name: format!("Service {n}"),
             })
@@ -32,7 +32,7 @@ fn packet(d: &mut Decoder, seq: u8, blocks: &[(u8, &[u8])], pts: u64) {
         d.push(2, [p[0], p[1]], pts);
     }
 }
-fn open(d: &Decoder, id: u8) -> Option<String> {
+fn open(d: &Decoder, id: u16) -> Option<String> {
     d.snapshot()
         .into_iter()
         .find(|c| c.channel == id && c.end.is_none())

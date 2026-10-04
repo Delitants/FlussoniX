@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 #[derive(Clone, Debug)]
 pub struct Service {
-    pub channel: u8,
+    pub channel: u16,
     pub language: String,
     pub name: String,
 }
@@ -12,21 +12,24 @@ pub struct Service {
 #[serde(deny_unknown_fields)]
 struct Row {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    channel: Option<u8>,
+    channel: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     service: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    teletext_page: Option<u16>,
     language: String,
     name: String,
 }
 impl<'de> Deserialize<'de> for Service {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let row = Row::deserialize(d)?;
-        let channel = match (row.channel, row.service) {
-            (Some(c), None) if (1..=4).contains(&c) => c,
-            (None, Some(s)) if (1..=63).contains(&s) => 64 + s,
+        let channel = match (row.channel, row.service, row.teletext_page) {
+            (Some(c), None, None) if (1..=4).contains(&c) => c,
+            (None, Some(s), None) if (1..=63).contains(&s) => 64 + u16::from(s),
+            (None, None, Some(p)) if (100..=899).contains(&p) => 1024 + p,
             _ => {
                 return Err(serde::de::Error::custom(
-                    "choose channel 1..4 OR service 1..63",
+                    "choose channel 1..4 OR service 1..63 OR teletext_page 100..899",
                 ));
             }
         };
@@ -41,11 +44,12 @@ impl Serialize for Service {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         Row {
             channel: (self.channel <= 4).then_some(self.channel),
-            service: if self.channel > 64 {
-                Some(self.channel - 64)
+            service: if (65..=127).contains(&self.channel) {
+                Some((self.channel - 64) as u8)
             } else {
                 None
             },
+            teletext_page: (self.channel >= 1124).then(|| self.channel - 1024),
             language: self.language.clone(),
             name: self.name.clone(),
         }
@@ -57,8 +61,10 @@ impl Service {
         key(self.channel)
     }
 }
-pub fn key(channel: u8) -> String {
-    if channel > 64 {
+pub fn key(channel: u16) -> String {
+    if channel >= 1124 {
+        format!("ttx{}", channel - 1024)
+    } else if channel > 64 {
         format!("s{}", channel - 64)
     } else {
         format!("cc{channel}")
@@ -69,7 +75,7 @@ pub fn configuration(cfg: &Value) -> Result<Vec<Service>, String> {
         return Ok(vec![]);
     };
     let services: Vec<Service> = serde_json::from_value(rows.clone()).map_err(
-        |_| "HLS captions require rows with channel 1..4 OR service 1..63, language and name",
+        |_| "HLS captions require rows with channel 1..4 OR service 1..63 OR teletext_page 100..899, language and name",
     )?;
     if services.len() > 4 {
         return Err("at most four HLS caption renditions are supported".into());
@@ -107,7 +113,7 @@ pub fn configuration(cfg: &Value) -> Result<Vec<Service>, String> {
 }
 #[derive(Clone, Debug)]
 pub struct Cue {
-    pub channel: u8,
+    pub channel: u16,
     pub start: u64,
     pub end: Option<u64>,
     pub text: String,
@@ -292,19 +298,27 @@ pub struct Decoder {
     selected: [usize; 2],
     history: VecDeque<Cue>,
     digital: crate::cea708::Decoder,
-    digital_open: BTreeMap<u8, Cue>,
+    teletext: crate::teletext::Decoder,
+    digital_open: BTreeMap<u16, Cue>,
     pub first_pts: Option<u64>,
     pub latest_pts: u64,
     pub error: Option<&'static str>,
 }
 impl Decoder {
     pub fn new(services: Vec<Service>) -> Self {
-        let digital = crate::cea708::Decoder::new(
+        let digital = crate::cea708::Decoder::new(services.iter().filter_map(|s| {
+            (65..=127)
+                .contains(&s.channel)
+                .then_some(s.channel.wrapping_sub(64) as u8)
+        }));
+        let teletext = crate::teletext::Decoder::new(
             services
                 .iter()
-                .filter_map(|s| (s.channel > 64).then_some(s.channel.wrapping_sub(64))),
+                .filter(|s| s.channel >= 1124)
+                .map(|s| s.channel - 1024),
         );
         Self {
+            teletext,
             digital,
             digital_open: BTreeMap::new(),
             services,
@@ -318,7 +332,7 @@ impl Decoder {
     }
     fn digital_changes(&mut self, changes: Vec<crate::cea708::Change>) {
         for change in changes {
-            let id = 64 + change.service;
+            let id = 64 + u16::from(change.service);
             if let Some(mut cue) = self.digital_open.remove(&id) {
                 cue.end = Some(change.pts.max(cue.start));
                 if cue.end != Some(cue.start) {
@@ -350,7 +364,55 @@ impl Decoder {
         self.first_pts.get_or_insert(pts);
         self.observe(frontier);
     }
+    pub(crate) fn teletext_pages(&self) -> Vec<u16> {
+        self.teletext.pages()
+    }
+    pub fn teletext_stats(&self) -> Value {
+        self.teletext.stats()
+    }
+    fn teletext_changes(&mut self, changes: Vec<crate::teletext::Change>) {
+        for c in changes {
+            let id = 1024 + c.page;
+            if let Some(mut cue) = self.digital_open.remove(&id) {
+                cue.end = Some(c.pts.max(cue.start));
+                if cue.end != Some(cue.start) {
+                    self.history.push_back(cue);
+                }
+            }
+            if !c.text.is_empty() {
+                self.digital_open.insert(
+                    id,
+                    Cue {
+                        channel: id,
+                        start: c.pts,
+                        end: None,
+                        text: c.text,
+                    },
+                );
+            }
+        }
+        while self.history.len() > 4096 {
+            self.history.pop_front();
+        }
+        if self.teletext.error.is_some() {
+            self.error = self.teletext.error;
+        }
+    }
+    pub(crate) fn teletext_bindings(&mut self, b: &BTreeMap<u16, u16>, pts: u64) {
+        let c = self.teletext.bindings(b, pts);
+        self.teletext_changes(c);
+    }
+    pub(crate) fn teletext_gap(&mut self, pid: u16, pts: u64) {
+        let c = self.teletext.reset_pid(pid, pts);
+        self.teletext_changes(c);
+    }
+    pub(crate) fn push_teletext(&mut self, pid: u16, body: &[u8], pts: u64) {
+        let c = self.teletext.push(pid, body, pts);
+        self.teletext_changes(c);
+    }
     pub fn observe(&mut self, pts: u64) {
+        let changes = self.teletext.advance(pts);
+        self.teletext_changes(changes);
         let changes = self.digital.advance(pts);
         self.digital_changes(changes);
         self.first_pts.get_or_insert(pts);
@@ -410,7 +472,7 @@ impl Decoder {
         }
         if !text.is_empty() {
             channel.open = Some(Cue {
-                channel: index as u8 + 1,
+                channel: index as u16 + 1,
                 start: pts,
                 end: None,
                 text,
@@ -421,6 +483,8 @@ impl Decoder {
         }
     }
     pub fn reset(&mut self, pts: u64) {
+        let changes = self.teletext.reset(pts);
+        self.teletext_changes(changes);
         let changes = self.digital.reset(pts);
         self.digital_changes(changes);
         for i in 0..4 {

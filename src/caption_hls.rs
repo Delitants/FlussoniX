@@ -54,7 +54,7 @@ impl State {
     pub fn stats(&self) -> serde_json::Value {
         let ready = self.variants.lock().unwrap().iter().all(|v| v.av.is_some());
         let d = self.decoder.lock().unwrap();
-        serde_json::json!({"status":if self.failed.load(Ordering::Relaxed){"failed"}else if d.error.is_some(){"degraded"}else if d.first_pts.is_some()&&ready{"running"}else{"starting"},"last_error":if self.failed.load(Ordering::Relaxed){d.error.or(Some("caption_decoder_lag"))}else{d.error},"channels":d.services,"cues":d.snapshot().len()})
+        serde_json::json!({"status":if self.failed.load(Ordering::Relaxed){"failed"}else if d.error.is_some(){"degraded"}else if d.first_pts.is_some()&&ready{"running"}else{"starting"},"last_error":if self.failed.load(Ordering::Relaxed){d.error.or(Some("caption_decoder_lag"))}else{d.error},"channels":d.services,"teletext_pages":d.teletext_stats(),"cues":d.snapshot().len()})
     }
     pub fn read(&self, file: &str) -> Option<Bytes> {
         let (index, file) = if let Some(f) = file.strip_prefix("fmp4/") {
@@ -320,7 +320,7 @@ async fn bounded_read(path: &Path) -> Result<Vec<u8>, String> {
 }
 fn webvtt(
     cues: &[Cue],
-    channel: u8,
+    channel: u16,
     first: u64,
     anchor: u64,
     start: u64,

@@ -10,6 +10,7 @@ const MASK: u64 = (1 << 33) - 1;
 #[derive(Default)]
 pub struct Transport {
     pending: Vec<u8>,
+    teletext: crate::teletext_transport::Transport,
     pmt: Option<u16>,
     video: Option<(u16, bool)>,
     pat_section: Vec<u8>,
@@ -45,6 +46,7 @@ impl Transport {
         }
     }
     fn packet(&mut self, p: &[u8; 188], d: &mut Decoder) {
+        self.teletext.packet(p, d);
         let pid = (u16::from(p[1] & 31) << 8) | u16::from(p[2]);
         let start = p[1] & 0x40 != 0;
         let offset = if p[3] & 0x20 != 0 {
@@ -190,6 +192,7 @@ impl Transport {
                 d.error = Some("caption_clock_discontinuity");
             }
             self.last_pts = Some(t);
+            self.teletext.advance(watermark, d);
             d.observe_video(t, watermark);
             self.pes_pts = Some(t);
         }
@@ -203,6 +206,7 @@ impl Transport {
         }
     }
     fn gap(&mut self, d: &mut Decoder) {
+        self.teletext.reset();
         self.pes.clear();
         self.events.clear();
         self.pes_pts = None;
