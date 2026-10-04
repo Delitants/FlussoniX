@@ -13,5 +13,6 @@ This stage covers the independently implemented Level 1 Latin profile. Broader p
 - Final: Ruling: DVB OCR, GPU conversion, real HEVC browser playback and native separate-subtitle relay remain pending — fixtures do not establish these capabilities — cost if wrong: those users cannot migrate yet.
 - Final: Ruling: Sustained deployment scale and broad broadcaster compatibility remain unclaimed — owned bounded fixtures prove this profile only — cost if wrong: later scale/field qualification may reveal bottlenecks or unsupported streams.
 - Final: Ruling: Public Rust u16 source adjustment remains accepted — stable wire selectors/URLs and collision-free native page identities take priority in this preview — cost if wrong: external Rust consumers must update source.
+- Final: Ruling: Correct the qualification guard to await both independent HLS variants reaching silence — CI reproduced the premature fMP4 check; no weaker assertion or increased timeout — cost if wrong: a different underlying fault still fails qualification and delays publication.
 
 Fresh review found three subtitle integrity issues: mixed SEI deadline ordering, PAT/PMT program ownership and repeated page transaction timing. Six focused regressions reproduced all three causes and are included with their fixes. No Minor findings were deferred.

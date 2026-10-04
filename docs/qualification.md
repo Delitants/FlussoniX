@@ -258,3 +258,5 @@ Friendly page controls support mixed selectors,100..899 validation and inherited
 Pre-review teletext stage local checks:354 Rust tests passed,0failed,1existing external opt-in skipped;28 browser cases passed on a fresh isolated daemon with normal FFmpeg. Formatting, all-target Clippy with warnings denied, frontend build and diff checks passed. Whole-branch review and exact-head CI gate publication.
 
 After the fresh review, six regressions reproduced three Important subtitle-integrity issues: SEI deadline ordering, PAT/PMT program ownership and repeated-page transactions. The single fix pass passed360 Rust tests and28 browser cases, with0failures and1existing opt-in skip. No second reviewer or deferred Minor findings.
+
+Qualification waits for both independent HLS variants to reach the quiet tail before checking silent subtitle segments. The CI-reproduced premature fMP4 check was corrected for analog, digital and teletext fixtures; text, timing, silence assertions and existing deadlines remain intact. The resulting fresh full Rust run passed360 tests.

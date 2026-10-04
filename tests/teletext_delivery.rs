@@ -34,11 +34,15 @@ async fn run(cpu: bool) {
     p.stdin.as_mut().unwrap().write_all(&input).await.unwrap();
     tokio::time::timeout(Duration::from_secs(12), async {
         loop {
-            if e.read("group/owned", "fmp4/av.m3u8").await.is_ok()
-                && e.read("group/owned", "av.m3u8")
+            // Wait for both independent variants to reach the quiet tail.
+            let mut ready = true;
+            for prefix in ["", "fmp4/"] {
+                ready &= e
+                    .read("group/owned", &format!("{prefix}av.m3u8"))
                     .await
-                    .is_ok_and(|b| String::from_utf8_lossy(&b).matches("#EXTINF:").count() >= 5)
-            {
+                    .is_ok_and(|b| String::from_utf8_lossy(&b).matches("#EXTINF:").count() >= 5);
+            }
+            if ready {
                 break;
             }
             assert!(
@@ -97,7 +101,10 @@ async fn run(cpu: bool) {
         assert!(words.contains("GRÜSSE"), "{words}");
         assert!(words.lines().any(|l| l == "LIVE &lt;&amp;&gt;"), "{words}");
         assert!(words.contains("00:00:02.160 --> 00:00:03.000"), "{words}");
-        assert!(empty, "silence must publish an empty segment");
+        assert!(
+            empty,
+            "{prefix} silence must publish an empty segment: {list}"
+        );
     }
     for prefix in ["", "fmp4/"] {
         let list = String::from_utf8(
@@ -190,11 +197,16 @@ async fn empty_or_missing(selected: u16) {
             .unwrap();
         tokio::time::timeout(Duration::from_secs(12), async {
             loop {
-                if e.read("owned", "fmp4/av.m3u8").await.is_ok()
-                    && e.read("owned", "av.m3u8")
+                let mut ready = true;
+                for prefix in ["", "fmp4/"] {
+                    ready &= e
+                        .read("owned", &format!("{prefix}av.m3u8"))
                         .await
-                        .is_ok_and(|b| String::from_utf8_lossy(&b).matches("#EXTINF:").count() >= 5)
-                {
+                        .is_ok_and(|b| {
+                            String::from_utf8_lossy(&b).matches("#EXTINF:").count() >= 5
+                        });
+                }
+                if ready {
                     break;
                 }
                 assert!(
