@@ -427,7 +427,11 @@ impl Engine {
                 translated = proxy.url.clone();
                 // Only the verifier contacts HTTPS sources; no peer key is sent.
                 if !live {
-                    cmd.args(["-allowed_extensions", "ALL"]);
+                    cmd.args(["-allowed_extensions", "ALL", "-f", "hls"]);
+                } else {
+                    // A streaming response cannot select a network demuxer
+                    // that would fetch resources outside the verifier.
+                    cmd.args(["-f", "mpegts"]);
                 }
                 cmd.args(["-protocol_whitelist", "http,tcp,crypto"]);
                 peer_hls = Some(proxy);

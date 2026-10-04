@@ -70,7 +70,7 @@ async fn source(expired: bool, redirect: Option<String>) -> Source {
                     !req.headers().contains_key("Authorization"),
                     "external inputs sent a management credential"
                 );
-                if req.uri().path() == "/bad.m3u8" {
+                if ["/bad.m3u8", "/stream"].contains(&req.uri().path()) {
                     return (
                         [("Content-Type", "application/vnd.apple.mpegurl")],
                         redirect.unwrap(),
@@ -409,4 +409,95 @@ async fn raw_https_playlist_urls_use_verified_trust() {
 #[tokio::test]
 async fn raw_https_transport_urls_use_verified_trust() {
     raw_https_pull(false).await
+}
+
+#[tokio::test]
+async fn mismatched_streaming_response_is_not_followed_as_hls() {
+    // The TLS gateway accidentally returns a master playlist for a TS input.
+    // Its ordinary media URL points to another fixture we own on loopback.
+    let dir = tempfile::tempdir().unwrap();
+    let media = App::new(
+        dir.path().join("config.json"),
+        dir.path().join("source"),
+        Options {
+            admin_password: "owned-admin".into(),
+            peer_key: "owned-peer-secret".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    media
+        .config
+        .put(
+            "streams",
+            "owned",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let count = requests.clone();
+    let routes = router(media.clone()).layer(middleware::from_fn(
+        move |req: Request<Body>, next: Next| {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                next.run(req).await
+            }
+        },
+    ));
+    let stop = CancellationToken::new();
+    let cancel = stop.clone();
+    let task = AbortOnDropHandle::new(tokio::spawn(async move {
+        axum::serve(
+            tcp,
+            routes.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(cancel.cancelled_owned())
+        .await
+        .unwrap()
+    }));
+    let src = source(
+        false,
+        Some(format!(
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100000\nhttp://{addr}/owned/index.m3u8\n"
+        )),
+    )
+    .await;
+    for scheme in ["tshttps", "https"] {
+        let engine = Engine::new(dir.path().join(scheme), "ffmpeg");
+        let path = if scheme == "https" {
+            "/stream"
+        } else {
+            "/bad.m3u8"
+        };
+        let cfg = json!({"inputs":[{"url":format!("{scheme}://{}{path}",src.url.strip_prefix("https://").unwrap()),"flussonix_tls_ca":src.cert.ca}]});
+        // Both response paths serve the same ordinary HLS body.
+        let worker = engine.ensure("owned", &cfg).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if requests.load(Ordering::SeqCst) > 0 || !worker.alive.load(Ordering::Relaxed) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "selected TS profile fetched an HLS media URL"
+        );
+        assert_eq!(worker.stats()["bytes_in"], 0);
+        engine.stop_all().await;
+    }
+    media.media.stop_all().await;
+    src.stop().await;
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(6), task)
+        .await
+        .unwrap()
+        .unwrap();
 }

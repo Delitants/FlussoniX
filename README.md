@@ -36,7 +36,7 @@ Add `--https-listen 0.0.0.0:18443 --https-cert /etc/flussonix/server-chain.pem -
 
 Streams and Templates expose **Trusted CA file** for HLSS, TSHTTPS and `https://` inputs, alongside the existing secure native and RTSPS inputs. Leave it empty for public roots, or enter an absolute PEM bundle path on the receiving server. The Rust fetcher verifies chain, expiry and DNS/IP identity before HTTP; FFmpeg receives only a loopback URL and no cluster credential is sent upstream. Custom roots replace public roots.
 
-Use `hlss://` for an HLS playlist, including extensionless URLs, or `tshttps://` for a streamed MPEG-TS URL at any path. A plain `https://` URL ending in `.m3u8` selects HLS; other paths are streamed to the media worker. Same-origin HTTPS redirects are bounded to three requests, and HLS variants, segments, keys and initialization resources must stay on that origin. Embedded URL credentials and fragments are rejected. Trust paths persist and inherit; changing to a plain input clears the field. See [qualification and remaining limits](docs/https-delivery.md).
+Use `hlss://` for an HLS playlist, including extensionless URLs, or `tshttps://` for a streamed MPEG-TS URL at any path. A plain `https://` URL ending in `.m3u8` selects HLS; other paths select MPEG-TS. Same-origin HTTPS redirects are bounded to three requests, and HLS variants, segments, keys and initialization resources must stay on that origin. Embedded URL credentials and fragments are rejected. Trust paths persist and inherit; changing to a plain input clears the field. See [qualification and remaining limits](docs/https-delivery.md).
 
 ## RTSPS preview
 
