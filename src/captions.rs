@@ -360,7 +360,8 @@ pub struct Decoder {
     pub(crate) dvb_ocr: crate::dvb_ocr::Store,
     digital_open: BTreeMap<u64, Cue>,
     native_last: BTreeMap<u64, u64>,
-    pub(crate) native_video_dts: Option<u64>,
+    pub(crate) native_clock_dts: Option<u64>,
+    pub(crate) native_audio_only: bool,
     pub first_pts: Option<u64>,
     pub latest_pts: u64,
     pub error: Option<&'static str>,
@@ -374,7 +375,7 @@ impl Decoder {
     pub(crate) fn publication_frontier(&mut self) -> u64 {
         self.dvb_ocr.expire(std::time::Instant::now());
         self.dvb_ocr.frontier(
-            self.native_video_dts
+            self.native_clock_dts
                 .map_or(self.latest_pts, |dts| dts.min(self.latest_pts)),
         )
     }
@@ -463,7 +464,8 @@ impl Decoder {
             digital,
             digital_open: BTreeMap::new(),
             native_last: BTreeMap::new(),
-            native_video_dts: None,
+            native_clock_dts: None,
+            native_audio_only: false,
             services,
             channels: std::array::from_fn(|_| Channel::default()),
             selected: [0, 2],

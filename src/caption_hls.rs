@@ -70,6 +70,9 @@ impl State {
         decoder: &mut Decoder,
     ) {
         if decoder.first_pts.is_none() {
+            if self.decoder.lock().unwrap().native_audio_only {
+                transport.use_audio_clock();
+            }
             transport.push(bytes, decoder);
             if let Some(pts) = decoder.first_pts {
                 self.variants.lock().unwrap()[0].anchor.get_or_insert(pts);
@@ -239,7 +242,11 @@ impl State {
                     else {
                         continue;
                     };
-                    let (Some(mp4), Some(ts)) = (mp4_clock(&init, &media), ts_clock(&ts)) else {
+                    let audio_only = self.decoder.lock().unwrap().native_audio_only;
+                    let (Some(mp4), Some(ts)) = (
+                        mp4_clock_kind(&init, &media, audio_only),
+                        ts_clock_kind(&ts, audio_only),
+                    ) else {
                         continue;
                     };
                     self.variants.lock().unwrap()[1].anchor = Some(
@@ -295,9 +302,9 @@ impl State {
                         break;
                     };
                     let clock = if let Some(init) = &init {
-                        mp4_clock(init, &data)
+                        mp4_clock_kind(init, &data, self.decoder.lock().unwrap().native_audio_only)
                     } else {
-                        ts_clock(&data)
+                        ts_clock_kind(&data, self.decoder.lock().unwrap().native_audio_only)
                     };
                     let Some(clock) = clock else {
                         complete = false;
@@ -559,8 +566,11 @@ impl Grid {
         out
     }
 }
-fn ts_clock(data: &[u8]) -> Option<u64> {
+fn ts_clock_kind(data: &[u8], audio_only: bool) -> Option<u64> {
     let mut t = crate::caption_transport::Transport::default();
+    if audio_only {
+        t.use_audio_clock();
+    }
     let mut d = Decoder::new(vec![]);
     for chunk in data.chunks(188 * 64) {
         t.push(chunk, &mut d);
@@ -580,15 +590,15 @@ fn field<'a>(data: &'a [u8], kind: &[u8]) -> Option<&'a [u8]> {
 fn n32(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_be_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
-fn mp4_clock(init: &[u8], media: &[u8]) -> Option<u64> {
+fn mp4_clock_kind(init: &[u8], media: &[u8], audio_only: bool) -> Option<u64> {
     let moov = field(init, b"moov")?;
-    let mut video = None;
+    let mut clock_track = None;
     for (kind, trak) in boxes(moov).ok()? {
         if kind != b"trak" {
             continue;
         }
         let mdia = field(trak, b"mdia")?;
-        if field(mdia, b"hdlr")?.get(8..12)? != b"vide" {
+        if field(mdia, b"hdlr")?.get(8..12)? != if audio_only { b"soun" } else { b"vide" } {
             continue;
         }
         let tkhd = field(trak, b"tkhd")?;
@@ -598,10 +608,10 @@ fn mp4_clock(init: &[u8], media: &[u8]) -> Option<u64> {
         if scale == 0 {
             return None;
         }
-        video = Some((id, u64::from(scale)));
+        clock_track = Some((id, u64::from(scale)));
         break;
     }
-    let (id, scale) = video?;
+    let (id, scale) = clock_track?;
     let moof = field(media, b"moof")?;
     for (kind, traf) in boxes(moof).ok()? {
         if kind != b"traf" {

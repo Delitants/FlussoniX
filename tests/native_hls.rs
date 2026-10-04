@@ -106,6 +106,14 @@ async fn source(
     bad: bool,
 ) -> (String, Server, Arc<std::sync::atomic::AtomicUsize>) {
     let (tracks, frames) = fixture(bad);
+    source_owned(protocol, gops, tracks, frames).await
+}
+async fn source_owned(
+    protocol: &str,
+    gops: bool,
+    tracks: Vec<Track>,
+    frames: Vec<Frame>,
+) -> (String, Server, Arc<std::sync::atomic::AtomicUsize>) {
     let mut data = wire::encode_info(&tracks).unwrap();
     let mut segments = HashMap::new();
     let mut signals = String::new();
@@ -188,12 +196,31 @@ async fn source(
     )
 }
 async fn run(protocol: &str, gops: bool, cpu: bool, preserve: bool, bad: bool) {
-    let (url, _source, _) = source(protocol, gops, bad).await;
+    run_profile(protocol, gops, cpu, preserve, bad, None).await
+}
+async fn run_profile(
+    protocol: &str,
+    gops: bool,
+    cpu: bool,
+    preserve: bool,
+    bad: bool,
+    audio: Option<&str>,
+) {
+    let (url, _source, controls) = if let Some(codec) = audio {
+        let (tracks, frames) = audio_fixture(codec, bad);
+        source_owned(protocol, gops, tracks, frames).await
+    } else {
+        source(protocol, gops, bad).await
+    };
     let dir = tempfile::tempdir().unwrap();
     let engine = Arc::new(Engine::new(dir.path(), "ffmpeg"));
     let mut cfg = json!({"inputs":[{"url":url}],"flussonix_subtitle_tracks":if preserve{"preserve"}else{"drop"},"flussonix_hls_subtitles":"convert","flussonix_hls_captions":[{"native_track":7,"language":"en","name":"English"},{"native_track":u32::MAX,"language":"de","name":"Deutsch"}]});
     if cpu {
-        cfg["transcoder"] = json!({"encoder":"libx264","vb":300});
+        cfg["transcoder"] = if audio.is_some() {
+            json!({"ab":96})
+        } else {
+            json!({"encoder":"libx264","vb":300})
+        };
     }
     let worker = engine.ensure("owned", &cfg).await.unwrap();
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -268,9 +295,18 @@ async fn run(protocol: &str, gops: bool, cpu: bool, preserve: bool, bad: bool) {
             assert!(!text.contains(other));
             assert!(quiet, "silence must have empty VTT segments");
             // First video presentation is at 1.08s: cue starts at 3.0s, clear at 4.0s.
-            assert!(text.contains("00:00:01.920 --> 00:00:02.920"), "{text}");
+            let timing = if audio.is_some() {
+                "00:00:02.000 --> 00:00:03.000"
+            } else {
+                "00:00:01.920 --> 00:00:02.920"
+            };
+            assert!(text.contains(timing), "{text}");
             assert!(
-                !text.contains("00:00:02.920 -->"),
+                !text.contains(if audio.is_some() {
+                    "00:00:03.000 -->"
+                } else {
+                    "00:00:02.920 -->"
+                }),
                 "early clear must truncate cue: {text}"
             );
         }
@@ -310,17 +346,32 @@ async fn run(protocol: &str, gops: bool, cpu: bool, preserve: bool, bad: bool) {
         );
         let path = dir.path().join("decode.bin");
         std::fs::write(&path, data).unwrap();
-        let decode = std::process::Command::new("ffmpeg")
+        let mut command = std::process::Command::new("ffmpeg");
+        command
             .args(["-v", "error", "-threads", "1", "-i"])
-            .arg(&path)
-            .args(["-frames:v", "2", "-f", "null", "-"])
-            .output()
-            .unwrap();
+            .arg(&path);
+        if audio.is_some() {
+            command.args(["-map", "0:a:0", "-frames:a", "10", "-f", "s16le", "pipe:1"]);
+        } else {
+            command.args(["-frames:v", "2", "-f", "null", "-"]);
+        }
+        let decode = command.output().unwrap();
         assert!(
             decode.status.success(),
             "{}",
             String::from_utf8_lossy(&decode.stderr)
         );
+        assert!(
+            decode.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&decode.stderr)
+        );
+        if audio.is_some() {
+            assert!(
+                decode.stdout.len() > 1024 && decode.stdout.iter().any(|b| *b != 0),
+                "independent audio decoder must produce PCM"
+            );
+        }
     }
     if bad {
         assert_eq!(
@@ -350,6 +401,11 @@ async fn run(protocol: &str, gops: bool, cpu: bool, preserve: bool, bad: bool) {
             "original output policy must remain independent"
         );
     }
+    assert_eq!(
+        controls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one input session"
+    );
     engine.stop_all().await;
 }
 #[tokio::test]
@@ -504,4 +560,104 @@ async fn native_hls_assets_require_authorization_and_revoke_cached_delivery() {
             .unwrap();
     }
     app.media.stop_all().await;
+}
+
+fn audio_fixture(codec: &str, bad: bool) -> (Vec<Track>, Vec<Frame>) {
+    let (mut tracks, mut frames) = fixture(bad);
+    tracks.retain(|t| t.codec == "subtitle");
+    frames.retain(|f| f.track_id != 1);
+    let mut config = vec![];
+    if codec == "aac" {
+        config = vec![0x11, 0x88];
+        let out = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=880:sample_rate=48000",
+                "-t",
+                "14.4",
+                "-c:a",
+                "aac",
+                "-f",
+                "adts",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let mut at = 0;
+        let mut n = 0;
+        while at < out.stdout.len() {
+            let h = &out.stdout[at..];
+            let size =
+                (usize::from(h[3] & 3) << 11) | (usize::from(h[4]) << 3) | usize::from(h[5] >> 5);
+            frames.push(Frame {
+                track_id: 2,
+                dts: 90000 + n * 1920,
+                pts_offset: 0,
+                key: true,
+                body: h[7..size].to_vec(),
+            });
+            at += size;
+            n += 1;
+        }
+    } else {
+        let (step, body) = if codec == "m2a" {
+            (2160, include_bytes!("fixtures/codecs/mp2.bin").as_slice())
+        } else {
+            (2351, include_bytes!("fixtures/codecs/mp3.bin").as_slice())
+        };
+        for n in 0..600 {
+            frames.push(Frame {
+                track_id: 2,
+                dts: 90000 + n * step,
+                pts_offset: 0,
+                key: true,
+                body: body.to_vec(),
+            });
+        }
+    }
+    tracks.insert(
+        0,
+        Track {
+            id: 2,
+            codec: codec.into(),
+            config,
+        },
+    );
+    frames.sort_by_key(|f| f.dts);
+    (tracks, frames)
+}
+#[tokio::test]
+async fn native_audio_aac_frames_hls_retains_original_subtitles() {
+    run_profile("m4s", false, false, true, false, Some("aac")).await;
+}
+#[tokio::test]
+async fn native_audio_m2a_sparse_m4f_hls_with_original_drop() {
+    run_profile("m4f", true, false, false, false, Some("m2a")).await;
+}
+#[tokio::test]
+async fn native_audio_mp3_packed_gops_cpu_hls_with_original_drop() {
+    run_profile("m4s", true, true, false, false, Some("mp3")).await;
+}
+#[tokio::test]
+async fn native_audio_malformed_selected_text_falls_back_to_audio() {
+    run_profile("m4s", false, false, false, true, Some("aac")).await;
+}
+#[test]
+fn writes_owned_native_audio_browser_fixture_when_requested() {
+    if let Ok(path) = std::env::var("FLUSSONIX_NATIVE_AUDIO_FIXTURE_FILE") {
+        let (tracks, frames) = audio_fixture("aac", false);
+        let mut data = wire::encode_info(&tracks).unwrap();
+        for f in frames {
+            data.extend(
+                wire::encode_frame(tracks.iter().find(|t| t.id == f.track_id).unwrap(), &f)
+                    .unwrap(),
+            );
+        }
+        std::fs::write(path, data).unwrap();
+    }
 }

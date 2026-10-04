@@ -14,6 +14,8 @@ pub struct Transport {
     dvb: crate::subtitle_transport::Transport<true>,
     pmt: Option<u16>,
     video: Option<(u16, bool)>,
+    audio_clock: Option<u16>,
+    audio_clock_mode: bool,
     pat_section: Vec<u8>,
     pmt_section: Vec<u8>,
     pes: Vec<u8>,
@@ -23,6 +25,10 @@ pub struct Transport {
     events: Vec<Timed>,
 }
 impl Transport {
+    pub(crate) fn use_audio_clock(&mut self) {
+        self.audio_clock_mode = true;
+    }
+
     pub fn push(&mut self, data: &[u8], decoder: &mut Decoder) {
         // Caller drains fixed-size reads. Process arbitrarily large supplied chunks
         // incrementally rather than retaining a caller-sized allocation.
@@ -120,6 +126,12 @@ impl Transport {
                 let mut at = 12 + ((usize::from(s[10] & 15) << 8) | usize::from(s[11]));
                 while at + 5 <= n - 4 {
                     let kind = s[at];
+                    if self.audio_clock_mode && matches!(kind, 3 | 4 | 0x0f) {
+                        self.audio_clock =
+                            Some((u16::from(s[at + 1] & 31) << 8) | u16::from(s[at + 2]));
+                        break;
+                    }
+
                     if kind == 2 || kind == 0x10 {
                         d.error = Some("caption_video_codec_unsupported");
                         return;
@@ -136,6 +148,20 @@ impl Transport {
                         break;
                     }
                     at += 5 + ((usize::from(s[at + 3] & 15) << 8) | usize::from(s[at + 4]));
+                }
+            }
+            return;
+        }
+        if self.audio_clock_mode && self.audio_clock == Some(pid) {
+            if start
+                && bytes.len() >= 14
+                && bytes[..3] == [0, 0, 1]
+                && bytes[6] & 0xc0 == 0x80
+                && bytes[7] & 0x80 != 0
+                && bytes[8] >= 5
+            {
+                if let Some(raw) = pts(&bytes[9..14]) {
+                    d.observe(raw);
                 }
             }
             return;

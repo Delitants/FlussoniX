@@ -18,7 +18,7 @@ jobs:
       - name: Rust qualification and owned browser caption fixture
         run: |
           mkdir -p .runtime
-          FLUSSONIX_NATIVE_FIXTURE_FILE="$PWD/.runtime/owned-native.m4s" FLUSSONIX_DVB_FIXTURE_FILE="$PWD/.runtime/owned-dvb.ts" FLUSSONIX_TELETEXT_FIXTURE_FILE="$PWD/.runtime/owned-teletext.ts" FLUSSONIX_708_FIXTURE_FILE="$PWD/.runtime/owned-708.ts" FLUSSONIX_CAPTION_FIXTURE_FILE="$PWD/.runtime/owned-captions.ts" cargo test --locked
+          FLUSSONIX_NATIVE_AUDIO_FIXTURE_FILE="$PWD/.runtime/owned-native-audio.m4s" FLUSSONIX_NATIVE_FIXTURE_FILE="$PWD/.runtime/owned-native.m4s" FLUSSONIX_DVB_FIXTURE_FILE="$PWD/.runtime/owned-dvb.ts" FLUSSONIX_TELETEXT_FIXTURE_FILE="$PWD/.runtime/owned-teletext.ts" FLUSSONIX_708_FIXTURE_FILE="$PWD/.runtime/owned-708.ts" FLUSSONIX_CAPTION_FIXTURE_FILE="$PWD/.runtime/owned-captions.ts" cargo test --locked
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -30,6 +30,7 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Verify admin against live daemon
         run: |
+          export FLUSSONIX_NATIVE_AUDIO_FIXTURE_FILE="$PWD/.runtime/owned-native-audio.m4s"
           export FLUSSONIX_NATIVE_FIXTURE_FILE="$PWD/.runtime/owned-native.m4s"
           export FLUSSONIX_DVB_FIXTURE_FILE="$PWD/.runtime/owned-dvb.ts"
           export FLUSSONIX_TELETEXT_FIXTURE_FILE="$PWD/.runtime/owned-teletext.ts"

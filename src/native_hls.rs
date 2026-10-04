@@ -33,6 +33,12 @@ fn text(body: &[u8]) -> Result<String, &'static str> {
         .collect::<Vec<_>>()
         .join("\n"))
 }
+fn clock_track(tracks: &[Track]) -> Option<&Track> {
+    tracks
+        .iter()
+        .find(|t| t.kind().is_ok_and(|c| c.is_video()))
+        .or_else(|| tracks.iter().find(|t| t.kind().is_ok_and(|c| c.is_audio())))
+}
 impl State {
     fn native_failed(&self, reason: &'static str) {
         self.decoder.lock().unwrap().error = Some(reason);
@@ -42,10 +48,12 @@ impl State {
         if self.failed.load(Ordering::Relaxed) {
             return;
         }
-        if !tracks.iter().any(|t| t.kind().is_ok_and(|c| c.is_video())) {
-            self.native_failed("native_subtitle_video_required");
+        if clock_track(tracks).is_none() {
+            self.native_failed("native_subtitle_av_required");
             return;
         }
+        self.decoder.lock().unwrap().native_audio_only =
+            !tracks.iter().any(|t| t.kind().is_ok_and(|c| c.is_video()));
         let invalid = self
             .decoder
             .lock()
@@ -65,14 +73,13 @@ impl State {
         let Some(track) = tracks.iter().find(|t| t.id == frame.track_id) else {
             return;
         };
-        if track.kind().is_ok_and(|c| c.is_video()) {
-            // The AV packager selects its first video stream.
-            if tracks
-                .iter()
-                .find(|t| t.kind().is_ok_and(|c| c.is_video()))
-                .map(|t| t.id)
-                != Some(track.id)
-            {
+        if track.kind().is_ok_and(|c| c.is_video() || c.is_audio()) {
+            // The AV packager's first video owns the clock, or first audio with no video.
+            if clock_track(tracks).map(|t| t.id) != Some(track.id) {
+                return;
+            }
+            if track.kind().is_ok_and(|c| c.is_audio()) && frame.pts_offset != 0 {
+                self.native_failed("native_subtitle_clock_discontinuity");
                 return;
             }
             if frame.pts_offset.unsigned_abs() > 2 * 90000 {
@@ -88,14 +95,14 @@ impl State {
                 return;
             };
             let mut d = self.decoder.lock().unwrap();
-            if d.native_video_dts
+            if d.native_clock_dts
                 .is_some_and(|last| frame.dts < last || frame.dts.saturating_sub(last) > 10 * 90000)
             {
                 d.error = Some("native_subtitle_clock_discontinuity");
                 self.failed.store(true, Ordering::Relaxed);
                 return;
             }
-            d.native_video_dts = Some(frame.dts);
+            d.native_clock_dts = Some(frame.dts);
             d.observe(pts);
         } else if track.codec == "subtitle" {
             let channel = NATIVE_BASE + u64::from(frame.track_id);
@@ -114,7 +121,7 @@ impl State {
                     .decoder
                     .lock()
                     .unwrap()
-                    .native_video_dts
+                    .native_clock_dts
                     .is_some_and(|dts| frame.dts < dts)
                 {
                     return Err("native_subtitle_clock_discontinuity");
@@ -338,5 +345,95 @@ mod frontier_tests {
             s.failed.load(Ordering::Relaxed),
             "late cue must not be silently omitted from an immutable rendition"
         );
+    }
+}
+
+#[cfg(test)]
+mod audio_clock_tests {
+    use super::*;
+    use serde_json::json;
+    fn state() -> State {
+        State::new(crate::captions::Decoder::new(crate::captions::configuration(&json!({"flussonix_hls_captions":[{"native_track":7,"language":"en","name":"English"}]})).unwrap()),"owned".into(),0)
+    }
+    fn track(id: u32, codec: &str) -> Track {
+        Track {
+            id,
+            codec: codec.into(),
+            config: vec![],
+        }
+    }
+    fn frame(id: u32, dts: u64) -> Frame {
+        Frame {
+            track_id: id,
+            dts,
+            pts_offset: 0,
+            key: true,
+            body: vec![],
+        }
+    }
+    #[test]
+    fn audio_clock_uses_first_audio_only_when_video_is_absent() {
+        let s = state();
+        let tracks = [track(7, "subtitle"), track(2, "aac"), track(3, "mp3")];
+        s.native_tracks(&tracks);
+        assert!(!s.failed.load(Ordering::Relaxed));
+        s.native_frame(&tracks, &frame(3, 99000));
+        assert!(s.decoder.lock().unwrap().first_pts.is_none());
+        s.native_frame(&tracks, &frame(2, 90000));
+        assert_eq!(s.decoder.lock().unwrap().first_pts, Some(90000));
+        let s = state();
+        let tracks = [track(2, "aac"), track(1, "hevc"), track(7, "subtitle")];
+        s.native_tracks(&tracks);
+        s.native_frame(&tracks, &frame(2, 90000));
+        assert!(s.decoder.lock().unwrap().first_pts.is_none());
+        s.native_frame(&tracks, &frame(1, 97200));
+        assert_eq!(s.decoder.lock().unwrap().first_pts, Some(97200));
+    }
+    #[test]
+    fn audio_clock_rejects_gaps_backwards_time_and_late_cues() {
+        let s = state();
+        let tracks = [track(2, "aac"), track(7, "subtitle")];
+        s.native_tracks(&tracks);
+        let mut f = frame(2, 90000);
+        f.pts_offset = 1;
+        s.native_frame(&tracks, &f);
+        assert_eq!(
+            s.decoder.lock().unwrap().error,
+            Some("native_subtitle_clock_discontinuity")
+        );
+
+        for next in [89999, 90000 + 10 * 90000 + 1] {
+            let s = state();
+            let tracks = [track(2, "aac"), track(7, "subtitle")];
+            s.native_tracks(&tracks);
+            s.native_frame(&tracks, &frame(2, 90000));
+            s.native_frame(&tracks, &frame(2, next));
+            assert!(s.failed.load(Ordering::Relaxed));
+            assert_eq!(
+                s.decoder.lock().unwrap().error,
+                Some("native_subtitle_clock_discontinuity")
+            );
+        }
+        let s = state();
+        let tracks = [track(2, "aac"), track(7, "subtitle")];
+        s.native_tracks(&tracks);
+        s.native_frame(&tracks, &frame(2, 90000));
+        s.native_frame(
+            &tracks,
+            &Frame {
+                track_id: 7,
+                dts: 89999,
+                pts_offset: 90000,
+                key: true,
+                body: b"late".to_vec(),
+            },
+        );
+        assert_eq!(
+            s.decoder.lock().unwrap().error,
+            Some("native_subtitle_clock_discontinuity")
+        );
+        let s = state();
+        s.native_tracks(&[track(7, "subtitle")]);
+        assert!(s.failed.load(Ordering::Relaxed));
     }
 }
