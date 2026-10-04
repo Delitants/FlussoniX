@@ -925,6 +925,9 @@ impl Engine {
     }
 }
 fn caption_output(cmd: &mut Command, target: &str, teletext: bool) {
+    // Keep fractional source PTS when copying into tee. FFmpeg 6 auto mode
+    // can choose the video frame-rate timebase and shift caption clock origin.
+    cmd.args(["-copytb", "1"]);
     // Include one optional audio stream for the null fallback: an audio-only
     // source must not lose AV because an optional caption output has no video.
     cmd.args(["-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy"]);
