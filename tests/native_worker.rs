@@ -532,7 +532,9 @@ async fn fmp4_profile(kind: &str, protocol: &str) {
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(8), async {
-        while !engine.ready("owned").await {
+        // TS and fMP4 tee outputs publish their playlists independently.
+        while !engine.ready("owned").await || engine.read("owned", "fmp4/index.m3u8").await.is_err()
+        {
             assert!(!worker.is_closed());
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
