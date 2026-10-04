@@ -207,6 +207,8 @@ Native v0.4 background recovery restores failed CDN pulls within the existing so
 
 ## Implemented v0.5 equivalent-origin failover
 
+Source relationships also support an optional [MPEG-TS private pull](cluster-subtitles.md) for original DVB/teletext carriage and CDN HLS conversion. The established HLS default, M4 transports, policy discovery and admission/failover controls are unchanged.
+
 Sources may declare `flussonix_source_group`; streams/templates may declare inherited `flussonix_content_id`. Each optional identifier contains 1..128 ASCII letters, digits, dots, underscores or hyphens; each group allows eight sources. Explicit relationships, equal content identity and equal normalized viewer policy are all required to switch an existing route. Identical names alone do not establish equivalence. Local configured streams retain precedence. Each selected source uses its own peer key and private endpoint, and upstream transcoding is not repeated.
 
 A healthy source remains selected. Media failure after cooldown triggers equivalent discovery even when its API is still alive. API unavailability also permits equivalent fallback. An authoritative disabled/deleted/malformed or invalid-policy response fails closed and remains denied through later API outages until that same authority returns valid enabled metadata or the relationship is reset. Fallback scans rotate after the selected source so repeated bad origins cannot starve later replicas. A recovered preferred source does not displace a healthy fallback. Operators can reconfigure relationships to select it again.

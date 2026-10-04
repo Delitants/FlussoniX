@@ -51,6 +51,8 @@ pub fn source_input_url(endpoint: &str, name: &str, transport: &str) -> Result<S
         ("m4s", true) => "m4ss",
         ("m4f", false) => "m4f",
         ("m4f", true) => "m4fs",
+        ("mpegts", false) => "tshttp",
+        ("mpegts", true) => "tshttps",
         _ => return Err("unsupported source transport".into()),
     };
     let name = name
@@ -60,10 +62,10 @@ pub fn source_input_url(endpoint: &str, name: &str, transport: &str) -> Result<S
         })
         .collect::<Vec<_>>()
         .join("/");
-    let suffix = if transport == "hls" {
-        "/index.m3u8"
-    } else {
-        ""
+    let suffix = match transport {
+        "hls" => "/index.m3u8",
+        "mpegts" => "/mpegts",
+        _ => "",
     };
     url.set_path(&format!(
         "{}/{name}{suffix}",

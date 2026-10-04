@@ -130,3 +130,21 @@ fn private_source_urls_preserve_prefix_secure_scheme_and_encoded_stream_names() 
     assert!(source_input_url("file:///etc", "one", "m4f").is_err());
     assert!(source_input_url("http://origin.example", "../bad", "m4s").is_err());
 }
+
+#[test]
+fn private_transport_stream_urls_preserve_prefix_query_and_secure_scheme() {
+    use flussonix::cluster::source_input_url;
+    assert_eq!(
+        source_input_url(
+            "http://origin.example/media/?routing=owned",
+            "region/café HD",
+            "mpegts"
+        )
+        .unwrap(),
+        "tshttp://origin.example/media/region/caf%C3%A9%20HD/mpegts?routing=owned"
+    );
+    assert_eq!(
+        source_input_url("https://origin.example", "one", "mpegts").unwrap(),
+        "tshttps://origin.example/one/mpegts"
+    );
+}

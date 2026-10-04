@@ -76,6 +76,23 @@ test('cluster source fields preserve endpoints and mask the peer key',async({pag
  await expect(page.locator('textarea')).toHaveCount(0);
 });
 
+test('cluster MPEG-TS source transport is editable without JSON',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-ts-source';
+ expect((await request.put(`/streamer/api/v3/cluster/sources/${name}`,{headers,data:{api_url:'https://source.example/control',private_payload_url:'https://source.example/lan',cluster_key:'owned-ts-source-key'}})).ok()).toBeTruthy();
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();await page.getByRole('button',{name:'Source servers',exact:true}).click();
+ await page.getByRole('row').filter({has:page.getByRole('cell',{name,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+ await page.getByLabel('Source transport',{exact:true}).selectOption('mpegts');
+ await expect(page.locator('textarea')).toHaveCount(0);
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ const saved=await(await request.get(`/streamer/api/v3/cluster/sources/${name}`,{headers})).json();
+ expect(saved.flussonix_transport).toBe('mpegts');expect(saved.private_payload_url).toBe('https://source.example/lan');expect(saved.cluster_key).toBe('owned-ts-source-key');
+ await page.getByRole('row').filter({has:page.getByRole('cell',{name,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+ await expect(page.getByLabel('Source transport',{exact:true})).toHaveValue('mpegts');
+ await page.getByRole('button',{name:'Cancel',exact:true}).click();
+ await request.delete(`/streamer/api/v3/cluster/sources/${name}`,{headers});
+});
+
 test('changing authorization mode preserves the existing session limits and identity',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
  const name='ui-auth-policy';

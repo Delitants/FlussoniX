@@ -206,10 +206,10 @@ fn explicit_copy_encoder_overrides_template_transcoding() {
 fn native_source_transport_is_explicit_source_only_and_validated() {
     let d = tempfile::tempdir().unwrap();
     let s = flussonix::config::ConfigStore::open(d.path().join("config.json")).unwrap();
-    for transport in ["hls", "m4s", "m4f"] {
+    for transport in ["hls", "m4s", "m4f", "mpegts"] {
         s.put("sources","origin",serde_json::json!({"api_url":"http://origin.example/control","private_payload_url":"https://origin.example/media","flussonix_transport":transport})).expect("source transport must save");
     }
-    for transport in [serde_json::json!("mpegts"), serde_json::json!(true)] {
+    for transport in [serde_json::json!("rtsp"), serde_json::json!(true)] {
         assert!(s.put("sources","bad",serde_json::json!({"api_url":"http://origin.example","flussonix_transport":transport})).is_err());
     }
     assert!(

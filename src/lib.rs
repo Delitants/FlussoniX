@@ -54,3 +54,4 @@ pub mod dvb;
 pub mod dvb_ocr;
 
 mod subtitle_transport;
+mod ts_profile;

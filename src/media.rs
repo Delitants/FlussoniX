@@ -249,26 +249,6 @@ impl Engine {
         tokio::fs::create_dir_all(dir.join("fmp4"))
             .await
             .map_err(|e| e.to_string())?;
-        // Published MPEG-TS can provoke diagnostics during format probing.
-        // Give binary wire media its own connection, isolated from stderr.
-        let publish_wire = if publication {
-            Some(
-                tokio::net::TcpListener::bind("127.0.0.1:0")
-                    .await
-                    .map_err(|_| "cannot bind publication wire pipe")?,
-            )
-        } else {
-            None
-        };
-        let wire_target = match &publish_wire {
-            Some(listener) => format!(
-                "tcp://{}",
-                listener
-                    .local_addr()
-                    .map_err(|_| "publication wire address unavailable")?
-            ),
-            None => "pipe:2".into(),
-        };
         let caption_listener = if caption_services.is_empty() {
             None
         } else {
@@ -299,6 +279,9 @@ impl Engine {
             "2",
         ]);
         let mut peer_hls = None;
+
+        let peer_ts = cfg["flussonix_peer_key"].is_string()
+            && (input.starts_with("tshttp://") || input.starts_with("tshttps://"));
         let mut tls_input = None;
         let synthetic = input == "testsrc://";
         let m4s_input = input.starts_with("m4s://") || input.starts_with("m4ss://");
@@ -369,16 +352,17 @@ impl Engine {
                 cmd.args(["-rw_timeout", "10000000"]);
             }
             if let Some(key) = cfg["flussonix_peer_key"].as_str() {
-                let proxy = crate::peer_hls::PeerHls::start(&translated, key).await?;
+                let proxy = crate::peer_hls::PeerHls::start_inspected(&translated, key).await?;
+
                 translated = proxy.url.clone();
                 // All remote resources are fetched inside our origin-scoped
                 // proxy; FFmpeg never receives the native peer credential.
-                cmd.args([
-                    "-allowed_extensions",
-                    "ALL",
-                    "-protocol_whitelist",
-                    "http,tcp,crypto",
-                ]);
+                if url::Url::parse(&translate_input(input)?)
+                    .is_ok_and(|u| u.path().ends_with(".m3u8"))
+                {
+                    cmd.args(["-allowed_extensions", "ALL"]);
+                }
+                cmd.args(["-protocol_whitelist", "http,tcp,crypto"]);
                 peer_hls = Some(proxy);
             }
             cmd.args(["-i", &translated]);
@@ -440,7 +424,29 @@ impl Engine {
             && (cfg.get("transcoder").is_none() || cfg["transcoder"]["encoder"] == "copy");
         let native_copy = (m4s_input || m4f_input)
             && (cfg.get("transcoder").is_none() || cfg["transcoder"]["encoder"] == "copy");
-        let wire_output = if copy_publication || native_copy {
+        let copy_peer_ts =
+            peer_ts && (cfg.get("transcoder").is_none() || cfg["transcoder"]["encoder"] == "copy");
+        // Published MPEG-TS can provoke diagnostics during format probing.
+        // Give binary wire media its own connection, isolated from stderr.
+        let mut publish_wire = if publication || copy_peer_ts {
+            Some(
+                tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .map_err(|_| "cannot bind publication wire pipe")?,
+            )
+        } else {
+            None
+        };
+        let wire_target = match &publish_wire {
+            Some(listener) => format!(
+                "tcp://{}",
+                listener
+                    .local_addr()
+                    .map_err(|_| "publication wire address unavailable")?
+            ),
+            None => "pipe:2".into(),
+        };
+        let wire_output = if copy_publication || native_copy || copy_peer_ts {
             String::new()
         } else {
             format!(
@@ -449,6 +455,8 @@ impl Engine {
         };
         let fmp4_filter = if native_copy {
             "__NATIVE_FMP4_FILTER__"
+        } else if copy_peer_ts {
+            "__PEER_FMP4_FILTER__"
         } else if copy_publication {
             ":bsfs/a=aac_adtstoasc"
         } else {
@@ -487,7 +495,7 @@ impl Engine {
             dir.join("fmp4/index.m3u8").display()
         );
         let native_input = m4s_input || m4f_input;
-        if !native_input {
+        if !native_input && !peer_ts {
             cmd.args(["-threads", "2", "-f", "tee", &output]);
         }
         if copy_publication {
@@ -510,7 +518,7 @@ impl Engine {
                 &wire_target,
             ]);
         }
-        if !native_input {
+        if !native_input && !peer_ts {
             if let Some(target) = caption_target.as_deref() {
                 caption_output(&mut cmd, target, caption_separate);
             }
@@ -518,7 +526,7 @@ impl Engine {
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let mut child = if native_input {
+        let mut child = if native_input || peer_ts {
             None
         } else {
             Some(
@@ -573,6 +581,21 @@ impl Engine {
             // cancels and joins its tasks before signaling completion.
             async {
                 let mut child = if let Some(child) = child {
+                    child
+                } else if peer_ts {
+                    let bridge=peer_hls.as_mut().unwrap();
+                    let profile=tokio::select!{biased;_=cancel.cancelled()=>return,result=bridge.metadata()=>result};
+                    let (audio,video)=match profile {Ok(profile)=>profile,Err(reason)=>{w.failed(match reason.as_str(){"peer transport metadata exceeds limit"=>"metadata_limit","peer transport metadata timeout"=>"startup_timeout",_=>"input_closed"});return;}};
+                    let output=output.replace("__PEER_FMP4_FILTER__",if audio==Some(0x0f){":bsfs/a=aac_adtstoasc"}else{""});
+                    cmd.args(["-threads","2","-f","tee",&output]);
+                    let wire_copy=copy_peer_ts && video==Some(0x1b) && matches!(audio,None|Some(0x0f));
+                    if wire_copy {
+                        cmd.args(["-map","0:v:0?","-map","0:a:0?","-c","copy","-bsf:a","aac_adtstoasc","-f","flv","-flvflags","no_duration_filesize",&wire_target]);
+                    } else if copy_peer_ts {drop(publish_wire.take());}
+                    if let Some(target)=caption_target.as_deref(){caption_output(&mut cmd,target,caption_separate);}
+                    if cancel.is_cancelled(){return;}
+                    let child=match cmd.spawn(){Ok(child)=>child,Err(_)=>{w.failed("packaging_failed");return;}};
+                    w.pid.store(child.id().unwrap_or(0),Ordering::Relaxed);
                     child
                 } else {
                     let (mut reader, mut writer) = tokio::io::duplex(64 * 1024);

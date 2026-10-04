@@ -357,9 +357,11 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     if *kind != "sources"
                         || !transport
                             .as_str()
-                            .is_some_and(|t| ["hls", "m4s", "m4f"].contains(&t))
+                            .is_some_and(|t| ["hls", "m4s", "m4f", "mpegts"].contains(&t))
                     {
-                        return Err("flussonix_transport is source-only: hls, m4s or m4f".into());
+                        return Err(
+                            "flussonix_transport is source-only: hls, m4s, m4f or mpegts".into(),
+                        );
                     }
                 }
                 if *kind != "auth_backends" && item["api_url"].as_str().is_none() {

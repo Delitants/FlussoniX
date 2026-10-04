@@ -1,4 +1,4 @@
-//! Credential-scoped native HLS fetcher. FFmpeg receives only loopback URLs.
+//! Credential-scoped native HLS/continuous MPEG-TS fetcher. FFmpeg receives only loopback URLs.
 //! URI lines and quoted URI attributes are resolved relative to their playlist
 //! (RFC 8216), then constrained to the configured HTTP(S) origin.
 use axum::{
@@ -13,13 +13,15 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use std::{sync::Arc, time::Duration};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+type Profile = (Option<u8>, Option<u8>);
 pub struct PeerHls {
     pub url: String,
     cancel: CancellationToken,
+    profile: Option<tokio::sync::oneshot::Receiver<Result<Profile, String>>>,
 }
 impl Drop for PeerHls {
     fn drop(&mut self) {
@@ -34,6 +36,9 @@ struct Fetcher {
     key: String,
     slots: Arc<Semaphore>,
     cancel: CancellationToken,
+    live: bool,
+    inspected: bool,
+    prefetched: Arc<std::sync::Mutex<Option<(Bytes, reqwest::Response)>>>,
 }
 fn permitted(origin: &Url, url: &Url) -> bool {
     matches!(url.scheme(), "http" | "https")
@@ -116,7 +121,12 @@ fn playlist(f: &Fetcher, base: &Url, bytes: &[u8]) -> Result<Bytes, ()> {
     }
     Ok(Bytes::from(out))
 }
-async fn fetch(f: &Fetcher, resource: &str, headers: &HeaderMap) -> Result<Response, ()> {
+async fn fetch(
+    f: &Fetcher,
+    resource: &str,
+    headers: &HeaderMap,
+    slot: OwnedSemaphorePermit,
+) -> Result<Response, ()> {
     if resource.len() > 16384 {
         return Err(());
     }
@@ -125,13 +135,44 @@ async fn fetch(f: &Fetcher, resource: &str, headers: &HeaderMap) -> Result<Respo
     if !permitted(&f.origin, &url) {
         return Err(());
     }
-    let mut request = f.client.get(url.clone()).header("X-Flussonix-Peer", &f.key);
-    if let Some(range) = headers.get("range") {
-        request = request.header("range", range);
+    if f.live && url != f.origin {
+        return Err(());
     }
-    let response = request.send().await.map_err(|_| ())?;
+    let (prefix, response) = if f.live && f.inspected {
+        f.prefetched.lock().unwrap().take().ok_or(())?
+    } else {
+        let mut request = f.client.get(url.clone()).header("X-Flussonix-Peer", &f.key);
+        if let Some(range) = headers.get("range").filter(|_| !f.live) {
+            request = request.header("range", range);
+        }
+        (Bytes::new(), request.send().await.map_err(|_| ())?)
+    };
     if !response.status().is_success() {
         return Err(());
+    }
+    if f.live {
+        if response.status() != StatusCode::OK {
+            return Err(());
+        }
+        let cancel = f.cancel.clone();
+        let body = futures_util::stream::unfold(
+            (
+                futures_util::stream::once(std::future::ready(Ok(prefix)))
+                    .chain(response.bytes_stream())
+                    .boxed(),
+                cancel,
+                slot,
+            ),
+            |(mut stream, cancel, slot)| async move {
+                let chunk = tokio::select! { biased; _ = cancel.cancelled() => return None, chunk = stream.next() => chunk? };
+                Some((chunk, (stream, cancel, slot)))
+            },
+        );
+        return Response::builder()
+            .header("content-type", "video/mp2t")
+            .header("cache-control", "no-store")
+            .body(Body::from_stream(body))
+            .map_err(|_| ());
     }
     if response
         .content_length()
@@ -181,7 +222,7 @@ async fn resource(
             .body(Body::empty())
             .unwrap();
     };
-    let result = tokio::select! { biased; _ = f.cancel.cancelled() => Err(()), result = fetch(&f, &resource, &headers) => result };
+    let result = tokio::select! { biased; _ = f.cancel.cancelled() => Err(()), result = fetch(&f, &resource, &headers, _slot) => result };
     result.unwrap_or_else(|_| {
         Response::builder()
             .status(StatusCode::BAD_GATEWAY)
@@ -189,11 +230,58 @@ async fn resource(
             .unwrap()
     })
 }
+async fn inspect_transport(
+    f: &Fetcher,
+) -> Result<(Bytes, reqwest::Response, Option<u8>, Option<u8>), String> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut response = f
+            .client
+            .get(f.origin.clone())
+            .header("X-Flussonix-Peer", &f.key)
+            .send()
+            .await
+            .map_err(|_| "cannot connect peer transport")?;
+        if response.status() != StatusCode::OK {
+            return Err("peer transport rejected".into());
+        }
+        let mut probe = crate::ts_profile::Probe::default();
+        let mut prefix = BytesMut::new();
+        while probe.audio.is_none() {
+            let chunk = response
+                .chunk()
+                .await
+                .map_err(|_| "peer transport metadata read failed")?
+                .ok_or("peer transport metadata missing")?;
+            if prefix.len() + chunk.len() > 1024 * 1024 {
+                return Err("peer transport metadata exceeds limit".into());
+            }
+            probe.push(&chunk);
+            prefix.extend_from_slice(&chunk);
+        }
+        Ok::<_, String>((prefix.freeze(), response, probe.audio.unwrap(), probe.video))
+    })
+    .await
+    .map_err(|_| "peer transport metadata timeout")?
+}
 impl PeerHls {
+    pub(crate) async fn metadata(&mut self) -> Result<Profile, String> {
+        self.profile
+            .take()
+            .ok_or("peer transport metadata not requested")?
+            .await
+            .map_err(|_| "peer transport metadata task stopped")?
+    }
     pub async fn start(input: &str, key: &str) -> Result<Self, String> {
-        let origin = Url::parse(input).map_err(|_| "invalid peer HLS URL")?;
-        if !permitted(&origin, &origin) || !origin.path().ends_with(".m3u8") {
-            return Err("native peer HTTP input requires an HLS playlist URL".into());
+        Self::start_inner(input, key, false).await
+    }
+    pub(crate) async fn start_inspected(input: &str, key: &str) -> Result<Self, String> {
+        Self::start_inner(input, key, true).await
+    }
+    async fn start_inner(input: &str, key: &str, inspect: bool) -> Result<Self, String> {
+        let origin = Url::parse(input).map_err(|_| "invalid peer media URL")?;
+        let live = origin.path().ends_with("/mpegts");
+        if !permitted(&origin, &origin) || !(origin.path().ends_with(".m3u8") || live) {
+            return Err("native peer HTTP input requires an HLS playlist or /mpegts URL".into());
         }
         let key = reqwest::header::HeaderValue::from_str(key).map_err(|_| "invalid peer key")?;
         let key = key.to_str().map_err(|_| "invalid peer key")?.to_owned();
@@ -208,19 +296,43 @@ impl PeerHls {
             uuid::Uuid::new_v4()
         );
         let cancel = CancellationToken::new();
+        let mut client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5));
+        client = if live {
+            client.read_timeout(Duration::from_secs(10))
+        } else {
+            client.timeout(Duration::from_secs(10))
+        };
+        let client = client
+            .build()
+            .map_err(|_| "cannot build peer media fetcher")?;
+        let (metadata_tx, metadata_rx) = tokio::sync::oneshot::channel();
         let f = Fetcher {
             origin: origin.clone(),
             local: local.clone(),
             key,
-            slots: Arc::new(Semaphore::new(8)),
+            slots: Arc::new(Semaphore::new(if live { 1 } else { 8 })),
             cancel: cancel.clone(),
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(5))
-                .timeout(Duration::from_secs(10))
-                .build()
-                .map_err(|_| "cannot build peer HLS fetcher")?,
+            live,
+            inspected: inspect,
+            prefetched: Arc::new(std::sync::Mutex::new(None)),
+            client,
+        };
+        let profile = if live && inspect {
+            let inspected = f.clone();
+            tokio::spawn(async move {
+                let result = tokio::select! {biased;_=inspected.cancel.cancelled()=>Err("peer transport canceled".into()),result=inspect_transport(&inspected)=>result};
+                let profile = result.map(|(prefix, response, audio, video)| {
+                    *inspected.prefetched.lock().unwrap() = Some((prefix, response));
+                    (audio, video)
+                });
+                let _ = metadata_tx.send(profile);
+            });
+            Some(metadata_rx)
+        } else {
+            None
         };
         let url = local_uri(&f, &origin, origin.as_str()).map_err(|_| "invalid peer HLS URL")?;
         let route = format!(
@@ -234,6 +346,10 @@ impl PeerHls {
                 .with_graceful_shutdown(shutdown.cancelled_owned())
                 .await;
         });
-        Ok(Self { url, cancel })
+        Ok(Self {
+            url,
+            cancel,
+            profile,
+        })
     }
 }

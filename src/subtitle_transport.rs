@@ -4,12 +4,12 @@ use std::collections::{BTreeMap, BTreeSet};
 const MASK: u64 = (1 << 33) - 1;
 const PES_LIMIT: usize = 65541;
 #[derive(Default)]
-struct Psi {
+pub(crate) struct Psi {
     bytes: Vec<u8>,
     counter: Option<u8>,
 }
 impl Psi {
-    fn push(&mut self, b: &[u8], start: bool, cc: u8) -> Vec<Vec<u8>> {
+    pub(crate) fn push(&mut self, b: &[u8], start: bool, cc: u8) -> Vec<Vec<u8>> {
         let mut out = vec![];
         if !start && self.counter.is_some_and(|old| (old + 1) & 15 != cc) {
             self.bytes.clear();

@@ -164,7 +164,11 @@ async fn check_source_cdn_balancer(transport: &str) {
     assert_eq!(cdn.media.count().await, 1);
     assert_eq!(
         cdn.media.stats("region/news").await["input_protocol"],
-        transport
+        if transport == "mpegts" {
+            "tshttp"
+        } else {
+            transport
+        }
     );
     if transport == "m4f" {
         let input =
@@ -546,6 +550,11 @@ async fn source_cdn_balancer_over_m4s_preserves_auth_and_one_worker() {
 #[tokio::test]
 async fn source_cdn_balancer_over_m4f_preserves_segments_and_source_timeline() {
     check_source_cdn_balancer("m4f").await;
+}
+
+#[tokio::test]
+async fn source_cdn_balancer_over_mpegts_preserves_auth_and_one_worker() {
+    check_source_cdn_balancer("mpegts").await;
 }
 
 #[tokio::test]
