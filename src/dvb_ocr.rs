@@ -69,7 +69,7 @@ impl Store {
         Self {
             pages: services
                 .iter()
-                .filter(|s| s.channel >= 65536)
+                .filter(|s| (65536..131072).contains(&s.channel))
                 .map(|s| {
                     (
                         (s.channel - 65536) as u16,
@@ -269,7 +269,7 @@ impl Store {
                     .iter()
                     .filter(|r| !r.pending && !r.text.is_empty() && r.end > r.start)
                     .map(move |r| Cue {
-                        channel: 65536 + u32::from(page),
+                        channel: 65536 + u64::from(page),
                         start: r.start,
                         end: Some(r.end),
                         text: r.text.clone(),

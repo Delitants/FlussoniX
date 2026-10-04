@@ -109,3 +109,5 @@ Rows require `dvb_page`0..65535 and `ocr_language` (one to four installed model 
 ## Generic native text stage
 
 Copy-mode native M4F/M4S now preserves or filters the observed generic text codec through the same original-track control. HLS conversion of its opaque payload and preservation during transcoding remain unsupported and explicitly reported. See [native subtitle delivery](native-subtitles.md) for the format, evidence and limits.
+
+Generic native UTF-8 text now has an explicit HLS track selector and independent conversion path. See [native subtitles](native-subtitles.md) for controls, clock alignment, limits and qualification.

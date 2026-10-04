@@ -57,3 +57,5 @@ mod subtitle_transport;
 mod ts_profile;
 
 mod native_subtitles;
+
+mod native_hls;

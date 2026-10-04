@@ -1,0 +1,9 @@
+# Native text to HLS
+
+Convert explicitly selected generic native `subtitle` tracks from M4F/M4S to selectable plain-text WebVTT in both TS and fMP4 HLS. Preserve/drop for native output remains independent. Each rendition uses `native_track` (1..4294967295), `language` and `name` in the existing HLS captions configuration and friendly Stream/Template forms.
+
+Native events must arrive in source DTS order. Reordered video presentation timestamps do not advance the publication frontier beyond decoded DTS. Use the existing generation-owned HLS cache, viewer authorization and real output video clocks. Observe source video PTS and cue start/end before native-output filtering, on the same input connection. Do not send native text through FFmpeg or add a vendor dependency. Native selections cannot be mixed with broadcast selections in one generation because their clock observation paths differ.
+
+The initial profile is a real H.264/HEVC video source in copy mode, or CPU video encoding with original subtitle tracks dropped. GPU subtitle conversion and native subtitle retention during transcoding remain unqualified. Audio-only conversion, bitmap/XML payload conversion, automatic language selection and full reference parity remain pending.
+
+Accept bounded UTF-8 literal text (16 KiB, 64 lines), normalize CR/LF and prevent blank lines from delimiting extra WebVTT cues. Escape markup. Require positive cue duration up to 120 seconds; empty samples clear the selected display. Limit retained history to 4096 cues, 120 seconds and 1 MiB. Video composition offsets are bounded to two seconds; source DTS gaps above ten seconds or selected cues arriving behind decoded video DTS disable conversion. Invalid selected text, timing or video clocks disable subtitle conversion with a visible error and leave AV delivery running. Unselected opaque text remains untouched by conversion.

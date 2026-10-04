@@ -117,6 +117,21 @@ impl Worker {
             });
             stats["native_subtitle_hls"] = json!(if self.hls_subtitles == "drop" {
                 "Off"
+            } else if let Some(c) = self.captions.as_ref().filter(|c| c
+                .decoder
+                .lock()
+                .unwrap()
+                .services
+                .iter()
+                .any(|s| s.native_track().is_some()))
+            {
+                if c.failed.load(Ordering::Relaxed) {
+                    "Failed"
+                } else if c.stats()["status"] == "running" {
+                    "Converted"
+                } else {
+                    "Starting"
+                }
             } else {
                 "Not supported"
             });
@@ -187,6 +202,7 @@ impl Engine {
         let subtitle_tracks = crate::config::subtitle_tracks(cfg)?;
         let hls_subtitles = crate::config::hls_subtitles(cfg)?;
         let caption_services = crate::captions::configuration(cfg)?;
+        let native_captions = caption_services.iter().any(|s| s.native_track().is_some());
         let caption_separate = caption_services.iter().any(|s| s.channel >= 1124);
         if hls_subtitles == "convert" && caption_services.is_empty() {
             return Err("Choose at least one HLS caption channel for conversion".into());
@@ -248,6 +264,13 @@ impl Engine {
             .ok_or("stream has no input")?;
         index %= inputs.len();
         let input = inputs[index]["url"].as_str().ok_or("input URL required")?;
+        if native_captions
+            && !["m4f://", "m4fs://", "m4s://", "m4ss://"]
+                .iter()
+                .any(|prefix| input.starts_with(prefix))
+        {
+            return Err("native text conversion requires an M4F/M4S input".into());
+        }
         if workers
             .values()
             .filter(|w| w.alive.load(Ordering::Relaxed))
@@ -269,7 +292,7 @@ impl Engine {
         tokio::fs::create_dir_all(dir.join("fmp4"))
             .await
             .map_err(|e| e.to_string())?;
-        let caption_listener = if caption_services.is_empty() {
+        let caption_listener = if caption_services.is_empty() || native_captions {
             None
         } else {
             Some(
@@ -626,7 +649,7 @@ impl Engine {
                     tasks.push(tokio::spawn(async move {
                         let result = tokio::select! { biased;
                             _=c.cancelled()=>Ok(()),
-                            result=crate::m4_ingest::pull_ready_with_subtitles(&url,key.as_deref(),&mut writer,if original_wire {Some(&input_worker.wire)}else{None},metadata_tx,subtitle_tracks == "preserve",Some(&input_worker.native_text_tracks))=>result,
+                            result=crate::m4_ingest::pull_ready_with_subtitles(&url,key.as_deref(),&mut writer,if original_wire {Some(&input_worker.wire)}else{None},metadata_tx,crate::m4_ingest::Subtitles { preserve: subtitle_tracks == "preserve", detected: Some(&input_worker.native_text_tracks), conversion: if native_captions {input_worker.captions.as_deref()} else {None} })=>result,
                         };
                         if let Err(reason) = result {
                             input_worker.failed(if reason == "native_subtitle_transcode_unsupported" { "native_subtitle_transcode_unsupported" } else { "input_closed" });
@@ -685,6 +708,8 @@ impl Engine {
                     }));
                     let c=cancel.clone();let drain_state=state.clone();tasks.push(tokio::spawn(async move {let Ok(Ok((mut socket,_)))=(tokio::select!{biased;_=c.cancelled()=>return,r=tokio::time::timeout(Duration::from_secs(5),listener.accept())=>r})else{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");return};let mut buffer=[0;16384];loop{let read=tokio::select!{biased;_=c.cancelled()=>break,r=socket.read(&mut buffer)=>r};match read{Ok(n)if n>0=>{if enqueue_caption(&sender,Bytes::copy_from_slice(&buffer[..n]),&c).await.is_err(){drain_state.failed.store(true,Ordering::Relaxed);break;}},_=>{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");break}}}}));
                     for _ in 0..2{tasks.push(tokio::spawn(state.clone().ocr(tesseract.clone(),cancel.clone())));}
+                }
+                if let Some(state) = w.captions.clone() {
                     tasks.push(tokio::spawn(state.watch(dir.clone(),cancel.clone())));
                 }
                 let Some(mut stdout) = child.stdout.take() else {
@@ -821,6 +846,8 @@ impl Engine {
             if logical == "index.m3u8"
                 || logical == "av.m3u8"
                 || logical.starts_with("cc")
+                || (logical.starts_with("nt")
+                    && logical.as_bytes().get(2).is_some_and(u8::is_ascii_digit))
                 || (logical.starts_with('s')
                     && logical.as_bytes().get(1).is_some_and(u8::is_ascii_digit))
                 || (logical.starts_with("dvb")

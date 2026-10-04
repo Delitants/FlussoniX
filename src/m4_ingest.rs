@@ -82,6 +82,7 @@ struct SubtitlePolicy<'a> {
     copy: bool,
     sparse: bool,
     detected: Option<&'a AtomicU64>,
+    conversion: Option<&'a crate::caption_hls::State>,
 }
 async fn configs<W: AsyncWrite + Unpin>(
     stdin: &mut W,
@@ -92,6 +93,9 @@ async fn configs<W: AsyncWrite + Unpin>(
     metadata: &mut Option<oneshot::Sender<Vec<Track>>>,
     policy: SubtitlePolicy<'_>,
 ) -> Result<(), String> {
+    if let Some(state) = policy.conversion {
+        state.native_tracks(&new);
+    }
     if let Some(count) = policy.detected {
         count.fetch_max(
             new.iter().filter(|t| t.codec == "subtitle").count() as u64,
@@ -154,7 +158,7 @@ pub async fn pull(
     stdin: &mut tokio::process::ChildStdin,
     hub: Option<&Hub>,
 ) -> Result<(), String> {
-    pull_inner(input, key, stdin, hub, None, false, None).await
+    pull_inner(input, key, stdin, hub, None, Subtitles::default()).await
 }
 /// Supply validated metadata before the first TS write, on the same input session.
 pub async fn pull_ready<W: AsyncWrite + Unpin>(
@@ -164,7 +168,13 @@ pub async fn pull_ready<W: AsyncWrite + Unpin>(
     hub: Option<&Hub>,
     metadata: oneshot::Sender<Vec<Track>>,
 ) -> Result<(), String> {
-    pull_ready_with_subtitles(input, key, output, hub, metadata, false, None).await
+    pull_ready_with_subtitles(input, key, output, hub, metadata, Subtitles::default()).await
+}
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Subtitles<'a> {
+    pub preserve: bool,
+    pub detected: Option<&'a AtomicU64>,
+    pub conversion: Option<&'a crate::caption_hls::State>,
 }
 pub(crate) async fn pull_ready_with_subtitles<W: AsyncWrite + Unpin>(
     input: &str,
@@ -172,10 +182,9 @@ pub(crate) async fn pull_ready_with_subtitles<W: AsyncWrite + Unpin>(
     output: &mut W,
     hub: Option<&Hub>,
     metadata: oneshot::Sender<Vec<Track>>,
-    preserve: bool,
-    detected: Option<&AtomicU64>,
+    subtitles: Subtitles<'_>,
 ) -> Result<(), String> {
-    pull_inner(input, key, output, hub, Some(metadata), preserve, detected).await
+    pull_inner(input, key, output, hub, Some(metadata), subtitles).await
 }
 async fn pull_inner<W: AsyncWrite + Unpin>(
     input: &str,
@@ -183,15 +192,20 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
     stdin: &mut W,
     hub: Option<&Hub>,
     mut metadata: Option<oneshot::Sender<Vec<Track>>>,
-    preserve: bool,
-    detected: Option<&AtomicU64>,
+    subtitles: Subtitles<'_>,
 ) -> Result<(), String> {
+    let Subtitles {
+        preserve,
+        detected,
+        conversion,
+    } = subtitles;
     let is_m4f = input.starts_with("m4f");
     let policy = SubtitlePolicy {
         preserve,
         copy: hub.is_some(),
         sparse: is_m4f,
         detected,
+        conversion,
     };
     let suffix = if is_m4f { "/m4f" } else { "/m4s" };
     let scheme = if input.starts_with("m4ss://") || input.starts_with("m4fs://") {
@@ -275,6 +289,12 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
                 }
                 let body = body.freeze();
                 let (new, frames) = crate::m4f::unpack(&body)?;
+                if let Some(state) = conversion {
+                    state.native_tracks(&new);
+                    for f in &frames {
+                        state.native_frame(&new, f);
+                    }
+                }
                 let source_start = frames.iter().map(|f| f.dts).min();
                 let source_tracks = new.clone();
                 let (body, new, frames) = if !preserve && new.iter().any(|t| t.codec == "subtitle")
@@ -369,6 +389,9 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
                             key,
                             body,
                         };
+                        if let Some(state) = conversion {
+                            state.native_frame(&tracks, &f);
+                        }
                         write_frame(stdin, &mut muxer, &f).await?;
                         if let Some(h) = hub {
                             if preserve
@@ -400,6 +423,9 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
                         )
                         .await?;
                         for f in &frames {
+                            if let Some(state) = conversion {
+                                state.native_frame(&new, f);
+                            }
                             write_frame(stdin, &mut muxer, f).await?;
                         }
                         if let Some(h) = hub {

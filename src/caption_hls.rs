@@ -128,7 +128,11 @@ impl State {
     pub async fn ocr(self: Arc<Self>, executable: String, cancel: CancellationToken) {
         let mut changes = {
             let d = self.decoder.lock().unwrap();
-            if !d.services.iter().any(|s| s.channel >= 65536) {
+            if !d
+                .services
+                .iter()
+                .any(|s| (65536..131072).contains(&s.channel))
+            {
                 return;
             }
             d.dvb_ocr.subscribe()
@@ -413,7 +417,7 @@ async fn bounded_read(path: &Path) -> Result<Vec<u8>, String> {
 }
 fn webvtt(
     cues: &[Cue],
-    channel: u32,
+    channel: u64,
     first: u64,
     anchor: u64,
     start: u64,

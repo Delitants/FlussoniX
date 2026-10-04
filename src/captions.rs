@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 #[derive(Clone, Debug)]
 pub struct Service {
-    pub channel: u32,
+    pub channel: u64,
     pub language: String,
     pub name: String,
     pub ocr_language: Option<String>,
@@ -14,6 +14,8 @@ pub struct Service {
 struct Row {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     channel: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_track: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     service: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -28,18 +30,25 @@ struct Row {
 impl<'de> Deserialize<'de> for Service {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let row = Row::deserialize(d)?;
-        let channel = match (row.channel, row.service, row.teletext_page, row.dvb_page) {
-            (Some(c), None, None, None) if (1..=4).contains(&c) => u32::from(c),
-            (None, Some(s), None, None) if (1..=63).contains(&s) => 64 + u32::from(s),
-            (None, None, Some(p), None) if (100..=899).contains(&p) => 1024 + u32::from(p),
-            (None, None, None, Some(p)) => 65536 + u32::from(p),
+        let channel = match (
+            row.channel,
+            row.service,
+            row.teletext_page,
+            row.dvb_page,
+            row.native_track,
+        ) {
+            (Some(c), None, None, None, None) if (1..=4).contains(&c) => u64::from(c),
+            (None, Some(s), None, None, None) if (1..=63).contains(&s) => 64 + u64::from(s),
+            (None, None, Some(p), None, None) if (100..=899).contains(&p) => 1024 + u64::from(p),
+            (None, None, None, Some(p), None) => 65536 + u64::from(p),
+            (None, None, None, None, Some(id)) if id > 0 => NATIVE_BASE + u64::from(id),
             _ => {
                 return Err(serde::de::Error::custom(
-                    "choose channel 1..4 OR service 1..63 OR teletext_page 100..899 OR dvb_page 0..65535",
+                    "choose channel 1..4 OR service 1..63 OR teletext_page 100..899 OR dvb_page 0..65535 OR native_track 1..4294967295",
                 ));
             }
         };
-        if (channel >= 65536) != row.ocr_language.is_some()
+        if (65536..131072).contains(&channel) != row.ocr_language.is_some()
             || row
                 .ocr_language
                 .as_ref()
@@ -61,6 +70,7 @@ impl Serialize for Service {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         Row {
             channel: (self.channel <= 4).then_some(self.channel as u16),
+            native_track: self.native_track(),
             service: if (65..=127).contains(&self.channel) {
                 Some((self.channel - 64) as u8)
             } else {
@@ -69,7 +79,9 @@ impl Serialize for Service {
             teletext_page: (1124..=1923)
                 .contains(&self.channel)
                 .then(|| (self.channel - 1024) as u16),
-            dvb_page: (self.channel >= 65536).then(|| (self.channel - 65536) as u16),
+            dvb_page: (65536..131072)
+                .contains(&self.channel)
+                .then(|| (self.channel - 65536) as u16),
             ocr_language: self.ocr_language.clone(),
             language: self.language.clone(),
             name: self.name.clone(),
@@ -77,13 +89,19 @@ impl Serialize for Service {
         .serialize(s)
     }
 }
+pub(crate) const NATIVE_BASE: u64 = 1 << 32;
 impl Service {
+    pub fn native_track(&self) -> Option<u32> {
+        (self.channel > NATIVE_BASE).then(|| (self.channel - NATIVE_BASE) as u32)
+    }
     pub fn key(&self) -> String {
         key(self.channel)
     }
 }
-pub fn key(channel: u32) -> String {
-    if channel >= 65536 {
+pub fn key(channel: u64) -> String {
+    if channel > NATIVE_BASE {
+        format!("nt{}", channel - NATIVE_BASE)
+    } else if channel >= 65536 {
         format!("dvb{}", channel - 65536)
     } else if channel >= 1124 {
         format!("ttx{}", channel - 1024)
@@ -106,10 +124,17 @@ pub fn configuration(cfg: &Value) -> Result<Vec<Service>, String> {
         return Ok(vec![]);
     };
     let services: Vec<Service> = serde_json::from_value(rows.clone()).map_err(
-        |_| "HLS captions require one channel/service/teletext_page/dvb_page selector, language and name; DVB pages also require OCR model names",
+        |_| "HLS captions require one channel/service/teletext_page/dvb_page/native_track selector, language and name; DVB pages also require OCR model names",
     )?;
     if services.len() > 4 {
         return Err("at most four HLS caption renditions are supported".into());
+    }
+    if services.iter().any(|s| s.native_track().is_some())
+        && services.iter().any(|s| s.native_track().is_none())
+    {
+        return Err(
+            "native text selectors cannot be mixed with broadcast caption selectors".into(),
+        );
     }
     let mut names = std::collections::HashSet::new();
     let mut seen = std::collections::HashSet::new();
@@ -144,7 +169,7 @@ pub fn configuration(cfg: &Value) -> Result<Vec<Service>, String> {
 }
 #[derive(Clone, Debug)]
 pub struct Cue {
-    pub channel: u32,
+    pub channel: u64,
     pub start: u64,
     pub end: Option<u64>,
     pub text: String,
@@ -333,7 +358,9 @@ pub struct Decoder {
     dvb: crate::dvb::Decoder,
     dvb_frames: VecDeque<crate::dvb::Frame>,
     pub(crate) dvb_ocr: crate::dvb_ocr::Store,
-    digital_open: BTreeMap<u32, Cue>,
+    digital_open: BTreeMap<u64, Cue>,
+    native_last: BTreeMap<u64, u64>,
+    pub(crate) native_video_dts: Option<u64>,
     pub first_pts: Option<u64>,
     pub latest_pts: u64,
     pub error: Option<&'static str>,
@@ -346,7 +373,10 @@ impl Decoder {
     }
     pub(crate) fn publication_frontier(&mut self) -> u64 {
         self.dvb_ocr.expire(std::time::Instant::now());
-        self.dvb_ocr.frontier(self.latest_pts)
+        self.dvb_ocr.frontier(
+            self.native_video_dts
+                .map_or(self.latest_pts, |dts| dts.min(self.latest_pts)),
+        )
     }
     fn reset_dvb_ocr(&mut self, pages: &[u16], pts: u64, reason: &'static str) {
         self.dvb_frames.retain(|f| !pages.contains(&f.page));
@@ -422,7 +452,7 @@ impl Decoder {
         let dvb = crate::dvb::Decoder::new(
             services
                 .iter()
-                .filter(|s| s.channel >= 65536)
+                .filter(|s| (65536..131072).contains(&s.channel))
                 .map(|s| (s.channel - 65536) as u16),
         );
         Self {
@@ -432,6 +462,8 @@ impl Decoder {
             teletext,
             digital,
             digital_open: BTreeMap::new(),
+            native_last: BTreeMap::new(),
+            native_video_dts: None,
             services,
             channels: std::array::from_fn(|_| Channel::default()),
             selected: [0, 2],
@@ -443,7 +475,7 @@ impl Decoder {
     }
     fn digital_changes(&mut self, changes: Vec<crate::cea708::Change>) {
         for change in changes {
-            let id = 64 + u32::from(change.service);
+            let id = 64 + u64::from(change.service);
             if let Some(mut cue) = self.digital_open.remove(&id) {
                 cue.end = Some(change.pts.max(cue.start));
                 if cue.end != Some(cue.start) {
@@ -483,7 +515,7 @@ impl Decoder {
     }
     fn teletext_changes(&mut self, changes: Vec<crate::teletext::Change>) {
         for c in changes {
-            let id = 1024 + u32::from(c.page);
+            let id = 1024 + u64::from(c.page);
             if let Some(mut cue) = self.digital_open.remove(&id) {
                 cue.end = Some(c.pts.max(cue.start));
                 if cue.end != Some(cue.start) {
@@ -585,7 +617,7 @@ impl Decoder {
         }
         if !text.is_empty() {
             channel.open = Some(Cue {
-                channel: index as u32 + 1,
+                channel: index as u64 + 1,
                 start: pts,
                 end: None,
                 text,
@@ -609,6 +641,45 @@ impl Decoder {
             self.channels[i] = Channel::default()
         }
         self.selected = [0, 2];
+    }
+    pub(crate) fn native_cue(
+        &mut self,
+        channel: u64,
+        start: u64,
+        end: u64,
+        text: String,
+    ) -> Result<(), &'static str> {
+        if self
+            .native_last
+            .get(&channel)
+            .is_some_and(|last| start < *last)
+        {
+            return Err("native_subtitle_clock_discontinuity");
+        }
+        self.native_last.insert(channel, start);
+        for cue in self.history.iter_mut().filter(|c| c.channel == channel) {
+            if cue.end.is_some_and(|end| end > start) {
+                cue.end = Some(start.max(cue.start));
+            }
+        }
+        if !text.is_empty() {
+            if self.history.len() >= 4096
+                || self.history.iter().map(|c| c.text.len()).sum::<usize>() + text.len()
+                    > 1024 * 1024
+            {
+                return Err("native_subtitle_history_limit");
+            }
+            self.history.push_back(Cue {
+                channel,
+                start,
+                end: Some(end),
+                text,
+            });
+        }
+        if self.history.len() > 4096 {
+            return Err("native_subtitle_history_limit");
+        }
+        Ok(())
     }
     pub fn snapshot(&self) -> Vec<Cue> {
         self.history
