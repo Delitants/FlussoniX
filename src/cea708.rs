@@ -251,11 +251,35 @@ impl Window {
         }
     }
     fn backspace(&mut self) {
+        let original = (self.row, self.col);
         self.step(true);
+        if !self.bounds() {
+            let row_valid = self.row >= 0 && (self.row as usize) < self.rows;
+            let col_valid = self.col >= 0 && (self.col as usize) < self.cols;
+            match self.print {
+                0 if self.col == -1 && row_valid && self.scroll >= 2 => {
+                    self.row += if self.scroll == 3 { -1 } else { 1 };
+                    self.col = self.cols as i16 - 1;
+                }
+                1 if self.col == self.cols as i16 && row_valid && self.scroll >= 2 => {
+                    self.row += if self.scroll == 3 { -1 } else { 1 };
+                    self.col = 0;
+                }
+                2 if self.row == -1 && col_valid && self.scroll <= 1 => {
+                    self.col += if self.scroll == 1 { -1 } else { 1 };
+                    self.row = self.rows as i16 - 1;
+                }
+                3 if self.row == self.rows as i16 && col_valid && self.scroll <= 1 => {
+                    self.col += if self.scroll == 1 { -1 } else { 1 };
+                    self.row = 0;
+                }
+                _ => {}
+            }
+        }
         if self.bounds() {
             self.cells[self.row as usize][self.col as usize] = ' ';
         } else {
-            self.step(false);
+            (self.row, self.col) = original;
         }
     }
     fn carriage(&mut self) {

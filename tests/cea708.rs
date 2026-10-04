@@ -369,3 +369,168 @@ fn unselected_command_bytes_are_not_interpreted_and_vertical_style_seven_advance
     packet(&mut d, 1, &[(1, &[0x0d, b'D'])], 180000);
     assert_eq!(open(&d, 65).as_deref(), Some("AD\nB\nC"));
 }
+fn reordered_delay(control: u8) {
+    use flussonix::{caption_transport::Transport, m4f::Frame, m4s::Track, worker_ts::Muxer};
+    let track = Track {
+        id: 1,
+        codec: "h264".into(),
+        config: vec![
+            1, 100, 0, 31, 255, 225, 0, 4, 103, 100, 0, 31, 1, 0, 2, 104, 0,
+        ],
+    };
+    let mut mux = Muxer::new(&[track]).unwrap();
+    let mut t = Transport::default();
+    let mut d = digital(&[1]);
+    t.push(&mux.tables(), &mut d);
+    let commands = [0x98, 0, 0, 0, 0, 20, 0, b'A', 0x8d, 4, 0x89, 1];
+    for (index, (pts, dts)) in [
+        (18000, 0),
+        (45000, 9000),
+        (27000, 18000),
+        (36000, 27000),
+        (72000, 36000),
+        (54000, 45000),
+        (63000, 54000),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let cmd: &[u8] = if index == 0 {
+            &commands
+        } else if index == 1 {
+            std::slice::from_ref(&control)
+        } else {
+            &[]
+        };
+        let mut payload = b"\xb5\x00\x31GA94\x03".to_vec();
+        let mut triples = vec![];
+        if !cmd.is_empty() {
+            let mut block = vec![0x20 | cmd.len() as u8];
+            block.extend(cmd);
+            if block.len() % 2 == 0 {
+                block.push(0);
+            }
+            triples.push((
+                3,
+                ((index as u8) << 6) | block.len().div_ceil(2) as u8,
+                block[0],
+            ));
+            for p in block[1..].chunks_exact(2) {
+                triples.push((2, p[0], p[1]));
+            }
+        }
+        payload.extend([0x40 | triples.len() as u8, 255]);
+        for (kind, a, b) in triples {
+            payload.extend([0xfc | kind, a, b]);
+        }
+        payload.push(255);
+        let mut rbsp = vec![4, payload.len() as u8];
+        rbsp.extend(payload);
+        rbsp.push(128);
+        let mut nal = vec![6];
+        let mut zeros = 0;
+        for b in rbsp {
+            if zeros >= 2 && b <= 3 {
+                nal.push(3);
+                zeros = 0;
+            }
+            nal.push(b);
+            zeros = if b == 0 { zeros + 1 } else { 0 };
+        }
+        let mut body = (nal.len() as u32).to_be_bytes().to_vec();
+        body.extend(nal);
+        body.extend([0, 0, 0, 2, 0x65, 1]);
+        t.push(
+            &mux.frame(&Frame {
+                track_id: 1,
+                dts,
+                pts_offset: pts as i64 - dts as i64,
+                key: true,
+                body,
+            })
+            .unwrap(),
+            &mut d,
+        );
+        if index <= 4 {
+            assert_eq!(
+                open(&d, 65),
+                None,
+                "caption cannot display before the safe source frontier reaches its cancel/reset command"
+            );
+        }
+    }
+    assert_eq!(d.first_pts, Some(18000));
+    assert_eq!(d.latest_pts, 54000);
+    if control == 0x8e || control == 0 {
+        let cue = d.snapshot().into_iter().find(|c| c.end.is_none()).unwrap();
+        assert_eq!(cue.text, "A");
+        assert_eq!(cue.start, if control == 0 { 54000 } else { 45000 });
+    } else {
+        assert!(d.snapshot().is_empty());
+    }
+}
+#[test]
+fn reordered_dlc_runs_before_delay_deadline_despite_future_reference_pts() {
+    reordered_delay(0x8e);
+}
+#[test]
+fn reordered_rst_discards_delayed_display_without_a_premature_flash() {
+    reordered_delay(0x8f);
+}
+#[test]
+fn backspace_at_row_boundary_replaces_the_previous_rows_last_character() {
+    let mut d = digital(&[1]);
+    packet(
+        &mut d,
+        0,
+        &[(
+            1,
+            &[
+                0x98, 0x20, 0, 0, 1, 3, 0, b'A', b'B', b'C', b'D', 0x0d, 0x08, b'Z',
+            ],
+        )],
+        90000,
+    );
+    assert_eq!(open(&d, 65).as_deref(), Some("ABCZ"));
+}
+#[test]
+fn right_to_left_backspace_crosses_to_previous_row_without_scrolling() {
+    let mut d = digital(&[1]);
+    packet(
+        &mut d,
+        0,
+        &[(
+            1,
+            &[
+                0x98, 0x20, 0, 0, 1, 3, 0, 0x97, 0, 0, 0x1c, 0, 0x92, 0, 3, b'A', b'B', b'C', b'D',
+                0x0d, 0x08, b'Z',
+            ],
+        )],
+        90000,
+    );
+    assert_eq!(open(&d, 65).as_deref(), Some("ZCBA"));
+}
+
+#[test]
+fn delayed_display_advances_during_silent_reordered_video() {
+    reordered_delay(0);
+}
+#[test]
+fn vertical_backspace_crosses_columns_without_scrolling_or_leaving_the_grid() {
+    for (direction, start_row, want) in [(0x24, 0, "A\nZ"), (0x34, 1, "Z\nA")] {
+        let mut d = digital(&[1]);
+        packet(
+            &mut d,
+            0,
+            &[(
+                1,
+                &[
+                    0x98, 0x20, 0, 0, 1, 1, 0, 0x97, 0, 0, direction, 0, 0x92, start_row, 0, b'A',
+                    b'B', 0x0d, 0x08, b'Z',
+                ],
+            )],
+            90000,
+        );
+        assert_eq!(open(&d, 65).as_deref(), Some(want));
+    }
+}

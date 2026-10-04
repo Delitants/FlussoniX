@@ -190,7 +190,7 @@ impl Transport {
                 d.error = Some("caption_clock_discontinuity");
             }
             self.last_pts = Some(t);
-            d.observe(t);
+            d.observe_video(t, watermark);
             self.pes_pts = Some(t);
         }
         if self.pes_pts.is_some() {

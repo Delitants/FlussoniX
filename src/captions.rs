@@ -344,6 +344,12 @@ impl Decoder {
             self.error = self.digital.error;
         }
     }
+    // Anchor to the first presentation timestamp, but only execute deadlines
+    // and publish clock progress after preceding reordered events are safe.
+    pub(crate) fn observe_video(&mut self, pts: u64, frontier: u64) {
+        self.first_pts.get_or_insert(pts);
+        self.observe(frontier);
+    }
     pub fn observe(&mut self, pts: u64) {
         let changes = self.digital.advance(pts);
         self.digital_changes(changes);

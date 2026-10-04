@@ -1,6 +1,6 @@
 # Subtitle conversion and preservation contract
 
-Status: original separate DVB/teletext track preservation and selectable plain-text CEA-608 WebVTT are implemented. HLS offers original TS pass-through, conversion and filtering. CEA-708/teletext conversion and DVB OCR remain pending; see the qualification record for the measured codec/player subset.
+Status: original separate DVB/teletext track preservation and selectable plain-text CEA-608/708 WebVTT are implemented. HLS offers original TS pass-through, conversion and filtering. Teletext conversion and DVB OCR remain pending; see [CEA-708 qualification](cea708-qualification.md) for the measured codec/player subset.
 
 ## User requirement
 
