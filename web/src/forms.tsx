@@ -13,7 +13,7 @@ export function ConfigurationFields({kind,value,onChange,templates,backends,lock
  const updateInput=(i:number,url:string)=>set('inputs',(value.inputs||[]).map((v:Item,n:number)=>{if(n!==i)return v;const next:Item={...v,url};if(!url.startsWith('rtsp://'))delete next.rtp;if(!trustedInput(url))delete next.flussonix_tls_ca;return next}));
  const setTransport=(i:number,transport:string)=>set('inputs',(value.inputs||[]).map((v:Item,n:number)=>{if(n!==i)return v;const next={...v};if(transport==='udp')next.rtp='udp';else delete next.rtp;return next}));
  const setCA=(i:number,path:string)=>set('inputs',(value.inputs||[]).map((v:Item,n:number)=>{if(n!==i)return v;const next={...v};if(path)next.flussonix_tls_ca=path;else delete next.flussonix_tls_ca;return next}));
- const updateEndpoint=(field:string,url:string)=>{const next={...value,[field]:url};if(!next.api_url?.startsWith('https://'))delete next.flussonix_tls_ca;if(!(next.private_payload_url||next.api_url||'').startsWith('https://'))delete next.flussonix_media_tls_ca;onChange(next)};
+ const updateEndpoint=(field:string,url:string)=>{const next:Item={...value};if(url)next[field]=url;else delete next[field];if(!next.api_url?.startsWith('https://'))delete next.flussonix_tls_ca;if(!(next.private_payload_url||next.api_url||'').startsWith('https://'))delete next.flussonix_media_tls_ca;onChange(next)};
  const nodeCA=(field:string,path:string)=>{const next={...value};if(path)next[field]=path;else delete next[field];onChange(next)};
  const media=kind==='streams'||kind==='templates';
  const rawAuth=typeof value.on_play==='string'?{url:value.on_play}:value.on_play||{};

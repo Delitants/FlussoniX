@@ -33,8 +33,14 @@ async fn run(cpu: bool) {
         bytes
     });
     let input = original::inject(&fixture::transport());
-    p.stdin.as_mut().unwrap().write_all(&input).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(12), async {
+    // Deliver at the source PTS rate: a 16-second burst can advance the
+    // six-segment live window past the early cue before both variants are read.
+    let feed = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(fixture::paced(
+        p.stdin.take().unwrap(),
+        input,
+    )));
+    // Allow the 16-second real-time fixture to reach both packaging paths.
+    tokio::time::timeout(Duration::from_secs(16), async {
         loop {
             // Wait for both independent variants to reach the quiet tail.
             let mut ready = true;
@@ -98,7 +104,7 @@ async fn run(cpu: bool) {
             }
             words += &vtt;
         }
-        assert!(words.contains("USA 608"), "{words}");
+        assert!(words.contains("USA 608"), "playlist: {list}\n{words}");
         assert!(words.contains("00:00:02.160 --> 00:00:03.000"), "{words}");
         assert!(
             empty,
@@ -122,6 +128,8 @@ async fn run(cpu: bool) {
     }
     assert_eq!(p.worker.stats()["hls_captions"]["status"], "running");
     assert!(p.worker.stats()["hls_captions"]["cues"].as_u64().unwrap() > 0);
+    feed.abort();
+    let _ = feed.await;
     e.stop_all().await;
 }
 #[tokio::test]
