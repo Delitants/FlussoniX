@@ -11,6 +11,7 @@ const MASK: u64 = (1 << 33) - 1;
 pub struct Transport {
     pending: Vec<u8>,
     teletext: crate::teletext_transport::Transport,
+    dvb: crate::subtitle_transport::Transport<true>,
     pmt: Option<u16>,
     video: Option<(u16, bool)>,
     pat_section: Vec<u8>,
@@ -47,6 +48,7 @@ impl Transport {
     }
     fn packet(&mut self, p: &[u8; 188], d: &mut Decoder) {
         self.teletext.packet(p, d);
+        self.dvb.packet(p, d);
         let pid = (u16::from(p[1] & 31) << 8) | u16::from(p[2]);
         let start = p[1] & 0x40 != 0;
         let offset = if p[3] & 0x20 != 0 {
@@ -193,6 +195,7 @@ impl Transport {
             }
             self.last_pts = Some(t);
             self.teletext.advance(watermark, d);
+            self.dvb.advance(watermark, d);
             d.observe_video(t, watermark);
             self.pes_pts = Some(t);
         }
@@ -207,6 +210,7 @@ impl Transport {
     }
     fn gap(&mut self, d: &mut Decoder) {
         self.teletext.reset();
+        self.dvb.reset();
         self.pes.clear();
         self.events.clear();
         self.pes_pts = None;
@@ -244,6 +248,7 @@ impl Transport {
         // Embedded pairs call Decoder::push/observe, which executes page
         // deadlines. Apply all due subtitle rows at this safe frontier first.
         self.teletext.advance(watermark, d);
+        self.dvb.advance(watermark, d);
         while self.events.first().is_some_and(|e| e.pts <= watermark) {
             let event = self.events.remove(0);
             for (field, pair) in event.pairs {

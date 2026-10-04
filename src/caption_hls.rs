@@ -320,7 +320,7 @@ async fn bounded_read(path: &Path) -> Result<Vec<u8>, String> {
 }
 fn webvtt(
     cues: &[Cue],
-    channel: u16,
+    channel: u32,
     first: u64,
     anchor: u64,
     start: u64,
@@ -598,6 +598,7 @@ mod failure_tests {
                 channel: 1,
                 language: "en".into(),
                 name: "English".into(),
+                ocr_language: None,
             }]),
             "owned".into(),
             1,
@@ -661,6 +662,7 @@ mod full_period_tests {
                 channel: 1,
                 language: "en".into(),
                 name: "English".into(),
+                ocr_language: None,
             }]);
             let parity = |b: u8| b | if b.count_ones() % 2 == 0 { 128 } else { 0 };
             d.observe(first);

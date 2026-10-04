@@ -110,6 +110,7 @@ async fn hls_passes_or_filters_embedded_captions_without_changing_other_outputs(
                 channel: 1,
                 language: "en".into(),
                 name: "English".into(),
+                ocr_language: None,
             }]);
             Transport::default().push(&demux.stdout, &mut decoder);
             let text = decoder
@@ -160,6 +161,7 @@ async fn hls_passes_or_filters_embedded_captions_without_changing_other_outputs(
             channel: 1,
             language: "en".into(),
             name: "English".into(),
+            ocr_language: None,
         }]);
         Transport::default().push(&all, &mut decoder);
         assert!(decoder.snapshot().iter().any(|c| c.text.contains("LIVE")));

@@ -49,3 +49,7 @@ mod raw_hls;
 
 mod teletext;
 mod teletext_transport;
+
+pub mod dvb;
+
+mod subtitle_transport;

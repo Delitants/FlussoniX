@@ -4,9 +4,10 @@ use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 #[derive(Clone, Debug)]
 pub struct Service {
-    pub channel: u16,
+    pub channel: u32,
     pub language: String,
     pub name: String,
+    pub ocr_language: Option<String>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -17,39 +18,59 @@ struct Row {
     service: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     teletext_page: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dvb_page: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ocr_language: Option<String>,
     language: String,
     name: String,
 }
 impl<'de> Deserialize<'de> for Service {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let row = Row::deserialize(d)?;
-        let channel = match (row.channel, row.service, row.teletext_page) {
-            (Some(c), None, None) if (1..=4).contains(&c) => c,
-            (None, Some(s), None) if (1..=63).contains(&s) => 64 + u16::from(s),
-            (None, None, Some(p)) if (100..=899).contains(&p) => 1024 + p,
+        let channel = match (row.channel, row.service, row.teletext_page, row.dvb_page) {
+            (Some(c), None, None, None) if (1..=4).contains(&c) => u32::from(c),
+            (None, Some(s), None, None) if (1..=63).contains(&s) => 64 + u32::from(s),
+            (None, None, Some(p), None) if (100..=899).contains(&p) => 1024 + u32::from(p),
+            (None, None, None, Some(p)) => 65536 + u32::from(p),
             _ => {
                 return Err(serde::de::Error::custom(
-                    "choose channel 1..4 OR service 1..63 OR teletext_page 100..899",
+                    "choose channel 1..4 OR service 1..63 OR teletext_page 100..899 OR dvb_page 0..65535",
                 ));
             }
         };
+        if (channel >= 65536) != row.ocr_language.is_some()
+            || row
+                .ocr_language
+                .as_ref()
+                .is_some_and(|s| !ocr_model_names(s))
+        {
+            return Err(serde::de::Error::custom(
+                "only DVB pages require valid OCR model names",
+            ));
+        }
         Ok(Self {
             channel,
             language: row.language,
             name: row.name,
+            ocr_language: row.ocr_language,
         })
     }
 }
 impl Serialize for Service {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         Row {
-            channel: (self.channel <= 4).then_some(self.channel),
+            channel: (self.channel <= 4).then_some(self.channel as u16),
             service: if (65..=127).contains(&self.channel) {
                 Some((self.channel - 64) as u8)
             } else {
                 None
             },
-            teletext_page: (self.channel >= 1124).then(|| self.channel - 1024),
+            teletext_page: (1124..=1923)
+                .contains(&self.channel)
+                .then(|| (self.channel - 1024) as u16),
+            dvb_page: (self.channel >= 65536).then(|| (self.channel - 65536) as u16),
+            ocr_language: self.ocr_language.clone(),
             language: self.language.clone(),
             name: self.name.clone(),
         }
@@ -61,8 +82,10 @@ impl Service {
         key(self.channel)
     }
 }
-pub fn key(channel: u16) -> String {
-    if channel >= 1124 {
+pub fn key(channel: u32) -> String {
+    if channel >= 65536 {
+        format!("dvb{}", channel - 65536)
+    } else if channel >= 1124 {
         format!("ttx{}", channel - 1024)
     } else if channel > 64 {
         format!("s{}", channel - 64)
@@ -70,12 +93,20 @@ pub fn key(channel: u16) -> String {
         format!("cc{channel}")
     }
 }
+fn ocr_model_names(s: &str) -> bool {
+    s.len() <= 99
+        && (1..=4).contains(&s.split('+').count())
+        && s.split('+').all(|part| {
+            (1..=24).contains(&part.len())
+                && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        })
+}
 pub fn configuration(cfg: &Value) -> Result<Vec<Service>, String> {
     let Some(rows) = cfg.get("flussonix_hls_captions") else {
         return Ok(vec![]);
     };
     let services: Vec<Service> = serde_json::from_value(rows.clone()).map_err(
-        |_| "HLS captions require rows with channel 1..4 OR service 1..63 OR teletext_page 100..899, language and name",
+        |_| "HLS captions require one channel/service/teletext_page/dvb_page selector, language and name; DVB pages also require OCR model names",
     )?;
     if services.len() > 4 {
         return Err("at most four HLS caption renditions are supported".into());
@@ -113,7 +144,7 @@ pub fn configuration(cfg: &Value) -> Result<Vec<Service>, String> {
 }
 #[derive(Clone, Debug)]
 pub struct Cue {
-    pub channel: u16,
+    pub channel: u32,
     pub start: u64,
     pub end: Option<u64>,
     pub text: String,
@@ -299,12 +330,48 @@ pub struct Decoder {
     history: VecDeque<Cue>,
     digital: crate::cea708::Decoder,
     teletext: crate::teletext::Decoder,
-    digital_open: BTreeMap<u16, Cue>,
+    dvb: crate::dvb::Decoder,
+    dvb_frames: VecDeque<crate::dvb::Frame>,
+    digital_open: BTreeMap<u32, Cue>,
     pub first_pts: Option<u64>,
     pub latest_pts: u64,
     pub error: Option<&'static str>,
 }
 impl Decoder {
+    pub fn take_dvb_frames(&mut self) -> Vec<crate::dvb::Frame> {
+        self.dvb_frames.drain(..).collect()
+    }
+    pub fn dvb_stats(&self) -> Value {
+        self.dvb.stats()
+    }
+    pub(crate) fn dvb_pages(&self) -> Vec<u16> {
+        self.dvb.pages()
+    }
+    fn dvb_changes(&mut self, frames: Vec<crate::dvb::Frame>) {
+        for f in frames {
+            if self.dvb_frames.len() >= 8 {
+                self.dvb_frames.clear();
+                self.error = Some("dvb_image_queue_limit");
+            }
+            self.dvb_frames.push_back(f);
+        }
+        if self.dvb.error.is_some() {
+            self.error = self.dvb.error;
+        }
+    }
+    pub(crate) fn dvb_bindings(&mut self, b: &BTreeMap<u16, (u16, u16)>, pts: u64) {
+        let frames = self.dvb.bindings(b, pts);
+        self.dvb_changes(frames);
+    }
+    pub(crate) fn dvb_gap(&mut self, pid: u16, pts: u64) {
+        let frames = self.dvb.reset_pid(pid, pts);
+        self.dvb_changes(frames);
+    }
+    pub(crate) fn push_dvb(&mut self, pid: u16, body: &[u8], pts: u64) {
+        let frames = self.dvb.push(pid, body, pts);
+        self.dvb_changes(frames);
+    }
+
     pub fn new(services: Vec<Service>) -> Self {
         let digital = crate::cea708::Decoder::new(services.iter().filter_map(|s| {
             (65..=127)
@@ -314,10 +381,18 @@ impl Decoder {
         let teletext = crate::teletext::Decoder::new(
             services
                 .iter()
-                .filter(|s| s.channel >= 1124)
-                .map(|s| s.channel - 1024),
+                .filter(|s| (1124..=1923).contains(&s.channel))
+                .map(|s| (s.channel - 1024) as u16),
+        );
+        let dvb = crate::dvb::Decoder::new(
+            services
+                .iter()
+                .filter(|s| s.channel >= 65536)
+                .map(|s| (s.channel - 65536) as u16),
         );
         Self {
+            dvb,
+            dvb_frames: VecDeque::new(),
             teletext,
             digital,
             digital_open: BTreeMap::new(),
@@ -332,7 +407,7 @@ impl Decoder {
     }
     fn digital_changes(&mut self, changes: Vec<crate::cea708::Change>) {
         for change in changes {
-            let id = 64 + u16::from(change.service);
+            let id = 64 + u32::from(change.service);
             if let Some(mut cue) = self.digital_open.remove(&id) {
                 cue.end = Some(change.pts.max(cue.start));
                 if cue.end != Some(cue.start) {
@@ -372,7 +447,7 @@ impl Decoder {
     }
     fn teletext_changes(&mut self, changes: Vec<crate::teletext::Change>) {
         for c in changes {
-            let id = 1024 + c.page;
+            let id = 1024 + u32::from(c.page);
             if let Some(mut cue) = self.digital_open.remove(&id) {
                 cue.end = Some(c.pts.max(cue.start));
                 if cue.end != Some(cue.start) {
@@ -411,6 +486,8 @@ impl Decoder {
         self.teletext_changes(c);
     }
     pub fn observe(&mut self, pts: u64) {
+        let frames = self.dvb.advance(pts);
+        self.dvb_changes(frames);
         let changes = self.teletext.advance(pts);
         self.teletext_changes(changes);
         let changes = self.digital.advance(pts);
@@ -472,7 +549,7 @@ impl Decoder {
         }
         if !text.is_empty() {
             channel.open = Some(Cue {
-                channel: index as u16 + 1,
+                channel: index as u32 + 1,
                 start: pts,
                 end: None,
                 text,
@@ -483,6 +560,8 @@ impl Decoder {
         }
     }
     pub fn reset(&mut self, pts: u64) {
+        let frames = self.dvb.reset(pts);
+        self.dvb_changes(frames);
         let changes = self.teletext.reset(pts);
         self.teletext_changes(changes);
         let changes = self.digital.reset(pts);
