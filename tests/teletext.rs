@@ -467,3 +467,141 @@ fn exact_duplicate_ts_packet_is_idempotent() {
     assert_eq!(r.open(), ["ONE"]);
     assert_eq!(r.d.error, None);
 }
+
+#[test]
+fn embedded_sei_cannot_expire_a_page_before_queued_teletext_rows() {
+    let mut r = Run::new(&[888], &[(0x121, 888)]);
+    r.units(
+        0x121,
+        9000,
+        &[
+            f::header(888, true, 0, false, false, 0),
+            f::row(888, 1, b"FIRST"),
+        ],
+    );
+    let b = f::video_reordered_padding(18000, 9000, &mut r.v);
+    r.feed(&b);
+    r.units(0x121, 13500, &[f::row(888, 2, b"SECOND")]);
+    let b = f::video_reordered(36000, 18000, &mut r.v);
+    r.feed(&b);
+    assert!(
+        r.d.snapshot().is_empty(),
+        "a due SEI pair must not commit an incomplete page"
+    );
+    let b = f::video_reordered(45000, 27000, &mut r.v);
+    r.feed(&b);
+    let cues = r.d.snapshot();
+    assert_eq!(cues.len(), 1);
+    assert_eq!(cues[0].text, "FIRST\nSECOND");
+    assert_eq!(cues[0].start, 9000);
+}
+#[test]
+fn pat_program_removal_clears_display_availability_and_old_pes() {
+    let mut r = Run::new(&[888], &[(0x121, 888)]);
+    r.show(888, 90000, b"OLD");
+    r.feed(&f::section(0, vec![0, 0xb0, 0, 0, 1, 0xc3, 0, 0], &mut 1));
+    assert!(r.open().is_empty());
+    assert_eq!(r.d.teletext_stats()[0]["status"], "unavailable");
+    r.units(
+        0x121,
+        180000,
+        &[
+            f::header(888, true, 0, false, false, 0),
+            f::row(888, 1, b"STALE"),
+        ],
+    );
+    r.video(198000);
+    assert!(r.open().is_empty());
+    assert!(r.d.latest_pts >= 198000);
+}
+#[test]
+fn reused_pmt_pid_for_a_new_program_discards_old_queued_subtitles() {
+    let mut r = Run::new(&[888], &[(0x121, 888)]);
+    r.units(
+        0x121,
+        90000,
+        &[
+            f::header(888, true, 0, false, false, 0),
+            f::row(888, 1, b"OLD PROGRAM"),
+        ],
+    );
+    r.feed(&f::section(
+        0,
+        vec![0, 0xb0, 0, 0, 1, 0xc3, 0, 0, 0, 2, 0xf0, 0],
+        &mut 1,
+    ));
+    assert_eq!(r.d.teletext_stats()[0]["status"], "unavailable");
+    r.feed(&f::program_pmt(2, &[(0x121, 888)], 1));
+    r.video(108000);
+    assert!(r.d.snapshot().is_empty());
+    assert_eq!(r.d.teletext_stats()[0]["status"], "available");
+    r.s = 0;
+    r.show(888, 180000, b"NEW PROGRAM");
+    assert_eq!(r.open(), ["NEW PROGRAM"]);
+}
+#[test]
+fn pmt_for_an_unselected_program_cannot_bind_or_replace_pages() {
+    let mut r = Run::new(&[888], &[]);
+    r.feed(&f::program_pmt(2, &[(0x121, 888)], 1));
+    r.show(888, 90000, b"WRONG PROGRAM");
+    assert!(r.open().is_empty());
+    assert_eq!(r.d.teletext_stats()[0]["status"], "unavailable");
+    r.feed(&f::program_pmt(1, &[(0x121, 888)], 2));
+    r.s = 0;
+    r.show(888, 180000, b"SELECTED");
+    assert_eq!(r.open(), ["SELECTED"]);
+    r.feed(&f::program_pmt(2, &[], 3));
+    assert_eq!(r.open(), ["SELECTED"]);
+}
+#[test]
+fn repeated_same_page_continuation_keeps_the_pending_header_timestamp() {
+    let mut r = Run::new(&[888], &[(0x121, 888)]);
+    r.units(
+        0x121,
+        9000,
+        &[
+            f::header(888, true, 0, false, false, 0),
+            f::row(888, 1, b"FIRST"),
+        ],
+    );
+    r.units(
+        0x121,
+        13500,
+        &[
+            f::header(888, false, 0, false, false, 0),
+            f::row(888, 2, b"SECOND"),
+        ],
+    );
+    r.video(27000);
+    let cues = r.d.snapshot();
+    assert_eq!(cues.len(), 1);
+    assert_eq!(cues[0].text, "FIRST\nSECOND");
+    assert_eq!(cues[0].start, 9000);
+}
+#[test]
+fn repeated_page_erase_or_subpage_change_starts_a_fresh_transaction() {
+    for (erase, sub) in [(true, 0), (false, 1)] {
+        let mut r = Run::new(&[888], &[(0x121, 888)]);
+        r.units(
+            0x121,
+            9000,
+            &[
+                f::header(888, true, 0, false, false, 0),
+                f::row(888, 1, b"OLD INCOMPLETE"),
+            ],
+        );
+        r.units(
+            0x121,
+            13500,
+            &[
+                f::header(888, erase, 0, false, false, sub),
+                f::row(888, 2, b"NEW"),
+            ],
+        );
+        r.video(27000);
+        let cues = r.d.snapshot();
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].text, "NEW");
+        assert_eq!(cues[0].start, 13500);
+    }
+}

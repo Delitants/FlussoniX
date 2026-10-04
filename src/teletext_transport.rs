@@ -76,6 +76,7 @@ pub(crate) struct Transport {
     pat: Psi,
     pmt: Psi,
     pmt_pid: Option<u16>,
+    program: Option<u16>,
     bindings: BTreeMap<u16, u16>,
     streams: BTreeMap<u16, Pes>,
     events: Vec<Event>,
@@ -140,26 +141,30 @@ impl Transport {
                 if s[0] != 0 {
                     continue;
                 }
-                if let Some(e) = s[8..s.len() - 4]
+                let next = s[8..s.len() - 4]
                     .chunks_exact(4)
                     .find(|e| e[0] != 0 || e[1] != 0)
-                {
-                    let next = (u16::from(e[2] & 31) << 8) | u16::from(e[3]);
-                    if self.pmt_pid != Some(next) {
-                        self.pmt_pid = Some(next);
-                        self.pmt = Psi::default();
-                        if self.seen_pmt {
-                            self.set_bindings(BTreeMap::new(), d);
-                        }
-                        self.seen_pmt = false;
+                    .map(|e| {
+                        (
+                            u16::from_be_bytes([e[0], e[1]]),
+                            (u16::from(e[2] & 31) << 8) | u16::from(e[3]),
+                        )
+                    });
+                if self.program.zip(self.pmt_pid) != next {
+                    self.program = next.map(|(program, _)| program);
+                    self.pmt_pid = next.map(|(_, pid)| pid);
+                    self.pmt = Psi::default();
+                    if self.seen_pmt {
+                        self.set_bindings(BTreeMap::new(), d);
                     }
+                    self.seen_pmt = false;
                 }
             }
             return;
         }
         if self.pmt_pid == Some(pid) {
             for s in self.pmt.push(bytes, start, cc) {
-                if s[0] == 2 {
+                if s[0] == 2 && self.program == Some(u16::from_be_bytes([s[3], s[4]])) {
                     self.announcements(&s, d);
                 }
             }

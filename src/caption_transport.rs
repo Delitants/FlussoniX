@@ -241,6 +241,9 @@ impl Transport {
             self.events.push(Timed { pts: t, pairs });
             self.events.sort_by_key(|e| e.pts);
         }
+        // Embedded pairs call Decoder::push/observe, which executes page
+        // deadlines. Apply all due subtitle rows at this safe frontier first.
+        self.teletext.advance(watermark, d);
         while self.events.first().is_some_and(|e| e.pts <= watermark) {
             let event = self.events.remove(0);
             for (field, pair) in event.pairs {

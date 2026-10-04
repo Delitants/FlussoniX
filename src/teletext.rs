@@ -234,10 +234,15 @@ impl Decoder {
                 };
                 h[i] = n;
             }
+            let magazine = if mag == 0 { 8 } else { u16::from(mag) };
+            let page = magazine * 100 + u16::from(h[1]) * 10 + u16::from(h[0]);
+            let incoming = (h[0] <= 9 && h[1] <= 9).then_some(page);
             let serial = self.serial.get(&pid).copied().unwrap_or(false) || h[7] & 1 != 0;
             let slots = self.active.entry(pid).or_insert([None; 8]);
             for (i, slot) in slots.iter_mut().enumerate() {
-                if serial || i == usize::from(mag) {
+                // Only a different page terminates reception. A repeated
+                // same-page header may continue a still-incomplete transaction.
+                if (serial || i == usize::from(mag)) && *slot != incoming {
                     if let Some(n) = slot.take() {
                         if let Some(p) = self.pages.get_mut(&n) {
                             out.extend(p.commit(n));
@@ -246,9 +251,7 @@ impl Decoder {
                 }
             }
             self.serial.insert(pid, h[7] & 1 != 0);
-            let magazine = if mag == 0 { 8 } else { u16::from(mag) };
-            let page = magazine * 100 + u16::from(h[1]) * 10 + u16::from(h[0]);
-            if h[0] > 9 || h[1] > 9 {
+            if incoming.is_none() {
                 return out;
             }
             if let Some(p) = self.pages.get_mut(&page).filter(|p| p.pid == Some(pid)) {
@@ -258,6 +261,7 @@ impl Decoder {
                     | (u16::from(h[5] & 3) << 11);
                 if h[3] & 8 != 0 || p.sub.is_some_and(|s| s != sub) {
                     p.rows = [[0x20; 40]; 24];
+                    p.pending = None;
                 }
                 p.sub = Some(sub);
                 p.boxed = h[5] & 12 != 0;
@@ -267,7 +271,7 @@ impl Decoder {
                 if p.blocked {
                     self.error = Some("teletext_character_set_unsupported");
                 }
-                p.pending = Some((pts, pts));
+                p.pending = Some((p.pending.map_or(pts, |(start, _)| start), pts));
                 self.active.get_mut(&pid).unwrap()[usize::from(mag)] = Some(page);
             }
             return out;

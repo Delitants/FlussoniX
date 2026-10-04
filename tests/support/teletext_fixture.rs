@@ -108,12 +108,16 @@ pub fn section(pid: u16, mut b: Vec<u8>, cc: &mut u8) -> Vec<u8> {
 }
 pub fn tables(pages: &[(u16, u16)], version: u8) -> Vec<u8> {
     let mut out = section(0, vec![0, 0xb0, 0, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0], &mut 0);
+    out.extend(program_pmt(1, pages, version));
+    out
+}
+pub fn program_pmt(program: u16, pages: &[(u16, u16)], version: u8) -> Vec<u8> {
     let mut s = vec![
         2,
         0xb0,
         0,
-        0,
-        1,
+        (program >> 8) as u8,
+        program as u8,
         0xc1 | (version << 1),
         0,
         0,
@@ -148,8 +152,7 @@ pub fn tables(pages: &[(u16, u16)], version: u8) -> Vec<u8> {
             ((((page / 10) % 10) << 4) | (page % 10)) as u8,
         ]);
     }
-    out.extend(section(4096, s, &mut 0));
-    out
+    section(4096, s, &mut (version & 15))
 }
 fn pts(t: u64, prefix: u8) -> [u8; 5] {
     [
@@ -308,4 +311,17 @@ pub fn transport_with_events(emit: bool) -> Vec<u8> {
         }
     }
     out
+}
+
+pub fn video_reordered_padding(t: u64, dts: u64, cc: &mut u8) -> Vec<u8> {
+    let mut b = vec![0, 0, 1, 0xe0, 0, 0, 0x80, 0xc0, 10];
+    b.extend(pts(t, 0x30));
+    b.extend(pts(dts, 0x10));
+    // A valid registered GA94 SEI containing an unselected analog padding pair.
+    // Processing it must not run teletext deadlines before due subtitle PES.
+    let payload = b"\xb5\x00\x31GA94\x03\x41\xff\xfc\x80\x80\xff";
+    b.extend([0, 0, 1, 6, 4, payload.len() as u8]);
+    b.extend(payload);
+    b.push(0x80);
+    packetize(256, &b, cc)
 }
