@@ -187,3 +187,125 @@ pub fn video_reordered(t: u64, dts: u64, cc: &mut u8) -> Vec<u8> {
     b.extend([0, 0, 1, 9, 0xf0]);
     packetize(256, &b, cc)
 }
+
+#[path = "subtitle_fixture.rs"]
+pub mod original;
+pub const TTX888_DESC: &[u8] = &[0x56, 5, b'd', b'e', b'u', 0x10, 0x88];
+pub const TTX889_DESC: &[u8] = &[0x56, 5, b'f', b'r', b'a', 0x10, 0x89];
+pub fn page_body(page: u16, national: u8, text: &[u8]) -> Vec<u8> {
+    body(&[
+        header(page, true, national, false, false, 0),
+        row(page, 1, text),
+        header(887, true, 0, false, false, 0),
+    ])
+}
+fn broadcast_pes(pid: u16, t: u64, body: &[u8], cc: &mut u8) -> Vec<u8> {
+    assert_eq!((45 + body.len()) % 184, 0);
+    let n = body.len() + 39;
+    let mut b = vec![0, 0, 1, 0xbd, (n >> 8) as u8, n as u8, 0x84, 0x80, 36];
+    b.extend(pts(t, 0x20));
+    b.extend([0xff; 31]);
+    b.extend(body);
+    packetize(pid, &b, cc)
+}
+fn av() -> &'static Vec<u8> {
+    static AV: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    AV.get_or_init(|| {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("owned-av.ts");
+        let r = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=64x48:rate=25",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=700:sample_rate=48000",
+                "-t",
+                "16",
+                "-threads",
+                "1",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "25",
+                "-bf",
+                "0",
+                "-c:a",
+                "aac",
+                "-muxdelay",
+                "0",
+                "-muxpreload",
+                "0",
+                "-pcr_period",
+                "20",
+                "-f",
+                "mpegts",
+            ])
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+        std::fs::read(file).unwrap()
+    })
+}
+pub fn transport() -> Vec<u8> {
+    let bytes = transport_with_events(true);
+    if let Ok(file) = std::env::var("FLUSSONIX_TELETEXT_FIXTURE_FILE") {
+        std::fs::write(file, &bytes).unwrap();
+    }
+    bytes
+}
+pub fn transport_with_events(emit: bool) -> Vec<u8> {
+    let mut out = vec![];
+    let (mut dc, mut a, mut b, mut frame) = (0, 0, 0, 0);
+    for p in av().chunks_exact(188) {
+        if original::pid(p) == 4096 {
+            let payload = original::payload(p).unwrap();
+            let start = 1 + usize::from(payload[0]);
+            let s = &payload[start..];
+            let len = 3 + ((usize::from(s[1] & 15) << 8) | usize::from(s[2]));
+            let mut s = s[..len - 4].to_vec();
+            for (pid, desc) in [
+                (0x120u16, original::DVB_DESC),
+                (0x121, TTX888_DESC),
+                (0x122, TTX889_DESC),
+            ] {
+                s.extend([
+                    6,
+                    0xe0 | (pid >> 8) as u8,
+                    pid as u8,
+                    0xf0,
+                    desc.len() as u8,
+                ]);
+                s.extend(desc);
+            }
+            out.extend(section(4096, s, &mut (p[3] & 15)));
+        } else {
+            out.extend(p);
+        }
+        if original::pid(p) == 256 && p[1] & 0x40 != 0 {
+            let t = original::pts(original::payload(p).unwrap()).unwrap();
+            if frame == 0 {
+                out.extend(pes(0x120, t, original::DVB_BODY, &mut dc));
+            }
+            if emit && [0, 29, 75, 103, 150].contains(&frame) {
+                let (de, fr) = match frame {
+                    29 => (&b"GR]SSE"[..], &b"fran~ais"[..]),
+                    103 => (&b"LIVE <&>"[..], &b"LIVE <&>"[..]),
+                    _ => (&b""[..], &b""[..]),
+                };
+                out.extend(broadcast_pes(0x121, t, &page_body(888, 1, de), &mut a));
+                out.extend(broadcast_pes(0x122, t, &page_body(889, 4, fr), &mut b));
+            }
+            frame += 1;
+        }
+    }
+    out
+}

@@ -158,6 +158,7 @@ impl Engine {
         let subtitle_tracks = crate::config::subtitle_tracks(cfg)?;
         let hls_subtitles = crate::config::hls_subtitles(cfg)?;
         let caption_services = crate::captions::configuration(cfg)?;
+        let caption_teletext = caption_services.iter().any(|s| s.channel >= 1124);
         if hls_subtitles == "convert" && caption_services.is_empty() {
             return Err("Choose at least one HLS caption channel for conversion".into());
         }
@@ -502,7 +503,7 @@ impl Engine {
         }
         if !native_input {
             if let Some(target) = caption_target.as_deref() {
-                caption_output(&mut cmd, target);
+                caption_output(&mut cmd, target, caption_teletext);
             }
         }
         cmd.stdout(std::process::Stdio::piped())
@@ -591,7 +592,7 @@ impl Engine {
                         output.replace("__NATIVE_FMP4_FILTER__", &native_fmp4_filters(&tracks))
                     } else { output };
                     cmd.args(["-threads", "2", "-f", "tee", &output]);
-                    if let Some(target)=caption_target.as_deref(){caption_output(&mut cmd,target);}
+                    if let Some(target)=caption_target.as_deref(){caption_output(&mut cmd,target,caption_teletext);}
                     if cancel.is_cancelled() { return; }
                     let mut child = match cmd.spawn() {
                         Ok(child)=>child,
@@ -764,6 +765,8 @@ impl Engine {
                 || logical.starts_with("cc")
                 || (logical.starts_with('s')
                     && logical.as_bytes().get(1).is_some_and(u8::is_ascii_digit))
+                || (logical.starts_with("ttx")
+                    && logical.as_bytes().get(3).is_some_and(u8::is_ascii_digit))
             {
                 return state.read(file).ok_or("caption media not ready".into());
             }
@@ -921,12 +924,18 @@ impl Engine {
             .collect()
     }
 }
-fn caption_output(cmd: &mut Command, target: &str) {
+fn caption_output(cmd: &mut Command, target: &str, teletext: bool) {
     // Include one optional audio stream for the null fallback: an audio-only
     // source must not lose AV because an optional caption output has no video.
-    cmd.args(["-map","0:v:0?","-map","0:a:0?","-c","copy","-sn",
-        "-max_interleave_delta","100000","-flush_packets","1","-f","tee",
-        &format!("[select='v':onfail=ignore:f=mpegts:max_interleave_delta=100000:flush_packets=1]{target}|[f=null]pipe:2")]);
+    cmd.args(["-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy"]);
+    if teletext {
+        cmd.args(["-map", "0:s?"]);
+    } else {
+        cmd.arg("-sn");
+    }
+    let selected = if teletext { "v,s" } else { "v" };
+    cmd.args(["-max_interleave_delta","100000","-flush_packets","1","-f","tee",
+        &format!("[select='{selected}':onfail=ignore:f=mpegts:max_interleave_delta=100000:flush_packets=1]{target}|[select='v,a':f=null]pipe:2")]);
 }
 /// FFmpeg maps the optional video first, then all audio in PMT order.
 /// Numeric stream specifiers avoid escaping colons inside tee option keys.
@@ -1222,7 +1231,7 @@ mod caption_sink_tests {
         cmd.args(["-v", "error", "-re", "-i"]).arg(&path).args([
             "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-f", "mpegts", "pipe:1",
         ]);
-        caption_output(&mut cmd, &target);
+        caption_output(&mut cmd, &target, false);
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
