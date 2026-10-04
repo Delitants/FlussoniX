@@ -466,3 +466,42 @@ async fn ancillary_rebinding_cancels_and_reaps_in_flight_recognition() {
     cancel.cancel();
     task.await.unwrap();
 }
+#[tokio::test]
+async fn unannounced_dvb_page_reports_degradation_while_av_progresses() {
+    let _serial = SERIAL.acquire().await.unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let e = Engine::new(d.path(), "ffmpeg");
+    let cfg = json!({"inputs":[{"url":"publish://"}],"flussonix_hls_captions":[{"dvb_page":777,"ocr_language":"eng","language":"en","name":"Missing page"}]});
+    let mut p = e
+        .publish_guarded("owned", &cfg, std::future::ready(true))
+        .await
+        .unwrap();
+    p.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&fixture::transport())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let mut ready = true;
+            for prefix in ["", "fmp4/"] {
+                ready &= e
+                    .read("owned", &format!("{prefix}av.m3u8"))
+                    .await
+                    .is_ok_and(|b| String::from_utf8_lossy(&b).matches("#EXTINF:").count() >= 5);
+            }
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await
+        }
+    })
+    .await
+    .unwrap();
+    let stats = p.worker.stats();
+    assert_eq!(stats["hls_captions"]["status"], "degraded", "{stats}");
+    assert_eq!(stats["hls_captions"]["last_error"], "dvb_page_unannounced");
+    assert_eq!(stats["hls_captions"]["dvb_pages"][0]["announced"], false);
+    e.stop_all().await;
+}

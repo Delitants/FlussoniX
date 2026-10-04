@@ -15,10 +15,12 @@ This build implements persisted Streams/Templates configuration, authenticated m
 | Output | HLS with TS or fMP4 segments, HTTP MPEG-TS, Original M4S frame/GOP relay, generated frame output; M4F signals with original or generated live segments; optional RTSP 1.0 TCP-interleaved or opt-in unicast UDP H.264/AAC-LC playback; optional RTSPS TLS TCP playback |
 | Recovery | Startup/media watchdog, capped retries through ordered inputs, background local/CDN recovery, new HLS sequences/segment/init identities after restart |
 | Transcoding | One supervised FFmpeg worker per stream; CPU H.264/AAC; `h264_nvenc` configuration requires NVIDIA hardware and runtime |
-| Subtitles | Independent CEA-608/708 and selected Level 1 Latin teletext to selectable WebVTT in TS/fMP4 HLS; friendly channel/service/page controls; original pass-through or filtering; [digital profile](docs/cea708-qualification.md), [teletext profile](docs/teletext-qualification.md) |
+| Subtitles | Independent CEA-608/708, selected Level 1 Latin teletext and optional DVB bitmap OCR to selectable WebVTT in TS/fMP4 HLS; friendly channel/service/page and recognition-language controls; original pass-through or filtering; [digital profile](docs/cea708-qualification.md), [teletext profile](docs/teletext-qualification.md), [DVB OCR profile](docs/dvb-qualification.md) |
 | Native cluster | Separate public/private endpoints, source discovery, explicit equivalent-origin failover, LAN pull, uplink/CPU/RAM selection, readiness, drain/stale exclusion, expiring capacity reservations |
 
 Required later work includes complete API/schema parity; Flussonic cluster discovery and credential compatibility; additional M4 codec/metadata modes; full publisher policy/session parity; RTSP publication/push and Basic/Digest viewer authentication; RTSPS publication/push and SRTP-protected UDP; direct RTP/SRTP inbound and outbound; SRT output/push; full private-CA HTTP input/cluster trust, secure push and trusted-proxy integration; full transcoder profiles, GPU qualification, DVR, distributed session ownership and complete failure/scale qualification. Unsupported saved options return errors. See [qualification](docs/qualification.md) for evidence and limits.
+
+DVB text recognition optionally requires independently installed Tesseract and selected language models, such as `tesseract-ocr-eng` and `tesseract-ocr-deu`. Streams/Templates expose a DVB composition page and recognition language without JSON editing. Missing or low-quality recognition reports degradation while AV continues. `FLUSSONIX_TESSERACT` selects a trusted executable at daemon startup.
 
 ## Publication preview
 

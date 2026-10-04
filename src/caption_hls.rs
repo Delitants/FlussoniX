@@ -76,7 +76,8 @@ impl State {
     pub fn stats(&self) -> serde_json::Value {
         let ready = self.variants.lock().unwrap().iter().all(|v| v.av.is_some());
         let d = self.decoder.lock().unwrap();
-        serde_json::json!({"status":if self.failed.load(Ordering::Relaxed){"failed"}else if d.error.or(d.dvb_ocr.error()).is_some(){"degraded"}else if d.first_pts.is_some()&&ready{"running"}else{"starting"},"last_error":if self.failed.load(Ordering::Relaxed){d.error.or(Some("caption_decoder_lag"))}else{d.error.or(d.dvb_ocr.error())},"channels":d.services,"teletext_pages":d.teletext_stats(),"dvb_pages":d.dvb_stats(),"dvb_ocr":d.dvb_ocr.stats(),"cues":d.snapshot().len()})
+        let error = d.error.or(d.dvb_error()).or(d.dvb_ocr.error());
+        serde_json::json!({"status":if self.failed.load(Ordering::Relaxed){"failed"}else if error.is_some(){"degraded"}else if d.first_pts.is_some()&&ready{"running"}else{"starting"},"last_error":if self.failed.load(Ordering::Relaxed){error.or(Some("caption_decoder_lag"))}else{error},"channels":d.services,"teletext_pages":d.teletext_stats(),"dvb_pages":d.dvb_stats(),"dvb_ocr":d.dvb_ocr.stats(),"cues":d.snapshot().len()})
     }
     pub fn read(&self, file: &str) -> Option<Bytes> {
         let (index, file) = if let Some(f) = file.strip_prefix("fmp4/") {

@@ -355,6 +355,9 @@ impl Decoder {
     pub fn take_dvb_frames(&mut self) -> Vec<crate::dvb::Frame> {
         self.dvb_frames.drain(..).collect()
     }
+    pub(crate) fn dvb_error(&self) -> Option<&'static str> {
+        self.dvb.current_error()
+    }
     pub fn dvb_stats(&self) -> Value {
         self.dvb.stats()
     }

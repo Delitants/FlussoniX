@@ -414,6 +414,9 @@ impl Decoder {
     pub fn pages(&self) -> Vec<u16> {
         self.pages.keys().copied().collect()
     }
+    pub(crate) fn current_error(&self) -> Option<&'static str> {
+        self.pages.values().find_map(|p| p.error)
+    }
     pub fn stats(&self) -> serde_json::Value {
         serde_json::json!(self.pages.iter().map(|(page,p)|serde_json::json!({"page":page,"announced":p.binding.is_some(),"pid":p.binding.map(|b|b.0),"ancillary_page":p.binding.map(|b|b.1),"last_error":p.error})).collect::<Vec<_>>())
     }
