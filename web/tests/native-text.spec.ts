@@ -5,7 +5,9 @@ import {fileURLToPath} from 'node:url';
 for(const audio of [false,true])for(const prefix of ['', 'fmp4/'])test(`native ${audio?'audio-only ':''}text during ${prefix?'fMP4':'TS'} HLS playback`,async({page,request,baseURL})=>{
  const fixture=audio?process.env.FLUSSONIX_NATIVE_AUDIO_FIXTURE_FILE:process.env.FLUSSONIX_NATIVE_FIXTURE_FILE;
  expect(fixture&&existsSync(fixture),'Generate the owned native fixture with the Rust tests').toBeTruthy();
- const source=createServer((req,res)=>{if(req.url!=='/owned/m4s'){res.writeHead(404);res.end();return;}res.writeHead(200,{'Content-Type':'application/octet-stream'});res.write(readFileSync(fixture!));});
+ const source=createServer((req,res)=>{if(req.url!=='/owned/m4s'){res.writeHead(404);res.end();return;}res.writeHead(200,{'Content-Type':'application/octet-stream'});const data=readFileSync(fixture!);if(!audio){res.write(data);return;}
+  // Pace the owned audio programme so the live window includes its initial segment.
+  let at=0;const write=()=>{if(at<data.length){res.write(data.subarray(at,at+4096));at+=4096;}else clearInterval(timer)};const timer=setInterval(write,14400/Math.ceil(data.length/4096));res.on('close',()=>clearInterval(timer));write();});
  await new Promise<void>(resolve=>source.listen(0,'127.0.0.1',resolve));
  const address=source.address() as {port:number};const name='ui-native-'+(audio?'a':'v')+Date.now()+(prefix?'m':'t');
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
