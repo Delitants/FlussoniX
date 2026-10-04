@@ -18,7 +18,7 @@ jobs:
       - name: Rust qualification and owned browser caption fixture
         run: |
           mkdir -p .runtime
-          FLUSSONIX_708_FIXTURE_FILE="$PWD/.runtime/owned-708.ts" FLUSSONIX_CAPTION_FIXTURE_FILE="$PWD/.runtime/owned-captions.ts" cargo test --locked
+          FLUSSONIX_TELETEXT_FIXTURE_FILE="$PWD/.runtime/owned-teletext.ts" FLUSSONIX_708_FIXTURE_FILE="$PWD/.runtime/owned-708.ts" FLUSSONIX_CAPTION_FIXTURE_FILE="$PWD/.runtime/owned-captions.ts" cargo test --locked
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -30,6 +30,7 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Verify admin against live daemon
         run: |
+          export FLUSSONIX_TELETEXT_FIXTURE_FILE="$PWD/.runtime/owned-teletext.ts"
           export FLUSSONIX_708_FIXTURE_FILE="$PWD/.runtime/owned-708.ts"
           export FLUSSONIX_CAPTION_FIXTURE_FILE="$PWD/.runtime/owned-captions.ts"
           export FLUSSONIX_ADMIN_USER=admin
