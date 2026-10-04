@@ -103,7 +103,10 @@ impl App {
                 .acquire()
                 .await
                 .map_err(|_| LookupFailure::Unavailable)?;
-            query(&self.client, source, name, &self.options.peer_key).await
+            let client = self
+                .cluster_client(source)
+                .map_err(|_| LookupFailure::Unavailable)?;
+            query(&client, source, name, &self.options.peer_key).await
         })
         .await
         .unwrap_or(Err(LookupFailure::Unavailable))
@@ -177,6 +180,14 @@ impl App {
         let transport = source["flussonix_transport"].as_str().unwrap_or("hls");
         let input = crate::cluster::source_input_url(private, name, transport).map_err(|_| ())?;
         c["inputs"] = json!([{"url":input}]);
+        if url::Url::parse(private).is_ok_and(|u| u.scheme() == "https") {
+            if let Some(ca) = source
+                .get("flussonix_media_tls_ca")
+                .or_else(|| source.get("flussonix_tls_ca"))
+            {
+                c["inputs"][0]["flussonix_tls_ca"] = ca.clone();
+            }
+        }
         c.as_object_mut().ok_or(())?.remove("transcoder");
         c["static"] = json!(false);
         c["flussonix_peer_key"] = json!(

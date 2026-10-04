@@ -272,16 +272,28 @@ impl PeerHls {
             .map_err(|_| "peer transport metadata task stopped")?
     }
     pub async fn start(input: &str, key: &str) -> Result<Self, String> {
-        Self::start_inner(input, key, false).await
+        Self::start_inner(input, key, false, None).await
     }
-    pub(crate) async fn start_inspected(input: &str, key: &str) -> Result<Self, String> {
-        Self::start_inner(input, key, true).await
+    pub(crate) async fn start_inspected(
+        input: &str,
+        key: &str,
+        ca: Option<&std::path::Path>,
+    ) -> Result<Self, String> {
+        Self::start_inner(input, key, true, ca).await
     }
-    async fn start_inner(input: &str, key: &str, inspect: bool) -> Result<Self, String> {
+    async fn start_inner(
+        input: &str,
+        key: &str,
+        inspect: bool,
+        ca: Option<&std::path::Path>,
+    ) -> Result<Self, String> {
         let origin = Url::parse(input).map_err(|_| "invalid peer media URL")?;
         let live = origin.path().ends_with("/mpegts");
         if !permitted(&origin, &origin) || !(origin.path().ends_with(".m3u8") || live) {
             return Err("native peer HTTP input requires an HLS playlist or /mpegts URL".into());
+        }
+        if ca.is_some() && origin.scheme() != "https" {
+            return Err("peer media CA requires HTTPS".into());
         }
         let key = reqwest::header::HeaderValue::from_str(key).map_err(|_| "invalid peer key")?;
         let key = key.to_str().map_err(|_| "invalid peer key")?.to_owned();
@@ -300,6 +312,11 @@ impl PeerHls {
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5));
+        if origin.scheme() == "https" {
+            client = client
+                .https_only(true)
+                .use_preconfigured_tls((*crate::tls_input::client(ca)?).clone());
+        }
         client = if live {
             client.read_timeout(Duration::from_secs(10))
         } else {

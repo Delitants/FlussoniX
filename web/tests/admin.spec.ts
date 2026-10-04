@@ -357,3 +357,18 @@ test('native TLS inputs retain a friendly trusted CA field across secure protoco
  await page.getByRole('button',{name:'Save',exact:true}).click();let state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_tls_ca).toBe(process.env.FLUSSONIX_TEST_CA_FILE);
  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(ca).toHaveValue(process.env.FLUSSONIX_TEST_CA_FILE!);await url.fill('m4s://localhost:19990/owned');await expect(ca).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_tls_ca).toBeUndefined();await expect(page.locator('textarea')).toHaveCount(0);await request.delete('/streamer/api/v3/streams/'+name,{headers});
 });
+
+
+test('cluster trust settings persist and clear with endpoint protocol changes',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};const name='ui-cluster-ca';
+ expect((await request.put(`/streamer/api/v3/cluster/sources/${name}`,{headers,data:{api_url:'https://localhost:19997',private_payload_url:'https://localhost:19998'}})).ok()).toBeTruthy();
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();await page.getByRole('button',{name:'Source servers',exact:true}).click();
+ const edit=async()=>{await page.getByRole('row').filter({has:page.getByRole('cell',{name,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click()};await edit();
+ const management=page.getByLabel('Management trusted CA file',{exact:true});const media=page.getByLabel('Private media trusted CA file',{exact:true});await expect(management).toBeVisible();await expect(media).toBeVisible();
+ await management.fill('relative.pem');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Trusted CA file must be an absolute server path');
+ await management.fill(process.env.FLUSSONIX_TEST_CA_FILE!);await media.fill(process.env.FLUSSONIX_TEST_CA_FILE!);await page.getByRole('button',{name:'Save',exact:true}).click();
+ let saved=await(await request.get(`/streamer/api/v3/cluster/sources/${name}`,{headers})).json();expect(saved.flussonix_tls_ca).toBe(process.env.FLUSSONIX_TEST_CA_FILE);expect(saved.flussonix_media_tls_ca).toBe(process.env.FLUSSONIX_TEST_CA_FILE);
+ await edit();await expect(management).toHaveValue(process.env.FLUSSONIX_TEST_CA_FILE!);await expect(media).toHaveValue(process.env.FLUSSONIX_TEST_CA_FILE!);
+ await page.getByLabel('Private media URL',{exact:true}).fill('http://localhost:19998');await expect(media).toHaveCount(0);await expect(management).toHaveValue(process.env.FLUSSONIX_TEST_CA_FILE!);await page.getByLabel('Management URL',{exact:true}).fill('http://localhost:19997');await expect(management).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();
+ saved=await(await request.get(`/streamer/api/v3/cluster/sources/${name}`,{headers})).json();expect(saved.flussonix_tls_ca).toBeUndefined();expect(saved.flussonix_media_tls_ca).toBeUndefined();await expect(page.locator('textarea')).toHaveCount(0);await request.delete(`/streamer/api/v3/cluster/sources/${name}`,{headers});
+});

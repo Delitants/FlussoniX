@@ -308,6 +308,8 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "drain",
                     "flussonix_transport",
                     "flussonix_source_group",
+                    "flussonix_tls_ca",
+                    "flussonix_media_tls_ca",
                 ],
                 "auth_backends" => &["name", "url"],
                 _ => &[],
@@ -348,6 +350,29 @@ fn validate_root(root: &Value) -> Result<(), String> {
                         .is_some_and(|k| k.len() >= 12 && !k.contains(['\r', '\n']))
                     {
                         return Err("cluster_key must be a string of at least 12 characters".into());
+                    }
+                }
+                for (field, endpoint) in [
+                    ("flussonix_tls_ca", item["api_url"].as_str()),
+                    (
+                        "flussonix_media_tls_ca",
+                        item["private_payload_url"]
+                            .as_str()
+                            .or(item["api_url"].as_str()),
+                    ),
+                ] {
+                    if let Some(ca) = item.get(field) {
+                        if field == "flussonix_media_tls_ca" && *kind != "sources" {
+                            return Err("private media CA is source-only".into());
+                        }
+                        if !endpoint
+                            .and_then(|u| url::Url::parse(u).ok())
+                            .is_some_and(|u| u.scheme() == "https")
+                        {
+                            return Err("cluster CA requires an HTTPS endpoint".into());
+                        }
+                        let path = ca.as_str().ok_or("TLS CA must be an absolute PEM path")?;
+                        crate::tls_input::client(Some(std::path::Path::new(path)))?;
                     }
                 }
                 if item.get("drain").is_some_and(|v| !v.is_boolean()) {

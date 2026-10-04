@@ -395,7 +395,10 @@ impl Engine {
                 cmd.args(["-rw_timeout", "10000000"]);
             }
             if let Some(key) = cfg["flussonix_peer_key"].as_str() {
-                let proxy = crate::peer_hls::PeerHls::start_inspected(&translated, key).await?;
+                let ca = inputs[index]["flussonix_tls_ca"]
+                    .as_str()
+                    .map(std::path::Path::new);
+                let proxy = crate::peer_hls::PeerHls::start_inspected(&translated, key, ca).await?;
 
                 translated = proxy.url.clone();
                 // All remote resources are fetched inside our origin-scoped

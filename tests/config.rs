@@ -506,3 +506,51 @@ fn native_tls_ca_is_persisted_inherited_and_rejects_plain_or_invalid_trust() {
         assert_eq!(store.snapshot(), saved);
     }
 }
+
+#[test]
+fn cluster_ca_paths_persist_and_invalid_or_plaintext_trust_is_not_saved() {
+    let d = tempfile::tempdir().unwrap();
+    let cert = tls_fixture::Certificates::new();
+    let path = d.path().join("config.json");
+    let store = ConfigStore::open(&path).unwrap();
+    for kind in ["sources", "peers"] {
+        store
+            .put(
+                kind,
+                "trusted",
+                json!({"api_url":"https://localhost:19876", "flussonix_tls_ca":cert.ca}),
+            )
+            .unwrap();
+    }
+    store.put("sources", "trusted", json!({"private_payload_url":"https://localhost:19877", "flussonix_media_tls_ca":cert.ca})).unwrap();
+    let saved = store.snapshot();
+    drop(store);
+    let store = ConfigStore::open(&path).unwrap();
+    assert_eq!(store.snapshot(), saved);
+    for (kind, patch) in [
+        ("sources", json!({"api_url":"http://localhost:19876"})),
+        (
+            "sources",
+            json!({"private_payload_url":"http://localhost:19877"}),
+        ),
+        ("sources", json!({"flussonix_tls_ca":"relative.pem"})),
+        (
+            "sources",
+            json!({"flussonix_media_tls_ca":"/missing-owned-ca.pem"}),
+        ),
+        ("sources", json!({"flussonix_media_tls_ca":true})),
+        ("peers", json!({"flussonix_media_tls_ca":cert.ca})),
+        ("peers", json!({"flussonix_tls_ca":12})),
+    ] {
+        assert!(store.put(kind, "trusted", patch).is_err());
+        assert_eq!(store.snapshot(), saved);
+    }
+    // Management can be encrypted while private delivery uses a configured LAN HTTP endpoint.
+    store
+        .put(
+            "sources",
+            "trusted",
+            json!({"flussonix_media_tls_ca":null,"private_payload_url":"http://localhost:19877"}),
+        )
+        .unwrap();
+}

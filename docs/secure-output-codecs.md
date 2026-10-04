@@ -75,3 +75,7 @@ This sequence is implementation order, not removal of any first-release requirem
 ## Configured native private CA increment
 
 Explicit M4FS/M4SS Stream/Template inputs now share the RTSPS absolute PEM trust option, certificate bounds and identity verification. Owned TLS tests exercise HEVC/Layer II native text preservation and both HLS subtitle formats over protected HTTPS, including certificate rejection before application data and origin-scoped redirects. These checks cover configured inputs rather than cluster discovery/management trust or every codec/direction combination. GPU qualification, secure push and the remaining migration matrix stay open.
+
+## Cluster private CA increment
+
+Configured source/peer management HTTPS requests now use optional private roots with identity verification and no redirects. Private source pulls inherit that trust or use a separate media bundle, including HLS, continuous MPEG-TS, M4F and M4S. Owned source/CDN/LB HTTPS tests verify admission, protected delivery, worker coalescing, FFmpeg decoding and exact native M4F segment bodies. This qualifies the configured native cluster flow; secure push, mutual TLS, automatic certificate rotation and broader vendor/codec/direction matrices remain open.

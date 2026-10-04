@@ -89,6 +89,7 @@ pub struct App {
     credentials: Credentials,
     pub options: Options,
     client: reqwest::Client,
+    cluster_clients: std::sync::Mutex<(u64, HashMap<String, reqwest::Client>)>,
     pub playback_auth: PlaybackAuth,
     reservations: Mutex<HashMap<String, Reservation>>,
     pub egress: Arc<AtomicU64>,
@@ -141,6 +142,7 @@ impl App {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| e.to_string())?,
+            cluster_clients: std::sync::Mutex::new((0, HashMap::new())),
             playback_auth: PlaybackAuth::new(options.client_limit as usize),
             reservations: Mutex::new(HashMap::new()),
             egress: Arc::new(AtomicU64::new(0)),
@@ -158,6 +160,44 @@ impl App {
     }
     pub fn set_http_delivery(&self, http: Option<SocketAddr>, https: Option<SocketAddr>) {
         *self.http_delivery.lock().unwrap() = json!({"http":http.map(|a|a.to_string()),"https":https.map(|a|a.to_string()),"https_only":http.is_none() && https.is_some()});
+    }
+    fn cluster_client(&self, node: &Value) -> Result<reqwest::Client, String> {
+        let Some(ca) = node.get("flussonix_tls_ca") else {
+            return Ok(self.client.clone());
+        };
+        if !node["api_url"]
+            .as_str()
+            .and_then(|u| url::Url::parse(u).ok())
+            .is_some_and(|u| u.scheme() == "https")
+        {
+            return Err("cluster CA requires HTTPS".into());
+        }
+        let path = ca.as_str().ok_or("invalid cluster CA")?;
+        // Share pools between nodes with the same trust profile, never default
+        // peer credentials. Saves invalidate cached trust. Source lookups
+        // retain their existing configuration revision checks.
+        let mut clients = self.cluster_clients.lock().unwrap();
+        let revision = self.config.revision();
+        if clients.0 != revision {
+            clients.0 = revision;
+            clients.1.clear();
+        }
+        if let Some(client) = clients.1.get(path) {
+            return Ok(client.clone());
+        }
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .https_only(true)
+            .timeout(Duration::from_secs(3))
+            .redirect(reqwest::redirect::Policy::none())
+            .use_preconfigured_tls((*crate::tls_input::client(Some(Path::new(path)))?).clone())
+            .build()
+            .map_err(|_| "cannot build cluster TLS client")?;
+        if clients.1.len() >= 64 {
+            clients.1.clear();
+        }
+        clients.1.insert(path.into(), client.clone());
+        Ok(client)
     }
     async fn media_config(&self, name: &str) -> Option<(Value, u64)> {
         let mirrors = self.mirrors.lock().await;
@@ -718,8 +758,8 @@ async fn balance(
             }
             let api = p["api_url"].as_str()?;
             let key = p["cluster_key"].as_str().unwrap_or(&app.options.peer_key);
-            let r = app
-                .client
+            let client = app.cluster_client(&p).ok()?;
+            let r = client
                 .get(format!(
                     "{}/flussonix/api/v1/node",
                     api.trim_end_matches('/')
@@ -765,8 +805,11 @@ async fn balance(
         let p = &valid[&id];
         let api = p["api_url"].as_str().unwrap_or("");
         let key = p["cluster_key"].as_str().unwrap_or(&app.options.peer_key);
-        let response = app
-            .client
+        let Ok(client) = app.cluster_client(p) else {
+            nodes.retain(|n| n.name != id);
+            continue;
+        };
+        let response = client
             .post(format!(
                 "{}/flussonix/api/v1/admit",
                 api.trim_end_matches('/')
