@@ -43,6 +43,51 @@ fn native(pages: &[u16]) -> flussonix::dvb::Decoder {
     d.bindings(&pages.iter().map(|p| (*p, (0x120, 2))).collect(), 0);
     d
 }
+fn replayed_non_pixel_object(field: &[u8]) -> flussonix::dvb::Decoder {
+    let mut d = native(&[1, 3]);
+    let layout: Vec<_> = (0..16).map(|id| (id, 0, 0)).collect();
+    d.push(0x120, &f::body(&[f::pcs(1, 0, 2, 2, &layout)]), 90000);
+    for id in 0..16 {
+        let mut region = f::region(1, 1, 2, 3, true, &vec![(9, 0, 0); 64]);
+        region[6] = id;
+        d.push(0x120, &f::body(&[region]), 90000);
+    }
+    d.push(
+        0x120,
+        &f::body(&[f::object(1, 9, 0, false, field, &[])]),
+        90000,
+    );
+    assert!(
+        d.push(0x120, &f::body(&[f::eod(1)]), 90000)
+            .iter()
+            .all(|f| f.image.is_none())
+    );
+    d
+}
+#[test]
+fn repeated_mapping_commands_are_charged_across_cached_object_replays() {
+    let mut d = replayed_non_pixel_object(&[0x20, 0x07, 0x8f].repeat(1500));
+    assert_eq!(d.error, Some("dvb_render_limit"));
+    let frames = d.push(0x120, &f::tiny(3), 180000);
+    assert_eq!(frames.len(), 1);
+    assert_eq!((frames[0].page, frames[0].pts), (3, 180000));
+    assert!(frames[0].image.is_some());
+}
+#[test]
+fn repeated_empty_pixel_strings_are_charged_across_cached_object_replays() {
+    let d = replayed_non_pixel_object(&[0x12, 0, 0].repeat(1500));
+    assert_eq!(d.error, Some("dvb_render_limit"));
+}
+#[test]
+fn repeated_end_of_lines_rejects_invalid_row_progression() {
+    let d = replayed_non_pixel_object(&[0xf0, 0xf0]);
+    assert_eq!(d.error, Some("dvb_pixel_position"));
+}
+#[test]
+fn empty_pixel_string_on_an_invalid_row_is_rejected() {
+    let d = replayed_non_pixel_object(&[0xf0, 0x12, 0, 0]);
+    assert_eq!(d.error, Some("dvb_pixel_position"));
+}
 #[test]
 fn literal_bitmap_has_exact_pixels_source_pts_and_empty_page_clear() {
     let mut d = native(&[1]);

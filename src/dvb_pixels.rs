@@ -41,6 +41,11 @@ struct Bits<'a> {
     bytes: &'a [u8],
     at: usize,
 }
+#[derive(Default)]
+pub(super) struct Budget {
+    pixels: usize,
+    encoded: usize,
+}
 impl Bits<'_> {
     fn take(&mut self, n: usize) -> Result<u8> {
         if self.at + n > self.bytes.len() * 8 {
@@ -63,8 +68,14 @@ pub(super) fn paint(
     y: usize,
     field: &[u8],
     nonmod: bool,
-    budget: &mut usize,
+    budget: &mut Budget,
 ) -> Result<()> {
+    // Charge every replay, including mapping tables and empty pixel strings.
+    budget.encoded = budget
+        .encoded
+        .checked_add(field.len())
+        .filter(|n| *n <= 4 * PIXELS)
+        .ok_or("dvb_render_limit")?;
     let (mut x, mut y) = (x, y);
     let origin = x;
     let mut bits = Bits {
@@ -95,10 +106,16 @@ pub(super) fn paint(
                 }
             }
             0xf0 => {
+                if y >= r.height {
+                    return Err("dvb_pixel_position");
+                }
                 x = origin;
                 y = y.checked_add(2).ok_or("dvb_pixel_position")?;
             }
             0x10..=0x12 => {
+                if y >= r.height || x > r.width {
+                    return Err("dvb_pixel_position");
+                }
                 let bpp = 1 << (kind - 0x0f);
                 if bpp > 1 << r.depth {
                     return Err("dvb_pixel_depth_unsupported");
@@ -156,8 +173,8 @@ pub(super) fn paint(
                     if y >= r.height {
                         return Err("dvb_pixel_position");
                     }
-                    *budget += n;
-                    if *budget > 4 * PIXELS {
+                    budget.pixels += n;
+                    if budget.pixels > 4 * PIXELS {
                         return Err("dvb_render_limit");
                     }
                     let mapped = match (kind, r.depth) {

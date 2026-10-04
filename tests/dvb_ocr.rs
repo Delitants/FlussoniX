@@ -6,6 +6,10 @@ use flussonix::{
     dvb_ocr::{Failure, Recognition, Store, parse_tsv, recognize},
 };
 use std::time::{Duration, Instant};
+// A parallel fork can retain another test's just-written executable handle and
+// cause ETXTBSY. Keep fixture creation/spawning isolated; exercise real worker
+// concurrency deliberately in the process-cap test below.
+static PROCESS_FIXTURES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 fn store() -> Store {
     Store::new(
         &serde_json::from_value::<Vec<Service>>(serde_json::json!([
@@ -166,6 +170,7 @@ fn tsv_is_plain_bounded_unicode_with_confidence_and_line_breaks() {
 }
 #[tokio::test]
 async fn independent_english_and_german_glyphs_are_recognized() {
+    let _fixture_guard = PROCESS_FIXTURES.lock().await;
     for (text, model) in [("EUROPE DVB", "eng"), ("GRÜSSE", "deu")] {
         let img = fixture::glyph(text);
         let result = recognize(
@@ -182,6 +187,7 @@ async fn independent_english_and_german_glyphs_are_recognized() {
 }
 #[tokio::test]
 async fn optional_missing_executable_or_model_degrades_explicitly() {
+    let _fixture_guard = PROCESS_FIXTURES.lock().await;
     let image = fixture::glyph("HELLO");
     assert_eq!(
         recognize(
@@ -211,6 +217,7 @@ async fn optional_missing_executable_or_model_degrades_explicitly() {
 #[cfg(unix)]
 #[tokio::test]
 async fn stalled_and_oversized_processes_are_terminated_and_reaped() {
+    let _fixture_guard = PROCESS_FIXTURES.lock().await;
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let image = Image {
@@ -275,6 +282,7 @@ fn completed_history_is_capped_and_mixed_wire_services_are_isolated() {
 }
 #[tokio::test]
 async fn explicit_cancellation_reaps_an_active_child() {
+    let _fixture_guard = PROCESS_FIXTURES.lock().await;
     use std::os::unix::fs::PermissionsExt;
     let d = tempfile::tempdir().unwrap();
     let file = d.path().join("sleep");
@@ -282,7 +290,8 @@ async fn explicit_cancellation_reaps_an_active_child() {
     std::fs::write(
         &file,
         format!(
-            "#!/bin/sh\necho $$ > '{}'\nexec /bin/sleep 60\n",
+            "#!/bin/sh\n: > '{}'\n/bin/sleep 0.03\necho $$ > '{}'\nexec /bin/sleep 60\n",
+            pidfile.display(),
             pidfile.display()
         ),
     )
@@ -292,14 +301,21 @@ async fn explicit_cancellation_reaps_an_active_child() {
     let c = cancel.clone();
     let pidcopy = pidfile.clone();
     let stop = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !pidcopy.exists() {
+        let pid = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pidcopy)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                {
+                    break pid;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await
             }
         })
         .await
         .unwrap();
         c.cancel();
+        pid
     });
     let image = Image {
         width: 2,
@@ -314,10 +330,109 @@ async fn explicit_cancellation_reaps_an_active_child() {
         cancel,
     )
     .await;
-    stop.await.unwrap();
+    let observed_pid = stop.await.unwrap_or_else(|error| {
+        panic!("child-start monitor failed: {error}; recognition result: {result:?}")
+    });
     assert_eq!(result.unwrap_err().reason, "dvb_ocr_canceled");
     let pid = std::fs::read_to_string(pidfile).unwrap();
-    assert!(!std::path::Path::new(&format!("/proc/{}", pid.trim())).exists());
+    assert_eq!(pid.trim().parse::<u32>().unwrap(), observed_pid);
+    assert!(!std::path::Path::new(&format!("/proc/{observed_pid}")).exists());
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn two_process_cap_queued_deadline_and_queued_cancellation_are_enforced() {
+    use flussonix::dvb_ocr::recognize_cancellable;
+    use std::os::unix::fs::PermissionsExt;
+    let _fixture_guard = PROCESS_FIXTURES.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let image = Image {
+        width: 2,
+        height: 2,
+        pixels: vec![[255, 255]; 4],
+    };
+    let mut fixtures = Vec::new();
+    // Close all fixture writes before any child is forked.
+    for id in 0..4 {
+        let script = dir.path().join(format!("worker{id}"));
+        let pid = dir.path().join(format!("pid{id}"));
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec /bin/sleep 60\n",
+                pid.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        fixtures.push((script, pid));
+    }
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut active = Vec::new();
+    for (script, _) in &fixtures[..2] {
+        let (script, image, token) = (script.clone(), image.clone(), cancel.clone());
+        active.push(tokio::spawn(async move {
+            recognize_cancellable(
+                script.to_str().unwrap(),
+                &image,
+                "eng",
+                Instant::now() + Duration::from_secs(2),
+                token,
+            )
+            .await
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !fixtures[0].1.exists() || !fixtures[1].1.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        recognize(
+            fixtures[2].0.to_str().unwrap(),
+            &image,
+            "eng",
+            Instant::now() + Duration::from_millis(150)
+        )
+        .await
+        .unwrap_err()
+        .reason,
+        "dvb_ocr_timeout"
+    );
+    assert!(
+        !fixtures[2].1.exists(),
+        "queued deadline must expire before spawning"
+    );
+    let queued_cancel = tokio_util::sync::CancellationToken::new();
+    let future = recognize_cancellable(
+        fixtures[3].0.to_str().unwrap(),
+        &image,
+        "eng",
+        Instant::now() + Duration::from_secs(2),
+        queued_cancel.clone(),
+    );
+    let signal = async {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        queued_cancel.cancel();
+    };
+    let (result, ()) = tokio::join!(future, signal);
+    assert_eq!(result.unwrap_err().reason, "dvb_ocr_canceled");
+    assert!(
+        !fixtures[3].1.exists(),
+        "queued cancellation must prevent spawning"
+    );
+    cancel.cancel();
+    for worker in active {
+        assert_eq!(
+            worker.await.unwrap().unwrap_err().reason,
+            "dvb_ocr_canceled"
+        );
+    }
+    for (_, pidfile) in &fixtures[..2] {
+        let pid = std::fs::read_to_string(pidfile).unwrap();
+        assert!(!std::path::Path::new(&format!("/proc/{}", pid.trim())).exists());
+    }
 }
 #[tokio::test]
 async fn thin_or_inconsistent_images_fail_before_spawning_ocr() {

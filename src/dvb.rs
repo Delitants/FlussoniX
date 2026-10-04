@@ -2,7 +2,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 #[path = "dvb_pixels.rs"]
 mod pixels;
-use pixels::{default_clut, paint};
+use pixels::{Budget, default_clut, paint};
 const PIXELS: usize = 1024 * 1024;
 type Color = [u8; 2]; // SDR luminance and opacity; text conversion flattens chroma.
 type Result<T> = std::result::Result<T, &'static str>;
@@ -327,7 +327,7 @@ impl Page {
             return Ok(None);
         }
         let ancillary = self.binding.map_or(page, |(_, a)| a);
-        let mut budget = 0;
+        let mut budget = Budget::default();
         for &(region, _, _) in &self.layout {
             let r = self.regions.get_mut(&region).ok_or("dvb_region_missing")?;
             for index in 0..r.objects.len() {
