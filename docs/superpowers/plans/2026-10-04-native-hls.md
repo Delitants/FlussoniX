@@ -10,6 +10,8 @@
 
 **Spec:** `docs/native-hls-design.md`
 
+**Status:** The checklist records the first implementation checkpoint (69a9463). Later qualification and publication evidence is recorded in repository Actions and the private execution ledger.
+
 ## Global Constraints
 
 - No official Flussonic component required for daemon, build or tests.

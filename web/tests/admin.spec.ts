@@ -324,3 +324,12 @@ test('reopening a saved source uses acknowledged settings while refresh is delay
   await edit();await expect(page.getByLabel('Source transport',{exact:true})).toHaveValue('mpegts');
  }finally{delay=false;for(const release of releases)release();await page.unrouteAll({behavior:'wait'});await request.delete(`/streamer/api/v3/cluster/sources/${name}`,{headers}).catch(()=>{});}
 });
+test('slow successful polling still loads the requested collection',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};const name='ui-slow-poll';
+ try{
+  expect((await request.put(`/streamer/api/v3/templates/${name}`,{headers,data:{static:false,inputs:[{url:'testsrc://'}]}})).ok()).toBeTruthy();
+  await page.route('**/streamer/api/v3/templates',async route=>{const response=await route.fetch();await new Promise(resolve=>setTimeout(resolve,4000));await route.fulfill({response});});
+  await page.getByRole('button',{name:'Templates',exact:true}).click();
+  await expect(page.getByRole('cell',{name,exact:true})).toBeVisible({timeout:8500});
+ }finally{await page.unrouteAll({behavior:'wait'});await request.delete(`/streamer/api/v3/templates/${name}`,{headers}).catch(()=>{});}
+});
