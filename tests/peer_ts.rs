@@ -360,3 +360,97 @@ async fn fixed_peer_ts_stream_delivers_before_eof_and_cancels_its_upstream() {
     .unwrap();
     server.abort();
 }
+
+#[tokio::test]
+async fn aac_only_peer_ts_retains_native_bootstrap_and_actual_media() {
+    let fixture = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000",
+            "-t",
+            "12",
+            "-c:a",
+            "aac",
+            "-f",
+            "mpegts",
+            "pipe:1",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(fixture.status.success());
+    let bytes = Bytes::from(fixture.stdout);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("tshttp://{}/radio/mpegts", listener.local_addr().unwrap());
+    let app = Router::new().route(
+        "/radio/mpegts",
+        get(move |headers: HeaderMap| {
+            let bytes = bytes.clone();
+            async move {
+                assert_eq!(headers["x-flussonix-peer"], "owned-radio-peer");
+                let body =
+                    futures_util::stream::once(std::future::ready(Ok::<_, std::io::Error>(bytes)))
+                        .chain(futures_util::stream::pending());
+                Body::from_stream(body)
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let engine = flussonix::media::Engine::new(dir.path(), "ffmpeg");
+    let worker = engine
+        .ensure(
+            "radio",
+            &serde_json::json!({"inputs":[{"url":url}],"flussonix_peer_key":"owned-radio-peer"}),
+        )
+        .await
+        .unwrap();
+    let ready = tokio::time::timeout(Duration::from_secs(8), async {
+        while worker.wire.signal_subscribe().0.is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        ready.is_ok(),
+        "AAC-only native output missing: {}",
+        worker.stats()
+    );
+    let mut decoder = flussonix::m4s::Decoder::default();
+    let mut tracks = Vec::new();
+    let mut frames = 0;
+    for record in worker.wire.m4s_subscribe().0 {
+        for event in decoder.push(&record).unwrap() {
+            match event {
+                flussonix::m4s::Event::Info { tracks: t, .. } => tracks = t,
+                flussonix::m4s::Event::Frame { body, .. } => {
+                    assert!(!body.is_empty());
+                    frames += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(tracks.len(), 1);
+    assert_eq!(tracks[0].codec, "aac");
+    assert!(frames > 0, "AAC-only M4S has metadata but no media");
+    for signal in worker.wire.signal_subscribe().0 {
+        let text = std::str::from_utf8(&signal).unwrap();
+        let stamp = text
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .split('-')
+            .next()
+            .unwrap();
+        let segment = worker.wire.segment(&format!("{stamp}.m4f")).unwrap();
+        let (_, decoded) = flussonix::m4f::unpack(&segment).unwrap();
+        assert!(!decoded.is_empty(), "AAC-only M4F has no media");
+    }
+    engine.stop_all().await;
+    server.abort();
+}

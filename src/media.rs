@@ -588,7 +588,7 @@ impl Engine {
                     let (audio,video)=match profile {Ok(profile)=>profile,Err(reason)=>{w.failed(match reason.as_str(){"peer transport metadata exceeds limit"=>"metadata_limit","peer transport metadata timeout"=>"startup_timeout",_=>"input_closed"});return;}};
                     let output=output.replace("__PEER_FMP4_FILTER__",if audio==Some(0x0f){":bsfs/a=aac_adtstoasc"}else{""});
                     cmd.args(["-threads","2","-f","tee",&output]);
-                    let wire_copy=copy_peer_ts && video==Some(0x1b) && matches!(audio,None|Some(0x0f));
+                    let wire_copy=copy_peer_ts && matches!(video,None|Some(0x1b)) && matches!(audio,None|Some(0x0f)) && (video.is_some() || audio.is_some());
                     if wire_copy {
                         cmd.args(["-map","0:v:0?","-map","0:a:0?","-c","copy","-bsf:a","aac_adtstoasc","-f","flv","-flvflags","no_duration_filesize",&wire_target]);
                     } else if copy_peer_ts {drop(publish_wire.take());}
@@ -662,7 +662,7 @@ impl Engine {
                         let mut transport=crate::caption_transport::Transport::default();
                         loop{let data=tokio::select!{biased;_=c.cancelled()=>break,data=receiver.recv()=>match data{Some(data)=>data,None=>break}};decoder_state.push_source(&data,&mut transport);if decoder_state.failed.load(Ordering::Relaxed){break}}
                     }));
-                    let c=cancel.clone();let drain_state=state.clone();tasks.push(tokio::spawn(async move {let Ok(Ok((mut socket,_)))=(tokio::select!{biased;_=c.cancelled()=>return,r=tokio::time::timeout(Duration::from_secs(5),listener.accept())=>r})else{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");return};let mut buffer=[0;16384];loop{let read=tokio::select!{biased;_=c.cancelled()=>break,r=socket.read(&mut buffer)=>r};match read{Ok(n)if n>0=>{if sender.try_send(Bytes::copy_from_slice(&buffer[..n])).is_err(){drain_state.failed.store(true,Ordering::Relaxed);}},_=>{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");break}}}}));
+                    let c=cancel.clone();let drain_state=state.clone();tasks.push(tokio::spawn(async move {let Ok(Ok((mut socket,_)))=(tokio::select!{biased;_=c.cancelled()=>return,r=tokio::time::timeout(Duration::from_secs(5),listener.accept())=>r})else{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");return};let mut buffer=[0;16384];loop{let read=tokio::select!{biased;_=c.cancelled()=>break,r=socket.read(&mut buffer)=>r};match read{Ok(n)if n>0=>{if enqueue_caption(&sender,Bytes::copy_from_slice(&buffer[..n]),&c).await.is_err(){drain_state.failed.store(true,Ordering::Relaxed);break;}},_=>{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");break}}}}));
                     for _ in 0..2{tasks.push(tokio::spawn(state.clone().ocr(tesseract.clone(),cancel.clone())));}
                     tasks.push(tokio::spawn(state.watch(dir.clone(),cancel.clone())));
                 }
@@ -963,6 +963,20 @@ impl Engine {
             .collect()
     }
 }
+async fn enqueue_caption(
+    sender: &tokio::sync::mpsc::Sender<Bytes>,
+    data: Bytes,
+    cancel: &CancellationToken,
+) -> Result<(), ()> {
+    // A full queue can be a short TCP/probe burst, not a stalled decoder.
+    // Retain the 32 x 16 KiB bound and only tolerate a bounded admission delay.
+    tokio::select! { biased;
+        _ = cancel.cancelled() => Ok(()),
+        result = tokio::time::timeout(Duration::from_millis(250), sender.send(data)) =>
+            result.map_err(|_| ())?.map_err(|_| ()),
+    }
+}
+
 fn caption_output(cmd: &mut Command, target: &str, teletext: bool) {
     // Keep fractional source PTS when copying into tee. FFmpeg 6 auto mode
     // can choose the video frame-rate timebase and shift caption clock origin.
@@ -1025,6 +1039,43 @@ mod lifecycle_tests {
     use crate::server::{App, Options, router};
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
+    #[tokio::test]
+    async fn caption_queue_retains_a_transient_burst_in_order() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender.send(Bytes::from_static(b"first")).await.unwrap();
+        let cancel = CancellationToken::new();
+        let next = tokio::spawn(async move {
+            enqueue_caption(&sender, Bytes::from_static(b"second"), &cancel).await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(receiver.recv().await.unwrap(), "first");
+        assert_eq!(next.await.unwrap(), Ok(()));
+        assert_eq!(receiver.recv().await.unwrap(), "second");
+    }
+    #[tokio::test]
+    async fn caption_queue_bounds_a_stall_and_cancels_promptly() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        sender.send(Bytes::from_static(b"full")).await.unwrap();
+        let cancel = CancellationToken::new();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            enqueue_caption(&sender, Bytes::from_static(b"stalled"), &cancel).await,
+            Err(())
+        );
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let c = cancel.clone();
+        let task = tokio::spawn(async move {
+            enqueue_caption(&sender, Bytes::from_static(b"cancelled"), &c).await
+        });
+        cancel.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), task)
+                .await
+                .is_ok()
+        );
+    }
+
     fn app(d: &std::path::Path) -> Arc<App> {
         App::new(
             d.join("config.json"),
