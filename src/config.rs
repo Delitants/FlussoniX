@@ -444,7 +444,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                             v.keys()
                                 .any(|k| k != "url" && k != "rtp" && k != "flussonix_tls_ca")
                         }) {
-                            return Err("only input url, RTSP rtp=udp and RTSPS/M4FS/M4SS flussonix_tls_ca are implemented".into());
+                            return Err("only input url, RTSP rtp=udp and RTSPS/M4FS/M4SS/HLSS/TSHTTPS/HTTPS flussonix_tls_ca are implemented".into());
                         }
                         let u = input["url"].as_str().ok_or("input url required")?;
                         let scheme = u.split("://").next().unwrap_or("");
@@ -462,13 +462,26 @@ fn validate_root(root: &Value) -> Result<(), String> {
                             return Err("rtp input option requires RTSP and value udp".into());
                         }
                         if let Some(ca) = input.get("flussonix_tls_ca") {
-                            if !["rtsps", "m4fs", "m4ss"].contains(&scheme) {
+                            if !["rtsps", "m4fs", "m4ss", "hlss", "tshttps", "https"]
+                                .contains(&scheme)
+                            {
                                 return Err(
-                                    "TLS CA input option requires RTSPS, M4FS or M4SS".into()
+                                    "TLS CA input option requires RTSPS, M4FS, M4SS, HLSS, TSHTTPS or HTTPS".into()
                                 );
                             }
                             let path = ca.as_str().ok_or("TLS CA must be an absolute PEM path")?;
                             crate::tls_input::client(Some(std::path::Path::new(path)))?;
+                        }
+                        if ["hlss", "tshttps", "https"].contains(&scheme) {
+                            let parsed = url::Url::parse(&crate::media::translate_input(u)?)
+                                .map_err(|_| "invalid HTTPS input URL")?;
+                            if parsed.host_str().is_none()
+                                || parsed.fragment().is_some()
+                                || !parsed.username().is_empty()
+                                || parsed.password().is_some()
+                            {
+                                return Err("HTTPS inputs require a host and forbid embedded credentials or fragments".into());
+                            }
                         }
                         if scheme == "rtsps" {
                             let parsed = url::Url::parse(u).map_err(|_| "invalid RTSPS URL")?;

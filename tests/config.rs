@@ -554,3 +554,46 @@ fn cluster_ca_paths_persist_and_invalid_or_plaintext_trust_is_not_saved() {
         )
         .unwrap();
 }
+
+#[test]
+fn https_input_ca_settings_inherit_persist_and_reject_plain_or_invalid_trust() {
+    let d = tempfile::tempdir().unwrap();
+    let cert = tls_fixture::Certificates::new();
+    let path = d.path().join("owned.json");
+    let store = ConfigStore::open(&path).unwrap();
+    for scheme in ["hlss", "tshttps", "https"] {
+        store.put("templates", "secure", json!({"inputs":[{"url":format!("{scheme}://localhost:19876/transport"),"flussonix_tls_ca":cert.ca}]})).expect("secure HTTP inputs must accept explicit trust");
+        store
+            .put(
+                "streams",
+                "owned",
+                json!({"template":"secure","static":false}),
+            )
+            .unwrap();
+        assert_eq!(
+            store.effective("owned").unwrap()["inputs"][0]["flussonix_tls_ca"],
+            json!(cert.ca)
+        );
+    }
+    let saved = store.snapshot();
+    drop(store);
+    let store = ConfigStore::open(&path).unwrap();
+    assert_eq!(store.snapshot(), saved);
+    for input in [
+        json!({"url":"hls://localhost/owned","flussonix_tls_ca":cert.ca}),
+        json!({"url":"tshttp://localhost/owned","flussonix_tls_ca":cert.ca}),
+        json!({"url":"hlss://localhost/owned","flussonix_tls_ca":"relative.pem"}),
+        json!({"url":"tshttps://localhost/owned","flussonix_tls_ca":false}),
+        json!({"url":"hlss://localhost/owned","flussonix_tls_ca":"/no-owned-ca.pem"}),
+        json!({"url":"hlss://localhost/owned#fragment","flussonix_tls_ca":cert.ca}),
+        json!({"url":"tshttps://user:password@localhost/owned","flussonix_tls_ca":cert.ca}),
+        json!({"url":"hlss://","flussonix_tls_ca":cert.ca}),
+    ] {
+        assert!(
+            store
+                .put("streams", "owned", json!({"inputs":[input]}))
+                .is_err()
+        );
+        assert_eq!(store.snapshot(), saved);
+    }
+}

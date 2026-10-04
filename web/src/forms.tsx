@@ -3,7 +3,7 @@ export type Item = Record<string, any>;
 export type Kind = 'streams' | 'templates' | 'sources' | 'peers' | 'auth_backends';
 export const kindLabel: Record<Kind,string> = {streams:'stream',templates:'template',sources:'source',peers:'peer',auth_backends:'auth backend'};
 const owns=(v:Item,k:string)=>Object.prototype.hasOwnProperty.call(v,k);
-const trustedInput=(url:string)=>['rtsps://','m4fs://','m4ss://'].some(prefix=>url.startsWith(prefix));
+const trustedInput=(url:string)=>['rtsps://','m4fs://','m4ss://','hlss://','tshttps://','https://'].some(prefix=>url.startsWith(prefix));
 export function Field({label,help,children}:{label:string,help?:string,children:React.ReactNode}) {
  const id=React.useId();
  return <div className="field"><label htmlFor={id}>{label}</label>{React.isValidElement(children)?React.cloneElement(children as React.ReactElement<{id:string;'aria-describedby'?:string}>,{id,'aria-describedby':help?id+'-help':undefined}):children}{help&&<small id={id+'-help'} className="field-help">{help}</small>}</div>;

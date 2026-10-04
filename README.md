@@ -18,7 +18,7 @@ This build implements persisted Streams/Templates configuration, authenticated m
 | Subtitles | Independent CEA-608/708, selected Level 1 Latin teletext and optional DVB bitmap OCR to selectable WebVTT in TS/fMP4 HLS; friendly channel/service/page and recognition-language controls; original pass-through or filtering; [digital profile](docs/cea708-qualification.md), [teletext profile](docs/teletext-qualification.md), [DVB OCR profile](docs/dvb-qualification.md) |
 | Native cluster | Separate public/private endpoints, source discovery, explicit equivalent-origin failover, LAN pull, uplink/CPU/RAM selection, readiness, drain/stale exclusion, expiring capacity reservations; configurable private CA trust for HTTPS management and HLS/TS/M4F/M4S media |
 
-Required later work includes complete API/schema parity; Flussonic cluster discovery and credential compatibility; additional M4 codec/metadata modes; full publisher policy/session parity; RTSP publication/push and Basic/Digest viewer authentication; RTSPS publication/push and SRTP-protected UDP; direct RTP/SRTP inbound and outbound; SRT output/push; private-CA external HLSS/TSHTTPS input, mutual TLS and automatic certificate rotation, secure push and trusted-proxy integration; full transcoder profiles, GPU qualification, DVR, distributed session ownership and complete failure/scale qualification. Unsupported saved options return errors. See [qualification](docs/qualification.md) for evidence and limits.
+Required later work includes complete API/schema parity; Flussonic cluster discovery and credential compatibility; additional M4 codec/metadata modes; full publisher policy/session parity; RTSP publication/push and Basic/Digest viewer authentication; RTSPS publication/push and SRTP-protected UDP; direct RTP/SRTP inbound and outbound; SRT output/push; cross-origin authenticated HLS input, mutual TLS and automatic certificate rotation, secure push and trusted-proxy integration; full transcoder profiles, GPU qualification, DVR, distributed session ownership and complete failure/scale qualification. Unsupported saved options return errors. See [qualification](docs/qualification.md) for evidence and limits.
 
 DVB text recognition optionally requires independently installed Tesseract and selected language models, such as `tesseract-ocr-eng` and `tesseract-ocr-deu`. Streams/Templates expose a DVB composition page and recognition language without JSON editing. Missing or low-quality recognition reports degradation while AV continues. `FLUSSONIX_TESSERACT` selects a trusted executable at daemon startup.
 
@@ -31,6 +31,12 @@ The callback receives documented publication JSON metadata with a stable session
 ## HTTPS preview
 
 Add `--https-listen 0.0.0.0:18443 --https-cert /etc/flussonix/server-chain.pem --https-key /etc/flussonix/server.key` to serve authorized HLS, MPEG-TS, M4F/M4S, publication and admin directly over TLS. Add `--https-only` to disable HTTP binding. Config shows actual listeners and startup guidance. HTTPS LB requests require HTTPS CDN public delivery URLs; plaintext backend redirects are denied. See [the profile and limits](docs/https-delivery.md). HEVC/m2a/MP3 remain upcoming work.
+
+## Verified HTTPS inputs
+
+Streams and Templates expose **Trusted CA file** for HLSS, TSHTTPS and `https://` inputs, alongside the existing secure native and RTSPS inputs. Leave it empty for public roots, or enter an absolute PEM bundle path on the receiving server. The Rust fetcher verifies chain, expiry and DNS/IP identity before HTTP; FFmpeg receives only a loopback URL and no cluster credential is sent upstream. Custom roots replace public roots.
+
+Use `hlss://` for an HLS playlist, including extensionless URLs, or `tshttps://` for a streamed MPEG-TS URL at any path. A plain `https://` URL ending in `.m3u8` selects HLS; other paths are streamed to the media worker. Same-origin HTTPS redirects are bounded to three requests, and HLS variants, segments, keys and initialization resources must stay on that origin. Embedded URL credentials and fragments are rejected. Trust paths persist and inherit; changing to a plain input clears the field. See [qualification and remaining limits](docs/https-delivery.md).
 
 ## RTSPS preview
 

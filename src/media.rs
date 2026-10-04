@@ -410,6 +410,27 @@ impl Engine {
                 }
                 cmd.args(["-protocol_whitelist", "http,tcp,crypto"]);
                 peer_hls = Some(proxy);
+            } else if ["hlss://", "tshttps://", "https://"]
+                .iter()
+                .any(|prefix| input.starts_with(prefix))
+            {
+                let live = input.starts_with("tshttps://")
+                    || (input.starts_with("https://")
+                        && !url::Url::parse(&translated)
+                            .is_ok_and(|u| u.path().ends_with(".m3u8")));
+                let proxy = crate::peer_hls::PeerHls::start_external(
+                    &translated,
+                    inputs[index]["flussonix_tls_ca"].as_str().map(Path::new),
+                    live,
+                )
+                .await?;
+                translated = proxy.url.clone();
+                // Only the verifier contacts HTTPS sources; no peer key is sent.
+                if !live {
+                    cmd.args(["-allowed_extensions", "ALL"]);
+                }
+                cmd.args(["-protocol_whitelist", "http,tcp,crypto"]);
+                peer_hls = Some(proxy);
             }
             cmd.args(["-i", &translated]);
         }

@@ -79,3 +79,8 @@ Explicit M4FS/M4SS Stream/Template inputs now share the RTSPS absolute PEM trust
 ## Cluster private CA increment
 
 Configured source/peer management HTTPS requests now use optional private roots with identity verification and no redirects. Private source pulls inherit that trust or use a separate media bundle, including HLS, continuous MPEG-TS, M4F and M4S. Owned source/CDN/LB HTTPS tests verify admission, protected delivery, worker coalescing, FFmpeg decoding and exact native M4F segment bodies. This qualifies the configured native cluster flow; secure push, mutual TLS, automatic certificate rotation and broader vendor/codec/direction matrices remain open.
+
+
+## Direct HTTP input trust increment
+
+Direct HLSS, TSHTTPS and raw HTTPS input now pass through the verified origin-scoped Rust fetcher. Optional private roots persist on Stream/Template inputs and share the existing friendly CA field. Owned copy/CPU H.264/AAC delivery, fMP4 HLS resources, arbitrary TS paths, TLS rejection before HTTP, same-origin redirect bounds and fallback recovery are qualified independently of cluster credentials. Cross-origin authenticated HLS, active certificate/trust reload, GPU and the remaining direction/codec matrix stay open; see [the input profile](https-delivery.md).

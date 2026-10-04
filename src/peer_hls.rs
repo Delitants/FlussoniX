@@ -1,4 +1,4 @@
-//! Credential-scoped native HLS/continuous MPEG-TS fetcher. FFmpeg receives only loopback URLs.
+//! Origin-scoped native peer and verified external HLS/continuous MPEG-TS fetcher. FFmpeg receives only loopback URLs.
 //! URI lines and quoted URI attributes are resolved relative to their playlist
 //! (RFC 8216), then constrained to the configured HTTP(S) origin.
 use axum::{
@@ -33,7 +33,7 @@ struct Fetcher {
     origin: Url,
     local: String,
     client: reqwest::Client,
-    key: String,
+    key: Option<reqwest::header::HeaderValue>,
     slots: Arc<Semaphore>,
     cancel: CancellationToken,
     live: bool,
@@ -141,7 +141,10 @@ async fn fetch(
     let (prefix, response) = if f.live && f.inspected {
         f.prefetched.lock().unwrap().take().ok_or(())?
     } else {
-        let mut request = f.client.get(url.clone()).header("X-Flussonix-Peer", &f.key);
+        let mut request = f.client.get(url.clone());
+        if let Some(key) = &f.key {
+            request = request.header("X-Flussonix-Peer", key);
+        }
         if let Some(range) = headers.get("range").filter(|_| !f.live) {
             request = request.header("range", range);
         }
@@ -180,6 +183,7 @@ async fn fetch(
     {
         return Err(());
     }
+    let response_url = response.url().clone();
     let status = response.status();
     let upstream_headers = response.headers().clone();
     let mut data = BytesMut::new();
@@ -193,7 +197,7 @@ async fn fetch(
     }
     let is_playlist = data.starts_with(b"#EXTM3U");
     let body = if is_playlist {
-        playlist(f, &url, &data)?
+        playlist(f, &response_url, &data)?
     } else {
         data.freeze()
     };
@@ -234,10 +238,11 @@ async fn inspect_transport(
     f: &Fetcher,
 ) -> Result<(Bytes, reqwest::Response, Option<u8>, Option<u8>), String> {
     tokio::time::timeout(Duration::from_secs(5), async {
-        let mut response = f
-            .client
-            .get(f.origin.clone())
-            .header("X-Flussonix-Peer", &f.key)
+        let mut request = f.client.get(f.origin.clone());
+        if let Some(key) = &f.key {
+            request = request.header("X-Flussonix-Peer", key);
+        }
+        let mut response = request
             .send()
             .await
             .map_err(|_| "cannot connect peer transport")?;
@@ -272,31 +277,58 @@ impl PeerHls {
             .map_err(|_| "peer transport metadata task stopped")?
     }
     pub async fn start(input: &str, key: &str) -> Result<Self, String> {
-        Self::start_inner(input, key, false, None).await
+        Self::start_inner(input, Some(key), false, None, None).await
     }
     pub(crate) async fn start_inspected(
         input: &str,
         key: &str,
         ca: Option<&std::path::Path>,
     ) -> Result<Self, String> {
-        Self::start_inner(input, key, true, ca).await
+        Self::start_inner(input, Some(key), true, ca, None).await
+    }
+    pub(crate) async fn start_external(
+        input: &str,
+        ca: Option<&std::path::Path>,
+        live: bool,
+    ) -> Result<Self, String> {
+        Self::start_inner(input, None, false, ca, Some(live)).await
     }
     async fn start_inner(
         input: &str,
-        key: &str,
+        key: Option<&str>,
         inspect: bool,
         ca: Option<&std::path::Path>,
+        external_live: Option<bool>,
     ) -> Result<Self, String> {
         let origin = Url::parse(input).map_err(|_| "invalid peer media URL")?;
-        let live = origin.path().ends_with("/mpegts");
-        if !permitted(&origin, &origin) || !(origin.path().ends_with(".m3u8") || live) {
+        let live = external_live.unwrap_or_else(|| origin.path().ends_with("/mpegts"));
+        if external_live.is_some() && origin.scheme() != "https" {
+            return Err("external TLS input requires HTTPS".into());
+        }
+        if !permitted(&origin, &origin)
+            || (external_live.is_none() && !(origin.path().ends_with(".m3u8") || live))
+        {
             return Err("native peer HTTP input requires an HLS playlist or /mpegts URL".into());
         }
         if ca.is_some() && origin.scheme() != "https" {
             return Err("peer media CA requires HTTPS".into());
         }
-        let key = reqwest::header::HeaderValue::from_str(key).map_err(|_| "invalid peer key")?;
-        let key = key.to_str().map_err(|_| "invalid peer key")?.to_owned();
+        let key = key
+            .map(reqwest::header::HeaderValue::from_str)
+            .transpose()
+            .map_err(|_| "invalid peer key")?;
+        let redirect = if key.is_some() {
+            reqwest::redirect::Policy::none()
+        } else {
+            let configured = origin.clone();
+            reqwest::redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() >= 3 || !permitted(&configured, attempt.url()) {
+                    attempt.stop()
+                } else {
+                    attempt.follow()
+                }
+            })
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|_| "cannot bind peer HLS fetcher")?;
@@ -310,7 +342,7 @@ impl PeerHls {
         let cancel = CancellationToken::new();
         let mut client = reqwest::Client::builder()
             .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(redirect)
             .connect_timeout(Duration::from_secs(5));
         if origin.scheme() == "https" {
             client = client
