@@ -18,7 +18,7 @@ function App(){
  useEffect(()=>{load();const timer=setInterval(()=>{if(!document.hidden&&!loadInFlight.current)load()},3000);return()=>clearInterval(timer)},[credentials,view,resource]);
  useEffect(()=>{if(view==='config'&&!dirty){setDraft(structuredClone(config));setBaseConfig(structuredClone(config));}},[view,config,dirty]);
  async function login(e:React.FormEvent){e.preventDefault();setBusy(true);const c=btoa(user+':'+password);try{await request(native+'node','GET',undefined,c);setCredentials(c);setPassword('');setError('');}catch(e){setError((e as Error).message)}finally{setBusy(false)}}
- function navigate(v:View){if(dirty&&!window.confirm('Leave this page and discard staged configuration changes?'))return;loadRevision.current++;setView(v);setSelected(null);setEditing(null);setError('');setNotice('');setFilter('all');setTab('overview');setDirty(false);}
+ function navigate(v:View){if(dirty&&!window.confirm('Leave this page and discard staged configuration changes?'))return;if(v!==view)loadRevision.current++;setView(v);setSelected(null);setEditing(null);setError('');setNotice('');setFilter('all');setTab('overview');setDirty(false);}
  function edit(item:Item|null,kind:Kind=view==='config'?section:view==='cluster'?resource as Kind:view as Kind){
   const v=item?structuredClone(item.config_on_disk||item):kind==='streams'?{name:'',title:'',static:false,inputs:[{url:''}]}:kind==='templates'?{name:'',static:false,inputs:[{url:''}]}:kind==='auth_backends'?{name:'',url:''}:{hostname:'',api_url:''};
   delete v.stats;delete v.config_on_disk;setEditing(v);setEditingKind(kind);setEditingName(item?.name||item?.hostname||'');setNotice('');setError('');

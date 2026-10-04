@@ -333,3 +333,13 @@ test('slow successful polling still loads the requested collection',async({page,
   await expect(page.getByRole('cell',{name,exact:true})).toBeVisible({timeout:8500});
  }finally{await page.unrouteAll({behavior:'wait'});await request.delete(`/streamer/api/v3/templates/${name}`,{headers}).catch(()=>{});}
 });
+test('clicking the active tab during a slow load does not stop polling',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};const name='ui-active-poll';let started!:()=>void;const pending=new Promise<void>(resolve=>started=resolve);
+ try{
+  expect((await request.put(`/streamer/api/v3/templates/${name}`,{headers,data:{static:false,inputs:[{url:'testsrc://'}]}})).ok()).toBeTruthy();
+  await page.route('**/streamer/api/v3/templates',async route=>{const response=await route.fetch();started();await new Promise(resolve=>setTimeout(resolve,4000));await route.fulfill({response});});
+  await page.getByRole('button',{name:'Templates',exact:true}).click();await pending;
+  await page.getByRole('button',{name:'Templates',exact:true}).click();
+  await expect(page.getByRole('cell',{name,exact:true})).toBeVisible({timeout:8500});
+ }finally{await page.unrouteAll({behavior:'wait'});await request.delete(`/streamer/api/v3/templates/${name}`,{headers}).catch(()=>{});}
+});
