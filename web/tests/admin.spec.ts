@@ -310,3 +310,17 @@ test('native text controls retain full track IDs and template inheritance withou
   await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('HLS subtitles',{exact:true}).selectOption('inherit');await save();const s=await(await request.get('/streamer/api/v3/streams/'+stream,{headers})).json();expect(s.config_on_disk.flussonix_hls_captions).toBeUndefined();expect(s.flussonix_hls_captions).toEqual(t.flussonix_hls_captions);await page.getByRole('button',{name:'Transcoder',exact:true}).click();await expect(page.getByText('Native track 4294967295 · Native German · de',{exact:true})).toBeVisible();
  }finally{await request.delete('/streamer/api/v3/streams/'+stream,{headers}).catch(()=>{});await request.delete('/streamer/api/v3/templates/'+template,{headers}).catch(()=>{});}
 });
+test('reopening a saved source uses acknowledged settings while refresh is delayed',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};const name='ui-save-race';
+ const releases:Array<()=>void>=[];let delay=false;
+ try{
+  expect((await request.put(`/streamer/api/v3/cluster/sources/${name}`,{headers,data:{api_url:'https://source.example/control',cluster_key:'owned-save-race-key'}})).ok()).toBeTruthy();
+  await page.getByRole('button',{name:'Cluster',exact:true}).click();await page.getByRole('button',{name:'Source servers',exact:true}).click();
+  const edit=()=>page.getByRole('row').filter({has:page.getByRole('cell',{name,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+  await edit();await page.getByLabel('Source transport',{exact:true}).selectOption('mpegts');
+  await page.route('**/streamer/api/v3/config',async route=>{const response=await route.fetch();if(delay)await new Promise<void>(resolve=>releases.push(resolve));await route.fulfill({response});});
+  delay=true;await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+  const saved=await(await request.get(`/streamer/api/v3/cluster/sources/${name}`,{headers})).json();expect(saved.flussonix_transport).toBe('mpegts');
+  await edit();await expect(page.getByLabel('Source transport',{exact:true})).toHaveValue('mpegts');
+ }finally{delay=false;for(const release of releases)release();await page.unrouteAll({behavior:'wait'});await request.delete(`/streamer/api/v3/cluster/sources/${name}`,{headers}).catch(()=>{});}
+});
