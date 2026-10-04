@@ -158,7 +158,7 @@ pub async fn pull(
     stdin: &mut tokio::process::ChildStdin,
     hub: Option<&Hub>,
 ) -> Result<(), String> {
-    pull_inner(input, key, stdin, hub, None, Subtitles::default()).await
+    pull_inner(input, key, stdin, hub, None, PullOptions::default()).await
 }
 /// Supply validated metadata before the first TS write, on the same input session.
 pub async fn pull_ready<W: AsyncWrite + Unpin>(
@@ -168,21 +168,22 @@ pub async fn pull_ready<W: AsyncWrite + Unpin>(
     hub: Option<&Hub>,
     metadata: oneshot::Sender<Vec<Track>>,
 ) -> Result<(), String> {
-    pull_ready_with_subtitles(input, key, output, hub, metadata, Subtitles::default()).await
+    pull_ready_with_options(input, key, output, hub, metadata, PullOptions::default()).await
 }
 #[derive(Clone, Copy, Default)]
-pub(crate) struct Subtitles<'a> {
+pub(crate) struct PullOptions<'a> {
+    pub ca: Option<&'a std::path::Path>,
     pub preserve: bool,
     pub detected: Option<&'a AtomicU64>,
     pub conversion: Option<&'a crate::caption_hls::State>,
 }
-pub(crate) async fn pull_ready_with_subtitles<W: AsyncWrite + Unpin>(
+pub(crate) async fn pull_ready_with_options<W: AsyncWrite + Unpin>(
     input: &str,
     key: Option<&str>,
     output: &mut W,
     hub: Option<&Hub>,
     metadata: oneshot::Sender<Vec<Track>>,
-    subtitles: Subtitles<'_>,
+    subtitles: PullOptions<'_>,
 ) -> Result<(), String> {
     pull_inner(input, key, output, hub, Some(metadata), subtitles).await
 }
@@ -192,9 +193,10 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
     stdin: &mut W,
     hub: Option<&Hub>,
     mut metadata: Option<oneshot::Sender<Vec<Track>>>,
-    subtitles: Subtitles<'_>,
+    subtitles: PullOptions<'_>,
 ) -> Result<(), String> {
-    let Subtitles {
+    let PullOptions {
+        ca,
         preserve,
         detected,
         conversion,
@@ -227,16 +229,35 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
     base.set_path(&path);
     let mut control = base.clone();
     control.set_path(&format!("{}{suffix}", base.path()));
-    let client = reqwest::Client::builder()
+    if ca.is_some() && scheme != "https" {
+        return Err("TLS CA requires a secure native input".into());
+    }
+    let origin = base.origin();
+    let redirects = if key.is_some() {
+        reqwest::redirect::Policy::none()
+    } else if scheme == "https" {
+        reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 3
+                || attempt.url().scheme() != "https"
+                || attempt.url().origin() != origin
+            {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        })
+    } else {
+        reqwest::redirect::Policy::limited(3)
+    };
+    let mut client = reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(Duration::from_secs(5))
-        .redirect(if key.is_some() {
-            reqwest::redirect::Policy::none()
-        } else {
-            reqwest::redirect::Policy::limited(3)
-        })
-        .build()
-        .map_err(|_| "cannot build input client")?;
+        .https_only(scheme == "https")
+        .redirect(redirects);
+    if scheme == "https" {
+        client = client.use_preconfigured_tls((*crate::tls_input::client(ca)?).clone());
+    }
+    let client = client.build().map_err(|_| "cannot build input client")?;
     let mut request = client
         .get(control)
         .header("X-Supported", "prepush,drop_status");

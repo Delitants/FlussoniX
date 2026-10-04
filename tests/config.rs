@@ -467,3 +467,42 @@ fn publication_inputs_credentials_and_callbacks_persist_and_inherit() {
         assert_eq!(store.snapshot(), before);
     }
 }
+
+#[test]
+fn native_tls_ca_is_persisted_inherited_and_rejects_plain_or_invalid_trust() {
+    let d = tempfile::tempdir().unwrap();
+    let c = tls_fixture::Certificates::new();
+    let path = d.path().join("c.json");
+    let store = ConfigStore::open(&path).unwrap();
+    for scheme in ["m4fs", "m4ss"] {
+        store.put("templates","secure",json!({"inputs":[{"url":format!("{scheme}://localhost/owned"),"flussonix_tls_ca":c.ca}]})).unwrap();
+        store
+            .put(
+                "streams",
+                "owned",
+                json!({"template":"secure","static":false}),
+            )
+            .unwrap();
+        assert_eq!(
+            store.effective("owned").unwrap()["inputs"][0]["flussonix_tls_ca"],
+            json!(c.ca)
+        );
+    }
+    let saved = store.snapshot();
+    drop(store);
+    let store = ConfigStore::open(&path).unwrap();
+    assert_eq!(store.snapshot(), saved);
+    for input in [
+        json!({"url":"m4f://localhost/owned","flussonix_tls_ca":c.ca}),
+        json!({"url":"m4s://localhost/owned","flussonix_tls_ca":c.ca}),
+        json!({"url":"m4ss://localhost/owned","flussonix_tls_ca":"relative.pem"}),
+        json!({"url":"m4fs://localhost/owned","flussonix_tls_ca":true}),
+    ] {
+        assert!(
+            store
+                .put("streams", "owned", json!({"inputs":[input]}))
+                .is_err()
+        );
+        assert_eq!(store.snapshot(), saved);
+    }
+}

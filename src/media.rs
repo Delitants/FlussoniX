@@ -614,6 +614,9 @@ impl Engine {
         });
         let original_wire = (m4s_input || m4f_input)
             && (cfg.get("transcoder").is_none() || cfg["transcoder"]["encoder"] == "copy");
+        let native_ca = inputs[index]["flussonix_tls_ca"]
+            .as_str()
+            .map(std::path::PathBuf::from);
         let url = input.to_owned();
         let key = cfg["flussonix_peer_key"].as_str().map(str::to_owned);
         workers.insert(name.into(), worker.clone());
@@ -649,7 +652,7 @@ impl Engine {
                     tasks.push(tokio::spawn(async move {
                         let result = tokio::select! { biased;
                             _=c.cancelled()=>Ok(()),
-                            result=crate::m4_ingest::pull_ready_with_subtitles(&url,key.as_deref(),&mut writer,if original_wire {Some(&input_worker.wire)}else{None},metadata_tx,crate::m4_ingest::Subtitles { preserve: subtitle_tracks == "preserve", detected: Some(&input_worker.native_text_tracks), conversion: if native_captions {input_worker.captions.as_deref()} else {None} })=>result,
+                            result=crate::m4_ingest::pull_ready_with_options(&url,key.as_deref(),&mut writer,if original_wire {Some(&input_worker.wire)}else{None},metadata_tx,crate::m4_ingest::PullOptions { ca: native_ca.as_deref(), preserve: subtitle_tracks == "preserve", detected: Some(&input_worker.native_text_tracks), conversion: if native_captions {input_worker.captions.as_deref()} else {None} })=>result,
                         };
                         if let Err(reason) = result {
                             input_worker.failed(if reason == "native_subtitle_transcode_unsupported" { "native_subtitle_transcode_unsupported" } else { "input_closed" });

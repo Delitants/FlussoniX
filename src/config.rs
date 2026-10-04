@@ -419,7 +419,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                             v.keys()
                                 .any(|k| k != "url" && k != "rtp" && k != "flussonix_tls_ca")
                         }) {
-                            return Err("only input url, RTSP rtp=udp and RTSPS flussonix_tls_ca are implemented".into());
+                            return Err("only input url, RTSP rtp=udp and RTSPS/M4FS/M4SS flussonix_tls_ca are implemented".into());
                         }
                         let u = input["url"].as_str().ok_or("input url required")?;
                         let scheme = u.split("://").next().unwrap_or("");
@@ -437,11 +437,12 @@ fn validate_root(root: &Value) -> Result<(), String> {
                             return Err("rtp input option requires RTSP and value udp".into());
                         }
                         if let Some(ca) = input.get("flussonix_tls_ca") {
-                            if scheme != "rtsps" {
-                                return Err("TLS CA input option requires RTSPS".into());
+                            if !["rtsps", "m4fs", "m4ss"].contains(&scheme) {
+                                return Err(
+                                    "TLS CA input option requires RTSPS, M4FS or M4SS".into()
+                                );
                             }
-                            let path =
-                                ca.as_str().ok_or("RTSPS CA must be an absolute PEM path")?;
+                            let path = ca.as_str().ok_or("TLS CA must be an absolute PEM path")?;
                             crate::tls_input::client(Some(std::path::Path::new(path)))?;
                         }
                         if scheme == "rtsps" {

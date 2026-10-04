@@ -343,3 +343,17 @@ test('clicking the active tab during a slow load does not stop polling',async({p
   await expect(page.getByRole('cell',{name,exact:true})).toBeVisible({timeout:8500});
  }finally{await page.unrouteAll({behavior:'wait'});await request.delete(`/streamer/api/v3/templates/${name}`,{headers}).catch(()=>{});}
 });
+
+
+test('native TLS inputs retain a friendly trusted CA field across secure protocols',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-native-tls-trust';
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,static:false,inputs:[{url:'m4fs://localhost:19990/owned'}]}})).ok()).toBeTruthy();
+ await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+ const ca=page.getByLabel('Trusted CA file',{exact:true});const url=page.getByLabel('Input URL',{exact:true});
+ await expect(ca).toBeVisible();await ca.fill('relative.pem');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByText('Trusted CA file must be an absolute server path.',{exact:true})).toBeVisible();
+ await ca.fill(process.env.FLUSSONIX_TEST_CA_FILE!);
+ for(const protocol of ['m4ss','rtsps','m4fs']) {await url.fill(protocol+'://localhost:19990/owned');await expect(ca).toHaveValue(process.env.FLUSSONIX_TEST_CA_FILE!)}
+ await page.getByRole('button',{name:'Save',exact:true}).click();let state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_tls_ca).toBe(process.env.FLUSSONIX_TEST_CA_FILE);
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(ca).toHaveValue(process.env.FLUSSONIX_TEST_CA_FILE!);await url.fill('m4s://localhost:19990/owned');await expect(ca).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_tls_ca).toBeUndefined();await expect(page.locator('textarea')).toHaveCount(0);await request.delete('/streamer/api/v3/streams/'+name,{headers});
+});

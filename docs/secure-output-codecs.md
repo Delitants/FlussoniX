@@ -71,3 +71,7 @@ For M4F and M4S, test H.264 and HEVC with each of AAC, m2a and MP3, plus video-o
 TLS tests cover valid chains, private CA, wrong hostname, expired/untrusted certificates, mismatched key, missing files, busy ports, slow handshake, disconnect/shutdown and plaintext downgrade. Repeat token denial/revocation, publisher renewal and clean cluster-ticket redemption over HTTPS. Test LAN source pulls and public LB redirects independently. Capacity qualification measures handshake cost and sustained secure fan-out without changing production Flussonic listeners.
 
 This sequence is implementation order, not removal of any first-release requirement. No migration is claimed ready until the measured matrix covers the actual migration servers and stream profiles.
+
+## Configured native private CA increment
+
+Explicit M4FS/M4SS Stream/Template inputs now share the RTSPS absolute PEM trust option, certificate bounds and identity verification. Owned TLS tests exercise HEVC/Layer II native text preservation and both HLS subtitle formats over protected HTTPS, including certificate rejection before application data and origin-scoped redirects. These checks cover configured inputs rather than cluster discovery/management trust or every codec/direction combination. GPU qualification, secure push and the remaining migration matrix stay open.

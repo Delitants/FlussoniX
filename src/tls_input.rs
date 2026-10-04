@@ -16,19 +16,17 @@ pub(crate) fn client(ca: Option<&Path>) -> Result<Arc<rustls::ClientConfig>, Str
     let mut roots = rustls::RootCertStore::empty();
     if let Some(path) = ca {
         if !path.is_absolute() || !path.is_file() {
-            return Err("RTSPS CA must be an absolute regular PEM file path".into());
+            return Err("TLS CA must be an absolute regular PEM file path".into());
         }
-        let bytes = crate::rtsp::tls::pem(path).map_err(|_| "cannot read RTSPS CA PEM")?;
+        let bytes = crate::rtsp::tls::pem(path).map_err(|_| "cannot read TLS CA PEM")?;
         let certs = CertificateDer::pem_slice_iter(&bytes)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| "invalid RTSPS CA PEM")?;
+            .map_err(|_| "invalid TLS CA PEM")?;
         if certs.is_empty() || certs.len() > 128 {
-            return Err("RTSPS CA bundle requires 1..128 certificates".into());
+            return Err("TLS CA bundle requires 1..128 certificates".into());
         }
         for cert in certs {
-            roots
-                .add(cert)
-                .map_err(|_| "invalid RTSPS CA certificate")?;
+            roots.add(cert).map_err(|_| "invalid TLS CA certificate")?;
         }
     } else {
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
