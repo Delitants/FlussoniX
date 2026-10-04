@@ -6,7 +6,11 @@ use crate::{
 };
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt},
     sync::oneshot,
@@ -72,16 +76,39 @@ impl Signals {
         Ok(out)
     }
 }
+#[derive(Clone, Copy)]
+struct SubtitlePolicy<'a> {
+    preserve: bool,
+    copy: bool,
+    sparse: bool,
+    detected: Option<&'a AtomicU64>,
+}
 async fn configs<W: AsyncWrite + Unpin>(
     stdin: &mut W,
     tracks: &mut Vec<Track>,
     muxer: &mut Option<Muxer>,
     new: Vec<Track>,
     metadata: &mut Option<oneshot::Sender<Vec<Track>>>,
+    policy: SubtitlePolicy<'_>,
 ) -> Result<(), String> {
+    if let Some(count) = policy.detected {
+        count.fetch_max(
+            new.iter().filter(|t| t.codec == "subtitle").count() as u64,
+            Ordering::Relaxed,
+        );
+    }
+    if policy.preserve && !policy.copy && new.iter().any(|t| t.codec == "subtitle") {
+        return Err("native_subtitle_transcode_unsupported".into());
+    }
     if muxer.is_some() {
         if *tracks != new {
-            return Err("native metadata changed; worker restart required".into());
+            if !policy.sparse {
+                return Err("native metadata changed; worker restart required".into());
+            }
+            // Segment inventories omit silent text tracks. Keep the existing AV
+            // muxer, continuity counters and clock when only text presence changes.
+            muxer.as_mut().unwrap().sparse_tracks(&new)?;
+            *tracks = new;
         }
         return Ok(());
     }
@@ -123,7 +150,7 @@ pub async fn pull(
     stdin: &mut tokio::process::ChildStdin,
     hub: Option<&Hub>,
 ) -> Result<(), String> {
-    pull_inner(input, key, stdin, hub, None).await
+    pull_inner(input, key, stdin, hub, None, false, None).await
 }
 /// Supply validated metadata before the first TS write, on the same input session.
 pub async fn pull_ready<W: AsyncWrite + Unpin>(
@@ -133,7 +160,18 @@ pub async fn pull_ready<W: AsyncWrite + Unpin>(
     hub: Option<&Hub>,
     metadata: oneshot::Sender<Vec<Track>>,
 ) -> Result<(), String> {
-    pull_inner(input, key, output, hub, Some(metadata)).await
+    pull_ready_with_subtitles(input, key, output, hub, metadata, false, None).await
+}
+pub(crate) async fn pull_ready_with_subtitles<W: AsyncWrite + Unpin>(
+    input: &str,
+    key: Option<&str>,
+    output: &mut W,
+    hub: Option<&Hub>,
+    metadata: oneshot::Sender<Vec<Track>>,
+    preserve: bool,
+    detected: Option<&AtomicU64>,
+) -> Result<(), String> {
+    pull_inner(input, key, output, hub, Some(metadata), preserve, detected).await
 }
 async fn pull_inner<W: AsyncWrite + Unpin>(
     input: &str,
@@ -141,8 +179,16 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
     stdin: &mut W,
     hub: Option<&Hub>,
     mut metadata: Option<oneshot::Sender<Vec<Track>>>,
+    preserve: bool,
+    detected: Option<&AtomicU64>,
 ) -> Result<(), String> {
     let is_m4f = input.starts_with("m4f");
+    let policy = SubtitlePolicy {
+        preserve,
+        copy: hub.is_some(),
+        sparse: is_m4f,
+        detected,
+    };
     let suffix = if is_m4f { "/m4f" } else { "/m4s" };
     let scheme = if input.starts_with("m4ss://") || input.starts_with("m4fs://") {
         "https"
@@ -224,17 +270,35 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
                 }
                 let body = body.freeze();
                 let (new, frames) = crate::m4f::unpack(&body)?;
+                let source_start = frames.iter().map(|f| f.dts).min();
+                let source_tracks = new.clone();
+                let (body, new, frames) = if !preserve && new.iter().any(|t| t.codec == "subtitle")
+                {
+                    let filtered = crate::native_subtitles::segment(&body)?;
+                    let (new, frames) = crate::m4f::unpack(&filtered)?;
+                    (filtered, new, frames)
+                } else {
+                    (body, new, frames)
+                };
                 if frames.is_empty() {
                     return Err("empty M4F segment".into());
                 }
-                configs(stdin, &mut tracks, &mut muxer, new.clone(), &mut metadata).await?;
+                configs(
+                    stdin,
+                    &mut tracks,
+                    &mut muxer,
+                    source_tracks,
+                    &mut metadata,
+                    policy,
+                )
+                .await?;
                 for f in &frames {
                     write_frame(stdin, &mut muxer, f).await?;
                 }
                 if let Some(hub) = hub {
                     let gop = PackedGop {
                         utc: n.utc,
-                        dts_ms: frames.iter().map(|f| f.dts).min().unwrap() as f64 / 90.0,
+                        dts_ms: source_start.unwrap() as f64 / 90.0,
                         sequence: n.sequence,
                         duration_ms: n.duration_ms,
                         body: body.clone(),
@@ -258,9 +322,29 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
             for event in decoder.push(&bytes)? {
                 match event {
                     Event::Info { tracks: new, wire } => {
-                        configs(stdin, &mut tracks, &mut muxer, new.clone(), &mut metadata).await?;
+                        configs(
+                            stdin,
+                            &mut tracks,
+                            &mut muxer,
+                            new.clone(),
+                            &mut metadata,
+                            policy,
+                        )
+                        .await?;
                         if let Some(h) = hub {
-                            h.relay_info(new.clone(), wire)?;
+                            let text = new.iter().any(|t| t.codec == "subtitle");
+                            let output = if !preserve && text {
+                                crate::native_subtitles::info(&wire)?
+                            } else {
+                                wire
+                            };
+                            h.relay_info(
+                                new.iter()
+                                    .filter(|t| preserve || t.codec != "subtitle")
+                                    .cloned()
+                                    .collect(),
+                                output,
+                            )?;
                         }
                     }
                     Event::Frame {
@@ -280,7 +364,13 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
                         };
                         write_frame(stdin, &mut muxer, &f).await?;
                         if let Some(h) = hub {
-                            h.relay_frame(f.clone(), wire)?;
+                            if preserve
+                                || tracks
+                                    .iter()
+                                    .any(|t| t.id == f.track_id && t.codec != "subtitle")
+                            {
+                                h.relay_frame(f.clone(), wire)?;
+                            }
                         }
                     }
                     Event::Gop {
@@ -289,12 +379,37 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
                         frames,
                         wire,
                     } => {
-                        configs(stdin, &mut tracks, &mut muxer, new.clone(), &mut metadata).await?;
+                        configs(
+                            stdin,
+                            &mut tracks,
+                            &mut muxer,
+                            new.clone(),
+                            &mut metadata,
+                            SubtitlePolicy {
+                                sparse: true,
+                                ..policy
+                            },
+                        )
+                        .await?;
                         for f in &frames {
                             write_frame(stdin, &mut muxer, f).await?;
                         }
                         if let Some(h) = hub {
-                            h.relay_gop(gop, new.clone(), wire)?;
+                            if !preserve && new.iter().any(|t| t.codec == "subtitle") {
+                                let body = crate::native_subtitles::segment(&gop.body)?;
+                                let filtered = PackedGop { body, ..gop };
+                                let wire = crate::m4s::encode_gop(&filtered)?;
+                                h.relay_gop(
+                                    filtered,
+                                    new.iter()
+                                        .filter(|t| t.codec != "subtitle")
+                                        .cloned()
+                                        .collect(),
+                                    wire,
+                                )?;
+                            } else {
+                                h.relay_gop(gop, new.clone(), wire)?;
+                            }
                         }
                     }
                     Event::Other { wire } => {

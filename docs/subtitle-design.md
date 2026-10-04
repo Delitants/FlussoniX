@@ -39,7 +39,7 @@ Read-only inspection of this host's `schema-v3-public.json` and `schema-v3-priva
 - Input `closed_captions`: string-to-string rules on MPEG-TS, SRT, M4F, M4S and copy inputs; rule value semantics still need observation.
 - Video track caption metadata: language/name, with private fields for standard 608/708 and channel/service identity. Preserve these distinctions when constructing HLS manifests.
 
-These observations inform the follow-on implementation; they do not imply the current AV-only native parser supports the subtitle tracks.
+These schema observations inform follow-on migration work. The independent generic native text subset is now qualified separately in [native subtitle delivery](native-subtitles.md); it does not implement these legacy field semantics.
 
 ## Runtime and delivery
 
@@ -47,7 +47,7 @@ One source session feeds video, audio and subtitle processing. Parse announced l
 
 Segment WebVTT on the AV HLS generation grid, with correct MPEGTS timestamp mapping, overlapping cues, empty segments during silence, discontinuities, timestamp wrap and recovery. Include renditions in TS-HLS and fMP4-HLS master playlists. Serve every rendition playlist and segment through the existing token/session checks and HTTP/HTTPS endpoints. CDN metadata/cache and source pull must carry the language, service, timing and output policy without a second source subscription.
 
-Preservation applies only when the target protocol/container carries that representation. TSHTTP/TSHTTPS, SRT carrying TS and RTP carrying TS need subtitle PIDs/descriptors; elementary audio/video RTP does not carry arbitrary DVB PES. Native M4F/M4S subtitle track and metadata representation needs independent reference observation and codec qualification; existing AV-only parsers cannot be presented as subtitle passthrough. Copy-mode caption SEI must survive H.264/HEVC framing; CPU/GPU transcoding needs explicit caption retention or extraction, verified per encoder. Unsupported combinations must return an actionable capability error.
+Preservation applies only when the target protocol/container carries that representation. TSHTTP/TSHTTPS, SRT carrying TS and RTP carrying TS need subtitle PIDs/descriptors; elementary audio/video RTP does not carry arbitrary DVB PES. Generic native M4F/M4S text copy and filtering are implemented as described in [native subtitle delivery](native-subtitles.md). Mapping regional broadcast PES into native subtitle tracks remains unqualified. Copy-mode caption SEI must survive H.264/HEVC framing; CPU/GPU transcoding needs explicit caption retention or extraction, verified per encoder. Unsupported combinations must return an actionable capability error.
 
 ## Implementation and qualification sequence
 
@@ -64,7 +64,7 @@ Streams and Templates now accept `flussonix_subtitle_tracks`: `preserve` copies 
 
 Both HLS variants and FLV receive only video/audio, so DVB/teletext tracks do not make incompatible containers fail. Copy-mode embedded captions stay in video; the separate-track drop setting does not strip caption SEI. Owned DVB clear-page and teletext page 888 fixtures retain encoded payloads, languages and page identifiers through copy and CPU video transcoding. Remuxing may change PID numbers. Native H.264/HEVC framing tests retain both 608 and 708 packet bytes; this does not yet prove decoded caption timing, encoder retention or complete regional functionality.
 
-At that initial stage, selectable conversion, service detection, OCR, caption stripping and regional cluster round trips remained pending; the subsequent stage below implements selected 608 conversion and targeted HLS filtering. Native separate subtitle tracks and regional subtitle cluster round trips are still pending; the DVB stage below adds optional OCR. In particular, the current AV-only HLS source pull does not carry separate DVB/teletext tracks from source to CDN. SRT/RTP subtitle delivery and GPU caption retention have not been qualified. The subsequent Convert option uses the real decoder and authorized rendition path described below.
+At that initial stage, selectable conversion, service detection, OCR, caption stripping and regional cluster round trips remained pending; the subsequent stage below implements selected 608 conversion and targeted HLS filtering. Native text copy/filtering and the MPEG-TS regional cluster path are now documented in the later qualification stages; the DVB stage below adds optional OCR. In particular, the current AV-only HLS source pull does not carry separate DVB/teletext tracks from source to CDN. SRT/RTP subtitle delivery and GPU caption retention have not been qualified. The subsequent Convert option uses the real decoder and authorized rendition path described below.
 
 Sparse subtitle qualification: continuously paced publications with declared but absent subtitle packets, and with only initial cues followed by silence, keep AV progressing and publish both HLS variants in copy and CPU modes. Preservation caps common tee and nested live-TS interleaving at 100 ms; this is a mux buffering budget, not an end-to-end latency promise. Four new regressions first reproduced startup timeouts before the fix and then passed.
 
@@ -105,3 +105,7 @@ Selected announced DVB teletext subtitle pages100..899 share the existing source
 The shared subtitle carrier binds configured DVB composition/ancillary pages and reconstructs coding0 interlaced bitmap display sets in bounded native caches. Optional independent Tesseract jobs fill retained source intervals before HLS publication; clear/update/timeout closes intervals even while recognition is pending. Canceled/reset/rebound tokens cannot revive cues. Identical accepted or pending images extend intervals; failed recognition may retry at a source refresh.
 
 Rows require `dvb_page`0..65535 and `ocr_language` (one to four installed model names joined by `+`). Stable URLs use `dvbN`; existing CC/digital/teletext wire fields and URLs remain unchanged. Public Rust Service/Cue identities are nowu32. Friendly UI fields and recognition status are available in Streams/Templates. Original TS track preservation and HLS pass-through/filter remain independent. See [the measured profile](dvb-qualification.md). Full styling/color, enhanced objects, automatic discovery, capacity qualification, GPU conversion and regional native subtitle carriage remain open.
+
+## Generic native text stage
+
+Copy-mode native M4F/M4S now preserves or filters the observed generic text codec through the same original-track control. HLS conversion of its opaque payload and preservation during transcoding remain unsupported and explicitly reported. See [native subtitle delivery](native-subtitles.md) for the format, evidence and limits.

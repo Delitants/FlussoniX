@@ -110,20 +110,21 @@ impl Hub {
     }
     pub fn relay_frame(&self, frame: Frame, wire: Bytes) -> Result<(), String> {
         let mut s = self.state.lock().unwrap();
-        let video = s
+        let kind = s
             .tracks
             .iter()
             .find(|t| t.id == frame.track_id)
             .ok_or("unknown wire track")?
-            .kind()?
-            .is_video();
+            .kind()?;
+        let video = kind.is_video();
         let has_video = s
             .tracks
             .iter()
             .any(|t| t.kind().is_ok_and(|k| k.is_video()));
         self.rtp.frame(&frame);
         let origin = *s.origin.get_or_insert(frame.dts);
-        let audio_boundary = !has_video
+        let audio_boundary = kind.is_audio()
+            && !has_video
             && (!s.segment_ready
                 || !s.bootstrap_ready
                 || s.frames
@@ -144,6 +145,11 @@ impl Hub {
                     .checked_sub(start)
                     .ok_or("invalid segment timeline")?;
                 let bytes = Bytes::from(pack(&s.tracks, &s.frames, duration)?);
+                let bytes = if let Some(info) = &s.info {
+                    crate::native_subtitles::carry_metadata(bytes, info)?
+                } else {
+                    bytes
+                };
                 let offset = start.saturating_sub(origin) / 90;
                 let ms = s
                     .utc
@@ -323,11 +329,7 @@ pub fn encode_info(tracks: &[Track]) -> Result<Vec<u8>, String> {
     for t in tracks {
         let mut handler = vec![0; 4];
         handler.extend_from_slice(&t.id.to_be_bytes());
-        handler.extend_from_slice(if t.kind()?.is_video() {
-            b"vide"
-        } else {
-            b"soun"
-        });
+        handler.extend_from_slice(t.kind()?.handler());
         handler.extend_from_slice(t.codec.as_bytes());
         handler.push(0);
         let mut shft = vec![0; 4];
@@ -355,7 +357,7 @@ pub fn encode_frame(track: &Track, frame: &Frame) -> Result<Vec<u8>, String> {
     }
     let mut h = frame.track_id.to_be_bytes().to_vec();
     h.extend_from_slice(&[
-        if kind.is_video() { 1 } else { 2 },
+        kind.content_type(),
         if frame.key { 2 } else { 3 },
         u8::from(frame.key && kind.is_video()),
         0,

@@ -103,7 +103,7 @@ pub fn pack(tracks: &[Track], frames: &[Frame], duration: u64) -> Result<Vec<u8>
         let mut t = atom(b"shft", &shft);
         let mut handler = vec![0; 4];
         handler.extend_from_slice(&track.id.to_be_bytes());
-        handler.extend_from_slice(if kind.is_video() { b"vide" } else { b"soun" });
+        handler.extend_from_slice(kind.handler());
         handler.extend_from_slice(track.codec.as_bytes());
         handler.push(0);
         t.extend(atom(b"hdlr", &handler));
@@ -144,6 +144,10 @@ pub fn pack(tracks: &[Track], frames: &[Frame], duration: u64) -> Result<Vec<u8>
                 }
                 Codec::H264 | Codec::Hevc => 3600,
                 Codec::Aac => 1920,
+                // Native text PTS is the cue end; DTS is its start.
+                Codec::Subtitle => {
+                    u64::try_from(s.pts_offset).map_err(|_| "native subtitle ends before start")?
+                }
             };
             let delta = samples
                 .get(i + 1)

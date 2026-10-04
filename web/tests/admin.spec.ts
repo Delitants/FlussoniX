@@ -227,7 +227,7 @@ test('subtitle track controls inherit, override and restore template policy with
  cfg=await(await request.get('/streamer/api/v3/streams/'+stream,{headers})).json();expect(cfg.flussonix_subtitle_tracks).toBe('drop');expect(cfg.config_on_disk.flussonix_subtitle_tracks).toBe('drop');
  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Original subtitle tracks',{exact:true}).selectOption('inherit');await save();
  cfg=await(await request.get('/streamer/api/v3/streams/'+stream,{headers})).json();expect(cfg.flussonix_subtitle_tracks).toBe('preserve');expect(cfg.config_on_disk.flussonix_subtitle_tracks).toBeUndefined();
- await page.getByRole('button',{name:'Transcoder',exact:true}).click();await expect(page.getByText('Keep in MPEG-TS output',{exact:true})).toBeVisible();
+ await page.getByRole('button',{name:'Transcoder',exact:true}).click();await expect(page.getByText('Keep in compatible outputs',{exact:true})).toBeVisible();
 });
 
 test('HLS subtitle controls pass through, convert, filter and inherit without JSON',async({page,request})=>{

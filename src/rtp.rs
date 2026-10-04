@@ -332,6 +332,7 @@ fn describe(s: &State) -> Result<Description, String> {
     })
 }
 fn parse_tracks(tracks: &[Track]) -> Result<Vec<PacketTrack>, String> {
+    let tracks: Vec<_> = tracks.iter().filter(|t| t.codec != "subtitle").collect();
     if tracks.is_empty() || tracks.len() > 2 {
         return Err("RTSP requires one or two H.264/AAC tracks".into());
     }

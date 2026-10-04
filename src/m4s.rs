@@ -1,5 +1,5 @@
 //! Independent decoder for the observed M4S length-prefixed media records.
-//! Supports observed AVC/AAC MDin, FRam and packed Fgop records.
+//! Supports qualified native codec profiles in MDin, FRam and packed Fgop records.
 use crate::codec::Codec;
 use crate::m4f::Frame;
 use bytes::{Buf, Bytes, BytesMut};
@@ -26,7 +26,12 @@ pub fn validate_tracks(tracks: &[Track]) -> Result<(), String> {
         if !ids.insert(t.id) || videos > 1 || t.config.len() > 1024 * 1024 {
             return Err("invalid native tracks/configuration".into());
         }
-        if t.config.is_empty() && !matches!(codec, Codec::M2a | Codec::Mp3 | Codec::Hevc) {
+        if t.config.is_empty()
+            && !matches!(
+                codec,
+                Codec::M2a | Codec::Mp3 | Codec::Hevc | Codec::Subtitle
+            )
+        {
             return Err("missing native codec configuration".into());
         }
     }
@@ -41,7 +46,7 @@ pub(crate) fn decode_track(fields: &[BoxView<'_>]) -> Result<Track, String> {
         .map_err(|_| "invalid native codec name")?
         .to_owned();
     let kind = Codec::parse(&codec)?;
-    if &h[8..12] != if kind.is_video() { b"vide" } else { b"soun" } {
+    if &h[8..12] != kind.handler() {
         return Err("native handler/codec kind mismatch".into());
     }
     let config = required(fields, b"cnfg")?
@@ -140,10 +145,14 @@ impl Decoder {
                     }
                     let track_id = u32::from_be_bytes(h[..4].try_into().unwrap());
                     let name = if h[8] == b' ' { &h[9..12] } else { &h[8..12] };
-                    let codec = Codec::parse(
-                        std::str::from_utf8(name).map_err(|_| "invalid native frame codec")?,
-                    )?;
-                    if h[4] != if codec.is_video() { 1 } else { 2 } || !matches!(h[5], 2 | 3) {
+                    let codec = if name == b"subt" {
+                        Codec::Subtitle
+                    } else {
+                        Codec::parse(
+                            std::str::from_utf8(name).map_err(|_| "invalid native frame codec")?,
+                        )?
+                    };
+                    if h[4] != codec.content_type() || !matches!(h[5], 2 | 3) {
                         return Err("native frame codec/kind mismatch".into());
                     }
                     if !self.tracks.is_empty()

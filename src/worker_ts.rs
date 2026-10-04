@@ -25,11 +25,13 @@ pub struct Muxer {
     pcr: u16,
     counters: HashMap<u16, u8>,
     last_tables: Option<u64>,
+    subtitles: Vec<u32>,
 }
 impl Muxer {
     pub fn new(tracks: &[Track]) -> Result<Self, String> {
         validate_tracks(tracks)?;
         let mut streams = vec![];
+        let mut subtitles = vec![];
         for (i, t) in tracks.iter().enumerate() {
             let kind = t.kind()?;
             let format = match kind {
@@ -59,6 +61,10 @@ impl Muxer {
                     Format::Aac { rate, channels }
                 }
                 Codec::M2a | Codec::Mp3 => Format::Mpeg,
+                Codec::Subtitle => {
+                    subtitles.push(t.id);
+                    continue;
+                }
             };
             streams.push(Stream {
                 track: t.clone(),
@@ -67,6 +73,9 @@ impl Muxer {
                 format,
                 last_dts: None,
             });
+        }
+        if streams.is_empty() {
+            return Err("native source requires audio or video".into());
         }
         let pcr = streams
             .iter()
@@ -78,6 +87,7 @@ impl Muxer {
             pcr,
             counters: HashMap::new(),
             last_tables: None,
+            subtitles,
         })
     }
     pub fn tables(&mut self) -> Vec<u8> {
@@ -104,6 +114,7 @@ impl Muxer {
                 Codec::Hevc => 0x24,
                 Codec::Aac => 0x0f,
                 Codec::M2a | Codec::Mp3 => 3,
+                Codec::Subtitle => unreachable!("native text is not a TS audio/video stream"),
             };
             pmt.extend([ty, 0xe0 | ((s.pid >> 8) as u8), s.pid as u8, 0xf0, 0]);
         }
@@ -113,7 +124,23 @@ impl Muxer {
         self.packets(4096, &[vec![0], pmt].concat(), None, false, &mut out);
         out
     }
+    pub(crate) fn sparse_tracks(&mut self, tracks: &[Track]) -> Result<(), String> {
+        validate_tracks(tracks)?;
+        let av: Vec<_> = tracks.iter().filter(|t| t.codec != "subtitle").collect();
+        if av != self.streams.iter().map(|s| &s.track).collect::<Vec<_>>() {
+            return Err("native metadata changed; worker restart required".into());
+        }
+        self.subtitles = tracks
+            .iter()
+            .filter(|t| t.codec == "subtitle")
+            .map(|t| t.id)
+            .collect();
+        Ok(())
+    }
     pub fn frame(&mut self, f: &Frame) -> Result<Vec<u8>, String> {
+        if self.subtitles.contains(&f.track_id) {
+            return Ok(Vec::new());
+        }
         let index = self
             .streams
             .iter()

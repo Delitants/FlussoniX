@@ -47,6 +47,7 @@ pub struct Worker {
     input_protocol: String,
     subtitle_tracks: &'static str,
     hls_subtitles: &'static str,
+    native_text_tracks: AtomicU64,
     captions: Option<Arc<crate::caption_hls::State>>,
     restart_count: u64,
     input_timeout: Duration,
@@ -101,7 +102,26 @@ impl Worker {
         } else {
             "stopped"
         };
-        json!({"status":status,"pid":self.pid(),"bytes_in":self.bytes.load(Ordering::Relaxed),"online_clients":self.viewers.load(Ordering::Relaxed),"uptime":self.started.elapsed().as_secs(),"input_protocol":self.input_protocol,"input_index":self.input_index,"restart_count":self.restart_count,"retry_in_ms":recovery.retry_in().map(|d|d.as_millis()),"last_error":recovery.last_error(),"media_age_ms":recovery.media_age_ms(),"subtitle_tracks":self.subtitle_tracks,"hls_subtitles":self.hls_subtitles,"hls_captions":self.captions.as_ref().map(|c|c.stats())})
+        let mut stats = json!({"status":status,"pid":self.pid(),"bytes_in":self.bytes.load(Ordering::Relaxed),"online_clients":self.viewers.load(Ordering::Relaxed),"uptime":self.started.elapsed().as_secs(),"input_protocol":self.input_protocol,"input_index":self.input_index,"restart_count":self.restart_count,"retry_in_ms":recovery.retry_in().map(|d|d.as_millis()),"last_error":recovery.last_error(),"media_age_ms":recovery.media_age_ms(),"subtitle_tracks":self.subtitle_tracks,"hls_subtitles":self.hls_subtitles,"hls_captions":self.captions.as_ref().map(|c|c.stats())});
+        let native_text_tracks = self.native_text_tracks.load(Ordering::Relaxed);
+        if native_text_tracks > 0 {
+            stats["native_subtitle_tracks"] = json!(native_text_tracks);
+            stats["native_subtitle_output"] = json!(if recovery.last_error()
+                == Some("native_subtitle_transcode_unsupported")
+            {
+                "Not supported"
+            } else if self.subtitle_tracks == "preserve" {
+                "Kept"
+            } else {
+                "Filtered"
+            });
+            stats["native_subtitle_hls"] = json!(if self.hls_subtitles == "drop" {
+                "Off"
+            } else {
+                "Not supported"
+            });
+        }
+        stats
     }
 }
 impl Engine {
@@ -556,6 +576,7 @@ impl Engine {
             signature,
             subtitle_tracks,
             hls_subtitles,
+            native_text_tracks: AtomicU64::new(0),
             captions,
             input_index: index,
             input_protocol: input.split("://").next().unwrap_or("unknown").into(),
@@ -605,10 +626,10 @@ impl Engine {
                     tasks.push(tokio::spawn(async move {
                         let result = tokio::select! { biased;
                             _=c.cancelled()=>Ok(()),
-                            result=crate::m4_ingest::pull_ready(&url,key.as_deref(),&mut writer,if original_wire {Some(&input_worker.wire)}else{None},metadata_tx)=>result,
+                            result=crate::m4_ingest::pull_ready_with_subtitles(&url,key.as_deref(),&mut writer,if original_wire {Some(&input_worker.wire)}else{None},metadata_tx,subtitle_tracks == "preserve",Some(&input_worker.native_text_tracks))=>result,
                         };
                         if let Err(reason) = result {
-                            input_worker.failed("input_closed");
+                            input_worker.failed(if reason == "native_subtitle_transcode_unsupported" { "native_subtitle_transcode_unsupported" } else { "input_closed" });
                             tracing::warn!(error = %reason, "wire input stopped");
                         }
                         c.cancel();
@@ -1000,7 +1021,7 @@ fn native_fmp4_filters(tracks: &[crate::m4s::Track]) -> String {
     let offset = tracks.iter().filter(video).count();
     tracks
         .iter()
-        .filter(|t| !matches!(t.codec.as_str(), "h264" | "hevc"))
+        .filter(|t| matches!(t.codec.as_str(), "aac" | "m2a" | "mp3"))
         .enumerate()
         .filter(|(_, t)| t.codec == "aac")
         .map(|(i, _)| format!(":bsfs/{}=aac_adtstoasc", offset + i))
