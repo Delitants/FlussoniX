@@ -86,6 +86,7 @@ struct SubtitlePolicy<'a> {
 async fn configs<W: AsyncWrite + Unpin>(
     stdin: &mut W,
     tracks: &mut Vec<Track>,
+    declared: &mut Option<Vec<Track>>,
     muxer: &mut Option<Muxer>,
     new: Vec<Track>,
     metadata: &mut Option<oneshot::Sender<Vec<Track>>>,
@@ -100,11 +101,14 @@ async fn configs<W: AsyncWrite + Unpin>(
     if policy.preserve && !policy.copy && new.iter().any(|t| t.codec == "subtitle") {
         return Err("native_subtitle_transcode_unsupported".into());
     }
+    if !policy.sparse {
+        if declared.as_ref().is_some_and(|old| old != &new) {
+            return Err("native metadata changed; worker restart required".into());
+        }
+        *declared = Some(new.clone());
+    }
     if muxer.is_some() {
         if *tracks != new {
-            if !policy.sparse {
-                return Err("native metadata changed; worker restart required".into());
-            }
             // Segment inventories omit silent text tracks. Keep the existing AV
             // muxer, continuity counters and clock when only text presence changes.
             muxer.as_mut().unwrap().sparse_tracks(&new)?;
@@ -236,6 +240,7 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
     let mut decoder = Decoder::default();
     let mut signals = Signals::default();
     let mut tracks = Vec::new();
+    let mut declared = None;
     let mut muxer = None;
     let mut seen: VecDeque<String> = VecDeque::new();
     loop {
@@ -286,6 +291,7 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
                 configs(
                     stdin,
                     &mut tracks,
+                    &mut declared,
                     &mut muxer,
                     source_tracks,
                     &mut metadata,
@@ -325,6 +331,7 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
                         configs(
                             stdin,
                             &mut tracks,
+                            &mut declared,
                             &mut muxer,
                             new.clone(),
                             &mut metadata,
@@ -382,6 +389,7 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
                         configs(
                             stdin,
                             &mut tracks,
+                            &mut declared,
                             &mut muxer,
                             new.clone(),
                             &mut metadata,

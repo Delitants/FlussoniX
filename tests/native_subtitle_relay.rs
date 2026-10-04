@@ -125,6 +125,9 @@ async fn run(
         signals += &format!("{n} {stamp}-2000\n");
         segments.insert(format!("owned/{stamp}.m4f"), body.clone());
         if gops {
+            if sparse {
+                control.extend(track_metadata(&wire::encode_info(&tracks).unwrap(), true));
+            }
             control.extend(
                 m4s::encode_gop(&PackedGop {
                     utc: 1700000000 + n as u32 * 2,
