@@ -114,6 +114,9 @@ impl Default for Hub {
     }
 }
 impl Hub {
+    pub(crate) fn finish(&self) {
+        self.q.close();
+    }
     pub fn new() -> Self {
         Self {
             q: Channel::new(4096, 64 * 1024 * 1024),

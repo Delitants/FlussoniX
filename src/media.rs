@@ -736,9 +736,11 @@ impl Engine {
                     }));
                 }
                 let separate_av = av_listener.is_some();
+                let av_finished=CancellationToken::new();
+                let mut clean_end=false;
                 let mut av_done = None;
                 if let Some(listener) = av_listener {
-                    let w=w.clone();let c=cancel.clone();let (sender,receiver)=oneshot::channel();av_done=Some(receiver);
+                    let w=w.clone();let c=cancel.clone();let end=av_finished.clone();let (sender,receiver)=oneshot::channel();av_done=Some(receiver);
                     tasks.push(tokio::spawn(async move {
                         let result = async {
                             let accepted=tokio::select! {biased;_=c.cancelled()=>return Ok(()), r=tokio::time::timeout(timeout+Duration::from_secs(1),listener.accept())=>r};
@@ -755,11 +757,11 @@ impl Engine {
                                 }
                             }
                         }.await;
-                        // EOF is terminal for this generation even if stdout
-                        // continues. Final native frames were published above.
-                        if !c.is_cancelled() {w.failed(result.err().unwrap_or("input_closed"));}
                         let _=sender.send(result);
-                        c.cancel();
+                        if !c.is_cancelled() {
+                            if let Err(reason)=result {w.failed(reason);c.cancel();}
+                            else {end.cancel();}
+                        }
                     }));
                 }
                 let mut native_output=if !original_wire && !separate_av {Some(crate::worker_output::live::Forwarder::new(timeout))}else{None};
@@ -769,6 +771,7 @@ impl Engine {
                 loop {
                     let read = tokio::select! { biased;
                         _ = cancel.cancelled() => break,
+                        _ = av_finished.cancelled() => {clean_end=true;w.failed("input_closed");break;},
                         result = tokio::time::timeout(timeout, stdout.read(&mut buffer)) => result,
                     };
                     match read {
@@ -777,6 +780,7 @@ impl Engine {
                             else if let Some(receiver)=av_done.take() {
                                 tokio::select! {biased;_=cancel.cancelled()=>break,r=tokio::time::timeout(timeout,receiver)=>match r {Ok(Ok(result))=>result,_=>Err("wire_decode_failed")}}
                             } else {Ok(())};
+                            clean_end=result.is_ok();
                             w.failed(result.err().unwrap_or("input_closed"));
                             break;
                         }
@@ -805,6 +809,15 @@ impl Engine {
                 }
                 let _ = child.kill().await;
                 let _ = child.wait().await;
+                if clean_end && !cancel.is_cancelled() {
+                    w.wire.finish();
+                    // Give authorized public consumers a bounded clean-EOF
+                    // drain. Abort/revocation/config replacement cancels this
+                    // immediately and preserves the existing reader fences.
+                    if w.viewers.load(Ordering::Relaxed)>0 {
+                        tokio::select! {biased;_=cancel.cancelled()=>{},_=tokio::time::sleep(Duration::from_secs(2))=>{}}
+                    }
+                }
             }.await;
             cancel.cancel();
             for task in tasks {

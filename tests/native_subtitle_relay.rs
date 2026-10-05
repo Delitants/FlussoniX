@@ -346,7 +346,15 @@ async fn run(
         if preserve { 2 } else { 0 },
         "effective original-track policy"
     );
-    assert!(observed.iter().any(|f| f.track_id == 2));
+    let audio_ids = native_tracks
+        .iter()
+        .filter(|t| t.kind().is_ok_and(|k| k.is_audio()))
+        .map(|t| t.id)
+        .collect::<Vec<_>>();
+    assert!(
+        !audio_ids.is_empty() && observed.iter().any(|f| audio_ids.contains(&f.track_id)),
+        "native output must retain audio under its declared output ID"
+    );
     if preserve {
         for id in [7, 8] {
             assert!(
@@ -363,7 +371,7 @@ async fn run(
                 && original.body == f.body));
         }
     } else {
-        assert!(observed.iter().all(|f| f.track_id == 2));
+        assert!(observed.iter().all(|f| audio_ids.contains(&f.track_id)));
     }
     for signal in if sparse {
         source_signals
@@ -404,7 +412,7 @@ async fn run(
             assert_eq!(bytes, originals[&format!("owned/{name}")]);
         }
         if !preserve {
-            assert!(fs.iter().all(|f| f.track_id == 2));
+            assert!(fs.iter().all(|f| audio_ids.contains(&f.track_id)));
             assert!(!bytes.windows(7).any(|b| b == b"AMERICA"));
             assert!(!bytes.windows(6).any(|b| b == b"EUROPE"));
         }

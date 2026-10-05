@@ -39,6 +39,11 @@ impl Default for Hub {
     }
 }
 impl Hub {
+    pub(crate) fn finish(&self) {
+        self.m4s.close();
+        self.signals.close();
+        self.rtp.finish();
+    }
     pub fn new() -> Self {
         Self {
             m4s: Channel::new(256, 16 * 1024 * 1024),

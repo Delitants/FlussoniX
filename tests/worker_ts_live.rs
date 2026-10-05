@@ -122,6 +122,7 @@ async fn publication(preserve: bool) {
                         }
                     }
                 }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
                 Ok(Err(e)) => panic!("native queue lost records: {e}"),
                 Err(_) => {
                     if worker.is_closed() {
@@ -195,6 +196,15 @@ async fn publication(preserve: bool) {
             include_bytes!("fixtures/codecs/mp3.bin").as_slice()
         };
         assert!(got.iter().all(|f| f.body == body));
+        let original = expected.iter().filter(|f| f.track_id == (i + 1) as u32);
+        for (sample, original) in got.iter().zip(original) {
+            assert_eq!(
+                sample.dts as i64 - original.dts as i64,
+                shift,
+                "MPEG audio must use the same clock shift as video"
+            );
+            assert_eq!(sample.pts_offset, 0);
+        }
     }
     // Read an actual originated M4F segment, not just reconstructed M4S.
     let signals = worker.wire.signal_subscribe().0;
@@ -315,4 +325,115 @@ async fn malformed_av_channel_closes_generation_and_reaps_packager() {
 #[tokio::test]
 async fn clean_av_eof_does_not_leave_a_healthy_transport_worker() {
     fake_output(true, true).await;
+}
+
+#[cfg(unix)]
+async fn public_eof(abort: bool, wait_deadline: bool) {
+    use axum::{body::Body, http::Request};
+    use flussonix::server::{App, Options, router};
+    use http_body_util::BodyExt;
+    use std::os::unix::fs::PermissionsExt;
+    use tower::ServiceExt;
+    let dir = tempfile::tempdir().unwrap();
+    let transport = dir.path().join("owned.ts");
+    let (tracks, frames, _) = fixture();
+    let frames = frames
+        .into_iter()
+        .filter(|f| f.dts < 110000)
+        .collect::<Vec<_>>();
+    let mut mux = Muxer::new(&tracks).unwrap();
+    let mut ts = mux.tables();
+    for f in &frames {
+        ts.extend(mux.frame(f).unwrap());
+    }
+    std::fs::write(&transport, ts).unwrap();
+    let script = dir.path().join("owned-eof.py");
+    // Split small packet batches so the public route can establish an existing
+    // viewer, then finish in the same poll as the last native samples.
+    std::fs::write(&script,format!("#!/usr/bin/python3\nimport os,time\ndata=open({:?},'rb').read()\nfor i in range(0,len(data),188*8):\n os.write(1,data[i:i+188*8]);time.sleep(0.05)\n",transport.to_str().unwrap())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let app = App::new(
+        dir.path().join("config.json"),
+        dir.path().join("media"),
+        Options {
+            ffmpeg: script.to_str().unwrap().into(),
+            admin_password: "owned-admin".into(),
+            peer_key: "owned-native-peer".into(),
+            uplink_interface: "process".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    use sha2::{Digest, Sha256};
+    app.config.put("streams","owned",json!({"static":false,"inputs":[{"url":"testsrc://"}],"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"owned-viewer"))})).unwrap();
+    let response = router(app.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/owned/m4s?token=owned-viewer")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let worker = app
+        .media
+        .ensure("owned", &app.config.effective("owned").unwrap())
+        .await
+        .unwrap();
+    let pid = worker.pid();
+    // Delay this authorized consumer until the packager actually exits. Its
+    // bounded queue is small enough to retain every sample without eviction.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("owned packager EOF");
+    if abort {
+        app.media.stop("owned").await;
+    }
+    if wait_deadline {
+        tokio::time::timeout(Duration::from_secs(3), worker.closed())
+            .await
+            .expect("clean drain must have a deadline");
+    }
+    let result = tokio::time::timeout(Duration::from_secs(5), response.into_body().collect()).await;
+    app.media.stop_all().await;
+    let bytes = result
+        .expect("bounded public native EOF")
+        .unwrap()
+        .to_bytes();
+    let mut decoder = m4s::Decoder::default();
+    let events = decoder.push(&bytes).unwrap();
+    let count = events
+        .iter()
+        .filter(|e| matches!(e, m4s::Event::Frame { .. }))
+        .count();
+    assert_eq!(
+        count,
+        if abort || wait_deadline {
+            0
+        } else {
+            frames.len()
+        },
+        "authorized public EOF drain and cancellation fence"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn authorized_public_m4s_drains_final_samples_on_clean_worker_eof() {
+    public_eof(false, false).await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_stop_fences_a_public_consumer_during_clean_eof_grace() {
+    public_eof(true, false).await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn a_public_consumer_cannot_hold_clean_eof_grace_open_forever() {
+    public_eof(false, true).await;
 }
