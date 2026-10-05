@@ -1,4 +1,4 @@
-//! Independent H.264/HEVC/AAC RTP packetization shared by all RTSP viewers.
+//! Independent H.264/HEVC and AAC/MPEG audio RTP packetization.
 use crate::{m4f::Frame, m4s::Track, media_queue::Channel};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
@@ -24,15 +24,16 @@ impl Description {
         let mut text="v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=FlussoniX live\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\na=control:*\r\na=range:npt=0-\r\n".to_string();
         for t in &self.tracks {
             text.push_str(&format!(
-                "m={} 0 RTP/AVP {}\r\na=rtpmap:{} {}\r\na=fmtp:{} {}\r\na=control:trackID={}\r\n",
+                "m={} 0 RTP/AVP {}\r\na=rtpmap:{} {}\r\n",
                 if t.video { "video" } else { "audio" },
                 t.payload,
                 t.payload,
-                t.encoding,
-                t.payload,
-                t.fmtp,
-                t.id
+                t.encoding
             ));
+            if !t.fmtp.is_empty() {
+                text.push_str(&format!("a=fmtp:{} {}\r\n", t.payload, t.fmtp));
+            }
+            text.push_str(&format!("a=control:trackID={}\r\n", t.id));
         }
         text
     }
@@ -41,6 +42,8 @@ struct PacketTrack {
     description: MediaTrack,
     length: usize,
     hevc: bool,
+    mpeg_audio: Option<crate::codec::Codec>,
+    audio_end: Option<i128>,
     sequence: u16,
 }
 struct State {
@@ -245,7 +248,12 @@ impl Hub {
         };
         let video = s.tracks[index].description.video;
         // Validate the complete access unit before publishing any packet.
-        let payloads = match payloads(&s.tracks[index], &f.body) {
+        let prepared = if let Some(codec) = s.tracks[index].mpeg_audio {
+            mpeg_payloads(codec, &f.body).map(|(packets, duration)| (packets, Some(duration)))
+        } else {
+            payloads(&s.tracks[index], &f.body).map(|packets| (packets, None))
+        };
+        let (payloads, mpeg_duration) = match prepared {
             Ok(p) => p,
             Err(e) => {
                 s.error = Some(e);
@@ -276,16 +284,25 @@ impl Hub {
             }
         }
         let track = &mut s.tracks[index];
-        let stamp = ((f.dts as i128 + f.pts_offset as i128) * track.description.clock as i128
-            / 90000)
-            .rem_euclid(1i128 << 32) as u32;
+        let pts = f.dts as i128 + f.pts_offset as i128;
+        let talkspurt =
+            mpeg_duration.is_some() && track.audio_end.is_none_or(|end| (pts - end).abs() > 1);
+        if let Some(duration) = mpeg_duration {
+            track.audio_end = Some(pts + i128::from(duration));
+        }
+        let stamp = (pts * track.description.clock as i128 / 90000).rem_euclid(1i128 << 32) as u32;
         let count = payloads.len();
         let mut packets = Vec::with_capacity(count);
         for (i, payload) in payloads.into_iter().enumerate() {
             let mut b = Vec::with_capacity(16 + payload.len());
             b.extend(f.track_id.to_be_bytes());
             b.push(0x80);
-            b.push(track.description.payload | if i + 1 == count { 128 } else { 0 });
+            let marker = if mpeg_duration.is_some() {
+                i == 0 && talkspurt
+            } else {
+                i + 1 == count
+            };
+            b.push(track.description.payload | if marker { 128 } else { 0 });
             b.extend(track.sequence.to_be_bytes());
             b.extend(stamp.to_be_bytes());
             b.extend(track.description.ssrc.to_be_bytes());
@@ -335,7 +352,9 @@ fn describe(s: &State) -> Result<Description, String> {
 fn parse_tracks(tracks: &[Track]) -> Result<Vec<PacketTrack>, String> {
     let tracks: Vec<_> = tracks.iter().filter(|t| t.codec != "subtitle").collect();
     if tracks.is_empty() || tracks.len() > 2 {
-        return Err("RTSP requires one video (H.264/HEVC) and/or one AAC track".into());
+        return Err(
+            "RTSP requires one video (H.264/HEVC) and/or one audio (AAC/MPEG) track".into(),
+        );
     }
     let mut out: Vec<PacketTrack> = vec![];
     for t in tracks {
@@ -350,6 +369,25 @@ fn parse_tracks(tracks: &[Track]) -> Result<Vec<PacketTrack>, String> {
         let ssrc = u32::from_be_bytes(random[0..4].try_into().unwrap());
         let sequence = u16::from_be_bytes(random[4..6].try_into().unwrap());
         let (length, description) = match t.codec.as_str() {
+            "m2a" | "mp3" => {
+                if t.config.len() > 65536 {
+                    return Err("RTSP MPEG audio configuration exceeds 64 KiB".into());
+                }
+                // MPEG audio headers carry their own rate/layer/channel data.
+                // Native opaque configuration is not converted into AAC ASC.
+                (
+                    0,
+                    MediaTrack {
+                        id: t.id,
+                        payload: 14,
+                        clock: 90000,
+                        ssrc,
+                        video: false,
+                        encoding: "MPA/90000".into(),
+                        fmtp: String::new(),
+                    },
+                )
+            }
             "hevc" => {
                 if t.config.len() > 65536 {
                     return Err("RTSP HEVC configuration exceeds 64 KiB".into());
@@ -442,10 +480,31 @@ fn parse_tracks(tracks: &[Track]) -> Result<Vec<PacketTrack>, String> {
             description,
             length,
             hevc: t.codec == "hevc",
+            mpeg_audio: match t.codec.as_str() {
+                "m2a" => Some(crate::codec::Codec::M2a),
+                "mp3" => Some(crate::codec::Codec::Mp3),
+                _ => None,
+            },
+            audio_end: None,
             sequence,
         });
     }
     Ok(out)
+}
+fn mpeg_payloads(codec: crate::codec::Codec, body: &[u8]) -> Result<(Vec<Vec<u8>>, u32), String> {
+    let header = crate::mpeg_audio::inspect(codec, body)?;
+    // RFC 2250's profile covers MPEG-1/2; MPEG-2.5 is a separate extension.
+    if (body[1] >> 3) & 3 == 0 {
+        return Err("RTSP MPEG-2.5 audio is not supported".into());
+    }
+    let mut packets = Vec::new();
+    for (i, chunk) in body.chunks(MTU - 16).enumerate() {
+        let mut payload = vec![0, 0];
+        payload.extend(((i * (MTU - 16)) as u16).to_be_bytes());
+        payload.extend_from_slice(chunk);
+        packets.push(payload);
+    }
+    Ok((packets, header.duration_90k()))
 }
 pub(crate) fn avcc(c: &[u8]) -> Result<(usize, Vec<&[u8]>), String> {
     let error = || "invalid AVCDecoderConfigurationRecord".to_string();

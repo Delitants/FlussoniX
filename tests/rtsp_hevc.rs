@@ -39,7 +39,7 @@ struct Lab {
     expected: HashSet<String>,
     audio: bool,
 }
-async fn fixture(transport: &str, audio: bool) -> Lab {
+async fn fixture_profile(transport: &str, video: bool, audio: &str) -> Lab {
     let dir = tempfile::tempdir().unwrap();
     let cert = tls_fixture::Certificates::new();
     let mut tracks = vec![Track {
@@ -88,7 +88,14 @@ async fn fixture(transport: &str, audio: bool) -> Lab {
     assert!(decoded.status.success() && decoded.stderr.is_empty());
     let expected = hashes(&decoded.stdout, 0);
     assert_eq!(expected.len(), 12);
-    if audio {
+    let expected = if video {
+        expected
+    } else {
+        tracks.clear();
+        frames.clear();
+        HashSet::new()
+    };
+    if audio == "aac" {
         // Independently encode a continuous AAC source, then retain its ADTS payloads.
         let encoded = tokio::process::Command::new("ffmpeg")
             .args([
@@ -132,6 +139,79 @@ async fn fixture(transport: &str, audio: bool) -> Lab {
             n += 1;
         }
         tracks.reverse(); // Audio metadata precedes video; IDs are nonsequential.
+    } else if audio != "none" {
+        let (codec, encoder, rate, kbps) = match audio {
+            "m2a" => ("m2a", "mp2", 32000u64, 384u64),
+            "mp3" => ("mp3", "libmp3lame", 22050, 64),
+            "mp3-mpeg1" => ("mp3", "libmp3lame", 32000, 320),
+            _ => panic!("unknown owned audio profile"),
+        };
+        let mut cmd = tokio::process::Command::new("ffmpeg");
+        cmd.args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=880:sample_rate=48000",
+            "-t",
+            "20",
+            "-c:a",
+            encoder,
+            "-ar",
+            &rate.to_string(),
+            "-ac",
+            "2",
+            "-b:a",
+            &format!("{kbps}k"),
+            "-f",
+            if codec == "m2a" { "mp2" } else { "mp3" },
+        ]);
+        if codec == "mp3" {
+            cmd.args([
+                "-write_xing",
+                "0",
+                "-id3v2_version",
+                "0",
+                "-write_id3v1",
+                "0",
+            ]);
+        }
+        cmd.arg("pipe:1");
+        let encoded = cmd.output().await.unwrap();
+        assert!(
+            encoded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&encoded.stderr)
+        );
+        tracks.push(Track {
+            id: 88,
+            codec: codec.into(),
+            config: vec![],
+        });
+        let mut at = 0;
+        let mut n = 0u64;
+        while at < encoded.stdout.len() {
+            let h = &encoded.stdout[at..];
+            assert_eq!(h[0], 255);
+            let version = (h[1] >> 3) & 3;
+            let samples = if codec == "mp3" && version != 3 {
+                576
+            } else {
+                1152
+            };
+            let size = (samples / 8 * kbps * 1000 / rate + u64::from((h[2] >> 1) & 1)) as usize;
+            frames.push(Frame {
+                track_id: 88,
+                dts: 90000 + n * samples * 90000 / rate,
+                pts_offset: 0,
+                key: true,
+                body: h[..size].to_vec(),
+            });
+            at += size;
+            n += 1;
+        }
+        tracks.reverse();
     }
     frames.sort_by_key(|f| f.dts);
     let cancel = CancellationToken::new();
@@ -219,7 +299,7 @@ async fn fixture(transport: &str, audio: bool) -> Lab {
         tasks: vec![source_task, task],
         hits,
         expected,
-        audio,
+        audio: audio != "none",
     }
 }
 fn hashes(data: &[u8], id: usize) -> HashSet<String> {
@@ -296,7 +376,10 @@ impl Lab {
     }
 }
 async fn playback(transport: &str, audio: bool) {
-    let lab = fixture(transport, audio).await;
+    playback_profile(transport, true, if audio { "aac" } else { "none" }).await;
+}
+async fn playback_profile(transport: &str, video: bool, audio: &str) {
+    let lab = fixture_profile(transport, video, audio).await;
     let mut socket = connect(&lab).await;
     assert_eq!(request(&mut socket, "DESCRIBE", &lab.url, "").await.0, 403);
     assert_eq!(lab.app.media.count().await, 0);
@@ -304,7 +387,16 @@ async fn playback(transport: &str, audio: bool) {
     let protected = format!("{}?token=owned-viewer", lab.url);
     let (status, _, sdp) = request(&mut socket, "DESCRIBE", &protected, "").await;
     assert_eq!(status, 200);
-    assert!(String::from_utf8(sdp).unwrap().contains("H265/90000"));
+    let sdp = String::from_utf8(sdp).unwrap();
+    assert_eq!(sdp.contains("H265/90000"), video);
+    if audio.starts_with("mp3") || audio == "m2a" {
+        assert!(sdp.contains("MPA/90000"));
+        assert!(!sdp.contains("a=fmtp:14"));
+    }
+    // Exercise a late join, including the rolling audio-only bootstrap.
+    if audio.starts_with("mp3") || audio == "m2a" {
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+    }
     drop(socket);
     let bridge = if transport == "tls" {
         Some(
@@ -327,10 +419,11 @@ async fn playback(transport: &str, audio: bool) {
         decode_url,
         "-t",
         "3",
-        "-map",
-        "0:v:0",
     ]);
-    if audio {
+    if video {
+        cmd.args(["-map", "0:v:0"]);
+    }
+    if audio != "none" {
         cmd.args(["-map", "0:a:0"]);
     }
     cmd.args(["-threads", "1", "-f", "framemd5", "-"])
@@ -345,14 +438,44 @@ async fn playback(transport: &str, audio: bool) {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.lines().filter(|l| l.starts_with("0,")).count() >= 50);
-    let actual = hashes(&out.stdout, 0);
-    assert_eq!(
-        actual, lab.expected,
-        "all twelve independently decoded source pictures must appear"
-    );
+    if video {
+        assert!(text.lines().filter(|l| l.starts_with("0,")).count() >= 50);
+        let actual = hashes(&out.stdout, 0);
+        assert_eq!(
+            actual, lab.expected,
+            "all twelve independently decoded source pictures must appear"
+        );
+    }
     if lab.audio {
-        assert!(text.lines().filter(|l| l.starts_with("1,")).count() >= 100);
+        let prefix = if video { "1," } else { "0," };
+        let minimum = if audio == "aac" || audio == "mp3" {
+            100
+        } else {
+            60
+        };
+        assert!(
+            text.lines().filter(|l| l.starts_with(prefix)).count() >= minimum,
+            "decoded audio frame count"
+        );
+        if audio != "aac" {
+            let rate = if audio == "mp3" { "22050" } else { "32000" };
+            assert!(
+                text.lines().any(|l| l.starts_with("#sample_rate")
+                    && l.rsplit(':')
+                        .next()
+                        .is_some_and(|value| value.trim() == rate)),
+                "decoded sample rate"
+            );
+            assert!(
+                text.lines()
+                    .any(|l| l.starts_with("#channel_layout") && l.trim_end().ends_with("stereo")),
+                "decoded channel layout"
+            );
+            assert!(
+                hashes(&out.stdout, usize::from(video)).len() >= 10,
+                "nonconstant decoded MPEG audio"
+            );
+        }
     }
     assert_eq!(lab.app.media.count().await, 1);
     assert_eq!(lab.hits.load(Ordering::SeqCst), 1);
@@ -378,80 +501,119 @@ async fn hevc_aac_verified_tls_playback_decodes_owned_pictures() {
 async fn hevc_video_only_tcp_playback_decodes_owned_pictures() {
     playback("tcp", false).await
 }
+async fn revoked_profile(transport: &str, audio: &str, track: u32) {
+    let lab = fixture_profile(transport, true, audio).await;
+    let mut socket = connect(&lab).await;
+    assert_eq!(
+        request(
+            &mut socket,
+            "DESCRIBE",
+            &format!("{}?token=owned-viewer", lab.url),
+            ""
+        )
+        .await
+        .0,
+        200
+    );
+    let (status, h, _) = request(
+        &mut socket,
+        "SETUP",
+        &format!("{}/trackID={track}", lab.url),
+        "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n",
+    )
+    .await;
+    assert_eq!(status, 200);
+    let session = h
+        .lines()
+        .find_map(|l| l.strip_prefix("Session: "))
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    assert_eq!(
+        request(
+            &mut socket,
+            "PLAY",
+            &lab.url,
+            &format!("Session: {session}\r\n")
+        )
+        .await
+        .0,
+        200
+    );
+    let mut header = [0; 4];
+    tokio::time::timeout(Duration::from_secs(3), socket.read_exact(&mut header))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(header[0], b'$');
+    let id = lab.app.playback_auth.snapshots()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(lab.app.playback_auth.revoke(&id));
+    let mut rest = vec![];
+    let closed = tokio::time::timeout(Duration::from_secs(2), socket.read_to_end(&mut rest))
+        .await
+        .expect("revocation must close HEVC media");
+    // Revocation immediately drops the session; TLS may report an abrupt
+    // authenticated peer EOF rather than an orderly close_notify.
+    assert!(
+        closed.is_ok()
+            || (transport == "tls"
+                && closed
+                    .as_ref()
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof)),
+        "{closed:?}"
+    );
+    let worker = lab
+        .app
+        .media
+        .ensure("owned", &lab.app.config.effective("owned").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(worker.viewers.load(Ordering::Relaxed), 0);
+    lab.stop().await;
+}
 #[tokio::test]
 async fn hevc_plain_and_tls_sessions_close_on_revocation() {
     for transport in ["tcp", "tls"] {
-        let lab = fixture(transport, true).await;
-        let mut socket = connect(&lab).await;
-        assert_eq!(
-            request(
-                &mut socket,
-                "DESCRIBE",
-                &format!("{}?token=owned-viewer", lab.url),
-                ""
-            )
-            .await
-            .0,
-            200
-        );
-        let (status, h, _) = request(
-            &mut socket,
-            "SETUP",
-            &format!("{}/trackID=205", lab.url),
-            "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n",
-        )
-        .await;
-        assert_eq!(status, 200);
-        let session = h
-            .lines()
-            .find_map(|l| l.strip_prefix("Session: "))
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap();
-        assert_eq!(
-            request(
-                &mut socket,
-                "PLAY",
-                &lab.url,
-                &format!("Session: {session}\r\n")
-            )
-            .await
-            .0,
-            200
-        );
-        let mut header = [0; 4];
-        tokio::time::timeout(Duration::from_secs(3), socket.read_exact(&mut header))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(header[0], b'$');
-        let id = lab.app.playback_auth.snapshots()[0]["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert!(lab.app.playback_auth.revoke(&id));
-        let mut rest = vec![];
-        let closed = tokio::time::timeout(Duration::from_secs(2), socket.read_to_end(&mut rest))
-            .await
-            .expect("revocation must close HEVC media");
-        // Revocation immediately drops the session; TLS may report an abrupt
-        // authenticated peer EOF rather than an orderly close_notify.
-        assert!(
-            closed.is_ok()
-                || (transport == "tls"
-                    && closed
-                        .as_ref()
-                        .is_err_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof)),
-            "{closed:?}"
-        );
-        let worker = lab
-            .app
-            .media
-            .ensure("owned", &lab.app.config.effective("owned").unwrap())
-            .await
-            .unwrap();
-        assert_eq!(worker.viewers.load(Ordering::Relaxed), 0);
-        lab.stop().await;
+        revoked_profile(transport, "aac", 205).await;
     }
+}
+#[tokio::test]
+async fn mpeg_plain_and_tls_sessions_close_on_revocation() {
+    for codec in ["m2a", "mp3"] {
+        for transport in ["tcp", "tls"] {
+            revoked_profile(transport, codec, 88).await;
+        }
+    }
+}
+#[tokio::test]
+async fn mpeg_layer_two_and_three_tcp_playback_decode_original_audio() {
+    for codec in ["m2a", "mp3"] {
+        playback_profile("tcp", true, codec).await
+    }
+}
+#[tokio::test]
+async fn mpeg_layer_two_and_three_udp_playback_decode_original_audio() {
+    for codec in ["m2a", "mp3"] {
+        playback_profile("udp", true, codec).await
+    }
+}
+#[tokio::test]
+async fn mpeg_layer_two_and_three_verified_tls_playback_decode_original_audio() {
+    for codec in ["m2a", "mp3"] {
+        playback_profile("tls", true, codec).await
+    }
+}
+#[tokio::test]
+async fn mpeg_layer_two_and_three_audio_only_playback_decode_original_audio() {
+    for codec in ["m2a", "mp3"] {
+        playback_profile("tcp", false, codec).await
+    }
+}
+#[tokio::test]
+async fn mpeg_one_layer_three_large_frames_decode_after_rtp_fragmentation() {
+    playback_profile("tcp", true, "mp3-mpeg1").await
 }
