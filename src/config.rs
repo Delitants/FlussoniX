@@ -174,7 +174,15 @@ pub fn effective(root: &Value, name: &str) -> Option<Value> {
             .iter()
             .find(|t| t["name"] == template)
         {
-            result = merge(&result, t)
+            result = merge(&result, t);
+            // Legacy templates implicitly encode H.264. Resolve that default
+            // before audio-only stream overrides change the object's shape.
+            if result["transcoder"].as_object().is_some_and(|profile| {
+                !profile.contains_key("encoder")
+                    && (profile.contains_key("vb") || profile.is_empty())
+            }) {
+                result["transcoder"]["encoder"] = json!("libx264");
+            }
         }
     }
     result = merge(&result, disk);

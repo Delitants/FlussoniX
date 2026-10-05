@@ -11,3 +11,5 @@ UI: independent inheritance/reset per dropdown; preserve the other codec and bit
 Sources: [Flussonic audio options](https://flussonic.com/doc/fms/transcoder/internals/).
 
 Qualification: six CPU video/audio combinations and M4S/M4F input with independently encoded audio or video. Native frame and packed output, TS-HLS and fMP4 HLS are independently decoded; original VCL payloads remain byte-identical for audio-only conversion. MPEG Layer II in MP4 has a generic MPEG-audio descriptor which FFprobe labels MP3; demuxed sample headers prove Layer II and normal FFmpeg decode succeeds. This does not qualify browser Layer II playback. Native/audio copy fMP4 filters depend on audio copy, while original native relay depends on full AV copy.
+
+Legacy template video defaults are resolved before stream overrides, preserving H.264 for old empty/vb-only templates when a stream adds audio settings. Later explicit template video edits still apply. Editing standalone legacy `{}` materializes its implicit H.264 before adding an audio option. Bitrate fields show merged values; pinning an unchanged inherited codec retains its active rate.

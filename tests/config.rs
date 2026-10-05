@@ -687,3 +687,36 @@ fn invalid_audio_profiles_and_merged_template_rates_are_atomic() {
     s.put("streams", "owned", json!({"transcoder":{"ab":null}}))
         .expect_err("reset must validate inherited bitrate");
 }
+
+#[test]
+fn legacy_template_video_default_survives_audio_only_overrides_and_future_edits() {
+    let d = tempfile::tempdir().unwrap();
+    let s = ConfigStore::open(d.path().join("c.json")).unwrap();
+    for t in [json!({}), json!({"vb":1800})] {
+        s.put("templates", "legacy", json!({"$reset":true,"transcoder":t}))
+            .unwrap();
+        s.put(
+            "streams",
+            "owned",
+            json!({"$reset":true,"template":"legacy","transcoder":{"acodec":"mp3","ab":128}}),
+        )
+        .unwrap();
+        let effective = s.effective("owned").unwrap();
+        assert_eq!(effective["transcoder"]["encoder"], "libx264");
+        assert!(
+            effective["config_on_disk"]["transcoder"]
+                .get("encoder")
+                .is_none()
+        );
+        s.put(
+            "templates",
+            "legacy",
+            json!({"transcoder":{"encoder":"libx265"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            s.effective("owned").unwrap()["transcoder"]["encoder"],
+            "libx265"
+        );
+    }
+}
