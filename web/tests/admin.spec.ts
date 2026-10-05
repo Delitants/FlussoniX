@@ -21,6 +21,11 @@ test('Config shows readable SRT playback state without exposing startup secrets'
  await page.route('**/flussonix/api/v1/node',async route=>{const response=await route.fetch();const data=await response.json();data.srt_playback={enabled:false,listen:null,encrypted:false,passphrase:'owned-never-rendered-secret'};await route.fulfill({response,json:data});});
  await expect(playback).toContainText('Not enabled');await expect(page.getByText('owned-never-rendered-secret',{exact:false})).toHaveCount(0);
 });
+test('SRT playback status remains visible in mobile Config',async({page})=>{
+ await page.setViewportSize({width:393,height:852});await page.getByRole('button',{name:'Config',exact:true}).click();
+ const playback=page.getByRole('region',{name:'SRT playback',exact:true});await expect(playback).toBeVisible();await expect(playback).toContainText('startup options');
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth)).toBe(false);
+});
 test('SRT playback URL uses an IPv6 endpoint and token placeholder without saved secrets',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
  expect((await request.put('/streamer/api/v3/streams/srt-ui-playback',{headers,data:{inputs:[{url:'testsrc://'}],static:false}})).ok()).toBeTruthy();
