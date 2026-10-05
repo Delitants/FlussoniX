@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet, path::Path, process::Stdio, sync::atomic::Ordering, time::Duration,
 };
+use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
@@ -25,37 +26,26 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 async fn capture(endpoint: &str, listener: bool, path: &Path) -> Child {
     let log = std::fs::File::create(path.with_extension("log")).unwrap();
     let mut cmd = Command::new("ffmpeg");
-    cmd.args([
-        "-v",
-        "error",
-        "-nostdin",
-        "-y",
-        "-threads",
-        "1",
-        "-passphrase",
-        SECRET,
-    ]);
+    cmd.args(["-v", "error", "-y", "-threads", "1", "-passphrase", SECRET]);
     if !listener {
         cmd.args(["-srt_streamid", "#!::r=owned,m=request,u=owned-viewer"]);
     }
     cmd.args([
         "-f",
-        "mpegts",
+        "data",
+        "-raw_packet_size",
+        "1316",
         "-i",
         endpoint,
         "-map",
         "0",
         "-c",
         "copy",
-        "-max_interleave_delta",
-        "100000",
-        "-t",
-        "9",
         "-f",
-        "mpegts",
+        "data",
     ])
     .arg(path)
-    .stdin(Stdio::null())
+    .stdin(Stdio::piped())
     .stdout(Stdio::null())
     .stderr(log)
     .kill_on_drop(true)
@@ -128,10 +118,16 @@ fn verify_original_tracks(bytes: &[u8], keep: bool) {
                 "disabled original tracks escaped filtering"
             );
             // Detect orphan payloads even if their descriptor was removed.
-            assert!(
-                !bytes.windows(body.len()).any(|b| b == body),
-                "orphan subtitle payload"
-            );
+            let pids: BTreeSet<_> = bytes.chunks_exact(188).map(original::pid).collect();
+            for pid in pids {
+                let payloads = original::pes_bodies(bytes, pid);
+                assert!(
+                    !payloads
+                        .iter()
+                        .any(|p| p.windows(body.len()).any(|b| b == body)),
+                    "orphan subtitle payload on PID {pid}"
+                );
+            }
         }
     }
 }
@@ -231,7 +227,18 @@ async fn run(push: bool, digital: bool, input: &[u8], expected: &BTreeSet<Vec<u8
             publication.stdin.take().unwrap(),
             input.to_vec(),
         )));
-        let outcome = tokio::time::timeout(Duration::from_secs(20), receiver.wait()).await;
+        // Data capture has no media timestamps. Stop through FFmpeg's normal
+        // interactive quit after the paced fixture has supplied all cue events;
+        // flush the untouched transport and require successful process exit.
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        receiver
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"q\n")
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), receiver.wait()).await;
         let words = if hls == "convert" {
             Some(converted_words(&app, if digital { "s1.m3u8" } else { "cc1.m3u8" }).await)
         } else {
@@ -337,4 +344,35 @@ async fn encrypted_listener_carries_608_708_dvb_teletext_independently_of_hls_po
 #[tokio::test]
 async fn encrypted_push_carries_608_708_dvb_teletext_independently_of_hls_policy() {
     regional(true).await;
+}
+
+#[test]
+fn filtered_transport_oracle_rejects_fragmented_unannounced_pes() {
+    let av = captions::transport();
+    let injected = original::inject(&av);
+    let mut orphaned = av;
+    for id in [0x120, 0x121] {
+        let first = injected
+            .chunks_exact(188)
+            .find(|p| original::pid(p) == id)
+            .unwrap();
+        let pes = original::payload(first).unwrap();
+        // The PES body is deliberately split by transport headers; neither its
+        // descriptor nor a contiguous encoded body is present in this fixture.
+        for (index, chunk) in pes.chunks(7).enumerate() {
+            let mut packet = [0xff; 188];
+            packet[0] = 0x47;
+            packet[1] = (id >> 8) as u8 | if index == 0 { 0x40 } else { 0 };
+            packet[2] = id as u8;
+            packet[3] = 0x30 | (index as u8 & 15);
+            packet[4] = (183 - chunk.len()) as u8;
+            packet[5] = 0;
+            packet[188 - chunk.len()..].copy_from_slice(chunk);
+            orphaned.extend(packet);
+        }
+    }
+    assert!(
+        std::panic::catch_unwind(|| verify_original_tracks(&orphaned, false)).is_err(),
+        "filter oracle accepted orphaned PES split across transport packets"
+    );
 }

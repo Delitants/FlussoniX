@@ -21,11 +21,16 @@ remove embedded video captions. **HLS subtitles** controls HLS delivery only.
 This stage adds transport evidence for the existing controls, without new API
 fields or UI settings.
 
-The receiver must finish successfully. Independent video extraction compares
+The independent receiver records raw SRT payload bytes through FFmpeg's data
+input/output path, without MPEG-TS demuxing or rebuilding program tables. It
+quits normally after a twelve-second live sample and must finish successfully.
+Independent video extraction from that raw capture compares
 every distinct authored GA94 caption command with the source, and verifies the
 source contains the stated 608 or 708 packet types. Separate-track assertions
 check language/page descriptors, repeated exact encoded PES bodies, and absence
-of orphaned payloads in the filtered cases. Independent FFmpeg decodes both
+of orphaned payloads in the filtered cases, reassembling PES across transport
+packets even for PIDs absent from the PMT. A deliberately fragmented, unannounced
+PES fixture must fail this filtering assertion. Independent FFmpeg decodes both
 H.264 video and AAC audio from every received file. Playback uses a real viewer
 token and attaches before feeding early live caption events; all ports, streams,
 secrets and media belong to the tests. Shutdown joins the listener and stops

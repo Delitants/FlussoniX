@@ -34,8 +34,13 @@ async fn run(cpu: bool) {
         bytes
     });
     let input = original::inject(&fixture::digital_transport());
-    p.stdin.as_mut().unwrap().write_all(&input).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(12), async {
+    // A full sixteen-second burst can rotate the live window past the first
+    // digital cue before both independently scheduled HLS variants are read.
+    let feed = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(fixture::paced(
+        p.stdin.take().unwrap(),
+        input,
+    )));
+    tokio::time::timeout(Duration::from_secs(16), async {
         loop {
             // Variants publish independently. Both must reach the quiet tail
             // before either playlist can prove an empty subtitle segment.
@@ -148,6 +153,8 @@ async fn run(cpu: bool) {
     }
     assert_eq!(p.worker.stats()["hls_captions"]["status"], "running");
     assert!(p.worker.stats()["hls_captions"]["cues"].as_u64().unwrap() > 0);
+    feed.abort();
+    let _ = feed.await;
     e.stop_all().await;
 }
 #[tokio::test]
