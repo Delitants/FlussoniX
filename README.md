@@ -14,13 +14,17 @@ This build implements persisted Streams/Templates configuration, authenticated m
 | Input | HLS/HLSS, TSHTTP/TSHTTPS, M4S AVC/HEVC with AAC/Layer II/III frame modes, AVC/AAC packed-GOP modes, M4F qualified single-chunk sample tables; HTTP MPEG-TS publication to publish:// streams; RTSP pull, verified RTSPS TCP pull and SRT receive adapters |
 | Output | HLS with TS or fMP4 segments, HTTP MPEG-TS, Original M4S frame/GOP relay, generated frame output; M4F signals with original or generated live segments; optional RTSP 1.0 TCP-interleaved or opt-in unicast UDP H.264/HEVC with optional AAC-LC or MPEG-1/2 Layer II/III playback; optional RTSPS TLS TCP playback |
 | Recovery | Startup/media watchdog, capped retries through ordered inputs, background local/CDN recovery, new HLS sequences/segment/init identities after restart |
-| Transcoding | One supervised FFmpeg worker per stream; CPU H.264/AAC; `h264_nvenc` configuration requires NVIDIA hardware and runtime |
+| Transcoding | One supervised FFmpeg worker per stream; CPU H.264/HEVC with independent AAC/Layer II/MP3/copy audio; NVIDIA H.264/HEVC controls and bounded initialization checks, delivered GPU media unqualified |
 | Subtitles | Independent CEA-608/708, selected Level 1 Latin teletext and optional DVB bitmap OCR to selectable WebVTT in TS/fMP4 HLS; friendly channel/service/page and recognition-language controls; original pass-through or filtering; [digital profile](docs/cea708-qualification.md), [teletext profile](docs/teletext-qualification.md), [DVB OCR profile](docs/dvb-qualification.md) |
 | Native cluster | Separate public/private endpoints, source discovery, explicit equivalent-origin failover, LAN pull, uplink/CPU/RAM selection, readiness, drain/stale exclusion, expiring capacity reservations; configurable private CA trust for HTTPS management and HLS/TS/M4F/M4S media |
 
 Required later work includes complete API/schema parity; Flussonic cluster discovery and credential compatibility; additional M4 codec/metadata modes; full publisher policy/session parity; RTSP publication/push and Basic/Digest viewer authentication; RTSPS publication/push and SRTP-protected UDP; direct RTP/SRTP inbound and outbound; SRT output/push; cross-origin authenticated HLS input, mutual TLS and automatic certificate rotation, secure push and trusted-proxy integration; full transcoder profiles, GPU qualification, DVR, distributed session ownership and complete failure/scale qualification. Unsupported saved options return errors. See [qualification](docs/qualification.md) for evidence and limits.
 
 DVB text recognition optionally requires independently installed Tesseract and selected language models, such as `tesseract-ocr-eng` and `tesseract-ocr-deu`. Streams/Templates expose a DVB composition page and recognition language without JSON editing. Missing or low-quality recognition reports degradation while AV continues. `FLUSSONIX_TESSERACT` selects a trusted executable at daemon startup.
+
+## NVIDIA codec readiness
+
+Streams and Templates expose NVIDIA H.264 and HEVC alongside the independent audio controls. Build capabilities shows each encoder's initialization result. Checks use the configured FFmpeg and default NVIDIA device, run once per daemon with a five-second bound per encoder, and require a daemon restart to refresh. An unavailable or timed-out GPU profile fails before replacing a live CPU worker; it never silently falls back to CPU. Configuration can be saved for deployment to a different GPU host. Initialization success does not qualify delivered GPU media, performance or device recovery. See [the profile and current limits](docs/gpu-codec-controls.md).
 
 ## Publication preview
 

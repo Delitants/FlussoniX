@@ -720,3 +720,38 @@ fn legacy_template_video_default_survives_audio_only_overrides_and_future_edits(
         );
     }
 }
+
+#[test]
+fn nvidia_hevc_profile_preserves_independent_audio_and_template_inheritance() {
+    let d = tempfile::tempdir().unwrap();
+    let s = ConfigStore::open(d.path().join("config.json")).unwrap();
+    s.put(
+        "templates",
+        "gpu",
+        json!({"transcoder":{"encoder":"hevc_nvenc","vb":1400,"acodec":"mp2a","ab":192}}),
+    )
+    .unwrap();
+    s.put(
+        "streams",
+        "owned",
+        json!({"template":"gpu","transcoder":{"acodec":"mp3","ab":128}}),
+    )
+    .unwrap();
+    assert_eq!(
+        s.effective("owned").unwrap()["transcoder"],
+        json!({"encoder":"hevc_nvenc","vb":1400,"acodec":"mp3","ab":128})
+    );
+    s.put(
+        "streams",
+        "owned",
+        json!({"transcoder":{"encoder":"libx265"}}),
+    )
+    .unwrap();
+    assert_eq!(s.effective("owned").unwrap()["transcoder"]["acodec"], "mp3");
+    s.put("streams", "owned", json!({"transcoder":{"encoder":null}}))
+        .unwrap();
+    assert_eq!(
+        s.effective("owned").unwrap()["transcoder"]["encoder"],
+        "hevc_nvenc"
+    );
+}

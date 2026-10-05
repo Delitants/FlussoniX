@@ -486,3 +486,62 @@ test('audio bitrate edits preserve standalone and inherited legacy video default
  await page.getByLabel('Audio bitrate (kb/s)',{exact:true}).fill('128');await expect(page.getByLabel('Transcoding',{exact:true})).toHaveValue('inherit');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('heading',{name,exact:true})).toBeVisible();
  const stream=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(stream.config_on_disk.transcoder).toEqual({ab:128});expect(stream.transcoder.encoder).toBe('libx264');
 });
+
+test('NVIDIA HEVC and independent audio persist with readable host readiness',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-gpu-codec-'+Date.now(), stream=name+'-stream';
+ await page.getByRole('button',{name:'Templates',exact:true}).click();
+ await page.getByRole('button',{name:'Add template',exact:true}).click();
+ await page.getByLabel('Template name',{exact:true}).fill(name);
+ await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');
+ await page.getByLabel('Activation',{exact:true}).selectOption('ondemand');
+ await page.getByLabel('Transcoding',{exact:true}).selectOption('hevc_nvenc');
+ await page.getByLabel('Video bitrate (kb/s)',{exact:true}).fill('1400');
+ await page.getByLabel('Audio encoding',{exact:true}).selectOption('mp3');
+ await page.getByLabel('Audio bitrate (kb/s)',{exact:true}).selectOption('128');
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ await expect(page.getByRole('cell',{name,exact:true})).toBeVisible();
+ const saved=await(await request.get('/streamer/api/v3/templates/'+name,{headers})).json();
+ expect(saved.transcoder).toEqual({encoder:'hevc_nvenc',vb:1400,acodec:'mp3',ab:128});
+ expect((await request.put('/streamer/api/v3/streams/'+stream,{headers,data:{template:name,static:false}})).ok()).toBeTruthy();
+ await page.getByRole('button',{name:'Streams',exact:true}).click();
+ await expect(page.getByRole('button',{name:stream,exact:true})).toBeVisible();
+ await expect(page.getByRole('row').filter({has:page.getByRole('button',{name:stream,exact:true})})).toContainText('NVIDIA HEVC / H.265');
+ await page.getByRole('button',{name:stream,exact:true}).click();
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+ await expect(page.getByLabel('Transcoding',{exact:true})).toHaveValue('inherit');
+ await page.getByLabel('Audio encoding',{exact:true}).selectOption('copy');
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ const effective=await(await request.get('/streamer/api/v3/streams/'+stream,{headers})).json();
+ expect(effective.transcoder.encoder).toBe('hevc_nvenc');expect(effective.transcoder.acodec).toBe('copy');
+ expect(effective.config_on_disk.transcoder.encoder).toBeUndefined();
+ await page.getByRole('button',{name:'← Streams',exact:true}).click();
+ await page.getByText('Build capabilities and compatibility',{exact:true}).click();
+ const caps=await(await request.get('/flussonix/api/v1/capabilities',{headers})).json();
+ const readiness:Record<string,string>={available:'Initialization passed',unavailable:'Unavailable on this host',probe_failed:'Readiness check failed',timed_out:'Readiness check timed out'};
+ for(const p of caps.transcoding.gpu_profiles){
+  await expect(page.getByText('NVIDIA '+p.codec+' — '+readiness[p.status],{exact:true})).toBeVisible();
+ }
+ await expect(page.getByText('Initialization checks do not qualify delivered GPU media.',{exact:true})).toBeVisible();
+ await expect(page.locator('textarea')).toHaveCount(0);
+});
+
+test('slow GPU readiness does not delay stream management',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-gpu-slow-'+Date.now();
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{static:false,inputs:[{url:'testsrc://'}]}})).ok()).toBeTruthy();
+ await page.getByRole('button',{name:'Sign out',exact:true}).click();
+ let release:()=>void=()=>{};const held=new Promise<void>(r=>release=r);
+ await page.route('**/flussonix/api/v1/capabilities',async route=>{await held;await route.continue()});
+ try{
+  await page.getByLabel('Username').fill(process.env.FLUSSONIX_ADMIN_USER||'admin');
+  await page.getByLabel('Password',{exact:true}).fill(process.env.FLUSSONIX_ADMIN_PASSWORD!);
+  await page.getByRole('button',{name:'Sign in',exact:true}).click();
+  await expect(page.getByRole('button',{name,exact:true})).toBeVisible({timeout:5000});
+  await page.getByRole('button',{name,exact:true}).click();
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+  await page.getByLabel('Title',{exact:true}).fill('Management while readiness is pending');
+  await page.getByRole('button',{name:'Save',exact:true}).click();
+  await expect(page.getByRole('heading',{name:'Management while readiness is pending',exact:true})).toBeVisible({timeout:5000});
+ }finally{release();await page.unrouteAll({behavior:'wait'});}
+});

@@ -24,6 +24,7 @@ pub struct Engine {
     tesseract: String,
     hls_epoch: crate::hls_generation::Epoch,
     workers: Mutex<HashMap<String, Arc<Worker>>>,
+    gpu: crate::gpu::Checks,
 }
 pub struct Publication {
     pub worker: Arc<Worker>,
@@ -154,7 +155,11 @@ impl Engine {
             tesseract: tesseract.into(),
             hls_epoch: crate::hls_generation::Epoch::new(),
             workers: Mutex::new(HashMap::new()),
+            gpu: crate::gpu::Checks::default(),
         }
+    }
+    pub async fn gpu_capabilities(&self) -> Value {
+        json!(self.gpu.report(&self.ffmpeg).await)
     }
     fn directory(&self, name: &str) -> PathBuf {
         self.root
@@ -211,9 +216,15 @@ impl Engine {
             && (cfg["inputs"]
                 .as_array()
                 .is_some_and(|a| a.iter().any(|i| i["url"] == "testsrc://"))
-                || cfg["transcoder"]["encoder"] == "h264_nvenc")
+                || matches!(
+                    cfg["transcoder"]["encoder"].as_str(),
+                    Some("h264_nvenc" | "hevc_nvenc")
+                ))
         {
             return Err("HLS caption conversion requires a real H.264/HEVC video source; GPU conversion is not qualified".into());
+        }
+        if let Some(encoder) = crate::transcoder::Profile::resolve(cfg, false)?.gpu_encoder() {
+            self.gpu.require(&self.ffmpeg, encoder).await?;
         }
         let mut workers = self.workers.lock().await;
         // Recheck after waiting for another stream startup/replacement. A stale

@@ -40,7 +40,12 @@ impl Profile {
             Some(Some("libx264")) => "libx264",
             Some(Some("libx265")) => "libx265",
             Some(Some("h264_nvenc")) => "h264_nvenc",
-            _ => return Err("supported encoders: copy, libx264, libx265, h264_nvenc".into()),
+            Some(Some("hevc_nvenc")) => "hevc_nvenc",
+            _ => {
+                return Err(
+                    "supported encoders: copy, libx264, libx265, h264_nvenc, hevc_nvenc".into(),
+                );
+            }
         };
         let audio = match t.get("acodec").map(|v| v.as_str()) {
             None => {
@@ -101,6 +106,12 @@ impl Profile {
     pub(crate) fn audio_copy(&self) -> bool {
         self.audio == "copy"
     }
+    pub(crate) fn gpu_encoder(&self) -> Option<&'static str> {
+        match self.video {
+            "h264_nvenc" | "hevc_nvenc" => Some(self.video),
+            _ => None,
+        }
+    }
     pub(crate) fn apply(&self, cmd: &mut Command) {
         cmd.args(["-c:v", self.video]);
         if self.video != "copy" {
@@ -117,6 +128,9 @@ impl Profile {
             }
             if self.video == "libx265" {
                 cmd.args(["-x265-params", "pools=2:frame-threads=2:log-level=error"]);
+            }
+            if self.gpu_encoder().is_some() {
+                cmd.args(["-bf", "0"]);
             }
         }
         cmd.args(["-c:a", self.audio]);
