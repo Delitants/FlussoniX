@@ -597,3 +597,93 @@ fn https_input_ca_settings_inherit_persist_and_reject_plain_or_invalid_trust() {
         assert_eq!(store.snapshot(), saved);
     }
 }
+
+#[test]
+fn cpu_codec_profiles_save_and_inherit_independently() {
+    let d = tempfile::tempdir().unwrap();
+    let s = ConfigStore::open(d.path().join("c.json")).unwrap();
+    s.put(
+        "templates",
+        "codec",
+        json!({"transcoder":{"encoder":"libx265","vb":900,"acodec":"mp2a","ab":192}}),
+    )
+    .unwrap();
+    s.put(
+        "streams",
+        "owned",
+        json!({"template":"codec","transcoder":{"encoder":"copy"}}),
+    )
+    .unwrap();
+    assert_eq!(
+        s.effective("owned").unwrap()["transcoder"],
+        json!({"encoder":"copy","vb":900,"acodec":"mp2a","ab":192})
+    );
+    s.put(
+        "streams",
+        "owned",
+        json!({"transcoder":{"acodec":"mp3","ab":128}}),
+    )
+    .unwrap();
+    s.put("templates", "codec", json!({"transcoder":{"vb":1200}}))
+        .unwrap();
+    assert_eq!(
+        s.effective("owned").unwrap()["transcoder"],
+        json!({"encoder":"copy","vb":1200,"acodec":"mp3","ab":128})
+    );
+    s.put(
+        "streams",
+        "owned",
+        json!({"transcoder":{"acodec":null,"ab":null}}),
+    )
+    .unwrap();
+    assert_eq!(
+        s.effective("owned").unwrap()["transcoder"]["acodec"],
+        "mp2a"
+    );
+    drop(s);
+    let s = ConfigStore::open(d.path().join("c.json")).unwrap();
+    assert_eq!(
+        s.effective("owned").unwrap()["transcoder"]["encoder"],
+        "copy"
+    );
+}
+#[test]
+fn invalid_audio_profiles_and_merged_template_rates_are_atomic() {
+    let d = tempfile::tempdir().unwrap();
+    let s = ConfigStore::open(d.path().join("c.json")).unwrap();
+    s.put(
+        "templates",
+        "codec",
+        json!({"transcoder":{"encoder":"libx265","acodec":"aac","ab":100}}),
+    )
+    .unwrap();
+    let before = s.snapshot();
+    for t in [
+        json!({"acodec":"mp2a","ab":100}),
+        json!({"acodec":"mp3","ab":384}),
+        json!({"acodec":"aac","ab":31}),
+        json!({"acodec":"aac","ab":512.5}),
+        json!({"acodec":"opus"}),
+        json!({"encoder":"libx265","ab":"128k"}),
+    ] {
+        assert!(s.put("streams", "bad", json!({"transcoder":t})).is_err());
+        assert_eq!(s.snapshot(), before);
+    }
+    assert!(
+        s.put(
+            "streams",
+            "bad",
+            json!({"template":"codec","transcoder":{"acodec":"mp2a"}})
+        )
+        .is_err()
+    );
+    assert_eq!(s.snapshot(), before);
+    s.put(
+        "streams",
+        "owned",
+        json!({"template":"codec","transcoder":{"acodec":"mp2a","ab":192}}),
+    )
+    .unwrap();
+    s.put("streams", "owned", json!({"transcoder":{"ab":null}}))
+        .expect_err("reset must validate inherited bitrate");
+}

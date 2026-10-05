@@ -388,3 +388,40 @@ for(const kind of ['streams','templates'] as const) test(`HTTPS pull trust uses 
  if(kind==='streams'){await page.getByRole('button',{name:'Edit stream',exact:true}).click()}else{await page.getByRole('row').filter({has:page.getByRole('cell',{name,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click()}
  await ca.fill(caFile);await input.fill('tshttp://localhost:19990/transport');await expect(ca).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();state=await(await request.get(`/streamer/api/v3/${kind}/${name}`,{headers})).json();expect((state.config_on_disk||state).inputs[0].flussonix_tls_ca).toBeUndefined();await expect(page.locator('textarea')).toHaveCount(0);await request.delete(`/streamer/api/v3/${kind}/${name}`,{headers});
 });
+
+test('friendly CPU HEVC and audio controls round-trip template profiles independently',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-codec-template';
+ await page.getByRole('button',{name:'Templates',exact:true}).click();await page.getByRole('button',{name:'Add template',exact:true}).click();
+ await page.getByLabel('Template name',{exact:true}).fill(name);await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');await page.getByLabel('Activation',{exact:true}).selectOption('ondemand');
+ await page.getByLabel('Transcoding',{exact:true}).selectOption('libx265');await page.getByLabel('Video bitrate (kb/s)',{exact:true}).fill('1100');
+ await page.getByLabel('Audio encoding',{exact:true}).selectOption('mp2a');await page.getByLabel('Audio bitrate (kb/s)',{exact:true}).selectOption('192');
+ await expect(page.locator('textarea')).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();
+ await expect(page.getByRole('cell',{name,exact:true})).toBeVisible();
+ const read=async()=>(await(await request.get('/streamer/api/v3/templates/'+name,{headers})).json()).transcoder;
+ expect(await read()).toEqual({encoder:'libx265',vb:1100,acodec:'mp2a',ab:192});
+ await page.getByRole('row').filter({has:page.getByRole('cell',{name,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+ await page.getByLabel('Transcoding',{exact:true}).selectOption('libx264');await expect(page.getByLabel('Audio encoding',{exact:true})).toHaveValue('mp2a');
+ await page.getByLabel('Audio encoding',{exact:true}).selectOption('copy');await expect(page.getByLabel('Video bitrate (kb/s)',{exact:true})).toHaveValue('1100');await expect(page.getByLabel('Audio bitrate (kb/s)',{exact:true})).toHaveCount(0);
+ await page.getByRole('button',{name:'Save',exact:true}).click();expect(await read()).toEqual({encoder:'libx264',vb:1100,acodec:'copy'});
+});
+
+test('audio-only stream override keeps independent template video inheritance',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const template='ui-codec-inherit',name='ui-audio-only';
+ expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{static:false,transcoder:{encoder:'libx265',vb:900,acodec:'mp2a',ab:192}}})).ok()).toBeTruthy();
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{template}})).ok()).toBeTruthy();
+ await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+ await expect(page.getByLabel('Transcoding',{exact:true})).toHaveValue('inherit');await page.getByLabel('Audio encoding',{exact:true}).selectOption('mp3');
+ await expect(page.getByLabel('Transcoding',{exact:true})).toHaveValue('inherit');await expect(page.getByLabel('Audio bitrate (kb/s)',{exact:true})).toHaveValue('128');
+ await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('heading',{name,exact:true})).toBeVisible();
+ const read=async()=>await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();
+ expect((await read()).config_on_disk.transcoder).toEqual({acodec:'mp3',ab:128});
+ expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{transcoder:{encoder:'libx264',vb:1200,acodec:'aac',ab:96}}})).ok()).toBeTruthy();
+ expect((await read()).transcoder).toEqual({encoder:'libx264',vb:1200,acodec:'mp3',ab:128});
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Transcoding',{exact:true}).selectOption('copy');
+ await expect(page.getByLabel('Audio encoding',{exact:true})).toHaveValue('mp3');await page.getByLabel('Transcoding',{exact:true}).selectOption('inherit');
+ await expect(page.getByLabel('Audio encoding',{exact:true})).toHaveValue('mp3');await page.getByLabel('Audio encoding',{exact:true}).selectOption('inherit');
+ await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('heading',{name,exact:true})).toBeVisible();
+ expect((await read()).config_on_disk.transcoder).toBeUndefined();expect((await read()).transcoder.acodec).toBe('aac');
+});

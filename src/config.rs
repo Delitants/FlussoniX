@@ -499,29 +499,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                         }
                     }
                 }
-                if let Some(t) = item.get("transcoder") {
-                    if !t.is_object() {
-                        return Err("transcoder must be an object".into());
-                    }
-                    for k in t.as_object().unwrap().keys() {
-                        if !["encoder", "vb"].contains(&k.as_str()) {
-                            return Err(format!("transcoder option {k} is not implemented"));
-                        }
-                    }
-                    if let Some(v) = t.get("vb") {
-                        if !v.as_u64().is_some_and(|n| (100..=50000).contains(&n)) {
-                            return Err("vb must be 100..50000 kbps".into());
-                        }
-                    }
-                    if let Some(e) = t.get("encoder") {
-                        if !e
-                            .as_str()
-                            .is_some_and(|e| ["copy", "libx264", "h264_nvenc"].contains(&e))
-                        {
-                            return Err("supported encoders: copy, libx264, h264_nvenc".into());
-                        }
-                    }
-                }
+                crate::transcoder::Profile::resolve(item, false)?;
                 for field in ["dvr", "pushes"] {
                     if item.get(field).is_some() {
                         return Err(format!("{field} is not implemented in this build"));
@@ -531,6 +509,9 @@ fn validate_root(root: &Value) -> Result<(), String> {
         }
     }
     for s in root["streams"].as_array().unwrap() {
+        if let Some(effective) = effective(root, s["name"].as_str().unwrap()) {
+            crate::transcoder::Profile::resolve(&effective, false)?;
+        }
         if let Some(t) = s["template"].as_str() {
             if !root["templates"]
                 .as_array()

@@ -450,36 +450,16 @@ impl Engine {
                 "0:a:0?"
             },
         ]);
-        if synthetic || cfg.get("transcoder").is_some() && cfg["transcoder"]["encoder"] != "copy" {
-            let t = &cfg["transcoder"];
-            let encoder = t["encoder"].as_str().unwrap_or("libx264");
-            if !["libx264", "h264_nvenc"].contains(&encoder) {
-                return Err("unsupported encoder".into());
-            }
-            let vb = t["vb"]
-                .as_u64()
-                .unwrap_or(900)
-                .clamp(100, 50000)
-                .to_string()
-                + "k";
-            cmd.args([
-                "-c:v", encoder, "-b:v", &vb, "-g", "50", "-pix_fmt", "yuv420p",
-            ]);
-            if encoder == "libx264" {
-                cmd.args(["-preset", "veryfast", "-tune", "zerolatency"]);
-            }
-            cmd.args(["-c:a", "aac", "-b:a", "96k"]);
-        } else {
-            cmd.args(["-c", "copy"]);
-            // The AAC RTP depacketizer can omit key flags. AAC-LC access
-            // units are independently decodable; do not discard their copy.
-            if m4s_input
+        let profile = crate::transcoder::Profile::resolve(cfg, synthetic)?;
+        profile.apply(&mut cmd);
+        // RTP AAC depacketizers can omit key flags; copied units are independent.
+        if profile.audio_copy()
+            && (m4s_input
                 || m4f_input
                 || input.starts_with("rtsp://")
-                || input.starts_with("rtsps://")
-            {
-                cmd.arg("-copyinkf:a");
-            }
+                || input.starts_with("rtsps://"))
+        {
+            cmd.arg("-copyinkf:a");
         }
         let raw_hls = cfg["flussonix_hls_subtitles"] == "passthrough";
         // Separate DVB/teletext tracks belong on TS-based delivery. Copy their
@@ -491,12 +471,10 @@ impl Engine {
             cmd.args(["-max_interleave_delta", "100000"]);
         }
         // One encode/mux source feeds both HLS variants and shared live TS fan-out.
-        let copy_publication = publication
-            && (cfg.get("transcoder").is_none() || cfg["transcoder"]["encoder"] == "copy");
-        let native_copy = (m4s_input || m4f_input)
-            && (cfg.get("transcoder").is_none() || cfg["transcoder"]["encoder"] == "copy");
-        let copy_peer_ts =
-            peer_ts && (cfg.get("transcoder").is_none() || cfg["transcoder"]["encoder"] == "copy");
+        let copy_publication = publication && profile.audio_copy();
+        let native_copy = (m4s_input || m4f_input) && profile.full_copy();
+        let native_audio_copy = (m4s_input || m4f_input) && profile.audio_copy();
+        let copy_peer_ts = peer_ts && profile.audio_copy();
         // Original subtitle PES stays on stdout. The native decoder receives
         // only AV, either directly or through this owned tee connection.
         let av_listener = if subtitle_tracks == "preserve" && !native_copy {
@@ -518,7 +496,7 @@ impl Engine {
         } else {
             String::new()
         };
-        let fmp4_filter = if native_copy {
+        let fmp4_filter = if native_audio_copy {
             "__NATIVE_FMP4_FILTER__"
         } else if copy_peer_ts {
             "__PEER_FMP4_FILTER__"
@@ -527,7 +505,7 @@ impl Engine {
         } else {
             ""
         };
-        let fmp4_failure = if native_copy || copy_publication || copy_peer_ts {
+        let fmp4_failure = if native_audio_copy || copy_publication || copy_peer_ts {
             "onfail=ignore:"
         } else {
             ""
@@ -618,8 +596,7 @@ impl Engine {
             wire: Hub::new(),
             last_access,
         });
-        let original_wire = (m4s_input || m4f_input)
-            && (cfg.get("transcoder").is_none() || cfg["transcoder"]["encoder"] == "copy");
+        let original_wire = (m4s_input || m4f_input) && profile.full_copy();
         let native_ca = inputs[index]["flussonix_tls_ca"]
             .as_str()
             .map(std::path::PathBuf::from);
@@ -670,7 +647,7 @@ impl Engine {
                             Err(_)=>{ w.failed("startup_timeout"); return; },
                         },
                     };
-                    let output = if native_copy {
+                    let output = if native_audio_copy {
                         output.replace("__NATIVE_FMP4_FILTER__", &native_fmp4_filters(&tracks))
                     } else { output };
                     cmd.args(["-threads", "2", "-f", "tee", &output]);
