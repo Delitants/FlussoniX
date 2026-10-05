@@ -16,13 +16,15 @@ fn unused_udp_port() -> u16 {
 async fn receiver(path: &Path, port: u16, secret: &str) -> tokio::process::Child {
     let mut cmd = Command::new("ffmpeg");
     let url = format!(
-        "srt://127.0.0.1:{port}?mode=listener&listen_timeout=15000000&timeout=5000000&passphrase={secret}&enforced_encryption=1"
+        "srt://127.0.0.1:{port}?mode=listener&listen_timeout=15000000&timeout=5000000&enforced_encryption=1"
     );
+    cmd.args(["-passphrase", secret]);
+    let log = std::fs::File::create(path.with_extension("log")).unwrap();
     let child = cmd
         .args([
             "-hide_banner",
             "-loglevel",
-            "error",
+            "verbose",
             "-y",
             "-f",
             "mpegts",
@@ -42,7 +44,7 @@ async fn receiver(path: &Path, port: u16, secret: &str) -> tokio::process::Child
         .arg(path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(log))
         .kill_on_drop(true)
         .spawn()
         .unwrap();
@@ -146,7 +148,7 @@ async fn unavailable_destination_does_not_block_healthy_output_and_reconnects() 
     let path = dir.path().join("first.ts");
     let mut rx = receiver(&path, port, "").await;
     let engine = flussonix::media::Engine::new(dir.path().join("media"), "ffmpeg");
-    let cfg = json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":format!("srt://127.0.0.1:{port}"),"retry_timeout":1},{"url":format!("srt://127.0.0.1:{bad}"),"connect_timeout":1,"retry_timeout":1}]});
+    let cfg = json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":format!("srt://127.0.0.1:{port}"),"retry_timeout":1},{"url":format!("srt://127.0.0.1:{bad}"),"connect_timeout":1,"retry_timeout":1,"passphrase":"owned-unreachable-secret"}]});
     let w = engine.ensure("owned", &cfg).await.unwrap();
     wait_push(&w, 1, "retrying").await;
     received(&mut rx, &path, "h264", "aac").await;
@@ -470,5 +472,46 @@ async fn srt_keeps_or_filters_original_dvb_tracks_from_http_publication() {
         } else {
             assert!(dvb.is_empty());
         }
+    }
+}
+
+#[tokio::test]
+async fn receiver_observes_exact_stream_ids_and_punctuation_secrets() {
+    let _lock = MEDIA_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = flussonix::media::Engine::new(dir.path().join("media"), "ffmpeg");
+    for query in [false, true] {
+        let id = if query {
+            "é".repeat(256)
+        } else {
+            "#!::r=owned,m=publish,password=id+% &".into()
+        };
+        let port = unused_udp_port();
+        let path = dir
+            .path()
+            .join(if query { "query-id.ts" } else { "field-id.ts" });
+        let secret = "owned+secret&% =?123";
+        let mut rx = receiver(&path, port, secret).await;
+        let push = if query {
+            json!({"url":format!("srt://127.0.0.1:{port}?streamid={}&passphrase=owned%2Bsecret%26%25+%3D%3F123", "%C3%A9".repeat(256))})
+        } else {
+            json!({"url":format!("srt://127.0.0.1:{port}"),"streamid":id,"passphrase":secret})
+        };
+        let w = engine
+            .ensure(
+                "owned",
+                &json!({"inputs":[{"url":"testsrc://"}],"pushes":[push]}),
+            )
+            .await
+            .unwrap();
+        received(&mut rx, &path, "h264", "aac").await;
+        engine.stop_all().await;
+        let log = std::fs::read(path.with_extension("log")).unwrap();
+        assert!(
+            String::from_utf8_lossy(&log)
+                .contains(&format!("accept streamid [{id}], length {}", id.len())),
+            "receiver handshake did not preserve the exact Stream ID"
+        );
+        assert!(!w.stats().to_string().contains(secret));
     }
 }

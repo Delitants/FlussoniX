@@ -18,6 +18,8 @@ pub(crate) struct Destination {
     pub disabled: bool,
     pub retry_seconds: u64,
     startup_seconds: u64,
+    streamid: String,
+    passphrase: String,
 }
 
 pub(crate) fn configuration(cfg: &Value) -> Result<Vec<Destination>, String> {
@@ -158,13 +160,8 @@ fn parse(item: &Value) -> Result<Destination, String> {
             .append_pair("enforced_encryption", "1")
             .append_pair("latency", &(latency * 1000).to_string())
             .append_pair("connect_timeout", &(connect * 1000).to_string());
-        if !streamid.is_empty() {
-            query.append_pair("streamid", streamid);
-        }
         if !passphrase.is_empty() {
-            query
-                .append_pair("passphrase", passphrase)
-                .append_pair("pbkeylen", "16");
+            query.append_pair("pbkeylen", "16");
         }
     }
     Ok(Destination {
@@ -173,6 +170,8 @@ fn parse(item: &Value) -> Result<Destination, String> {
         disabled: item["disabled"] == true,
         retry_seconds,
         startup_seconds: connect + 5,
+        streamid: streamid.to_owned(),
+        passphrase: passphrase.to_owned(),
     })
 }
 
@@ -305,14 +304,21 @@ impl State {
             "0.2",
             "-progress",
             "pipe:1",
-            "-f",
-            "mpegts",
-            &self.destination.url,
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
+        ]);
+        // FFmpeg 5/6 do not URL-decode SRT strings, and later versions
+        // extract encoded query values through a 1024-byte buffer. Preserve
+        // the validated UTF-8/ASCII values as separate output options.
+        if !self.destination.streamid.is_empty() {
+            cmd.args(["-srt_streamid", &self.destination.streamid]);
+        }
+        if !self.destination.passphrase.is_empty() {
+            cmd.args(["-passphrase", &self.destination.passphrase]);
+        }
+        cmd.args(["-f", "mpegts", &self.destination.url])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
         let Ok(mut child) = cmd.spawn() else {
             return "push_start_failed";
         };

@@ -57,8 +57,11 @@ destinations, on-demand activation, config replacement and process cleanup.
 Owned DVB publication tests verify retained descriptors and subtitle PES at
 the SRT receiver, and filtering when separate tracks are disabled. Dedicated
 SRT CEA/teletext delivery tests remain pending; the established worker policies
-still apply. Owned fault processes qualify stalls and cancellation, not media
-interoperability. No production
+still apply. Receiver handshake logs also verify exact Stream IDs, including a 512-byte
+UTF-8 ID and punctuation-bearing passphrases from query and normal fields.
+Decoded values are passed as separate FFmpeg output options to avoid older
+versions' missing URL decode and encoded query-buffer truncation. Owned fault
+processes qualify stalls and cancellation, not media interoperability. No production
 listener is changed. Internet loss/retransmission, sustained throughput and
 all vendor SRT dialects remain unqualified.
 
