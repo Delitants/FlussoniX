@@ -472,3 +472,17 @@ test('bitrate-only overrides keep inherited codecs and matching bitrate controls
  const stream=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(stream.config_on_disk.transcoder).toEqual({vb:2000,ab:320});expect(stream.transcoder).toEqual({encoder:'libx265',vb:2000,acodec:'mp3',ab:320});
  await expect(page.getByText('Use template video · 2000 kb/s · Use template / default audio · 320 kb/s',{exact:true})).toBeVisible();
 });
+
+test('audio bitrate edits preserve standalone and inherited legacy video defaults',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const suffix=Date.now(),direct='ui-legacy-rate-'+suffix,parent='ui-legacy-rate-parent-'+suffix,name='ui-legacy-rate-stream-'+suffix;
+ for(const template of [direct,parent])expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{static:false,transcoder:{}}})).ok()).toBeTruthy();
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{template:parent}})).ok()).toBeTruthy();
+ await page.getByRole('button',{name:'Templates',exact:true}).click();await page.getByRole('row').filter({has:page.getByRole('cell',{name:direct,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+ await expect(page.getByLabel('Audio bitrate (kb/s)',{exact:true})).toHaveValue('96');await page.getByLabel('Audio bitrate (kb/s)',{exact:true}).fill('128');await expect(page.getByLabel('Transcoding',{exact:true})).toHaveValue('libx264');
+ await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('cell',{name:direct,exact:true})).toBeVisible();
+ const template=await(await request.get('/streamer/api/v3/templates/'+direct,{headers})).json();expect(template.transcoder).toEqual({encoder:'libx264',ab:128});
+ await page.getByRole('button',{name:'Streams',exact:true}).click();await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+ await page.getByLabel('Audio bitrate (kb/s)',{exact:true}).fill('128');await expect(page.getByLabel('Transcoding',{exact:true})).toHaveValue('inherit');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('heading',{name,exact:true})).toBeVisible();
+ const stream=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(stream.config_on_disk.transcoder).toEqual({ab:128});expect(stream.transcoder.encoder).toBe('libx264');
+});

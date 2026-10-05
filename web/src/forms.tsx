@@ -35,13 +35,17 @@ export function ConfigurationFields({kind,value,onChange,templates,backends,lock
  const effectiveAudio=effectiveTranscoder.acodec||(effectiveVideo!=='copy'||effectiveTranscoder.ab!==undefined?'aac':'copy');
  const videoChoice=owns(value.transcoder||{},'encoder')?value.transcoder.encoder:!inheritedTranscoder&&(owns(value.transcoder||{},'vb')||value.transcoder&&Object.keys(value.transcoder).length===0)?'libx264':'inherit';
  const audioChoice=value.transcoder?.acodec||(!inheritedTranscoder&&value.transcoder?.ab!==undefined?'aac':'inherit');
+ const writeTranscoder=(next:Item,preserveVideo:boolean)=>{
+  // Audio edits must not change a standalone legacy {} from H.264 to copy.
+  if(preserveVideo&&value.transcoder&&Object.keys(value.transcoder).length===0&&!inheritedTranscoder)next.encoder='libx264';
+  set('transcoder',Object.keys(next).length?next:undefined);
+ };
+ const setBitrate=(key:'vb'|'ab',rate:number|'')=>writeTranscoder({...value.transcoder,[key]:rate},key==='ab');
  const setCodec=(key:'encoder'|'acodec',codec:string)=>{
   const next={...(value.transcoder||{})};const bitrate=key==='encoder'?'vb':'ab';
-  // Adding an audio key to a standalone legacy {} must keep its implicit H.264.
-  if(key==='acodec'&&value.transcoder&&Object.keys(value.transcoder).length===0&&!inheritedTranscoder)next.encoder='libx264';
   if(codec==='inherit'){delete next[key];delete next[bitrate];}
   else {next[key]=codec;if(codec==='copy')delete next[bitrate];else next[bitrate]=key==='encoder'?(effectiveTranscoder.vb??900):codec===effectiveAudio?(effectiveTranscoder.ab??audioDefault(codec)):audioDefault(codec);}
-  set('transcoder',Object.keys(next).length?next:undefined);
+  writeTranscoder(next,key==='acodec');
  };
  const setCaption=(i:number,key:string,v:any)=>set('flussonix_hls_captions',captionRows.map((row,n)=>n===i?{...row,[key]:v}:row));
  const setCaptionFormat=(i:number,format:string)=>set('flussonix_hls_captions',captionRows.map((row,n)=>{
@@ -71,9 +75,9 @@ export function ConfigurationFields({kind,value,onChange,templates,backends,lock
    <Field label="Media stall timeout (seconds)" help={template?'Leave empty to inherit the template timeout. The server default is 15 seconds.':'Restart the input if it produces no media. Leave empty for the 15-second default.'}><input type="number" min="1" max="300" placeholder="15" value={value.flussonix_input_timeout??''} onChange={e=>set('flussonix_input_timeout',e.target.value===''?undefined:Number(e.target.value))}/></Field>
   </fieldset>
   <fieldset><legend>Processing</legend><div className="form-grid"><Field label="Transcoding" help={template?'Video inherits independently from audio. Copy overrides the template video encoder.':'Choose a video codec or keep the source video. NVIDIA encoding requires supported hardware and drivers.'}><select value={videoChoice} onChange={e=>setCodec('encoder',e.target.value)}><option value="inherit">{template?'Use template video settings':'Copy video (default)'}</option><option value="copy">Copy video</option><option value="libx264">CPU · H.264</option><option value="libx265">CPU · HEVC / H.265</option><option value="h264_nvenc">NVIDIA GPU · H.264</option></select></Field>
-   {effectiveVideo!=='copy'&&<Field label="Video bitrate (kb/s)"><input type="number" min="100" max="50000" value={effectiveTranscoder.vb??900} onChange={e=>set('transcoder',{...value.transcoder,vb:e.target.value===''?'':Number(e.target.value)})}/></Field>}
+   {effectiveVideo!=='copy'&&<Field label="Video bitrate (kb/s)"><input type="number" min="100" max="50000" value={effectiveTranscoder.vb??900} onChange={e=>setBitrate('vb',e.target.value===''?'':Number(e.target.value))}/></Field>}
    <Field label="Audio encoding" help={template?'Audio inherits independently. Default: AAC with encoded video, copy with copied video.':'Default: AAC with encoded video, copy with copied video. Audio encoding uses 48 kHz stereo; Copy retains the source format.'}><select value={audioChoice} onChange={e=>setCodec('acodec',e.target.value)}><option value="inherit">{template?'Use template / default audio':'Follow video profile (default)'}</option><option value="copy">Copy audio</option><option value="aac">AAC</option><option value="mp2a">MPEG Layer II</option><option value="mp3">MP3</option></select></Field>
-   {effectiveAudio!=='copy'&&<Field label="Audio bitrate (kb/s)">{effectiveAudio==='aac'?<input type="number" min="32" max="512" value={effectiveTranscoder.ab??96} onChange={e=>set('transcoder',{...value.transcoder,ab:e.target.value===''?'':Number(e.target.value)})}/>:<select value={effectiveTranscoder.ab??audioDefault(effectiveAudio)} onChange={e=>set('transcoder',{...value.transcoder,ab:Number(e.target.value)})}>{(effectiveAudio==='mp2a'?mp2Rates:mp3Rates).map(rate=><option key={rate} value={rate}>{rate}</option>)}</select>}</Field>}
+   {effectiveAudio!=='copy'&&<Field label="Audio bitrate (kb/s)">{effectiveAudio==='aac'?<input type="number" min="32" max="512" value={effectiveTranscoder.ab??96} onChange={e=>setBitrate('ab',e.target.value===''?'':Number(e.target.value))}/>:<select value={effectiveTranscoder.ab??audioDefault(effectiveAudio)} onChange={e=>setBitrate('ab',Number(e.target.value))}>{(effectiveAudio==='mp2a'?mp2Rates:mp3Rates).map(rate=><option key={rate} value={rate}>{rate}</option>)}</select>}</Field>}
    <Field label="Original subtitle tracks" help="Native text tracks are kept in copy-mode M4F/M4S. Select native track IDs below to convert UTF-8 text to HLS. Keeping native tracks during transcoding is not yet supported. Keep separate DVB and teletext tracks in MPEG-TS output. This control applies to separate tracks on other TS-based outputs. Embedded captions are preserved in copy mode. HLS uses its own setting below."><select value={value.flussonix_subtitle_tracks||'inherit'} onChange={e=>set('flussonix_subtitle_tracks',e.target.value==='inherit'?undefined:e.target.value)}><option value="inherit">{template?'Use template setting':'Drop separate tracks (default)'}</option><option value="preserve">Keep in compatible outputs</option><option value="drop">Drop separate tracks</option></select></Field>
    <Field label="Stream availability"><select value={owns(value,'disabled')?value.disabled?'disabled':'enabled':'inherit'} onChange={e=>set('disabled',e.target.value==='inherit'?undefined:e.target.value==='disabled')}><option value="inherit">{template?'Use template setting':'Enabled by default'}</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></Field>
   </div>
