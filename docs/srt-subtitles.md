@@ -35,8 +35,11 @@ decodes H.264 video and AAC audio from a separate copy containing complete PES.
 A wall-clock sample may stop inside the last PES on a PID; only unfinished
 terminal PES and a trailing partial transport packet are omitted from that decode
 copy. Raw caption, descriptor and orphan assertions inspect the untouched capture.
-A deterministic negative test requires an interior packet loss to remain a
-strict decoding failure after this terminal handling. Playback uses a real viewer
+Strict decoding requires successful process exit and an empty error log; some
+FFmpeg versions report decoder errors without returning a failing exit code.
+A deterministic negative test verifies exactly which terminal audio packet is
+omitted and requires an interior packet loss to remain a strict decoding failure
+after this terminal handling. Playback uses a real viewer
 token and attaches before feeding early live caption events; all ports, streams,
 secrets and media belong to the tests. Shutdown joins the listener and stops
 the worker.

@@ -67,6 +67,12 @@ fn complete_sample(bytes: &[u8]) -> Vec<u8> {
     result
 }
 
+fn clean_decode(output: &std::process::Output) -> bool {
+    // FFmpeg 6 may return zero after a decoder-thread error. With -v error,
+    // stderr must also be empty to qualify a clean independent decode.
+    output.status.success() && output.stderr.is_empty()
+}
+
 async fn strict_decode(path: &Path) -> std::process::Output {
     Command::new("ffmpeg")
         .args(["-v", "error", "-xerror", "-threads", "1", "-i"])
@@ -333,7 +339,7 @@ async fn run(push: bool, digital: bool, input: &[u8], expected: &BTreeSet<Vec<u8
         .unwrap();
         let decoded = strict_decode(&decode_path).await;
         assert!(
-            decoded.status.success(),
+            clean_decode(&decoded),
             "{}",
             String::from_utf8_lossy(&decoded.stderr)
         );
@@ -458,13 +464,29 @@ async fn finite_sample_omits_terminal_partial_pes_without_hiding_interior_corrup
     let partial = &bytes[..(terminal + 1) * 188];
     std::fs::write(&path, partial).unwrap();
     assert!(
-        !strict_decode(&path).await.status.success(),
+        !clean_decode(&strict_decode(&path).await),
         "reproducer must end in an incomplete audio PES"
     );
-    std::fs::write(&path, complete_sample(partial)).unwrap();
+    let complete = complete_sample(partial);
+    let terminal_pid = original::pid(&partial[terminal * 188..]);
+    let audio_packets: Vec<_> = partial
+        .chunks_exact(188)
+        .filter(|p| original::pid(p) == terminal_pid)
+        .collect();
+    let complete_audio: Vec<_> = complete
+        .chunks_exact(188)
+        .filter(|p| original::pid(p) == terminal_pid)
+        .collect();
+    assert!(audio_packets.len() > 1);
+    assert_eq!(
+        complete_audio,
+        audio_packets[..audio_packets.len() - 1],
+        "omit only the terminal partial audio PES, retaining every prior packet"
+    );
+    std::fs::write(&path, complete).unwrap();
     let decoded = strict_decode(&path).await;
     assert!(
-        decoded.status.success(),
+        clean_decode(&decoded),
         "terminal capture boundary: {}",
         String::from_utf8_lossy(&decoded.stderr)
     );
@@ -477,7 +499,7 @@ async fn finite_sample_omits_terminal_partial_pes_without_hiding_interior_corrup
     corrupt.extend(&bytes[(interior + 2) * 188..]);
     std::fs::write(&path, complete_sample(&corrupt)).unwrap();
     assert!(
-        !strict_decode(&path).await.status.success(),
+        !clean_decode(&strict_decode(&path).await),
         "interior corruption must remain visible to -xerror"
     );
 }
