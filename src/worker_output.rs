@@ -255,8 +255,18 @@ impl Decoder {
         let expanded = if let Some(anchor) = self.anchor {
             let delta = ((raw.wrapping_sub(anchor & MASK).wrapping_add(1 << 32)) & MASK) as i64
                 - (1i64 << 32);
-            let stamp = i128::from(anchor) + i128::from(delta);
-            if stamp < 0 || stamp > i128::from(u64::MAX) || delta.unsigned_abs() > 60 * 90000 {
+            let mut stamp = i128::from(anchor) + i128::from(delta);
+            if delta.unsigned_abs() > 60 * 90000 {
+                return Err("worker program timestamp discontinuity".into());
+            }
+            // The first completed PID may start just after wrap while another
+            // PID's first PES starts just before it. No metadata or frames have
+            // escaped yet, so choose a common nonnegative initialization epoch.
+            if stamp < 0 && !self.published {
+                self.shift_initial_epoch()?;
+                stamp += 1i128 << 33;
+            }
+            if stamp < 0 || stamp > i128::from(u64::MAX) {
                 return Err("worker program timestamp discontinuity".into());
             }
             stamp as u64
@@ -265,6 +275,20 @@ impl Decoder {
         };
         self.anchor = Some(self.anchor.map_or(expanded, |a| a.max(expanded)));
         Ok(expanded)
+    }
+    fn shift_initial_epoch(&mut self) -> Result<(), String> {
+        let shift = 1u64 << 33;
+        let add = |value: u64| value.checked_add(shift).ok_or("worker epoch overflow");
+        self.anchor = self.anchor.map(add).transpose()?;
+        for frame in &mut self.waiting {
+            frame.dts = add(frame.dts)?;
+        }
+        for stream in self.streams.values_mut() {
+            stream.last = stream.last.map(add).transpose()?;
+            stream.audio.shift_epoch(shift)?;
+            stream.video.shift_epoch(shift)?;
+        }
+        Ok(())
     }
     fn flush(&mut self, pid: u16, out: &mut Vec<Event>, complete: bool) -> Result<(), String> {
         let s = self.streams.get_mut(&pid).unwrap();

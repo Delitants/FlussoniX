@@ -642,3 +642,119 @@ fn annex_b_length_conversion_cannot_expand_a_sample_past_its_bound() {
         Err(e) => assert!(e.contains("sample exceeds bound"), "{e}"),
     }
 }
+
+#[test]
+fn hevc_pes_requires_a_picture_start_before_any_continuation_slice() {
+    let t = track("hevc", 1, include_bytes!("fixtures/codecs/hevc.hvcc"));
+    let complete = include_bytes!("fixtures/codecs/hevc-00.bin");
+    let mut partial = complete.to_vec();
+    partial[6] &= 0x7f;
+    for body in [partial.clone(), [partial, complete.to_vec()].concat()] {
+        let data = mux(std::slice::from_ref(&t), &[frame(1, 90000, &body)]);
+        let mut d = Decoder::default();
+        for b in data.chunks(188 * 64) {
+            d.push(b).unwrap();
+        }
+        assert!(
+            d.finish().is_err(),
+            "a missing first slice must not publish a complete key picture"
+        );
+    }
+}
+#[test]
+fn initial_completion_order_across_wrap_rebases_all_unpublished_audio_clocks() {
+    let wrap = 1u64 << 33;
+    let input = [
+        frame(2, wrap + 191, MP3),
+        frame(1, wrap - 2160, MP2),
+        frame(2, wrap + 2542, MP3),
+        frame(1, wrap, MP2),
+    ];
+    let events = decode(
+        &mux(&[track("m2a", 1, &[]), track("mp3", 2, &[])], &input),
+        188,
+    );
+    let got = samples(&events);
+    assert_eq!(got.len(), 4);
+    for (a, b) in got.iter().zip(input) {
+        assert_eq!((a.dts, a.pts_offset, &a.body), (b.dts, 0, &b.body));
+    }
+}
+
+#[test]
+fn initial_wrap_resolution_retimes_held_video_and_its_next_picture_clock() {
+    let wrap = 1u64 << 33;
+    let t = track("hevc", 1, include_bytes!("fixtures/codecs/hevc.hvcc"));
+    let mut first = frame(
+        1,
+        wrap + 3600,
+        include_bytes!("fixtures/codecs/hevc-00.bin"),
+    );
+    first.pts_offset = -1800;
+    let mut second = first.clone();
+    second.dts = wrap + 7200;
+    second.pts_offset = 3600;
+    let events = decode(
+        &mux(
+            &[t, track("m2a", 2, &[])],
+            &[
+                first,
+                second,
+                frame(2, wrap - 2160, MP2),
+                frame(2, wrap, MP2),
+            ],
+        ),
+        257,
+    );
+    let got = samples(&events);
+    assert_eq!(got.len(), 4);
+    assert_eq!(
+        got.iter()
+            .filter(|f| f.track_id == 256)
+            .map(|f| (f.dts, f.pts_offset))
+            .collect::<Vec<_>>(),
+        [(wrap + 3600, -1800), (wrap + 7200, 3600)]
+    );
+    assert_eq!(
+        got.iter()
+            .filter(|f| f.track_id == 257)
+            .map(|f| f.dts)
+            .collect::<Vec<_>>(),
+        [wrap - 2160, wrap]
+    );
+}
+#[test]
+fn avc_pes_requires_the_first_slice_before_continuation_slices() {
+    let t = track(
+        "h264",
+        1,
+        &[
+            1, 100, 0, 31, 255, 225, 0, 4, 103, 100, 0, 31, 1, 0, 2, 104, 1,
+        ],
+    );
+    let first = [0, 0, 0, 2, 0x65, 0x80]; // first_mb_in_slice = 0
+    let partial = [0, 0, 0, 2, 0x65, 0x40]; // first_mb_in_slice = 1
+    for body in [
+        partial.to_vec(),
+        [partial.to_vec(), first.to_vec()].concat(),
+    ] {
+        let mut d = Decoder::default();
+        d.push(&mux(std::slice::from_ref(&t), &[frame(1, 90000, &body)]))
+            .unwrap();
+        assert!(d.finish().unwrap_err().contains("partial picture"));
+    }
+}
+#[test]
+fn a_published_generation_cannot_reinterpret_a_backwards_clock_as_initial_wrap() {
+    let mut d = Decoder::default();
+    let mut cc = 0;
+    let tables = Muxer::new(&[track("m2a", 1, &[])]).unwrap().tables();
+    d.push(&tables).unwrap();
+    let first = d.push(&packets(256, &pes(MP2, 1000), &mut cc)).unwrap();
+    assert_eq!(samples(&first)[0].dts, 1000);
+    assert!(
+        d.push(&packets(256, &pes(MP2, (1 << 33) - 1160), &mut cc))
+            .is_err()
+    );
+    assert!(d.finish().is_err());
+}

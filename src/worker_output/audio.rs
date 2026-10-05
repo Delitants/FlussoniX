@@ -25,6 +25,19 @@ impl Audio {
     pub(super) fn retained(&self) -> usize {
         self.pending.len()
     }
+    pub(super) fn shift_epoch(&mut self, shift: u64) -> Result<(), String> {
+        if self.format.is_some() || !self.pending.is_empty() {
+            self.base = self
+                .base
+                .checked_add(shift)
+                .ok_or("worker audio epoch overflow")?;
+        }
+        self.last = self
+            .last
+            .map(|last| last.checked_add(shift).ok_or("worker audio epoch overflow"))
+            .transpose()?;
+        Ok(())
+    }
     pub(super) fn finish(&self) -> Result<(), String> {
         if self.pending.is_empty() {
             Ok(())

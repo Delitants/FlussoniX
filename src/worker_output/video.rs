@@ -12,6 +12,13 @@ impl Video {
     pub(super) fn retained(&self) -> usize {
         self.sets.iter().flatten().map(Vec::len).sum()
     }
+    pub(super) fn shift_epoch(&mut self, shift: u64) -> Result<(), String> {
+        self.last = self
+            .last
+            .map(|last| last.checked_add(shift).ok_or("worker video epoch overflow"))
+            .transpose()?;
+        Ok(())
+    }
     pub(super) fn push(
         &mut self,
         pid: u16,
@@ -91,6 +98,9 @@ impl Video {
                 continue;
             }
             if vcl {
+                if !picture && !first {
+                    return Err("worker video PES starts with a partial picture".into());
+                }
                 boundaries += usize::from(first);
                 if boundaries > 1 {
                     return Err("multiple pictures in worker video PES".into());
