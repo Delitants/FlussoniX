@@ -171,31 +171,35 @@ impl Hub {
         let s = self.state.lock().unwrap();
         let description = describe(&s)?;
         let packets: Vec<Bytes> = s.bootstrap.iter().map(|(_, b)| b.clone()).collect();
-        let positions =
-            s.tracks
-                .iter()
-                .map(|t| {
-                    if let Some(packet) = packets.iter().find(|b| {
-                        u32::from_be_bytes(b[..4].try_into().unwrap()) == t.description.id
-                    }) {
-                        (
-                            t.description.id,
-                            u16::from_be_bytes(packet[6..8].try_into().unwrap()),
-                            u32::from_be_bytes(packet[8..12].try_into().unwrap()),
-                        )
-                    } else {
-                        (
-                            t.description.id,
-                            t.sequence,
-                            s.origin
-                                .map(|(dts, _)| {
-                                    ((dts as u128 * t.description.clock as u128) / 90000) as u32
-                                })
-                                .unwrap_or(0),
-                        )
-                    }
-                })
-                .collect();
+        let positions = s
+            .tracks
+            .iter()
+            .map(|t| {
+                if let Some(packet) = packets
+                    .iter()
+                    .find(|b| u32::from_be_bytes(b[..4].try_into().unwrap()) == t.description.id)
+                {
+                    (
+                        t.description.id,
+                        u16::from_be_bytes(packet[6..8].try_into().unwrap()),
+                        u32::from_be_bytes(packet[8..12].try_into().unwrap()),
+                    )
+                } else {
+                    (
+                        t.description.id,
+                        t.sequence,
+                        // A keyframe may have cleared a track's cached packets.
+                        // Map that track to this GOP's media time, not stream startup.
+                        s.bootstrap
+                            .front()
+                            .map(|(dts, _)| *dts)
+                            .or_else(|| s.origin.map(|(dts, _)| dts))
+                            .map(|dts| ((dts as u128 * t.description.clock as u128) / 90000) as u32)
+                            .unwrap_or(0),
+                    )
+                }
+            })
+            .collect();
         Ok(PlaySnapshot {
             description,
             decode_times: s.bootstrap.iter().map(|(dts, _)| *dts).collect(),

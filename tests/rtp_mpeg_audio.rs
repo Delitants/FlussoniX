@@ -187,3 +187,59 @@ fn opaque_mpeg_configuration_is_bounded_and_never_becomes_an_aac_fmtp() {
     h.configure(&[t]);
     assert!(h.description().unwrap().is_err());
 }
+
+#[test]
+fn late_join_without_cached_audio_uses_the_current_gop_clock() {
+    for codec in ["m2a", "mp3", "aac"] {
+        let h = Hub::new();
+        let video = Track {
+            id: 7,
+            codec: "h264".into(),
+            config: vec![
+                1, 100, 0, 31, 255, 225, 0, 4, 103, 100, 0, 31, 1, 0, 2, 104, 0,
+            ],
+        };
+        let mut audio = track(codec);
+        if codec == "aac" {
+            audio.config = vec![0x12, 0x10];
+        }
+        h.configure(&[audio, video]);
+        let key = |dts| Frame {
+            track_id: 7,
+            dts,
+            pts_offset: 7200,
+            key: true,
+            body: vec![0, 0, 0, 2, 0x65, 42],
+        };
+        h.frame(&key(90000));
+        h.frame(&frame(
+            if codec == "aac" {
+                vec![42]
+            } else {
+                fixture(codec)
+            },
+            90000,
+        ));
+        // A video keyframe clears the old GOP before the next audio AU arrives.
+        h.frame(&key(315000));
+        let snapshot = h.play_snapshot().unwrap();
+        assert!(
+            snapshot
+                .packets
+                .iter()
+                .all(|b| u32::from_be_bytes(b[..4].try_into().unwrap()) == 7)
+        );
+        let audio = snapshot.positions.iter().find(|p| p.0 == 88).unwrap();
+        let clock = if codec == "aac" { 44100u64 } else { 90000 };
+        assert_eq!(
+            audio.2,
+            (315000 * clock / 90000) as u32,
+            "missing audio must map to the current GOP, not stream startup"
+        );
+        let video = snapshot.positions.iter().find(|p| p.0 == 7).unwrap();
+        assert_eq!(
+            video.2, 322200,
+            "cached video retains its actual signed presentation timestamp"
+        );
+    }
+}

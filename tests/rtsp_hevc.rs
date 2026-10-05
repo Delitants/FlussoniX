@@ -439,7 +439,13 @@ async fn playback_profile(transport: &str, video: bool, audio: &str) {
     );
     let text = String::from_utf8_lossy(&out.stdout);
     if video {
-        assert!(text.lines().filter(|l| l.starts_with("0,")).count() >= 50);
+        assert!(
+            text.lines().filter(|l| l.starts_with("0,")).count() >= 50,
+            "video_count={} audio_count={} worker={}",
+            text.lines().filter(|l| l.starts_with("0,")).count(),
+            text.lines().filter(|l| l.starts_with("1,")).count(),
+            lab.app.media.stats("owned").await
+        );
         let actual = hashes(&out.stdout, 0);
         assert_eq!(
             actual, lab.expected,
@@ -455,7 +461,10 @@ async fn playback_profile(transport: &str, video: bool, audio: &str) {
         };
         assert!(
             text.lines().filter(|l| l.starts_with(prefix)).count() >= minimum,
-            "decoded audio frame count"
+            "decoded audio frame count: actual={} minimum={} worker={}",
+            text.lines().filter(|l| l.starts_with(prefix)).count(),
+            minimum,
+            lab.app.media.stats("owned").await
         );
         if audio != "aac" {
             let rate = if audio == "mp3" { "22050" } else { "32000" };
