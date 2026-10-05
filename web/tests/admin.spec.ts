@@ -458,3 +458,17 @@ test('partial and pinned audio overrides retain the effective template bitrate',
  await expect(page.getByLabel('Transcoding',{exact:true})).toHaveValue('inherit');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('heading',{name,exact:true})).toBeVisible();
  const stream=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(stream.transcoder.encoder).toBe('libx264');expect(stream.transcoder.acodec).toBe('mp3');
  });
+
+test('bitrate-only overrides keep inherited codecs and matching bitrate controls',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const template='ui-rate-only-template-'+Date.now(),name='ui-rate-only-'+Date.now();
+ expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{static:false,transcoder:{encoder:'libx265',vb:1800,acodec:'mp3',ab:320}}})).ok()).toBeTruthy();
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{template,transcoder:{vb:1000,ab:128}}})).ok()).toBeTruthy();
+ await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+ await expect(page.getByLabel('Transcoding',{exact:true})).toHaveValue('inherit');await expect(page.getByLabel('Audio encoding',{exact:true})).toHaveValue('inherit');
+ await expect(page.getByLabel('Video bitrate (kb/s)',{exact:true})).toHaveValue('1000');await expect(page.getByLabel('Audio bitrate (kb/s)',{exact:true})).toHaveJSProperty('tagName','SELECT');await expect(page.getByLabel('Audio bitrate (kb/s)',{exact:true})).toHaveValue('128');
+ await page.getByLabel('Video bitrate (kb/s)',{exact:true}).fill('2000');await page.getByLabel('Audio bitrate (kb/s)',{exact:true}).selectOption('320');
+ await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('heading',{name,exact:true})).toBeVisible();
+ const stream=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(stream.config_on_disk.transcoder).toEqual({vb:2000,ab:320});expect(stream.transcoder).toEqual({encoder:'libx265',vb:2000,acodec:'mp3',ab:320});
+ await expect(page.getByText('Use template video · 2000 kb/s · Use template / default audio · 320 kb/s',{exact:true})).toBeVisible();
+});
