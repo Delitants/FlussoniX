@@ -1,6 +1,6 @@
 # Encoded worker output decoder foundation
 
-`worker_output::Decoder` reconstructs native `Track`/`Frame` events from independently produced MPEG-TS. This is a library foundation for the HEVC and MPEG audio transcoding work. **The active worker still uses its existing FLV output bridge.** No new encoder setting or runtime output capability follows from this commit.
+`worker_output::Decoder` reconstructs native `Track`/`Frame` events from independently produced MPEG-TS. The [live worker integration](worker-ts-live.md) now connects this decoder to the native hub and replaces the active FLV bridge. The decoder foundation itself adds no encoder setting.
 
 The initial profile covers one stable program, up to 16 AV tracks and one video: H.264, single-layer HEVC, AAC-LC in unprotected ADTS, MPEG Layer II and MPEG Layer III. Video PES packets must start their coded picture before any continuation slice and contain at most one coded picture and a stable parameter-set family. The decoder derives AVC/hvcC initialization, retains picture/SEI bytes, removes ADTS headers, and preserves complete MPEG audio frames. It waits for all track initialization before emitting metadata and samples. IDs are transport PIDs; consumers must start a fresh hub generation rather than equate them with original input IDs.
 
@@ -12,4 +12,4 @@ Limits include 16 MiB per PES/sample, 32 MiB retained media including waiting fr
 
 Qualification includes bytewise input, MPEG identity, split/aggregated audio, fractional clocks, signed offsets and wrap, initialization ordering/limits, malformed transport/PES/audio and independent FFmpeg-generated AVC/AAC, HEVC/Layer II and Main10 HEVC/Layer III. Each independently generated video profile must reconstruct all 25 pictures, and independent decoded picture/audio sample hashes must match the original transport.
 
-Next: connect encoded worker transport to a fresh native hub generation, remove redundant FLV muxing, then expose labeled CPU HEVC and independent audio choices in streams/templates. GPU execution still requires available hardware and drivers; this host's NVIDIA driver was unavailable during the stage. Secure publishing, long-running synchronization and capacity require their own qualification.
+Next: expose labeled CPU HEVC and independent audio choices in streams/templates after the live integration qualification. GPU execution still requires available hardware and drivers; this host's NVIDIA driver was unavailable during the stage. Secure publishing, long-running synchronization and capacity require their own qualification.

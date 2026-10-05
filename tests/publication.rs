@@ -526,7 +526,12 @@ async fn large_chunked_publication_feeds_hls_native_wire_and_cpu_transcoding() {
             String::from_utf8_lossy(&decoded.stderr)
         );
         let frames = String::from_utf8(decoded.stdout).unwrap();
-        assert!(frames.lines().filter(|l| l.starts_with("0,")).count() >= 25);
+        assert!(
+            frames.lines().filter(|l| l.starts_with("0,")).count() >= 25,
+            "encoder={encoder}, videos={}, manifest={fmp4_manifest}, stats={}",
+            frames.lines().filter(|l| l.starts_with("0,")).count(),
+            w.stats()
+        );
         assert!(frames.lines().filter(|l| l.starts_with("1,")).count() >= 50);
         let hls = a.media.read("owned", "index.m3u8").await.unwrap();
         let text = String::from_utf8(hls.to_vec()).unwrap();

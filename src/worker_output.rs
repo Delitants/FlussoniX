@@ -1,10 +1,11 @@
 //! Independent, bounded MPEG-TS worker output reconstruction.
 //!
-//! This library is not yet connected to the active worker. The initial profile
+//! The live worker originates native output through this decoder. The initial profile
 //! accepts one stable program, one picture per video PES, AVC/single-layer HEVC,
 //! unprotected AAC-LC ADTS and MPEG Layers II/III. Caller chunks are at most
 //! 188*64 bytes. Errors are terminal; restart with a fresh decoder generation.
 mod audio;
+pub(crate) mod live;
 mod video;
 use crate::{m4f::Frame, m4s::Track};
 use std::collections::BTreeMap;
