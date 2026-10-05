@@ -1,4 +1,4 @@
-//! Independent H.264/AAC RTP packetization shared by all RTSP viewers.
+//! Independent H.264/HEVC/AAC RTP packetization shared by all RTSP viewers.
 use crate::{m4f::Frame, m4s::Track, media_queue::Channel};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
@@ -40,6 +40,7 @@ impl Description {
 struct PacketTrack {
     description: MediaTrack,
     length: usize,
+    hevc: bool,
     sequence: u16,
 }
 struct State {
@@ -334,14 +335,14 @@ fn describe(s: &State) -> Result<Description, String> {
 fn parse_tracks(tracks: &[Track]) -> Result<Vec<PacketTrack>, String> {
     let tracks: Vec<_> = tracks.iter().filter(|t| t.codec != "subtitle").collect();
     if tracks.is_empty() || tracks.len() > 2 {
-        return Err("RTSP requires one or two H.264/AAC tracks".into());
+        return Err("RTSP requires one video (H.264/HEVC) and/or one AAC track".into());
     }
     let mut out: Vec<PacketTrack> = vec![];
     for t in tracks {
-        if out
-            .iter()
-            .any(|old| old.description.id == t.id || old.description.video == (t.codec == "h264"))
-        {
+        if out.iter().any(|old| {
+            old.description.id == t.id
+                || old.description.video == matches!(t.codec.as_str(), "h264" | "hevc")
+        }) {
             return Err("duplicate RTP track or codec".into());
         }
         let uuid = uuid::Uuid::new_v4();
@@ -349,6 +350,36 @@ fn parse_tracks(tracks: &[Track]) -> Result<Vec<PacketTrack>, String> {
         let ssrc = u32::from_be_bytes(random[0..4].try_into().unwrap());
         let sequence = u16::from_be_bytes(random[4..6].try_into().unwrap());
         let (length, description) = match t.codec.as_str() {
+            "hevc" => {
+                if t.config.len() > 65536 {
+                    return Err("RTSP HEVC configuration exceeds 64 KiB".into());
+                }
+                let config = crate::hevc::Configuration::parse(&t.config)?;
+                let mut sets: [Vec<String>; 3] = Default::default();
+                for nal in config.initialization_nals() {
+                    let kind = hevc_nal_type(nal)?;
+                    if (32..=34).contains(&kind) {
+                        sets[(kind - 32) as usize].push(STANDARD.encode(nal));
+                    }
+                }
+                (
+                    config.nal_length_size,
+                    MediaTrack {
+                        id: t.id,
+                        payload: 96,
+                        clock: 90000,
+                        ssrc,
+                        video: true,
+                        encoding: "H265/90000".into(),
+                        fmtp: format!(
+                            "sprop-vps={};sprop-sps={};sprop-pps={};sprop-max-don-diff=0",
+                            sets[0].join(","),
+                            sets[1].join(","),
+                            sets[2].join(",")
+                        ),
+                    },
+                )
+            }
             "h264" => {
                 let (length, sets) = avcc(&t.config)?;
                 let profile = format!("{:02x}{:02x}{:02x}", sets[0][1], sets[0][2], sets[0][3]);
@@ -410,6 +441,7 @@ fn parse_tracks(tracks: &[Track]) -> Result<Vec<PacketTrack>, String> {
         out.push(PacketTrack {
             description,
             length,
+            hevc: t.codec == "hevc",
             sequence,
         });
     }
@@ -451,6 +483,9 @@ pub(crate) fn avcc(c: &[u8]) -> Result<(usize, Vec<&[u8]>), String> {
 fn payloads(t: &PacketTrack, body: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     if body.is_empty() || body.len() > 16 * 1024 * 1024 {
         return Err("invalid RTP access unit size".into());
+    }
+    if t.hevc {
+        return hevc_payloads(t.length, body);
     }
     let mut out = vec![];
     if !t.description.video {
@@ -498,6 +533,55 @@ fn payloads(t: &PacketTrack, body: &[u8]) -> Result<Vec<Vec<u8>>, String> {
                         | if i + 1 == count { 64 } else { 0 },
                 ];
                 p.extend(chunk);
+                out.push(p);
+            }
+        }
+    }
+    Ok(out)
+}
+
+// Single-layer SRST, decode-order transmission without DONL (RFC 7798).
+fn hevc_nal_type(nal: &[u8]) -> Result<u8, String> {
+    if nal.len() < 2 || nal[0] & 0x81 != 0 || nal[1] & 0xf8 != 0 || nal[1] & 7 == 0 {
+        return Err("RTSP HEVC requires a valid single-layer NAL header".into());
+    }
+    let kind = (nal[0] >> 1) & 63;
+    if kind >= 48 {
+        return Err("invalid single HEVC NAL type".into());
+    }
+    Ok(kind)
+}
+fn hevc_payloads(width: usize, body: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    let mut count = 0;
+    while cursor < body.len() {
+        count += 1;
+        if count > 4096 {
+            return Err("too many HEVC NAL units".into());
+        }
+        let size = body
+            .get(cursor..cursor + width)
+            .ok_or("truncated HEVC length")?
+            .iter()
+            .fold(0usize, |n, b| (n << 8) | usize::from(*b));
+        cursor += width;
+        let end = cursor.checked_add(size).ok_or("HEVC length overflow")?;
+        let nal = body.get(cursor..end).ok_or("truncated HEVC NAL")?;
+        cursor = end;
+        let kind = hevc_nal_type(nal)?;
+        if nal.len() <= MTU - 12 {
+            out.push(nal.to_vec());
+        } else {
+            let chunks = nal[2..].chunks(MTU - 15);
+            let fragments = chunks.len();
+            for (i, chunk) in chunks.enumerate() {
+                let mut p = vec![
+                    (nal[0] & 0x81) | (49 << 1),
+                    nal[1],
+                    kind | if i == 0 { 128 } else { 0 } | if i + 1 == fragments { 64 } else { 0 },
+                ];
+                p.extend_from_slice(chunk);
                 out.push(p);
             }
         }

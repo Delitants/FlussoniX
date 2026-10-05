@@ -1,4 +1,4 @@
-//! RTSP/1.0 live playback, TCP-interleaved H.264/AAC only.
+//! RTSP/1.0 live playback using the shared H.264/HEVC/AAC RTP profile.
 pub mod protocol;
 pub mod tls;
 pub mod udp;

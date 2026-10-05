@@ -14,7 +14,7 @@ Here `m2a` means MPEG audio Layer II, called `mp2` by FFmpeg; MP3 is Layer III. 
 
 | Capability | v0.10 profile | Required next work |
 |---|---|---|
-| RTSPS playback | Verified TLS, H.264/AAC-LC, interleaved TCP media | HEVC/MPEG audio packetization; remaining publication/push roles |
+| RTSPS playback | Verified TLS, H.264/HEVC with optional AAC-LC, interleaved TCP media | MPEG audio packetization; remaining publication/push roles |
 | HTTPS stream output | Native TLS listener shares HTTP media/publication/auth routes; HTTPS-only and secure viewer redirect rules | Full private-CA input/cluster trust, secure push, certificate reload/expiry reporting |
 | Secure HTTP inputs/private endpoints | Secure aliases exist; full direction/certificate matrix incomplete | Qualify every TLS role, public/private identity and trust configuration |
 | M4F/M4S codecs | H.264/AAC end-to-end subset; [native codec library foundation](native-codecs.md) implemented in subsequent source work | Generalized worker bridge and full HEVC/m2a/MP3 metadata/playback in both directions, with native and reference peers |
@@ -84,3 +84,7 @@ Configured source/peer management HTTPS requests now use optional private roots 
 ## Direct HTTP input trust increment
 
 Direct HLSS, TSHTTPS and raw HTTPS input now pass through the verified origin-scoped Rust fetcher. Optional private roots persist on Stream/Template inputs and share the existing friendly CA field. Owned copy/CPU H.264/AAC delivery, fMP4 HLS resources, arbitrary TS paths, TLS rejection before HTTP, same-origin redirect bounds and fallback recovery are qualified independently of cluster credentials. Cross-origin authenticated HLS, active certificate/trust reload, GPU and the remaining direction/codec matrix stay open; see [the input profile](https-delivery.md).
+
+## HEVC RTSP playback follow-on
+
+The independent shared RTP packetizer adds single-layer HEVC SDP, single-NAL/FU delivery, signed presentation timing and existing decode-time pacing. Owned M4S Main8-bit B-frame sources decode over RTSP TCP/UDP and verified RTSPS TCP, with independently checked picture hashes, optional AAC audio, token isolation, one worker/source pull and revocation cleanup. This is playback from native copy input, not HEVC transcoding or new native origination. The remaining codec/direction, Main10, MPEG audio RTP, GPU and migration matrix stays open; see [the profile and limits](rtsp-rtp-support.md#hevc-playback-increment).

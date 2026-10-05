@@ -74,6 +74,9 @@ impl Configuration {
         }
         out
     }
+    pub(crate) fn initialization_nals(&self) -> impl Iterator<Item = &[u8]> {
+        self.initialization.iter().map(Vec::as_slice)
+    }
     pub fn access_unit(&self, data: &[u8]) -> Result<AccessUnit, String> {
         if !matches!(self.nal_length_size, 1 | 2 | 4) {
             return Err("unsupported HEVC NAL length width".into());
