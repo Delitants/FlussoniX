@@ -30,8 +30,13 @@ source contains the stated 608 or 708 packet types. Separate-track assertions
 check language/page descriptors, repeated exact encoded PES bodies, and absence
 of orphaned payloads in the filtered cases, reassembling PES across transport
 packets even for PIDs absent from the PMT. A deliberately fragmented, unannounced
-PES fixture must fail this filtering assertion. Independent FFmpeg decodes both
-H.264 video and AAC audio from every received file. Playback uses a real viewer
+PES fixture must fail this filtering assertion. Independent FFmpeg strictly
+decodes H.264 video and AAC audio from a separate copy containing complete PES.
+A wall-clock sample may stop inside the last PES on a PID; only unfinished
+terminal PES and a trailing partial transport packet are omitted from that decode
+copy. Raw caption, descriptor and orphan assertions inspect the untouched capture.
+A deterministic negative test requires an interior packet loss to remain a
+strict decoding failure after this terminal handling. Playback uses a real viewer
 token and attaches before feeding early live caption events; all ports, streams,
 secrets and media belong to the tests. Shutdown joins the listener and stops
 the worker.

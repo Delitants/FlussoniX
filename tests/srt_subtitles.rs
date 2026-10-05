@@ -14,7 +14,11 @@ use flussonix::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet, path::Path, process::Stdio, sync::atomic::Ordering, time::Duration,
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    process::Stdio,
+    sync::atomic::Ordering,
+    time::Duration,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
@@ -22,6 +26,56 @@ use tokio_util::sync::CancellationToken;
 
 const SECRET: &str = "owned-regional-srt-secret";
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn complete_sample(bytes: &[u8]) -> Vec<u8> {
+    // Raw transport assertions remain untouched. Exclude only each PID's
+    // unfinished terminal PES from a separate strict-decode copy.
+    let mut last: BTreeMap<u16, (usize, Vec<u8>)> = BTreeMap::new();
+    for (index, packet) in bytes.chunks_exact(188).enumerate() {
+        assert_eq!(packet[0], 0x47);
+        let Some(data) = original::payload(packet) else {
+            continue;
+        };
+        let pid = original::pid(packet);
+        if packet[1] & 0x40 != 0 {
+            last.insert(pid, (index, data.to_vec()));
+        } else if let Some((_, current)) = last.get_mut(&pid) {
+            current.extend(data);
+        }
+    }
+    let unfinished: BTreeMap<_, _> = last
+        .into_iter()
+        .filter_map(|(pid, (index, pes))| {
+            if pes.len() < 6 || pes[..3] != [0, 0, 1] {
+                return None;
+            }
+            let length = usize::from(u16::from_be_bytes([pes[4], pes[5]]));
+            // An unbounded video PES is proven complete by its successor. The
+            // final one has no successor in the sample, so omit it once.
+            (length == 0 || pes.len() < 6 + length).then_some((pid, index))
+        })
+        .collect();
+    let mut result = Vec::new();
+    for (index, packet) in bytes.chunks_exact(188).enumerate() {
+        if unfinished
+            .get(&original::pid(packet))
+            .is_none_or(|start| index < *start)
+        {
+            result.extend(packet);
+        }
+    }
+    result
+}
+
+async fn strict_decode(path: &Path) -> std::process::Output {
+    Command::new("ffmpeg")
+        .args(["-v", "error", "-xerror", "-threads", "1", "-i"])
+        .arg(path)
+        .args(["-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"])
+        .output()
+        .await
+        .unwrap()
+}
 
 async fn capture(endpoint: &str, listener: bool, path: &Path) -> Child {
     let log = std::fs::File::create(path.with_extension("log")).unwrap();
@@ -271,13 +325,13 @@ async fn run(push: bool, digital: bool, input: &[u8], expected: &BTreeSet<Vec<u8
         if let Some(words) = words {
             assert!(words.contains(if digital { "USA708" } else { "USA 608" }));
         }
-        let decoded = Command::new("ffmpeg")
-            .args(["-v", "error", "-xerror", "-threads", "1", "-i"])
-            .arg(&path)
-            .args(["-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"])
-            .output()
-            .await
-            .unwrap();
+        let decode_path = path.with_file_name("complete-pes.ts");
+        std::fs::write(
+            &decode_path,
+            complete_sample(&std::fs::read(&path).unwrap()),
+        )
+        .unwrap();
+        let decoded = strict_decode(&decode_path).await;
         assert!(
             decoded.status.success(),
             "{}",
@@ -374,5 +428,56 @@ fn filtered_transport_oracle_rejects_fragmented_unannounced_pes() {
     assert!(
         std::panic::catch_unwind(|| verify_original_tracks(&orphaned, false)).is_err(),
         "filter oracle accepted orphaned PES split across transport packets"
+    );
+}
+
+#[tokio::test]
+async fn finite_sample_omits_terminal_partial_pes_without_hiding_interior_corruption() {
+    let _guard = SERIAL.lock().await;
+    let bytes = original::inject(&captions::transport());
+    let starts: Vec<_> = bytes
+        .chunks_exact(188)
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let data = original::payload(p)?;
+            if p[1] & 0x40 != 0
+                && data.len() >= 6
+                && data[..3] == [0, 0, 1]
+                && (0xc0..=0xdf).contains(&data[3])
+                && 6 + usize::from(u16::from_be_bytes([data[4], data[5]])) > data.len()
+            {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let terminal = *starts.iter().find(|i| **i > bytes.len() / 188 / 2).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sample.ts");
+    let partial = &bytes[..(terminal + 1) * 188];
+    std::fs::write(&path, partial).unwrap();
+    assert!(
+        !strict_decode(&path).await.status.success(),
+        "reproducer must end in an incomplete audio PES"
+    );
+    std::fs::write(&path, complete_sample(partial)).unwrap();
+    let decoded = strict_decode(&path).await;
+    assert!(
+        decoded.status.success(),
+        "terminal capture boundary: {}",
+        String::from_utf8_lossy(&decoded.stderr)
+    );
+    // Remove an interior continuation packet, not an unfinished terminal PES.
+    let interior = *starts
+        .iter()
+        .find(|i| **i > bytes.len() / 188 / 4 && **i < terminal)
+        .unwrap();
+    let mut corrupt = bytes[..(interior + 1) * 188].to_vec();
+    corrupt.extend(&bytes[(interior + 2) * 188..]);
+    std::fs::write(&path, complete_sample(&corrupt)).unwrap();
+    assert!(
+        !strict_decode(&path).await.status.success(),
+        "interior corruption must remain visible to -xerror"
     );
 }
