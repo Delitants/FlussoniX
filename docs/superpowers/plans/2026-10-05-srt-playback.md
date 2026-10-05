@@ -29,13 +29,13 @@
 
 ### Task 1: Independent listener adapter and Stream ID parsing
 
-**Files:** Create `src/srt_playback.rs` with module exports, `src/srt_playback/native.rs`, `src/srt_playback/selection.rs`; modify `src/lib.rs`; add direct `libloading` and `libc` dependencies and lockfile; test in the new modules.
+**Files:** Create `src/srt_playback.rs` with module exports, `src/srt_playback/native.rs`, `src/srt_playback/selection.rs`; modify `src/lib.rs`; add direct `libloading` and `libc` dependencies and lockfile; create `tests/srt_listener_native.rs` and unit tests.
 
-**Interfaces:** `Settings::validate`; private native `Listener::bind`, `address`, `accept -> Result<Option<(Socket,SocketAddr)>>`; socket `stream_id`, `try_send`, `is_connected`; owned drop closes each socket. Parser `Selection::parse(&str) -> Result<Selection,String>` returns name/token only.
+**Interfaces:** `Settings::new(u32,usize,String) -> io::Result<Settings>`; private native `Listener::bind`, `address`, `accept -> Result<Option<(Socket,SocketAddr)>>`; socket `stream_id`, `try_send`, `is_connected`; owned drop closes each socket. Parser `Selection::parse(&str) -> Result<Selection,&'static str>` returns name/token only.
 
-- [ ] Write parser/settings/address tests for duplicates, unknown fields, publish mode, controls, 512-byte boundary, Unicode, invalid passphrases and latency/slot limits; run expecting missing modules.
-- [ ] Implement strict selection/settings and isolated C ABI adapter with documented unsafe call invariants, runtime version guard, nonblocking sockets and disabled library logs.
-- [ ] Add independent FFmpeg handshake/receive primitive qualification with ephemeral ports and exact IDs; run expecting PASS; commit adapter.
+- [x] Write parser/settings/address tests for duplicates, unknown fields, publish mode, controls, 512-byte boundary, Unicode, invalid passphrases and latency/slot limits; run expecting missing modules.
+- [x] Implement strict selection/settings and isolated C ABI adapter with documented unsafe call invariants, runtime version guard, nonblocking sockets and disabled library logs.
+- [x] Add independent FFmpeg handshake/receive primitive qualification with ephemeral ports and exact IDs; run expecting PASS; commit adapter.
 
 ### Task 2: Authorized shared delivery, startup and friendly runtime UI
 
