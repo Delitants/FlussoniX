@@ -347,7 +347,10 @@ async fn playback(transport: &str, audio: bool) {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.lines().filter(|l| l.starts_with("0,")).count() >= 50);
     let actual = hashes(&out.stdout, 0);
-    assert!(!actual.is_empty() && actual.is_subset(&lab.expected));
+    assert_eq!(
+        actual, lab.expected,
+        "all twelve independently decoded source pictures must appear"
+    );
     if lab.audio {
         assert!(text.lines().filter(|l| l.starts_with("1,")).count() >= 100);
     }
