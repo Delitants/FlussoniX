@@ -15,6 +15,14 @@ impl Header {
     }
 }
 pub fn inspect(codec: Codec, data: &[u8]) -> Result<Header, String> {
+    let h = header(codec, data)?;
+    if data.len() != h.frame_bytes {
+        return Err("MPEG audio frame length mismatch".into());
+    }
+    Ok(h)
+}
+/// Inspect a prefix to determine the length of an incrementally received frame.
+pub(crate) fn header(codec: Codec, data: &[u8]) -> Result<Header, String> {
     if !matches!(codec, Codec::M2a | Codec::Mp3)
         || data.len() < 4
         || data[0] != 255
@@ -58,7 +66,7 @@ pub fn inspect(codec: Codec, data: &[u8]) -> Result<Header, String> {
     };
     let coefficient = if samples == 576 { 72000 } else { 144000 };
     let frame_bytes = (coefficient * kbps / sample_rate + u32::from((data[2] >> 1) & 1)) as usize;
-    if data.len() != frame_bytes || frame_bytes < if data[1] & 1 == 0 { 6 } else { 4 } {
+    if frame_bytes < if data[1] & 1 == 0 { 6 } else { 4 } {
         return Err("MPEG audio frame length mismatch".into());
     }
     Ok(Header {

@@ -59,3 +59,5 @@ mod ts_profile;
 mod native_subtitles;
 
 mod native_hls;
+
+pub mod worker_output;
