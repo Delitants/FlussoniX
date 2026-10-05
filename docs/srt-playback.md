@@ -75,8 +75,10 @@ and native CDN pulls. Test address-family conversion and invalid settings,
 including the full Stream ID parser boundary. Browser tests verify the
 readable disabled/enabled Config card and token-placeholder output URL.
 
-DVB keep/drop delivery and regional captions use the worker's established
-policy; dedicated listener subtitle round trips are qualified separately.
+Dedicated [regional subtitle qualification](srt-subtitles.md) covers encrypted
+copy-mode CEA-608/708 and exact DVB/teletext delivery, separate-track filtering
+and CEA HLS conversion alongside SRT. Broader encoder, input and cluster
+subtitle combinations remain pending.
 SRT publication authorization, per-stream keys/ports, complete vendor API
 objects, WAN loss/retransmission, sustained throughput and scale remain
 explicit further work. Listener playback is not an HTTP LB redirect path.

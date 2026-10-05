@@ -55,9 +55,10 @@ success and wrong-secret denial, H.264/HEVC with all three audio codecs,
 simultaneous healthy/unreachable destinations, receiver restart, disabled
 destinations, on-demand activation, config replacement and process cleanup.
 Owned DVB publication tests verify retained descriptors and subtitle PES at
-the SRT receiver, and filtering when separate tracks are disabled. Dedicated
-SRT CEA/teletext delivery tests remain pending; the established worker policies
-still apply. Receiver handshake logs also verify exact Stream IDs, including a 512-byte
+the SRT receiver, and filtering when separate tracks are disabled. Dedicated [regional subtitle qualification](srt-subtitles.md) also covers encrypted
+copy-mode CEA-608/708 and exact DVB/teletext carriage, separate-track filtering
+and CEA HLS conversion alongside SRT. Broader encoder, input and cluster
+subtitle combinations remain pending. Receiver handshake logs also verify exact Stream IDs, including a 512-byte
 UTF-8 ID and punctuation-bearing passphrases from query and normal fields.
 Decoded values are passed as separate FFmpeg output options to avoid older
 versions' missing URL decode and encoded query-buffer truncation. Owned fault
