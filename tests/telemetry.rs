@@ -16,6 +16,23 @@ fn fixture() -> tempfile::TempDir {
     .unwrap();
     d
 }
+#[test]
+fn srt_listener_output_is_separate_and_included_in_process_capacity() {
+    let d = fixture();
+    let sampler =
+        Sampler::with_roots("process", d.path().join("proc"), d.path().join("sys")).unwrap();
+    let t = Instant::now();
+    sampler.sample_all_media_at(t, 100, 200, 300);
+    sampler.sample_all_media_at(t + Duration::from_secs(1), 100100, 250200, 125300);
+    let value = sampler.snapshot_at(t + Duration::from_secs(1), 1000.0);
+    assert_eq!(value["srt_egress_mbps"], 1.0);
+    assert_eq!(value["media_egress_mbps"], 3.8);
+    assert_eq!(value["egress_mbps"], 3.8);
+    assert_eq!(value["bytes_out"], 475600);
+    sampler.sample_all_media_at(t + Duration::from_secs(2), 100100, 250200, 1);
+    let value = sampler.snapshot_at(t + Duration::from_secs(2), 1000.0);
+    assert!(value["srt_egress_mbps"].is_null() && value["uplink"].is_null());
+}
 fn write(d: &Path, bytes: u64, total: u64, idle: u64) {
     std::fs::write(
         d.join("sys/class/net/wan0/statistics/tx_bytes"),

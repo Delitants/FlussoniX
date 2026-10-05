@@ -24,7 +24,9 @@ to the public [1.5.4 C declarations](https://github.com/Haivision/srt/blob/v1.5.
 and require a runtime version in the 1.5 series.
 
 Send the existing shared worker's MPEG-TS directly in messages of at most
-1316 bytes. No additional FFmpeg process or encode runs per viewer. Keep
+1316 bytes. No additional FFmpeg process or encode runs per viewer. Delivery starts live;
+a late join can wait for the next source keyframe. This profile does not replay
+a cached GOP. Keep
 nonblocking accept and send operations, a finite SRT send buffer, disabled
 linger, bounded pending/active viewers, and the existing bounded worker
 broadcast. A slow or lagging receiver closes independently. Send stalls
@@ -56,7 +58,8 @@ session deletion, stream disable/delete and media replacement terminate
 delivery. Client-supplied session metadata never becomes a trusted grant ID.
 
 Count bytes accepted by libsrt in viewer sessions and native SRT egress
-metrics. Include SRT in process-based aggregate media/uplink measurements.
+metrics. Include SRT listener output in process-based aggregate media/uplink measurements.
+Caller pushes are measured separately; interface-based uplink sampling includes all traffic.
 These counters do not prove remote acknowledgement. Never report tokens,
 raw Stream IDs, passphrases or library error strings.
 

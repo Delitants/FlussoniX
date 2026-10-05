@@ -11,6 +11,23 @@ test('Config shows actual HTTP and HTTPS listeners with startup guidance',async(
  await expect(delivery).toContainText('startup options');
  await expect(delivery.locator('input,textarea')).toHaveCount(0);
 });
+test('Config shows readable SRT playback state without exposing startup secrets',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const node=await(await request.get('/flussonix/api/v1/node',{headers})).json();
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ const playback=page.getByRole('region',{name:'SRT playback',exact:true});await expect(playback).toBeVisible();
+ await expect(playback).toContainText(node.srt_playback?.listen||'Not enabled');await expect(playback).toContainText('startup options');await expect(playback.locator('input,textarea')).toHaveCount(0);
+ if(node.srt_playback?.enabled){await expect(playback).toContainText(node.srt_playback.encrypted?'Encrypted':'Plaintext');await expect(playback).toContainText(`${node.srt_playback.latency_ms} ms`);}
+ await page.route('**/flussonix/api/v1/node',async route=>{const response=await route.fetch();const data=await response.json();data.srt_playback={enabled:false,listen:null,encrypted:false,passphrase:'owned-never-rendered-secret'};await route.fulfill({response,json:data});});
+ await expect(playback).toContainText('Not enabled');await expect(page.getByText('owned-never-rendered-secret',{exact:false})).toHaveCount(0);
+});
+test('SRT playback URL uses an IPv6 endpoint and token placeholder without saved secrets',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ expect((await request.put('/streamer/api/v3/streams/srt-ui-playback',{headers,data:{inputs:[{url:'testsrc://'}],static:false}})).ok()).toBeTruthy();
+ await page.route('**/flussonix/api/v1/node',async route=>{const response=await route.fetch();const data=await response.json();data.srt_playback={enabled:true,listen:'[::1]:28567',encrypted:true,latency_ms:120,client_limit:128,clients:0,passphrase:'owned-never-rendered-secret'};await route.fulfill({response,json:data});});
+ await page.getByRole('button',{name:'Streams',exact:true}).click();await page.getByRole('button',{name:'srt-ui-playback',exact:true}).click();await page.getByRole('button',{name:'Output',exact:true}).click();
+ const playback=page.getByRole('region',{name:'SRT playback URL',exact:true});await expect(playback).toBeVisible();await expect(playback).toContainText('srt://[::1]:28567');await expect(playback).toContainText('#!::r=srt-ui-playback,m=request,u=YOUR_TOKEN');await expect(playback).toContainText('client passphrase');await expect(playback).not.toContainText('owned-never-rendered-secret');await expect(page.locator('textarea')).toHaveCount(0);
+});
 test('create owned stream and show persisted operational state',async({page})=>{await page.getByRole('button',{name:'Add stream'}).click();await page.getByLabel('Stream name',{exact:true}).fill('ui-test');await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('heading',{name:'ui-test',exact:true})).toBeVisible();await page.getByRole('button',{name:'← Streams'}).click();await expect(page.getByRole('button',{name:'ui-test',exact:true})).toBeVisible();await page.screenshot({path:'../.runtime/screenshots/streams.png',fullPage:true});});
 test('configuration edits can be validated without applying',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};

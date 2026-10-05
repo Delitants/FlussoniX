@@ -39,11 +39,12 @@ jobs:
           export FLUSSONIX_ADMIN_USER=admin
           export FLUSSONIX_ADMIN_PASSWORD="$(openssl rand -hex 24)"
           export FLUSSONIX_PEER_KEY="$(openssl rand -hex 32)"
+          export FLUSSONIX_SRT_PLAY_PASSPHRASE="$(openssl rand -hex 24)"
           mkdir -p .runtime
           export FLUSSONIX_TEST_CA_FILE="$PWD/.runtime/ui-test-ca.pem"
           openssl req -x509 -newkey rsa:2048 -nodes -keyout .runtime/ui-test-ca.key -out "$FLUSSONIX_TEST_CA_FILE" -days 2 -subj '/CN=FlussoniX CI test CA' -addext 'basicConstraints=critical,CA:TRUE' > .runtime/ui-test-ca.log 2>&1
           chmod 600 .runtime/ui-test-ca.key
-          ./target/debug/flussonix --config .runtime/config.json --media-dir .runtime/media > .runtime/server.log 2>&1 &
+          ./target/debug/flussonix --config .runtime/config.json --media-dir .runtime/media --srt-play-listen 127.0.0.1:0 > .runtime/server.log 2>&1 &
           flussonix_ci_pid=$!
           trap 'kill "$flussonix_ci_pid"; wait "$flussonix_ci_pid" || true' EXIT
           for attempt in $(seq 1 40); do

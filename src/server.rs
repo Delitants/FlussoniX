@@ -84,6 +84,7 @@ struct Resolved {
 }
 pub struct App {
     http_delivery: std::sync::Mutex<Value>,
+    srt_playback: std::sync::Mutex<Value>,
     pub config: ConfigStore,
     pub media: Engine,
     credentials: Credentials,
@@ -95,6 +96,8 @@ pub struct App {
     pub egress: Arc<AtomicU64>,
     pub rtsp_egress: Arc<AtomicU64>,
     pub rtsp_udp_egress: Arc<AtomicU64>,
+    pub srt_egress: Arc<AtomicU64>,
+    pub(crate) srt_connections: AtomicU64,
     telemetry: crate::telemetry::Sampler,
     pub started: Instant,
     mirrors: Mutex<HashMap<String, Mirror>>,
@@ -132,6 +135,9 @@ impl App {
             http_delivery: std::sync::Mutex::new(
                 json!({"http":null,"https":null,"https_only":false}),
             ),
+            srt_playback: std::sync::Mutex::new(
+                json!({"enabled":false,"listen":null,"encrypted":false}),
+            ),
             config: ConfigStore::open(config)?,
             media: Engine::new(media, &options.ffmpeg),
             credentials,
@@ -148,6 +154,8 @@ impl App {
             egress: Arc::new(AtomicU64::new(0)),
             rtsp_egress: Arc::new(AtomicU64::new(0)),
             rtsp_udp_egress: Arc::new(AtomicU64::new(0)),
+            srt_egress: Arc::new(AtomicU64::new(0)),
+            srt_connections: AtomicU64::new(0),
             telemetry: crate::telemetry::Sampler::new(&options.uplink_interface)?,
             started: Instant::now(),
             mirrors: Mutex::new(HashMap::new()),
@@ -160,6 +168,14 @@ impl App {
     }
     pub fn set_http_delivery(&self, http: Option<SocketAddr>, https: Option<SocketAddr>) {
         *self.http_delivery.lock().unwrap() = json!({"http":http.map(|a|a.to_string()),"https":https.map(|a|a.to_string()),"https_only":http.is_none() && https.is_some()});
+    }
+    pub fn set_srt_playback(&self, listener: Option<&crate::srt_playback::Listener>) {
+        *self.srt_playback.lock().unwrap() = match listener {
+            Some(l) => {
+                json!({"enabled":true,"listen":l.address().to_string(),"encrypted":l.settings().encrypted(),"latency_ms":l.settings().latency_millis(),"client_limit":l.settings().client_limit()})
+            }
+            None => json!({"enabled":false,"listen":null,"encrypted":false}),
+        };
     }
     fn cluster_client(&self, node: &Value) -> Result<reqwest::Client, String> {
         let Some(ca) = node.get("flussonix_tls_ca") else {
@@ -326,6 +342,10 @@ impl App {
         }
         let mut metrics = self.telemetry.snapshot(self.options.uplink_mbps);
         metrics["rtsp_udp_bytes_out"] = json!(self.rtsp_udp_egress.load(Ordering::Relaxed));
+        metrics["srt_bytes_out"] = json!(self.srt_egress.load(Ordering::Relaxed));
+        let mut srt = self.srt_playback.lock().unwrap().clone();
+        srt["clients"] = json!(self.srt_connections.load(Ordering::Relaxed));
+        metrics["srt_playback"] = srt;
         let mut reservations = self.reservations.lock().await;
         reservations.retain(|_, v| v.expires > Instant::now());
         let reserved = reservations.len() as u64;
@@ -338,9 +358,10 @@ impl App {
         metrics
     }
     pub fn sample_metrics(&self) {
-        self.telemetry.sample_media(
+        self.telemetry.sample_all_media(
             self.egress.load(Ordering::Relaxed),
             self.rtsp_egress.load(Ordering::Relaxed),
+            self.srt_egress.load(Ordering::Relaxed),
         );
     }
 
@@ -641,7 +662,7 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
     }
     if tail == "capabilities" && request.method() == "GET" {
         return json_response(
-            json!({"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","rtsps (verified TLS, interleaved TCP)","srt","publish:// (HTTP MPEG-TS receive)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["srt (caller push, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","rtsp (TCP / opt-in unicast UDP playback, H.264/AAC-LC)","rtsps (opt-in TLS TCP playback, H.264/AAC-LC)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["direct rtp","srtp","rtsp publication / push","rtsp Basic / Digest viewer auth","dvr","non-SRT push","srt listener playback / publication policy"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA H.264 / HEVC; initialization check only, delivered GPU media not qualified","gpu_profiles":app.media.gpu_capabilities().await},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP redirects"}),
+            json!({"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","rtsps (verified TLS, interleaved TCP)","srt","publish:// (HTTP MPEG-TS receive)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["srt (caller push / global listener playback, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","rtsp (TCP / opt-in unicast UDP playback, H.264/AAC-LC)","rtsps (opt-in TLS TCP playback, H.264/AAC-LC)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["direct rtp","srtp","rtsp publication / push","rtsp Basic / Digest viewer auth","dvr","non-SRT push","srt publication policy / per-stream playback listeners"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA H.264 / HEVC; initialization check only, delivered GPU media not qualified","gpu_profiles":app.media.gpu_capabilities().await},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP redirects"}),
         );
     }
     if let Some(name) = tail.strip_prefix("stream/") {
@@ -1290,5 +1311,6 @@ mod continuous_session_tests {
 mod origin_resolution;
 
 pub(crate) mod rtsp_access;
+pub(crate) mod ts_access;
 
 mod publication;

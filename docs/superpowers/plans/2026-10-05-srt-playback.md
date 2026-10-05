@@ -43,8 +43,8 @@
 
 **Interfaces:** `serve(Listener,Arc<App>,CancellationToken)` owns finite viewer tasks; `App::ts_admit`/`ts_current` return fenced worker/grant without RTP constraints. App exposes sanitized listener state and SRT egress. CLI uses optional `--srt-play-listen`, latency/limit and hidden environment passphrase.
 
-- [ ] Write owned receiver tests for six codec combinations, encryption denial, two viewers/one worker, denied/stalled callbacks, session revoke, worker replacement, slot recovery, shutdown and authenticated CDN pull; run expecting missing playback.
-- [ ] Implement grant/worker fencing and direct bounded TS fan-out, byte accounting and process aggregate metrics; wire startup validation/bind and fatal listener/shutdown handling.
-- [ ] Extend saved Superdesign Config/output direction and browser cases for readable listener status and placeholder URL; implement normal UI, run targeted checks expecting PASS.
+- [x] Write owned receiver tests for six codec combinations, encryption denial, two viewers/one worker, denied/stalled callbacks, session revoke, worker replacement, slot recovery, shutdown and authenticated CDN pull; run expecting missing playback.
+- [x] Implement grant/worker fencing and direct bounded TS fan-out, byte accounting and process aggregate metrics; wire startup validation/bind and fatal listener/shutdown handling.
+- [x] Extend saved Superdesign Config/output direction and browser cases for readable listener status and placeholder URL; implement normal UI, run targeted checks expecting PASS.
 - [ ] Run formatting, warnings-denied clippy, full Rust then full browser checks; obtain one fresh review, resolve material findings with RED/GREEN, require exact-head CI.
 - [ ] Fast-forward and publish main, refresh the owned preview with private config hash preserved, archive evidence and clean the merged worktree.

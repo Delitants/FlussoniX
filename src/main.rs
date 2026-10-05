@@ -33,6 +33,20 @@ struct Args {
     /// Per-viewer RTP application-data cap in Mbps (1..10000; default 100).
     #[arg(long, requires = "rtsp_udp_ports")]
     rtsp_udp_mbps: Option<f64>,
+    /// Optional shared SRT playback UDP listener (disabled by default).
+    #[arg(long)]
+    srt_play_listen: Option<SocketAddr>,
+    #[arg(long, requires = "srt_play_listen")]
+    srt_play_latency: Option<u32>,
+    #[arg(long, requires = "srt_play_listen")]
+    srt_play_client_limit: Option<usize>,
+    #[arg(
+        long,
+        env = "FLUSSONIX_SRT_PLAY_PASSPHRASE",
+        hide_env_values = true,
+        requires = "srt_play_listen"
+    )]
+    srt_play_passphrase: Option<String>,
     #[arg(long, default_value = "config.json")]
     config: PathBuf,
     #[arg(long, default_value = "runtime/media")]
@@ -80,6 +94,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Some(cert), Some(key)) => Some(flussonix::rtsp::tls::server(cert, key)?),
         _ => None,
     };
+    // Validate encryption/limits and bind UDP before config/media ownership starts.
+    let srt_listener = match a.srt_play_listen {
+        Some(address) => Some(flussonix::srt_playback::Listener::bind(
+            address,
+            flussonix::srt_playback::Settings::new(
+                a.srt_play_latency.unwrap_or(120),
+                a.srt_play_client_limit.unwrap_or(128),
+                a.srt_play_passphrase.unwrap_or_default(),
+            )?,
+        )?),
+        None => None,
+    };
     let options = Options {
         admin_user: a.admin_user,
         admin_password: a.admin_password,
@@ -125,13 +151,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|l| l.local_addr())
         .transpose()?;
     app.set_http_delivery(http_address, https_address);
+    app.set_srt_playback(srt_listener.as_ref());
     println!(
         "{}",
-        serde_json::json!({"service":"FlussoniX","listen":http_address.map(|a|a.to_string()),"https_listen":https_address.map(|a|a.to_string()),"rtsp_listen":rtsp_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"rtsps_listen":tls_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"rtsp_udp_ports":a.rtsp_udp_ports.map(|p|p.to_string()),"rtsp_udp_mbps":a.rtsp_udp_ports.map(|_|udp_rate),"version":env!("CARGO_PKG_VERSION")})
+        serde_json::json!({"service":"FlussoniX","listen":http_address.map(|a|a.to_string()),"https_listen":https_address.map(|a|a.to_string()),"rtsp_listen":rtsp_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"rtsps_listen":tls_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"srt_play_listen":srt_listener.as_ref().map(|l|l.address().to_string()),"srt_play_encrypted":srt_listener.as_ref().map(|l|l.settings().encrypted()),"rtsp_udp_ports":a.rtsp_udp_ports.map(|p|p.to_string()),"rtsp_udp_mbps":a.rtsp_udp_ports.map(|_|udp_rate),"version":env!("CARGO_PKG_VERSION")})
     );
     app.reconcile().await;
     let background = app.clone();
     let cancel = tokio_util::sync::CancellationToken::new();
+    let mut srt_task = srt_listener.map(|listener| {
+        tokio::spawn(flussonix::srt_playback::serve(
+            listener,
+            app.clone(),
+            cancel.clone(),
+        ))
+    });
     let mut rtsp_task = rtsp_listener.map(|listener| {
         tokio::spawn(flussonix::rtsp::serve_with_udp(
             listener,
@@ -194,16 +228,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut rtsp_result = None;
     let mut tls_result = None;
+    let mut srt_result = None;
     let completed = tokio::select! {
         result=serving.next()=>result,
         result=async{match rtsp_task.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{rtsp_result=Some(result);None},
         result=async{match tls_task.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{tls_result=Some(result);None},
+        result=async{match srt_task.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{srt_result=Some(result);None},
         _=shutdown()=>None
     };
     cancel.cancel();
     let _ = supervisor.await;
     let _ = authorization.await;
     let _ = telemetry.await;
+    if srt_result.is_none() {
+        if let Some(task) = srt_task {
+            srt_result = Some(task.await);
+        }
+    }
     app.media.stop_all().await;
     if rtsp_result.is_none() {
         if let Some(task) = rtsp_task {
@@ -234,6 +275,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         result??;
     }
     if let Some(result) = tls_result {
+        result??;
+    }
+    if let Some(result) = srt_result {
         result??;
     }
     Ok(())
