@@ -192,6 +192,10 @@ impl Engine {
         self.ensure_guarded(name, cfg, false, std::future::ready(true))
             .await
     }
+    #[cfg(test)]
+    pub(crate) async fn hold_startups_for_test(&self) -> impl Drop + '_ {
+        self.workers.lock().await
+    }
     pub async fn ensure_guarded(
         &self,
         name: &str,

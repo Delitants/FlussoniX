@@ -125,18 +125,41 @@ async fn send(
     cancel: &CancellationToken,
     revision: &mut u64,
 ) -> Result<(), ()> {
+    send_with(data, app, playback, cancel, revision, |data| {
+        socket.try_send(data)
+    })
+    .await
+}
+// The write operation is isolated so cancellation/source interleavings can be
+// tested deterministically without depending on kernel buffer timing.
+pub(crate) async fn send_with(
+    data: &[u8],
+    app: &App,
+    playback: &Playback,
+    cancel: &CancellationToken,
+    revision: &mut u64,
+    mut write: impl FnMut(&[u8]) -> std::io::Result<bool>,
+) -> Result<(), ()> {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         if cancel.is_cancelled() || playback.grant.is_cancelled() || playback.worker.is_closed() {
             return Err(());
         }
-        if app.config.revision() != *revision {
-            if !app.ts_current(playback).await {
-                return Err(());
-            }
-            *revision = app.config.revision();
+        // Validate after every pending wait and immediately before each write.
+        // A mirror can change while the root configuration revision stays equal.
+        let checked_revision = app.config.revision();
+        let current = tokio::select! {biased;_=cancel.cancelled()=>return Err(()),_=playback.grant.cancelled()=>return Err(()),_=playback.worker.closed()=>return Err(()),_=tokio::time::sleep_until(deadline)=>return Err(()),value=app.ts_current(playback)=>value};
+        if !current {
+            return Err(());
         }
-        match socket.try_send(data) {
+        if app.config.revision() != checked_revision {
+            continue;
+        }
+        *revision = checked_revision;
+        if cancel.is_cancelled() || playback.grant.is_cancelled() || playback.worker.is_closed() {
+            return Err(());
+        }
+        match write(data) {
             Ok(true) => {
                 playback.grant.add_bytes(data.len());
                 app.srt_egress
@@ -145,12 +168,6 @@ async fn send(
             }
             Ok(false) => {}
             Err(_) => return Err(()),
-        }
-        // A pending write may span a policy/source update even without a local
-        // revision change. Recheck before retrying instead of queuing stale media.
-        let current = tokio::select! {biased;_=cancel.cancelled()=>return Err(()),_=playback.grant.cancelled()=>return Err(()),_=playback.worker.closed()=>return Err(()),value=app.ts_current(playback)=>value};
-        if !current {
-            return Err(());
         }
         tokio::select! {biased;_=cancel.cancelled()=>return Err(()),_=playback.grant.cancelled()=>return Err(()),_=playback.worker.closed()=>return Err(()),_=tokio::time::sleep_until(deadline)=>return Err(()),_=tokio::time::sleep(Duration::from_millis(2))=>{}}
     }
