@@ -267,7 +267,7 @@ impl App {
                 if let Some(name) = disk["name"].as_str() {
                     if let Some((config, revision)) = self.media_config(name).await {
                         if config["disabled"] != true
-                            && config["static"] != false
+                            && (config["static"] != false || crate::srt_push::enabled(&config))
                             && self.options.role != "lb"
                         {
                             self.recover_current(name, &config, revision).await;

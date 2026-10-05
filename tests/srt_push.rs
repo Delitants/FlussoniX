@@ -1,0 +1,372 @@
+use flussonix::config::ConfigStore;
+use serde_json::json;
+use std::{path::Path, sync::atomic::Ordering, time::Duration};
+use tokio::process::Command;
+
+static MEDIA_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn unused_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+async fn receiver(path: &Path, port: u16, secret: &str) -> tokio::process::Child {
+    let mut cmd = Command::new("ffmpeg");
+    let url = format!(
+        "srt://127.0.0.1:{port}?mode=listener&listen_timeout=15000000&timeout=5000000&passphrase={secret}&enforced_encryption=1"
+    );
+    let child = cmd
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "mpegts",
+            "-i",
+            &url,
+            "-map",
+            "0:v?",
+            "-map",
+            "0:a?",
+            "-t",
+            "2",
+            "-c",
+            "copy",
+            "-f",
+            "mpegts",
+        ])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    child
+}
+
+async fn received(child: &mut tokio::process::Child, path: &Path, video: &str, audio: &str) {
+    assert!(
+        tokio::time::timeout(Duration::from_secs(20), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    let result = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .await
+        .unwrap();
+    assert!(result.status.success());
+    let tracks: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    let codecs: Vec<_> = tracks["streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["codec_name"].as_str().unwrap())
+        .collect();
+    assert!(codecs.contains(&video), "missing {video}: {codecs:?}");
+    assert!(codecs.contains(&audio), "missing {audio}: {codecs:?}");
+    let decoded = Command::new("ffmpeg")
+        .args(["-v", "error", "-xerror", "-threads", "2", "-i"])
+        .arg(path)
+        .args(["-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        decoded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decoded.stderr)
+    );
+}
+
+async fn wait_push(w: &flussonix::media::Worker, index: usize, state: &str) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let s = w.stats()["flussonix_pushes"][index].clone();
+            if s["status"] == state {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("push never reached {state}: {}", w.stats()))
+}
+
+#[tokio::test]
+async fn encrypted_srt_delivers_h264_hevc_with_aac_layer_ii_and_mp3() {
+    let _lock = MEDIA_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = flussonix::media::Engine::new(dir.path().join("media"), "ffmpeg");
+    for (video, encoder) in [("h264", "libx264"), ("hevc", "libx265")] {
+        for (audio, acodec, ab) in [
+            ("aac", "aac", 96),
+            ("mp2", "mp2a", 192),
+            ("mp3", "mp3", 128),
+        ] {
+            let port = unused_udp_port();
+            let path = dir.path().join(format!("{video}-{audio}.ts"));
+            let mut rx = receiver(&path, port, "owned-secret-123").await;
+            let cfg = json!({"inputs":[{"url":"testsrc://"}],"transcoder":{"encoder":encoder,"acodec":acodec,"ab":ab},"pushes":[{"url":format!("srt://127.0.0.1:{port}"),"streamid":"#!::r=owned,m=publish,password=owned-sensitive-id","passphrase":"owned-secret-123","latency":200,"retry_timeout":1}]});
+            let worker = engine.ensure("owned", &cfg).await.unwrap();
+            let s = wait_push(&worker, 0, "sending").await;
+            assert!(s["muxed_bytes"].as_u64().unwrap() > 0);
+            assert!(!worker.stats().to_string().contains("owned-secret"));
+            assert!(!worker.stats().to_string().contains("owned-sensitive-id"));
+            received(&mut rx, &path, video, audio).await;
+            engine.stop_all().await;
+            assert!(!worker.alive.load(Ordering::Relaxed));
+            assert_eq!(worker.stats()["flussonix_pushes"][0]["pid"], 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn unavailable_destination_does_not_block_healthy_output_and_reconnects() {
+    let _lock = MEDIA_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let port = unused_udp_port();
+    let bad = unused_udp_port();
+    let path = dir.path().join("first.ts");
+    let mut rx = receiver(&path, port, "").await;
+    let engine = flussonix::media::Engine::new(dir.path().join("media"), "ffmpeg");
+    let cfg = json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":format!("srt://127.0.0.1:{port}"),"retry_timeout":1},{"url":format!("srt://127.0.0.1:{bad}"),"connect_timeout":1,"retry_timeout":1}]});
+    let w = engine.ensure("owned", &cfg).await.unwrap();
+    wait_push(&w, 1, "retrying").await;
+    received(&mut rx, &path, "h264", "aac").await;
+    assert!(w.alive.load(Ordering::Relaxed));
+    assert_eq!(engine.count().await, 1);
+    assert!(!engine.read("owned", "index.m3u8").await.unwrap().is_empty());
+    let second = dir.path().join("second.ts");
+    let mut rx = receiver(&second, port, "").await;
+    received(&mut rx, &second, "h264", "aac").await;
+    assert!(
+        w.stats()["flussonix_pushes"][0]["attempts"]
+            .as_u64()
+            .unwrap()
+            >= 2
+    );
+    let pids: Vec<u64> = w.stats()["flussonix_pushes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["pid"].as_u64())
+        .filter(|p| *p > 0)
+        .collect();
+    tokio::time::timeout(Duration::from_secs(3), engine.stop_all())
+        .await
+        .unwrap();
+    for pid in pids {
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+    assert_eq!(w.stats()["flussonix_pushes"][0]["status"], "stopped");
+}
+
+#[tokio::test]
+async fn wrong_passphrase_fails_closed_and_replacement_reaps_old_pushes() {
+    let _lock = MEDIA_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let port = unused_udp_port();
+    let path = dir.path().join("wrong.ts");
+    let mut rx = receiver(&path, port, "owned-right-secret").await;
+    let engine = flussonix::media::Engine::new(dir.path().join("media"), "ffmpeg");
+    let cfg = json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":format!("srt://127.0.0.1:{port}"),"passphrase":"owned-wrong-secret","connect_timeout":1,"retry_timeout":1}]});
+    let old = engine.ensure("owned", &cfg).await.unwrap();
+    wait_push(&old, 0, "retrying").await;
+    assert!(old.alive.load(Ordering::Relaxed));
+    assert!(std::fs::metadata(&path).is_err());
+    let mut replacement = cfg.clone();
+    replacement["pushes"][0]["disabled"] = json!(true);
+    let new = engine.ensure("owned", &replacement).await.unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&old, &new));
+    assert!(!old.alive.load(Ordering::Relaxed));
+    assert_eq!(old.stats()["flussonix_pushes"][0]["pid"], 0);
+    assert_eq!(new.stats()["flussonix_pushes"][0]["status"], "disabled");
+    assert_eq!(new.stats()["flussonix_pushes"][0]["attempts"], 0);
+    engine.stop_all().await;
+    let _ = rx.kill().await;
+    let _ = rx.wait().await;
+}
+
+#[tokio::test]
+async fn configured_push_starts_on_demand_but_disabled_and_publication_wait() {
+    let _lock = MEDIA_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(dir.path().join("config.json")).unwrap();
+    let cfg = json!({"static":false,"inputs":[{"url":"testsrc://"}],"pushes":[{"url":format!("srt://127.0.0.1:{}",unused_udp_port()),"connect_timeout":1}]});
+    store.put("streams", "owned", cfg.clone()).unwrap();
+    let mut disabled = cfg.clone();
+    disabled["pushes"][0]["disabled"] = json!(true);
+    store.put("streams", "disabled", disabled).unwrap();
+    store
+        .put(
+            "streams",
+            "publication",
+            json!({"static":false,"inputs":[{"url":"publish://"}],"pushes":cfg["pushes"]}),
+        )
+        .unwrap();
+    let app = flussonix::server::App::new(
+        dir.path().join("config.json"),
+        dir.path().join("media"),
+        flussonix::server::Options {
+            admin_password: "owned-admin-password".into(),
+            peer_key: "owned-peer-secret".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    app.reconcile().await;
+    assert_eq!(app.media.count().await, 1);
+    assert_ne!(app.media.stats("owned").await["status"], "waiting");
+    assert_eq!(app.media.stats("disabled").await["status"], "waiting");
+    assert_eq!(app.media.stats("publication").await["status"], "waiting");
+    app.media.stop_all().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stalled_push_is_reaped_while_the_shared_worker_keeps_running() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = MEDIA_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let wrapper = dir.path().join("owned-ffmpeg-wrapper");
+    std::fs::write(&wrapper,"#!/usr/bin/python3\nimport os,sys,time\nif '-progress' in sys.argv: time.sleep(30)\nelse: os.execv('/usr/bin/ffmpeg',['ffmpeg']+sys.argv[1:])\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = flussonix::media::Engine::new(dir.path().join("media"), wrapper.to_str().unwrap());
+    let cfg = json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":"srt://127.0.0.1:19999","retry_timeout":5}]});
+    let w = engine.ensure("owned", &cfg).await.unwrap();
+    let pid = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(pid) = w.stats()["flussonix_pushes"][0]["pid"]
+                .as_u64()
+                .filter(|p| *p > 0)
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let s = wait_push(&w, 0, "retrying").await;
+    assert_eq!(s["last_error"], "push_stalled");
+    assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    assert!(w.alive.load(Ordering::Relaxed));
+    assert!(w.bytes.load(Ordering::Relaxed) > 0);
+    let _ = wait_push(&w, 0, "connecting").await;
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(2), engine.stop_all())
+        .await
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(w.stats()["flussonix_pushes"][0]["pid"], 0);
+}
+
+#[test]
+fn destinations_inherit_persist_and_explicit_empty_disables_them() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("config.json");
+    let store = ConfigStore::open(&path).unwrap();
+    let push = json!({"url":"srt://127.0.0.1:19992","streamid":"#!::r=owned,m=publish","passphrase":"owned-secret-123","latency":250,"connect_timeout":2});
+    store
+        .put(
+            "templates",
+            "owned",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}],"pushes":[push]}),
+        )
+        .unwrap();
+    store
+        .put("streams", "one", json!({"template":"owned"}))
+        .unwrap();
+    assert_eq!(store.effective("one").unwrap()["pushes"][0], push);
+    drop(store);
+    let store = ConfigStore::open(&path).unwrap();
+    assert_eq!(store.effective("one").unwrap()["pushes"][0], push);
+    store.put("streams", "one", json!({"pushes":[]})).unwrap();
+    assert_eq!(store.effective("one").unwrap()["pushes"], json!([]));
+    store.put("streams", "one", json!({"pushes":null})).unwrap();
+    assert_eq!(store.effective("one").unwrap()["pushes"][0], push);
+}
+
+#[test]
+fn raw_and_encoded_stream_ids_are_accepted_without_accepting_hidden_options() {
+    let d = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(d.path().join("config.json")).unwrap();
+    for url in [
+        "srt://127.0.0.1:19992?streamid=#!::r=owned,m=publish&latency=250",
+        "srt://[::1]:19992?streamid=%23!%3A%3Ar%3Downed%2Cm%3Dpublish",
+        "srt://receiver.example:9000?mode=caller&passphrase=owned-secret-123",
+    ] {
+        store
+            .put(
+                "streams",
+                "owned",
+                json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":url}]}),
+            )
+            .unwrap();
+    }
+    let saved = store.snapshot();
+    for url in [
+        "srt://127.0.0.1:19992?streamid=#!::r=owned&unknown=owned-secret-123",
+        "srt://127.0.0.1:19992?passphrase=owned-secret-123&passphrase=second-secret",
+        "srt://127.0.0.1:19992?mode=listener",
+        "srt://127.0.0.1:19992?pbkeylen=0",
+        "srt://127.0.0.1:19992/path",
+        "srt://user:owned-secret-123@receiver:9000",
+        "http://receiver:9000",
+    ] {
+        let err = store
+            .put("streams", "owned", json!({"pushes":[{"url":url}]}))
+            .unwrap_err();
+        assert!(!err.contains("owned-secret-123"));
+        assert_eq!(store.snapshot(), saved);
+    }
+}
+
+#[test]
+fn invalid_push_profiles_are_rejected_atomically_without_secrets() {
+    let d = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(d.path().join("config.json")).unwrap();
+    store
+        .put("streams", "owned", json!({"inputs":[{"url":"testsrc://"}]}))
+        .unwrap();
+    let saved = store.snapshot();
+    for patch in [
+        json!({"pushes":{}}),
+        json!({"pushes":[{"url":"srt://receiver:9000","latency":0}]}),
+        json!({"pushes":[{"url":"srt://receiver:9000","connect_timeout":0}]}),
+        json!({"pushes":[{"url":"srt://receiver:9000","retry_timeout":301}]}),
+        json!({"pushes":[{"url":"srt://receiver:9000","passphrase":"short"}]}),
+        json!({"pushes":[{"url":"srt://receiver:9000","enforcedencryption":false}]}),
+        json!({"pushes":[{"url":"srt://receiver:9000?latency=100","latency":200}]}),
+        json!({"pushes":[{"url":"srt://receiver:9000","disabled":"true"}]}),
+        json!({"pushes":[{"url":"srt://receiver:9000","streamid":"x".repeat(513)}]}),
+        json!({"pushes":vec![json!({"url":"srt://receiver:9000"});5]}),
+    ] {
+        assert!(store.put("streams", "owned", patch).is_err());
+        assert_eq!(store.snapshot(), saved);
+    }
+    for patch in [
+        json!({"pushes":[{"url":"srt://receiver:9000","latency":10000,"connect_timeout":30,"retry_timeout":300,"passphrase":"x".repeat(79)}]}),
+        json!({"pushes":[{"url":"srt://receiver:9000","disabled":true}]}),
+        json!({"pushes":[]}),
+    ] {
+        store.put("streams", "owned", patch).unwrap();
+    }
+}

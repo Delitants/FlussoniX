@@ -6,6 +6,7 @@ pub mod m4s;
 pub mod media;
 pub mod playback_auth;
 pub mod server;
+mod srt_push;
 pub mod telemetry;
 pub mod wire;
 

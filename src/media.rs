@@ -50,6 +50,8 @@ pub struct Worker {
     hls_subtitles: &'static str,
     native_text_tracks: AtomicU64,
     captions: Option<Arc<crate::caption_hls::State>>,
+    pushes: Vec<Arc<crate::srt_push::State>>,
+    active_pushes: bool,
     restart_count: u64,
     input_timeout: Duration,
     recovery: std::sync::Mutex<crate::recovery::Recovery>,
@@ -104,6 +106,10 @@ impl Worker {
             "stopped"
         };
         let mut stats = json!({"status":status,"pid":self.pid(),"bytes_in":self.bytes.load(Ordering::Relaxed),"online_clients":self.viewers.load(Ordering::Relaxed),"uptime":self.started.elapsed().as_secs(),"input_protocol":self.input_protocol,"input_index":self.input_index,"restart_count":self.restart_count,"retry_in_ms":recovery.retry_in().map(|d|d.as_millis()),"last_error":recovery.last_error(),"media_age_ms":recovery.media_age_ms(),"subtitle_tracks":self.subtitle_tracks,"hls_subtitles":self.hls_subtitles,"hls_captions":self.captions.as_ref().map(|c|c.stats())});
+        if !self.pushes.is_empty() {
+            stats["flussonix_pushes"] =
+                json!(self.pushes.iter().map(|p| p.stats()).collect::<Vec<_>>());
+        }
         let native_text_tracks = self.native_text_tracks.load(Ordering::Relaxed);
         if native_text_tracks > 0 {
             stats["native_subtitle_tracks"] = json!(native_text_tracks);
@@ -205,6 +211,7 @@ impl Engine {
         publishing: bool,
     ) -> Result<Arc<Worker>, String> {
         let subtitle_tracks = crate::config::subtitle_tracks(cfg)?;
+        let destinations = crate::srt_push::configuration(cfg)?;
         let hls_subtitles = crate::config::hls_subtitles(cfg)?;
         let caption_services = crate::captions::configuration(cfg)?;
         let native_captions = caption_services.iter().any(|s| s.native_track().is_some());
@@ -596,6 +603,12 @@ impl Engine {
             hls_subtitles,
             native_text_tracks: AtomicU64::new(0),
             captions,
+            pushes: destinations
+                .into_iter()
+                .enumerate()
+                .map(|(i, d)| crate::srt_push::State::new(d, i))
+                .collect(),
+            active_pushes: crate::srt_push::enabled(cfg),
             input_index: index,
             input_protocol: input.split("://").next().unwrap_or("unknown").into(),
             restart_count,
@@ -616,6 +629,17 @@ impl Engine {
         workers.insert(name.into(), worker.clone());
         let w = worker.clone();
         let tesseract = self.tesseract.clone();
+        let push_tasks: Vec<_> = worker
+            .pushes
+            .iter()
+            .map(|state| {
+                tokio::spawn(state.clone().run(
+                    self.ffmpeg.clone(),
+                    worker.tx.subscribe(),
+                    cancel.clone(),
+                ))
+            })
+            .collect();
         tokio::spawn(async move {
             let mut tasks = Vec::new();
             // Early returns only leave this setup/run block. The owner always
@@ -808,6 +832,9 @@ impl Engine {
                 }
             }.await;
             cancel.cancel();
+            for task in push_tasks {
+                let _ = task.await;
+            }
             for task in tasks {
                 task.abort();
                 let _ = task.await;
@@ -1001,7 +1028,10 @@ impl Engine {
             .await
             .iter()
             .filter(|(_, w)| {
-                !w.publication && w.idle_seconds() >= 60 && w.viewers.load(Ordering::Relaxed) == 0
+                !w.publication
+                    && !w.active_pushes
+                    && w.idle_seconds() >= 60
+                    && w.viewers.load(Ordering::Relaxed) == 0
             })
             .map(|(n, _)| n.clone())
             .collect()
@@ -1074,7 +1104,7 @@ pub fn translate_input(input: &str) -> Result<String, String> {
 }
 
 pub fn media_signature(cfg: &Value) -> String {
-    format!("{:x}",Sha256::digest(serde_json::to_vec(&json!({"inputs":cfg["inputs"],"transcoder":cfg["transcoder"],"peer":cfg["flussonix_peer_key"],"timeout":cfg["flussonix_input_timeout"],"subtitle_tracks":cfg["flussonix_subtitle_tracks"],"hls_captions":cfg["flussonix_hls_captions"],"hls_subtitles":cfg["flussonix_hls_subtitles"]})).unwrap()))
+    format!("{:x}",Sha256::digest(serde_json::to_vec(&json!({"inputs":cfg["inputs"],"transcoder":cfg["transcoder"],"pushes":cfg["pushes"],"peer":cfg["flussonix_peer_key"],"timeout":cfg["flussonix_input_timeout"],"subtitle_tracks":cfg["flussonix_subtitle_tracks"],"hls_captions":cfg["flussonix_hls_captions"],"hls_subtitles":cfg["flussonix_hls_subtitles"]})).unwrap()))
 }
 
 #[cfg(test)]

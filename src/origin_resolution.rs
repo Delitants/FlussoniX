@@ -189,6 +189,8 @@ impl App {
             }
         }
         c.as_object_mut().ok_or(())?.remove("transcoder");
+        // Output destinations belong to local configuration, never source discovery.
+        c.as_object_mut().ok_or(())?.remove("pushes");
         c["static"] = json!(false);
         c["flussonix_peer_key"] = json!(
             source["cluster_key"]
@@ -505,6 +507,31 @@ impl App {
 
 #[cfg(test)]
 mod cache_tests {
+    #[test]
+    fn discovered_origin_pushes_are_never_activated_on_a_cdn() {
+        let d = tempfile::tempdir().unwrap();
+        let app = super::App::new(
+            d.path().join("config.json"),
+            d.path().join("media"),
+            super::Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let raw = serde_json::json!({"name":"owned","pushes":[{"url":"srt://receiver:9000","passphrase":"owned-upstream-secret"}]});
+        let normalized = app
+            .normalize_origin(
+                &serde_json::json!({"api_url":"http://127.0.0.1:19990"}),
+                "owned",
+                raw,
+                &app.config.snapshot(),
+            )
+            .unwrap();
+        assert!(normalized.get("pushes").is_none());
+        assert!(!crate::srt_push::enabled(&normalized));
+    }
     use super::*;
     #[tokio::test]
     async fn completed_probe_capacity_is_reclaimed_for_new_stream_lookup() {
