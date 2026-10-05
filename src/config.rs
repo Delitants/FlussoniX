@@ -510,10 +510,8 @@ fn validate_root(root: &Value) -> Result<(), String> {
                 }
                 crate::transcoder::Profile::resolve(item, false)?;
                 crate::srt_push::configuration(item)?;
-                for field in ["dvr"] {
-                    if item.get(field).is_some() {
-                        return Err(format!("{field} is not implemented in this build"));
-                    }
+                if item.get("dvr").is_some() {
+                    return Err("dvr is not implemented in this build".into());
                 }
             }
         }

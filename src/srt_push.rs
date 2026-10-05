@@ -17,6 +17,7 @@ pub(crate) struct Destination {
     pub endpoint: String,
     pub disabled: bool,
     pub retry_seconds: u64,
+    startup_seconds: u64,
 }
 
 pub(crate) fn configuration(cfg: &Value) -> Result<Vec<Destination>, String> {
@@ -80,6 +81,20 @@ fn parse(item: &Value) -> Result<Destination, String> {
         return Err("SRT destination must use srt://HOST:PORT in caller mode".into());
     }
     let mut options = serde_json::Map::new();
+    if let Some(query) = url.query() {
+        let bytes = query.as_bytes();
+        for (i, byte) in bytes.iter().enumerate() {
+            if *byte == b'%'
+                && (bytes.get(i + 1).is_none_or(|b| !b.is_ascii_hexdigit())
+                    || bytes.get(i + 2).is_none_or(|b| !b.is_ascii_hexdigit()))
+            {
+                return Err("Invalid SRT query encoding".into());
+            }
+        }
+        percent_encoding::percent_decode_str(query)
+            .decode_utf8()
+            .map_err(|_| "Invalid SRT query encoding")?;
+    }
     for (key, value) in url.query_pairs() {
         if ![
             "streamid",
@@ -157,6 +172,7 @@ fn parse(item: &Value) -> Result<Destination, String> {
         endpoint,
         disabled: item["disabled"] == true,
         retry_seconds,
+        startup_seconds: connect + 5,
     })
 }
 
@@ -308,7 +324,12 @@ impl State {
         let mut previous = 0;
         let mut progress = Instant::now();
         let error = loop {
-            let remaining = Duration::from_secs(10).saturating_sub(progress.elapsed());
+            let limit = if previous == 0 {
+                self.destination.startup_seconds
+            } else {
+                10
+            };
+            let remaining = Duration::from_secs(limit).saturating_sub(progress.elapsed());
             tokio::select! {biased;
                 _=cancel.cancelled()=>break "push_stopped",
                 _=tokio::time::sleep(remaining)=>break "push_stalled",
@@ -329,7 +350,8 @@ impl State {
                 },
                 result=receiver.recv()=> {
                     let data=match result {Ok(data)=>data,Err(broadcast::error::RecvError::Lagged(_))=>break "push_queue_overflow",Err(broadcast::error::RecvError::Closed)=>break "push_stopped"};
-                    let remaining=Duration::from_secs(10).saturating_sub(progress.elapsed());
+                    let limit=if previous==0 {self.destination.startup_seconds}else{10};
+                    let remaining=Duration::from_secs(limit).saturating_sub(progress.elapsed());
                     let written=tokio::select! {biased;
                         _=cancel.cancelled()=>break "push_stopped",
                         _=child.wait()=>break "push_failed",

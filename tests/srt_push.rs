@@ -326,6 +326,8 @@ fn raw_and_encoded_stream_ids_are_accepted_without_accepting_hidden_options() {
         "srt://127.0.0.1:19992?streamid=#!::r=owned&unknown=owned-secret-123",
         "srt://127.0.0.1:19992?passphrase=owned-secret-123&passphrase=second-secret",
         "srt://127.0.0.1:19992?mode=listener",
+        "srt://127.0.0.1:19992?streamid=%FF",
+        "srt://127.0.0.1:19992?streamid=%ZZ",
         "srt://127.0.0.1:19992?pbkeylen=0",
         "srt://127.0.0.1:19992/path",
         "srt://user:owned-secret-123@receiver:9000",
@@ -368,5 +370,105 @@ fn invalid_push_profiles_are_rejected_atomically_without_secrets() {
         json!({"pushes":[]}),
     ] {
         store.put("streams", "owned", patch).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_long_connection_timeout_is_not_cut_short_by_the_output_watchdog() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = MEDIA_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let wrapper = dir.path().join("owned-pending-handshake");
+    std::fs::write(&wrapper,"#!/usr/bin/python3\nimport os,sys,time\nif '-progress' in sys.argv:\n while True:\n  os.read(0,16384)\nelse: os.execv('/usr/bin/ffmpeg',['ffmpeg']+sys.argv[1:])\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = flussonix::media::Engine::new(dir.path().join("media"), wrapper.to_str().unwrap());
+    let cfg = json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":"srt://127.0.0.1:19999","connect_timeout":20}]});
+    let w = engine.ensure("owned", &cfg).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(11000)).await;
+    let s = w.stats()["flussonix_pushes"][0].clone();
+    engine.stop_all().await;
+    assert_eq!(s["status"], "connecting");
+    assert_eq!(s["attempts"], 1);
+}
+
+#[path = "support/dvb_fixture.rs"]
+mod subtitle_fixture;
+
+#[tokio::test]
+async fn srt_keeps_or_filters_original_dvb_tracks_from_http_publication() {
+    use tokio::io::AsyncWriteExt;
+    let _lock = MEDIA_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = flussonix::media::Engine::new(dir.path().join("media"), "ffmpeg");
+    let transport = subtitle_fixture::transport();
+    for keep in [true, false] {
+        let port = unused_udp_port();
+        let path = dir
+            .path()
+            .join(if keep { "kept.ts" } else { "filtered.ts" });
+        let mut rx = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "mpegts",
+                "-i",
+                &format!(
+                    "srt://127.0.0.1:{port}?mode=listener&listen_timeout=10000000&timeout=5000000"
+                ),
+                "-map",
+                "0",
+                "-c",
+                "copy",
+                "-max_interleave_delta",
+                "100000",
+                "-t",
+                "6",
+                "-f",
+                "mpegts",
+            ])
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let cfg = json!({"inputs":[{"url":"publish://"}],"flussonix_subtitle_tracks":if keep {"preserve"}else{"drop"},"pushes":[{"url":format!("srt://127.0.0.1:{port}")}]});
+        let mut publisher = engine
+            .publish_guarded("owned", &cfg, std::future::ready(true))
+            .await
+            .unwrap();
+        publisher
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(&transport)
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(15), rx.wait()).await;
+        engine.stop_all().await;
+        assert!(
+            outcome.unwrap().unwrap().success(),
+            "{}",
+            publisher.worker.stats()
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        let descriptors = subtitle_fixture::carrier::original::descriptors(&bytes);
+        let dvb: Vec<_> = descriptors
+            .iter()
+            .filter(|(_, desc)| desc.contains(&0x59))
+            .collect();
+        if keep {
+            assert_eq!(dvb.len(), 2);
+            for (pid, _) in dvb {
+                assert!(!subtitle_fixture::carrier::original::pes_bodies(&bytes, *pid).is_empty());
+            }
+        } else {
+            assert!(dvb.is_empty());
+        }
     }
 }

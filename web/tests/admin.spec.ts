@@ -545,3 +545,62 @@ test('slow GPU readiness does not delay stream management',async({page,request})
   await expect(page.getByRole('heading',{name:'Management while readiness is pending',exact:true})).toBeVisible({timeout:5000});
  }finally{release();await page.unrouteAll({behavior:'wait'});}
 });
+
+test('SRT destinations have friendly template controls and inherited stream overrides',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const template='ui-srt-template-'+Date.now(),name=template+'-stream';
+ await page.getByRole('button',{name:'Templates',exact:true}).click();await page.getByRole('button',{name:'Add template',exact:true}).click();
+ await page.getByLabel('Template name',{exact:true}).fill(template);await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');
+ await page.getByLabel('Activation',{exact:true}).selectOption('ondemand');
+ await page.getByLabel('Destination settings',{exact:true}).selectOption('override');
+ await page.getByLabel('Destination URL 1',{exact:true}).fill('srt://127.0.0.1:19990');
+ await page.getByLabel('Stream ID 1',{exact:true}).fill('#!::r=owned,m=publish,password=owned-id-secret');
+ await page.getByLabel('Passphrase 1',{exact:true}).fill('owned-push-secret');
+ await expect(page.getByLabel('Passphrase 1',{exact:true})).toHaveAttribute('type','password');
+ await expect(page.getByLabel('Stream ID 1',{exact:true})).toHaveAttribute('type','password');
+ await page.getByLabel('Latency (milliseconds) 1',{exact:true}).fill('250');
+ await page.getByLabel('Connection timeout (seconds) 1',{exact:true}).fill('2');
+ await page.getByLabel('Retry interval (seconds) 1',{exact:true}).fill('7');
+ await page.getByLabel('Destination enabled 1',{exact:true}).uncheck();
+ await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('cell',{name:template,exact:true})).toBeVisible();
+ const saved=await(await request.get('/streamer/api/v3/templates/'+template,{headers})).json();
+ expect(saved.pushes).toEqual([{url:'srt://127.0.0.1:19990',streamid:'#!::r=owned,m=publish,password=owned-id-secret',passphrase:'owned-push-secret',latency:250,connect_timeout:2,retry_timeout:7,disabled:true}]);
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{template,static:false}})).ok()).toBeTruthy();
+ await page.getByRole('button',{name:'Streams',exact:true}).click();await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();
+ await page.getByRole('button',{name:'Output',exact:true}).click();await expect(page.getByText('1. srt://127.0.0.1:19990 · Disabled · Encrypted',{exact:true})).toBeVisible();
+ await expect(page.locator('body')).not.toContainText('owned-id-secret');await expect(page.locator('body')).not.toContainText('owned-push-secret');
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(page.getByLabel('Destination settings',{exact:true})).toHaveValue('inherit');
+ await page.getByLabel('Destination settings',{exact:true}).selectOption('none');await page.getByRole('button',{name:'Save',exact:true}).click();
+ let stream=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(stream.pushes).toEqual([]);expect(stream.config_on_disk.pushes).toEqual([]);
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Destination settings',{exact:true}).selectOption('inherit');await page.getByRole('button',{name:'Save',exact:true}).click();
+ stream=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(stream.pushes).toEqual(saved.pushes);expect(stream.config_on_disk.pushes).toBeUndefined();
+ await request.delete('/streamer/api/v3/streams/'+name,{headers});await request.delete('/streamer/api/v3/templates/'+template,{headers});
+});
+
+test('SRT destinations validate secrets and expand raw stream ID queries without JSON',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-srt-query-'+Date.now();
+ const raw='srt://127.0.0.1:19990?streamid=#!::r=owned,m=publish,password=owned-query-id&passphrase=owned-query-secret&latency=200';
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{static:false,inputs:[{url:'testsrc://'}],pushes:[{url:raw,disabled:true}]}})).ok()).toBeTruthy();
+ await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();
+ await expect(page.locator('body')).not.toContainText('owned-query-id');await expect(page.locator('body')).not.toContainText('owned-query-secret');
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(page.getByLabel('Stream ID 1',{exact:true})).toHaveValue('#!::r=owned,m=publish,password=owned-query-id');
+ await expect(page.getByLabel('Destination URL 1',{exact:true})).toHaveValue('srt://127.0.0.1:19990');
+ await page.getByLabel('Passphrase 1',{exact:true}).fill('short');await page.getByRole('button',{name:'Save',exact:true}).click();
+ await expect(page.getByRole('dialog').getByRole('alert')).toContainText('10 to 79');
+ await page.getByLabel('Passphrase 1',{exact:true}).fill('owned-updated-secret');await page.getByLabel('Latency (milliseconds) 1',{exact:true}).fill('300');
+ await expect(page.locator('textarea')).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();
+ const saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();
+ expect(saved.pushes[0]).toEqual({url:'srt://127.0.0.1:19990',streamid:'#!::r=owned,m=publish,password=owned-query-id',passphrase:'owned-updated-secret',latency:300,disabled:true});
+ await request.delete('/streamer/api/v3/streams/'+name,{headers});
+});
+
+test('SRT destinations reject malformed query encoding before expanding fields',async({page})=>{
+ await page.getByRole('button',{name:'Templates',exact:true}).click();await page.getByRole('button',{name:'Add template',exact:true}).click();
+ await page.getByLabel('Template name',{exact:true}).fill('ui-srt-invalid-encoding-'+Date.now());await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');
+ await page.getByLabel('Destination settings',{exact:true}).selectOption('override');await page.getByLabel('Destination URL 1',{exact:true}).fill('srt://127.0.0.1:19990?streamid=%FF');
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Destination URL');
+ await expect(page.getByLabel('Stream ID 1',{exact:true})).toHaveValue('');
+ await page.getByRole('button',{name:'Cancel',exact:true}).click();
+});

@@ -34,8 +34,9 @@ convert them to WebVTT. Embedded captions follow the worker's copy/encode
 behavior. Exact TS byte/PID preservation is not promised after remuxing.
 
 A slow consumer cannot block the shared worker. Broadcast overflow, a failed
-process or ten seconds without output progress kills and reaps that destination
-before retrying. Stop, source closure, stream disable/delete or configuration
+process or absent output progress kills and reaps that destination before
+retrying. Initial progress has the connection timeout plus five seconds for
+probing; after first output, progress must continue within ten seconds. Stop, source closure, stream disable/delete or configuration
 replacement cancels and joins all destination processes. Destination edits
 replace the shared worker in this first profile and require continuous viewers
 to reconnect. Enabled pushes keep an on-demand configured stream active without
@@ -49,10 +50,15 @@ queued. Neither byte count proves remote reception or SRT acknowledgement.
 These are native diagnostics, not a claim of vendor push counter parity.
 Passphrases, query strings, stream IDs and raw FFmpeg errors are never included.
 
-Qualification must exercise independent localhost receivers, encrypted success
-and wrong-secret denial, H.264/HEVC with all three audio codecs, simultaneous
-healthy/unreachable destinations, receiver restart, disabled destinations,
-on-demand activation, config replacement and process cleanup. No production
+Local qualification exercises independent localhost receivers, encrypted
+success and wrong-secret denial, H.264/HEVC with all three audio codecs,
+simultaneous healthy/unreachable destinations, receiver restart, disabled
+destinations, on-demand activation, config replacement and process cleanup.
+Owned DVB publication tests verify retained descriptors and subtitle PES at
+the SRT receiver, and filtering when separate tracks are disabled. Dedicated
+SRT CEA/teletext delivery tests remain pending; the established worker policies
+still apply. Owned fault processes qualify stalls and cancellation, not media
+interoperability. No production
 listener is changed. Internet loss/retransmission, sustained throughput and
 all vendor SRT dialects remain unqualified.
 
