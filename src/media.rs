@@ -56,7 +56,7 @@ pub struct Worker {
     hls_subtitles: &'static str,
     native_text_tracks: AtomicU64,
     captions: Option<Arc<crate::caption_hls::State>>,
-    pushes: Vec<Arc<crate::srt_push::State>>,
+    pushes: Vec<Arc<crate::push::State>>,
     active_pushes: bool,
     direct_outputs: Vec<Arc<crate::direct_rtp::output::State>>,
     direct_input: Option<Arc<crate::direct_rtp::input::Statistics>>,
@@ -260,7 +260,7 @@ impl Engine {
         publishing: Option<PublicationInput>,
     ) -> Result<Arc<Worker>, String> {
         let subtitle_tracks = crate::config::subtitle_tracks(cfg)?;
-        let destinations = crate::srt_push::configuration(cfg)?;
+        let destinations = crate::push::configuration(cfg)?;
         let direct_destinations = crate::direct_rtp::config::outputs(cfg)?;
         let hls_subtitles = crate::config::hls_subtitles(cfg)?;
         let caption_services = crate::captions::configuration(cfg)?;
@@ -714,7 +714,7 @@ impl Engine {
             pushes: destinations
                 .into_iter()
                 .enumerate()
-                .map(|(i, d)| crate::srt_push::State::new(d, i))
+                .map(|(i, d)| crate::push::State::new(d, i))
                 .collect(),
             direct_input: direct_input.as_ref().map(|i| i.stats.clone()),
             direct_outputs: direct_destinations
@@ -724,7 +724,7 @@ impl Engine {
                     crate::direct_rtp::output::State::with_egress(d, n, self.direct_egress.clone())
                 })
                 .collect(),
-            active_pushes: crate::srt_push::enabled(cfg) || crate::direct_rtp::config::enabled(cfg),
+            active_pushes: crate::push::enabled(cfg) || crate::direct_rtp::config::enabled(cfg),
             input_index: index,
             input_protocol: match publishing {
                 Some(PublicationInput::Sdp { secure: true }) => "rtsps".into(),
@@ -753,11 +753,11 @@ impl Engine {
             .pushes
             .iter()
             .map(|state| {
-                tokio::spawn(state.clone().run(
-                    self.ffmpeg.clone(),
-                    worker.tx.subscribe(),
-                    cancel.clone(),
-                ))
+                tokio::spawn(
+                    state
+                        .clone()
+                        .run(self.ffmpeg.clone(), worker.clone(), cancel.clone()),
+                )
             })
             .collect();
         let direct_tasks: Vec<_> = worker

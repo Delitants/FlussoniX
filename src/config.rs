@@ -540,7 +540,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     }
                 }
                 crate::transcoder::Profile::validate_partial(item)?;
-                crate::srt_push::configuration(item)?;
+                crate::push::configuration(item)?;
                 crate::direct_rtp::config::outputs(item)?;
                 if item.get("dvr").is_some() {
                     return Err("dvr is not implemented in this build".into());

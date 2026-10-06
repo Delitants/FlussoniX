@@ -804,10 +804,17 @@ fn valid_rtcp(body: &[u8]) -> bool {
     }
     !body.is_empty()
 }
-fn sender_report(ssrc: u32, stamp: u32, packets: u32, octets: u32) -> Vec<u8> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+pub(crate) fn sender_report(ssrc: u32, stamp: u32, packets: u32, octets: u32) -> Vec<u8> {
+    sender_report_at(ssrc, stamp, packets, octets, SystemTime::now())
+}
+pub(crate) fn sender_report_at(
+    ssrc: u32,
+    stamp: u32,
+    packets: u32,
+    octets: u32,
+    time: SystemTime,
+) -> Vec<u8> {
+    let now = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let mut b = vec![0x80, 200, 0, 6];
     for value in [
         ssrc,

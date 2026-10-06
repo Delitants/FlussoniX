@@ -7,6 +7,8 @@ pub(crate) struct Probe {
     pmt: Psi,
     program: Option<(u16, u16)>,
     pub audio: Option<Option<u8>>,
+    pub audio_types: Vec<u8>,
+    pub unsupported_tracks: bool,
     pub video: Option<u8>,
 }
 impl Probe {
@@ -74,6 +76,8 @@ impl Probe {
                 let end = s.len() - 4;
                 let mut at = 12 + ((usize::from(s[10] & 15) << 8) | usize::from(s[11]));
                 let mut audio = None;
+                let mut audio_types = Vec::new();
+                let mut unsupported_tracks = false;
                 let mut video = None;
                 while at + 5 <= end {
                     let next =
@@ -84,13 +88,20 @@ impl Probe {
                     if video.is_none() && [2, 0x10, 0x1b, 0x24].contains(&s[at]) {
                         video = Some(s[at]);
                     }
-                    if audio.is_none() && [3, 4, 0x0f, 0x11, 0x81, 0x87].contains(&s[at]) {
-                        audio = Some(s[at]);
+                    if [3, 4, 0x0f, 0x11, 0x81, 0x87].contains(&s[at]) {
+                        if audio.is_none() {
+                            audio = Some(s[at]);
+                        }
+                        audio_types.push(s[at]);
+                    } else if ![0x1b, 0x24].contains(&s[at]) {
+                        unsupported_tracks = true;
                     }
                     at = next;
                 }
                 if at == end {
                     self.audio = Some(audio);
+                    self.audio_types = audio_types;
+                    self.unsupported_tracks = unsupported_tracks;
                     self.video = video;
                 }
             }
