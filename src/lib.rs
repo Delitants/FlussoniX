@@ -22,6 +22,7 @@ mod hls_generation;
 
 pub mod source_directory;
 
+pub mod direct_rtp;
 pub mod rtp;
 
 pub mod rtsp;

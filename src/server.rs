@@ -283,7 +283,9 @@ impl App {
                 if let Some(name) = disk["name"].as_str() {
                     if let Some((config, revision)) = self.media_config(name).await {
                         if config["disabled"] != true
-                            && (config["static"] != false || crate::srt_push::enabled(&config))
+                            && (config["static"] != false
+                                || crate::srt_push::enabled(&config)
+                                || crate::direct_rtp::config::enabled(&config))
                             && self.options.role != "lb"
                         {
                             self.recover_current(name, &config, revision).await;
@@ -342,6 +344,7 @@ impl App {
         }
         let mut metrics = self.telemetry.snapshot(self.options.uplink_mbps);
         metrics["rtsp_udp_bytes_out"] = json!(self.rtsp_udp_egress.load(Ordering::Relaxed));
+        metrics["direct_rtp_bytes_out"] = json!(self.media.direct_egress.load(Ordering::Relaxed));
         metrics["srt_bytes_out"] = json!(self.srt_egress.load(Ordering::Relaxed));
         let mut srt = self.srt_playback.lock().unwrap().clone();
         srt["clients"] = json!(self.srt_connections.load(Ordering::Relaxed));
@@ -358,10 +361,11 @@ impl App {
         metrics
     }
     pub fn sample_metrics(&self) {
-        self.telemetry.sample_all_media(
+        self.telemetry.sample_transports(
             self.egress.load(Ordering::Relaxed),
             self.rtsp_egress.load(Ordering::Relaxed),
             self.srt_egress.load(Ordering::Relaxed),
+            self.media.direct_egress.load(Ordering::Relaxed),
         );
     }
 
@@ -662,7 +666,7 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
     }
     if tail == "capabilities" && request.method() == "GET" {
         return json_response(
-            json!({"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","rtsps (verified TLS, interleaved TCP)","srt","publish:// (HTTP MPEG-TS receive)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["srt (caller push / global listener playback, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","rtsp (TCP / opt-in unicast UDP playback, H.264/AAC-LC)","rtsps (opt-in TLS TCP playback, H.264/AAC-LC)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["direct rtp","srtp","rtsp publication / push","rtsp Basic / Digest viewer auth","dvr","non-SRT push","srt publication policy / per-stream playback listeners"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA H.264 / HEVC; initialization check only, delivered GPU media not qualified","gpu_profiles":app.media.gpu_capabilities().await},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP redirects"}),
+            json!({"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","rtsps (verified TLS, interleaved TCP)","srt","rtp (MPEG-TS / PT33, unicast and IPv4 multicast)","publish:// (HTTP MPEG-TS receive)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["rtp (MPEG-TS / PT33, unicast and IPv4 multicast)","srt (caller push / global listener playback, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","rtsp (TCP / opt-in unicast UDP playback, H.264/AAC-LC)","rtsps (opt-in TLS TCP playback, H.264/AAC-LC)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["elementary RTP / SDP negotiation","srtp","rtsp publication / push","rtsp Basic / Digest viewer auth","dvr","non-SRT push","srt publication policy / per-stream playback listeners"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA H.264 / HEVC; initialization check only, delivered GPU media not qualified","gpu_profiles":app.media.gpu_capabilities().await},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP redirects"}),
         );
     }
     if let Some(name) = tail.strip_prefix("stream/") {

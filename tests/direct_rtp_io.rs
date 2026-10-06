@@ -1,0 +1,249 @@
+use flussonix::direct_rtp::{config::Settings, input::Input, packet::packet};
+use serde_json::json;
+use std::time::Duration;
+use tokio::{io::AsyncReadExt, net::UdpSocket};
+use tokio_util::sync::CancellationToken;
+fn ports() -> u16 {
+    for _ in 0..64 {
+        let a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let p = a.local_addr().unwrap().port();
+        if p < 65535 && std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, p + 1)).is_ok() {
+            return p;
+        }
+    }
+    panic!("no owned pair");
+}
+fn ts() -> Vec<u8> {
+    let mut b = vec![0xff; 188];
+    b[..4].copy_from_slice(&[0x47, 0x1f, 0xff, 0x10]);
+    b
+}
+#[tokio::test]
+async fn input_pins_media_peer_reorders_and_releases_both_ports_on_cancel() {
+    let port = ports();
+    let settings = Settings::parse(
+        &json!({"url":format!("rtp://127.0.0.1:{port}"),"flussonix_rtp":{"jitter_ms":30}}),
+    )
+    .unwrap();
+    let input = Input::bind(&settings).await.unwrap();
+    let stats = input.stats.clone();
+    let (write, mut read) = tokio::io::duplex(4096);
+    let cancel = CancellationToken::new();
+    let c = cancel.clone();
+    let task = tokio::spawn(async move { input.run(write, c).await });
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let hostile = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut body = ts();
+    sender
+        .send_to(&packet(65534, 0, 42, &body), settings.address)
+        .await
+        .unwrap();
+    let mut received = vec![0; 188];
+    tokio::time::timeout(Duration::from_secs(2), read.read_exact(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received, body);
+    hostile
+        .send_to(&packet(65535, 1, 42, &body), settings.address)
+        .await
+        .unwrap();
+    sender
+        .send_to(&packet(65535, 1, 43, &body), settings.address)
+        .await
+        .unwrap();
+    body[4] = 3;
+    sender
+        .send_to(&packet(0, 2, 42, &body), settings.address)
+        .await
+        .unwrap();
+    body[4] = 2;
+    sender
+        .send_to(&packet(65535, 1, 42, &body), settings.address)
+        .await
+        .unwrap();
+    let mut rest = vec![0; 376];
+    tokio::time::timeout(Duration::from_secs(2), read.read_exact(&mut rest))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rest[4], 2);
+    assert_eq!(rest[192], 3);
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(UdpSocket::bind(settings.address).await.is_ok());
+    assert!(
+        UdpSocket::bind((settings.address.ip(), port + 1))
+            .await
+            .is_ok()
+    );
+    assert_eq!(stats.snapshot()["packets"], 3);
+    assert_eq!(stats.snapshot()["foreign_packets"], 2);
+}
+#[tokio::test]
+async fn occupied_rtcp_port_rejects_startup_without_leaking_rtp_socket() {
+    let port = ports();
+    let held = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port + 1))
+        .await
+        .unwrap();
+    let cfg = Settings::parse(&json!({"url":format!("rtp://127.0.0.1:{port}")})).unwrap();
+    assert!(Input::bind(&cfg).await.is_err());
+    assert!(UdpSocket::bind(cfg.address).await.is_ok());
+    drop(held);
+}
+#[tokio::test]
+async fn output_preserves_ts_in_mtu_packets_and_stops_without_a_remux_child() {
+    use flussonix::direct_rtp::{config::outputs, output::State};
+    let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let defs = outputs(
+        &json!({"flussonix_rtp_outputs":[{"url":format!("rtp://{address}"),"max_mbps":10}]}),
+    )
+    .unwrap();
+    let state = State::new(defs.into_iter().next().unwrap(), 0);
+    let (tx, rx) = tokio::sync::broadcast::channel(8);
+    let cancel = CancellationToken::new();
+    let c = cancel.clone();
+    let s = state.clone();
+    let task = tokio::spawn(async move {
+        s.run(rx, c).await;
+    });
+    let body = ts().repeat(14);
+    tx.send(bytes::Bytes::copy_from_slice(&body[..100]))
+        .unwrap();
+    tx.send(bytes::Bytes::copy_from_slice(&body[100..]))
+        .unwrap();
+    let mut received: Vec<u8> = Vec::new();
+    let mut seq = None;
+    let mut id = None;
+    for _ in 0..2 {
+        let mut buffer = vec![0; 1600];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 1328);
+        assert_eq!(&buffer[..2], &[0x80, 33]);
+        let next = u16::from_be_bytes(buffer[2..4].try_into().unwrap());
+        if let Some(prior) = seq {
+            assert_eq!(next, prior + 1)
+        }
+        seq = Some(next);
+        let ssrc = u32::from_be_bytes(buffer[8..12].try_into().unwrap());
+        if let Some(prior) = id {
+            assert_eq!(ssrc, prior)
+        }
+        id = Some(ssrc);
+        received.extend_from_slice(&buffer[12..n]);
+    }
+    assert_eq!(received, body);
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.stats()["packets"], 2);
+    assert_eq!(state.stats()["status"], "stopped");
+}
+#[tokio::test]
+async fn sparse_output_flushes_complete_ts_packets_without_waiting_for_seven() {
+    use flussonix::direct_rtp::{config::outputs, output::State};
+    let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let def = outputs(&json!({"flussonix_rtp_outputs":[{"url":format!("rtp://{address}")}]}))
+        .unwrap()
+        .remove(0);
+    let state = State::new(def, 0);
+    let (tx, rx) = tokio::sync::broadcast::channel(8);
+    let cancel = CancellationToken::new();
+    let c = cancel.clone();
+    let task = tokio::spawn(async move { state.run(rx, c).await });
+    tx.send(bytes::Bytes::from(ts().repeat(3))).unwrap();
+    let mut b = [0; 1600];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(1), listener.recv_from(&mut b))
+        .await
+        .expect("sparse complete TS must progress")
+        .unwrap();
+    assert_eq!(n, 12 + 3 * 188);
+    cancel.cancel();
+    task.await.unwrap();
+}
+#[tokio::test]
+async fn input_sends_receiver_report_only_to_its_pinned_media_source() {
+    let port = ports();
+    let source_port = ports();
+    assert_ne!(port, source_port);
+    let settings = Settings::parse(&json!({"url":format!("rtp://127.0.0.1:{port}")})).unwrap();
+    let input = Input::bind(&settings).await.unwrap();
+    let (write, mut read) = tokio::io::duplex(4096);
+    let cancel = CancellationToken::new();
+    let c = cancel.clone();
+    let task = tokio::spawn(async move { input.run(write, c).await });
+    let source = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, source_port))
+        .await
+        .unwrap();
+    let reports = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, source_port + 1))
+        .await
+        .unwrap();
+    source
+        .send_to(&packet(100, 90, 42, &ts()), settings.address)
+        .await
+        .unwrap();
+    let mut tsbytes = [0; 188];
+    read.read_exact(&mut tsbytes).await.unwrap();
+    let mut report = [0; 2048];
+    let (n, peer) = tokio::time::timeout(Duration::from_secs(2), reports.recv_from(&mut report))
+        .await
+        .expect("RTCP receiver report must arrive")
+        .unwrap();
+    assert_eq!(peer.port(), port + 1);
+    assert_eq!(&report[..2], &[0x81, 201]);
+    assert_eq!(u32::from_be_bytes(report[8..12].try_into().unwrap()), 42);
+    assert!(flussonix::direct_rtp::packet::valid_rtcp(&report[..n]));
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+}
+#[tokio::test]
+async fn ipv4_multicast_uses_explicit_loopback_interface_and_releases_pair() {
+    use flussonix::direct_rtp::{config::outputs, output::State};
+    let port = ports();
+    let url = format!("rtp://239.255.19.42:{port}");
+    let opts = json!({"interface":"127.0.0.1","ttl":1});
+    let cfg = Settings::parse(&json!({"url":url,"flussonix_rtp":opts})).unwrap();
+    let input = Input::bind(&cfg).await.unwrap();
+    let (write, mut read) = tokio::io::duplex(4096);
+    let cancel = CancellationToken::new();
+    let c = cancel.clone();
+    let task = tokio::spawn(async move { input.run(write, c).await });
+    let definition = outputs(&json!({"flussonix_rtp_outputs":[{"url":url,"flussonix_rtp":opts}]}))
+        .unwrap()
+        .remove(0);
+    let state = State::new(definition, 0);
+    let (tx, rx) = tokio::sync::broadcast::channel(4);
+    let c = cancel.clone();
+    let sender = tokio::spawn(async move { state.run(rx, c).await });
+    tx.send(bytes::Bytes::from(ts().repeat(7))).unwrap();
+    let mut body = vec![0; 7 * 188];
+    tokio::time::timeout(Duration::from_secs(2), read.read_exact(&mut body))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(body, ts().repeat(7));
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+    sender.await.unwrap();
+    assert!(
+        UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+            .await
+            .is_ok()
+    );
+    assert!(
+        UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port + 1))
+            .await
+            .is_ok()
+    );
+}

@@ -25,6 +25,7 @@ pub struct Engine {
     hls_epoch: crate::hls_generation::Epoch,
     workers: Mutex<HashMap<String, Arc<Worker>>>,
     gpu: crate::gpu::Checks,
+    pub direct_egress: Arc<AtomicU64>,
 }
 pub struct Publication {
     pub worker: Arc<Worker>,
@@ -52,6 +53,8 @@ pub struct Worker {
     captions: Option<Arc<crate::caption_hls::State>>,
     pushes: Vec<Arc<crate::srt_push::State>>,
     active_pushes: bool,
+    direct_outputs: Vec<Arc<crate::direct_rtp::output::State>>,
+    direct_input: Option<Arc<crate::direct_rtp::input::Statistics>>,
     restart_count: u64,
     input_timeout: Duration,
     recovery: std::sync::Mutex<crate::recovery::Recovery>,
@@ -110,6 +113,17 @@ impl Worker {
             stats["flussonix_pushes"] =
                 json!(self.pushes.iter().map(|p| p.stats()).collect::<Vec<_>>());
         }
+        if let Some(input) = &self.direct_input {
+            stats["direct_rtp_input"] = input.snapshot();
+        }
+        if !self.direct_outputs.is_empty() {
+            stats["flussonix_rtp_outputs"] = json!(
+                self.direct_outputs
+                    .iter()
+                    .map(|o| o.stats())
+                    .collect::<Vec<_>>()
+            );
+        }
         let native_text_tracks = self.native_text_tracks.load(Ordering::Relaxed);
         if native_text_tracks > 0 {
             stats["native_subtitle_tracks"] = json!(native_text_tracks);
@@ -162,6 +176,7 @@ impl Engine {
             hls_epoch: crate::hls_generation::Epoch::new(),
             workers: Mutex::new(HashMap::new()),
             gpu: crate::gpu::Checks::default(),
+            direct_egress: Arc::new(AtomicU64::new(0)),
         }
     }
     pub async fn gpu_capabilities(&self) -> Value {
@@ -216,6 +231,7 @@ impl Engine {
     ) -> Result<Arc<Worker>, String> {
         let subtitle_tracks = crate::config::subtitle_tracks(cfg)?;
         let destinations = crate::srt_push::configuration(cfg)?;
+        let direct_destinations = crate::direct_rtp::config::outputs(cfg)?;
         let hls_subtitles = crate::config::hls_subtitles(cfg)?;
         let caption_services = crate::captions::configuration(cfg)?;
         let native_captions = caption_services.iter().any(|s| s.native_track().is_some());
@@ -348,6 +364,7 @@ impl Engine {
         let peer_ts = cfg["flussonix_peer_key"].is_string()
             && (input.starts_with("tshttp://") || input.starts_with("tshttps://"));
         let mut tls_input = None;
+        let mut direct_input = None;
         let synthetic = input == "testsrc://";
         let m4s_input = input.starts_with("m4s://") || input.starts_with("m4ss://");
         let m4f_input = input.starts_with("m4f://") || input.starts_with("m4fs://");
@@ -380,6 +397,21 @@ impl Engine {
             cmd.stdin(std::process::Stdio::piped());
         } else if m4s_input || m4f_input {
             cmd.args([
+                "-probesize",
+                "1048576",
+                "-analyzeduration",
+                "1000000",
+                "-f",
+                "mpegts",
+                "-i",
+                "pipe:0",
+            ]);
+            cmd.stdin(std::process::Stdio::piped());
+        } else if let Some(settings) = crate::direct_rtp::config::Settings::input(&inputs[index])? {
+            direct_input = Some(crate::direct_rtp::input::Input::bind(&settings).await?);
+            cmd.args([
+                "-protocol_whitelist",
+                "pipe",
                 "-probesize",
                 "1048576",
                 "-analyzeduration",
@@ -466,7 +498,7 @@ impl Engine {
             "-map",
             if synthetic {
                 "1:a:0?"
-            } else if m4s_input || m4f_input || publication || peer_ts {
+            } else if m4s_input || m4f_input || publication || peer_ts || direct_input.is_some() {
                 "0:a?"
             } else {
                 "0:a:0?"
@@ -493,7 +525,7 @@ impl Engine {
             cmd.args(["-max_interleave_delta", "100000"]);
         }
         // One encode/mux source feeds both HLS variants and shared live TS fan-out.
-        let copy_publication = publication && profile.audio_copy();
+        let copy_publication = (publication || direct_input.is_some()) && profile.audio_copy();
         let native_copy = (m4s_input || m4f_input) && profile.full_copy();
         let native_audio_copy = (m4s_input || m4f_input) && profile.audio_copy();
         let copy_peer_ts = peer_ts && profile.audio_copy();
@@ -612,7 +644,15 @@ impl Engine {
                 .enumerate()
                 .map(|(i, d)| crate::srt_push::State::new(d, i))
                 .collect(),
-            active_pushes: crate::srt_push::enabled(cfg),
+            direct_input: direct_input.as_ref().map(|i| i.stats.clone()),
+            direct_outputs: direct_destinations
+                .into_iter()
+                .enumerate()
+                .map(|(n, d)| {
+                    crate::direct_rtp::output::State::with_egress(d, n, self.direct_egress.clone())
+                })
+                .collect(),
+            active_pushes: crate::srt_push::enabled(cfg) || crate::direct_rtp::config::enabled(cfg),
             input_index: index,
             input_protocol: input.split("://").next().unwrap_or("unknown").into(),
             restart_count,
@@ -644,8 +684,28 @@ impl Engine {
                 ))
             })
             .collect();
+        let direct_tasks: Vec<_> = worker
+            .direct_outputs
+            .iter()
+            .map(|state| tokio::spawn(state.clone().run(worker.tx.subscribe(), cancel.clone())))
+            .collect();
         tokio::spawn(async move {
             let mut tasks = Vec::new();
+            if let Some(input) = direct_input {
+                if let Some(writer) = stdin.take() {
+                    let c = cancel.clone();
+                    let w = w.clone();
+                    tasks.push(tokio::spawn(async move {
+                        if input.run(writer, c.clone()).await.is_err() {
+                            w.failed("input_closed");
+                            c.cancel();
+                        }
+                    }));
+                } else {
+                    w.failed("packaging_failed");
+                    cancel.cancel();
+                }
+            }
             // Early returns only leave this setup/run block. The owner always
             // cancels and joins its tasks before signaling completion.
             async {
@@ -836,6 +896,9 @@ impl Engine {
                 }
             }.await;
             cancel.cancel();
+            for task in direct_tasks {
+                let _ = task.await;
+            }
             for task in push_tasks {
                 let _ = task.await;
             }
@@ -1108,7 +1171,7 @@ pub fn translate_input(input: &str) -> Result<String, String> {
 }
 
 pub fn media_signature(cfg: &Value) -> String {
-    format!("{:x}",Sha256::digest(serde_json::to_vec(&json!({"inputs":cfg["inputs"],"transcoder":cfg["transcoder"],"pushes":cfg["pushes"],"peer":cfg["flussonix_peer_key"],"timeout":cfg["flussonix_input_timeout"],"subtitle_tracks":cfg["flussonix_subtitle_tracks"],"hls_captions":cfg["flussonix_hls_captions"],"hls_subtitles":cfg["flussonix_hls_subtitles"]})).unwrap()))
+    format!("{:x}",Sha256::digest(serde_json::to_vec(&json!({"inputs":cfg["inputs"],"transcoder":cfg["transcoder"],"pushes":cfg["pushes"],"direct_outputs":cfg["flussonix_rtp_outputs"],"peer":cfg["flussonix_peer_key"],"timeout":cfg["flussonix_input_timeout"],"subtitle_tracks":cfg["flussonix_subtitle_tracks"],"hls_captions":cfg["flussonix_hls_captions"],"hls_subtitles":cfg["flussonix_hls_subtitles"]})).unwrap()))
 }
 
 #[cfg(test)]

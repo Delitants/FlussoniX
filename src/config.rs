@@ -297,6 +297,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "disabled",
                     "inputs",
                     "pushes",
+                    "flussonix_rtp_outputs",
                     "transcoder",
                     "on_play",
                     "on_publish",
@@ -450,13 +451,18 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     let inputs = inputs.as_array().ok_or("inputs must be array")?;
                     for input in inputs {
                         if input.as_object().is_none_or(|v| {
-                            v.keys()
-                                .any(|k| k != "url" && k != "rtp" && k != "flussonix_tls_ca")
+                            v.keys().any(|k| {
+                                k != "url"
+                                    && k != "rtp"
+                                    && k != "flussonix_tls_ca"
+                                    && k != "flussonix_rtp"
+                            })
                         }) {
-                            return Err("only input url, RTSP rtp=udp and RTSPS/M4FS/M4SS/HLSS/TSHTTPS/HTTPS flussonix_tls_ca are implemented".into());
+                            return Err("supported input fields: url, RTSP rtp=udp, secure HTTP/RTSP flussonix_tls_ca, and direct RTP/SRTP flussonix_rtp".into());
                         }
                         let u = input["url"].as_str().ok_or("input url required")?;
                         let scheme = u.split("://").next().unwrap_or("");
+                        crate::direct_rtp::config::Settings::input(input)?;
                         if scheme == "publish"
                             && (u != "publish://"
                                 || inputs.len() != 1
@@ -500,7 +506,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                         }
                         if ![
                             "testsrc", "http", "https", "hls", "hlss", "tshttp", "tshttps", "rtsp",
-                            "rtsps", "srt", "m4s", "m4ss", "m4f", "m4fs", "publish",
+                            "rtsps", "srt", "m4s", "m4ss", "m4f", "m4fs", "publish", "rtp", "srtp",
                         ]
                         .contains(&scheme)
                         {
@@ -510,6 +516,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                 }
                 crate::transcoder::Profile::resolve(item, false)?;
                 crate::srt_push::configuration(item)?;
+                crate::direct_rtp::config::outputs(item)?;
                 if item.get("dvr").is_some() {
                     return Err("dvr is not implemented in this build".into());
                 }

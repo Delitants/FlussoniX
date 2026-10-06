@@ -629,3 +629,28 @@ test('SRT destinations reject malformed query encoding before expanding fields',
  await expect(page.getByLabel('Stream ID 1',{exact:true})).toHaveValue('');
  await page.getByRole('button',{name:'Cancel',exact:true}).click();
 });
+
+test('direct RTP forms persist friendly input and destination controls without JSON',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};const name='ui-direct-rtp';
+ expect((await request.put(`/streamer/api/v3/streams/${name}`,{headers,data:{$reset:true,disabled:true,static:false,inputs:[{url:'hls://example.net/owned/index.m3u8'}]}})).ok()).toBeTruthy();
+ try{
+  await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Input URL',{exact:true}).fill('rtp://127.0.0.1:39002');
+  await expect(page.getByLabel('RTP source IP',{exact:true})).toBeVisible();await page.getByLabel('RTP source IP',{exact:true}).fill('127.0.0.1');await page.getByLabel('RTP jitter (milliseconds)',{exact:true}).fill('25');
+  await page.getByLabel('Direct transport destinations',{exact:true}).selectOption('override');await page.getByLabel('RTP destination URL 1',{exact:true}).fill('rtp://127.0.0.1:39004');await page.getByLabel('RTP maximum bitrate (Mbps) 1',{exact:true}).fill('10');
+  await expect(page.locator('textarea')).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+  let data=await(await request.get(`/streamer/api/v3/streams/${name}`,{headers})).json();expect(data.config_on_disk.inputs[0].flussonix_rtp).toMatchObject({source_ip:'127.0.0.1',jitter_ms:25});expect(data.config_on_disk.flussonix_rtp_outputs[0]).toMatchObject({url:'rtp://127.0.0.1:39004',max_mbps:10});
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(page.getByLabel('RTP source IP',{exact:true})).toHaveValue('127.0.0.1');await page.getByLabel('Input URL',{exact:true}).fill('hls://example.net/owned/index.m3u8');await expect(page.getByLabel('RTP source IP',{exact:true})).toHaveCount(0);await page.getByLabel('Direct transport destinations',{exact:true}).selectOption('none');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+  data=await(await request.get(`/streamer/api/v3/streams/${name}`,{headers})).json();expect(data.config_on_disk.inputs[0].flussonix_rtp).toBeUndefined();expect(data.config_on_disk.flussonix_rtp_outputs).toEqual([]);
+ }finally{await request.delete(`/streamer/api/v3/streams/${name}`,{headers})}
+});
+
+test('direct transport template destinations inherit, override and clear without JSON',async({page,request})=>{
+ test.setTimeout(60000);
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};const template='ui-direct-template-'+Date.now(),name=template+'-stream';
+ const outputs=[{url:'rtp://127.0.0.1:39004',disabled:true,max_mbps:20}];
+ expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{disabled:true,static:false,inputs:[{url:'testsrc://'}],flussonix_rtp_outputs:outputs}})).ok()).toBeTruthy();expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{template}})).ok()).toBeTruthy();
+ try{await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(page.getByLabel('Direct transport destinations',{exact:true})).toHaveValue('inherit');await page.getByLabel('Direct transport destinations',{exact:true}).selectOption('override');await expect(page.getByLabel('RTP maximum bitrate (Mbps) 1',{exact:true})).toHaveValue('20');await page.getByLabel('RTP maximum bitrate (Mbps) 1',{exact:true}).fill('30');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+ let data=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(data.config_on_disk.flussonix_rtp_outputs[0].max_mbps).toBe(30);
+ for(const mode of ['none','inherit']){await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Direct transport destinations',{exact:true}).selectOption(mode);await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);data=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();if(mode==='none')expect(data.flussonix_rtp_outputs).toEqual([]);else{expect(data.config_on_disk.flussonix_rtp_outputs).toBeUndefined();expect(data.flussonix_rtp_outputs).toEqual(outputs);}}
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});await request.delete('/streamer/api/v3/templates/'+template,{headers});}
+});

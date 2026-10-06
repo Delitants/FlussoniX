@@ -129,3 +129,23 @@ fn reset_of_either_media_counter_invalidates_process_capacity() {
     assert!(v["uplink"].is_null());
     assert_eq!(v["rtsp_egress_mbps"], 1.6);
 }
+#[test]
+fn direct_rtp_and_srtp_egress_counts_towards_load_balancer_capacity() {
+    let d = fixture();
+    let sampler =
+        Sampler::with_roots("process", d.path().join("proc"), d.path().join("sys")).unwrap();
+    let t = Instant::now();
+    sampler.sample_transports_at(t, 0, 0, 0, 0);
+    sampler.sample_transports_at(
+        t + Duration::from_secs(1),
+        100_000,
+        200_000,
+        300_000,
+        400_000,
+    );
+    let v = sampler.snapshot_at(t + Duration::from_secs(1), 100.0);
+    assert_eq!(v["direct_rtp_egress_mbps"], 3.2);
+    assert_eq!(v["bytes_out"], 1_000_000);
+    assert_eq!(v["egress_mbps"], 8.0);
+    assert_eq!(v["uplink"], 0.08);
+}
