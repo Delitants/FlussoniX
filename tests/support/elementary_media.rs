@@ -90,6 +90,8 @@ pub async fn qualify(
     secure_output: bool,
 ) {
     let d = tempfile::tempdir().unwrap();
+    let ffmpeg =
+        std::env::var("FLUSSONIX_TEST_FFMPEG").unwrap_or_else(|_| "/usr/bin/ffmpeg".into());
     use base64::Engine as _;
     use std::os::unix::fs::PermissionsExt;
     let key = base64::engine::general_purpose::STANDARD.encode([0x31; 30]);
@@ -117,7 +119,7 @@ pub async fn qualify(
         });
     let (input, reserved) = ports();
     let (input_sdp, output_sdp) = (d.path().join("input.sdp"), d.path().join("output.sdp"));
-    let mut sender = Command::new("/usr/bin/ffmpeg");
+    let mut sender = Command::new(&ffmpeg);
     sender.args([
         "-nostdin",
         "-hide_banner",
@@ -239,25 +241,22 @@ pub async fn qualify(
     // Keep the output pairs owned until FFmpeg is ready to bind them; the native
     // sender can publish actual SDP without provoking ICMP destination failures.
     let (output, reserved) = ports();
-    let executable = if let Some(out) = &artifact {
-        use std::os::unix::fs::PermissionsExt;
-        let wrapper = out.join("owned-ffmpeg");
-        // Paths come from our private artifact directory, never stream settings.
-        let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
-        std::fs::write(
-            &wrapper,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexec /usr/bin/ffmpeg \"$@\" 2> {}\n",
-                quote(&out.join("worker-args.txt")),
-                quote(&out.join("worker.log"))
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-        wrapper
-    } else {
-        "/usr/bin/ffmpeg".into()
-    };
+    // Always retain worker diagnostics until this fixture finishes. Startup
+    // failures must report the actual independent decoder error in CI.
+    let diagnostics = artifact.as_deref().unwrap_or(d.path());
+    let executable = diagnostics.join("owned-ffmpeg");
+    let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+    std::fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexec {} \"$@\" 2> {}\n",
+            quote(&diagnostics.join("worker-args.txt")),
+            quote(Path::new(&ffmpeg)),
+            quote(&diagnostics.join("worker.log"))
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
     let engine = Engine::new(d.path().join("media"), executable.to_str().unwrap());
     if profile["encoder"]
         .as_str()
@@ -297,7 +296,7 @@ pub async fn qualify(
                 break s;
             }
             if !worker.alive.load(std::sync::atomic::Ordering::Relaxed) {
-                panic!("{}", worker.stats());
+                panic!("case video={video:?} audio={audio:?} secure_input={secure_input} secure_output={secure_output}: {}; worker: {}; sender: {}", worker.stats(), std::fs::read_to_string(diagnostics.join("worker.log")).unwrap_or_default(), std::fs::read_to_string(d.path().join("sender.log")).unwrap_or_default());
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -316,6 +315,39 @@ pub async fn qualify(
         }
         panic!("SDP startup: {}", worker.stats())
     });
+    if ffmpeg == "/usr/bin/ffmpeg" {
+        // Plaintext decoder sockets may only exist on the trusted loopback
+        // boundary, even though public sockets are authenticated separately.
+        let inodes: std::collections::HashSet<_> =
+            std::fs::read_dir(format!("/proc/{}/fd", worker.pid()))
+                .unwrap()
+                .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+                .filter_map(|link| {
+                    link.to_str()
+                        .and_then(|s| s.strip_prefix("socket:["))
+                        .and_then(|s| s.strip_suffix(']'))
+                        .map(str::to_owned)
+                })
+                .collect();
+        let table = std::fs::read_to_string("/proc/self/net/udp").unwrap();
+        let local: Vec<_> = table
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let f: Vec<_> = line.split_ascii_whitespace().collect();
+                if inodes.contains(*f.get(9)?) {
+                    Some(f[1].to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let loopback = format!("{:08X}:", u32::from_ne_bytes([127, 0, 0, 1]));
+        assert!(
+            !local.is_empty() && local.iter().all(|s| s.starts_with(&loopback)),
+            "Private decoder UDP sockets must bind loopback: {local:?}"
+        );
+    }
     std::fs::write(&output_sdp, &text).unwrap();
     // Keep public receiver ports continuously owned. A test-only UDP forwarder
     // delivers unchanged datagrams to independent FFmpeg after its sockets bind.
@@ -344,7 +376,7 @@ pub async fn qualify(
     std::fs::set_permissions(&receiver_sdp, std::fs::Permissions::from_mode(0o600)).unwrap();
     drop(private_reserved);
     let received = d.path().join("received.ts");
-    let mut receiver = Command::new("/usr/bin/ffmpeg")
+    let mut receiver = Command::new(&ffmpeg)
         .args([
             "-nostdin",
             "-hide_banner",

@@ -416,6 +416,11 @@ impl Engine {
             cmd.stdin(std::process::Stdio::piped());
         } else if let Some(settings) = crate::direct_rtp::config::Settings::input(&inputs[index])? {
             direct_input = Some(crate::direct_rtp::input::Input::bind(&settings).await?);
+            if settings.elementary {
+                // SDP connection addresses describe a peer; FFmpeg otherwise
+                // binds wildcard local sockets. Decrypted media stays private.
+                cmd.args(["-localaddr", "127.0.0.1"]);
+            }
             cmd.args([
                 "-protocol_whitelist",
                 if settings.elementary {

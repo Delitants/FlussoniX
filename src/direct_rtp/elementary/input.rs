@@ -5,7 +5,6 @@ use super::{
 };
 use crate::direct_rtp::{config::Settings, crypto, packet as control, sockets::Pair, stats::Stats};
 use std::{
-    io::ErrorKind,
     net::{SocketAddr, UdpSocket},
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
@@ -144,17 +143,9 @@ impl Input {
             .iter()
             .flat_map(|lane| [lane.target.port(), lane.target.port() + 1])
             .collect();
-        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+        let ready: Result<(), &'static str> = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let mut ready = true;
-                for port in &decoder_ports {
-                    match UdpSocket::bind(("127.0.0.1", *port)) {
-                        Ok(_) => ready = false,
-                        Err(e) if e.kind() == ErrorKind::AddrInUse => {},
-                        Err(_) => return Err("Private RTP decoder bind failed"),
-                    }
-                }
-                if ready {return Ok(());}
+                if super::readiness::bound(&decoder_ports)? {return Ok(());}
                 tokio::select! { _=cancel.cancelled()=>return Ok(()), _=tokio::time::sleep(Duration::from_millis(10))=>{} }
             }
         }).await.map_err(|_| "Elementary RTP decoder did not bind")?;
