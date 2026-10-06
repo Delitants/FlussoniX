@@ -58,6 +58,16 @@ async fn receive_authenticates_before_peer_pin_and_rejects_plaintext_tamper_repl
         .protect(&mut malformed, false)
         .unwrap();
     hostile.send_to(&malformed, cfg.address).await.unwrap();
+    let mut malformed_ts = ts();
+    malformed_ts[3] = 0x30;
+    malformed_ts[4] = 1;
+    malformed_ts[5] = 0x10;
+    let mut encrypted = packet::packet(3, 0, 98, &malformed_ts);
+    Session::new([0x33; 30], Some(98))
+        .unwrap()
+        .protect(&mut encrypted, false)
+        .unwrap();
+    hostile.send_to(&encrypted, cfg.address).await.unwrap();
     sender
         .send_to(&packet::packet(65534, 0, 42, &ts()), cfg.address)
         .await
@@ -232,7 +242,8 @@ async fn encrypted_destination_never_sends_plaintext_and_releases_local_pair() {
             delay_sr: 0,
         },
     );
-    malformed.extend([0, 0, 0, 0]);
+    malformed.truncate(32);
+    malformed.extend([0x81, 202, 0, 1, 0, 0, 0, 45]);
     Session::new([0x33; 30], Some(45))
         .unwrap()
         .protect(&mut malformed, true)
@@ -252,7 +263,13 @@ async fn encrypted_destination_never_sends_plaintext_and_releases_local_pair() {
         .send_to(&encrypted, (source.ip(), source.port() + 1))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.stats()["rtcp_packets"] != 1 || state.stats()["invalid_packets"] != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("malformed SDES must be rejected before the valid feedback identity is committed");
     assert_eq!(state.stats()["rtcp_packets"], 1);
     assert!(state.stats()["auth_failures"].as_u64().unwrap() >= 2);
     c.cancel();

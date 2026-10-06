@@ -3,6 +3,97 @@ use std::{
     time::{Duration, Instant},
 };
 pub const MAX_PACKET: usize = 1600;
+// Every SDES chunk must contain a bounded item list terminated by END and
+// zero alignment bytes. A claimed SSRC alone is not a source description.
+fn valid_sdes(b: &[u8], count: usize) -> bool {
+    let mut at = 0;
+    for _ in 0..count {
+        if b.get(at..at + 4).is_none() {
+            return false;
+        }
+        at += 4;
+        loop {
+            let Some(&kind) = b.get(at) else {
+                return false;
+            };
+            at += 1;
+            if kind == 0 {
+                break;
+            }
+            let Some(&n) = b.get(at) else {
+                return false;
+            };
+            at += 1;
+            if b.get(at..at + usize::from(n)).is_none() {
+                return false;
+            }
+            at += usize::from(n);
+        }
+        while at % 4 != 0 {
+            if b.get(at) != Some(&0) {
+                return false;
+            }
+            at += 1;
+        }
+    }
+    at == b.len()
+}
+fn skip(b: &mut &[u8], n: usize) -> bool {
+    if let Some(rest) = b.get(n..) {
+        *b = rest;
+        true
+    } else {
+        false
+    }
+}
+fn valid_ts(p: &[u8]) -> bool {
+    if p[0] != 0x47 || p[1] & 0x80 != 0 {
+        return false;
+    }
+    match p[3] & 0x30 {
+        0 => return false,
+        0x10 => return true,
+        0x20 if p[4] != 183 => return false,
+        0x30 if p[4] > 182 => return false,
+        _ => {}
+    }
+    let length = usize::from(p[4]);
+    if length == 0 {
+        return true;
+    }
+    let flags = p[5];
+    let mut fields = &p[6..5 + length];
+    for (flag, n) in [(0x10, 6), (0x08, 6), (0x04, 1)] {
+        if flags & flag != 0 && !skip(&mut fields, n) {
+            return false;
+        }
+    }
+    if flags & 0x02 != 0 {
+        let Some(&n) = fields.first() else {
+            return false;
+        };
+        if !skip(&mut fields, 1 + usize::from(n)) {
+            return false;
+        }
+    }
+    if flags & 0x01 != 0 {
+        let Some((&n, rest)) = fields.split_first() else {
+            return false;
+        };
+        let Some(mut extension) = rest.get(..usize::from(n)) else {
+            return false;
+        };
+        if let Some((&flags, rest)) = extension.split_first() {
+            extension = rest;
+            for (flag, n) in [(0x80, 2), (0x40, 3), (0x20, 5)] {
+                if flags & flag != 0 && !skip(&mut extension, n) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
 pub fn valid_rtcp(mut b: &[u8]) -> bool {
     if b.is_empty() || b.len() > 2048 {
         return false;
@@ -28,6 +119,14 @@ pub fn valid_rtcp(mut b: &[u8]) -> bool {
             || b[0] & 32 != 0
                 && (len != b.len() || b[len - 1] == 0 || usize::from(b[len - 1]) > len - min)
         {
+            return false;
+        }
+        let padding = if b[0] & 32 != 0 {
+            usize::from(b[len - 1])
+        } else {
+            0
+        };
+        if b[1] == 202 && !valid_sdes(&b[4..len - padding], rc) {
             return false;
         }
         b = &b[len..];
@@ -67,12 +166,7 @@ pub fn parse(b: &[u8]) -> Result<Parsed<'_>, &'static str> {
     if data.is_empty()
         || data.len() > 7 * 188
         || data.len() % 188 != 0
-        || data.chunks_exact(188).any(|p| {
-            p[0] != 0x47
-                || p[1] & 0x80 != 0
-                || p[3] & 0x30 == 0
-                || p[3] & 0x20 != 0 && (usize::from(p[4]) > 183 || 5 + usize::from(p[4]) > 188)
-        })
+        || data.chunks_exact(188).any(|p| !valid_ts(p))
     {
         return Err("invalid MP2T payload");
     }

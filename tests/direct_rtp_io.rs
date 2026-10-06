@@ -339,3 +339,156 @@ async fn ipv6_loopback_receives_and_transmits_on_owned_consecutive_ports() {
             .is_ok()
     );
 }
+
+#[tokio::test]
+async fn malformed_ts_does_not_pin_or_reach_the_decoder() {
+    let p = ports();
+    let cfg = Settings::parse(&json!({"url":format!("rtp://127.0.0.1:{p}")})).unwrap();
+    let input = Input::bind(&cfg).await.unwrap();
+    let stats = input.stats.clone();
+    let (write, mut read) = tokio::io::duplex(4096);
+    let cancel = CancellationToken::new();
+    let c = cancel.clone();
+    let task = tokio::spawn(async move { input.run(write, c).await });
+    let hostile = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for (afc, len, flags) in [(0x20, 0, 0), (0x30, 183, 0), (0x30, 1, 0x10)] {
+        let mut malformed = ts();
+        malformed[3] = afc;
+        malformed[4] = len;
+        malformed[5] = flags;
+        hostile
+            .send_to(&packet(1, 0, 99, &malformed), cfg.address)
+            .await
+            .unwrap();
+    }
+    sender
+        .send_to(&packet(1, 0, 42, &ts()), cfg.address)
+        .await
+        .unwrap();
+    let mut received = [0; 188];
+    tokio::time::timeout(Duration::from_secs(2), read.read_exact(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.to_vec(), ts());
+    assert_eq!(stats.snapshot()["packets"], 1);
+    assert_eq!(stats.snapshot()["invalid_packets"], 3);
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+}
+#[tokio::test]
+async fn multicast_ignores_unrelated_unicast_before_source_pin() {
+    let p = ports();
+    let cfg=Settings::parse(&json!({"url":format!("rtp://239.255.19.43:{p}"),"flussonix_rtp":{"interface":"127.0.0.1"}})).unwrap();
+    let input = Input::bind(&cfg).await.unwrap();
+    let (write, mut read) = tokio::io::duplex(4096);
+    let cancel = CancellationToken::new();
+    let c = cancel.clone();
+    let task = tokio::spawn(async move { input.run(write, c).await });
+    let hostile = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    hostile
+        .send_to(&packet(1, 0, 99, &ts()), (std::net::Ipv4Addr::LOCALHOST, p))
+        .await
+        .unwrap();
+    let mut received = [0; 188];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), read.read_exact(&mut received))
+            .await
+            .is_err(),
+        "unicast must not enter configured multicast input"
+    );
+    let source = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    source.set_multicast_loop_v4(true).unwrap();
+    use std::os::fd::AsRawFd;
+    let interface = libc::in_addr {
+        s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+    };
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                source.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_MULTICAST_IF,
+                (&interface as *const libc::in_addr).cast(),
+                std::mem::size_of_val(&interface) as libc::socklen_t,
+            )
+        },
+        0
+    );
+    source
+        .send_to(&packet(1, 0, 42, &ts()), cfg.address)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), read.read_exact(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.to_vec(), ts());
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+}
+#[tokio::test]
+async fn distinct_multicast_groups_share_ports_without_cross_delivery_and_release() {
+    use flussonix::direct_rtp::{config::outputs, output::State};
+    let p = ports();
+    let opts = json!({"interface":"127.0.0.1","ttl":1});
+    let cancel = CancellationToken::new();
+    let mut readers = vec![];
+    let mut tasks = vec![];
+    let mut txs = vec![];
+    for (i, group) in ["239.255.19.44", "239.255.19.45"].iter().enumerate() {
+        let url = format!("rtp://{group}:{p}");
+        let cfg = Settings::parse(&json!({"url":url,"flussonix_rtp":opts})).unwrap();
+        let input = Input::bind(&cfg)
+            .await
+            .expect("different multicast groups may share RTP/RTCP ports");
+        let (write, read) = tokio::io::duplex(4096);
+        readers.push(read);
+        let c = cancel.clone();
+        tasks.push(tokio::spawn(
+            async move { input.run(write, c).await.unwrap() },
+        ));
+        let def = outputs(&json!({"flussonix_rtp_outputs":[{"url":url,"flussonix_rtp":opts}]}))
+            .unwrap()
+            .remove(0);
+        let state = State::new(def, i);
+        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        txs.push(tx);
+        let c = cancel.clone();
+        tasks.push(tokio::spawn(async move { state.run(rx, c).await }));
+    }
+    for (i, tx) in txs.iter().enumerate() {
+        let mut body = ts();
+        body[4] = i as u8;
+        tx.send(bytes::Bytes::from(body)).unwrap();
+    }
+    for (i, read) in readers.iter_mut().enumerate() {
+        let mut b = [0; 188];
+        tokio::time::timeout(Duration::from_secs(2), read.read_exact(&mut b))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut expected = ts();
+        expected[4] = i as u8;
+        assert_eq!(b.to_vec(), expected);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), read.read_exact(&mut b))
+                .await
+                .is_err()
+        );
+    }
+    cancel.cancel();
+    for task in tasks {
+        task.await.unwrap();
+    }
+    assert!(
+        UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, p))
+            .await
+            .is_ok()
+    );
+    assert!(
+        UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, p + 1))
+            .await
+            .is_ok()
+    );
+}

@@ -39,8 +39,11 @@ fn socket(address: SocketAddr, cfg: &Settings, receive: bool) -> std::io::Result
 }
 impl Pair {
     pub fn receive(cfg: &Settings) -> Result<Self, String> {
+        // Binding the configured group isolates destination addresses and permits
+        // distinct IPTV groups on the same port without socket reuse. Wildcard
+        // membership also receives unrelated unicast traffic on Linux.
         let ip = if cfg.address.ip().is_multicast() {
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            cfg.address.ip()
         } else {
             cfg.interface.map(IpAddr::V4).unwrap_or(cfg.address.ip())
         };

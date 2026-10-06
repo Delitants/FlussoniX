@@ -66,3 +66,81 @@ fn reorder_does_not_delay_contiguous_data_when_jitter_is_zero() {
     assert_eq!(r.push(4, vec![4], now), vec![vec![4]]);
     assert_eq!(r.lost, 1);
 }
+
+#[test]
+fn adaptation_fields_require_correct_occupancy_and_flag_directed_lengths() {
+    let mut body = ts();
+    for (afc, length, flags) in [
+        (0x20, 0, 0),
+        (0x30, 183, 0),
+        (0x30, 1, 0x10),
+        (0x30, 1, 0x08),
+        (0x30, 1, 0x04),
+        (0x30, 1, 0x02),
+        (0x30, 1, 0x01),
+    ] {
+        body[3] = afc;
+        body[4] = length;
+        body[5] = flags;
+        assert!(
+            parse(&packet(1, 0, 42, &body)).is_err(),
+            "AFC={afc:x} length={length} flags={flags:x}"
+        );
+    }
+    body[3] = 0x30;
+    body[4] = 2;
+    body[5] = 2;
+    body[6] = 10;
+    assert!(
+        parse(&packet(1, 0, 42, &body)).is_err(),
+        "truncated private data"
+    );
+    body[5] = 1;
+    body[6] = 10;
+    assert!(
+        parse(&packet(1, 0, 42, &body)).is_err(),
+        "truncated extension"
+    );
+    for flag in [0x80, 0x40, 0x20] {
+        body[4] = 3;
+        body[5] = 1;
+        body[6] = 1;
+        body[7] = flag;
+        assert!(
+            parse(&packet(1, 0, 42, &body)).is_err(),
+            "truncated extension field"
+        );
+    }
+    body = ts();
+    body[3] = 0x20;
+    body[4] = 183;
+    body[5] = 0;
+    assert!(parse(&packet(1, 0, 42, &body)).is_ok());
+    body = ts();
+    body[3] = 0x30;
+    body[4] = 0;
+    assert!(parse(&packet(1, 0, 42, &body)).is_ok());
+    // PCR, OPCR, splice countdown, private data, and all extension fields.
+    body[4] = 33;
+    body[5] = 0x1f;
+    body[19] = 2;
+    body[22] = 11;
+    body[23] = 0xe0;
+    assert!(parse(&packet(1, 0, 42, &body)).is_ok());
+}
+#[test]
+fn rtcp_sdes_requires_terminated_bounded_aligned_chunks() {
+    use flussonix::direct_rtp::packet::{Reception, receiver_report, valid_rtcp};
+    let good = receiver_report(42, 43, &Reception::default());
+    assert!(valid_rtcp(&good));
+    for chunk in [
+        vec![0x81, 202, 0, 1, 0, 0, 0, 42],
+        vec![0x81, 202, 0, 2, 0, 0, 0, 42, 1, 8, 0, 0],
+        vec![0x81, 202, 0, 2, 0, 0, 0, 42, 0, 1, 0, 0],
+        vec![0x82, 202, 0, 2, 0, 0, 0, 42, 0, 0, 0, 0],
+    ] {
+        let mut bad = good[..32].to_vec();
+        bad.extend(chunk);
+        assert!(!valid_rtcp(&bad));
+    }
+}
