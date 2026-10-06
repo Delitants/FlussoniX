@@ -26,6 +26,12 @@ pub struct Transport {
 }
 impl Transport {
     pub fn parse(s: &str) -> Result<Self, u16> {
+        Self::parse_mode(s, "PLAY")
+    }
+    pub(crate) fn record(s: &str) -> Result<Self, u16> {
+        Self::parse_mode(s, "RECORD")
+    }
+    fn parse_mode(s: &str, mode: &str) -> Result<Self, u16> {
         let mut parts = s.split(';');
         if !parts
             .next()
@@ -43,7 +49,7 @@ impl Transport {
             }
             match key.as_str() {
                 "unicast" if value.is_empty() => {}
-                "mode" if value.trim_matches('"').eq_ignore_ascii_case("PLAY") => {}
+                "mode" if value.trim_matches('"').eq_ignore_ascii_case(mode) => {}
                 "interleaved" => {
                     let (a, b) = value.split_once('-').ok_or(461u16)?;
                     let a = a.parse::<u8>().map_err(|_| 461u16)?;
@@ -159,6 +165,7 @@ pub fn response(code: u16, cseq: u32, headers: &[(&str, String)], body: &[u8]) -
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
+        409 => "Conflict",
         413 => "Request Entity Too Large",
         415 => "Unsupported Media Type",
         453 => "Not Enough Bandwidth",

@@ -1,5 +1,6 @@
 //! RTSP/1.0 live playback using the shared H.264/HEVC/AAC/MPEG audio RTP profile.
 pub mod protocol;
+mod publication;
 pub mod tls;
 pub mod udp;
 use crate::{
@@ -22,7 +23,7 @@ use tokio::{
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
-const PUBLIC: &str = "OPTIONS, DESCRIBE, SETUP, PLAY, GET_PARAMETER, TEARDOWN";
+const PUBLIC: &str = "OPTIONS, DESCRIBE, SETUP, PLAY, ANNOUNCE, RECORD, GET_PARAMETER, TEARDOWN";
 struct ReaderTask(JoinHandle<()>);
 impl Drop for ReaderTask {
     fn drop(&mut self) {
@@ -281,6 +282,19 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
             }
             Next::Control(Some(Ok(Event::Request(request)))) => {
                 last_control = Instant::now();
+                if request.method == "ANNOUNCE" && session.is_none() {
+                    publication::receive(
+                        request,
+                        &mut controls,
+                        &mut write,
+                        &app,
+                        peer,
+                        &cancel,
+                        secure,
+                    )
+                    .await?;
+                    break;
+                }
                 let reply = tokio::select! {biased;_=cancel.cancelled()=>break,reply=handle(&request,&mut session,&app,peer,udp.as_ref(),secure)=>reply};
                 let bytes =
                     protocol::response(reply.code, request.cseq, &reply.headers, &reply.body);

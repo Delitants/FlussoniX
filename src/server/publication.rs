@@ -14,12 +14,12 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{io::AsyncWriteExt, time::Instant};
 
 #[derive(Clone)]
-struct Snapshot {
-    config: Value,
-    policy: Policy,
+pub(crate) struct Snapshot {
+    pub(crate) config: Value,
+    pub(crate) policy: Policy,
     signature: String,
 }
-fn snapshot(app: &App, name: &str) -> Option<Snapshot> {
+pub(crate) fn snapshot(app: &App, name: &str) -> Option<Snapshot> {
     app.config.read(|root| {
         let config = crate::config::effective(root, name)?;
         if config["disabled"] == true || !is_input(&config) {
@@ -34,15 +34,15 @@ fn snapshot(app: &App, name: &str) -> Option<Snapshot> {
         })
     })
 }
-fn current(app: &App, name: &str, expected: &Snapshot) -> bool {
+pub(crate) fn current(app: &App, name: &str, expected: &Snapshot) -> bool {
     snapshot(app, name)
         .is_some_and(|s| s.signature == expected.signature && s.policy == expected.policy)
 }
-struct Session {
-    metadata: Value,
-    started: Instant,
-    number: u64,
-    bytes: u64,
+pub(crate) struct Session {
+    pub(crate) metadata: Value,
+    pub(crate) started: Instant,
+    pub(crate) number: u64,
+    pub(crate) bytes: u64,
 }
 impl Session {
     async fn authorize(&mut self, app: &App, policy: &Policy) -> Result<Duration, ()> {
@@ -84,7 +84,7 @@ impl Session {
         Ok(Duration::from_secs(seconds))
     }
 }
-async fn authorize_current(
+pub(crate) async fn authorize_current(
     session: &mut Session,
     app: &App,
     name: &str,

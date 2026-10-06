@@ -27,6 +27,11 @@ pub struct Engine {
     gpu: crate::gpu::Checks,
     pub direct_egress: Arc<AtomicU64>,
 }
+#[derive(Clone, Copy)]
+enum PublicationInput {
+    MpegTs,
+    Sdp { secure: bool },
+}
 pub struct Publication {
     pub worker: Arc<Worker>,
     pub stdin: Option<tokio::process::ChildStdin>,
@@ -195,10 +200,32 @@ impl Engine {
         cfg: &Value,
         current: impl std::future::Future<Output = bool>,
     ) -> Result<Publication, String> {
+        self.publish_mode(name, cfg, current, PublicationInput::MpegTs)
+            .await
+    }
+    pub(crate) async fn publish_sdp_guarded(
+        &self,
+        name: &str,
+        cfg: &Value,
+        secure: bool,
+        current: impl std::future::Future<Output = bool>,
+    ) -> Result<Publication, String> {
+        self.publish_mode(name, cfg, current, PublicationInput::Sdp { secure })
+            .await
+    }
+    async fn publish_mode(
+        &self,
+        name: &str,
+        cfg: &Value,
+        current: impl std::future::Future<Output = bool>,
+        mode: PublicationInput,
+    ) -> Result<Publication, String> {
         if !crate::publish::is_input(cfg) {
             return Err("stream does not accept publications".into());
         }
-        let worker = self.ensure_mode(name, cfg, true, current, true).await?;
+        let worker = self
+            .ensure_mode(name, cfg, true, current, Some(mode))
+            .await?;
         let stdin = worker.publisher_stdin.lock().unwrap().take();
         Ok(Publication { worker, stdin })
     }
@@ -221,7 +248,7 @@ impl Engine {
         touch_demand: bool,
         current: impl std::future::Future<Output = bool>,
     ) -> Result<Arc<Worker>, String> {
-        self.ensure_mode(name, cfg, touch_demand, current, false)
+        self.ensure_mode(name, cfg, touch_demand, current, None)
             .await
     }
     async fn ensure_mode(
@@ -230,7 +257,7 @@ impl Engine {
         cfg: &Value,
         touch_demand: bool,
         current: impl std::future::Future<Output = bool>,
-        publishing: bool,
+        publishing: Option<PublicationInput>,
     ) -> Result<Arc<Worker>, String> {
         let subtitle_tracks = crate::config::subtitle_tracks(cfg)?;
         let destinations = crate::srt_push::configuration(cfg)?;
@@ -283,14 +310,15 @@ impl Engine {
             viewers = w.viewers.clone();
             let running = w.alive.load(Ordering::Relaxed) && !w.is_closed();
             if running && w.signature == signature {
-                if publishing {
+                if publishing.is_some() {
                     return Err("publisher already connected".into());
                 }
                 return Ok(w.clone());
             }
             if !running && w.signature == signature {
                 let recovery = w.recovery.lock().unwrap();
-                if !publishing && recovery.retry_in().is_some_and(|delay| !delay.is_zero()) {
+                if publishing.is_none() && recovery.retry_in().is_some_and(|delay| !delay.is_zero())
+                {
                     return Err("input retry backoff".into());
                 }
                 index = w.input_index + 1;
@@ -324,7 +352,7 @@ impl Engine {
             return Err("worker limit reached".into());
         }
         let publication = crate::publish::is_input(cfg);
-        if publication && !publishing {
+        if publication && publishing.is_none() {
             return Err("waiting for publisher".into());
         }
         let dir = self.directory(name);
@@ -388,6 +416,22 @@ impl Engine {
                 "-i",
                 "sine=frequency=440:sample_rate=48000",
             ]);
+        } else if matches!(publishing, Some(PublicationInput::Sdp { .. })) {
+            cmd.args([
+                "-localaddr",
+                "127.0.0.1",
+                "-protocol_whitelist",
+                "pipe,udp,rtp",
+                "-probesize",
+                "1048576",
+                "-analyzeduration",
+                "1000000",
+                "-f",
+                "sdp",
+                "-i",
+                "pipe:0",
+            ]);
+            cmd.stdin(std::process::Stdio::piped());
         } else if publication {
             cmd.args([
                 "-protocol_whitelist",
@@ -524,7 +568,8 @@ impl Engine {
         profile.apply(&mut cmd);
         // RTP AAC depacketizers can omit key flags; copied units are independent.
         if profile.audio_copy()
-            && (m4s_input
+            && (matches!(publishing, Some(PublicationInput::Sdp { .. }))
+                || m4s_input
                 || m4f_input
                 || input.starts_with("rtsp://")
                 || input.starts_with("rtsps://")
@@ -672,7 +717,11 @@ impl Engine {
                 .collect(),
             active_pushes: crate::srt_push::enabled(cfg) || crate::direct_rtp::config::enabled(cfg),
             input_index: index,
-            input_protocol: input.split("://").next().unwrap_or("unknown").into(),
+            input_protocol: match publishing {
+                Some(PublicationInput::Sdp { secure: true }) => "rtsps".into(),
+                Some(PublicationInput::Sdp { secure: false }) => "rtsp".into(),
+                _ => input.split("://").next().unwrap_or("unknown").into(),
+            },
             restart_count,
             input_timeout: timeout,
             recovery: std::sync::Mutex::new(crate::recovery::Recovery::new(streak)),

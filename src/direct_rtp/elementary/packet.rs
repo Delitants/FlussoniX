@@ -86,7 +86,16 @@ fn payload(b: &[u8], codec: &Codec) -> bool {
     }
 }
 pub fn parse<'a>(b: &'a [u8], track: &Track) -> Result<Parsed<'a>, &'static str> {
-    if b.len() < 12 || b.len() > MAX_PACKET || b[0] >> 6 != 2 || b[1] & 127 != track.payload {
+    parse_limit(b, track, MAX_PACKET)
+}
+pub(crate) fn parse_interleaved<'a>(
+    b: &'a [u8],
+    track: &Track,
+) -> Result<Parsed<'a>, &'static str> {
+    parse_limit(b, track, 8192)
+}
+fn parse_limit<'a>(b: &'a [u8], track: &Track, limit: usize) -> Result<Parsed<'a>, &'static str> {
+    if b.len() < 12 || b.len() > limit || b[0] >> 6 != 2 || b[1] & 127 != track.payload {
         return Err("invalid elementary RTP header");
     }
     let mut start = 12 + usize::from(b[0] & 15) * 4;

@@ -3,7 +3,7 @@ pub mod config;
 pub mod input;
 pub mod output;
 pub mod packet;
-mod sockets;
+pub(crate) mod sockets;
 mod stats;
 
 pub mod crypto;

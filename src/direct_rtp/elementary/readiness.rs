@@ -2,7 +2,7 @@
 //! Binding a port to probe it can race the decoder and make its bind fail.
 use std::io::Read;
 const LIMIT: usize = 1024 * 1024;
-pub(super) fn bound(ports: &[u16]) -> Result<bool, &'static str> {
+pub(crate) fn bound(ports: &[u16]) -> Result<bool, &'static str> {
     let file = std::fs::File::open("/proc/self/net/udp")
         .map_err(|_| "Private RTP decoder socket table unavailable")?;
     let mut bytes = Vec::new();
