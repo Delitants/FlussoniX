@@ -1,5 +1,6 @@
 //! Bounded receiving sessions share HTTP publisher policy and worker ownership.
 mod bridge;
+mod reports;
 mod sdp;
 use super::protocol::{self, Event, Request, Transport};
 use crate::{
@@ -358,23 +359,31 @@ async fn run<W: AsyncWrite + Unpin>(
     );
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     let mut activity = Instant::now();
+    let mut reports = tokio::time::interval(Duration::from_secs(5));
+    reports.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    reports.tick().await;
     loop {
         tokio::select! {biased;
         _=cancel.cancelled()=>break,
         _=tick.tick()=>{if !admission::current(app,&s.name,&s.expected)||s.publication.as_ref().is_some_and(|p|p.worker.is_closed())||s.publication.is_some()&&s.progress.elapsed()>=timeout{break;}},
         _=tokio::time::sleep_until(activity+Duration::from_secs(30))=>break,
         _=tokio::time::sleep_until(s.renew_at),if s.expected.policy.url.is_some()=>{let renew=tokio::select!{biased;_=cancel.cancelled()=>break,r=admission::authorize_current(&mut s.grant,app,&s.name,&s.expected,s.publication.as_ref().map(|p|p.worker.as_ref()))=>r};match renew{Ok(d)=>s.renew_at=Instant::now()+d,Err(_)=>break}},
+        _=reports.tick(),if s.bridge.is_some()=>{
+            let body=s.bridge.as_mut().unwrap().reports();
+            if !body.is_empty() {tokio::select!{biased;_=cancel.cancelled()=>break,_=s.publication.as_ref().unwrap().worker.closed()=>break,r=tokio::time::timeout(Duration::from_secs(2),write.write_all(&body))=>if !matches!(r,Ok(Ok(()))){break;}}}
+        },
         event=controls.recv()=>match event{
         Some(Ok(Event::Request(r)))=>{let(code,headers,close)=s.request(&r,app,cancel).await;reply(write,cancel,code,r.cseq,&headers).await?;if close{break;}
         if code==200{activity=Instant::now();}},
         Some(Ok(Event::Interleaved(channel,body)))=>{
         let Some(bridge)=s.bridge.as_mut() else{break;};
         let forwarded=tokio::select!{biased;_=cancel.cancelled()=>break,r=tokio::time::timeout(Duration::from_millis(250),bridge.forward(channel,&body))=>r};
-        match forwarded {Ok(Ok(media))=>{if media{s.progress=Instant::now();activity=s.progress;s.grant.bytes=s.grant.bytes.saturating_add(body.len() as u64);}},_=>break}
+        match forwarded {Ok(Ok(media))=>{if media{s.progress=Instant::now();activity=s.progress;s.grant.bytes=s.grant.bytes.saturating_add(body.len() as u64);}},Ok(Err(reason))=>{tracing::debug!(reason,channel,length=body.len(),"RTSP publication packet rejected");break;},Err(_)=>{tracing::debug!("RTSP publication packet relay stalled");break;}}
         },
-        _=>break,
+        Some(Err(error))=>{tracing::debug!(code=error.code,"RTSP publication framing failed");break;},
+        _=>{tracing::debug!("RTSP publisher connection ended");break;},
         },
-        feedback=async{match &s.bridge{Some(b)=>b.feedback().await,None=>std::future::pending().await}}=>{match feedback{Ok((channel,body))=>{let mut b=vec![b'$',channel];b.extend_from_slice(&(body.len() as u16).to_be_bytes());b.extend(body);tokio::select!{biased;_=cancel.cancelled()=>break,r=tokio::time::timeout(Duration::from_secs(2),write.write_all(&b))=>if !matches!(r,Ok(Ok(()))){break;} }},Err(_)=>break}},
+        feedback=async{match &s.bridge{Some(b)=>b.feedback().await,None=>std::future::pending().await}}=>{match feedback{Ok((channel,body))=>{let mut b=vec![b'$',channel];b.extend_from_slice(&(body.len() as u16).to_be_bytes());b.extend(body);tokio::select!{biased;_=cancel.cancelled()=>break,r=tokio::time::timeout(Duration::from_secs(2),write.write_all(&b))=>if !matches!(r,Ok(Ok(()))){break;} }},Err(reason)=>{tracing::debug!(reason,"RTSP publication feedback failed");break;}}},
         }
     }
     Ok(())

@@ -23,6 +23,10 @@ impl Lab {
         Self::with_ffmpeg(role, "/usr/bin/ffmpeg").await
     }
     async fn with_ffmpeg(role: &str, ffmpeg: &str) -> Self {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .try_init();
         let dir = tempfile::tempdir().unwrap();
         // Preserve owned decoder diagnostics without exposing production input URLs.
         // exec keeps the actual FFmpeg PID and its stdin/stdout/lifecycle unchanged.
@@ -1298,4 +1302,144 @@ async fn http_owner_prevents_rtsp_record_until_its_generation_is_reaped() {
     assert!(!new.is_closed());
     drop(s);
     l.end().await;
+}
+
+#[tokio::test]
+async fn receiver_reports_return_to_the_negotiated_publisher_channel() {
+    let l = Lab::new("standalone").await;
+    let mut cfg = l.app.config.snapshot()["streams"]["owned"].clone();
+    cfg["flussonix_input_timeout"] = json!(15);
+    l.app.config.put("streams", "owned", cfg).unwrap();
+    let cfg = l.app.config.effective("owned").unwrap();
+    let endpoint = url::Url::parse(&l.url).unwrap();
+    let target = format!(
+        "{}:{}",
+        endpoint.host_str().unwrap(),
+        endpoint.port().unwrap()
+    );
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let input = format!(
+        "rtsp://{}/owned?password=owned-publish",
+        proxy.local_addr().unwrap()
+    );
+    let relay = tokio::spawn(async move {
+        let (publisher, _) = proxy.accept().await.unwrap();
+        let decoder = TcpStream::connect(target).await.unwrap();
+        let (mut pr, mut pw) = publisher.into_split();
+        let (mut dr, mut dw) = decoder.into_split();
+        let outgoing = tokio::spawn(async move { tokio::io::copy(&mut pr, &mut dw).await });
+        let mut recorded = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            let n = dr.read(&mut buffer).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            recorded.extend_from_slice(&buffer[..n]);
+            assert!(recorded.len() <= 65536, "bounded owned feedback trace");
+            if pw.write_all(&buffer[..n]).await.is_err() {
+                break;
+            }
+        }
+        outgoing.abort();
+        let _ = outgoing.await;
+        recorded
+    });
+    let mut child = publisher(Some("libx264"), &["aac"], &input);
+    let progress = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            if let Ok(w) = l.app.media.ensure("owned", &cfg).await {
+                if w.stats()["bytes_in"].as_u64().unwrap_or(0) >= 18800 {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let _ = child.kill().await;
+    let recorded = tokio::time::timeout(Duration::from_secs(3), relay)
+        .await
+        .unwrap()
+        .unwrap();
+    l.end().await;
+    progress.expect("independent publisher must produce actual common media");
+    let mut bytes = recorded.as_slice();
+    let mut channels = Vec::new();
+    while !bytes.is_empty() {
+        if bytes[0] == b'$' {
+            let length = usize::from(u16::from_be_bytes(bytes[2..4].try_into().unwrap()));
+            let body = &bytes[4..4 + length];
+            assert!(flussonix::direct_rtp::packet::valid_rtcp(body));
+            assert_eq!(body[1], 201, "actual receiver report");
+            channels.push(bytes[1]);
+            bytes = &bytes[4 + length..];
+        } else {
+            let end = bytes.windows(4).position(|b| b == b"\r\n\r\n").unwrap() + 4;
+            let header = std::str::from_utf8(&bytes[..end]).unwrap();
+            let length = header
+                .lines()
+                .find_map(|l| l.strip_prefix("Content-Length: "))
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            bytes = &bytes[end + length..];
+        }
+    }
+    assert!(
+        channels.contains(&1),
+        "Video receiver reports must return over negotiated channel 1"
+    );
+}
+
+#[tokio::test]
+async fn receiver_reports_bind_the_source_and_account_for_sequence_gaps() {
+    let l = Lab::new("standalone").await;
+    let mut cfg = l.app.config.snapshot()["streams"]["owned"].clone();
+    cfg["flussonix_input_timeout"] = json!(15);
+    l.app.config.put("streams", "owned", cfg).unwrap();
+    let mut s = l.socket().await;
+    let (_, h) = announce(&mut s, &l.url, SDP).await;
+    let sid = id(&h);
+    assert_eq!(setup(&mut s, &track(&l.url), &sid, TRANSPORT).await, 200);
+    assert_eq!(
+        request(&mut s, "RECORD", &l.url, &format!("Session: {sid}\r\n"), "")
+            .await
+            .0,
+        200
+    );
+    let source = 0x12345678u32;
+    let mut sr = vec![0x80, 200, 0, 6];
+    sr.extend(source.to_be_bytes());
+    sr.extend([0, 0, 1, 2, 3, 4, 0, 0]);
+    sr.extend([0; 12]);
+    interleaved(&mut s, 1, &sr).await;
+    for sequence in [100u16, 102, 102] {
+        let mut body = vec![0x80, 96];
+        body.extend(sequence.to_be_bytes());
+        body.extend(90000u32.to_be_bytes());
+        body.extend(source.to_be_bytes());
+        body.extend([0x65, 0x88, 0x84]);
+        interleaved(&mut s, 0, &body).await;
+    }
+    let report =
+        tokio::time::timeout(Duration::from_secs(7), rtsp::protocol::read_event(&mut s)).await;
+    drop(s);
+    l.end().await;
+    let rtsp::protocol::Event::Interleaved(channel, body) =
+        report.expect("receiver report deadline").unwrap()
+    else {
+        panic!("Expected interleaved RTCP");
+    };
+    assert_eq!(channel, 1);
+    assert!(flussonix::direct_rtp::packet::valid_rtcp(&body));
+    assert_eq!(body[1], 201);
+    assert_ne!(&body[4..8], &source.to_be_bytes());
+    assert_eq!(&body[8..12], &source.to_be_bytes());
+    assert_eq!(body[12], 85, "One missing of three expected packets");
+    assert_eq!(&body[13..16], &[0, 0, 1]);
+    assert_eq!(&body[16..20], &102u32.to_be_bytes());
+    assert_eq!(&body[24..28], &0x01020304u32.to_be_bytes());
+    assert!(u32::from_be_bytes(body[28..32].try_into().unwrap()) > 0);
 }
