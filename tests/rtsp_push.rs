@@ -1067,8 +1067,15 @@ async fn native_text_preserve_rejects_rtsp_before_connect_and_drop_delivers_audi
                     "destination failure must leave common worker alive"
                 );
             } else {
-                wait_push(&worker, 0, "sending").await;
+                // A finite native GOP can finish before a transient status is observed.
+                // The independently decoded recording and cumulative RTP prove delivery.
                 received(receiver.as_mut().unwrap(), &path, None, "mp2").await;
+                assert!(
+                    worker.stats()["flussonix_pushes"][0]["rtp_bytes"]
+                        .as_u64()
+                        .unwrap()
+                        > 0
+                );
             }
             engine.stop_all().await;
             source_task.abort();
