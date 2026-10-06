@@ -761,6 +761,12 @@ test('RTSPS push controls save masked credentials and inherit from templates',as
  await page.getByRole('button',{name:'Streams',exact:true}).click();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Output',exact:true}).click();
  await expect(page.getByText('1. rtsps://localhost:13220 · Disabled · Verified TLS',{exact:true})).toBeVisible();await expect(page.locator('body')).not.toContainText('owned-ui-secret');
  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Destination settings',{exact:true}).selectOption('override');await expect(page.getByLabel('Destination URL 1',{exact:true})).toHaveValue(url);
+ const destination=page.getByLabel('Destination URL 1',{exact:true});
+ await destination.fill(url.replace('rtsps:','rtps:'));
+ await expect(destination).toHaveAttribute('type','password');
+ await expect(page.getByLabel('Destination protocol 1',{exact:true})).toHaveValue('rtsps');
+ await expect(page.locator('body')).not.toContainText('owned-ui-secret');
+ await destination.fill(url);
  await page.getByLabel('Destination protocol 1',{exact:true}).selectOption('rtsp');await expect(page.getByLabel('Destination trusted CA file 1',{exact:true})).toHaveCount(0);
  await page.getByRole('button',{name:'Save',exact:true}).click();
  const stream=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(stream.pushes).toEqual([{url:url.replace('rtsps:','rtsp:'),disabled:true}]);

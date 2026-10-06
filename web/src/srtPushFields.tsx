@@ -49,33 +49,45 @@ export function pushError(value:Item):string|undefined {
 }
 
 export function PushFields({value,inherited,onChange}:{value:Item,inherited?:Item[],onChange:(pushes:Item[]|undefined)=>void}) {
+ const [editingProtocols,setEditingProtocols]=React.useState<Record<number,string>>({});
+ const rowProtocol=(i:number,p:Item)=>editingProtocols[i]??protocol(p);
  const mode=owns(value,'pushes')?(value.pushes?.length?'override':'none'):'inherit';
  const rows:Item[]=(value.pushes||[]).map(expandedPush);
- const set=(i:number,key:string,v:any)=>onChange(rows.map((p,n)=>{
-  if(n!==i)return p;const next={...p};if(v===undefined)delete next[key];else next[key]=v;return next;
- }));
- const changeProtocol=(i:number,kind:string)=>onChange(rows.map((p,n)=>{
+ const set=(i:number,key:string,v:any)=>{
+  if(key==='url')setEditingProtocols(previous=>({...previous,[i]:previous[i]??protocol(rows[i])}));
+  onChange(rows.map((p,n)=>{
+   if(n!==i)return p;const next={...p};if(v===undefined)delete next[key];else next[key]=v;return next;
+  }));
+ };
+ const remove=(i:number)=>{
+  setEditingProtocols(previous=>Object.fromEntries(Object.entries(previous).filter(([key])=>Number(key)!==i).map(([key,kind])=>[Number(key)>i?Number(key)-1:Number(key),kind])));
+  onChange(rows.filter((_,n)=>n!==i));
+ };
+ const changeProtocol=(i:number,kind:string)=>{
+  setEditingProtocols(previous=>({...previous,[i]:kind}));
+  onChange(rows.map((p,n)=>{
   if(n!==i)return p;
   const next:Item={};for(const key of ['url','disabled','comment','connect_timeout','retry_timeout'])if(owns(p,key))next[key]=p[key];
   try {const u=protocol(p)==='srt'?parsedURL(p.url):new URL(p.url);u.protocol=kind+':';if(kind==='srt'){u.pathname='/';u.search='';}next.url=u.toString();}catch{next.url=kind+'://';}
   return next;
  }));
+ };
  return <fieldset><legend>Push destinations</legend>
   <p className="muted">SRT caller mode or RTSP TCP sends the processed stream to each receiver. RTSPS verifies the receiver certificate and identity. Enabled destinations keep a stream active without viewers. Editing destinations restarts the stream in this preview.</p>
-  <Field label="Destination settings"><select value={mode} onChange={e=>onChange(e.target.value==='inherit'?undefined:e.target.value==='none'?[]:inherited?.length?inherited.map(expandedPush):[{url:''}])}><option value="inherit">{value.template?'Use template destinations':'No destinations (default)'}</option><option value="override">Override destinations</option><option value="none">No destinations</option></select></Field>
+  <Field label="Destination settings"><select value={mode} onChange={e=>{setEditingProtocols({});onChange(e.target.value==='inherit'?undefined:e.target.value==='none'?[]:inherited?.length?inherited.map(expandedPush):[{url:''}]);}}><option value="inherit">{value.template?'Use template destinations':'No destinations (default)'}</option><option value="override">Override destinations</option><option value="none">No destinations</option></select></Field>
   {mode==='inherit'&&value.template&&<div className="muted">{pushSummary(inherited||[])}</div>}
   {mode==='override'&&<>{rows.map((p,i)=><div className="form-details" key={i}><h3>Destination {i+1}</h3><div className="form-grid">
-   <Field label={`Destination protocol ${i+1}`}><select value={protocol(p)} onChange={e=>changeProtocol(i,e.target.value)}><option value="srt">SRT</option><option value="rtsp">RTSP</option><option value="rtsps">RTSPS (verified TLS)</option></select></Field>
-   <Field label={`Destination URL ${i+1}`} help={protocol(p)==='srt'?"Receiver address, including its SRT port.":"Receiver stream address. Query credentials are hidden; Basic/Digest userinfo is not supported."}><input type={protocol(p)==='srt'?'text':'password'} autoComplete="off" placeholder={protocol(p)==='srt'?'srt://receiver.example:9000':protocol(p)+'://receiver.example/stream'} value={p.url||''} onChange={e=>set(i,'url',e.target.value)}/></Field>
-   {protocol(p)==='srt'&&<>
+   <Field label={`Destination protocol ${i+1}`}><select value={rowProtocol(i,p)} onChange={e=>changeProtocol(i,e.target.value)}><option value="srt">SRT</option><option value="rtsp">RTSP</option><option value="rtsps">RTSPS (verified TLS)</option></select></Field>
+   <Field label={`Destination URL ${i+1}`} help={rowProtocol(i,p)==='srt'?"Receiver address, including its SRT port. URL credentials are hidden.":"Receiver stream address. Query credentials are hidden; Basic/Digest userinfo is not supported."}><input type="password" autoComplete="off" placeholder={rowProtocol(i,p)==='srt'?'srt://receiver.example:9000':rowProtocol(i,p)+'://receiver.example/stream'} value={p.url||''} onChange={e=>set(i,'url',e.target.value)}/></Field>
+   {rowProtocol(i,p)==='srt'&&<>
    <Field label={`Stream ID ${i+1}`} help="Optional identifier for the receiver, such as #!::r=channel,m=publish. Hidden because it may contain credentials."><input type="password" autoComplete="off" maxLength={512} value={p.streamid??''} onChange={e=>set(i,'streamid',e.target.value)}/></Field>
    <Field label={`Passphrase ${i+1}`} help="Matching 10–79 ASCII character secrets enable encryption. Empty means plaintext."><input type="password" autoComplete="off" maxLength={79} value={p.passphrase??''} onChange={e=>set(i,'passphrase',e.target.value)}/></Field>
    <Field label={`Latency (milliseconds) ${i+1}`} help="Delivery delay, 1–10000 milliseconds; default 120."><input type="number" min="1" max="10000" value={p.latency??120} onChange={e=>set(i,'latency',e.target.value===''?'':Number(e.target.value))}/></Field>
    </>}
-   {protocol(p)==='rtsps'&&<Field label={`Destination trusted CA file ${i+1}`} help="Optional absolute PEM bundle path on this server. Leave empty for public roots."><input value={p.flussonix_tls_ca||''} onChange={e=>set(i,'flussonix_tls_ca',e.target.value||undefined)}/></Field>}
+   {rowProtocol(i,p)==='rtsps'&&<Field label={`Destination trusted CA file ${i+1}`} help="Optional absolute PEM bundle path on this server. Leave empty for public roots."><input value={p.flussonix_tls_ca||''} onChange={e=>set(i,'flussonix_tls_ca',e.target.value||undefined)}/></Field>}
    <Field label={`Connection timeout (seconds) ${i+1}`}><input type="number" min="1" max="30" value={p.connect_timeout??3} onChange={e=>set(i,'connect_timeout',e.target.value===''?'':Number(e.target.value))}/></Field>
    <Field label={`Retry interval (seconds) ${i+1}`}><input type="number" min="1" max="300" value={p.retry_timeout??5} onChange={e=>set(i,'retry_timeout',e.target.value===''?'':Number(e.target.value))}/></Field>
    <Field label={`Destination enabled ${i+1}`}><input type="checkbox" checked={!p.disabled} onChange={e=>set(i,'disabled',!e.target.checked)}/></Field>
-  </div><button type="button" onClick={()=>onChange(rows.filter((_,n)=>n!==i))}>Remove destination {i+1}</button></div>)}<button type="button" disabled={rows.length>=4} onClick={()=>onChange([...rows,{url:''}])}>Add destination</button></>}
+  </div><button type="button" onClick={()=>remove(i)}>Remove destination {i+1}</button></div>)}<button type="button" disabled={rows.length>=4} onClick={()=>onChange([...rows,{url:''}])}>Add destination</button></>}
  </fieldset>;
 }
