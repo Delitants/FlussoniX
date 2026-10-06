@@ -347,8 +347,9 @@ available internal iGPU with the separately qualified Intel driver environment.
 A real trusted TLS bridge carries HEVC/MP3 into the independent receiver.
 Untrusted roots, wrong IP identity and expired certificates forward no RTSP
 data. A receiving FlussoniX node tests the configured publisher password and
-rejects an administrator password. Separate retained DVB subtitles fail the
-destination before connecting. Disabled and publication-waiting streams retain
+rejects an administrator password. Separate retained DVB subtitles and native
+M4F/M4S text fail the destination before connecting; explicit filtering of native
+US/European text still delivers strictly decoded audio. Disabled and publication-waiting streams retain
 the existing on-demand activation rules. Real sockets exercise cancellation
 during stalled TLS and partial RTSP setup.
 

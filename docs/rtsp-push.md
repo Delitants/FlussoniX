@@ -38,7 +38,8 @@ tracks are supported. The existing worker's copy/CPU/GPU selection applies;
 a destination does not initiate another transcode. AAC uses MPEG4-GENERIC;
 MPEG audio uses MPA/90000. Embedded captions follow the worker's selected
 copy/encode behavior. Separate retained subtitle tracks cannot be represented
-by this RTSP profile and fail the destination explicitly; choosing to filter
+by this RTSP profile and fail the destination before connecting, including native
+M4F/M4S text that has no MPEG-TS mapping; choosing to filter
 original tracks allows supported audio/video output. This does not change the
 separate HLS subtitle controls.
 
@@ -47,7 +48,9 @@ Relative controls append `/trackID=...` to the exact aggregate URL, including
 an existing query, matching the qualified receiving dialect. RTCP sender
 reports synchronize tracks, and OPTIONS keeps the session alive. Setup
 requires matching CSeq, stable Session and the exact offered distinct channel
-pairs. Protocol buffers are bounded: 16 KiB headers, 64 unique headers,
+pairs. A SETUP response may use `mode=record` or the receiver-side
+`mode=receive` alias; playback mode, duplicate options and channel substitutions
+remain rejected. Protocol buffers are bounded: 16 KiB headers, 64 unique headers,
 64 KiB bodies, 16 KiB ANNOUNCE and 8 KiB interleaved frames; pending control
 requests are capped at 16. Incoming RTCP must use a negotiated RTCP channel.
 

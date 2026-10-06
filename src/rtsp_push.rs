@@ -208,9 +208,23 @@ impl State {
             Ok(Err(error)) => return error,
             Err(_) => return "push_metadata_timeout",
         }
+        let deadline = started + Duration::from_secs(self.destination.connect_seconds + 5);
+        let snapshot = tokio::select! {biased;
+            _=cancel.cancelled()=>return "push_stopped",
+            result=tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                loop {
+                    match worker.wire.rtp.publish_snapshot() {
+                        Ok(snapshot) if !snapshot.packets.is_empty() => return Ok(snapshot),
+                        Err(error) if error == "push_profile_unsupported" => return Err("push_profile_unsupported"),
+                        _ => {}
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })=>match result {Ok(Ok(snapshot))=>snapshot,Ok(Err(error))=>return error,Err(_)=>return "push_metadata_timeout"}
+        };
         let bridge = tokio::select! {biased;_=cancel.cancelled()=>return "push_stopped", result=tokio::time::timeout(Duration::from_secs(self.destination.connect_seconds),bridge::Bridge::prepare(&self.destination))=>match result{Ok(Ok(b))=>b,_=>return "push_connect_failed"}};
         let mut readers = tokio::task::JoinSet::new();
-        let result = tokio::select! {biased;_=cancel.cancelled()=>Err("push_stopped"),result=self.send(worker,&bridge,started,&mut readers)=>result};
+        let result = tokio::select! {biased;_=cancel.cancelled()=>Err("push_stopped"),result=self.send(worker,&bridge,started,snapshot,&mut readers)=>result};
         readers.abort_all();
         while readers.join_next().await.is_some() {}
         bridge.close().await;
@@ -221,21 +235,10 @@ impl State {
         worker: &Arc<crate::media::Worker>,
         bridge: &bridge::Bridge,
         started: Instant,
+        snapshot: crate::rtp::PlaySnapshot,
         readers: &mut tokio::task::JoinSet<()>,
     ) -> Result<(), &'static str> {
         let deadline = started + Duration::from_secs(self.destination.connect_seconds + 5);
-        let snapshot = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-            loop {
-                if let Ok(snapshot) = worker.wire.rtp.play_snapshot() {
-                    if !snapshot.packets.is_empty() {
-                        return snapshot;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .map_err(|_| "push_metadata_timeout")?;
         if snapshot.description.tracks.len()
             != snapshot
                 .description

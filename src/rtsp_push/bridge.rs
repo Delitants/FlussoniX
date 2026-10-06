@@ -322,6 +322,13 @@ pub(super) fn transport_response(value: &str) -> io::Result<Transport> {
                 return Err(bad());
             }
             ssrc = true;
+        } else if part.trim().split_once('=').is_some_and(|(key, value)| {
+            key.eq_ignore_ascii_case("mode")
+                && value.trim_matches('"').eq_ignore_ascii_case("receive")
+        }) {
+            // Receiver-side RECORD alias used by independent FFmpeg 6 listeners.
+            // The strict parser still rejects duplicate mode and foreign options.
+            options.push("mode=record");
         } else {
             options.push(part);
         }
@@ -523,6 +530,56 @@ mod tests {
                 .unwrap(),
             0
         );
+        bridge.close().await;
+    }
+    #[tokio::test]
+    async fn receive_transport_alias_preserves_negotiated_channels_and_record_progress() {
+        let (bridge, mut local, mut remote) = lab().await;
+        let url = bridge.local_url().to_owned();
+        reply(
+            &mut local,
+            &mut remote,
+            &url,
+            "ANNOUNCE",
+            1,
+            None,
+            "RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n",
+        )
+        .await;
+        reply(&mut local, &mut remote, &format!("{url}/trackID=1"), "SETUP", 2,
+            Some("RTP/AVP/TCP;unicast;interleaved=0-1;mode=record"),
+            "RTSP/1.0 200 OK\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;mode=receive;interleaved=0-1\r\n\r\n").await;
+        reply(
+            &mut local,
+            &mut remote,
+            &url,
+            "RECORD",
+            3,
+            None,
+            "RTSP/1.0 200 OK\r\nCSeq: 3\r\n\r\n",
+        )
+        .await;
+        let rtp = [0x80, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1];
+        media(&mut local, 0, &rtp).await.unwrap();
+        assert!(matches!(
+            frame(&mut remote).await.unwrap(),
+            Frame::Media(0, _)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while bridge.rtp_bytes() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(bridge.rtp_bytes(), 12);
+        for value in [
+            "RTP/AVP/TCP;interleaved=0-1;mode=play",
+            "RTP/AVP/TCP;interleaved=0-1;mode=receive;mode=record",
+            "RTP/AVP;mode=receive;client_port=4000-4001",
+        ] {
+            assert!(transport_response(value).is_err());
+        }
         bridge.close().await;
     }
     #[tokio::test]

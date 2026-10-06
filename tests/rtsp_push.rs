@@ -938,3 +938,141 @@ async fn mixed_encrypted_srt_and_rtsp_deliver_from_one_worker_and_stop_owned_ses
         assert_eq!(entry["pid"], 0);
     }
 }
+
+// A TS-only eligibility probe cannot see retained native text tracks.
+#[tokio::test]
+async fn native_text_preserve_rejects_rtsp_before_connect_and_drop_delivers_audio() {
+    use axum::{Router, body::Body, routing::get};
+    use bytes::Bytes;
+    use flussonix::{m4f::Frame, m4s::Track};
+    use futures_util::StreamExt;
+    for protocol in ["m4s", "m4f"] {
+        for preserve in [true, false] {
+            let dir = labdir();
+            let tracks = vec![
+                Track {
+                    id: 2,
+                    codec: "m2a".into(),
+                    config: vec![],
+                },
+                Track {
+                    id: 7,
+                    codec: "subtitle".into(),
+                    config: vec![],
+                },
+                Track {
+                    id: 8,
+                    codec: "subtitle".into(),
+                    config: vec![],
+                },
+            ];
+            let mut frames: Vec<_> = (0..600)
+                .map(|n| Frame {
+                    track_id: 2,
+                    dts: 90000 + n * 2160,
+                    pts_offset: 0,
+                    key: true,
+                    body: include_bytes!("fixtures/codecs/mp2.bin").to_vec(),
+                })
+                .collect();
+            for (id, text) in [(7, "AMERICA HELLO"), (8, "EUROPE GRÜSSE")] {
+                frames.push(Frame {
+                    track_id: id,
+                    dts: 117000,
+                    pts_offset: 63000,
+                    key: true,
+                    body: text.as_bytes().to_vec(),
+                });
+            }
+            frames.sort_by_key(|f| f.dts);
+            let mut control = flussonix::wire::encode_info(&tracks).unwrap();
+            for frame in &frames {
+                control.extend(
+                    flussonix::wire::encode_frame(
+                        tracks.iter().find(|t| t.id == frame.track_id).unwrap(),
+                        frame,
+                    )
+                    .unwrap(),
+                );
+            }
+            let segment = Bytes::from(flussonix::m4f::pack(&tracks, &frames, 1_296_000).unwrap());
+            let control = if protocol == "m4f" {
+                Bytes::from_static(b"0 2023/11/14/22/13/20-14400\n")
+            } else {
+                Bytes::from(control)
+            };
+            let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let source_addr = source.local_addr().unwrap();
+            let routes = Router::new()
+                .route(
+                    &format!("/owned/{protocol}"),
+                    get(move || {
+                        let control = control.clone();
+                        async move {
+                            Body::from_stream(
+                                futures_util::stream::once(std::future::ready(Ok::<
+                                    _,
+                                    std::io::Error,
+                                >(
+                                    control
+                                )))
+                                .chain(futures_util::stream::pending()),
+                            )
+                        }
+                    }),
+                )
+                .route(
+                    "/owned/2023/11/14/22/13/20.m4f",
+                    get(move || {
+                        let segment = segment.clone();
+                        async move { segment }
+                    }),
+                );
+            let source_task =
+                tokio::spawn(async move { axum::serve(source, routes).await.unwrap() });
+            let path = dir.path().join("native-text.ts");
+            let denied_listener = if preserve {
+                Some(TcpListener::bind("127.0.0.1:0").await.unwrap())
+            } else {
+                None
+            };
+            let (port, mut receiver) = if let Some(listener) = &denied_listener {
+                (listener.local_addr().unwrap().port(), None)
+            } else {
+                let (port, child) = receiver(&path).await;
+                (port, Some(child))
+            };
+            let engine = owned_engine(dir.path());
+            let worker = engine.ensure("owned", &json!({
+                "inputs":[{"url":format!("{protocol}://{source_addr}/owned")}],
+                "flussonix_subtitle_tracks":if preserve {"preserve"} else {"drop"},
+                "pushes":[{"url":format!("rtsp://127.0.0.1:{port}/owned"),"retry_timeout":10}]
+            })).await.unwrap();
+            if let Some(listener) = denied_listener {
+                let stats = wait_push(&worker, 0, "retrying").await;
+                assert_eq!(
+                    stats["last_error"], "push_profile_unsupported",
+                    "{protocol} native text must not disappear"
+                );
+                assert_eq!(stats["rtp_bytes"], 0);
+                assert_eq!(worker.stats()["native_subtitle_tracks"], 2);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                        .await
+                        .is_err(),
+                    "retained native text must fail before connecting"
+                );
+                assert!(
+                    !worker.is_closed(),
+                    "destination failure must leave common worker alive"
+                );
+            } else {
+                wait_push(&worker, 0, "sending").await;
+                received(receiver.as_mut().unwrap(), &path, None, "mp2").await;
+            }
+            engine.stop_all().await;
+            source_task.abort();
+            let _ = source_task.await;
+        }
+    }
+}

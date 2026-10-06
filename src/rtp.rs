@@ -183,7 +183,19 @@ impl Hub {
         ))
     }
     pub fn play_snapshot(&self) -> Result<PlaySnapshot, String> {
+        self.snapshot(false)
+    }
+    pub(crate) fn publish_snapshot(&self) -> Result<PlaySnapshot, String> {
+        self.snapshot(true)
+    }
+    fn snapshot(&self, require_all_tracks: bool) -> Result<PlaySnapshot, String> {
         let s = self.state.lock().unwrap();
+        if require_all_tracks
+            && !s.input.is_empty()
+            && (s.error.is_some() || s.input.len() != s.tracks.len())
+        {
+            return Err("push_profile_unsupported".into());
+        }
         let description = describe(&s)?;
         let packets: Vec<Bytes> = s.bootstrap.iter().map(|(_, b)| b.clone()).collect();
         let positions = s
