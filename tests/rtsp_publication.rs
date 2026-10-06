@@ -24,6 +24,17 @@ impl Lab {
     }
     async fn with_ffmpeg(role: &str, ffmpeg: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
+        // Preserve owned decoder diagnostics without exposing production input URLs.
+        // exec keeps the actual FFmpeg PID and its stdin/stdout/lifecycle unchanged.
+        let wrapper = dir.path().join("owned-ffmpeg");
+        let selected = if ffmpeg == "/usr/bin/ffmpeg" {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&wrapper,format!("#!/usr/bin/python3\nimport os,sys\nf=open({:?},'wb')\nos.dup2(f.fileno(),2)\nos.execv('/usr/bin/ffmpeg',['ffmpeg']+sys.argv[1:])\n",dir.path().join("worker-stderr.log"))).unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+            wrapper.to_str().unwrap()
+        } else {
+            ffmpeg
+        };
         let app = App::new(
             dir.path().join("c.json"),
             dir.path().join("media"),
@@ -31,7 +42,7 @@ impl Lab {
                 admin_password: "owned-admin".into(),
                 peer_key: "owned-peer-key".into(),
                 role: role.into(),
-                ffmpeg: ffmpeg.into(),
+                ffmpeg: selected.into(),
                 ..Default::default()
             },
         )
@@ -566,7 +577,24 @@ async fn qualify(video: Option<&str>, audio: &[&str], profile: serde_json::Value
     while let Ok(r) = tokio::time::timeout_at(deadline, rx.recv()).await {
         ts.extend_from_slice(&r.expect("shared TS lag"));
     }
-    assert_eq!(l.app.media.count().await, 1);
+    if l.app.media.count().await != 1 {
+        let _ = child.kill().await;
+        let mut diagnostics = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                stderr.read_to_string(&mut diagnostics),
+            )
+            .await;
+        }
+        let packager =
+            std::fs::read_to_string(l._dir.path().join("worker-stderr.log")).unwrap_or_default();
+        panic!(
+            "Publication lost: decoder={packager} video={video:?} audio={audio:?} bytes={} worker={} publisher={diagnostics}",
+            ts.len(),
+            w.stats()
+        );
+    }
     assert_eq!(
         w.stats()["input_protocol"],
         if tls { "rtsps" } else { "rtsp" }
