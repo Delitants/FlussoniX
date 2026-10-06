@@ -418,13 +418,17 @@ impl Engine {
             direct_input = Some(crate::direct_rtp::input::Input::bind(&settings).await?);
             cmd.args([
                 "-protocol_whitelist",
-                "pipe",
+                if settings.elementary {
+                    "pipe,udp,rtp"
+                } else {
+                    "pipe"
+                },
                 "-probesize",
                 "1048576",
                 "-analyzeduration",
                 "1000000",
                 "-f",
-                "mpegts",
+                if settings.elementary { "sdp" } else { "mpegts" },
                 "-i",
                 "pipe:0",
             ]);
@@ -518,7 +522,9 @@ impl Engine {
             && (m4s_input
                 || m4f_input
                 || input.starts_with("rtsp://")
-                || input.starts_with("rtsps://"))
+                || input.starts_with("rtsps://")
+                || (direct_input.is_some()
+                    && inputs[index]["flussonix_rtp"]["profile"] == "elementary"))
         {
             cmd.arg("-copyinkf:a");
         }
@@ -694,7 +700,7 @@ impl Engine {
         let direct_tasks: Vec<_> = worker
             .direct_outputs
             .iter()
-            .map(|state| tokio::spawn(state.clone().run(worker.tx.subscribe(), cancel.clone())))
+            .map(|state| tokio::spawn(state.clone().run_worker(worker.clone(), cancel.clone())))
             .collect();
         tokio::spawn(async move {
             let mut tasks = Vec::new();
@@ -1067,6 +1073,31 @@ impl Engine {
             .get(name)
             .map(|w| w.stats())
             .unwrap_or(json!({"status":"waiting","online_clients":0}))
+    }
+    pub async fn rtp_sdp(&self, name: &str, index: usize, cfg: &Value) -> Result<String, String> {
+        let definitions = crate::direct_rtp::config::outputs(cfg)?;
+        let workers = self.workers.lock().await;
+        let worker = workers
+            .get(name)
+            .filter(|w| !w.is_closed())
+            .ok_or("Stream is not running")?;
+        let state = worker
+            .direct_outputs
+            .get(index)
+            .ok_or("RTP destination not found")?;
+        if definitions.get(index) != Some(&state.definition) {
+            return Err("RTP destination changed; waiting for current worker".into());
+        }
+        let generation = worker
+            .wire
+            .rtp
+            .description()
+            .and_then(Result::ok)
+            .ok_or("Elementary RTP SDP is not ready")?
+            .generation;
+        state
+            .sdp_for_generation(generation)
+            .ok_or("Elementary RTP SDP is not ready".into())
     }
     pub async fn ready(&self, name: &str) -> bool {
         let alive = self.workers.lock().await.get(name).is_some_and(|w| {

@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Settings {
     pub address: SocketAddr,
     pub secure: bool,
@@ -14,6 +14,8 @@ pub struct Settings {
     pub jitter: Duration,
     pub ttl: u32,
     pub key_file: Option<PathBuf>,
+    pub elementary: bool,
+    pub sdp_file: Option<PathBuf>,
 }
 impl Settings {
     pub fn input(item: &Value) -> Result<Option<Self>, String> {
@@ -25,6 +27,9 @@ impl Settings {
             return Ok(None);
         }
         let settings = Self::parse(item)?;
+        if settings.elementary && settings.sdp_file.is_none() {
+            return Err("Elementary RTP input requires an SDP file".into());
+        }
         if let Some(interface) = settings.interface {
             if !settings.address.ip().is_multicast()
                 && !settings.address.ip().is_unspecified()
@@ -77,9 +82,42 @@ impl Settings {
             .unwrap_or_else(|| serde_json::json!({}));
         let object = opts.as_object().ok_or("RTP options must be an object")?;
         if object.keys().any(|k| {
-            !["interface", "source_ip", "jitter_ms", "ttl", "key_file"].contains(&k.as_str())
+            ![
+                "interface",
+                "source_ip",
+                "jitter_ms",
+                "ttl",
+                "key_file",
+                "profile",
+                "sdp_file",
+            ]
+            .contains(&k.as_str())
         }) {
             return Err("Unknown direct RTP option".into());
+        }
+        let elementary = match opts.get("profile").map(Value::as_str) {
+            None | Some(Some("mp2t")) => false,
+            Some(Some("elementary")) => true,
+            _ => return Err("RTP profile must be mp2t or elementary".into()),
+        };
+        let sdp_file = opts
+            .get("sdp_file")
+            .map(|v| {
+                let value = v
+                    .as_str()
+                    .filter(|s| s.len() <= 4096 && !s.chars().any(char::is_control))
+                    .ok_or("SDP file must be an absolute path")?;
+                let path = PathBuf::from(value);
+                if !path.is_absolute() {
+                    return Err("SDP file must be an absolute path");
+                }
+                Ok(path)
+            })
+            .transpose()?;
+        if (!elementary && sdp_file.is_some())
+            || (elementary && (u.scheme() == "srtp" || port > 65520 || ip.is_unspecified()))
+        {
+            return Err("Elementary RTP requires plaintext RTP and a concrete IP with port 1024..65520; SDP files require the elementary profile".into());
         }
         let interface = opts
             .get("interface")
@@ -142,6 +180,8 @@ impl Settings {
             jitter: Duration::from_millis(number(&opts, "jitter_ms", 50, 0, 1000)?),
             ttl: number(&opts, "ttl", 16, 1, 255)? as u32,
             key_file,
+            elementary,
+            sdp_file,
         })
     }
     pub fn endpoint(&self) -> String {
@@ -152,6 +192,7 @@ impl Settings {
         )
     }
 }
+#[derive(PartialEq, Eq)]
 pub struct Output {
     pub settings: Settings,
     pub disabled: bool,
@@ -183,6 +224,7 @@ pub fn outputs(cfg: &Value) -> Result<Vec<Output>, String> {
             }
             let settings = Settings::parse(row)?;
             if settings.address.ip().is_unspecified()
+                || settings.sdp_file.is_some()
                 || settings.source_ip.is_some()
                 || row["flussonix_rtp"].get("jitter_ms").is_some()
             {

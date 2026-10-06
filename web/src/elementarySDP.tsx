@@ -1,0 +1,11 @@
+import React,{useEffect,useState,useRef} from 'react';
+import {type Item} from './forms';
+export function ElementarySDP({name,rows,runtime,workerPid,request}:{name:string,rows:Item[],runtime:Item[],workerPid?:number,request:(url:string)=>Promise<any>}) {
+ const [text,setText]=useState(''),[error,setError]=useState(''),[busy,setBusy]=useState(false);
+ const generation=runtime.map(r=>String(r.sdp_generation??'')+':'+r.sdp_ready).join(',');
+ const current=useRef('');const context=name+':'+workerPid+':'+generation;current.current=context;
+ useEffect(()=>{setText('');setError('')},[name,workerPid,generation]);
+ if(!rows.some(r=>r.flussonix_rtp?.profile==='elementary'))return null;
+ async function load(index:number,download=false){const started=context;setBusy(true);setError('');try{const result=await request('/flussonix/api/v1/rtp-sdp/'+name.split('/').map(encodeURIComponent).join('/')+'?destination='+index);if(current.current!==started)return;if(typeof result!=='string')throw Error('SDP could not be loaded.');setText(result);if(download){const url=URL.createObjectURL(new Blob([result],{type:'application/sdp'}));const link=document.createElement('a');link.href=url;link.download=name.replaceAll('/','-')+'-'+(index+1)+'.sdp';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}}catch(e){setError((e as Error).message);setText('')}finally{setBusy(false)}}
+ return <section aria-label="Elementary RTP SDP"><h2>Elementary RTP receiver setup</h2><p className="muted">Open the SDP on the configured receiver. It contains the active codecs, target address and ports. Available after the stream starts; a codec change requires fresh SDP.</p>{rows.map((row,i)=>row.flussonix_rtp?.profile==='elementary'&&<div key={i}><p>Destination {i+1} · {runtime[i]?.sdp_ready?'SDP ready':row.disabled?'Disabled':'Waiting for active media'}</p><button disabled={busy||!runtime[i]?.sdp_ready} onClick={()=>load(i)}>View SDP {i+1}</button><button disabled={busy||!runtime[i]?.sdp_ready} onClick={()=>load(i,true)}>Download SDP {i+1}</button></div>)}{error&&<p role="alert">{error}</p>}{text&&<details open><summary>Active receiver description</summary><pre className="sdp-preview">{text}</pre></details>}</section>;
+}

@@ -11,20 +11,26 @@ use std::{
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 pub struct State {
-    definition: Output,
+    pub(crate) definition: Output,
     index: usize,
-    stats: Stats,
-    egress: Arc<AtomicU64>,
+    pub(super) stats: Stats,
+    pub(super) egress: Arc<AtomicU64>,
+    pub(super) sdp: std::sync::Mutex<Option<(u64, String)>>,
 }
 impl State {
     pub fn new(definition: Output, index: usize) -> Arc<Self> {
         Self::with_egress(definition, index, Arc::new(AtomicU64::new(0)))
     }
     pub fn with_egress(definition: Output, index: usize, egress: Arc<AtomicU64>) -> Arc<Self> {
+        let stats = Stats::default();
+        if definition.settings.elementary {
+            *stats.profile.lock().unwrap() = "elementary";
+        }
         Arc::new(Self {
+            sdp: std::sync::Mutex::new(None),
             definition,
             index,
-            stats: Stats::default(),
+            stats,
             egress,
         })
     }
@@ -33,13 +39,43 @@ impl State {
         v["index"] = self.index.into();
         v["endpoint"] = self.definition.settings.endpoint().into();
         v["encrypted"] = self.definition.settings.secure.into();
+        if self.definition.settings.elementary {
+            let saved = self.sdp.lock().unwrap();
+            v["sdp_ready"] = saved.is_some().into();
+            v["sdp_generation"] =
+                serde_json::json!(saved.as_ref().map(|(generation, _)| generation));
+        }
         v
+    }
+    pub(crate) fn sdp_for_generation(&self, generation: u64) -> Option<String> {
+        self.sdp
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(g, _)| *g == generation)
+            .map(|(_, s)| s.clone())
+    }
+    pub async fn run_worker(
+        self: Arc<Self>,
+        worker: Arc<crate::media::Worker>,
+        cancel: CancellationToken,
+    ) {
+        if self.definition.settings.elementary {
+            super::elementary::output::run(self, worker, cancel).await;
+        } else {
+            self.run(worker.subscribe(), cancel).await;
+        }
     }
     pub async fn run(
         self: Arc<Self>,
         mut receiver: broadcast::Receiver<Bytes>,
         cancel: CancellationToken,
     ) {
+        if self.definition.settings.elementary {
+            *self.stats.status.lock().unwrap() = "failed";
+            *self.stats.error.lock().unwrap() = Some("Elementary RTP requires a native worker");
+            return;
+        }
         if self.definition.disabled {
             *self.stats.status.lock().unwrap() = "disabled";
             return;
@@ -175,7 +211,7 @@ impl State {
         }
     }
 }
-fn report(ssrc: u32, timestamp: u32, packets: u32, octets: u32) -> Vec<u8> {
+pub(super) fn report(ssrc: u32, timestamp: u32, packets: u32, octets: u32) -> Vec<u8> {
     let time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();

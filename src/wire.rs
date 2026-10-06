@@ -48,7 +48,7 @@ impl Hub {
         Self {
             m4s: Channel::new(256, 16 * 1024 * 1024),
             signals: Channel::new(16, 8192),
-            rtp: crate::rtp::Hub::new(),
+            rtp: crate::rtp::Hub::new_multitrack(),
             state: Mutex::new(State {
                 tracks: vec![],
                 info: None,

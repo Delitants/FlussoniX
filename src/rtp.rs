@@ -107,6 +107,7 @@ pub struct PlaySnapshot {
 pub struct Hub {
     q: Channel,
     state: Mutex<State>,
+    max_tracks: usize,
 }
 impl Default for Hub {
     fn default() -> Self {
@@ -118,7 +119,14 @@ impl Hub {
         self.q.close();
     }
     pub fn new() -> Self {
+        Self::with_limit(2)
+    }
+    pub fn new_multitrack() -> Self {
+        Self::with_limit(8)
+    }
+    fn with_limit(max_tracks: usize) -> Self {
         Self {
+            max_tracks,
             q: Channel::new(4096, 64 * 1024 * 1024),
             state: Mutex::new(State {
                 input: vec![],
@@ -143,7 +151,7 @@ impl Hub {
         s.bytes = 0;
         s.ready = false;
         s.origin = None;
-        match parse_tracks(tracks) {
+        match parse_tracks(tracks, self.max_tracks) {
             Ok(parsed) => {
                 s.tracks = parsed;
                 s.error = None;
@@ -161,6 +169,10 @@ impl Hub {
         } else {
             Some(describe(&s))
         }
+    }
+    pub fn generation_is(&self, generation: u64) -> bool {
+        let s = self.state.lock().unwrap();
+        s.generation == generation && s.error.is_none() && !s.tracks.is_empty()
     }
     pub fn subscribe(&self) -> Result<(Description, Vec<Bytes>, Receiver), String> {
         let s = self.state.lock().unwrap();
@@ -356,9 +368,9 @@ fn describe(s: &State) -> Result<Description, String> {
         generation: s.generation,
     })
 }
-fn parse_tracks(tracks: &[Track]) -> Result<Vec<PacketTrack>, String> {
+fn parse_tracks(tracks: &[Track], max_tracks: usize) -> Result<Vec<PacketTrack>, String> {
     let tracks: Vec<_> = tracks.iter().filter(|t| t.codec != "subtitle").collect();
-    if tracks.is_empty() || tracks.len() > 2 {
+    if tracks.is_empty() || tracks.len() > max_tracks {
         return Err(
             "RTSP requires one video (H.264/HEVC) and/or one audio (AAC/MPEG) track".into(),
         );
@@ -367,7 +379,8 @@ fn parse_tracks(tracks: &[Track]) -> Result<Vec<PacketTrack>, String> {
     for t in tracks {
         if out.iter().any(|old| {
             old.description.id == t.id
-                || old.description.video == matches!(t.codec.as_str(), "h264" | "hevc")
+                || (old.description.video == matches!(t.codec.as_str(), "h264" | "hevc")
+                    && (max_tracks == 2 || old.description.video))
         }) {
             return Err("duplicate RTP track or codec".into());
         }

@@ -661,6 +661,53 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
     if !peer && role.is_none() {
         return error(StatusCode::UNAUTHORIZED, "credentials required");
     }
+    if let Some(name) = tail.strip_prefix("rtp-sdp/") {
+        if request.method() != "GET" {
+            return error(StatusCode::METHOD_NOT_ALLOWED, "GET required");
+        }
+        let Some(cfg) = app.config.effective(name) else {
+            return error(StatusCode::NOT_FOUND, "stream not found");
+        };
+        if cfg["disabled"] == true {
+            return error(StatusCode::CONFLICT, "stream disabled");
+        }
+        let mut index = None;
+        for (k, v) in url::form_urlencoded::parse(request.uri().query().unwrap_or("").as_bytes()) {
+            if k != "destination" || index.is_some() {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "Choose one RTP destination index from 0 to 3",
+                );
+            }
+            index = v.parse::<usize>().ok().filter(|i| *i < 4);
+            if index.is_none() {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "Choose one RTP destination index from 0 to 3",
+                );
+            }
+        }
+        let index = index.unwrap_or(0);
+        if !cfg["flussonix_rtp_outputs"].get(index).is_some_and(|row| {
+            row["disabled"] != true && row["flussonix_rtp"]["profile"] == "elementary"
+        }) {
+            return error(
+                StatusCode::CONFLICT,
+                "Enabled elementary RTP destination required",
+            );
+        }
+        return match app.media.rtp_sdp(name, index, &cfg).await {
+            Ok(text) => (
+                [
+                    ("Content-Type", "application/sdp"),
+                    ("Cache-Control", "no-store"),
+                ],
+                text,
+            )
+                .into_response(),
+            Err(e) => error(StatusCode::CONFLICT, &e),
+        };
+    }
     if tail == "node" && request.method() == "GET" {
         return json_response(app.node().await);
     }
@@ -668,7 +715,7 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
         let (gpu_profiles, vaapi_profiles) =
             tokio::join!(app.media.gpu_capabilities(), app.media.vaapi_capabilities());
         return json_response(
-            json!({"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","rtsps (verified TLS, interleaved TCP)","srt","rtp (MPEG-TS / PT33, unicast and IPv4 multicast)","srtp (MP2T / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","publish:// (HTTP MPEG-TS receive)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["rtp (MPEG-TS / PT33, unicast and IPv4 multicast)","srtp (MP2T / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","srt (caller push / global listener playback, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","rtsp (TCP / opt-in unicast UDP playback, H.264/AAC-LC)","rtsps (opt-in TLS TCP playback, H.264/AAC-LC)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["elementary RTP / SDP negotiation","DTLS-SRTP / automatic key negotiation","rtsp publication / push","rtsp Basic / Digest viewer auth","dvr","non-SRT push","srt publication policy / per-stream playback listeners"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA / VAAPI H.264 / HEVC; profile readiness check, no software fallback","gpu_profiles":gpu_profiles,"vaapi_profiles":vaapi_profiles},"direct_srtp":{"available":crate::direct_rtp::crypto::availability(),"profile":"AES_CM_128_HMAC_SHA1_80","library":"independent system libsrtp2"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP redirects"}),
+            json!({"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","rtsps (verified TLS, interleaved TCP)","srt","rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","publish:// (HTTP MPEG-TS receive)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","srt (caller push / global listener playback, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","rtsp (TCP / opt-in unicast UDP playback, H.264/AAC-LC)","rtsps (opt-in TLS TCP playback, H.264/AAC-LC)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["elementary SRTP / SDP negotiation","DTLS-SRTP / automatic key negotiation","rtsp publication / push","rtsp Basic / Digest viewer auth","dvr","non-SRT push","srt publication policy / per-stream playback listeners"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA / VAAPI H.264 / HEVC; profile readiness check, no software fallback","gpu_profiles":gpu_profiles,"vaapi_profiles":vaapi_profiles},"direct_srtp":{"available":crate::direct_rtp::crypto::availability(),"profile":"AES_CM_128_HMAC_SHA1_80","library":"independent system libsrtp2"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP redirects"}),
         );
     }
     if let Some(name) = tail.strip_prefix("stream/") {

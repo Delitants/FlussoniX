@@ -7,3 +7,5 @@ mod sockets;
 mod stats;
 
 pub mod crypto;
+
+pub mod elementary;

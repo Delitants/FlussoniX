@@ -13,7 +13,7 @@ use std::{
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
-pub struct Input {
+struct Mp2t {
     pair: Pair,
     settings: Settings,
     pub stats: Arc<Stats>,
@@ -21,7 +21,7 @@ pub struct Input {
     feedback: Option<Session>,
     receiver_id: u32,
 }
-impl Input {
+impl Mp2t {
     pub async fn bind(settings: &Settings) -> Result<Self, String> {
         let receiver_id =
             u32::from_be_bytes(uuid::Uuid::new_v4().as_bytes()[..4].try_into().unwrap());
@@ -132,6 +132,42 @@ impl Input {
             for data in ready {
                 tokio::select! {biased;_=cancel.cancelled()=>return Ok(()),result=tokio::time::timeout(Duration::from_secs(2),writer.write_all(&data))=>{result.map_err(|_| "RTP decoder stalled")?.map_err(|_| "RTP decoder closed")?;}}
             }
+        }
+    }
+}
+
+enum Implementation {
+    Mp2t(Mp2t),
+    Elementary(super::elementary::input::Input),
+}
+pub struct Input {
+    inner: Implementation,
+    pub stats: Arc<Stats>,
+}
+impl Input {
+    pub async fn bind(settings: &Settings) -> Result<Self, String> {
+        if settings.elementary {
+            let input = super::elementary::input::Input::bind(settings).await?;
+            Ok(Self {
+                stats: input.stats.clone(),
+                inner: Implementation::Elementary(input),
+            })
+        } else {
+            let input = Mp2t::bind(settings).await?;
+            Ok(Self {
+                stats: input.stats.clone(),
+                inner: Implementation::Mp2t(input),
+            })
+        }
+    }
+    pub async fn run<W: AsyncWrite + Unpin>(
+        self,
+        writer: W,
+        cancel: CancellationToken,
+    ) -> Result<(), String> {
+        match self.inner {
+            Implementation::Mp2t(input) => input.run(writer, cancel).await,
+            Implementation::Elementary(input) => input.run(writer, cancel).await,
         }
     }
 }
