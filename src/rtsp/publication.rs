@@ -366,7 +366,7 @@ async fn run<W: AsyncWrite + Unpin>(
         tokio::select! {biased;
         _=cancel.cancelled()=>break,
         _=tick.tick()=>{if !admission::current(app,&s.name,&s.expected)||s.publication.as_ref().is_some_and(|p|p.worker.is_closed())||s.publication.is_some()&&s.progress.elapsed()>=timeout{break;}},
-        _=tokio::time::sleep_until(activity+Duration::from_secs(30))=>break,
+        _=tokio::time::sleep_until(activity+Duration::from_secs(30)),if s.publication.is_none()=>break,
         _=tokio::time::sleep_until(s.renew_at),if s.expected.policy.url.is_some()=>{let renew=tokio::select!{biased;_=cancel.cancelled()=>break,r=admission::authorize_current(&mut s.grant,app,&s.name,&s.expected,s.publication.as_ref().map(|p|p.worker.as_ref()))=>r};match renew{Ok(d)=>s.renew_at=Instant::now()+d,Err(_)=>break}},
         _=reports.tick(),if s.bridge.is_some()=>{
             let body=s.bridge.as_mut().unwrap().reports();

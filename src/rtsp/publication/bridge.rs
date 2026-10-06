@@ -22,11 +22,57 @@ struct Lane {
     pending_report: Option<(Vec<u8>, Instant)>,
     reports: super::reports::Reports,
 }
+
 pub(super) struct Bridge {
     session: Session,
     ports: Vec<u16>,
     reserved: Vec<Pair>,
     lanes: Vec<Lane>,
+}
+// A lane represents one media source. Report-block SSRCs describe receivers'
+// observations and are not senders; SDES chunks and BYE lists are source-bearing.
+// Validate the whole compound before it can be queued or sent to the decoder.
+fn control_source(mut body: &[u8]) -> Result<u32, &'static str> {
+    if !crate::direct_rtp::packet::valid_rtcp(body) {
+        return Err("Invalid publisher RTCP");
+    }
+    let mut source = None;
+    let mut bind = |bytes: &[u8]| {
+        let next = u32::from_be_bytes(bytes.try_into().unwrap());
+        if source.is_some_and(|s| s != next) {
+            return Err("RTCP SSRC changed");
+        }
+        source = Some(next);
+        Ok(())
+    };
+    while !body.is_empty() {
+        // Structural validation above bounds every member, chunk and item.
+        let len = (usize::from(u16::from_be_bytes([body[2], body[3]])) + 1) * 4;
+        let packet = &body[..len];
+        let count = usize::from(packet[0] & 31);
+        match packet[1] {
+            200 | 201 | 204 => bind(&packet[4..8])?,
+            202 => {
+                let mut at = 4;
+                for _ in 0..count {
+                    bind(&packet[at..at + 4])?;
+                    at += 4;
+                    while packet[at] != 0 {
+                        at += 2 + usize::from(packet[at + 1]);
+                    }
+                    at = (at + 4) & !3;
+                }
+            }
+            203 => {
+                for bytes in packet[4..4 + 4 * count].chunks_exact(4) {
+                    bind(bytes)?;
+                }
+            }
+            _ => return Err("Invalid publisher RTCP"),
+        }
+        body = &body[len..];
+    }
+    source.ok_or("Publisher RTCP has no source")
 }
 impl Bridge {
     pub async fn bind(session: &Session, transports: &[Option<Transport>]) -> Result<Self, String> {
@@ -137,10 +183,7 @@ impl Bridge {
                 .map_err(|_| "Private RTP send failed")?;
             Ok(true)
         } else {
-            if !crate::direct_rtp::packet::valid_rtcp(body) || body.len() < 8 {
-                return Err("Invalid publisher RTCP");
-            }
-            let source = u32::from_be_bytes(body[4..8].try_into().unwrap());
+            let source = control_source(body)?;
             match lane.ssrc {
                 Some(s) if s == source => {
                     lane.reports.sender_report(body, Instant::now());
@@ -197,5 +240,116 @@ impl Bridge {
             return std::future::pending().await;
         }
         futures_util::future::select_all(futures).await.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const SOURCE: u32 = 0x12345678;
+    async fn bridge() -> Bridge {
+        let description = super::super::sdp::parse(
+            b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=owned\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1\r\na=control:streamid=0\r\n",
+            &url::Url::parse("rtsp://127.0.0.1/owned").unwrap(),
+        ).unwrap();
+        Bridge::bind(&description.media, &[Some(Transport { rtp: 0, rtcp: 1 })])
+            .await
+            .unwrap()
+    }
+    fn rtp() -> Vec<u8> {
+        let mut p = vec![0x80, 96, 0, 1, 0, 0, 0, 0];
+        p.extend(SOURCE.to_be_bytes());
+        p.extend([0x65, 0x88, 0x84]);
+        p
+    }
+    fn sr(source: u32) -> Vec<u8> {
+        let mut p = vec![0x80, 200, 0, 6];
+        p.extend(source.to_be_bytes());
+        p.extend([0; 20]);
+        p
+    }
+    fn sdes(source: u32) -> Vec<u8> {
+        let mut p = vec![0x81, 202, 0, 3];
+        p.extend(source.to_be_bytes());
+        p.extend([1, 4, b't', b'e', b's', b't', 0, 0]);
+        p
+    }
+    async fn received(bridge: &Bridge) -> Option<Vec<u8>> {
+        let mut p = vec![0; 2048];
+        let n = tokio::time::timeout(
+            Duration::from_millis(100),
+            bridge.reserved[0].rtcp.recv(&mut p),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        p.truncate(n);
+        Some(p)
+    }
+    // Checking only the first RTCP source forwards foreign clock mappings into
+    // the real decoder UDP endpoint, both immediately and from pending reports.
+    #[tokio::test]
+    async fn compound_rtcp_rejects_foreign_sender_after_media() {
+        let mut b = bridge().await;
+        b.forward(0, &rtp()).await.unwrap();
+        let compound = [sr(SOURCE), sr(SOURCE + 1)].concat();
+        let result = b.forward(1, &compound).await;
+        let forwarded = received(&b).await;
+        assert!(
+            result.is_err(),
+            "Every compound sender must match pinned media"
+        );
+        assert!(forwarded.is_none(), "Foreign sender must not reach decoder");
+    }
+    #[tokio::test]
+    async fn compound_rtcp_rejects_foreign_sender_before_media() {
+        let mut b = bridge().await;
+        let compound = [sr(SOURCE), sr(SOURCE + 1)].concat();
+        let result = b.forward(1, &compound).await;
+        b.forward(0, &rtp()).await.unwrap();
+        let forwarded = received(&b).await;
+        assert!(
+            result.is_err(),
+            "Pending reports must have one media identity"
+        );
+        assert!(
+            forwarded.is_none(),
+            "Foreign pending report must not reach decoder"
+        );
+    }
+    #[tokio::test]
+    async fn compound_rtcp_binds_sdes_bye_and_app_sources() {
+        let foreign = SOURCE + 1;
+        let mut bye = vec![0x81, 203, 0, 1];
+        bye.extend(foreign.to_be_bytes());
+        let mut app = vec![0x80, 204, 0, 2];
+        app.extend(foreign.to_be_bytes());
+        app.extend(*b"test");
+        for packet in [sdes(foreign), bye, app] {
+            let mut b = bridge().await;
+            b.forward(0, &rtp()).await.unwrap();
+            let result = b.forward(1, &[sr(SOURCE), packet].concat()).await;
+            let forwarded = received(&b).await;
+            assert!(
+                result.is_err(),
+                "Every forwarded control source must match media"
+            );
+            assert!(forwarded.is_none());
+        }
+    }
+    #[tokio::test]
+    async fn matching_compound_sender_reports_and_sdes_reach_decoder() {
+        for pending in [false, true] {
+            let mut b = bridge().await;
+            if !pending {
+                b.forward(0, &rtp()).await.unwrap();
+            }
+            let compound = [sr(SOURCE), sdes(SOURCE)].concat();
+            assert!(!b.forward(1, &compound).await.unwrap());
+            if pending {
+                b.forward(0, &rtp()).await.unwrap();
+            }
+            assert_eq!(received(&b).await.unwrap(), compound);
+        }
     }
 }

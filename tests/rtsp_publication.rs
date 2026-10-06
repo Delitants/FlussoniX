@@ -897,6 +897,41 @@ async fn malformed_media_and_ssrc_substitution_reap_only_the_publisher() {
     l.end().await;
 }
 #[tokio::test]
+async fn active_media_grace_period_can_exceed_the_negotiation_deadline() {
+    // An unconditional 30-second negotiation timer incorrectly reaps this
+    // real active publisher before its configured 40-second media deadline.
+    let l = Lab::new("standalone").await;
+    let mut cfg = l.app.config.snapshot()["streams"]["owned"].clone();
+    cfg["flussonix_input_timeout"] = json!(40);
+    l.app.config.put("streams", "owned", cfg).unwrap();
+    let (mut s, _, w) = recording(&l).await;
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    let survived = !w.is_closed() && l.app.media.count().await == 1;
+    let expired = if survived {
+        tokio::time::timeout(Duration::from_secs(12), w.closed())
+            .await
+            .is_ok()
+    } else {
+        false
+    };
+    let mut body = Vec::new();
+    let disconnected = tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut body))
+        .await
+        .is_ok_and(|r| r.is_ok());
+    let stats = w.stats();
+    let diagnostic =
+        std::fs::read_to_string(l._dir.path().join("worker-stderr.log")).unwrap_or_default();
+    drop(s);
+    l.end().await;
+    assert!(
+        survived,
+        "Active publisher must survive the negotiation deadline: {stats}; {diagnostic}"
+    );
+    assert!(expired, "Configured media silence must still expire");
+    assert!(disconnected, "Expired publisher connection must close");
+}
+
+#[tokio::test]
 async fn control_flood_does_not_hide_media_stall() {
     let l = Lab::new("standalone").await;
     let (s, sid, w) = recording(&l).await;

@@ -417,6 +417,15 @@ impl Engine {
                 "sine=frequency=440:sample_rate=48000",
             ]);
         } else if matches!(publishing, Some(PublicationInput::Sdp { .. })) {
+            // The SDP demuxer's own inactivity deadline must not shorten the
+            // configured publication grace period before our watchdog fires.
+            cmd.arg("-listen_timeout").arg(
+                cfg["flussonix_input_timeout"]
+                    .as_u64()
+                    .unwrap_or(15)
+                    .clamp(1, 300)
+                    .to_string(),
+            );
             cmd.args([
                 "-localaddr",
                 "127.0.0.1",
