@@ -8,15 +8,20 @@ fn parity(b: u8) -> u8 {
     b | if b.count_ones() % 2 == 0 { 128 } else { 0 }
 }
 pub fn transport() -> Vec<u8> {
-    make(false)
+    make(false, false)
 }
 #[allow(dead_code)]
 pub fn digital_transport() -> Vec<u8> {
-    make(true)
+    make(true, false)
 }
-fn make(digital: bool) -> Vec<u8> {
+#[allow(dead_code)]
+pub fn hevc_transport(digital: bool) -> Vec<u8> {
+    make(digital, true)
+}
+fn make(digital: bool, hevc: bool) -> Vec<u8> {
     let d = tempfile::tempdir().unwrap();
-    let raw = d.path().join("raw.h264");
+    let format = if hevc { "hevc" } else { "h264" };
+    let raw = d.path().join(format!("raw.{format}"));
     run(&[
         "-y",
         "-v",
@@ -30,17 +35,21 @@ fn make(digital: bool) -> Vec<u8> {
         "-threads",
         "1",
         "-c:v",
-        "libx264",
+        if hevc { "libx265" } else { "libx264" },
         "-preset",
         "ultrafast",
         "-g",
         "50",
         "-bf",
         "0",
-        "-x264-params",
-        "aud=1",
+        if hevc { "-x265-params" } else { "-x264-params" },
+        if hevc {
+            "aud=1:pools=none:frame-threads=1:repeat-headers=1:log-level=error"
+        } else {
+            "aud=1"
+        },
         "-f",
-        "h264",
+        format,
         raw.to_str().unwrap(),
     ]);
     let source = std::fs::read(raw).unwrap();
@@ -61,7 +70,12 @@ fn make(digital: bool) -> Vec<u8> {
         let nal = &source[w[0]..w[1] - 3];
         annotated.extend([0, 0, 0, 1]);
         annotated.extend(nal);
-        if nal[0] & 31 != 9 {
+        let aud = if hevc {
+            (nal[0] >> 1) & 63 == 35
+        } else {
+            nal[0] & 31 == 9
+        };
+        if !aud {
             continue;
         }
         frame += 1;
@@ -139,21 +153,29 @@ fn make(digital: bool) -> Vec<u8> {
             escaped.push(b);
             zeros = if b == 0 { zeros + 1 } else { 0 }
         }
-        annotated.extend([0, 0, 0, 1, 6]);
+        if hevc {
+            // HEVC prefix SEI, layer zero, temporal_id_plus1 one.
+            annotated.extend([0, 0, 0, 1, 0x4e, 1]);
+        } else {
+            annotated.extend([0, 0, 0, 1, 6]);
+        }
         annotated.extend(escaped);
     }
-    let input = d.path().join("owned.h264");
+    let input = d.path().join(format!("owned.{format}"));
     std::fs::write(&input, annotated).unwrap();
     let output = d.path().join("owned.ts");
     remux(&input, &output);
     {
         let bytes = std::fs::read(output).unwrap();
-        if let Ok(path) = std::env::var(if digital {
-            "FLUSSONIX_708_FIXTURE_FILE"
-        } else {
-            "FLUSSONIX_CAPTION_FIXTURE_FILE"
-        }) {
-            std::fs::write(path, &bytes).unwrap();
+        // Browser fixtures retain their established AVC format.
+        if !hevc {
+            if let Ok(path) = std::env::var(if digital {
+                "FLUSSONIX_708_FIXTURE_FILE"
+            } else {
+                "FLUSSONIX_CAPTION_FIXTURE_FILE"
+            }) {
+                std::fs::write(path, &bytes).unwrap();
+            }
         }
         bytes
     }

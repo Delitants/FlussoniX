@@ -113,13 +113,59 @@ async fn capture(endpoint: &str, listener: bool, path: &Path) -> Child {
     .unwrap()
 }
 
-// Independently extract the video, then compare complete registered GA94 bodies,
-// rather than checking for a magic marker or trusting server subtitle counters.
-async fn caption_bodies(path: &Path) -> BTreeSet<Vec<u8>> {
+// Codec identity must be checked independently of the requested output format.
+async fn verify_codecs(path: &Path, hevc: bool) {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        clean_decode(&out),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let info: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let streams = info["streams"].as_array().unwrap();
+    for (kind, codec) in [
+        ("video", if hevc { "hevc" } else { "h264" }),
+        ("audio", "aac"),
+    ] {
+        let actual: Vec<_> = streams
+            .iter()
+            .filter(|s| s["codec_type"] == kind)
+            .map(|s| s["codec_name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            actual,
+            [codec],
+            "independent probe must verify the {kind} codec"
+        );
+    }
+}
+
+// Independently extract the video, then compare complete registered GA94 bodies.
+async fn caption_bodies(path: &Path, hevc: bool) -> BTreeSet<Vec<u8>> {
     let out = Command::new("ffmpeg")
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(path)
-        .args(["-map", "0:v:0", "-c:v", "copy", "-f", "h264", "pipe:1"])
+        .args([
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            "-f",
+            if hevc { "hevc" } else { "h264" },
+            "pipe:1",
+        ])
         .output()
         .await
         .unwrap();
@@ -214,7 +260,7 @@ async fn converted_words(app: &App, file: &str) -> String {
     .expect("HLS conversion must continue alongside encrypted SRT")
 }
 
-async fn run(push: bool, digital: bool, input: &[u8], expected: &BTreeSet<Vec<u8>>) {
+async fn run(push: bool, digital: bool, hevc: bool, input: &[u8], expected: &BTreeSet<Vec<u8>>) {
     for (hls, keep) in [("convert", true), ("drop", true), ("drop", false)] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("received.ts");
@@ -321,7 +367,8 @@ async fn run(push: bool, digital: bool, input: &[u8], expected: &BTreeSet<Vec<u8
             std::fs::read_to_string(path.with_extension("log")).unwrap()
         );
         verify_original_tracks(&std::fs::read(&path).unwrap(), keep);
-        let actual = caption_bodies(&path).await;
+        verify_codecs(&path, hevc).await;
+        let actual = caption_bodies(&path, hevc).await;
         assert!(
             expected.is_subset(&actual),
             "SRT must preserve every authored caption command independently of HLS policy; expected {} bodies, got {}",
@@ -346,22 +393,25 @@ async fn run(push: bool, digital: bool, input: &[u8], expected: &BTreeSet<Vec<u8
         assert_eq!(app.media.count().await, 0);
         assert_eq!(publication.worker.viewers.load(Ordering::Relaxed), 0);
         println!(
-            "qualified {} CEA-{} with DVB/teletext: HLS {hls}, originals {}",
+            "qualified {} {} CEA-{} with DVB/teletext: HLS {hls}, originals {}",
             if push {
                 "encrypted push"
             } else {
                 "encrypted playback"
             },
+            if hevc { "HEVC" } else { "H.264" },
             if digital { 708 } else { 608 },
             if keep { "kept" } else { "filtered" }
         );
     }
 }
 
-async fn regional(push: bool) {
+async fn regional(push: bool, hevc: bool) {
     let _guard = SERIAL.lock().await;
     for digital in [false, true] {
-        let input = original::inject(&if digital {
+        let input = original::inject(&if hevc {
+            captions::hevc_transport(digital)
+        } else if digital {
             captions::digital_transport()
         } else {
             captions::transport()
@@ -369,7 +419,8 @@ async fn regional(push: bool) {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("source.ts");
         std::fs::write(&file, &input).unwrap();
-        let expected = caption_bodies(&file).await;
+        verify_codecs(&file, hevc).await;
+        let expected = caption_bodies(&file, hevc).await;
         assert!(
             expected.len() >= 4,
             "source oracle must contain distinct authored events"
@@ -392,18 +443,28 @@ async fn regional(push: bool) {
             "fixture must contain the stated regional caption format"
         );
         verify_original_tracks(&input, true);
-        run(push, digital, &input, &expected).await;
+        run(push, digital, hevc, &input, &expected).await;
     }
 }
 
 #[tokio::test]
 async fn encrypted_listener_carries_608_708_dvb_teletext_independently_of_hls_policy() {
-    regional(false).await;
+    regional(false, false).await;
 }
 
 #[tokio::test]
 async fn encrypted_push_carries_608_708_dvb_teletext_independently_of_hls_policy() {
-    regional(true).await;
+    regional(true, false).await;
+}
+
+#[tokio::test]
+async fn encrypted_hevc_listener_preserves_regional_subtitles_and_hls_policy() {
+    regional(false, true).await;
+}
+
+#[tokio::test]
+async fn encrypted_hevc_push_preserves_regional_subtitles_and_hls_policy() {
+    regional(true, true).await;
 }
 
 #[test]

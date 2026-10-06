@@ -76,7 +76,7 @@ including the full Stream ID parser boundary. Browser tests verify the
 readable disabled/enabled Config card and token-placeholder output URL.
 
 Dedicated [regional subtitle qualification](srt-subtitles.md) covers encrypted
-copy-mode CEA-608/708 and exact DVB/teletext delivery, separate-track filtering
+H.264/HEVC with AAC copy-mode CEA-608/708 and exact DVB/teletext delivery, separate-track filtering
 and CEA HLS conversion alongside SRT. Broader encoder, input and cluster
 subtitle combinations remain pending.
 SRT publication authorization, per-stream keys/ports, complete vendor API

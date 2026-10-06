@@ -56,7 +56,7 @@ simultaneous healthy/unreachable destinations, receiver restart, disabled
 destinations, on-demand activation, config replacement and process cleanup.
 Owned DVB publication tests verify retained descriptors and subtitle PES at
 the SRT receiver, and filtering when separate tracks are disabled. Dedicated [regional subtitle qualification](srt-subtitles.md) also covers encrypted
-copy-mode CEA-608/708 and exact DVB/teletext carriage, separate-track filtering
+H.264/HEVC with AAC copy-mode CEA-608/708 and exact DVB/teletext carriage, separate-track filtering
 and CEA HLS conversion alongside SRT. Broader encoder, input and cluster
 subtitle combinations remain pending. Receiver handshake logs also verify exact Stream IDs, including a 512-byte
 UTF-8 ID and punctuation-bearing passphrases from query and normal fields.
