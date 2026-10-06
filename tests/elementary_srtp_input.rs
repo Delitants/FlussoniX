@@ -179,6 +179,9 @@ async fn authenticated_tracks_reject_bad_media_preserve_rollover_and_encrypt_fee
         tx.protect(&mut malformed, false).unwrap();
         socket.send_to(&malformed, target).await.unwrap();
         socket.send_to(&malformed, target).await.unwrap();
+        let mut alternate = malformed.clone();
+        alternate[8..12].copy_from_slice(&(id + 100).to_be_bytes());
+        socket.send_to(&alternate, target).await.unwrap();
         let plain = media(0, id, 1584);
         assert_eq!(plain.len(), 1600);
         let mut cipher = plain.clone();

@@ -156,6 +156,7 @@ pub struct Session {
     sender: bool,
     pinned: Option<u32>,
     candidate: Option<u32>,
+    failed: bool,
 }
 // The opaque context is used exclusively via &mut Session; sessions are never shared
 // or cloned. libSRTP owns per-session state and the global library stays initialized.
@@ -213,10 +214,11 @@ impl Session {
             sender: outbound,
             pinned: sender,
             candidate: None,
+            failed: false,
         })
     }
     /// Keep the authenticated candidate's replay/ROC state until another SSRC
-    /// arrives, but do not let malformed plaintext own this endpoint. The caller
+    /// authenticates, but do not let malformed plaintext own this endpoint. The caller
     /// may use this only before its first structurally valid media/control peer.
     pub(crate) fn discard_candidate(&mut self) -> Result<(), &'static str> {
         if self.sender {
@@ -243,6 +245,9 @@ impl Session {
         rtcp: bool,
         protect: bool,
     ) -> Result<(), &'static str> {
+        if self.failed {
+            return Err("SRTP session unavailable");
+        }
         let min = if rtcp { 8 } else { 12 };
         if packet.len() < min || packet.len() > 2048 || packet[0] >> 6 != 2 {
             return Err("SRTP packet framing rejected");
@@ -251,15 +256,6 @@ impl Session {
         let ssrc = u32::from_be_bytes(packet[offset..offset + 4].try_into().unwrap());
         if self.pinned.is_some_and(|s| s != ssrc) {
             return Err("SRTP source rejected");
-        }
-        if !protect && self.pinned.is_none() && self.candidate.is_some_and(|prior| prior != ssrc) {
-            // Public API takes network byte order. Retire only the uncommitted
-            // candidate before authenticating a new SSRC; at most one stream
-            // context exists, and the generation's wildcard key stays loaded.
-            let prior = self.candidate.take().unwrap();
-            if unsafe { (self.api.remove)(self.ctx, prior.to_be()) } != 0 {
-                return Err("SRTP candidate state could not be retired");
-            }
         }
         // libSRTP requires word-aligned storage and enough writable trailer space.
         // 576 initialized u32s hold 2048 bytes plus the maximum 148-byte library trailer.
@@ -280,11 +276,33 @@ impl Session {
         };
         let code = unsafe { operation(self.ctx, buffer.as_mut_ptr().cast(), &mut length) };
         let result = if code == 0 && length >= min as c_int && length as usize <= buffer.len() {
-            packet.clear();
-            packet.extend_from_slice(&buffer[..length as usize]);
-            self.pinned.get_or_insert(ssrc);
-            self.candidate = None;
-            Ok(())
+            // libSRTP creates an unknown-SSRC stream only after authentication.
+            // Retain the prior candidate through every failed authentication;
+            // only a successfully authenticated replacement can retire it.
+            // There are at most two streams during this exclusive transition,
+            // then one. The generation wildcard key remains loaded/unchanged.
+            let retired = if !protect {
+                self.candidate
+                    .filter(|prior| *prior != ssrc)
+                    .is_some_and(|prior| {
+                        // Public API accepts network byte order.
+                        (unsafe { (self.api.remove)(self.ctx, prior.to_be()) }) != 0
+                    })
+            } else {
+                false
+            };
+            if retired {
+                // A library failure must not admit further SSRCs and grow an
+                // untracked context set; fail closed until generation teardown.
+                self.failed = true;
+                Err("SRTP candidate state could not be retired")
+            } else {
+                packet.clear();
+                packet.extend_from_slice(&buffer[..length as usize]);
+                self.pinned.get_or_insert(ssrc);
+                self.candidate = None;
+                Ok(())
+            }
         } else {
             Err("SRTP authentication, replay or protection rejected")
         };
@@ -336,11 +354,46 @@ mod tests {
         rx.unprotect(&mut received, false).unwrap();
         rx.discard_candidate().unwrap();
         assert!(rx.unprotect(&mut wrong, false).is_err());
+        let mut alternate = wrong.clone();
+        alternate[8..12].copy_from_slice(&99u32.to_be_bytes());
+        assert!(rx.unprotect(&mut alternate, false).is_err());
+        // An invalid tag may not clear A's replay or rollover history.
+        assert!(rx.unprotect(&mut wrong, false).is_err());
         let plain = crate::direct_rtp::packet::packet(0, 0, 42, &ts);
         let mut cipher = plain.clone();
         tx.protect(&mut cipher, false).unwrap();
         rx.unprotect(&mut cipher, false).unwrap();
         assert_eq!(cipher, plain);
+    }
+    #[test]
+    fn failed_alternate_srtcp_ssrc_preserves_candidate_replay() {
+        let rr = |ssrc: u32| {
+            let mut b = vec![0x80, 201, 0, 1];
+            b.extend(ssrc.to_be_bytes());
+            b
+        };
+        let mut tx = Session::new([0x31; 30], Some(42)).unwrap();
+        let mut rx = Session::new([0x31; 30], None).unwrap();
+        let mut first = rr(42);
+        tx.protect(&mut first, true).unwrap();
+        rx.unprotect(&mut first.clone(), true).unwrap();
+        rx.discard_candidate().unwrap();
+        let mut alternate = first.clone();
+        alternate[4..8].copy_from_slice(&99u32.to_be_bytes());
+        assert!(rx.unprotect(&mut alternate, true).is_err());
+        assert!(rx.unprotect(&mut first, true).is_err());
+        let mut next = rr(42);
+        tx.protect(&mut next, true).unwrap();
+        rx.unprotect(&mut next, true).unwrap();
+        assert_eq!(next, rr(42));
+        rx.discard_candidate().unwrap();
+        // Authenticated replacement still retires the old stream and permits
+        // a structurally valid different peer; unauthenticated ones cannot.
+        let mut other = Session::new([0x31; 30], Some(77)).unwrap();
+        let mut body = rr(77);
+        other.protect(&mut body, true).unwrap();
+        rx.unprotect(&mut body, true).unwrap();
+        assert_eq!(body, rr(77));
     }
     #[test]
     fn libsrtp2_policy_matches_verified_public_c_abi() {
