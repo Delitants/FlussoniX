@@ -223,9 +223,6 @@ pub fn outputs(cfg: &Value) -> Result<Vec<Output>, String> {
                     return Err("RTP enabled setting must be boolean".into());
                 }
                 let settings = Settings::parse(row)?;
-                if settings.secure && settings.elementary {
-                    return Err("Encrypted elementary destinations are not yet available".into());
-                }
                 if settings.address.ip().is_unspecified()
                     || settings.sdp_file.is_some()
                     || settings.source_ip.is_some()

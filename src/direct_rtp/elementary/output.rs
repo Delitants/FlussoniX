@@ -1,6 +1,7 @@
 //! Shared native RTP packetizer output, one RTP/RTCP pair per actual track.
 use crate::{
     direct_rtp::{
+        crypto,
         output::{State, report_at},
         packet,
         sockets::Pair,
@@ -9,7 +10,7 @@ use crate::{
     rtp::{Description, MediaTrack},
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     net::SocketAddr,
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -22,13 +23,17 @@ struct Lane {
     octets: u32,
     stamp_origin: u32,
     target: SocketAddr,
+    sender: u32,
+    sequence: u16,
+    crypto: Option<crypto::Session>,
 }
 enum Sent {
     Packet,
     Unavailable,
     Cancelled,
 }
-fn sdp(description: &Description, address: SocketAddr) -> String {
+fn sdp(description: &Description, address: SocketAddr, secure: bool) -> String {
+    let transport = if secure { "RTP/SAVP" } else { "RTP/AVP" };
     let family = if address.is_ipv4() { "IP4" } else { "IP6" };
     let ip = address.ip();
     let mut out = format!(
@@ -37,7 +42,7 @@ fn sdp(description: &Description, address: SocketAddr) -> String {
     );
     for (i, t) in description.tracks.iter().enumerate() {
         out.push_str(&format!(
-            "m={} {} RTP/AVP {}\r\na=rtpmap:{} {}\r\n",
+            "m={} {} {transport} {}\r\na=rtpmap:{} {}\r\n",
             if t.video { "video" } else { "audio" },
             address.port() + 2 * i as u16,
             t.payload,
@@ -108,6 +113,40 @@ async fn send(
         .into_iter()
         .zip(snapshot.decode_times)
         .collect();
+    // Identity and key snapshots belong to this destination generation, never
+    // to the shared packetizer. Initialize every context before public sockets.
+    let secure = state.definition.settings.secure;
+    let mut used = HashSet::new();
+    let senders: Vec<_> = description
+        .tracks
+        .iter()
+        .map(|track| {
+            if !secure {
+                return track.ssrc;
+            }
+            loop {
+                let id =
+                    u32::from_be_bytes(uuid::Uuid::new_v4().as_bytes()[..4].try_into().unwrap());
+                if id != 0 && id != track.ssrc && used.insert(id) {
+                    break id;
+                }
+            }
+        })
+        .collect();
+    let mut contexts = if secure {
+        crypto::track_sessions(
+            state
+                .definition
+                .settings
+                .key_file
+                .as_deref()
+                .ok_or("SRTP key file required")?,
+            &senders.iter().copied().map(Some).collect::<Vec<_>>(),
+        )?
+        .into_iter()
+    } else {
+        vec![].into_iter()
+    };
     let mut lanes = vec![];
     for (i, track) in description.tracks.iter().enumerate() {
         let mut settings = state.definition.settings.clone();
@@ -120,12 +159,17 @@ async fn send(
                 .await
                 .map_err(|_| "Elementary RTP output socket failed")?,
         );
+        let (mut inbound, outbound) = contexts
+            .next()
+            .map_or((None, None), |(rx, tx)| (Some(rx), Some(tx)));
         let c = cancel.clone();
         let tx = pair.clone();
         let state = state.clone();
         let destination = settings.address;
         feedback.spawn(async move{let mut b=[0;2049];let mut peer=None;loop{let result=tokio::select!{biased;_=c.cancelled()=>return,result=tx.rtcp.recv_from(&mut b)=>result};let (n,addr)=match result{Ok(v)=>v,Err(e)if e.kind()==std::io::ErrorKind::ConnectionRefused=>{state.stats.unreachable.fetch_add(1,Ordering::Relaxed);continue;},Err(_)=>return};if addr.port()!=destination.port()+1 || addr.ip().is_multicast() || addr.ip().is_unspecified() || (!destination.ip().is_multicast() && addr.ip()!=destination.ip()) || peer.is_some_and(|p|p!=addr){state.stats.foreign.fetch_add(1,Ordering::Relaxed);continue;}
-        if packet::valid_rtcp(&b[..n]){peer.get_or_insert(addr);state.stats.rtcp.fetch_add(1,Ordering::Relaxed);}else{state.stats.invalid.fetch_add(1,Ordering::Relaxed);}}});
+        let mut body = b[..n].to_vec();
+        if let Some(rx) = &mut inbound { if rx.unprotect(&mut body,true).is_err() {state.stats.auth_failed.fetch_add(1,Ordering::Relaxed);continue;} }
+        if packet::valid_rtcp(&body){peer.get_or_insert(addr);state.stats.rtcp.fetch_add(1,Ordering::Relaxed);}else{state.stats.invalid.fetch_add(1,Ordering::Relaxed);if peer.is_none() {if let Some(rx)=&mut inbound {if rx.discard_candidate().is_err(){return;}}}}}});
         lanes.push(Lane {
             pair,
             track: track.clone(),
@@ -138,6 +182,9 @@ async fn send(
             )
             .max(1),
             target,
+            sender: senders[i],
+            sequence: 0,
+            crypto: outbound,
         });
     }
     if !current(worker, &description) {
@@ -145,7 +192,7 @@ async fn send(
     }
     *state.sdp.lock().unwrap() = Some((
         description.generation,
-        sdp(&description, state.definition.settings.address),
+        sdp(&description, state.definition.settings.address, secure),
     ));
     let mut pacer = crate::rtsp::udp::Pacer::new(state.definition.max_mbps as f64)
         .map_err(|_| "Elementary RTP rate invalid")?;
@@ -172,7 +219,7 @@ async fn send(
             item
         } else {
             tokio::select! {_=cancel.cancelled()=>return Ok(()),_=worker.closed()=>return Ok(()),_=feedback.join_next()=>return Err("Elementary RTCP feedback closed"),item=receiver.recv_timed()=>{let item=item.map_err(|_|"Elementary RTP output queue closed or lagged")?;(item.bytes,item.dts)},_=reports.tick()=>{
-             let observed = Instant::now(); let wall = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default(); let Some((dts, at)) = epoch else {continue;}; for lane in &lanes{if !current(worker,&description){return Err("Elementary RTP generation changed");}let clock = u128::from(lane.track.clock); let stamp = ((u128::from(dts)*clock/90000) + observed.duration_since(at).as_nanos()*clock/1_000_000_000) as u32; let body=report_at(lane.track.ssrc,stamp.wrapping_add(lane.stamp_origin),lane.packets,lane.octets,wall,&cname);match write(&lane.pair.rtcp,&body,Some(lane.target),cancel,worker,&description).await?{Sent::Cancelled=>return Ok(()),Sent::Unavailable=>{state.stats.unreachable.fetch_add(1,Ordering::Relaxed);},Sent::Packet=>{state.egress.fetch_add((body.len()+overhead) as u64,Ordering::Relaxed);}}}continue;
+             let observed = Instant::now(); let wall = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default(); let Some((dts, at)) = epoch else {continue;}; for lane in &mut lanes{if !current(worker,&description){return Err("Elementary RTP generation changed");}let clock = u128::from(lane.track.clock); let stamp = ((u128::from(dts)*clock/90000) + observed.duration_since(at).as_nanos()*clock/1_000_000_000) as u32; let mut body=report_at(lane.sender,stamp.wrapping_add(lane.stamp_origin),lane.packets,lane.octets,wall,&cname);if let Some(tx)=&mut lane.crypto {tx.protect(&mut body,true)?;}match write(&lane.pair.rtcp,&body,Some(lane.target),cancel,worker,&description).await?{Sent::Cancelled=>return Ok(()),Sent::Unavailable=>{state.stats.unreachable.fetch_add(1,Ordering::Relaxed);},Sent::Packet=>{state.egress.fetch_add((body.len()+overhead) as u64,Ordering::Relaxed);}}}continue;
             }}
         };
         let (bytes, dts) = item;
@@ -201,6 +248,22 @@ async fn send(
         {
             return Err("Elementary RTP packet generation changed");
         }
+        let payload_bytes = body.len() - 12;
+        if secure {
+            body[2..4].copy_from_slice(&lane.sequence.to_be_bytes());
+            body[8..12].copy_from_slice(&lane.sender.to_be_bytes());
+            // Advance even when the receiver is unavailable: an encryption
+            // index may never be protected a second time in this session.
+            lane.sequence = lane.sequence.wrapping_add(1);
+        }
+        let mut wire = secure.then(|| body.to_vec());
+        if let Some(tx) = &mut lane.crypto {
+            tx.protect(
+                wire.as_mut().ok_or("SRTP transport context missing")?,
+                false,
+            )?;
+        }
+        let body = wire.as_deref().unwrap_or(body);
         let due = pacer
             .ready_at(dts, body.len() + overhead, tokio::time::Instant::now())
             .map_err(|_| "Elementary RTP output pacing failed")?;
@@ -229,12 +292,12 @@ async fn send(
             .fetch_add((body.len() + overhead) as u64, Ordering::Relaxed);
         pacer.sent(body.len() + overhead, tokio::time::Instant::now());
         lane.packets = lane.packets.wrapping_add(1);
-        lane.octets = lane.octets.wrapping_add((body.len() - 12) as u32);
+        lane.octets = lane.octets.wrapping_add(payload_bytes as u32);
         state.stats.packets.fetch_add(1, Ordering::Relaxed);
         state
             .stats
             .bytes
-            .fetch_add((body.len() - 12) as u64, Ordering::Relaxed);
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
         *state.stats.status.lock().unwrap() = "sending";
     }
 }

@@ -24,7 +24,20 @@ async fn get(a: Arc<App>, auth: bool, query: &str) -> (u16, String) {
 }
 #[tokio::test]
 async fn sdp_is_management_authenticated_and_describes_only_running_elementary_destination() {
+    qualify(false).await;
+}
+#[tokio::test]
+async fn secure_sdp_is_authenticated_fenced_and_contains_no_key_or_key_path() {
+    qualify(true).await;
+}
+async fn qualify(secure: bool) {
     let d = tempfile::tempdir().unwrap();
+    let key = d.path().join("owned.key");
+    std::fs::write(&key, STANDARD.encode([0x31; 30])).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let scheme = if secure { "srtp" } else { "rtp" };
+    let transport = if secure { "RTP/SAVP" } else { "RTP/AVP" };
     let a = App::new(
         d.path().join("c.json"),
         d.path().join("media"),
@@ -55,7 +68,11 @@ async fn sdp_is_management_authenticated_and_describes_only_running_elementary_d
             break (port, sockets);
         }
     };
-    let cfg = json!({"static":false,"inputs":[{"url":"testsrc://"}],"flussonix_rtp_outputs":[{"url":format!("rtp://127.0.0.1:{port}"),"flussonix_rtp":{"profile":"elementary"}}]});
+    let mut options = json!({"profile":"elementary"});
+    if secure {
+        options["key_file"] = json!(key);
+    }
+    let cfg = json!({"static":false,"inputs":[{"url":"testsrc://"}],"flussonix_rtp_outputs":[{"url":format!("{scheme}://127.0.0.1:{port}"),"flussonix_rtp":options}]});
     a.config.put("streams", "owned", cfg.clone()).unwrap();
     assert_eq!(get(a.clone(), false, "").await.0, 401);
     assert_ne!(get(a.clone(), true, "").await.0, 200);
@@ -80,10 +97,13 @@ async fn sdp_is_management_authenticated_and_describes_only_running_elementary_d
     a.media.stop_all().await;
     assert_eq!(status, 200, "{text}");
     assert!(text.starts_with("v=0\r\n"));
-    assert!(text.contains(&format!("m=video {port} RTP/AVP 96")));
-    assert!(text.contains(&format!("m=audio {} RTP/AVP 97", port + 2)));
+    assert!(text.contains(&format!("m=video {port} {transport} 96")));
+    assert!(text.contains(&format!("m=audio {} {transport} 97", port + 2)));
     assert!(text.contains("MPEG4-GENERIC/48000/2"));
     assert!(!text.contains("token="));
+    assert!(!text.contains("crypto:"));
+    assert!(!text.contains(key.to_str().unwrap()));
+    assert!(!text.contains(&STANDARD.encode([0x31; 30])));
     assert_ne!(get(a.clone(), true, "").await.0, 200);
     assert_ne!(
         changed, 200,
