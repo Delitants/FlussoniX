@@ -1,0 +1,24 @@
+# Direct SRTP and SRTCP
+
+The direct MPEG-TS RTP profile also supports `srtp://IP:PORT` in both directions. RTP is encrypted and authenticated with AES_CM_128_HMAC_SHA1_80; the consecutive RTCP port uses encrypted authenticated SRTCP with an independent packet index and replay state. The native transport loads the independent system `libsrtp2.so.1` (libSRTP 2.x). Install the distribution's `libsrtp2-1` runtime package; Flussonic packages, Erlang modules and proprietary drivers are unnecessary. If the library, profile or key cannot be initialized, secure transport fails closed. It never sends or accepts plaintext as a fallback.
+
+Use the normal input or destination URL field, with `srtp://` instead of `rtp://`. The SRTP key file field holds an absolute path on that node, not a key pasted into the browser. Its API field is `flussonix_rtp.key_file`. Each file contains one base64 encoding of exactly 30 bytes: 16-byte master key followed by 14-byte master salt. Leading/trailing ASCII whitespace is accepted. The opened file must be regular, owned by the daemon UID, inaccessible to group/other users and at most 128 bytes. Final-component symlinks are rejected; non-regular files are opened nonblocking then rejected. The application erases key-loading buffers after session creation. Runtime counters and errors disclose neither key bytes nor file paths; authenticated administrators can edit the saved reference.
+
+Create a separate secret file through your server's normal secret provisioning, for example:
+
+```sh
+install -d -m 700 /etc/flussonix/keys
+(umask 077; openssl rand -base64 30 > /etc/flussonix/keys/channel.key)
+```
+
+Set its ownership to the daemon's service UID. Provision the same key/salt to the peer over an authenticated management channel. Do not put key material in media URLs, source-controlled configurations or command logs. No SDP, DTLS-SRTP or automatic key negotiation is implemented. Independent senders using a master key must avoid SSRC/index reuse; allocate keys per transport relationship and rotate them according to your operational policy.
+
+The receiver authenticates before pinning its media peer and before releasing TS to the decoder. It uses a 128-packet replay window and rejects wrong keys, modified packets, duplicates, plaintext, source changes and oversized frames. The libSRTP adapter pins one authenticated SSRC to bound stream-context state. Media address pinning additionally requires a valid MP2T payload. RTCP is accepted only from the media peer's consecutive port, after authentication; outgoing feedback is protected and directed only to that peer. Destination feedback is authenticated on the connected RTCP socket and pins one feedback SSRC.
+
+Keys are loaded once per worker generation. Editing the key-file reference or explicitly restarting a stream reloads the file and replaces both transport sessions, sockets, random SSRCs, sequence seeds and clocks. Replacing bytes at an unchanged path alone does not force an automatic restart. Coordinate key transitions with peers; unauthenticated rekey requests are not accepted. A failed destination does not automatically reuse its sender session. Its error stays visible until a new generation starts.
+
+The [RTP profile](direct-rtp.md) describes multicast, codecs, pacing, worker sharing, subtitle policies and uplink accounting. Encryption does not change TS codec/subtitle capabilities. Inbound authorization is the configured endpoint, optional source-IP filter and possession of the SRTP key; this UDP profile does not invent an HTTP viewer-token handshake. Outbound destinations are configured pushes, not separately authenticated viewers.
+
+Interoperability tests use independent FFmpeg SRTP peers as well as library-level packet tests. CPU encoding and available Intel H.264 VAAPI source fixtures are short, low-resolution delivered-media checks. This host's HEVC VAAPI encoder is unavailable with its test driver; HEVC transport is qualified using CPU-generated sources. Internal VAAPI transcoder controls and hardware throughput qualification remain separate pending work.
+
+This initial statically keyed profile requires receivers to start with a fresh sender epoch (initial rollover counter zero). A new receiver joining an already running SRTP sender after its first 16-bit sequence rollover lacks the sender's rollover state and fails authentication; a replay-window reset alone cannot recover it. Coordinate a fresh sender generation/key epoch when restarting or moving a receiver. Configurable initial ROC, negotiated context transfer and unsignalled late joining remain pending, including for multicast. Existing authenticated receiver sessions handle sequence rollover normally. Packet tests prove both continued-session rollover and fresh-receiver rejection; media tests start coordinated fresh epochs.

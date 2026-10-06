@@ -13,7 +13,15 @@ pub fn port() -> u16 {
     }
     panic!("no port pair")
 }
+#[allow(dead_code)]
 pub async fn run(video: Option<&str>, secure: bool, fixture: Option<&Path>) {
+    run_profile(video, secure, fixture, false).await;
+}
+#[allow(dead_code)]
+pub async fn run_cpu(secure: bool) {
+    run_profile(Some("libx264"), secure, None, true).await;
+}
+async fn run_profile(video: Option<&str>, secure: bool, fixture: Option<&Path>, transcode: bool) {
     let d = tempfile::tempdir().unwrap();
     let input = port();
     let output = port();
@@ -29,7 +37,10 @@ pub async fn run(video: Option<&str>, secure: bool, fixture: Option<&Path>) {
     } else {
         json!({})
     };
-    let cfg = json!({"inputs":[{"url":format!("{scheme}://127.0.0.1:{input}"),"flussonix_rtp":opts}],"flussonix_rtp_outputs":[{"url":format!("{scheme}://127.0.0.1:{output}"),"flussonix_rtp":opts}],"flussonix_input_timeout":15});
+    let mut cfg = json!({"inputs":[{"url":format!("{scheme}://127.0.0.1:{input}"),"flussonix_rtp":opts}],"flussonix_rtp_outputs":[{"url":format!("{scheme}://127.0.0.1:{output}"),"flussonix_rtp":opts}],"flussonix_input_timeout":15});
+    if transcode {
+        cfg["transcoder"] = json!({"encoder":"libx264","vb":100,"acodec":"aac","ab":64});
+    }
     let e = Engine::new(d.path().join("media"), "ffmpeg");
     let worker = e
         .ensure_guarded("owned", &cfg, true, std::future::ready(true))
@@ -144,7 +155,11 @@ pub async fn run(video: Option<&str>, secure: bool, fixture: Option<&Path>) {
     let _ = sender.kill().await;
     let _ = sender.wait().await;
     if let Ok(path) = std::env::var("FLUSSONIX_DIRECT_ARTIFACT_DIR") {
-        let out = Path::new(&path).join(format!("{scheme}-{}", video.unwrap_or("audio")));
+        let out = Path::new(&path).join(format!(
+            "{scheme}-{}{}",
+            video.unwrap_or("audio"),
+            if transcode { "-cpu" } else { "" }
+        ));
         std::fs::create_dir_all(&out).unwrap();
         for name in ["received.ts", "receiver.log", "sender.log"] {
             if d.path().join(name).is_file() {
@@ -213,7 +228,7 @@ pub async fn run(video: Option<&str>, secure: bool, fixture: Option<&Path>) {
     } else {
         assert!(streams.iter().all(|s| s["codec_type"] != "video"));
     }
-    let audio_codecs = if fixture.is_some() {
+    let audio_codecs = if fixture.is_some() || transcode {
         vec!["aac"]
     } else {
         vec!["aac", "mp2", "mp3"]

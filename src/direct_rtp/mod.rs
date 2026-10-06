@@ -5,3 +5,5 @@ pub mod output;
 pub mod packet;
 mod sockets;
 mod stats;
+
+pub mod crypto;

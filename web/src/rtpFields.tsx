@@ -6,14 +6,14 @@ function option(row:Item,key:string,value:any):Item {const options={...row.fluss
 export function RTPInputFields({row,onChange,suffix=''}:{row:Item,onChange:(v:Item)=>void,suffix?:string}) {
  if(!directRTP(row.url||''))return null;
  const opts=row.flussonix_rtp||{};
- return <div className="form-grid">
-  <Field label={'RTP interface IP'+suffix} help="IPv4 address of this node's network interface. Required for IPv4 multicast."><input value={opts.interface||''} placeholder="192.168.1.10" onChange={e=>onChange(option(row,'interface',e.target.value))}/></Field>
+ return <div className="form-grid rtp-input-options">
+  <Field label={'RTP interface IP'+suffix} help="Local IPv4 interface. Required for multicast; with a wildcard bind, restricts reception to this address. Otherwise it must match the input URL."><input value={opts.interface||''} placeholder="192.168.1.10" onChange={e=>onChange(option(row,'interface',e.target.value))}/></Field>
   <Field label={'RTP source IP'+suffix} help="Optional exact sender IP filter. The first valid sender and SSRC are pinned until restart."><input value={opts.source_ip||''} onChange={e=>onChange(option(row,'source_ip',e.target.value))}/></Field>
   <Field label={'RTP jitter (milliseconds)'+suffix} help="Reorder packets for up to 0–1000 ms; default 50. Queue is bounded to 64 packets."><input type="number" min="0" max="1000" placeholder="50" value={opts.jitter_ms??''} onChange={e=>onChange(option(row,'jitter_ms',e.target.value===''?'':Number(e.target.value)))}/></Field>
   {row.url?.startsWith('srtp://')&&<KeyField label={'SRTP key file'+suffix} value={opts.key_file||''} onChange={v=>onChange(option(row,'key_file',v))}/>}
  </div>;
 }
-function KeyField({label,value,onChange}:{label:string,value:string,onChange:(v:string)=>void}) {return <Field label={label} help="Absolute path on this node to an owner-only file containing a base64 30-byte key and salt. AES_CM_128_HMAC_SHA1_80; must match the peer. Changes take effect on restart."><input value={value} placeholder="/etc/flussonix/keys/channel.key" autoComplete="off" onChange={e=>onChange(e.target.value)}/></Field>}
+function KeyField({label,value,onChange}:{label:string,value:string,onChange:(v:string)=>void}) {return <Field label={label} help="Absolute path on this node to an owner-only file containing a base64 30-byte key and salt. AES_CM_128_HMAC_SHA1_80; must match the peer. Changes take effect on restart. Secure receivers need a fresh sender generation; automatic rollover-state transfer for late joins is not supported."><input value={value} placeholder="/etc/flussonix/keys/channel.key" autoComplete="off" onChange={e=>onChange(e.target.value)}/></Field>}
 export function rtpSummary(rows:Item[]):React.ReactNode {return rows?.length?rows.map((p,i)=><div key={i}>{i+1}. {p.url} · {p.disabled?'Disabled':'Enabled'} · {p.url?.startsWith('srtp://')?'Encrypted':'Plaintext'} · MPEG-TS / PT33</div>):'No destinations'}
 export function DirectOutputFields({value,inherited,onChange}:{value:Item,inherited?:Item[],onChange:(v:Item[]|undefined)=>void}) {
  const mode=owns(value,'flussonix_rtp_outputs')?(value.flussonix_rtp_outputs?.length?'override':'none'):'inherit';const rows:Item[]=value.flussonix_rtp_outputs||[];
@@ -34,6 +34,7 @@ export function DirectOutputFields({value,inherited,onChange}:{value:Item,inheri
 export function rtpError(value:Item):string|undefined {
  for(const row of [...(value.inputs||[]),...(value.flussonix_rtp_outputs||[])]) {
   if(!directRTP(row.url||''))continue;
+  if(/[\s\x00-\x1f\x7f]/.test(row.url)||row.url.split('://')[1]?.replace(/\/$/,'').includes('/'))return 'RTP URL cannot contain whitespace or a path.';
   try {const u=new URL(row.url);const host=u.hostname.replace(/^\[|\]$/g,'');const ipv4=/^(\d{1,3}\.){3}\d{1,3}$/.test(host)&&host.split('.').every(n=>Number(n)<=255);if(!ipv4&&!host.includes(':')||!u.port||Number(u.port)<1024||Number(u.port)>65534||u.search||u.hash||u.username||u.password||!['','/'].includes(u.pathname))return 'RTP URL needs a literal IP and port 1024–65534, without path, query or credentials.';}catch{return 'Enter a complete RTP or SRTP IP address and port.'}
   const o=row.flussonix_rtp||{};for(const [k,min,max] of [['jitter_ms',0,1000],['ttl',1,255]] as const)if(owns(o,k)&&(!Number.isInteger(o[k])||o[k]<min||o[k]>max))return `RTP ${k==='ttl'?'TTL':'jitter'} must be a whole number from ${min} to ${max}.`;
   if(row.url.startsWith('srtp://')&&!o.key_file?.startsWith('/'))return 'SRTP requires an absolute key file path on this node.';

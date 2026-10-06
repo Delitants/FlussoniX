@@ -24,10 +24,33 @@ impl Settings {
             }
             return Ok(None);
         }
-        Self::parse(item).map(Some)
+        let settings = Self::parse(item)?;
+        if let Some(interface) = settings.interface {
+            if !settings.address.ip().is_multicast()
+                && !settings.address.ip().is_unspecified()
+                && settings.address.ip() != IpAddr::V4(interface)
+            {
+                return Err(
+                    "RTP input interface must match its bind address or restrict a wildcard".into(),
+                );
+            }
+        }
+        Ok(Some(settings))
     }
     pub fn parse(item: &Value) -> Result<Self, String> {
         let raw = item["url"].as_str().ok_or("Direct RTP URL required")?;
+        let authority = raw
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .ok_or("Invalid direct RTP URL")?;
+        if raw.chars().any(|c| c.is_control() || c.is_whitespace())
+            || authority
+                .strip_suffix('/')
+                .unwrap_or(authority)
+                .contains('/')
+        {
+            return Err("Direct RTP URL cannot contain whitespace or a path".into());
+        }
         let u = url::Url::parse(raw).map_err(|_| "Invalid direct RTP URL")?;
         if !["rtp", "srtp"].contains(&u.scheme())
             || !u.username().is_empty()
@@ -67,6 +90,10 @@ impl Settings {
                     .map_err(|_| "RTP interface must be an IPv4 address")
             })
             .transpose()?;
+        if interface.is_some_and(|ip| ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast())
+        {
+            return Err("RTP interface must be a concrete unicast IPv4 address".into());
+        }
         let source_ip = opts
             .get("source_ip")
             .map(|v| {

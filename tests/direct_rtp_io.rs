@@ -223,6 +223,7 @@ async fn ipv4_multicast_uses_explicit_loopback_interface_and_releases_pair() {
         .unwrap()
         .remove(0);
     let state = State::new(definition, 0);
+    let output_stats = state.clone();
     let (tx, rx) = tokio::sync::broadcast::channel(4);
     let c = cancel.clone();
     let sender = tokio::spawn(async move { state.run(rx, c).await });
@@ -233,9 +234,19 @@ async fn ipv4_multicast_uses_explicit_loopback_interface_and_releases_pair() {
         .unwrap()
         .unwrap();
     assert_eq!(body, ts().repeat(7));
+    let feedback = tokio::time::timeout(Duration::from_secs(2), async {
+        while output_stats.stats()["rtcp_packets"].as_u64().unwrap() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
     cancel.cancel();
     task.await.unwrap().unwrap();
     sender.await.unwrap();
+    assert!(
+        feedback.is_ok(),
+        "multicast receiver feedback must reach sender"
+    );
     assert!(
         UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
             .await
@@ -243,6 +254,87 @@ async fn ipv4_multicast_uses_explicit_loopback_interface_and_releases_pair() {
     );
     assert!(
         UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port + 1))
+            .await
+            .is_ok()
+    );
+}
+#[tokio::test]
+async fn one_broadcast_fans_out_to_independent_destinations() {
+    use flussonix::direct_rtp::{config::outputs, output::State};
+    let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let defs=outputs(&json!({"flussonix_rtp_outputs":[{"url":format!("rtp://{}",first.local_addr().unwrap())},{"url":format!("rtp://{}",second.local_addr().unwrap())}]})).unwrap();
+    let (tx, _) = tokio::sync::broadcast::channel(8);
+    let cancel = CancellationToken::new();
+    let mut tasks = vec![];
+    for (i, def) in defs.into_iter().enumerate() {
+        let state = State::new(def, i);
+        let rx = tx.subscribe();
+        let c = cancel.clone();
+        tasks.push(tokio::spawn(async move { state.run(rx, c).await }));
+    }
+    let expected = ts().repeat(7);
+    tx.send(bytes::Bytes::copy_from_slice(&expected)).unwrap();
+    let mut ids = vec![];
+    for rx in [first, second] {
+        let mut b = [0; 1600];
+        let n = tokio::time::timeout(Duration::from_secs(2), rx.recv(&mut b))
+            .await
+            .unwrap()
+            .unwrap();
+        let p = flussonix::direct_rtp::packet::parse(&b[..n]).unwrap();
+        assert_eq!(p.payload, expected);
+        ids.push(p.ssrc);
+    }
+    assert_ne!(ids[0], ids[1]);
+    cancel.cancel();
+    for task in tasks {
+        task.await.unwrap();
+    }
+}
+#[tokio::test]
+async fn ipv6_loopback_receives_and_transmits_on_owned_consecutive_ports() {
+    use flussonix::direct_rtp::{config::outputs, output::State};
+    let p = loop {
+        let socket = std::net::UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, 0)).unwrap();
+        let p = socket.local_addr().unwrap().port();
+        if p < 65535 && std::net::UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, p + 1)).is_ok() {
+            break p;
+        }
+    };
+    let url = format!("rtp://[::1]:{p}");
+    let cfg = Settings::parse(&json!({"url":url,"flussonix_rtp":{"source_ip":"::1"}})).unwrap();
+    let input = Input::bind(&cfg).await.unwrap();
+    let (write, mut read) = tokio::io::duplex(4096);
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    let receiving = tokio::spawn(async move { input.run(write, stop).await });
+    let output = State::new(
+        outputs(&json!({"flussonix_rtp_outputs":[{"url":url}]}))
+            .unwrap()
+            .remove(0),
+        0,
+    );
+    let (tx, rx) = tokio::sync::broadcast::channel(4);
+    let stop = cancel.clone();
+    let sending = tokio::spawn(async move { output.run(rx, stop).await });
+    tx.send(bytes::Bytes::from(ts().repeat(7))).unwrap();
+    let mut received = [0; 7 * 188];
+    tokio::time::timeout(Duration::from_secs(2), read.read_exact(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.to_vec(), ts().repeat(7));
+    cancel.cancel();
+    receiving.await.unwrap().unwrap();
+    sending.await.unwrap();
+    assert!(
+        UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, p))
+            .await
+            .is_ok()
+    );
+    assert!(
+        UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, p + 1))
             .await
             .is_ok()
     );

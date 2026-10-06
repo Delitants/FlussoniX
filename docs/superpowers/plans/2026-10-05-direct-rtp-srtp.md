@@ -41,8 +41,10 @@ Task1 qualification: 6 native IO, 3 packet, 1 config, 7 telemetry and independen
 
 Files: create src/direct_rtp/crypto.rs; tests/direct_srtp.rs and tests/direct_srtp_media.rs; modify transport config/input/output and fields; CI install independent libsrtp2-1; docs/direct-srtp.md.
 Interfaces: crypto::Session::new(key:[u8;30],sender:Option<u32>)->Result<Session,String>; protect/unprotect(&mut Vec<u8>,rtcp:bool)->Result<(),String>; availability()->bool. Session owns opaque library state, key is erased after create; no Clone/concurrent use.
-- [ ] Write failing key-file, packet confidentiality/auth/replay/SRTCP and ABI layout tests; preserve RED, implement narrow adapter, run GREEN.
-- [ ] Add independent FFmpeg encrypted inbound/outbound tests for codec/CPU/iGPU fixture profiles, wrong secret, tampering, replay, plaintext exclusion, key generation change, cancellation; run GREEN and existing RTP regressions.
-- [ ] Finish friendly secure fields/capabilities/CI runtime dependency/docs; validate no key leakage and vendor independence.
+- [x] Write failing key-file, packet confidentiality/auth/replay/SRTCP and ABI layout tests; preserve RED, implement narrow adapter, run GREEN.
+- [x] Add independent FFmpeg encrypted inbound/outbound tests for codec/CPU/iGPU fixture profiles, wrong secret, tampering, replay, plaintext exclusion, key generation change, cancellation; run GREEN and existing RTP regressions.
+- [x] Finish friendly secure fields/capabilities/CI runtime dependency/docs; validate no key leakage and vendor independence.
 - [ ] Run fmt, warnings-denied Clippy, relevant suites and browser checks; commit both tasks; one fresh whole-branch review, apply justified fixes with RED/GREEN and ledger rulings.
 - [ ] Push candidate and verify full exact-head CI; publish main, verify owned preview config and binary provenance, archive evidence, remove only this owned merged worktree.
+
+Release gates and reviewer decisions are recorded in the owned qualification ledger. They are finalized after exact-head CI and publication, without retroactively changing the tested commit solely to update plan checkboxes.

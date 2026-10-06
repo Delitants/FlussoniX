@@ -1,4 +1,4 @@
-use super::{config::Output, packet, sockets::Pair, stats::Stats};
+use super::{config::Output, crypto, packet, sockets::Pair, stats::Stats};
 use bytes::Bytes;
 use serde_json::Value;
 use std::{
@@ -56,21 +56,32 @@ impl State {
         receiver: &mut broadcast::Receiver<Bytes>,
         cancel: &CancellationToken,
     ) -> Result<(), &'static str> {
-        if self.definition.settings.secure {
-            return Err("SRTP adapter is not ready");
-        }
         let pair = Pair::send(&self.definition.settings)
             .await
             .map_err(|_| "RTP output socket failed")?;
         let seed = *uuid::Uuid::new_v4().as_bytes();
         let ssrc = u32::from_be_bytes(seed[..4].try_into().unwrap());
         let mut sequence = u16::from_be_bytes(seed[4..6].try_into().unwrap());
+        let (mut feedback, mut crypto) = if self.definition.settings.secure {
+            let (rx, tx) = crypto::sessions(
+                self.definition
+                    .settings
+                    .key_file
+                    .as_deref()
+                    .ok_or("SRTP key file required")?,
+                ssrc,
+            )?;
+            (Some(rx), Some(tx))
+        } else {
+            (None, None)
+        };
         let origin = Instant::now();
         let stamp = u32::from_be_bytes(seed[8..12].try_into().unwrap());
         let mut reports = tokio::time::interval(Duration::from_secs(5));
         reports.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         reports.tick().await;
         let mut control = [0; 2049];
+        let mut control_peer = None;
         let mut pending = Vec::with_capacity(7 * 188);
         let mut pacer = crate::rtsp::udp::Pacer::new(self.definition.max_mbps as f64)
             .map_err(|_| "RTP rate invalid")?;
@@ -86,11 +97,17 @@ impl State {
                 result=receiver.recv()=>match result {Ok(b)=>b,Err(broadcast::error::RecvError::Closed)=>{drain=true;closed=true;Bytes::new()},Err(_)=>return Err("RTP output queue lagged")},
                 _=reports.tick()=>{
                     let time=stamp.wrapping_add((origin.elapsed().as_micros()*90/1000) as u32);
-                    let body=report(ssrc,time,self.stats.packets.load(Ordering::Relaxed) as u32,self.stats.bytes.load(Ordering::Relaxed) as u32);
-                    tokio::select!{biased;_=cancel.cancelled()=>return Ok(()),result=tokio::time::timeout(Duration::from_secs(2),pair.rtcp.send(&body))=>{result.map_err(|_| "RTCP send stalled")?.map_err(|_| "RTCP send failed")?;}}self.egress.fetch_add((body.len()+if self.definition.settings.address.is_ipv4(){28}else{48}) as u64,Ordering::Relaxed);continue;
+                    let mut body=report(ssrc,time,self.stats.packets.load(Ordering::Relaxed) as u32,self.stats.bytes.load(Ordering::Relaxed) as u32);
+                    if let Some(crypto)=&mut crypto {crypto.protect(&mut body,true)?;}
+                    tokio::select!{biased;_=cancel.cancelled()=>return Ok(()),result=tokio::time::timeout(Duration::from_secs(2),pair.rtcp.send_to(&body,std::net::SocketAddr::new(self.definition.settings.address.ip(),self.definition.settings.address.port()+1)))=>{result.map_err(|_| "RTCP send stalled")?.map_err(|_| "RTCP send failed")?;}}self.egress.fetch_add((body.len()+if self.definition.settings.address.is_ipv4(){28}else{48}) as u64,Ordering::Relaxed);continue;
                 },
                 _=flush.tick()=>{drain=true;Bytes::new()},
-                result=pair.rtcp.recv(&mut control)=>{if let Ok(n)=result {if packet::valid_rtcp(&control[..n]){self.stats.rtcp.fetch_add(1,Ordering::Relaxed);}}continue;},
+                result=pair.rtcp.recv_from(&mut control)=>{if let Ok((n,addr))=result {
+                    let destination=self.definition.settings.address;
+                    if addr.port()!=destination.port()+1 || addr.ip().is_multicast() || addr.ip().is_unspecified() || (!destination.ip().is_multicast()&&addr.ip()!=destination.ip()) || control_peer.is_some_and(|p|p!=addr){self.stats.foreign.fetch_add(1,Ordering::Relaxed);continue;}
+                    let mut plain=control[..n].to_vec();if let Some(cipher)=&mut feedback {if cipher.unprotect(&mut plain,true).is_err(){self.stats.auth_failed.fetch_add(1,Ordering::Relaxed);continue;}}
+                    if packet::valid_rtcp(&plain){control_peer.get_or_insert(addr);self.stats.rtcp.fetch_add(1,Ordering::Relaxed);}else{self.stats.invalid.fetch_add(1,Ordering::Relaxed);if control_peer.is_none(){if let Some(cipher)=&mut feedback{cipher.discard_candidate()?;}}}
+                }continue;},
             };
             // Incoming chunks can split TS packets. Retain at most one MTU of data.
             let mut offset = 0;
@@ -113,12 +130,19 @@ impl State {
                     let ticks = (origin.elapsed().as_micros() * 90 / 1000) as u64;
                     let now = tokio::time::Instant::now();
                     let due = pacer
-                        .ready_at(ticks, count + 12, now)
+                        .ready_at(
+                            ticks,
+                            count + 12 + if crypto.is_some() { 10 } else { 0 },
+                            now,
+                        )
                         .map_err(|_| "RTP output pacing failed")?;
                     tokio::select! {biased;_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep_until(due)=>{}}
                     let timestamp =
                         stamp.wrapping_add((origin.elapsed().as_micros() * 90 / 1000) as u32);
-                    let body = packet::packet(sequence, timestamp, ssrc, payload);
+                    let mut body = packet::packet(sequence, timestamp, ssrc, payload);
+                    if let Some(crypto) = &mut crypto {
+                        crypto.protect(&mut body, false)?;
+                    }
                     tokio::select! {biased;_=cancel.cancelled()=>return Ok(()),result=tokio::time::timeout(Duration::from_secs(2),pair.rtp.send(&body))=>{let n=result.map_err(|_| "RTP send stalled")?.map_err(|_| "RTP send failed")?;if n!=body.len(){return Err("RTP datagram truncated");}}}
                     self.egress.fetch_add(
                         (body.len()

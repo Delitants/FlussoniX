@@ -42,7 +42,7 @@ impl Pair {
         let ip = if cfg.address.ip().is_multicast() {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         } else {
-            cfg.address.ip()
+            cfg.interface.map(IpAddr::V4).unwrap_or(cfg.address.ip())
         };
         let rtp = socket(SocketAddr::new(ip, cfg.address.port()), cfg, true)
             .map_err(|_| "RTP input port unavailable")?;
@@ -72,9 +72,13 @@ impl Pair {
             rtp.connect(cfg.address)
                 .await
                 .map_err(|_| "RTP destination unavailable")?;
-            rtcp.connect(SocketAddr::new(cfg.address.ip(), cfg.address.port() + 1))
-                .await
-                .map_err(|_| "RTCP destination unavailable")?;
+            // Multicast reports go to the group, but receiver feedback is unicast
+            // to this source port. Connecting to the group would filter it out.
+            if !cfg.address.ip().is_multicast() {
+                rtcp.connect(SocketAddr::new(cfg.address.ip(), cfg.address.port() + 1))
+                    .await
+                    .map_err(|_| "RTCP destination unavailable")?;
+            }
             return Ok(Self { rtp, rtcp });
         }
         Err("RTP output pair unavailable".into())
