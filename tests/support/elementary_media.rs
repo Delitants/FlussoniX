@@ -25,60 +25,66 @@ fn ports() -> (u16, Vec<UdpSocket>) {
     panic!("owned RTP ports unavailable")
 }
 async fn decode(path: &Path, video: Option<&str>, audio: &[&str]) {
-    let probe = Command::new("/usr/bin/ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_streams",
-            "-count_frames",
-            "-of",
-            "json",
-        ])
-        .arg(path)
-        .output()
-        .await
-        .unwrap();
+    let probe = tokio::time::timeout(
+        Duration::from_secs(30),
+        Command::new("/usr/bin/ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_streams",
+                "-count_frames",
+                "-of",
+                "json",
+            ])
+            .arg(path)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("Probe stalled: {}", path.display()))
+    .unwrap();
     assert!(
-        probe.status.success(),
-        "{}",
+        probe.status.success() && probe.stderr.is_empty(),
+        "Probe {}: {}",
+        path.display(),
         String::from_utf8_lossy(&probe.stderr)
     );
     let data: Value = serde_json::from_slice(&probe.stdout).unwrap();
     let streams = data["streams"].as_array().unwrap();
-    if let Some(codec) = video {
-        let track = streams
-            .iter()
-            .find(|s| s["codec_name"] == codec)
-            .unwrap_or_else(|| panic!("{data}"));
+    let mut expected = audio.to_vec();
+    expected.extend(video);
+    expected.sort_unstable();
+    let mut actual: Vec<_> = streams
+        .iter()
+        .map(|stream| stream["codec_name"].as_str().unwrap())
+        .collect();
+    actual.sort_unstable();
+    assert_eq!(actual, expected, "Tracks {}: {data}", path.display());
+    for stream in streams {
         assert!(
-            track["nb_read_frames"]
+            stream["nb_read_frames"]
                 .as_str()
-                .unwrap()
-                .parse::<u32>()
-                .unwrap()
-                >= 20,
-            "{data}"
+                .is_some_and(|n| n.parse::<u32>().is_ok_and(|n| n >= 20)),
+            "Frames {}: {data}",
+            path.display()
         );
     }
-    for codec in audio {
-        assert!(
-            streams.iter().any(|s| s["codec_name"] == *codec
-                && s["nb_read_frames"]
-                    .as_str()
-                    .is_some_and(|n| n.parse::<u32>().is_ok_and(|n| n >= 20))),
-            "{data}"
-        );
-    }
-    let decoded = Command::new("/usr/bin/ffmpeg")
-        .args(["-nostdin", "-v", "error", "-xerror", "-i"])
-        .arg(path)
-        .args(["-map", "0", "-f", "null", "-"])
-        .output()
-        .await
-        .unwrap();
+    let decoded = tokio::time::timeout(
+        Duration::from_secs(30),
+        Command::new("/usr/bin/ffmpeg")
+            .args(["-nostdin", "-v", "error", "-xerror", "-i"])
+            .arg(path)
+            .args(["-map", "0", "-f", "null", "-"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("Decode stalled: {}", path.display()))
+    .unwrap();
     assert!(
         decoded.status.success() && decoded.stderr.is_empty(),
-        "{}",
+        "Decode {}: {}",
+        path.display(),
         String::from_utf8_lossy(&decoded.stderr)
     );
 }
@@ -287,7 +293,7 @@ pub async fn qualify(
     let recording = tokio::spawn(async move {
         use std::io::Write;
         loop {
-            tokio::select! {biased;_=c.cancelled()=>break,data=ts.recv()=>match data {Ok(data)=>record.write_all(&data).unwrap(),Err(_)=>break}}
+            tokio::select! {biased;_=c.cancelled()=>break,data=ts.recv()=>match data {Ok(data)=>record.write_all(&data).unwrap(),Err(error)=>panic!("Shared MPEG-TS recording failed: {error}")}}
         }
     });
     let text = tokio::time::timeout(Duration::from_secs(12), async {
@@ -533,6 +539,7 @@ pub async fn qualify(
             }
         })
         .collect();
+    decode(&d.path().join("worker.ts"), output_video, &expected).await;
     decode(&received, output_video, &expected).await;
     assert!(!Path::new(&format!("/proc/{}", worker.pid())).exists());
 }
