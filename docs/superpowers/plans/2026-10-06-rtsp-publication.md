@@ -16,7 +16,7 @@
 
 ### Task 1: Receive and authorize RTSP publications through the shared worker
 
-**Files:** src/rtsp.rs, src/rtsp/protocol.rs, src/rtsp/publication.rs, src/rtsp/publication/sdp.rs, src/media.rs, src/server/publication.rs, src/server.rs, src/direct_rtp/elementary/{packet,readiness,mod}.rs, tests/rtsp_publication.rs
+**Files:** src/rtsp.rs, src/rtsp/protocol.rs, src/rtsp/publication.rs, src/rtsp/publication/sdp.rs, src/media.rs, src/server/publication.rs, src/server.rs, src/direct_rtp/mod.rs, src/direct_rtp/elementary/{packet,readiness,mod}.rs, tests/rtsp_publication.rs
 **Interfaces:** Produces an ANNOUNCE/SETUP/RECORD receiving path for existing RTSP/RTSPS listeners, a guarded SDP publication worker entry and shared admission helpers. Consumes existing publish:// configuration, Policy, media signatures, decoder SDP/packet validation and worker generation fences. No configuration schema change.
 **Completion contract:** Real control tests cover admission before worker creation, password and callback denial, disabled/LB/missing/non-publisher streams, URL/session/channel binding, codec bounds, idle revocation, stalled media, conflict and disconnect/reconnect. Independent FFmpeg publishes H264/AAC to the real listener and shared TS independently decodes. Existing playback and HTTP publication tests pass.
 
@@ -33,7 +33,7 @@
 
 ### Task 2: Qualify media, TLS and friendly publication controls
 
-**Files:** tests/rtsp_publication.rs, tests/rtsps.rs or dedicated publication TLS test, src/server.rs, src/main.rs, web/src/components/ConfigurationFields.tsx and form parents, web/tests/admin.spec.ts, README.md, docs/COMPATIBILITY.md, docs/testing/rtsp-publication.md
+**Files:** tests/rtsp_publication.rs, tests/rtsps.rs or dedicated publication TLS test, src/server.rs, src/main.rs, web/src/forms.tsx and web/src/main.tsx, web/tests/admin.spec.ts, README.md, docs/compatibility.md, docs/rtsp-publication.md
 **Interfaces:** Consumes Task 1's receiving path and codec profile; produces independently decoded media qualification, actual listener capability metadata and friendly URL fields. Existing HTTP Publication URL label remains usable.
 **Completion contract:** HEVC, AAC, MP2/MP3, multi-audio/audio-only and CPU profile shared TS strictly decode; encrypted owned TLS input decodes with certificate verification and plain/TLS downgrade rejection; active callback renewal denies and reaps; config changes during admission revoke. UI capabilities show actual enabled addresses and hide unconfigured URL fields; browser test passes. H264 VAAPI is explicit opt-in if available, no HEVC GPU claim.
 

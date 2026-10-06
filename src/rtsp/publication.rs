@@ -365,7 +365,8 @@ async fn run<W: AsyncWrite + Unpin>(
         _=tokio::time::sleep_until(activity+Duration::from_secs(30))=>break,
         _=tokio::time::sleep_until(s.renew_at),if s.expected.policy.url.is_some()=>{let renew=tokio::select!{biased;_=cancel.cancelled()=>break,r=admission::authorize_current(&mut s.grant,app,&s.name,&s.expected,s.publication.as_ref().map(|p|p.worker.as_ref()))=>r};match renew{Ok(d)=>s.renew_at=Instant::now()+d,Err(_)=>break}},
         event=controls.recv()=>match event{
-        Some(Ok(Event::Request(r)))=>{let(code,headers,close)=s.request(&r,app,cancel).await;reply(write,cancel,code,r.cseq,&headers).await?;if close{break;}if code==200{activity=Instant::now();}},
+        Some(Ok(Event::Request(r)))=>{let(code,headers,close)=s.request(&r,app,cancel).await;reply(write,cancel,code,r.cseq,&headers).await?;if close{break;}
+        if code==200{activity=Instant::now();}},
         Some(Ok(Event::Interleaved(channel,body)))=>{
         let Some(bridge)=s.bridge.as_mut() else{break;};
         let forwarded=tokio::select!{biased;_=cancel.cancelled()=>break,r=tokio::time::timeout(Duration::from_millis(250),bridge.forward(channel,&body))=>r};

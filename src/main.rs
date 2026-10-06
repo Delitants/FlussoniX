@@ -152,6 +152,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?;
     app.set_http_delivery(http_address, https_address);
     app.set_srt_playback(srt_listener.as_ref());
+    app.set_rtsp_publication(
+        rtsp_listener.as_ref().map(|l| l.local_addr()).transpose()?,
+        tls_listener.as_ref().map(|l| l.local_addr()).transpose()?,
+    );
     println!(
         "{}",
         serde_json::json!({"service":"FlussoniX","listen":http_address.map(|a|a.to_string()),"https_listen":https_address.map(|a|a.to_string()),"rtsp_listen":rtsp_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"rtsps_listen":tls_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"srt_play_listen":srt_listener.as_ref().map(|l|l.address().to_string()),"srt_play_encrypted":srt_listener.as_ref().map(|l|l.settings().encrypted()),"rtsp_udp_ports":a.rtsp_udp_ports.map(|p|p.to_string()),"rtsp_udp_mbps":a.rtsp_udp_ports.map(|_|udp_rate),"version":env!("CARGO_PKG_VERSION")})

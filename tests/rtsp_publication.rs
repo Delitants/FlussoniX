@@ -437,30 +437,29 @@ async fn decoded(path: &std::path::Path, video: Option<&str>, audio: &[&str]) {
         String::from_utf8_lossy(&p.stderr)
     );
 }
-#[tokio::test]
-async fn independent_h264_aac_publisher_shared_ts_strictly_decodes() {
-    let l = Lab::new("standalone").await;
-    let mut child = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-nostdin",
-            "-v",
-            "error",
+#[path = "support/tls.rs"]
+mod tls_fixture;
+fn publisher(video: Option<&str>, audio: &[&str], input_url: &str) -> tokio::process::Child {
+    let mut cmd = tokio::process::Command::new("ffmpeg");
+    cmd.args(["-nostdin", "-v", "error"]);
+    if video.is_some() {
+        cmd.args(["-re", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25"]);
+    }
+    for (i, _) in audio.iter().enumerate() {
+        cmd.args([
             "-re",
             "-f",
             "lavfi",
             "-i",
-            "testsrc2=size=320x180:rate=25",
-            "-re",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=sample_rate=48000",
+            &format!("sine=frequency={}:sample_rate=48000", 440 + 110 * i),
+        ]);
+    }
+    if let Some(v) = video {
+        cmd.args([
             "-map",
             "0:v",
-            "-map",
-            "1:a",
             "-c:v",
-            "libx264",
+            v,
             "-preset",
             "ultrafast",
             "-tune",
@@ -469,22 +468,78 @@ async fn independent_h264_aac_publisher_shared_ts_strictly_decodes() {
             "25",
             "-threads",
             "1",
-            "-c:a",
-            "aac",
-            "-flags",
-            "+global_header",
-            "-f",
-            "rtsp",
-            "-rtsp_transport",
-            "tcp",
-        ])
-        .arg(&l.url)
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
+        ]);
+        if v == "libx265" {
+            cmd.args(["-x265-params", "log-level=error:pools=1:frame-threads=1"]);
+        }
+    }
+    for (i, a) in audio.iter().enumerate() {
+        cmd.args([
+            "-map",
+            &format!("{}:a", i + usize::from(video.is_some())),
+            &format!("-c:a:{i}"),
+            a,
+        ]);
+    }
+    cmd.args([
+        "-flags",
+        "+global_header",
+        "-f",
+        "rtsp",
+        "-rtsp_transport",
+        "tcp",
+    ])
+    .arg(input_url)
+    .stderr(std::process::Stdio::piped())
+    .kill_on_drop(true);
+    cmd.spawn().unwrap()
+}
+async fn qualify(video: Option<&str>, audio: &[&str], profile: serde_json::Value, tls: bool) {
+    let l = Lab::new("standalone").await;
+    let mut c = l.app.config.snapshot()["streams"]["owned"].clone();
+    c["transcoder"] = profile.clone();
+    c["flussonix_input_timeout"] = json!(15);
+    l.app.config.put("streams", "owned", c).unwrap();
+    let certificates = if tls {
+        Some(tls_fixture::Certificates::new())
+    } else {
+        None
+    };
+    let mut auxiliary = Vec::new();
+    let mut input_url = l.url.clone();
+    if tls {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tls_address = listener.local_addr().unwrap();
+        let app = l.app.clone();
+        let cancel = l.cancel.clone();
+        let server = certificates.as_ref().unwrap().server();
+        auxiliary.push(tokio::spawn(async move {
+            rtsp::serve_tls(listener, app, cancel, server)
+                .await
+                .unwrap();
+        }));
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        input_url = format!(
+            "rtsp://{}/owned?password=owned-publish",
+            proxy.local_addr().unwrap()
+        );
+        let client = certificates.as_ref().unwrap().client();
+        auxiliary.push(tokio::spawn(async move {
+            let (mut plain, _) = proxy.accept().await.unwrap();
+            let socket = TcpStream::connect(tls_address).await.unwrap();
+            let mut encrypted = tokio_rustls::TlsConnector::from(client)
+                .connect(
+                    tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                    socket,
+                )
+                .await
+                .expect("owned TLS certificate must verify");
+            let _ = tokio::io::copy_bidirectional(&mut plain, &mut encrypted).await;
+        }));
+    }
+    let mut child = publisher(video, audio, &input_url);
     let cfg = l.app.config.effective("owned").unwrap();
-    let w = tokio::time::timeout(Duration::from_secs(8), async {
+    let w = tokio::time::timeout(Duration::from_secs(12), async {
         loop {
             if let Ok(w) = l.app.media.ensure("owned", &cfg).await {
                 break w;
@@ -507,19 +562,148 @@ async fn independent_h264_aac_publisher_shared_ts_strictly_decodes() {
     .unwrap();
     let mut rx = w.subscribe();
     let mut ts = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     while let Ok(r) = tokio::time::timeout_at(deadline, rx.recv()).await {
         ts.extend_from_slice(&r.expect("shared TS lag"));
     }
     assert_eq!(l.app.media.count().await, 1);
-    assert_eq!(w.stats()["input_protocol"], "rtsp");
+    assert_eq!(
+        w.stats()["input_protocol"],
+        if tls { "rtsps" } else { "rtsp" }
+    );
     let path = l._dir.path().join("shared.ts");
     std::fs::write(&path, &ts).unwrap();
-    decoded(&path, Some("h264"), &["aac"]).await;
+    let output_video = if video.is_none() {
+        None
+    } else {
+        Some(if profile["encoder"] == "libx265" {
+            "hevc"
+        } else if profile["encoder"] == "libx264"
+            || profile["encoder"] == "h264_vaapi"
+            || video == Some("libx264")
+        {
+            "h264"
+        } else {
+            "hevc"
+        })
+    };
+    let output_audio: Vec<_> = audio
+        .iter()
+        .map(|a| match profile["acodec"].as_str().unwrap_or("copy") {
+            "aac" => "aac",
+            "mp2a" => "mp2",
+            "mp3" => "mp3",
+            _ => {
+                if *a == "libmp3lame" {
+                    "mp3"
+                } else {
+                    a
+                }
+            }
+        })
+        .collect();
+    decoded(&path, output_video, &output_audio).await;
+    assert!(
+        !w.wire.m4s_subscribe().0.is_empty(),
+        "shared native output must become ready"
+    );
+    if let Ok(root) = std::env::var("FLUSSONIX_RTSP_RECORD_DIR") {
+        let case = format!(
+            "{}-{}-{}-{}",
+            video.unwrap_or("audio"),
+            audio.join("_"),
+            profile["encoder"].as_str().unwrap_or("copy"),
+            if tls { "tls" } else { "tcp" }
+        );
+        let dir = std::path::Path::new(&root).join(case);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(&path, dir.join("worker.ts")).unwrap();
+        std::fs::write(dir.join("evidence.json"),json!({"video":output_video,"audio":output_audio,"profile":profile,"transport":if tls{"verified TLS relay"}else{"TCP"},"worker_pid":w.pid(),"stats":w.stats(),"bytes":ts.len()}).to_string()).unwrap();
+    }
     child.kill().await.unwrap();
     drop(child);
     l.end().await;
+    for task in auxiliary {
+        task.abort();
+        let _ = task.await;
+    }
 }
+#[tokio::test]
+async fn independent_h264_aac_publisher_shared_ts_strictly_decodes() {
+    qualify(
+        Some("libx264"),
+        &["aac"],
+        json!({"encoder":"copy","acodec":"copy"}),
+        false,
+    )
+    .await;
+}
+#[tokio::test]
+async fn hevc_h264_and_all_audio_publication_codecs_strictly_decode() {
+    for v in ["libx264", "libx265"] {
+        for a in ["aac", "mp2", "libmp3lame"] {
+            if v == "libx264" && a == "aac" {
+                continue;
+            }
+            qualify(
+                Some(v),
+                &[a],
+                json!({"encoder":"copy","acodec":"copy"}),
+                false,
+            )
+            .await;
+        }
+    }
+}
+#[tokio::test]
+async fn audio_only_and_multiple_mpeg_audio_publications_keep_tracks() {
+    qualify(
+        None,
+        &["aac"],
+        json!({"encoder":"copy","acodec":"copy"}),
+        false,
+    )
+    .await;
+    qualify(
+        None,
+        &["mp2", "libmp3lame"],
+        json!({"encoder":"copy","acodec":"copy"}),
+        false,
+    )
+    .await;
+}
+#[tokio::test]
+async fn cpu_publication_transcodes_hevc_with_mpeg_audio() {
+    qualify(
+        Some("libx264"),
+        &["aac"],
+        json!({"encoder":"libx265","acodec":"mp2a","ab":192}),
+        false,
+    )
+    .await;
+}
+#[tokio::test]
+async fn tls_publication_with_verified_certificate_strictly_decodes() {
+    qualify(
+        Some("libx265"),
+        &["libmp3lame"],
+        json!({"encoder":"copy","acodec":"copy"}),
+        true,
+    )
+    .await;
+}
+#[tokio::test]
+#[ignore = "Requires explicitly available H264 VAAPI hardware and scoped driver environment"]
+async fn vaapi_publication_transcode_strictly_decodes() {
+    qualify(
+        Some("libx264"),
+        &["aac"],
+        json!({"encoder":"h264_vaapi","qp":24,"acodec":"mp2a","ab":192}),
+        false,
+    )
+    .await;
+}
+
 async fn callback(
     app: &Arc<App>,
     deny_initial: bool,
@@ -848,5 +1032,242 @@ async fn policy_change_interrupts_decoder_startup_before_record_success() {
             .unwrap(),
         403
     );
+    l.end().await;
+}
+#[tokio::test]
+async fn capabilities_describe_disabled_publication_listeners_without_assumed_ports() {
+    use base64::Engine;
+    use tower::ServiceExt;
+    let l = Lab::new("standalone").await;
+    let request = axum::http::Request::builder()
+        .uri("/flussonix/api/v1/capabilities")
+        .header(
+            "Authorization",
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode("admin:owned-admin")
+            ),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = flussonix::server::router(l.app.clone())
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let b = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(j["rtsp_publication"]["enabled"], false);
+    assert_eq!(j["rtsp_publication"]["rtsp"], serde_json::Value::Null);
+    assert_eq!(j["rtsp_publication"]["rtsps"], serde_json::Value::Null);
+    l.end().await;
+}
+#[tokio::test]
+async fn capabilities_report_the_actual_bound_listener_addresses() {
+    use base64::Engine;
+    use tower::ServiceExt;
+    let l = Lab::new("standalone").await;
+    let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    l.app
+        .set_rtsp_publication(Some(a.local_addr().unwrap()), Some(b.local_addr().unwrap()));
+    let request = axum::http::Request::builder()
+        .uri("/flussonix/api/v1/capabilities")
+        .header(
+            "Authorization",
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode("admin:owned-admin")
+            ),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = flussonix::server::router(l.app.clone())
+        .oneshot(request)
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(j["rtsp_publication"]["enabled"], true);
+    assert_eq!(
+        j["rtsp_publication"]["rtsp"],
+        a.local_addr().unwrap().to_string()
+    );
+    assert_eq!(
+        j["rtsp_publication"]["rtsps"],
+        b.local_addr().unwrap().to_string()
+    );
+    l.end().await;
+}
+#[tokio::test]
+async fn active_publish_callback_counts_real_input_and_denial_reaps_the_worker() {
+    let l = Lab::new("standalone").await;
+    let (mut rx, callback) = callback(&l.app, false).await;
+    let mut child = publisher(Some("libx264"), &["aac"], &l.url);
+    let first = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let cfg = l.app.config.effective("owned").unwrap();
+    let w = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(w) = l.app.media.ensure("owned", &cfg).await {
+                break w;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let update = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(update["session_id"], first["session_id"]);
+    assert_eq!(update["proto"], "rtsp");
+    assert_eq!(update["request_number"], 1);
+    assert!(
+        update["bytes"].as_u64().unwrap() > 0,
+        "actual media bytes: {update}"
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while std::path::Path::new(&format!("/proc/{}", w.pid())).exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let _ = child.kill().await;
+    callback.abort();
+    l.end().await;
+}
+#[tokio::test]
+async fn tls_publication_rejects_plaintext_untrusted_certificates_and_scheme_downgrade() {
+    let l = Lab::new("standalone").await;
+    let mut plain = l.socket().await;
+    assert_eq!(
+        announce(&mut plain, &l.url.replacen("rtsp:", "rtsps:", 1), SDP)
+            .await
+            .0,
+        400
+    );
+    drop(plain);
+    let cert = tls_fixture::Certificates::new();
+    let untrusted = tls_fixture::Certificates::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = l.app.clone();
+    let cancel = l.cancel.clone();
+    let tls = tokio::spawn(async move {
+        rtsp::serve_tls(listener, app, cancel, cert.server())
+            .await
+            .unwrap();
+    });
+    let socket = TcpStream::connect(addr).await.unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio_rustls::TlsConnector::from(untrusted.client()).connect(
+            tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            socket,
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(result.is_err());
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(
+        format!("ANNOUNCE rtsps://{addr}/owned RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut b = Vec::new();
+    let r = tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut b))
+        .await
+        .unwrap();
+    assert!(
+        r.is_err() || b.is_empty() || b.starts_with(&[21, 3]),
+        "Plaintext must receive a TLS alert or close, not RTSP: {b:?}"
+    );
+    assert_eq!(l.app.media.count().await, 0);
+    l.end().await;
+    tls.await.unwrap();
+}
+#[tokio::test]
+async fn encoded_hierarchical_names_inherit_template_publication_policy() {
+    let l = Lab::new("standalone").await;
+    l.app
+        .config
+        .put(
+            "templates",
+            "owned-template",
+            json!({"inputs":[{"url":"publish://"}],"password":"owned-publish"}),
+        )
+        .unwrap();
+    l.app
+        .config
+        .put(
+            "streams",
+            "folder/café stream",
+            json!({"template":"owned-template","static":false}),
+        )
+        .unwrap();
+    let mut u = url::Url::parse(&l.url).unwrap();
+    u.set_path("/folder/café stream");
+    let url = u.to_string();
+    let mut s = l.socket().await;
+    let (c, h) = announce(
+        &mut s,
+        &url,
+        SDP.replace("streamid=0", "trackID=0").as_str(),
+    )
+    .await;
+    assert_eq!(c, 200);
+    let sid = id(&h);
+    u.set_path("/folder/café stream/trackID=0");
+    u.set_query(None);
+    assert_eq!(setup(&mut s, u.as_str(), &sid, TRANSPORT).await, 200);
+    assert_eq!(l.app.media.count().await, 0);
+    drop(s);
+    l.end().await;
+}
+#[tokio::test]
+async fn http_owner_prevents_rtsp_record_until_its_generation_is_reaped() {
+    let l = Lab::new("standalone").await;
+    let cfg = l.app.config.effective("owned").unwrap();
+    let owner = l
+        .app
+        .media
+        .publish_guarded("owned", &cfg, std::future::ready(true))
+        .await
+        .unwrap();
+    let old = owner.worker.clone();
+    let mut s = l.socket().await;
+    let (c, h) = announce(&mut s, &l.url, SDP).await;
+    assert_eq!(c, 200);
+    let sid = id(&h);
+    assert_eq!(setup(&mut s, &track(&l.url), &sid, TRANSPORT).await, 200);
+    assert_eq!(
+        request(&mut s, "RECORD", &l.url, &format!("Session: {sid}\r\n"), "")
+            .await
+            .0,
+        409
+    );
+    drop(owner);
+    assert_eq!(
+        request(&mut s, "RECORD", &l.url, &format!("Session: {sid}\r\n"), "")
+            .await
+            .0,
+        200
+    );
+    let new = l.app.media.ensure("owned", &cfg).await.unwrap();
+    assert!(!Arc::ptr_eq(&old, &new));
+    l.app.media.stop_if_current("owned", &old).await;
+    assert!(!new.is_closed());
+    drop(s);
     l.end().await;
 }
