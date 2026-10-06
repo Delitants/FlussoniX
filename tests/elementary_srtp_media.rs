@@ -1,17 +1,17 @@
-//! Independent plaintext RTP qualification.
+//! Independent encrypted sources and receivers qualify actual media.
 #[path = "support/elementary_media.rs"]
 mod support;
 use serde_json::json;
 use support::qualify;
 #[tokio::test]
-async fn elementary_roundtrip_cpu_h264_hevc_and_all_audio_codecs_decode() {
+async fn secure_elementary_source_h264_hevc_all_audio_decode() {
     for video in ["libx264", "libx265"] {
         for audio in ["aac", "mp2", "libmp3lame"] {
             qualify(
                 Some(video),
                 &[audio],
                 json!({"encoder":"copy","acodec":"copy"}),
-                false,
+                true,
                 false,
             )
             .await;
@@ -19,12 +19,12 @@ async fn elementary_roundtrip_cpu_h264_hevc_and_all_audio_codecs_decode() {
     }
 }
 #[tokio::test]
-async fn elementary_audio_only_and_multiple_mpeg_audio_tracks_remain_distinct() {
+async fn secure_source_audio_only_multiple_tracks_and_cpu_conversion_decode() {
     qualify(
         None,
         &["aac"],
         json!({"encoder":"copy","acodec":"copy"}),
-        false,
+        true,
         false,
     )
     .await;
@@ -32,30 +32,15 @@ async fn elementary_audio_only_and_multiple_mpeg_audio_tracks_remain_distinct() 
         None,
         &["mp2", "libmp3lame"],
         json!({"encoder":"copy","acodec":"copy"}),
-        false,
+        true,
         false,
     )
     .await;
-}
-#[tokio::test]
-async fn elementary_cpu_worker_changes_video_and_audio_codec_once() {
     qualify(
         Some("libx264"),
         &["aac"],
         json!({"encoder":"libx265","vb":300,"acodec":"mp3","ab":128}),
-        false,
-        false,
-    )
-    .await;
-}
-#[tokio::test]
-#[ignore = "requires an independently installed working VAAPI render device and driver environment"]
-async fn elementary_internal_vaapi_worker_output_decodes() {
-    qualify(
-        Some("libx264"),
-        &["aac"],
-        json!({"encoder":"h264_vaapi","qp":24,"acodec":"mp2a","ab":192}),
-        false,
+        true,
         false,
     )
     .await;

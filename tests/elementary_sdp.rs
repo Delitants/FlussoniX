@@ -9,7 +9,7 @@ fn elementary_configuration_requires_sdp_input_and_never_downgrades_srtp() {
     for row in [
         json!({"url":"rtp://127.0.0.1:20000","flussonix_rtp":{"profile":"elementary"}}),
         json!({"url":"rtp://127.0.0.1:20000","flussonix_rtp":{"profile":"elementary","sdp_file":"relative.sdp"}}),
-        json!({"url":"srtp://127.0.0.1:20000","flussonix_rtp":{"profile":"elementary","sdp_file":"/tmp/owned.sdp","key_file":"/tmp/key"}}),
+        json!({"url":"srtp://127.0.0.1:20000","flussonix_rtp":{"profile":"elementary","sdp_file":"/tmp/owned.sdp"}}),
         json!({"url":"rtp://127.0.0.1:20000","flussonix_rtp":{"sdp_file":"/tmp/owned.sdp"}}),
     ] {
         assert!(Settings::input(&row).is_err(), "{row}");

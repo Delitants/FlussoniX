@@ -280,10 +280,15 @@ impl Session {
                     if raws.len() >= 8
                         || f.len() != 4
                         || !["audio", "video"].contains(&f[0])
-                        || f[2] != "RTP/AVP"
+                        || f[2]
+                            != if settings.secure {
+                                "RTP/SAVP"
+                            } else {
+                                "RTP/AVP"
+                            }
                     {
                         return Err(
-                            "SDP supports up to eight audio/video RTP/AVP tracks, one payload each"
+                            "SDP requires matching AVP/SAVP transport for up to eight audio/video tracks, one payload each"
                                 .into(),
                         );
                     }

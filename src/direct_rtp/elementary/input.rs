@@ -3,7 +3,7 @@ use super::{
     packet,
     sdp::{Session, Track},
 };
-use crate::direct_rtp::{config::Settings, packet as control, sockets::Pair, stats::Stats};
+use crate::direct_rtp::{config::Settings, crypto, packet as control, sockets::Pair, stats::Stats};
 use std::{
     io::ErrorKind,
     net::{SocketAddr, UdpSocket},
@@ -18,6 +18,8 @@ struct Lane {
     target: SocketAddr,
     track: Track,
     settings: Settings,
+    crypto: Option<crypto::Session>,
+    feedback: Option<crypto::Session>,
 }
 pub struct Input {
     lanes: Vec<Lane>,
@@ -50,6 +52,24 @@ impl Input {
                 .ok_or("Elementary RTP input requires an SDP file")?,
             settings,
         )?;
+        let mut contexts = if settings.secure {
+            crypto::track_sessions(
+                settings
+                    .key_file
+                    .as_deref()
+                    .ok_or("SRTP key file required")?,
+                &vec![None; session.tracks.len()],
+            )?
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>()
+            .into_iter()
+        } else {
+            (0..session.tracks.len())
+                .map(|_| None)
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
         let stats = Arc::new(Stats::default());
         *stats.profile.lock().unwrap() = "elementary";
         *stats.status.lock().unwrap() = "starting";
@@ -75,7 +95,14 @@ impl Input {
                 target,
                 track: track.clone(),
                 settings: public,
+                crypto: None,
+                feedback: None,
             });
+            if let Some((receive, transmit)) = contexts.next().flatten() {
+                let lane = lanes.last_mut().unwrap();
+                lane.crypto = Some(receive);
+                lane.feedback = Some(transmit);
+            }
             reservations.push(reserved);
         }
         Ok(Self {
@@ -112,9 +139,25 @@ impl Input {
     async fn receive(&mut self, cancel: &CancellationToken) -> Result<(), String> {
         // Do not admit public datagrams until the owned decoder has opened every
         // private pair. The shared loopback trust boundary matches other worker bridges.
-        let ready=tokio::time::timeout(Duration::from_secs(5),async {
-   loop {let mut ready=true;for lane in &self.lanes {for port in [lane.target.port(),lane.target.port()+1] {match UdpSocket::bind(("127.0.0.1",port)){Ok(_)=>ready=false,Err(e)if e.kind()==ErrorKind::AddrInUse=>{},Err(_)=>return Err("Private RTP decoder bind failed")}}}if ready {return Ok(());}tokio::select!{_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_millis(10))=>{}}}
-  }).await.map_err(|_|"Elementary RTP decoder did not bind")?;
+        let decoder_ports: Vec<_> = self
+            .lanes
+            .iter()
+            .flat_map(|lane| [lane.target.port(), lane.target.port() + 1])
+            .collect();
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut ready = true;
+                for port in &decoder_ports {
+                    match UdpSocket::bind(("127.0.0.1", *port)) {
+                        Ok(_) => ready = false,
+                        Err(e) if e.kind() == ErrorKind::AddrInUse => {},
+                        Err(_) => return Err("Private RTP decoder bind failed"),
+                    }
+                }
+                if ready {return Ok(());}
+                tokio::select! { _=cancel.cancelled()=>return Ok(()), _=tokio::time::sleep(Duration::from_millis(10))=>{} }
+            }
+        }).await.map_err(|_| "Elementary RTP decoder did not bind")?;
         ready?;
         if cancel.is_cancelled() {
             return Ok(());
@@ -155,8 +198,8 @@ async fn send(
 ) -> Result<(), String> {
     tokio::select! {biased;_=cancel.cancelled()=>Ok(()),result=tokio::time::timeout(Duration::from_secs(2),async{match to{Some(to)=>socket.send_to(bytes,to).await,None=>socket.send(bytes).await}})=>{let n=result.map_err(|_|"Elementary RTP relay write stalled")?.map_err(|_|"Elementary RTP relay write failed")?;if n!=bytes.len(){return Err("Elementary RTP relay datagram truncated".into());}Ok(())}}
 }
-async fn relay(lane: Lane, stats: Arc<Stats>, cancel: CancellationToken) -> Result<(), String> {
-    let mut buffer = [0; control::MAX_PACKET + 1];
+async fn relay(mut lane: Lane, stats: Arc<Stats>, cancel: CancellationToken) -> Result<(), String> {
+    let mut buffer = [0; control::MAX_PACKET + 11];
     let mut rtcp = [0; 2049];
     let mut feedback = [0; 2049];
     let mut peer: Option<(SocketAddr, u32)> = None;
@@ -170,21 +213,23 @@ async fn relay(lane: Lane, stats: Arc<Stats>, cancel: CancellationToken) -> Resu
          result=lane.public.rtp.recv_from(&mut buffer)=>{
           let(n,addr)=result.map_err(|_|"Elementary RTP public socket failed")?;
           if lane.settings.source_ip.is_some_and(|ip|ip!=addr.ip()) || peer.is_some_and(|(p,_)|p!=addr){stats.foreign.fetch_add(1,Ordering::Relaxed);continue;}
-          let parsed=match packet::parse(&buffer[..n],&lane.track){Ok(p)=>p,Err(_)=>{stats.invalid.fetch_add(1,Ordering::Relaxed);continue;}};
+          let mut plain=buffer[..n].to_vec();if let Some(crypto)=&mut lane.crypto {if crypto.unprotect(&mut plain,false).is_err(){stats.auth_failed.fetch_add(1,Ordering::Relaxed);continue;}}
+          let parsed=match packet::parse(&plain,&lane.track){Ok(p)=>p,Err(_)=>{stats.invalid.fetch_add(1,Ordering::Relaxed);if peer.is_none(){if let Some(crypto)=&mut lane.crypto {crypto.discard_candidate()?;}}continue;}};
           if peer.is_some_and(|(_,ssrc)|ssrc!=parsed.ssrc){stats.foreign.fetch_add(1,Ordering::Relaxed);continue;}
           peer.get_or_insert((addr,parsed.ssrc));*stats.status.lock().unwrap()="receiving";stats.packets.fetch_add(1,Ordering::Relaxed);stats.bytes.fetch_add(parsed.payload.len() as u64,Ordering::Relaxed);
-          reorder.push(parsed.sequence,buffer[..n].to_vec(),Instant::now())
+          reorder.push(parsed.sequence,plain,Instant::now())
          },
          _=tick.tick()=>reorder.flush(Instant::now()),
          result=lane.public.rtcp.recv_from(&mut rtcp)=>{
           let(n,addr)=result.map_err(|_|"Elementary RTCP public socket failed")?;
           let Some((p,ssrc))=peer else{continue;};if addr.ip()!=p.ip() || p.port().checked_add(1)!=Some(addr.port()){stats.foreign.fetch_add(1,Ordering::Relaxed);continue;}
-          if !control::valid_rtcp(&rtcp[..n]) || rtcp[1]!=200 || u32::from_be_bytes(rtcp[4..8].try_into().unwrap())!=ssrc{stats.invalid.fetch_add(1,Ordering::Relaxed);continue;}
-          send(&lane.local.rtcp,&rtcp[..n],None,&cancel).await?;stats.rtcp.fetch_add(1,Ordering::Relaxed);continue;
+          let mut plain=rtcp[..n].to_vec();if let Some(crypto)=&mut lane.crypto {if crypto.unprotect(&mut plain,true).is_err(){stats.auth_failed.fetch_add(1,Ordering::Relaxed);continue;}}
+          if !control::valid_rtcp(&plain) || plain[1]!=200 || u32::from_be_bytes(plain[4..8].try_into().unwrap())!=ssrc{stats.invalid.fetch_add(1,Ordering::Relaxed);continue;}
+          send(&lane.local.rtcp,&plain,None,&cancel).await?;stats.rtcp.fetch_add(1,Ordering::Relaxed);continue;
          },
          result=lane.local.rtcp.recv(&mut feedback)=>{
           let n=result.map_err(|_|"Elementary RTCP private socket failed")?;let Some((p,_))=peer else{continue;};let Some(port)=p.port().checked_add(1)else{continue;};
-          if !control::valid_rtcp(&feedback[..n]){continue;}send(&lane.public.rtcp,&feedback[..n],Some(SocketAddr::new(p.ip(),port)),&cancel).await?;stats.rtcp.fetch_add(1,Ordering::Relaxed);continue;
+          if !control::valid_rtcp(&feedback[..n]){continue;}let mut body=feedback[..n].to_vec();if let Some(crypto)=&mut lane.feedback {crypto.protect(&mut body,true)?;}send(&lane.public.rtcp,&body,Some(SocketAddr::new(p.ip(),port)),&cancel).await?;stats.rtcp.fetch_add(1,Ordering::Relaxed);continue;
          },
         };
         stats.duplicates.fetch_add(

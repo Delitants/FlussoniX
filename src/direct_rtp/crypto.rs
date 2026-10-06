@@ -168,13 +168,19 @@ impl Drop for Session {
 impl Session {
     pub fn new(key: [u8; 30], sender: Option<u32>) -> Result<Self, &'static str> {
         let mut key = Secret(key);
-        Self::create(&mut key, sender)
+        Self::create(&mut key, sender, sender.is_some())
     }
-    fn create(key: &mut Secret, sender: Option<u32>) -> Result<Self, &'static str> {
+    fn create(key: &mut Secret, sender: Option<u32>, outbound: bool) -> Result<Self, &'static str> {
         let api = api()?;
         let mut policy = Policy {
             ssrc: Ssrc {
-                kind: if sender.is_some() { 1 } else { 2 },
+                kind: if sender.is_some() {
+                    1
+                } else if outbound {
+                    3
+                } else {
+                    2
+                },
                 value: sender.unwrap_or(0),
             },
             key: key.0.as_mut_ptr(),
@@ -204,7 +210,7 @@ impl Session {
         Ok(Self {
             ctx,
             api,
-            sender: sender.is_some(),
+            sender: outbound,
             pinned: sender,
             candidate: None,
         })
@@ -289,9 +295,30 @@ impl Session {
 /// Both directions load one generation's key, then erase all application buffers.
 pub fn sessions(path: &Path, sender: u32) -> Result<(Session, Session), &'static str> {
     let mut key = Secret(read_key(path)?);
-    let receive = Session::create(&mut key, None)?;
-    let transmit = Session::create(&mut key, Some(sender))?;
+    let receive = Session::create(&mut key, None, false)?;
+    let transmit = Session::create(&mut key, Some(sender), true)?;
     Ok((receive, transmit))
+}
+/// One immutable key snapshot for all bounded lanes in a transport generation.
+/// A wildcard transmitter is only for trusted private decoder feedback; after
+/// its first valid report Session pins that SSRC, just like specific senders.
+pub(crate) fn track_sessions(
+    path: &Path,
+    senders: &[Option<u32>],
+) -> Result<Vec<(Session, Session)>, &'static str> {
+    if senders.is_empty() || senders.len() > 8 {
+        return Err("SRTP requires 1..8 track contexts");
+    }
+    let mut key = Secret(read_key(path)?);
+    senders
+        .iter()
+        .map(|sender| {
+            Ok((
+                Session::create(&mut key, None, false)?,
+                Session::create(&mut key, *sender, true)?,
+            ))
+        })
+        .collect()
 }
 #[cfg(test)]
 mod tests {

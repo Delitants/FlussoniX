@@ -115,9 +115,9 @@ impl Settings {
             })
             .transpose()?;
         if (!elementary && sdp_file.is_some())
-            || (elementary && (u.scheme() == "srtp" || port > 65520 || ip.is_unspecified()))
+            || (elementary && (port > 65520 || ip.is_unspecified()))
         {
-            return Err("Elementary RTP requires plaintext RTP and a concrete IP with port 1024..65520; SDP files require the elementary profile".into());
+            return Err("Elementary RTP requires a concrete IP with port 1024..65520; SDP files require the elementary profile".into());
         }
         let interface = opts
             .get("interface")
@@ -223,6 +223,9 @@ pub fn outputs(cfg: &Value) -> Result<Vec<Output>, String> {
                     return Err("RTP enabled setting must be boolean".into());
                 }
                 let settings = Settings::parse(row)?;
+                if settings.secure && settings.elementary {
+                    return Err("Encrypted elementary destinations are not yet available".into());
+                }
                 if settings.address.ip().is_unspecified()
                     || settings.sdp_file.is_some()
                     || settings.source_ip.is_some()
