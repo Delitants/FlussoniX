@@ -26,6 +26,12 @@ the source must supply discovery and viewer policy. A paced source publication
 begins feeding after its private subscriber attaches. The independent SRT
 receiver captures untouched bytes for twelve seconds and exits normally.
 
+Every case checks the effective CDN HLS policy. Filter-out cases compare the
+same TS and fMP4 segments before and after delivered-HLS filtering: the raw
+segments must contain GA94 captions, the delivered segments must contain none,
+and the delivered audio/video must retain their codecs and decode cleanly.
+This prevents caption absence in an empty window from passing.
+
 Source and receiver codecs are independently verified with FFprobe. Distinct
 authored GA94 bodies, regional packet types, exact repeated European PES and
 language/page descriptors must survive. Filtered cases scan reassembled PES

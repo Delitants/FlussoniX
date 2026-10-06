@@ -158,6 +158,72 @@ fn listener() -> (Listener, String) {
     (listener, endpoint)
 }
 
+// Compare the same CDN segments before and after its delivered-HLS filter.
+// The unfiltered counterpart must contain captions, so an empty window cannot pass.
+async fn verify_hls_drop(cdn: &Node, dir: &Path, hevc: bool) {
+    let worker_root = dir
+        .join("cdn")
+        .join(format!("{:x}", Sha256::digest(b"owned")));
+    for prefix in ["", "fmp4/"] {
+        let bytes = cdn
+            .app
+            .media
+            .read("owned", &format!("{prefix}index.m3u8"))
+            .await
+            .unwrap();
+        let list = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            list.matches("#EXTINF:").count() >= 3,
+            "CDN must produce HLS media"
+        );
+        let mut files: Vec<_> = list
+            .lines()
+            .filter(|s| !s.starts_with('#') && !s.is_empty())
+            .collect();
+        if let Some(init) = list
+            .lines()
+            .find_map(|s| s.strip_prefix("#EXT-X-MAP:URI=\""))
+        {
+            files.push(init.split('"').next().unwrap());
+        }
+        let mut snapshots = Vec::new();
+        for delivered in [false, true] {
+            let out = dir.join(format!(
+                "hls-{}-{delivered}",
+                if prefix.is_empty() { "ts" } else { "mp4" }
+            ));
+            std::fs::create_dir(&out).unwrap();
+            let playlist = out.join("index.m3u8");
+            std::fs::write(&playlist, format!("{list}#EXT-X-ENDLIST\n")).unwrap();
+            for file in &files {
+                let path = format!("{prefix}{file}");
+                let data = if delivered {
+                    cdn.app.media.read("owned", &path).await.unwrap().to_vec()
+                } else {
+                    std::fs::read(worker_root.join(&path)).unwrap()
+                };
+                std::fs::write(out.join(file), data).unwrap();
+            }
+            snapshots.push(playlist);
+        }
+        assert!(
+            !caption_bodies(&snapshots[0], hevc).await.is_empty(),
+            "unfiltered {prefix} snapshot must actually contain captions"
+        );
+        verify_codecs(&snapshots[1], hevc).await;
+        let decoded = strict_decode(&snapshots[1]).await;
+        assert!(
+            clean_decode(&decoded),
+            "{}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+        assert!(
+            caption_bodies(&snapshots[1], hevc).await.is_empty(),
+            "delivered CDN {prefix} HLS must remove GA94 captions"
+        );
+    }
+}
+
 async fn case(
     digital: bool,
     hevc: bool,
@@ -201,6 +267,14 @@ async fn case(
         .await
         .unwrap();
     let outcome = tokio::time::timeout(Duration::from_secs(3), receiver.wait()).await;
+    assert_eq!(
+        cdn.app.media.stats("owned").await["hls_subtitles"],
+        hls,
+        "CDN must inherit the explicit source HLS policy"
+    );
+    if hls == "drop" {
+        verify_hls_drop(&cdn, dir.path(), hevc).await;
+    }
     let words = if hls == "convert" {
         Some(converted_words(&cdn.app, if digital { "s1.m3u8" } else { "cc1.m3u8" }).await)
     } else {
