@@ -77,8 +77,9 @@ readable disabled/enabled Config card and token-placeholder output URL.
 
 Dedicated [regional subtitle qualification](srt-subtitles.md) covers encrypted
 H.264/HEVC with AAC copy-mode CEA-608/708 and exact DVB/teletext delivery, separate-track filtering
-and CEA HLS conversion alongside SRT. Broader encoder, input and cluster
-subtitle combinations remain pending.
+and CEA HLS conversion alongside SRT. Dedicated [source/CDN tests](cluster-srt-subtitles.md)
+also qualify private MPEG-TS pulls into encrypted CDN listener playback.
+Broader encoder, input and cluster subtitle combinations remain pending.
 SRT publication authorization, per-stream keys/ports, complete vendor API
 objects, WAN loss/retransmission, sustained throughput and scale remain
 explicit further work. Listener playback is not an HTTP LB redirect path.

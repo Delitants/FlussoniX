@@ -1,5 +1,10 @@
 # MPEG-TS source pulls with broadcast subtitles
 
+The separate [source/CDN-to-SRT qualification](cluster-srt-subtitles.md) covers
+encrypted listener playback with H.264/HEVC/AAC copy-mode CEA-608/708 and original
+DVB/teletext carriage. Its local two-node profile and remaining limits are
+distinct from the three-node HLS/OCR qualification below.
+
 Cluster → Source servers → Source transport now offers **MPEG-TS · broadcast subtitles**. The native source-only extension is `flussonix_transport: "mpegts"`. The existing HLS default and M4F/M4S transports retain their behavior; this is not a legacy Flussonic cluster compatibility claim.
 
 Use the source's private delivery endpoint. HTTP maps to `tshttp://…/stream/mpegts`; HTTPS maps to `tshttps://…/stream/mpegts`. Endpoint prefixes, encoded stream names and query parameters are retained. HTTPS uses the independent Rust HTTP client's normal certificate verification. No insecure TLS switch or additional cluster CA field is introduced.

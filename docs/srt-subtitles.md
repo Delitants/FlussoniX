@@ -55,8 +55,12 @@ page888 fixture. It does not establish advanced DVB objects, broader teletext
 character sets or OCR accuracy. HLS conversion alongside SRT is exercised for
 the CEA family; European conversion has its separate HLS qualification.
 
+Dedicated [source/CDN-to-SRT tests](cluster-srt-subtitles.md) additionally qualify
+encrypted listener playback through a private MPEG-TS pull with the same
+H.264/HEVC/AAC copy profiles and inherited source policies.
+
 CPU/GPU caption retention over SRT, HEVC regional-caption B-frame and Main10
 profiles, MPEG audio with regional subtitles, SRT input-to-output subtitle round
-trips, source-to-CDN-to-SRT carriage, WAN loss and sustained throughput remain
+trips, caller pushes from a CDN, WAN loss and sustained throughput remain
 unqualified. Other established video/audio SRT
 tests do not imply those subtitle combinations are covered.
