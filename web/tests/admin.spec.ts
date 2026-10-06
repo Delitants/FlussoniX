@@ -743,3 +743,41 @@ test('receive forms show enabled RTSP and RTSPS publication URLs without secrets
  await expect(page.getByLabel('RTSP publication URL',{exact:true})).toHaveValue(`rtsp://${host}:19001/folder/channel`);await expect(page.getByLabel('RTSPS publication URL',{exact:true})).toHaveValue(`rtsps://${host}:19002/folder/channel`);await expect(page.getByLabel('RTSP publication URL',{exact:true})).toHaveAttribute('readonly','');await page.getByLabel('Publisher password',{exact:true}).fill('owned-never-in-url');await expect(page.getByLabel('RTSP publication URL',{exact:true})).not.toHaveValue(/owned-never-in-url/);await expect(page.locator('textarea')).toHaveCount(0);
  enabled=false;await open();await expect(page.getByLabel('RTSP publication URL',{exact:true})).toHaveCount(0);await expect(page.getByLabel('RTSPS publication URL',{exact:true})).toHaveCount(0);await expect(page.getByText('RTSP publication is disabled. Enable an RTSP or RTSPS listener at startup.',{exact:true})).toBeVisible();await page.unrouteAll({behavior:'wait'});
 });
+
+test('RTSPS push controls save masked credentials and inherit from templates',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const template='ui-rtsp-template-'+Date.now(),name=template+'-stream';
+ const ca=process.env.FLUSSONIX_TEST_CA_FILE!;expect(ca).toBeTruthy();
+ await page.getByRole('button',{name:'Templates',exact:true}).click();await page.getByRole('button',{name:'Add template',exact:true}).click();
+ await page.getByLabel('Template name',{exact:true}).fill(template);await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');await page.getByLabel('Activation',{exact:true}).selectOption('ondemand');
+ await page.getByLabel('Destination settings',{exact:true}).selectOption('override');await page.getByLabel('Destination protocol 1',{exact:true}).selectOption('rtsps');
+ const url='rtsps://localhost:13220/owned?password=owned-ui-secret';
+ await page.getByLabel('Destination URL 1',{exact:true}).fill(url);await expect(page.getByLabel('Destination URL 1',{exact:true})).toHaveAttribute('type','password');
+ await page.getByLabel('Destination trusted CA file 1',{exact:true}).fill(ca);await page.getByLabel('Destination enabled 1',{exact:true}).uncheck();
+ await expect(page.locator('textarea')).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('cell',{name:template,exact:true})).toBeVisible();
+ const saved=await(await request.get('/streamer/api/v3/templates/'+template,{headers})).json();
+ expect(saved.pushes).toEqual([{url,flussonix_tls_ca:ca,disabled:true}]);
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{template,static:false}})).ok()).toBeTruthy();
+ await page.getByRole('button',{name:'Streams',exact:true}).click();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Output',exact:true}).click();
+ await expect(page.getByText('1. rtsps://localhost:13220 · Disabled · Verified TLS',{exact:true})).toBeVisible();await expect(page.locator('body')).not.toContainText('owned-ui-secret');
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Destination settings',{exact:true}).selectOption('override');await expect(page.getByLabel('Destination URL 1',{exact:true})).toHaveValue(url);
+ await page.getByLabel('Destination protocol 1',{exact:true}).selectOption('rtsp');await expect(page.getByLabel('Destination trusted CA file 1',{exact:true})).toHaveCount(0);
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ const stream=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(stream.pushes).toEqual([{url:url.replace('rtsps:','rtsp:'),disabled:true}]);
+ await request.delete('/streamer/api/v3/streams/'+name,{headers});await request.delete('/streamer/api/v3/templates/'+template,{headers});
+});
+
+test('RTSP destination switching removes foreign settings and validates friendly fields on mobile',async({page})=>{
+ await page.setViewportSize({width:390,height:844});
+ await page.getByRole('button',{name:'Templates',exact:true}).click();await page.getByRole('button',{name:'Add template',exact:true}).click();
+ await page.getByLabel('Template name',{exact:true}).fill('ui-rtsp-validation-'+Date.now());await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');
+ await page.getByLabel('Destination settings',{exact:true}).selectOption('override');await page.getByLabel('Destination URL 1',{exact:true}).fill('srt://localhost:19990');
+ await page.getByLabel('Passphrase 1',{exact:true}).fill('owned-srt-secret');await page.getByLabel('Destination protocol 1',{exact:true}).selectOption('rtsps');
+ await expect(page.getByLabel('Passphrase 1',{exact:true})).toHaveCount(0);await expect(page.getByLabel('Stream ID 1',{exact:true})).toHaveCount(0);
+ await page.getByLabel('Destination URL 1',{exact:true}).fill('rtsps://localhost/owned');await page.getByLabel('Destination trusted CA file 1',{exact:true}).fill('relative.pem');
+ await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('absolute');
+ await page.getByLabel('Destination trusted CA file 1',{exact:true}).fill('');await page.getByLabel('Destination URL 1',{exact:true}).fill('rtsp://user:password@localhost/owned');
+ await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Destination URL');
+ await expect(page.locator('textarea')).toHaveCount(0);expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBeTruthy();
+ await page.getByRole('button',{name:'Cancel',exact:true}).click();
+});

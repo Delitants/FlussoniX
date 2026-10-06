@@ -328,3 +328,37 @@ Elementary SRTP/DTLS negotiation, IPv6 multicast, broader subtitle combinations,
 The elementary media harness independently probes and strictly decodes the shared worker's MPEG-TS recording as well as the independent RTP/SRTP receiver's recording. Exact codec-track multiplicity and at least20 decoded frames per track are required on both outputs; FFmpeg must decode every stream with `-xerror` and no error output. The worker recording is not remuxed or trimmed to hide startup failures. A lagged recording subscriber fails, and independent probe/decode subprocesses have 30-second deadlines with cancellation cleanup.
 
 The controlled qualification fault replaced only the shared worker recording with invalid owned bytes. The previous harness passed despite that corruption; the added worker decode rejected it while the RTP recording remained valid. The normal cases cover H.264/HEVC with AAC/Layer II/MP3, audio-only and separate Layer II/III tracks, plaintext/encrypted directions and CPU conversion. Internal H.264 VAAPI remains an explicitly hardware-gated case; GPU HEVC, WAN loss and sustained capacity remain unqualified. This adds automated coverage to the existing shared-worker delivery path and changes no production API or runtime dependency.
+
+## RTSP and RTSPS push qualification
+
+Owned independent FFmpeg recording receivers exercise all six H.264/HEVC ×
+AAC/MP2/MP3 combinations, AAC+Layer II+MP3 audio-only publication, receiver
+restart, healthy/unreachable destination isolation and configuration replacement.
+A live encrypted SRT+RTSP case strictly decodes both receivers from one worker
+and verifies owned process/session cleanup.
+Exact codec checks and strict mapped-track decoding require real received
+media, including every audio-only track. A longer session crosses the OPTIONS
+keepalive interval. An independent FFmpeg-to-FFmpeg reference reproduces the
+raw AAC stream-copy key-flag behavior; receivers use `-copyinkf`, rather than
+omitting audio checks. CPU encoders are exercised; the opt-in H.264 VAAPI test
+requires a qualified render device and driver environment. It passed on the
+available internal iGPU with the separately qualified Intel driver environment.
+
+A real trusted TLS bridge carries HEVC/MP3 into the independent receiver.
+Untrusted roots, wrong IP identity and expired certificates forward no RTSP
+data. A receiving FlussoniX node tests the configured publisher password and
+rejects an administrator password. Separate retained DVB subtitles fail the
+destination before connecting. Disabled and publication-waiting streams retain
+the existing on-demand activation rules. Real sockets exercise cancellation
+during stalled TLS and partial RTSP setup.
+
+Bridge cases cover unchanged path/query/track authority translation, matching
+CSeq, redirects, ambiguous lengths, invalid status, UDP/channel substitutions,
+channel collisions, pending-request/header/body/frame bounds and media before
+RECORD. RTCP alone increments no RTP byte counter. Browser cases exercise
+normal protocol controls, masked credentials, TLS CA validation, mixed template
+inheritance, transport switching and mobile layout alongside SRT regressions.
+These are owned loopback qualifications, with no production listeners or vendor
+components. Full Rust/browser/fmt/clippy/build and final exact-head CI remain
+publication gates; this does not qualify all recorder dialects, long-duration
+synchronization or production capacity.

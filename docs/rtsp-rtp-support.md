@@ -120,3 +120,14 @@ Every access unit must contain exactly one complete header-validated frame whose
 Owned encoder fixtures qualify stereo Layer II at 32 kHz/384 kb/s, MPEG-2 MP3 at 22.05 kHz/64 kb/s and fragmented MPEG-1 MP3 at 32 kHz/320 kb/s. Independent FFmpeg clients decode TCP, UDP and verified TLS audio/video, and TCP audio-only streams, after a delayed join into the running source. MP3 uses the encoder's normal bit reservoir. Decoded audio has the expected rate and stereo layout and nonconstant PCM; HEVC video retains all independently checked source picture hashes. MPEG audio track revocation closes plaintext and TLS sessions and releases viewer ownership.
 
 These checks do not qualify every MPEG rate/bitrate/channel mode, MPEG-2.5 RTSP, Layer I, long-duration A/V synchronization, multiple RTSP audio tracks, RTSP publication/push, direct RTP/SRTP, GPU, mixed vendor sessions or production capacity. M4F shares the native-copy hub but is not an additional live MPEG RTSP source qualification here.
+
+## RTSP publishing output increment
+
+Configured outbound RTSP/RTSPS TCP publishing now uses the shared native
+packetizer and a verified bounded bridge. One H.264/HEVC video and/or AAC-LC,
+Layer II and MP3 audio are supported, with eight tracks total. It has its own
+ANNOUNCE/SETUP/RECORD client, RTCP and OPTIONS keepalive, independent retries,
+query-based receiver authorization and cancellation. No per-destination
+encoder or vendor runtime is used. See [RTSP/RTSPS push](rtsp-push.md).
+Older pending-direction notes above describe their original increments; this
+addition qualifies the documented TCP publishing output subset only.

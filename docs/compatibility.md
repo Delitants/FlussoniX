@@ -181,3 +181,17 @@ The1.5second queue/process deadline and daemon-wide two-process cap bound lag/co
 Configured `publish://` streams, including template inheritance, receive RTSP/RTSPS ANNOUNCE, per-track SETUP and live RECORD through the existing optional listeners. Publication uses interleaved TCP, with H.264/HEVC, AAC-LC and MPEG Layer II/III. The shared HTTP publisher password and `on_publish` callback apply; changes to effective media settings or publisher policy revoke pending or active ownership. The callback protocol is `rtsp` on plain and TLS connections. Capability and node metadata contain actual enabled listener addresses.
 
 Independent publisher and strict decoder qualification covers the common worker TS, audio-only, distinct MPEG audio tracks, CPU HEVC/MPEG audio and a verifying TLS relay; H.264 VAAPI has an explicit opt-in local hardware test. See [profile, commands and limits](rtsp-publication.md). Earlier RTSP sections describe their stage-specific coverage; this receiving qualification supersedes their publication exclusions only for this profile. Dynamic publication, UDP receiving, outbound RTSP push, separate SDP subtitle tracks, Digest authentication, mixed-vendor publication and production capacity remain unqualified.
+
+## RTSP and RTSPS push increment
+
+The existing v3 `pushes` subset now accepts four total mixed SRT/RTSP/RTSPS
+destinations in Streams/Templates. Native ANNOUNCE/SETUP/RECORD publishing
+shares the existing RTP packetizer, verifies RTSPS identity and roots, and
+retains query-based receiver credentials. Friendly protocol-specific fields,
+inheritance and explicit empty overrides are available. Unsupported options,
+userinfo authentication, UDP substitution, redirects and retained separate
+subtitle tracks fail explicitly. Runtime counters are sanitized native
+diagnostics, not vendor push-stat parity. See the [exact push profile](rtsp-push.md).
+This supersedes older outbound RTSP pending statements for the bounded TCP
+profile; complete API, vendor recorder dialects and migration compatibility
+remain to be qualified.
