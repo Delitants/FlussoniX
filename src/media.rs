@@ -182,6 +182,9 @@ impl Engine {
     pub async fn gpu_capabilities(&self) -> Value {
         json!(self.gpu.report(&self.ffmpeg).await)
     }
+    pub async fn vaapi_capabilities(&self) -> Value {
+        json!(self.gpu.vaapi_report(&self.ffmpeg).await)
+    }
     fn directory(&self, name: &str) -> PathBuf {
         self.root
             .join(format!("{:x}", Sha256::digest(name.as_bytes())))
@@ -245,14 +248,17 @@ impl Engine {
                 .is_some_and(|a| a.iter().any(|i| i["url"] == "testsrc://"))
                 || matches!(
                     cfg["transcoder"]["encoder"].as_str(),
-                    Some("h264_nvenc" | "hevc_nvenc")
+                    Some("h264_nvenc" | "hevc_nvenc" | "h264_vaapi" | "hevc_vaapi")
                 ))
         {
             return Err("HLS caption conversion requires a real H.264/HEVC video source; GPU conversion is not qualified".into());
         }
-        if let Some(encoder) = crate::transcoder::Profile::resolve(cfg, false)?.gpu_encoder() {
-            self.gpu.require(&self.ffmpeg, encoder).await?;
-        }
+        self.gpu
+            .require_profile(
+                &self.ffmpeg,
+                &crate::transcoder::Profile::resolve(cfg, false)?,
+            )
+            .await?;
         let mut workers = self.workers.lock().await;
         // Recheck after waiting for another stream startup/replacement. A stale
         // route must not cancel an already-published replacement worker.
@@ -359,6 +365,7 @@ impl Engine {
             "-threads",
             "2",
         ]);
+        crate::transcoder::Profile::resolve(cfg, false)?.prepare(&mut cmd);
         let mut peer_hls = None;
 
         let peer_ts = cfg["flussonix_peer_key"].is_string()

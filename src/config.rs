@@ -185,6 +185,31 @@ pub fn effective(root: &Value, name: &str) -> Option<Value> {
             }
         }
     }
+    // Remove inherited hardware-dependent settings when a stream changes family
+    // or rate control. Explicit incompatible fields remain and are rejected.
+    if let Some(t) = result.get_mut("transcoder").and_then(Value::as_object_mut) {
+        let override_t = &disk["transcoder"];
+        if let Some(encoder) = override_t["encoder"].as_str() {
+            if !matches!(encoder, "h264_vaapi" | "hevc_vaapi") {
+                for key in ["vaapi_device", "low_power", "vaapi_rc", "qp"] {
+                    t.remove(key);
+                }
+            } else if override_t["vaapi_rc"].as_str() != Some("cbr")
+                && t.get("vaapi_rc").and_then(Value::as_str) != Some("cbr")
+            {
+                t.remove("vb");
+            }
+        }
+        match override_t["vaapi_rc"].as_str() {
+            Some("cbr") => {
+                t.remove("qp");
+            }
+            Some("cqp") => {
+                t.remove("vb");
+            }
+            _ => {}
+        }
+    }
     result = merge(&result, disk);
     result["config_on_disk"] = disk.clone();
     Some(result)
@@ -514,7 +539,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                         }
                     }
                 }
-                crate::transcoder::Profile::resolve(item, false)?;
+                crate::transcoder::Profile::validate_partial(item)?;
                 crate::srt_push::configuration(item)?;
                 crate::direct_rtp::config::outputs(item)?;
                 if item.get("dvr").is_some() {
