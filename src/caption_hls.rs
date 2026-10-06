@@ -814,11 +814,28 @@ mod full_period_tests {
             }
             std::fs::write(dir.path().join("index.m3u8"), list).unwrap();
             let cancel = CancellationToken::new();
-            let task = tokio::spawn(state.clone().watch(dir.path().into(), cancel.clone()));
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            let vtt = state.read("cc1_gowned_100.vtt").unwrap();
+            let task = tokio::spawn({
+                let state = state.clone();
+                let directory = dir.path().to_path_buf();
+                let cancel = cancel.clone();
+                async move {
+                    // Model delayed scheduling/filesystem readiness without changing media clocks.
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    state.watch(directory, cancel).await;
+                }
+            });
+            let rendition = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(vtt) = state.read("cc1_gowned_100.vtt") {
+                        break vtt;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
             cancel.cancel();
             task.await.unwrap();
+            let vtt = rendition.expect("current-epoch caption rendition must become ready");
             assert!(
                 String::from_utf8_lossy(&vtt).contains("OK"),
                 "current full-period cue disappeared: {}",
