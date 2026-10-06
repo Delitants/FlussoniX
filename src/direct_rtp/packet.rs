@@ -248,7 +248,10 @@ impl Reorder {
     }
 }
 pub fn sdes(ssrc: u32) -> Vec<u8> {
-    let name = format!("fx-{ssrc:08x}");
+    sdes_cname(ssrc, &format!("fx-{ssrc:08x}"))
+}
+pub(super) fn sdes_cname(ssrc: u32, name: &str) -> Vec<u8> {
+    debug_assert!(name.len() <= 255);
     let mut sdes = vec![0x81, 202, 0, 0];
     sdes.extend(ssrc.to_be_bytes());
     sdes.extend([1, name.len() as u8]);

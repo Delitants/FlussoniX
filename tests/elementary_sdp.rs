@@ -93,3 +93,49 @@ fn ffmpeg_aac_sdp_without_streamtype_is_normalized_after_codec_validation() {
         .is_err()
     );
 }
+
+#[test]
+fn enabled_destination_ranges_cannot_mix_tracks_on_one_address() {
+    use flussonix::direct_rtp::config::outputs;
+    use serde_json::json;
+    let row = |ip: &str, port: u16, elementary: bool, disabled: bool| json!({"url":format!("rtp://{ip}:{port}"),"disabled":disabled,"flussonix_rtp":{"profile":if elementary {"elementary"} else {"mp2t"},"interface":"127.0.0.1"}});
+    for pair in [
+        [
+            row("127.0.0.1", 40000, true, false),
+            row("127.0.0.1", 40002, true, false),
+        ],
+        [
+            row("127.0.0.1", 40000, true, false),
+            row("127.0.0.1", 40015, false, false),
+        ],
+        [
+            row("127.0.0.1", 40000, false, false),
+            row("127.0.0.1", 39985, true, false),
+        ],
+        [
+            row("127.0.0.1", 40000, false, false),
+            row("127.0.0.1", 40001, false, false),
+        ],
+    ] {
+        assert!(
+            outputs(&json!({"flussonix_rtp_outputs":pair})).is_err(),
+            "Overlapping active ranges must be rejected"
+        );
+    }
+    for pair in [
+        [
+            row("127.0.0.1", 40000, true, false),
+            row("127.0.0.1", 40016, true, false),
+        ],
+        [
+            row("127.0.0.1", 40000, true, false),
+            row("127.0.0.1", 40002, true, true),
+        ],
+        [
+            row("239.1.1.1", 40000, true, false),
+            row("239.1.1.2", 40000, true, false),
+        ],
+    ] {
+        assert!(outputs(&json!({"flussonix_rtp_outputs":pair})).is_ok());
+    }
+}

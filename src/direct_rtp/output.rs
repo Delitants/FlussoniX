@@ -215,6 +215,23 @@ pub(super) fn report(ssrc: u32, timestamp: u32, packets: u32, octets: u32) -> Ve
     let time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
+    report_at(
+        ssrc,
+        timestamp,
+        packets,
+        octets,
+        time,
+        &format!("fx-{ssrc:08x}"),
+    )
+}
+pub(super) fn report_at(
+    ssrc: u32,
+    timestamp: u32,
+    packets: u32,
+    octets: u32,
+    time: Duration,
+    cname: &str,
+) -> Vec<u8> {
     let mut out = vec![0x80, 200, 0, 6];
     for n in [
         ssrc,
@@ -226,6 +243,6 @@ pub(super) fn report(ssrc: u32, timestamp: u32, packets: u32, octets: u32) -> Ve
     ] {
         out.extend(n.to_be_bytes());
     }
-    out.extend(packet::sdes(ssrc));
+    out.extend(packet::sdes_cname(ssrc, cname));
     out
 }

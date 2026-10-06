@@ -1,7 +1,7 @@
 //! Shared native RTP packetizer output, one RTP/RTCP pair per actual track.
 use crate::{
     direct_rtp::{
-        output::{State, report},
+        output::{State, report_at},
         packet,
         sockets::Pair,
     },
@@ -12,7 +12,7 @@ use std::{
     collections::VecDeque,
     net::SocketAddr,
     sync::{Arc, atomic::Ordering},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio_util::sync::CancellationToken;
 struct Lane {
@@ -20,9 +20,7 @@ struct Lane {
     track: MediaTrack,
     packets: u32,
     octets: u32,
-    stamp: u32,
     stamp_origin: u32,
-    sent: Option<Instant>,
     target: SocketAddr,
 }
 enum Sent {
@@ -133,14 +131,12 @@ async fn send(
             track: track.clone(),
             packets: 0,
             octets: 0,
-            stamp: 0,
             // RTP origins belong to the transport session, not the media epoch.
             // A zero first origin also resets FFmpeg's RTP clock initialization.
             stamp_origin: u32::from_be_bytes(
                 uuid::Uuid::new_v4().as_bytes()[..4].try_into().unwrap(),
             )
             .max(1),
-            sent: None,
             target,
         });
     }
@@ -158,6 +154,10 @@ async fn send(
     } else {
         48
     };
+    // All related media share one stable decode-time/wall-time mapping.
+    // Packet PTS offsets and pacing delays must never re-anchor this mapping.
+    let mut epoch: Option<(u64, Instant)> = None;
+    let cname = format!("fx-{}", uuid::Uuid::new_v4());
     let mut reports = tokio::time::interval(Duration::from_secs(5));
     reports.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     reports.tick().await;
@@ -172,7 +172,7 @@ async fn send(
             item
         } else {
             tokio::select! {_=cancel.cancelled()=>return Ok(()),_=worker.closed()=>return Ok(()),_=feedback.join_next()=>return Err("Elementary RTCP feedback closed"),item=receiver.recv_timed()=>{let item=item.map_err(|_|"Elementary RTP output queue closed or lagged")?;(item.bytes,item.dts)},_=reports.tick()=>{
-             for lane in &lanes{if !current(worker,&description){return Err("Elementary RTP generation changed");}let stamp=lane.stamp.wrapping_add(lane.sent.map_or(0,|at|(at.elapsed().as_micros()*u128::from(lane.track.clock)/1_000_000) as u32));let body=report(lane.track.ssrc,stamp,lane.packets,lane.octets);match write(&lane.pair.rtcp,&body,Some(lane.target),cancel,worker,&description).await?{Sent::Cancelled=>return Ok(()),Sent::Unavailable=>{state.stats.unreachable.fetch_add(1,Ordering::Relaxed);},Sent::Packet=>{state.egress.fetch_add((body.len()+overhead) as u64,Ordering::Relaxed);}}}continue;
+             let observed = Instant::now(); let wall = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default(); let Some((dts, at)) = epoch else {continue;}; for lane in &lanes{if !current(worker,&description){return Err("Elementary RTP generation changed");}let clock = u128::from(lane.track.clock); let stamp = ((u128::from(dts)*clock/90000) + observed.duration_since(at).as_nanos()*clock/1_000_000_000) as u32; let body=report_at(lane.track.ssrc,stamp.wrapping_add(lane.stamp_origin),lane.packets,lane.octets,wall,&cname);match write(&lane.pair.rtcp,&body,Some(lane.target),cancel,worker,&description).await?{Sent::Cancelled=>return Ok(()),Sent::Unavailable=>{state.stats.unreachable.fetch_add(1,Ordering::Relaxed);},Sent::Packet=>{state.egress.fetch_add((body.len()+overhead) as u64,Ordering::Relaxed);}}}continue;
             }}
         };
         let (bytes, dts) = item;
@@ -211,6 +211,7 @@ async fn send(
         if !current(worker, &description) {
             return Err("Elementary RTP generation changed");
         }
+        epoch.get_or_insert((dts, Instant::now()));
         match write(&lane.pair.rtp, body, None, cancel, worker, &description).await? {
             Sent::Cancelled => return Ok(()),
             Sent::Unavailable => {
@@ -229,8 +230,6 @@ async fn send(
         pacer.sent(body.len() + overhead, tokio::time::Instant::now());
         lane.packets = lane.packets.wrapping_add(1);
         lane.octets = lane.octets.wrapping_add((body.len() - 12) as u32);
-        lane.stamp = u32::from_be_bytes(body[4..8].try_into().unwrap());
-        lane.sent = Some(Instant::now());
         state.stats.packets.fetch_add(1, Ordering::Relaxed);
         state
             .stats

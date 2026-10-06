@@ -208,38 +208,53 @@ pub fn outputs(cfg: &Value) -> Result<Vec<Output>, String> {
     if rows.len() > 4 {
         return Err("At most four direct RTP/SRTP destinations are supported".into());
     }
-    rows.iter()
-        .map(|row| {
-            let obj = row
-                .as_object()
-                .ok_or("Direct RTP destination must be an object")?;
-            if obj
-                .keys()
-                .any(|k| !["url", "flussonix_rtp", "max_mbps", "disabled"].contains(&k.as_str()))
-            {
-                return Err("Unknown direct RTP destination option".into());
-            }
-            if row.get("disabled").is_some_and(|v| !v.is_boolean()) {
-                return Err("RTP enabled setting must be boolean".into());
-            }
-            let settings = Settings::parse(row)?;
-            if settings.address.ip().is_unspecified()
-                || settings.sdp_file.is_some()
-                || settings.source_ip.is_some()
-                || row["flussonix_rtp"].get("jitter_ms").is_some()
-            {
-                return Err(
+    let outputs: Vec<Output> =
+        rows.iter()
+            .map(|row| {
+                let obj = row
+                    .as_object()
+                    .ok_or("Direct RTP destination must be an object")?;
+                if obj.keys().any(|k| {
+                    !["url", "flussonix_rtp", "max_mbps", "disabled"].contains(&k.as_str())
+                }) {
+                    return Err("Unknown direct RTP destination option".into());
+                }
+                if row.get("disabled").is_some_and(|v| !v.is_boolean()) {
+                    return Err("RTP enabled setting must be boolean".into());
+                }
+                let settings = Settings::parse(row)?;
+                if settings.address.ip().is_unspecified()
+                    || settings.sdp_file.is_some()
+                    || settings.source_ip.is_some()
+                    || row["flussonix_rtp"].get("jitter_ms").is_some()
+                {
+                    return Err(
                     "RTP destinations require a concrete address and cannot use receive options"
                         .into(),
                 );
-            }
-            Ok(Output {
-                settings,
-                disabled: row["disabled"] == true,
-                max_mbps: number(row, "max_mbps", 100, 1, 10000)?,
+                }
+                Ok(Output {
+                    settings,
+                    disabled: row["disabled"] == true,
+                    max_mbps: number(row, "max_mbps", 100, 1, 10000)?,
+                })
             })
-        })
-        .collect()
+            .collect::<Result<_, String>>()?;
+    for (i, a) in outputs.iter().enumerate().filter(|(_, o)| !o.disabled) {
+        let start = a.settings.address.port();
+        let end = start + if a.settings.elementary { 15 } else { 1 };
+        for b in outputs.iter().skip(i + 1).filter(|o| !o.disabled) {
+            let other = b.settings.address.port();
+            let other_end = other + if b.settings.elementary { 15 } else { 1 };
+            if a.settings.address.ip() == b.settings.address.ip()
+                && start <= other_end
+                && other <= end
+            {
+                return Err("Enabled RTP destinations on the same address require non-overlapping RTP/RTCP port ranges".into());
+            }
+        }
+    }
+    Ok(outputs)
 }
 pub fn enabled(cfg: &Value) -> bool {
     cfg["flussonix_rtp_outputs"]

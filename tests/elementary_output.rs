@@ -14,14 +14,14 @@ fn receivers() -> (u16, Vec<AsyncUdp>) {
             continue;
         }
         let mut sockets = vec![a];
-        for p in port + 1..port + 4 {
+        for p in port + 1..port + 16 {
             if let Ok(s) = UdpSocket::bind(("127.0.0.1", p)) {
                 sockets.push(s);
             } else {
                 break;
             }
         }
-        if sockets.len() != 4 {
+        if sockets.len() != 16 {
             continue;
         }
         return (
@@ -251,5 +251,99 @@ async fn paced_destination_queue_lag_fails_and_clears_its_description() {
             .contains("lagged")
     );
     assert_eq!(stats["flussonix_rtp_outputs"][0]["sdp_ready"], false);
+    assert!(!std::path::Path::new(&format!("/proc/{}", w.pid())).exists());
+}
+
+#[tokio::test]
+async fn related_tracks_share_cname_and_a_stable_clock_despite_composition_and_send_delay() {
+    use flussonix::{m4f::Frame, m4s::Track};
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let idle = d.path().join("owned-idle");
+    std::fs::write(&idle, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&idle, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let e = Engine::new(d.path().join("media"), idle.to_str().unwrap());
+    let (port, sockets) = receivers();
+    let cfg = json!({"inputs":[{"url":"testsrc://"}],"flussonix_rtp_outputs":[{"url":format!("rtp://127.0.0.1:{port}"),"flussonix_rtp":{"profile":"elementary"}}]});
+    let w = e.ensure("owned", &cfg).await.unwrap();
+    w.wire.rtp.configure(&[
+        Track {
+            id: 7,
+            codec: "h264".into(),
+            config: vec![
+                1, 100, 0, 31, 255, 225, 0, 4, 103, 100, 0, 31, 1, 0, 2, 104, 0,
+            ],
+        },
+        Track {
+            id: 8,
+            codec: "aac".into(),
+            config: vec![0x11, 0x90],
+        },
+    ]);
+    let frame = |id, dts, offset| Frame {
+        track_id: id,
+        dts,
+        pts_offset: offset,
+        key: true,
+        body: if id == 7 {
+            vec![0, 0, 0, 2, 0x65, 42]
+        } else {
+            vec![42]
+        },
+    };
+    for id in [7, 8] {
+        w.wire
+            .rtp
+            .frame(&frame(id, 0, if id == 7 { 9000 } else { 0 }));
+    }
+    let mut b = [0; 1601];
+    let mut origins = vec![];
+    for (i, offset) in [(0, 9000), (2, 0)] {
+        tokio::time::timeout(Duration::from_secs(2), sockets[i].recv_from(&mut b))
+            .await
+            .unwrap()
+            .unwrap();
+        origins.push(u32::from_be_bytes(b[4..8].try_into().unwrap()).wrapping_sub(offset));
+    }
+    w.wire.rtp.frame(&frame(7, 1920, 18000));
+    tokio::time::timeout(Duration::from_secs(2), sockets[0].recv_from(&mut b))
+        .await
+        .unwrap()
+        .unwrap();
+    let changed_pts = u32::from_be_bytes(b[4..8].try_into().unwrap()).wrapping_sub(origins[0]);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    w.wire.rtp.frame(&frame(8, 1920, 0));
+    tokio::time::timeout(Duration::from_secs(2), sockets[2].recv_from(&mut b))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut names = vec![];
+    let mut mapped = vec![];
+    let mut ssrcs = vec![];
+    for (j, i) in [1, 3].into_iter().enumerate() {
+        let (n, _) = tokio::time::timeout(Duration::from_secs(7), sockets[i].recv_from(&mut b))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(flussonix::direct_rtp::packet::valid_rtcp(&b[..n]));
+        ssrcs.push(u32::from_be_bytes(b[4..8].try_into().unwrap()));
+        names.push(b[38..38 + usize::from(b[37])].to_vec());
+        let ntp = u32::from_be_bytes(b[8..12].try_into().unwrap()) as f64
+            + u32::from_be_bytes(b[12..16].try_into().unwrap()) as f64 / 4294967296.0;
+        let stamp = u32::from_be_bytes(b[16..20].try_into().unwrap());
+        mapped.push(
+            ntp - stamp.wrapping_sub(origins[j]) as f64 / if j == 0 { 90000.0 } else { 48000.0 },
+        );
+    }
+    e.stop_all().await;
+    assert_eq!(
+        changed_pts, 19920,
+        "Changing composition offsets remain in media timestamps"
+    );
+    assert_ne!(ssrcs[0], ssrcs[1]);
+    assert!(
+        names[0] == names[1] && (mapped[0] - mapped[1]).abs() < 0.002,
+        "Related tracks need one CNAME and media epoch despite PTS/send delay: CNAMEs={names:?}, wall epochs={mapped:?}"
+    );
     assert!(!std::path::Path::new(&format!("/proc/{}", w.pid())).exists());
 }
