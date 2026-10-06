@@ -682,8 +682,10 @@ async fn retained_dvb_subtitles_fail_destination_without_silent_track_omission()
         .unwrap();
     let mut input = publication.stdin.take().unwrap();
     let (close, done) = tokio::sync::oneshot::channel();
+    let (fed, ready) = tokio::sync::oneshot::channel();
     let writer = tokio::spawn(async move {
         input.write_all(&bytes).await.unwrap();
+        let _ = fed.send(());
         let _ = done.await;
         drop(input);
     });
@@ -702,6 +704,11 @@ async fn retained_dvb_subtitles_fail_destination_without_silent_track_omission()
             .alive
             .load(std::sync::atomic::Ordering::Relaxed)
     );
+    // Finish the finite fixture write before intentionally closing its input pipe.
+    tokio::time::timeout(Duration::from_secs(10), ready)
+        .await
+        .unwrap()
+        .unwrap();
     engine.stop_all().await;
     let _ = close.send(());
     writer.await.unwrap();
@@ -721,7 +728,12 @@ async fn rtsp_push_keeps_on_demand_stream_active_but_disabled_and_publication_wa
         },
     )
     .unwrap();
-    let push = json!({"url":"rtsp://127.0.0.1:19991/owned","connect_timeout":1});
+    let owned_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let owned_url = format!(
+        "rtsp://127.0.0.1:{}/owned",
+        owned_listener.local_addr().unwrap().port()
+    );
+    let push = json!({"url":owned_url,"connect_timeout":1});
     app.config
         .put(
             "streams",
@@ -729,7 +741,7 @@ async fn rtsp_push_keeps_on_demand_stream_active_but_disabled_and_publication_wa
             json!({"static":false,"inputs":[{"url":"testsrc://"}],"pushes":[push]}),
         )
         .unwrap();
-    app.config.put("streams","disabled",json!({"static":false,"inputs":[{"url":"testsrc://"}],"pushes":[{"url":"rtsp://127.0.0.1:19991/owned","disabled":true}]})).unwrap();
+    app.config.put("streams","disabled",json!({"static":false,"inputs":[{"url":"testsrc://"}],"pushes":[{"url":owned_url,"disabled":true}]})).unwrap();
     app.config
         .put(
             "streams",
