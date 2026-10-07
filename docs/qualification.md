@@ -551,3 +551,13 @@ callback; its failure log is retained. Production session visibility is unchange
 Verified private-CA TLS clients qualify secure response framing and downgrade
 guards; secure multi-hop decoding, native adaptive RTSP LB routing and real
 vendor/client dialect parity remain separate gates. See [full scope](rtsp-auth-redirects.md).
+
+Final review corrections are qualified by failing regressions before fixes:
+raw URI-unsafe characters were previously emitted in Location, and token-free
+session keys allowed a warmed RTSP redirect to bypass builtin credentials or an
+invalid-first HTTP request to poison the shared cache. The corrected policy
+checks every request's builtin token before cache lookup, retaining refresh
+checks; raw RTSP destinations require RFC3986 characters and valid percent
+escapes. Eleven routing tests pass, including the shared HTTP grant regression.
+The earlier candidate CI was deliberately cancelled after review found these
+issues; release requires a full successful run of the revised immutable head.

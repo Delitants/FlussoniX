@@ -35,6 +35,7 @@ struct Backend {
     queries: Mutex<Vec<HashMap<String, String>>>,
     pause: AtomicBool,
     omit_location: AtomicBool,
+    allow: AtomicBool,
     entered: Notify,
     release: Notify,
 }
@@ -50,7 +51,9 @@ async fn callback(
     }
     let mut headers = HeaderMap::new();
     headers.insert("x-authduration", "60".parse().unwrap());
-    if let Some(target) = target {
+    if state.allow.load(Ordering::SeqCst) {
+        (StatusCode::OK, headers)
+    } else if let Some(target) = target {
         if !state.omit_location.load(Ordering::SeqCst) {
             headers.insert("location", target.parse().unwrap());
         }
@@ -332,6 +335,13 @@ async fn callback_rejects_wrong_protocol_unsafe_or_oversized_destinations() {
             "rtsp://127.0.0.1:9/path?x=a\tb".into(),
             "rtsp://127.0.0.1:9/path\\other".into(),
             "rtsp://127.0.0.1:65536/path".into(),
+            "rtsp://127.0.0.1:9/raw\"quote".into(),
+            "rtsp://127.0.0.1:9/<other>".into(),
+            "rtsp://127.0.0.1:9/{other}".into(),
+            "rtsp://127.0.0.1:9/other?x=`|^".into(),
+            "rtsp://127.0.0.1:9/percent%".into(),
+            "rtsp://127.0.0.1:9/percent%2".into(),
+            "rtsp://127.0.0.1:9/percent%GG".into(),
         ];
         invalid.push(format!("rtsp://127.0.0.1:9/{}", "a".repeat(8192)));
         for (index, target) in invalid.iter().enumerate() {
@@ -343,6 +353,10 @@ async fn callback_rejects_wrong_protocol_unsafe_or_oversized_destinations() {
         lab.target(Some("rtsp://127.0.0.1:9/other"));
         lab.backend.omit_location.store(true, Ordering::SeqCst);
         assert_eq!(lab.describe(false, "missing").await.0, 403);
+        lab.backend.omit_location.store(false, Ordering::SeqCst);
+        let encoded = "rtsp://127.0.0.1:9/%22%3C%3E%7B%7D%60%7C%5E?x=%25%20%0D%0A";
+        lab.target(Some(encoded));
+        redirected(lab.describe(false, "encoded").await, encoded);
         assert_eq!(lab.app.media.count().await, 0);
     })
     .catch_unwind()
@@ -464,14 +478,26 @@ async fn viewer_token_denial_precedes_callback_routing() {
         lab.app
             .config
             .put(
+                "templates",
+                "routing",
+                json!({"on_play":{"url":lab.callback,"session_keys":["name","proto"]}}),
+            )
+            .unwrap();
+        lab.app
+            .config
+            .put(
                 "streams",
                 "nested/owned",
                 json!({"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"known"))}),
             )
             .unwrap();
         lab.target(Some("rtsp://127.0.0.1:9/other"));
-        assert_eq!(lab.describe(false, "wrong").await.0, 403);
-        assert!(lab.backend.queries.lock().unwrap().is_empty());
+        redirected(
+            lab.describe(false, "known").await,
+            "rtsp://127.0.0.1:9/other",
+        );
+        // A different token must not read the warmed destination bearer token.
+        assert_eq!(lab.describe(false, "wrong-again").await.0, 403);
         redirected(
             lab.describe(false, "known").await,
             "rtsp://127.0.0.1:9/other",
@@ -632,6 +658,57 @@ async fn independent_client_follows_callback_to_authorized_decoded_media() {
         .await
         .unwrap()
         .unwrap();
+    lab.stop().await;
+    if let Err(p) = result {
+        std::panic::resume_unwind(p)
+    }
+}
+
+#[tokio::test]
+async fn token_free_http_session_identity_cannot_bypass_or_poison_builtin_token_checks() {
+    use sha2::{Digest, Sha256};
+    let mut lab = Lab::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        lab.backend.allow.store(true, Ordering::SeqCst);
+        lab.app
+            .config
+            .put(
+                "streams",
+                "nested/owned",
+                json!({
+                    "static":false,"inputs":[{"url":"testsrc://"}],
+                    "on_play":{"url":lab.callback,"session_keys":["name","proto"]},
+                    "flussonix_token_sha256":format!("{:x}",Sha256::digest(b"known"))
+                }),
+            )
+            .unwrap();
+        for (token, status) in [
+            ("wrong", 403),
+            ("known", 200),
+            ("wrong-again", 403),
+            ("known", 200),
+        ] {
+            let response = router(lab.app.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/nested/owned/mpegts?token={token}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "token {token}");
+            drop(response);
+            if token == "wrong" {
+                assert!(lab.backend.queries.lock().unwrap().is_empty());
+                assert_eq!(lab.app.media.count().await, 0);
+            }
+        }
+        assert_eq!(lab.backend.queries.lock().unwrap().len(), 1);
+        assert_eq!(lab.app.media.count().await, 1);
+    })
+    .catch_unwind()
+    .await;
     lab.stop().await;
     if let Err(p) = result {
         std::panic::resume_unwind(p)

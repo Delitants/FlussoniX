@@ -12,13 +12,18 @@ The wire response follows [RTSP/1.0 redirection](https://www.rfc-editor.org/rfc/
 The callback receives the existing `proto=rtsp`, decoded token, original query,
 stream name, client IP and session metadata. Stream and template policy,
 `X-AuthDuration` decision caching, token denial and manual revocation remain
-authoritative. Cached redirect entries do not consume active media/viewer slots.
+authoritative. Builtin token checks run for each request before cache lookup,
+even when session identity keys deliberately omit the token; an invalid request
+cannot read or poison another request's cached redirect or HTTP grant.
+Cached redirect entries do not consume active media/viewer slots.
 Policy changes already published by the configuration owner reject stale
 decisions. A root configuration revision change during the callback returns
 503 and requires a retry, even for an unrelated edit; no old redirect is emitted.
 
 Location is limited to 8192 bytes of ASCII URI text, with a host and without
 raw whitespace/control characters, backslashes, userinfo or fragments.
+Raw characters must be from the [RFC3986 URI character set](https://www.rfc-editor.org/rfc/rfc3986.html#section-2); percent escapes
+must contain two hexadecimal digits. Encoded equivalents remain unchanged.
 Relative destinations, HTTP(S) destinations and malformed ports are rejected.
 Percent-encoded path/query bytes are preserved; safe encoded characters are
 not reinterpreted as response headers. Direct self-redirects compare the actual
@@ -49,6 +54,8 @@ worker/session, TLS downgrade rejection after a plaintext cache fill, TLS URI
 aliases, plaintext-to-TLS routing, IPv6 destination syntax, invalid/missing/large
 Locations, direct self-loops, template inheritance, token denial, pending/cached
 revocation, configuration changes and unchanged HTTP redirect behavior.
+Token-free session identity tests cover valid-first RTSP cache access and
+invalid-first/warmed HTTP grant access, without bypass or cache poisoning.
 An independent FFmpeg client follows a plaintext redirect to a separately
 authorized node and strictly decodes both audio and video. Secure redirect
 headers are qualified with a certificate-verifying client; automated secure

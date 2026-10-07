@@ -94,6 +94,11 @@ impl Policy {
         }
         Ok(policy)
     }
+    fn accepts_token(&self, token: &str) -> bool {
+        self.token_hash.as_ref().is_none_or(|hash| {
+            format!("{:x}", Sha256::digest(token.as_bytes())).eq_ignore_ascii_case(hash)
+        })
+    }
     fn identity(&self, r: &ViewerRequest) -> String {
         // Length framing preserves ordered keys, including repeated keys, without delimiter collisions.
         let mut h = Sha256::new();
@@ -282,6 +287,12 @@ impl PlaybackAuth {
             return AuthOutcome::Denied;
         }
         let policy = snapshot.policy;
+        // Session keys may intentionally omit token. Builtin credentials are
+        // still per request: a cached decision must not bypass or be poisoned
+        // by a different request's invalid token.
+        if !policy.accepts_token(&request.token) {
+            return AuthOutcome::Denied;
+        }
         let identity = policy.identity(&request);
         let entry = {
             let authority = self.authority.lock().unwrap();
@@ -377,9 +388,7 @@ impl PlaybackAuth {
         let mut user_id = None;
         let mut max = policy.max_sessions;
         let mut unique = false;
-        if policy.token_hash.as_ref().is_some_and(|h| {
-            !format!("{:x}", Sha256::digest(r.token.as_bytes())).eq_ignore_ascii_case(h)
-        }) {
+        if !policy.accepts_token(&r.token) {
             decision = Decision::Deny;
         } else if let Some(url) = &policy.url {
             let Ok(_permit) = self.callbacks.try_acquire() else {

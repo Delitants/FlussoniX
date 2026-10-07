@@ -2,13 +2,28 @@
 use super::Reply;
 
 pub(crate) fn destination(value: &str) -> Option<url::Url> {
-    if value.is_empty()
-        || value.len() > 8192
-        || value
-            .bytes()
-            .any(|byte| byte <= 32 || byte >= 127 || byte == b'\\')
-    {
+    if value.is_empty() || value.len() > 8192 {
         return None;
+    }
+    // URL parsers may normalize invalid raw characters. Validate the original
+    // RFC3986 URI bytes because those exact bytes go into the Location header.
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            if bytes
+                .get(index + 1..index + 3)
+                .is_none_or(|escape| !escape.iter().all(u8::is_ascii_hexdigit))
+            {
+                return None;
+            }
+            index += 3;
+        } else if byte.is_ascii_alphanumeric() || b"-._~:/?#[]@!$&'()*+,;=".contains(&byte) {
+            index += 1;
+        } else {
+            return None;
+        }
     }
     let target = url::Url::parse(value).ok()?;
     (matches!(target.scheme(), "rtsp" | "rtsps")
