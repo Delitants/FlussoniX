@@ -5,6 +5,8 @@ use std::{path::Path, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, process::Command};
 #[path = "support/tls.rs"]
 mod tls_fixture;
+#[path = "support/udp.rs"]
+mod udp_fixture;
 
 struct LabDir {
     path: std::path::PathBuf,
@@ -69,7 +71,7 @@ fn mixed_push_config_roundtrips_inherits_and_rejects_invalid_profiles_without_se
         json!({"url":"rtsp://localhost/channel?password=%GGowned-secret"}),
         json!({"url":"rtsp://localhost/channel","flussonix_tls_ca":"/missing/owned-secret"}),
         json!({"url":"rtsps://localhost/channel","flussonix_tls_ca":"relative.pem"}),
-        json!({"url":"rtsp://localhost/channel","rtsp_transport":"udp"}),
+        json!({"url":"rtsp://localhost/channel","rtsp_transport":"invalid"}),
         json!({"url":"rtsp://localhost/channel","passphrase":"owned-secret"}),
         json!({"url":"rtsp://localhost/channel","disabled":"true"}),
         json!({"url":"rtsp://localhost/channel","connect_timeout":0}),
@@ -146,6 +148,13 @@ async fn receiver(path: &Path) -> (u16, tokio::process::Child) {
     receiver_for(path, 3).await
 }
 async fn receiver_for(path: &Path, seconds: u64) -> (u16, tokio::process::Child) {
+    receiver_transport(path, seconds, "tcp").await
+}
+async fn receiver_transport(
+    path: &Path,
+    seconds: u64,
+    transport: &str,
+) -> (u16, tokio::process::Child) {
     let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = reserved.local_addr().unwrap().port();
     drop(reserved);
@@ -162,7 +171,7 @@ async fn receiver_for(path: &Path, seconds: u64) -> (u16, tokio::process::Child)
             "-listen_timeout",
             "15",
             "-rtsp_transport",
-            "tcp",
+            transport,
             "-i",
             &format!("rtsp://127.0.0.1:{port}/owned"),
             "-map",
@@ -400,6 +409,11 @@ async fn untrusted_wrong_identity_and_expired_tls_never_forward_rtsp() {
 
 #[tokio::test]
 async fn receiver_publication_password_is_independent_of_viewer_and_management_auth() {
+    for udp in [false, true] {
+        receiver_password_case(udp).await;
+    }
+}
+async fn receiver_password_case(udp: bool) {
     use flussonix::server::{App, Options};
     use tokio_util::sync::CancellationToken;
     let dir = labdir();
@@ -423,13 +437,29 @@ async fn receiver_publication_password_is_independent_of_viewer_and_management_a
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(flussonix::rtsp::serve(
+    let pool = if udp {
+        let (range, reserved) = udp_fixture::reserved(8);
+        drop(reserved);
+        Some(
+            flussonix::rtsp::udp::Pool::bind("127.0.0.1".parse().unwrap(), range)
+                .await
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let task = tokio::spawn(flussonix::rtsp::serve_with_udp(
         listener,
         app.clone(),
         cancel.clone(),
+        pool.clone(),
+        100.0,
     ));
     let engine = flussonix::media::Engine::new(dir.path().join("source-media"), "ffmpeg");
     let mut cfg = json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":format!("rtsp://127.0.0.1:{port}/owned?password=owned-admin"),"retry_timeout":10}]});
+    if udp {
+        cfg["pushes"][0]["rtsp_transport"] = json!("udp");
+    }
     let wrong = engine.ensure("owned", &cfg).await.unwrap();
     wait_push(&wrong, 0, "retrying").await;
     assert_eq!(app.media.count().await, 0);
@@ -449,6 +479,36 @@ async fn receiver_publication_password_is_independent_of_viewer_and_management_a
     .unwrap();
     assert_eq!(app.media.count().await, 1);
     engine.stop_all().await;
+    if let Some(pool) = pool {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let mut leases = Vec::new();
+                for _ in 0..4 {
+                    if let Ok(lease) = pool
+                        .lease(
+                            "127.0.0.1".parse().unwrap(),
+                            flussonix::rtsp::protocol::ClientPorts {
+                                rtp: 6000,
+                                rtcp: 6001,
+                            },
+                        )
+                        .await
+                    {
+                        leases.push(lease);
+                    } else {
+                        break;
+                    }
+                }
+                if leases.len() == 4 {
+                    break;
+                }
+                drop(leases);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("stopping UDP push must release the receiver leases");
+    }
     cancel.cancel();
     task.await.unwrap().unwrap();
     app.media.stop_all().await;
@@ -1663,4 +1723,209 @@ async fn authenticated_and_unsigned_destinations_share_worker_without_credential
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn udp_push_roundtrips_templates_and_rejects_secure_or_invalid_transport() {
+    let dir = labdir();
+    let store = ConfigStore::open(dir.path().join("config.json")).unwrap();
+    let entries = json!([{"url":"rtsp://localhost/owned","rtsp_transport":"udp","disabled":true}]);
+    store
+        .put("templates", "udp", json!({"pushes":entries}))
+        .expect("UDP push must configure");
+    store
+        .put(
+            "streams",
+            "owned",
+            json!({"template":"udp","inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    assert_eq!(store.effective("owned").unwrap()["pushes"], entries);
+    for entry in [
+        json!({"url":"rtsps://localhost/owned","rtsp_transport":"udp"}),
+        json!({"url":"rtsp://localhost/owned","rtsp_transport":"multicast"}),
+        json!({"url":"rtsp://localhost/owned","rtsp_transport":1}),
+    ] {
+        assert!(
+            store
+                .put("streams", "bad", json!({"pushes":[entry]}))
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn independent_udp_receiver_decodes_all_six_codec_pairs_and_releases_owned_processes() {
+    use futures_util::FutureExt;
+    for (video, encoder) in [("h264", "libx264"), ("hevc", "libx265")] {
+        for (audio, acodec, ab) in [
+            ("aac", "aac", 96),
+            ("mp2", "mp2a", 192),
+            ("mp3", "mp3", 128),
+        ] {
+            let dir = labdir();
+            let path = dir.path().join("received.ts");
+            let (port, mut receiver) = receiver_transport(&path, 3, "udp").await;
+            let engine = owned_engine(dir.path());
+            let result=std::panic::AssertUnwindSafe(async {
+                let cfg=json!({"inputs":[{"url":"testsrc://"}],"transcoder":{"encoder":encoder,"acodec":acodec,"ab":ab},"pushes":[{"url":format!("rtsp://127.0.0.1:{port}/owned?token=owned-secret"),"rtsp_transport":"udp","retry_timeout":30}]});
+                let worker=engine.ensure("owned",&cfg).await.expect("UDP push must start");
+                let stats=wait_push(&worker,0,"sending").await;
+                assert!(stats["rtp_bytes"].as_u64().unwrap()>0);
+                assert_eq!(stats["transport"],"udp");
+                assert!(!worker.stats().to_string().contains("owned-secret"));
+                received(&mut receiver,&path,Some(video),audio).await;
+            }).catch_unwind().await;
+            if receiver.try_wait().unwrap().is_none() {
+                receiver.kill().await.unwrap();
+            }
+            let _ = receiver.wait().await;
+            engine.stop_all().await;
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn udp_transport_substitution_closes_before_record_and_reclaims_ports() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for tail in [
+        ";server_port=6000-6001;source=127.0.0.2",
+        ";server_port=6001-6002",
+        ";server_port=6000-6001;server_port=6002-6003",
+        "",
+        "collision",
+    ] {
+        let dir = labdir();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            drop(listener);
+            let (method, seq, _) = auth_control(&mut socket).await;
+            assert_eq!(method, "ANNOUNCE");
+            socket
+                .write_all(
+                    format!("RTSP/1.0 200 OK\r\nCSeq: {seq}\r\nContent-Length: 0\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let (method, seq, wire) = auth_control(&mut socket).await;
+            assert_eq!(method, "SETUP");
+            let value = wire
+                .lines()
+                .find_map(|l| {
+                    l.split_once(':')
+                        .filter(|(k, _)| k.eq_ignore_ascii_case("transport"))
+                        .map(|(_, v)| v.trim())
+                })
+                .unwrap();
+            assert!(value.starts_with("RTP/AVP;unicast;client_port="));
+            assert!(!value.contains("interleaved"));
+            let pair = value
+                .split("client_port=")
+                .nth(1)
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .to_owned();
+            let response_tail = if tail == "collision" {
+                ";server_port=6000-6001"
+            } else {
+                tail
+            };
+            socket.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {seq}\r\nSession: owned\r\nTransport: RTP/AVP;unicast;client_port={pair}{response_tail}\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
+            let pair = if tail == "collision" {
+                let (method, seq, wire) = auth_control(&mut socket).await;
+                assert_eq!(method, "SETUP");
+                let second = wire
+                    .lines()
+                    .find_map(|l| {
+                        l.split_once(':')
+                            .filter(|(k, _)| k.eq_ignore_ascii_case("transport"))
+                            .map(|(_, v)| v.trim())
+                    })
+                    .unwrap()
+                    .split("client_port=")
+                    .nth(1)
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .to_owned();
+                socket.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {seq}\r\nSession: owned\r\nTransport: RTP/AVP;unicast;client_port={second};server_port=6000-6001\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
+                format!("{pair},{second}")
+            } else {
+                pair
+            };
+            let mut byte = [0];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), socket.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0,
+                "bad transport must close without RECORD/media"
+            );
+            pair
+        });
+        let engine = owned_engine(dir.path());
+        let result = std::panic::AssertUnwindSafe(async {
+            let worker=engine.ensure("owned",&json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":format!("rtsp://127.0.0.1:{port}/owned"),"rtsp_transport":"udp","retry_timeout":30}]})).await.unwrap();
+            let stats = wait_push(&worker, 0, "retrying").await;
+            assert_eq!(stats["rtp_bytes"], 0);
+            task.await.unwrap()
+        });
+        use futures_util::FutureExt;
+        let result = result.catch_unwind().await;
+        engine.stop_all().await;
+        match result {
+            Ok(pair) => {
+                for pair in pair.split(',') {
+                    let (a, b) = pair.split_once('-').unwrap();
+                    let a = tokio::net::UdpSocket::bind(("127.0.0.1", a.parse::<u16>().unwrap()))
+                        .await
+                        .unwrap();
+                    let b = tokio::net::UdpSocket::bind(("127.0.0.1", b.parse::<u16>().unwrap()))
+                        .await
+                        .unwrap();
+                    drop((a, b));
+                }
+            }
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    }
+}
+
+#[tokio::test]
+async fn independent_udp_basic_and_digest_receivers_authenticate_and_decode() {
+    use futures_util::FutureExt;
+    for profile in ["basic", "SHA-256"] {
+        let dir = labdir();
+        let path = dir.path().join("authenticated-udp.ts");
+        let (rx_port, mut rx) = receiver_transport(&path, 3, "udp").await;
+        let (port, mut gateway) =
+            authentication_gateway(dir.path(), rx_port, profile, false, false, None).await;
+        let engine = owned_engine(dir.path());
+        let result=std::panic::AssertUnwindSafe(async {
+            let worker=engine.ensure("owned",&json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":format!("rtsp://user%20name:owned%3Asecret@127.0.0.1:{port}/owned?token=owned-query"),"rtsp_transport":"udp","retry_timeout":30}]})).await.unwrap();
+            wait_push(&worker,0,"sending").await;received(&mut rx,&path,Some("h264"),"aac").await;
+            let events=auth_events(dir.path());assert_eq!(events.iter().filter(|e|e["accepted"]==false).count(),1);
+            for method in ["ANNOUNCE","SETUP","RECORD"] {assert!(events.iter().any(|e|e["method"]==method && e["accepted"]==true));}
+        }).catch_unwind().await;
+        engine.stop_all().await;
+        for child in [&mut rx, &mut gateway] {
+            if child.try_wait().unwrap().is_none() {
+                let _ = child.kill().await;
+            }
+            let _ = child.wait().await;
+        }
+        if let Err(p) = result {
+            std::panic::resume_unwind(p);
+        }
+    }
 }

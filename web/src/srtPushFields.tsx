@@ -19,7 +19,7 @@ function expandedPush(value:Item):Item {
 }
 function endpoint(raw:string):string {try {const kind=protocol({url:raw});const u=kind==='srt'?parsedURL(raw):new URL(raw);return u.protocol+'//'+u.host+(u.port?'':kind==='rtsp'?':554':kind==='rtsps'?':322':'');}catch{return 'Invalid destination'}}
 export function pushSummary(pushes:Item[]):React.ReactNode {
- return pushes?.length?pushes.map((raw,i)=>{const p=expandedPush(raw);return <div key={i}>{i+1}. {endpoint(p.url)} · {p.disabled?'Disabled':'Enabled'} · {protocol(p)==='rtsps'?'Verified TLS':protocol(p)==='rtsp'?'Plaintext TCP':p.passphrase?'Encrypted':'Plaintext'}</div>}):'No destinations';
+ return pushes?.length?pushes.map((raw,i)=>{const p=expandedPush(raw);return <div key={i}>{i+1}. {endpoint(p.url)} · {p.disabled?'Disabled':'Enabled'} · {protocol(p)==='rtsps'?'Verified TLS':protocol(p)==='rtsp'?(p.rtsp_transport==='udp'?'Plaintext UDP':'Plaintext TCP'):p.passphrase?'Encrypted':'Plaintext'}</div>}):'No destinations';
 }
 export function pushError(value:Item):string|undefined {
  if(!owns(value,'pushes'))return;
@@ -31,6 +31,7 @@ export function pushError(value:Item):string|undefined {
     if(!['rtsp:','rtsps:'].includes(u.protocol)||!u.hostname||u.port==='0'||u.hash||!u.pathname.replaceAll('/','')||!raw.url||raw.url.length>4096||/[^\x21-\x7e]/.test(raw.url)||/%(?![a-fA-F0-9]{2})/.test(raw.url))return 'Destination URL must use rtsp://HOST/STREAM or rtsps://HOST/STREAM without fragments.';
     if(u.username||u.password){const username=decodeURIComponent(u.username),password=decodeURIComponent(u.password);if(!username||username.includes(':')||username.length>256||password.length>512||/[^\x20-\x7e]/.test(username+password))return 'Destination URL credentials need a printable ASCII username (up to 256 characters, without a colon) and password (up to 512 characters).';}
     if(owns(raw,'flussonix_tls_ca')&&(u.protocol!=='rtsps:'||typeof raw.flussonix_tls_ca!=='string'||!raw.flussonix_tls_ca.startsWith('/')))return 'RTSPS trusted CA must be an absolute file path, or leave it empty for public roots.';
+    if(owns(raw,'rtsp_transport')&&!(raw.rtsp_transport==='tcp'||raw.rtsp_transport==='udp'&&u.protocol==='rtsp:'))return 'RTSP transport must be TCP, or UDP for plaintext RTSP.';
     for(const [key,max] of [['connect_timeout',30],['retry_timeout',300]] as const)if(owns(raw,key)&&(!Number.isInteger(raw[key])||raw[key]<1||raw[key]>max))return `RTSP ${key==='connect_timeout'?'connection timeout':'retry interval'} must be a whole number from 1 to ${max}.`;
    }catch{return 'Destination URL must use rtsp://HOST/STREAM or rtsps://HOST/STREAM.'}
    continue;
@@ -74,7 +75,7 @@ export function PushFields({value,inherited,onChange}:{value:Item,inherited?:Ite
  }));
  };
  return <fieldset><legend>Push destinations</legend>
-  <p className="muted">SRT caller mode or RTSP TCP sends the processed stream to each receiver. RTSPS verifies the receiver certificate and identity. Enabled destinations keep a stream active without viewers. Editing destinations restarts the stream in this preview.</p>
+  <p className="muted">SRT caller mode or RTSP TCP/UDP sends the processed stream to each receiver. RTSPS verifies the receiver certificate and identity and keeps media on encrypted TCP. Enabled destinations keep a stream active without viewers. Editing destinations restarts the stream in this preview.</p>
   <Field label="Destination settings"><select value={mode} onChange={e=>{setEditingProtocols({});onChange(e.target.value==='inherit'?undefined:e.target.value==='none'?[]:inherited?.length?inherited.map(expandedPush):[{url:''}]);}}><option value="inherit">{value.template?'Use template destinations':'No destinations (default)'}</option><option value="override">Override destinations</option><option value="none">No destinations</option></select></Field>
   {mode==='inherit'&&value.template&&<div className="muted">{pushSummary(inherited||[])}</div>}
   {mode==='override'&&<>{rows.map((p,i)=><div className="form-details" key={i}><h3>Destination {i+1}</h3><div className="form-grid">
@@ -85,6 +86,7 @@ export function PushFields({value,inherited,onChange}:{value:Item,inherited?:Ite
    <Field label={`Passphrase ${i+1}`} help="Matching 10–79 ASCII character secrets enable encryption. Empty means plaintext."><input type="password" autoComplete="off" maxLength={79} value={p.passphrase??''} onChange={e=>set(i,'passphrase',e.target.value)}/></Field>
    <Field label={`Latency (milliseconds) ${i+1}`} help="Delivery delay, 1–10000 milliseconds; default 120."><input type="number" min="1" max="10000" value={p.latency??120} onChange={e=>set(i,'latency',e.target.value===''?'':Number(e.target.value))}/></Field>
    </>}
+   {rowProtocol(i,p)==='rtsp'&&<Field label={`Destination RTSP transport ${i+1}`} help="UDP uses negotiated unicast RTP/RTCP ports. The receiver and network must allow these ports."><select value={p.rtsp_transport||'tcp'} onChange={e=>set(i,'rtsp_transport',e.target.value==='udp'?'udp':undefined)}><option value="tcp">TCP (default)</option><option value="udp">UDP (unicast)</option></select></Field>}
    {rowProtocol(i,p)==='rtsps'&&<Field label={`Destination trusted CA file ${i+1}`} help="Optional absolute PEM bundle path on this server. Leave empty for public roots."><input value={p.flussonix_tls_ca||''} onChange={e=>set(i,'flussonix_tls_ca',e.target.value||undefined)}/></Field>}
    <Field label={`Connection timeout (seconds) ${i+1}`}><input type="number" min="1" max="30" value={p.connect_timeout??3} onChange={e=>set(i,'connect_timeout',e.target.value===''?'':Number(e.target.value))}/></Field>
    <Field label={`Retry interval (seconds) ${i+1}`}><input type="number" min="1" max="300" value={p.retry_timeout??5} onChange={e=>set(i,'retry_timeout',e.target.value===''?'':Number(e.target.value))}/></Field>

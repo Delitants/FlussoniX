@@ -836,3 +836,22 @@ test('RTSP2 camera audio defaults inherit and transport preserves the saved alia
  state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0]).toEqual({url});expect(state.config_on_disk.transcoder).toBeUndefined();await expect(page.locator('textarea')).toHaveCount(0);
  }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});await request.delete('/streamer/api/v3/templates/'+template,{headers});}
 });
+
+
+test('RTSP push UDP controls roundtrip templates and clear on secure transport switch',async({page,request})=>{
+ test.setTimeout(60000);
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};const name='ui-rtsp-udp-push-'+Date.now();
+ const pushes=[{url:'rtsp://user:owned-secret@127.0.0.1:19990/owned',rtsp_transport:'udp',disabled:true}];
+ expect((await request.put('/streamer/api/v3/templates/'+name,{headers,data:{disabled:true,inputs:[{url:'testsrc://'}],pushes}})).ok()).toBeTruthy();
+ try{
+  await page.getByRole('button',{name:'Templates',exact:true}).click();await page.getByRole('row').filter({has:page.getByRole('cell',{name,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+  await expect(page.getByLabel('Destination RTSP transport 1',{exact:true})).toHaveValue('udp');
+  await expect(page.locator('textarea')).toHaveCount(0);
+  await page.getByLabel('Destination RTSP transport 1',{exact:true}).selectOption('tcp');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+  let data=await(await request.get('/streamer/api/v3/templates/'+name,{headers})).json();expect(data.pushes[0].rtsp_transport).toBeUndefined();
+  await page.getByRole('row').filter({has:page.getByRole('cell',{name,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();await page.getByLabel('Destination RTSP transport 1',{exact:true}).selectOption('udp');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+  data=await(await request.get('/streamer/api/v3/templates/'+name,{headers})).json();expect(data.pushes[0].rtsp_transport).toBe('udp');
+  await page.getByRole('row').filter({has:page.getByRole('cell',{name,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();await page.getByLabel('Destination protocol 1',{exact:true}).selectOption('rtsps');await expect(page.getByLabel('Destination RTSP transport 1',{exact:true})).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+  data=await(await request.get('/streamer/api/v3/templates/'+name,{headers})).json();expect(data.pushes[0].rtsp_transport).toBeUndefined();expect(data.pushes[0].url).toContain('rtsps://user:owned-secret@');
+ }finally{await request.delete('/streamer/api/v3/templates/'+name,{headers});}
+});

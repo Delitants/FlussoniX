@@ -156,3 +156,7 @@ input form to save `rtp:"udp"` without changing the alias. An explicit stream or
 template audio codec overrides the default. This profile encodes all source
 audio to AAC by default, rather than detecting and selectively replacing G.711;
 see [compatibility details](docs/compatibility.md#rtsp2-camera-input).
+
+RTSP push destinations support TCP (default) or unicast UDP via the friendly
+Destination RTSP transport control (`rtsp_transport: "udp"`). RTSPS retains
+verified encrypted TCP. See [UDP push bounds](docs/rtsp-push.md#unicast-udp-push).

@@ -2,6 +2,7 @@
 mod auth;
 mod bridge;
 mod client;
+mod udp;
 use bytes::Bytes;
 use serde_json::{Value, json};
 use std::{
@@ -16,6 +17,7 @@ pub(crate) struct Destination {
     credentials: Option<auth::Credentials>,
     endpoint: String,
     disabled: bool,
+    udp: bool,
     connect_seconds: u64,
     retry_seconds: u64,
     tls: Option<Arc<tokio_rustls::rustls::ClientConfig>>,
@@ -33,6 +35,7 @@ impl Destination {
                 "connect_timeout",
                 "retry_timeout",
                 "flussonix_tls_ca",
+                "rtsp_transport",
             ]
             .contains(&k.as_str())
         }) {
@@ -70,6 +73,12 @@ impl Destination {
         {
             return Err("RTSP destination requires a stream path, host and no fragment".into());
         }
+        let udp = match item.get("rtsp_transport") {
+            None => false,
+            Some(v) if v == "tcp" => false,
+            Some(v) if v == "udp" && url.scheme() == "rtsp" => true,
+            _ => return Err("RTSP transport must be tcp, or udp for plaintext RTSP".into()),
+        };
         let credentials = auth::Credentials::take(&mut url)?;
         if object.get("disabled").is_some_and(|v| !v.is_boolean())
             || object
@@ -101,6 +110,7 @@ impl Destination {
         Ok(Self {
             url,
             credentials,
+            udp,
             endpoint,
             tls,
             disabled: item["disabled"] == true,
@@ -152,7 +162,7 @@ impl State {
     }
     pub fn stats(&self) -> Value {
         let c = self.counters.lock().unwrap();
-        json!({"index":self.index,"endpoint":self.destination.endpoint,"protocol":self.destination.url.scheme(),"status":c.status,"pid":c.pid,"attempts":c.attempts,"fed_bytes":c.fed_bytes,"rtp_bytes":c.rtp_bytes,"last_error":c.last_error})
+        json!({"index":self.index,"endpoint":self.destination.endpoint,"protocol":self.destination.url.scheme(),"transport":if self.destination.udp {"udp"} else {"tcp"},"status":c.status,"pid":c.pid,"attempts":c.attempts,"fed_bytes":c.fed_bytes,"rtp_bytes":c.rtp_bytes,"last_error":c.last_error})
     }
     pub async fn run(
         self: Arc<Self>,
@@ -290,8 +300,14 @@ impl State {
         controls.tick().await;
         let mut last = Instant::now();
         let mut previous = 0;
+        let mut pending = None;
+        let mut pacer = self
+            .destination
+            .udp
+            .then(|| crate::rtsp::udp::Pacer::new(100.0).unwrap());
         let mut progress_tick = tokio::time::interval(Duration::from_millis(100));
         loop {
+            bridge.count_udp(client.take_udp_bytes() as usize);
             let size = bridge.rtp_bytes();
             if size > previous {
                 let mut c = self.counters.lock().unwrap();
@@ -309,7 +325,32 @@ impl State {
             if !worker.wire.rtp.generation_is(description.generation) || worker.is_closed() {
                 return Err("push_generation_changed");
             }
+            if pacer.is_some() && pending.is_none() {
+                pending = initial.pop_front();
+            }
+            let ready = match (pending.as_ref(), pacer.as_mut()) {
+                (Some(packet), Some(pacer)) => Some(
+                    pacer
+                        .ready_at(
+                            packet.dts,
+                            packet.bytes.len() - 4,
+                            tokio::time::Instant::now(),
+                        )
+                        .map_err(|_| "push_packet_rejected")?,
+                ),
+                _ => None,
+            };
+            let paced = async {
+                if let Some(at) = ready {
+                    tokio::time::sleep_until(at).await;
+                } else {
+                    std::future::pending().await
+                }
+            };
             let next = async {
+                if pending.is_some() {
+                    return std::future::pending().await;
+                }
                 if let Some(packet) = initial.pop_front() {
                     Ok(packet)
                 } else {
@@ -325,9 +366,14 @@ impl State {
                 _=reports.tick()=>{tokio::time::timeout_at(due,client.reports()).await.map_err(|_|"push_stalled")??;},
                 _=controls.tick()=>{tokio::time::timeout_at(due,client.keepalive()).await.map_err(|_|"push_stalled")??;},
                 _=progress_tick.tick()=>{},
+                _=paced=>{
+                    let packet=pending.take().unwrap();
+                    tokio::time::timeout_at(due,client.packet(&packet.bytes)).await.map_err(|_|"push_stalled")??;
+                    pacer.as_mut().unwrap().sent(packet.bytes.len()-4,tokio::time::Instant::now());
+                }
                 packet=next=>{
                     let packet=packet?;
-                    tokio::time::timeout_at(due,client.packet(&packet.bytes)).await.map_err(|_|"push_stalled")??;
+                    if pacer.is_some() {pending=Some(packet);} else {tokio::time::timeout_at(due,client.packet(&packet.bytes)).await.map_err(|_|"push_stalled")??;}
                 }
             }
         }

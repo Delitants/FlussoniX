@@ -1,6 +1,6 @@
 //! One upstream identity per attempt; bounded framing and negotiated media only.
 use super::Destination;
-use crate::rtsp::protocol::Transport;
+use crate::rtsp::protocol::{Offer, Transport};
 use std::{
     collections::HashMap,
     io,
@@ -23,7 +23,7 @@ fn bad() -> io::Error {
 }
 struct Pending {
     method: String,
-    transport: Option<Transport>,
+    transport: Option<Offer>,
 }
 #[derive(Default)]
 struct Session {
@@ -31,12 +31,16 @@ struct Session {
     channels: HashMap<u8, bool>,
     recorded: bool,
     announced: bool,
+    udp_tracks: usize,
 }
 pub(super) struct Bridge {
     url: String,
     route: Route,
     task: Option<JoinHandle<()>>,
     bytes: Arc<AtomicU64>,
+    pub peer: std::net::IpAddr,
+    pub local: std::net::IpAddr,
+    pub udp: bool,
 }
 #[derive(Clone)]
 pub(super) struct Route {
@@ -74,6 +78,8 @@ impl Bridge {
             .unwrap_or(if destination.tls.is_some() { 322 } else { 554 });
         let socket = TcpStream::connect((host, port)).await?;
         socket.set_nodelay(true)?;
+        let peer = socket.peer_addr()?.ip();
+        let local = socket.local_addr()?.ip();
         let upstream: Box<dyn Socket> = if let Some(config) = &destination.tls {
             let identity = ServerName::try_from(host.to_owned()).map_err(|_| bad())?;
             Box::new(
@@ -101,6 +107,7 @@ impl Bridge {
         let forwarding = route.clone();
         let bytes = Arc::new(AtomicU64::new(0));
         let progress = bytes.clone();
+        let udp = destination.udp;
         let task = tokio::spawn(async move {
             let accepted = tokio::time::timeout(Duration::from_secs(8), listener.accept()).await;
             drop(listener);
@@ -114,8 +121,8 @@ impl Bridge {
             let mut read_local = BufReader::new(read_local);
             let mut read_remote = BufReader::new(read_remote);
             tokio::select! {
-                _=requests(&mut read_local,&mut write_remote,&forwarding,&state,&progress)=>{},
-                _=responses(&mut read_remote,&mut write_local,&state)=>{},
+                _=requests(&mut read_local,&mut write_remote,&forwarding,&state,&progress,udp)=>{},
+                _=responses(&mut read_remote,&mut write_local,&state,peer)=>{},
             }
         });
         Ok(Self {
@@ -123,6 +130,9 @@ impl Bridge {
             route,
             task: Some(task),
             bytes,
+            peer,
+            local,
+            udp,
         })
     }
     pub fn route(&self) -> Route {
@@ -133,6 +143,9 @@ impl Bridge {
     }
     pub fn rtp_bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
+    }
+    pub fn count_udp(&self, size: usize) {
+        self.bytes.fetch_add(size as u64, Ordering::Relaxed);
     }
     pub async fn close(mut self) {
         if let Some(task) = self.task.take() {
@@ -261,6 +274,7 @@ async fn requests<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     route: &Route,
     state: &Arc<Mutex<Session>>,
     bytes: &AtomicU64,
+    udp: bool,
 ) -> io::Result<()> {
     loop {
         match frame(read).await? {
@@ -290,10 +304,12 @@ async fn requests<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     return Err(bad());
                 }
                 let transport = if method == "SETUP" {
-                    Some(
-                        Transport::record(c.header("transport").ok_or_else(bad)?)
-                            .map_err(|_| bad())?,
-                    )
+                    let offer =
+                        Offer::record(c.header("transport").ok_or_else(bad)?).map_err(|_| bad())?;
+                    if matches!(offer, Offer::Udp(_)) != udp {
+                        return Err(bad());
+                    }
+                    Some(offer)
                 } else {
                     None
                 };
@@ -359,6 +375,7 @@ async fn responses<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     read: &mut R,
     write: &mut W,
     state: &Arc<Mutex<Session>>,
+    peer: std::net::IpAddr,
 ) -> io::Result<()> {
     loop {
         match frame(read).await? {
@@ -388,19 +405,30 @@ async fn responses<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             match p.method.as_str() {
                                 "ANNOUNCE" => s.announced = true,
                                 "SETUP" => {
-                                    let t =
-                                        transport_response(c.header("transport").ok_or_else(bad)?)?;
-                                    if p.transport != Some(t)
-                                        || s.channels.contains_key(&t.rtp)
-                                        || s.channels.contains_key(&t.rtcp)
-                                    {
-                                        return Err(bad());
+                                    let value = c.header("transport").ok_or_else(bad)?;
+                                    match p.transport.ok_or_else(bad)? {
+                                        Offer::Tcp(offer) => {
+                                            let t = transport_response(value)?;
+                                            if offer != t
+                                                || s.channels.contains_key(&t.rtp)
+                                                || s.channels.contains_key(&t.rtcp)
+                                            {
+                                                return Err(bad());
+                                            }
+                                            s.channels.insert(t.rtp, true);
+                                            s.channels.insert(t.rtcp, false);
+                                        }
+                                        Offer::Udp(offer) => {
+                                            super::udp::response(value, offer, peer)?;
+                                            s.udp_tracks += 1;
+                                            if s.udp_tracks > 8 {
+                                                return Err(bad());
+                                            }
+                                        }
                                     }
-                                    s.channels.insert(t.rtp, true);
-                                    s.channels.insert(t.rtcp, false);
                                 }
                                 "RECORD" => {
-                                    if !s.announced || s.channels.is_empty() {
+                                    if !s.announced || s.channels.is_empty() && s.udp_tracks == 0 {
                                         return Err(bad());
                                     }
                                     s.recorded = true;

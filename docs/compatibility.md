@@ -243,3 +243,7 @@ changes, secret masking, independent audio controls and clearing foreign TLS
 options. This adds no vendor runtime dependency. Camera dialect parity,
 `wait_rtcp`, receiving Basic/Digest policy, RTSP 2.0, multicast RTSP and
 production-scale migration qualification remain separate gaps.
+
+## Outbound unicast UDP RTSP push
+
+The native `pushes` RTSP profile accepts `rtsp_transport: "udp"`; TCP remains the default and RTSPS rejects plaintext UDP. Per-track owned sockets bind the control peer and negotiated server ports, pace shared native RTP, and carry bounded RTCP. Invalid negotiation closes before RECORD; retries/cancellation release the pairs. Streams/Templates expose a normal transport selector with inheritance. See [UDP push contract and qualification limits](rtsp-push.md#unicast-udp-push). This supersedes older UDP push exclusions only for this bounded unicast profile.

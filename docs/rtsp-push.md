@@ -109,8 +109,39 @@ strict decoding of every requested audio/video track. This receiver setting
 is not a universal client compatibility claim.
 
 See [qualification](qualification.md#rtsp-and-rtsps-push-qualification) for
-evidence. UDP push, Basic/Digest viewer or incoming publisher authentication,
+evidence. Basic/Digest viewer or incoming publisher authentication,
 proxy authentication, Digest auth-int/userhash/SHA-512 variants, dedicated subtitle RTP,
 RTSP balancer redirects, all recorder dialects, long-duration synchronization
 and production capacity remain unqualified. No official Flussonic component
 is linked, copied or required by this implementation.
+
+## Unicast UDP push
+
+Plain RTSP destinations may select `rtsp_transport: "udp"` using the normal
+Destination RTSP transport selector. Omitted or `"tcp"` preserves the existing
+TCP default. Templates inherit the same saved destination objects. RTSPS rejects
+UDP and continues to carry both control and media through verified TLS.
+
+Each attempt reserves an even/odd local RTP/RTCP pair per retained track, bound
+to the control connection's local interface. SETUP must echo those client ports
+and supply distinct, unicast even/odd server ports of at least 1024. RTP/AVP and
+RTP/AVP/UDP responses are accepted; optional source/destination addresses must
+match the connected control peer. Redirects, substituted transports, duplicate
+parameters, multicast and colliding remote track pairs fail before RECORD.
+Connected UDP sockets enforce the negotiated feedback endpoint. Pre-RECORD
+queues are drained through the actual socket with a 64-datagram bound, and
+oversized, malformed or overflowing admitted RTCP closes the attempt.
+
+The shared packetizer and worker provide H.264/HEVC, AAC-LC and MPEG Layer II/III.
+DTS pacing and a 100 Mbps application-payload token bucket bound bootstrap bursts;
+this is an outbound push ceiling, with a 32 KiB burst allowance. RTCP sender
+reports and OPTIONS renewal retain the existing deadlines and authentication.
+Only successful RTP datagram writes increment `rtp_bytes`; this proves local
+transport progress. Cancellation and retry join owned readers and release all
+port pairs. No per-destination FFmpeg or vendor component is used.
+
+Qualification covers owned loopback independent FFmpeg receivers, the codec
+matrix, Basic/Digest control authentication, strict mapped-track decoding,
+transport rejection and port reclamation. NAT traversal, multicast push,
+scoped IPv6, WAN loss, all recorder dialects and sustained capacity remain
+unqualified. These bounds apply to UDP push; earlier TCP evidence still applies.

@@ -19,6 +19,7 @@ struct Lane {
     clock: u32,
     packets: u32,
     octets: u32,
+    udp: Option<super::udp::Pair>,
 }
 pub(super) struct Client {
     write: OwnedWriteHalf,
@@ -31,6 +32,7 @@ pub(super) struct Client {
     lanes: HashMap<u32, Lane>,
     report_origin: (tokio::time::Instant, std::time::SystemTime),
     keepalive: Option<(u32, tokio::time::Instant, u8)>,
+    udp_bytes: u64,
 }
 impl Client {
     pub async fn publish(
@@ -48,6 +50,7 @@ impl Client {
         socket.set_nodelay(true).map_err(|_| "push_setup_failed")?;
         let (read, write) = socket.into_split();
         let (tx, rx) = mpsc::channel(16);
+        let udp_tx = tx.clone();
         readers.spawn(async move {
             let mut reader = BufReader::new(read);
             loop {
@@ -69,6 +72,7 @@ impl Client {
             lanes: HashMap::new(),
             report_origin: (tokio::time::Instant::now(), std::time::SystemTime::now()),
             keepalive: None,
+            udp_bytes: 0,
         };
         let sdp = description.sdp();
         client
@@ -85,17 +89,47 @@ impl Client {
             // Match ANNOUNCE's relative control URI, including an existing
             // query: FFmpeg and Flussonic resolve it by aggregate concatenation.
             let control = format!("{url}/trackID={}", track.id);
-            let offer =
-                format!("Transport: RTP/AVP/TCP;unicast;interleaved={rtp}-{rtcp};mode=record\r\n");
+            let mut pair = if bridge.udp {
+                Some(
+                    super::udp::Pair::bind(bridge.local)
+                        .await
+                        .map_err(|_| "push_setup_failed")?,
+                )
+            } else {
+                None
+            };
+            let offer = if let Some(pair) = &pair {
+                let p = pair.ports();
+                format!(
+                    "Transport: RTP/AVP;unicast;client_port={}-{};mode=record\r\n",
+                    p.rtp, p.rtcp
+                )
+            } else {
+                format!("Transport: RTP/AVP/TCP;unicast;interleaved={rtp}-{rtcp};mode=record\r\n")
+            };
             let response = client.exchange("SETUP", &control, &offer, &[]).await?;
-            let t = bridge::transport_response(
-                response
-                    .header("transport")
-                    .ok_or("push_transport_rejected")?,
-            )
-            .map_err(|_| "push_transport_rejected")?;
-            if t.rtp != rtp || t.rtcp != rtcp {
-                return Err("push_transport_rejected");
+            let value = response
+                .header("transport")
+                .ok_or("push_transport_rejected")?;
+            if let Some(pair) = &mut pair {
+                let ports = super::udp::response(value, pair.ports(), bridge.peer)
+                    .map_err(|_| "push_transport_rejected")?;
+                if client
+                    .lanes
+                    .values()
+                    .filter_map(|l| l.udp.as_ref())
+                    .any(|p| p.remote == Some(ports))
+                {
+                    return Err("push_transport_rejected");
+                }
+                pair.connect(bridge.peer, ports)
+                    .await
+                    .map_err(|_| "push_transport_rejected")?;
+            } else {
+                let t = bridge::transport_response(value).map_err(|_| "push_transport_rejected")?;
+                if t.rtp != rtp || t.rtcp != rtcp {
+                    return Err("push_transport_rejected");
+                }
             }
             client.lanes.insert(
                 track.id,
@@ -107,6 +141,7 @@ impl Client {
                     stamp: ((u128::from(stamp_origin) * u128::from(track.clock)) / 90000) as u32,
                     packets: 0,
                     octets: 0,
+                    udp: pair,
                 },
             );
         }
@@ -118,6 +153,33 @@ impl Client {
             .await?;
         // RECORD receivers need an initial common clock before media arrives.
         client.report_origin = (tokio::time::Instant::now(), std::time::SystemTime::now());
+        for lane in client.lanes.values() {
+            if let Some(pair) = &lane.udp {
+                pair.drain().map_err(|_| "push_feedback_rejected")?;
+                let socket = pair.rtcp.clone();
+                let tx = udp_tx.clone();
+                let channel = lane.rtcp;
+                readers.spawn(async move {
+                    let mut data = [0u8; 2049];
+                    loop {
+                        let item = match socket.recv(&mut data).await {
+                            Ok(n) if n <= 2048 => Ok(Frame::Media(channel, data[..n].to_vec())),
+                            _ => Err(std::io::Error::other("invalid UDP feedback")),
+                        };
+                        let failed = item.is_err();
+                        if tx.try_send(item).is_err() {
+                            let _ = tx
+                                .send(Err(std::io::Error::other("UDP feedback queue overflow")))
+                                .await;
+                            break;
+                        }
+                        if failed {
+                            break;
+                        }
+                    }
+                });
+            }
+        }
         client.reports().await?;
         Ok(client)
     }
@@ -211,13 +273,19 @@ impl Client {
         }
         let id = u32::from_be_bytes(packet[..4].try_into().unwrap());
         let lane = self.lanes.get_mut(&id).ok_or("push_packet_rejected")?;
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            bridge::media(&mut self.write, lane.rtp, &packet[4..]),
-        )
+        tokio::time::timeout(Duration::from_secs(2), async {
+            if let Some(pair) = &lane.udp {
+                pair.send(false, &packet[4..]).await
+            } else {
+                bridge::media(&mut self.write, lane.rtp, &packet[4..]).await
+            }
+        })
         .await
         .map_err(|_| "push_stalled")?
         .map_err(|_| "push_connection_closed")?;
+        if lane.udp.is_some() {
+            self.udp_bytes = self.udp_bytes.saturating_add((packet.len() - 4) as u64);
+        }
         lane.packets = lane.packets.wrapping_add(1);
         lane.octets = lane.octets.wrapping_add((packet.len() - 16) as u32);
         Ok(())
@@ -233,15 +301,21 @@ impl Client {
                 .wrapping_add((elapsed.as_nanos() * u128::from(lane.clock) / 1_000_000_000) as u32);
             let report =
                 crate::rtsp::sender_report_at(lane.ssrc, stamp, lane.packets, lane.octets, time);
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                bridge::media(&mut self.write, lane.rtcp, &report),
-            )
+            tokio::time::timeout(Duration::from_secs(2), async {
+                if let Some(pair) = &lane.udp {
+                    pair.send(true, &report).await
+                } else {
+                    bridge::media(&mut self.write, lane.rtcp, &report).await
+                }
+            })
             .await
             .map_err(|_| "push_stalled")?
             .map_err(|_| "push_connection_closed")?;
         }
         Ok(())
+    }
+    pub fn take_udp_bytes(&mut self) -> u64 {
+        std::mem::take(&mut self.udp_bytes)
     }
     pub async fn keepalive(&mut self) -> Result<(), &'static str> {
         if self.keepalive.is_some() {

@@ -451,3 +451,32 @@ selection, alias retention on transport changes and removing foreign TLS
 settings. Full exact-head CI and fresh review gate publication. These checks
 qualify the stated camera profile, not receiving viewer Basic/Digest policy,
 selective G.711-only conversion, all camera dialects or migration capacity.
+
+## Outbound unicast UDP RTSP push qualification
+
+Owned independent FFmpeg UDP RECORD receivers strictly decode all six
+H.264/HEVC × AAC/MP2/MP3 combinations from the shared native packetizer and
+worker. Independent Python Basic and SHA-256 Digest control gateways authenticate
+ANNOUNCE, each SETUP and RECORD while the independent UDP recorder decodes both
+tracks. Credentials remain absent from diagnostics. Existing full TCP/RTSPS push
+and authentication regressions pass alongside these new cases.
+
+Socket qualification checks exact local source ports, admitted receiver feedback,
+foreign feedback filtering, real pre-RECORD queue draining and both local ports
+being reusable after release. A controlled RTSP receiver substitutes a foreign
+source, invalid port pair, duplicate server ports, missing ports or colliding
+track destinations. Each attempt closes before RECORD, emits zero RTP progress
+and returns every allocated local pair. The native receiving-node test exercises
+both TCP and UDP: the management password is denied, the publisher password
+starts one worker, and stopping UDP push returns every receiver lease.
+
+The local suites pass 81 library, 26 push, 13 UDP playback and seven RTSPS tests;
+one push hardware test remains explicitly opt-in. Browser qualification verifies
+friendly UDP selection, persisted template settings, TCP default restoration and
+removal of UDP settings when choosing secure RTSPS. Production code passed the
+new configuration and independent media RED/GREEN cases. The UI RED first caught
+the API exclusion, then—after correcting a template-table locator—caught the
+missing selector against the previous UI; the new UI passes the same flow.
+All fixtures use owned loopback ports and independent components. Full final-head
+CI remains the release gate. See [transport bounds and remaining interoperability
+limits](rtsp-push.md#unicast-udp-push).
