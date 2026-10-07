@@ -17,17 +17,17 @@ struct Args {
     /// Disable plaintext HTTP binding; requires an HTTPS listener.
     #[arg(long, requires = "https_listen")]
     https_only: bool,
-    /// Optional RTSP/1.0 TCP playback listener (disabled by default).
+    /// Optional RTSP/1.0 playback and publication listener (disabled by default).
     #[arg(long)]
     rtsp_listen: Option<SocketAddr>,
-    /// Optional RTSPS playback listener; control and interleaved media use TLS.
+    /// Optional RTSPS playback and publication listener; control and media use TLS.
     #[arg(long, requires_all = ["rtsps_cert", "rtsps_key"])]
     rtsps_listen: Option<SocketAddr>,
     #[arg(long, requires = "rtsps_listen")]
     rtsps_cert: Option<PathBuf>,
     #[arg(long, requires = "rtsps_listen")]
     rtsps_key: Option<PathBuf>,
-    /// Opt-in inclusive UDP RTP/RTCP port range (even-first/odd-last, 2..256 ports).
+    /// Shared UDP playback/publication port range (even-first/odd-last, 2..256 ports).
     #[arg(long, requires = "rtsp_listen")]
     rtsp_udp_ports: Option<flussonix::rtsp::udp::PortRange>,
     /// Per-viewer RTP application-data cap in Mbps (1..10000; default 100).
@@ -156,6 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rtsp_listener.as_ref().map(|l| l.local_addr()).transpose()?,
         tls_listener.as_ref().map(|l| l.local_addr()).transpose()?,
     );
+    app.set_rtsp_publication_udp(udp_pool.is_some());
     println!(
         "{}",
         serde_json::json!({"service":"FlussoniX","listen":http_address.map(|a|a.to_string()),"https_listen":https_address.map(|a|a.to_string()),"rtsp_listen":rtsp_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"rtsps_listen":tls_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"srt_play_listen":srt_listener.as_ref().map(|l|l.address().to_string()),"srt_play_encrypted":srt_listener.as_ref().map(|l|l.settings().encrypted()),"rtsp_udp_ports":a.rtsp_udp_ports.map(|p|p.to_string()),"rtsp_udp_mbps":a.rtsp_udp_ports.map(|_|udp_rate),"version":env!("CARGO_PKG_VERSION")})

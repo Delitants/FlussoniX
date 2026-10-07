@@ -210,10 +210,21 @@ impl ClientPorts {
 }
 impl Offer {
     pub fn parse(value: &str) -> Result<Self, u16> {
+        Self::parse_mode(value, "PLAY")
+    }
+    pub(crate) fn record(value: &str) -> Result<Self, u16> {
+        Self::parse_mode(value, "RECORD")
+    }
+    fn parse_mode(value: &str, mode: &str) -> Result<Self, u16> {
         let mut parts = value.split(';');
         let protocol = parts.next().unwrap_or("").trim();
         if protocol.eq_ignore_ascii_case("RTP/AVP/TCP") {
-            return Transport::parse(value).map(Self::Tcp);
+            return if mode == "RECORD" {
+                Transport::record(value)
+            } else {
+                Transport::parse(value)
+            }
+            .map(Self::Tcp);
         }
         if !["RTP/AVP", "RTP/AVP/UDP"]
             .iter()
@@ -233,8 +244,8 @@ impl Offer {
             match key.as_str() {
                 "unicast" if value.is_empty() => unicast = true,
                 "mode"
-                    if value.eq_ignore_ascii_case("PLAY")
-                        || value.eq_ignore_ascii_case("\"PLAY\"") => {}
+                    if value.eq_ignore_ascii_case(mode)
+                        || value.eq_ignore_ascii_case(&format!("\"{mode}\"")) => {}
                 "client_port" => {
                     let (a, b) = value.split_once('-').ok_or(461u16)?;
                     if a.is_empty()

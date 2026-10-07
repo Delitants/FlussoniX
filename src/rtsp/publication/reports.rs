@@ -17,7 +17,7 @@ impl Reports {
         Self {
             id: u32::from_be_bytes(uuid::Uuid::new_v4().as_bytes()[..4].try_into().unwrap()),
             started: Instant::now(),
-            sequence: Reorder::new(Duration::ZERO),
+            sequence: Reorder::new(Duration::from_millis(50)),
             packets: 0,
             last_highest: None,
             last_loss: 0,
@@ -29,7 +29,8 @@ impl Reports {
     pub fn packet(&mut self, packet: &Parsed<'_>, clock: u32) {
         let now = Instant::now();
         self.packets = self.packets.saturating_add(1);
-        // TCP preserves arrival order; track gaps without retaining media payloads.
+        // Allow brief UDP reordering, retaining at most 64 empty sequence markers.
+        // Media itself goes directly to the decoder and is never held here.
         self.sequence.push(packet.sequence, Vec::new(), now);
         let arrival = (now.duration_since(self.started).as_nanos() * u128::from(clock)
             / 1_000_000_000) as u32;
@@ -46,6 +47,7 @@ impl Reports {
         }
     }
     pub fn report(&mut self, source: u32) -> Vec<u8> {
+        self.sequence.flush(Instant::now());
         let highest = self.sequence.highest();
         let expected = self.last_highest.map_or(
             self.packets
@@ -85,5 +87,32 @@ impl Reports {
                 delay_sr,
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn reordered_and_duplicate_packets_are_not_reported_as_loss() {
+        let mut reports = Reports::new();
+        for sequence in [100, 102, 101, 102, 103] {
+            reports.packet(
+                &Parsed {
+                    sequence,
+                    ssrc: 7,
+                    timestamp: 90000,
+                    payload: &[],
+                },
+                90000,
+            );
+        }
+        let report = reports.report(7);
+        assert_eq!(
+            &report[13..16],
+            &[0, 0, 0],
+            "reordered packet filled the gap"
+        );
+        assert_eq!(u32::from_be_bytes(report[16..20].try_into().unwrap()), 103);
     }
 }

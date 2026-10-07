@@ -207,6 +207,34 @@ impl Lease {
             .send_to(body, self.peer_rtcp)
             .await
     }
+    pub(crate) fn discard_pending(&self) -> std::io::Result<()> {
+        drain(self.pair.as_ref().unwrap())
+    }
+    pub(crate) async fn readable(&self, rtcp: bool) -> std::io::Result<()> {
+        let p = self.active.as_ref().unwrap();
+        if rtcp {
+            p.rtcp.readable().await
+        } else {
+            p.rtp.readable().await
+        }
+    }
+    pub(crate) fn receive(&self, rtcp: bool, body: &mut [u8]) -> std::io::Result<Option<usize>> {
+        let p = self.active.as_ref().unwrap();
+        let socket = if rtcp { &p.rtcp } else { &p.rtp };
+        let peer = SocketAddr::new(
+            self.peer_rtcp.ip(),
+            if rtcp {
+                self.client_ports.rtcp
+            } else {
+                self.client_ports.rtp
+            },
+        );
+        match socket.try_recv_from(body) {
+            Ok((n, source)) => Ok((source == peer && n <= 8192).then_some(n)),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
     pub async fn recv_rtcp(&self, body: &mut [u8]) -> std::io::Result<Option<usize>> {
         let (n, source) = self.active.as_ref().unwrap().rtcp.recv_from(body).await?;
         Ok((source == self.peer_rtcp && n <= 8192).then_some(n))

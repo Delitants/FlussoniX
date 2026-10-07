@@ -137,7 +137,7 @@ impl App {
                 json!({"http":null,"https":null,"https_only":false}),
             ),
             rtsp_publication: std::sync::Mutex::new(
-                json!({"enabled":false,"rtsp":null,"rtsps":null,"transport":"interleaved TCP","codecs":["H264","HEVC","AAC-LC","MP2","MP3"]}),
+                json!({"enabled":false,"rtsp":null,"rtsps":null,"transport":"interleaved TCP","udp_enabled":false,"codecs":["H264","HEVC","AAC-LC","MP2","MP3"]}),
             ),
             srt_playback: std::sync::Mutex::new(
                 json!({"enabled":false,"listen":null,"encrypted":false}),
@@ -174,8 +174,18 @@ impl App {
         *self.http_delivery.lock().unwrap() = json!({"http":http.map(|a|a.to_string()),"https":https.map(|a|a.to_string()),"https_only":http.is_none() && https.is_some()});
     }
     pub fn set_rtsp_publication(&self, rtsp: Option<SocketAddr>, rtsps: Option<SocketAddr>) {
-        *self.rtsp_publication.lock().unwrap() = json!({"enabled":rtsp.is_some()||rtsps.is_some(),"rtsp":rtsp.map(|a|a.to_string()),"rtsps":rtsps.map(|a|a.to_string()),"transport":"interleaved TCP","codecs":["H264","HEVC","AAC-LC","MP2","MP3"]});
+        *self.rtsp_publication.lock().unwrap() = json!({"enabled":rtsp.is_some()||rtsps.is_some(),"rtsp":rtsp.map(|a|a.to_string()),"rtsps":rtsps.map(|a|a.to_string()),"transport":"interleaved TCP","udp_enabled":false,"codecs":["H264","HEVC","AAC-LC","MP2","MP3"]});
     }
+    pub fn set_rtsp_publication_udp(&self, enabled: bool) {
+        let mut profile = self.rtsp_publication.lock().unwrap();
+        profile["udp_enabled"] = json!(enabled && profile["rtsp"].is_string());
+        if profile["udp_enabled"] == true {
+            profile["transport"] = json!("interleaved TCP or unicast UDP");
+        } else {
+            profile["transport"] = json!("interleaved TCP");
+        }
+    }
+
     pub fn set_srt_playback(&self, listener: Option<&crate::srt_playback::Listener>) {
         *self.srt_playback.lock().unwrap() = match listener {
             Some(l) => {
@@ -723,7 +733,7 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
         let (gpu_profiles, vaapi_profiles) =
             tokio::join!(app.media.gpu_capabilities(), app.media.vaapi_capabilities());
         return json_response(
-            json!({"rtsp_publication":app.rtsp_publication.lock().unwrap().clone(),"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","rtsp-udp (unicast RTP/RTCP)","rtsp2 (RTSP/1.0 camera input, AAC audio default)","rtsps (verified TLS, interleaved TCP)","srt","rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","publish:// (HTTP MPEG-TS or RTSP/RTSPS interleaved TCP receive, H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","srt (caller push / global listener playback, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","rtsp (TCP publish push; TCP / opt-in unicast UDP playback; H264/HEVC/AAC-LC/MP2/MP3)","rtsps (verified TLS TCP publish push; opt-in TLS TCP playback; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["SDP negotiation","DTLS-SRTP / automatic key negotiation","RTSP UDP publication / push","rtsp Basic / Digest viewer auth","dvr","push protocols beyond SRT/RTSP/RTSPS","srt publication policy / per-stream playback listeners"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA / VAAPI H.264 / HEVC; profile readiness check, no software fallback","gpu_profiles":gpu_profiles,"vaapi_profiles":vaapi_profiles},"direct_srtp":{"available":crate::direct_rtp::crypto::availability(),"profile":"AES_CM_128_HMAC_SHA1_80","library":"independent system libsrtp2"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP redirects"}),
+            json!({"rtsp_publication":app.rtsp_publication.lock().unwrap().clone(),"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","rtsp-udp (unicast RTP/RTCP)","rtsp2 (RTSP/1.0 camera input, AAC audio default)","rtsps (verified TLS, interleaved TCP)","srt","rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","publish:// (HTTP MPEG-TS; RTSP TCP / opt-in unicast UDP; RTSPS TLS TCP receive; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","srt (caller push / global listener playback, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","rtsp (TCP publish push; TCP / opt-in unicast UDP playback; H264/HEVC/AAC-LC/MP2/MP3)","rtsps (verified TLS TCP publish push; opt-in TLS TCP playback; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["SDP negotiation","DTLS-SRTP / automatic key negotiation","RTSP UDP push","rtsp Basic / Digest viewer auth","dvr","push protocols beyond SRT/RTSP/RTSPS","srt publication policy / per-stream playback listeners"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA / VAAPI H.264 / HEVC; profile readiness check, no software fallback","gpu_profiles":gpu_profiles,"vaapi_profiles":vaapi_profiles},"direct_srtp":{"available":crate::direct_rtp::crypto::availability(),"profile":"AES_CM_128_HMAC_SHA1_80","library":"independent system libsrtp2"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP redirects"}),
         );
     }
     if let Some(name) = tail.strip_prefix("stream/") {

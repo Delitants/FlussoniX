@@ -291,6 +291,7 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
                         peer,
                         &cancel,
                         secure,
+                        udp.as_ref().map(|o| o.pool.clone()),
                     )
                     .await?;
                     break;

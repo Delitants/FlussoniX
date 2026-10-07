@@ -203,14 +203,12 @@ impl Bridge {
             Ok(false)
         }
     }
-    pub fn reports(&mut self) -> Vec<u8> {
+    pub fn reports(&mut self) -> Vec<(u8, Vec<u8>)> {
         let mut frames = Vec::new();
         for lane in &mut self.lanes {
             if let Some(source) = lane.ssrc {
                 let body = lane.reports.report(source);
-                frames.extend([b'$', lane.transport.rtcp]);
-                frames.extend((body.len() as u16).to_be_bytes());
-                frames.extend(body);
+                frames.push((lane.transport.rtcp, body));
             }
         }
         frames

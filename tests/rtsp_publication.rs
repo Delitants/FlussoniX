@@ -3,7 +3,10 @@ use flussonix::{
     rtsp,
     server::{App, Options},
 };
+use futures_util::FutureExt;
 use serde_json::json;
+#[path = "support/udp.rs"]
+mod udp_fixture;
 use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
@@ -13,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 const SDP: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=owned\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1\r\na=control:streamid=0\r\n";
 struct Lab {
     _dir: tempfile::TempDir,
+    pool: Option<Arc<rtsp::udp::Pool>>,
     app: Arc<App>,
     url: String,
     cancel: CancellationToken,
@@ -23,6 +27,12 @@ impl Lab {
         Self::with_ffmpeg(role, "/usr/bin/ffmpeg").await
     }
     async fn with_ffmpeg(role: &str, ffmpeg: &str) -> Self {
+        Self::with_pool(role, ffmpeg, 0).await
+    }
+    async fn udp(ports: u16) -> Self {
+        Self::with_pool("standalone", "/usr/bin/ffmpeg", ports).await
+    }
+    async fn with_pool(role: &str, ffmpeg: &str, ports: u16) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
             .with_test_writer()
@@ -58,9 +68,27 @@ impl Lab {
             listener.local_addr().unwrap()
         );
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(rtsp::serve(listener, app.clone(), cancel.clone()));
+        let pool = if ports == 0 {
+            None
+        } else {
+            let (range, held) = udp_fixture::reserved(ports);
+            drop(held);
+            Some(
+                rtsp::udp::Pool::bind("127.0.0.1".parse().unwrap(), range)
+                    .await
+                    .unwrap(),
+            )
+        };
+        let task = tokio::spawn(rtsp::serve_with_udp(
+            listener,
+            app.clone(),
+            cancel.clone(),
+            pool.clone(),
+            100.0,
+        ));
         Self {
             _dir: dir,
+            pool,
             app,
             url,
             cancel,
@@ -455,6 +483,14 @@ async fn decoded(path: &std::path::Path, video: Option<&str>, audio: &[&str]) {
 #[path = "support/tls.rs"]
 mod tls_fixture;
 fn publisher(video: Option<&str>, audio: &[&str], input_url: &str) -> tokio::process::Child {
+    publisher_transport(video, audio, input_url, "tcp")
+}
+fn publisher_transport(
+    video: Option<&str>,
+    audio: &[&str],
+    input_url: &str,
+    transport: &str,
+) -> tokio::process::Child {
     let mut cmd = tokio::process::Command::new("ffmpeg");
     cmd.args(["-nostdin", "-v", "error"]);
     if video.is_some() {
@@ -502,7 +538,7 @@ fn publisher(video: Option<&str>, audio: &[&str], input_url: &str) -> tokio::pro
         "-f",
         "rtsp",
         "-rtsp_transport",
-        "tcp",
+        transport,
     ])
     .arg(input_url)
     .stderr(std::process::Stdio::piped())
@@ -510,7 +546,21 @@ fn publisher(video: Option<&str>, audio: &[&str], input_url: &str) -> tokio::pro
     cmd.spawn().unwrap()
 }
 async fn qualify(video: Option<&str>, audio: &[&str], profile: serde_json::Value, tls: bool) {
-    let l = Lab::new("standalone").await;
+    qualify_transport(video, audio, profile, tls, false).await;
+}
+async fn qualify_transport(
+    video: Option<&str>,
+    audio: &[&str],
+    profile: serde_json::Value,
+    tls: bool,
+    udp: bool,
+) {
+    assert!(!(tls && udp));
+    let l = if udp {
+        Lab::udp(16).await
+    } else {
+        Lab::new("standalone").await
+    };
     let mut c = l.app.config.snapshot()["streams"]["owned"].clone();
     c["transcoder"] = profile.clone();
     c["flussonix_input_timeout"] = json!(15);
@@ -552,7 +602,8 @@ async fn qualify(video: Option<&str>, audio: &[&str], profile: serde_json::Value
             let _ = tokio::io::copy_bidirectional(&mut plain, &mut encrypted).await;
         }));
     }
-    let mut child = publisher(video, audio, &input_url);
+    let mut child = publisher_transport(video, audio, &input_url, if udp { "udp" } else { "tcp" });
+    let outcome = std::panic::AssertUnwindSafe(async {
     let cfg = l.app.config.effective("owned").unwrap();
     let w = tokio::time::timeout(Duration::from_secs(12), async {
         loop {
@@ -645,19 +696,24 @@ async fn qualify(video: Option<&str>, audio: &[&str], profile: serde_json::Value
             video.unwrap_or("audio"),
             audio.join("_"),
             profile["encoder"].as_str().unwrap_or("copy"),
-            if tls { "tls" } else { "tcp" }
+            if tls { "tls" } else if udp { "udp" } else { "tcp" }
         );
         let dir = std::path::Path::new(&root).join(case);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::copy(&path, dir.join("worker.ts")).unwrap();
-        std::fs::write(dir.join("evidence.json"),json!({"video":output_video,"audio":output_audio,"profile":profile,"transport":if tls{"verified TLS relay"}else{"TCP"},"worker_pid":w.pid(),"stats":w.stats(),"bytes":ts.len()}).to_string()).unwrap();
+        std::fs::write(dir.join("evidence.json"),json!({"video":output_video,"audio":output_audio,"profile":profile,"transport":if tls{"verified TLS relay"}else if udp{"UDP"}else{"TCP"},"worker_pid":w.pid(),"stats":w.stats(),"bytes":ts.len()}).to_string()).unwrap();
     }
-    child.kill().await.unwrap();
+    }).catch_unwind().await;
+    let _ = child.kill().await;
+    let _ = child.wait().await;
     drop(child);
     l.end().await;
     for task in auxiliary {
         task.abort();
         let _ = task.await;
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
     }
 }
 #[tokio::test]
@@ -1477,4 +1533,509 @@ async fn receiver_reports_bind_the_source_and_account_for_sequence_gaps() {
     assert_eq!(&body[16..20], &102u32.to_be_bytes());
     assert_eq!(&body[24..28], &0x01020304u32.to_be_bytes());
     assert!(u32::from_be_bytes(body[28..32].try_into().unwrap()) > 0);
+}
+
+// Wire-level UDP publication tests use independent client sockets, not the relay.
+async fn client_pair() -> (tokio::net::UdpSocket, tokio::net::UdpSocket, String) {
+    let (_, mut held) = udp_fixture::reserved(2);
+    let b = held.pop().unwrap();
+    let a = held.pop().unwrap();
+    a.set_nonblocking(true).unwrap();
+    b.set_nonblocking(true).unwrap();
+    let ports = format!(
+        "{}-{}",
+        a.local_addr().unwrap().port(),
+        b.local_addr().unwrap().port()
+    );
+    (
+        tokio::net::UdpSocket::from_std(a).unwrap(),
+        tokio::net::UdpSocket::from_std(b).unwrap(),
+        ports,
+    )
+}
+async fn setup_udp(l: &Lab, s: &mut BufReader<TcpStream>, sid: &str, ports: &str) -> (u16, String) {
+    request(
+        s,
+        "SETUP",
+        &track(&l.url),
+        &format!(
+            "Session: {sid}\r\nTransport: RTP/AVP/UDP;unicast;client_port={ports};mode=record\r\n"
+        ),
+        "",
+    )
+    .await
+}
+fn server_pair(headers: &str) -> (std::net::SocketAddr, std::net::SocketAddr) {
+    let t = headers
+        .lines()
+        .find_map(|h| h.strip_prefix("Transport: "))
+        .unwrap();
+    let ports = t
+        .split(';')
+        .find_map(|p| p.strip_prefix("server_port="))
+        .unwrap();
+    let (a, b) = ports.split_once('-').unwrap();
+    (
+        format!("127.0.0.1:{a}").parse().unwrap(),
+        format!("127.0.0.1:{b}").parse().unwrap(),
+    )
+}
+fn udp_packet(seq: u16, source: u32) -> Vec<u8> {
+    let mut p = vec![0x80, 96];
+    p.extend(seq.to_be_bytes());
+    p.extend((u32::from(seq) * 3600).to_be_bytes());
+    p.extend(source.to_be_bytes());
+    p.extend([0x65, 0x88, 0x84]);
+    p
+}
+#[tokio::test]
+async fn udp_publication_setup_is_opt_in_and_retains_valid_leases_after_rejected_offers() {
+    let l = Lab::udp(2).await;
+    assert!(l.pool.is_some());
+    let mut s = l.socket().await;
+    let (_, h) = announce(&mut s, &l.url, SDP).await;
+    let sid = id(&h);
+    let (_a, _b, ports) = client_pair().await;
+    let (code, h) = setup_udp(&l, &mut s, &sid, &ports).await;
+    assert_eq!(code, 200);
+    let pair = server_pair(&h);
+    assert!(h.contains("mode=record") && h.contains(&format!("client_port={ports}")));
+    assert_eq!(l.app.media.count().await, 0);
+    for bad in [
+        TRANSPORT,
+        "RTP/AVP;multicast;client_port=22000-22001;mode=record",
+        "RTP/AVP;unicast;client_port=22000-22001;mode=play",
+        "RTP/AVP;unicast;client_port=22000-22001;destination=127.0.0.2;mode=record",
+        "RTP/AVP;unicast;client_port=22001-22002;mode=record",
+        "RTP/AVP;unicast;client_port=22000-22001;mode=record;mode=record",
+    ] {
+        assert_eq!(setup(&mut s, &track(&l.url), &sid, bad).await, 461, "{bad}");
+    }
+    // Retargeting the same track reuses its only pair even when the pool is full.
+    let (_c, _d, new_ports) = client_pair().await;
+    let (code, h) = setup_udp(&l, &mut s, &sid, &new_ports).await;
+    assert_eq!(code, 200);
+    assert_eq!(server_pair(&h), pair);
+    let mut second = l.socket().await;
+    let (_, h) = announce(&mut second, &l.url, SDP).await;
+    assert_eq!(setup_udp(&l, &mut second, &id(&h), &ports).await.0, 453);
+    assert_eq!(
+        request(
+            &mut s,
+            "TEARDOWN",
+            &l.url,
+            &format!("Session: {sid}\r\n"),
+            ""
+        )
+        .await
+        .0,
+        200
+    );
+    drop(s);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(setup_udp(&l, &mut second, &id(&h), &ports).await.0, 200);
+    drop(second);
+    l.end().await;
+}
+#[tokio::test]
+async fn udp_publication_discards_early_and_foreign_packets_and_returns_rtcp_to_negotiated_peer() {
+    let l = Lab::udp(2).await;
+    let mut cfg = l.app.config.snapshot()["streams"]["owned"].clone();
+    cfg["flussonix_input_timeout"] = json!(15);
+    l.app.config.put("streams", "owned", cfg).unwrap();
+    let mut s = l.socket().await;
+    let (_, h) = announce(&mut s, &l.url, SDP).await;
+    let sid = id(&h);
+    let (rtp, rtcp, ports) = client_pair().await;
+    let (code, h) = setup_udp(&l, &mut s, &sid, &ports).await;
+    assert_eq!(code, 200);
+    let pair = server_pair(&h);
+    rtp.send_to(b"early malformed RTP", pair.0).await.unwrap();
+    assert_eq!(
+        request(&mut s, "RECORD", &l.url, &format!("Session: {sid}\r\n"), "")
+            .await
+            .0,
+        200
+    );
+    let worker = l
+        .app
+        .media
+        .ensure("owned", &l.app.config.effective("owned").unwrap())
+        .await
+        .unwrap();
+    let foreign = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let other_ip =
+        tokio::net::UdpSocket::bind(format!("127.0.0.2:{}", rtp.local_addr().unwrap().port()))
+            .await
+            .unwrap();
+    let source = 0x12345678;
+    for seq in 1..=70 {
+        foreign
+            .send_to(&udp_packet(seq, 0x99887766), pair.0)
+            .await
+            .unwrap();
+        other_ip
+            .send_to(b"foreign malformed", pair.0)
+            .await
+            .unwrap();
+        rtp.send_to(&vec![0; 8193], pair.0).await.unwrap();
+        rtp.send_to(&udp_packet(seq, source), pair.0).await.unwrap();
+        assert_eq!(
+            request(
+                &mut s,
+                "GET_PARAMETER",
+                &l.url,
+                &format!("Session: {sid}\r\n"),
+                ""
+            )
+            .await
+            .0,
+            200
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+    let mut b = [0; 8193];
+    let (n, from) = tokio::time::timeout(Duration::from_secs(2), rtcp.recv_from(&mut b))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(from, pair.1);
+    assert!(rtsp::udp::valid_receiver_report(&b[..n], source));
+    assert!(!worker.is_closed());
+    // Malformed packets from the admitted endpoint still terminate its publication.
+    rtp.send_to(&udp_packet(71, source ^ 1), pair.0)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(4), worker.closed())
+        .await
+        .unwrap();
+    drop(s);
+    l.end().await;
+}
+#[tokio::test]
+async fn independent_udp_h264_aac_publication_strictly_decodes() {
+    qualify_transport(
+        Some("libx264"),
+        &["aac"],
+        json!({"encoder":"copy","acodec":"copy"}),
+        false,
+        true,
+    )
+    .await;
+}
+#[tokio::test]
+async fn udp_publication_hevc_h264_mpeg_audio_and_audio_only_strictly_decode() {
+    for v in ["libx264", "libx265"] {
+        for a in ["aac", "mp2", "libmp3lame"] {
+            if v == "libx264" && a == "aac" {
+                continue;
+            }
+            qualify_transport(
+                Some(v),
+                &[a],
+                json!({"encoder":"copy","acodec":"copy"}),
+                false,
+                true,
+            )
+            .await;
+        }
+    }
+    qualify_transport(
+        None,
+        &["mp2", "libmp3lame"],
+        json!({"encoder":"copy","acodec":"copy"}),
+        false,
+        true,
+    )
+    .await;
+    qualify_transport(
+        Some("libx264"),
+        &["aac"],
+        json!({"encoder":"libx265","acodec":"mp2a","ab":192}),
+        false,
+        true,
+    )
+    .await;
+}
+
+async fn reclaimed(l: &Lab) {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            match l
+                .pool
+                .as_ref()
+                .unwrap()
+                .lease(
+                    "127.0.0.1".parse().unwrap(),
+                    rtsp::protocol::ClientPorts {
+                        rtp: 29000,
+                        rtcp: 29001,
+                    },
+                )
+                .await
+            {
+                Ok(lease) => {
+                    drop(lease);
+                    break;
+                }
+                Err(e) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    })
+    .await
+    .expect("owned publication must return its UDP pair");
+}
+#[tokio::test]
+async fn udp_publication_requires_disjoint_tracks_and_complete_setup_without_mixing_tcp() {
+    let l = Lab::udp(4).await;
+    let mut s = l.socket().await;
+    let sdp =
+        format!("{SDP}m=audio 0 RTP/AVP 14\r\na=rtpmap:14 MPA/90000\r\na=control:streamid=1\r\n");
+    let (_, h) = announce(&mut s, &l.url, &sdp).await;
+    let sid = id(&h);
+    let (_a, _b, ports) = client_pair().await;
+    assert_eq!(setup_udp(&l, &mut s, &sid, &ports).await.0, 200);
+    assert_eq!(
+        request(&mut s, "RECORD", &l.url, &format!("Session: {sid}\r\n"), "")
+            .await
+            .0,
+        455
+    );
+    let second = track(&l.url).replace("streamid=0", "streamid=1");
+    assert_eq!(setup(&mut s, &second, &sid, TRANSPORT).await, 461);
+    assert_eq!(
+        setup(
+            &mut s,
+            &second,
+            &sid,
+            &format!("RTP/AVP;unicast;client_port={ports};mode=record")
+        )
+        .await,
+        461
+    );
+    let (_c, _d, ports) = client_pair().await;
+    assert_eq!(
+        setup(
+            &mut s,
+            &second,
+            &sid,
+            &format!("RTP/AVP;unicast;client_port={ports};mode=\"RECORD\"")
+        )
+        .await,
+        200
+    );
+    assert_eq!(l.app.media.count().await, 0);
+    drop(s);
+    l.end().await;
+}
+#[tokio::test]
+async fn udp_publication_reclaims_pending_ports_on_eof_or_policy_change() {
+    for policy in [false, true] {
+        let l = Lab::udp(2).await;
+        let mut s = l.socket().await;
+        let (_, h) = announce(&mut s, &l.url, SDP).await;
+        let sid = id(&h);
+        let (_a, _b, ports) = client_pair().await;
+        assert_eq!(setup_udp(&l, &mut s, &sid, &ports).await.0, 200);
+        if policy {
+            let mut cfg = l.app.config.snapshot()["streams"]["owned"].clone();
+            cfg["password"] = json!("changed");
+            l.app.config.put("streams", "owned", cfg).unwrap();
+            let mut b = [0];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), s.read(&mut b))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+        }
+        drop(s);
+        reclaimed(&l).await;
+        assert_eq!(l.app.media.count().await, 0);
+        l.end().await;
+    }
+}
+#[tokio::test]
+async fn udp_publication_queue_overflow_before_record_fails_closed_and_reclaims_ports() {
+    let l = Lab::udp(2).await;
+    let mut s = l.socket().await;
+    let (_, h) = announce(&mut s, &l.url, SDP).await;
+    let sid = id(&h);
+    let (rtp, _b, ports) = client_pair().await;
+    let (code, h) = setup_udp(&l, &mut s, &sid, &ports).await;
+    assert_eq!(code, 200);
+    let pair = server_pair(&h);
+    for seq in 0..100 {
+        rtp.send_to(&udp_packet(seq, 7), pair.0).await.unwrap();
+    }
+    assert_eq!(
+        request(&mut s, "RECORD", &l.url, &format!("Session: {sid}\r\n"), "")
+            .await
+            .0,
+        503
+    );
+    drop(s);
+    reclaimed(&l).await;
+    assert_eq!(l.app.media.count().await, 0);
+    l.end().await;
+}
+#[tokio::test]
+async fn udp_publication_foreign_flood_and_rtcp_do_not_extend_media_timeout() {
+    let l = Lab::udp(2).await;
+    let mut s = l.socket().await;
+    let (_, h) = announce(&mut s, &l.url, SDP).await;
+    let sid = id(&h);
+    let (_a, rtcp, ports) = client_pair().await;
+    let (code, h) = setup_udp(&l, &mut s, &sid, &ports).await;
+    assert_eq!(code, 200);
+    let pair = server_pair(&h);
+    assert_eq!(
+        request(&mut s, "RECORD", &l.url, &format!("Session: {sid}\r\n"), "")
+            .await
+            .0,
+        200
+    );
+    let worker = l
+        .app
+        .media
+        .ensure("owned", &l.app.config.effective("owned").unwrap())
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    let flood = tokio::spawn(async move {
+        let foreign = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut sr = vec![0x80, 200, 0, 6];
+        sr.extend(7u32.to_be_bytes());
+        sr.extend([0; 20]);
+        loop {
+            tokio::select! {biased;_=stop.cancelled()=>break,_=tokio::time::sleep(Duration::from_millis(1))=>{
+                for _ in 0..16 {foreign.send_to(&udp_packet(1,7),pair.0).await.unwrap();}
+                rtcp.send_to(&sr,pair.1).await.unwrap();
+            }}
+        }
+    });
+    assert_eq!(
+        request(
+            &mut s,
+            "GET_PARAMETER",
+            &l.url,
+            &format!("Session: {sid}\r\n"),
+            ""
+        )
+        .await
+        .0,
+        200
+    );
+    let closed = tokio::time::timeout(Duration::from_secs(5), worker.closed()).await;
+    cancel.cancel();
+    flood.await.unwrap();
+    drop(s);
+    reclaimed(&l).await;
+    l.end().await;
+    closed.expect("foreign/RTCP traffic cannot hide media silence");
+}
+#[tokio::test]
+async fn udp_publication_renewal_counts_only_admitted_rtp_and_denial_reclaims_worker_and_ports() {
+    let l = Lab::udp(2).await;
+    let (mut rx, callback_task) = callback(&l.app, false).await;
+    let mut s = l.socket().await;
+    let (_, h) = announce(&mut s, &l.url, SDP).await;
+    let sid = id(&h);
+    let first = rx.recv().await.unwrap();
+    assert_eq!(first["bytes"], 0);
+    let (rtp, rtcp, ports) = client_pair().await;
+    let (code, h) = setup_udp(&l, &mut s, &sid, &ports).await;
+    assert_eq!(code, 200);
+    let pair = server_pair(&h);
+    assert_eq!(
+        request(&mut s, "RECORD", &l.url, &format!("Session: {sid}\r\n"), "")
+            .await
+            .0,
+        200
+    );
+    let worker = l
+        .app
+        .media
+        .ensure("owned", &l.app.config.effective("owned").unwrap())
+        .await
+        .unwrap();
+    let foreign = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    foreign.send_to(&udp_packet(1, 8), pair.0).await.unwrap();
+    rtcp.send_to(&[0x80, 201, 0, 1, 0, 0, 0, 7], pair.1)
+        .await
+        .unwrap();
+    let packet = udp_packet(1, 7);
+    rtp.send_to(&packet, pair.0).await.unwrap();
+    let renewal = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(renewal["bytes"], packet.len());
+    assert_eq!(renewal["request_number"], 1);
+    tokio::time::timeout(Duration::from_secs(4), worker.closed())
+        .await
+        .unwrap();
+    drop(s);
+    reclaimed(&l).await;
+    l.end().await;
+    callback_task.abort();
+    let _ = callback_task.await;
+}
+#[tokio::test]
+async fn udp_publication_eight_audio_tracks_strictly_decode_without_starvation() {
+    qualify_transport(
+        None,
+        &["mp2"; 8],
+        json!({"encoder":"copy","acodec":"copy"}),
+        false,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn rtsps_publication_rejects_plaintext_udp_even_when_plain_rtsp_pool_is_enabled() {
+    let l = Lab::udp(2).await;
+    let certificates = tls_fixture::Certificates::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(rtsp::serve_tls(
+        listener,
+        l.app.clone(),
+        l.cancel.clone(),
+        certificates.server(),
+    ));
+    let socket = TcpStream::connect(address).await.unwrap();
+    let encrypted = tokio_rustls::TlsConnector::from(certificates.client())
+        .connect(
+            tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            socket,
+        )
+        .await
+        .unwrap();
+    let mut s = BufReader::new(encrypted);
+    let url = format!("rtsps://{address}/owned?password=owned-publish");
+    let (code, h) = announce(&mut s, &url, SDP).await;
+    assert_eq!(code, 200);
+    let sid = id(&h);
+    let (_a, _b, ports) = client_pair().await;
+    assert_eq!(
+        setup(
+            &mut s,
+            &track(&url),
+            &sid,
+            &format!("RTP/AVP;unicast;client_port={ports};mode=record")
+        )
+        .await,
+        461
+    );
+    assert_eq!(setup(&mut s, &track(&url), &sid, TRANSPORT).await, 200);
+    drop(s);
+    l.end().await;
+    task.await.unwrap().unwrap();
 }
