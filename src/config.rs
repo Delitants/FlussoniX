@@ -497,7 +497,8 @@ fn validate_root(root: &Value) -> Result<(), String> {
                                 "publish:// must be the exact sole input without options".into()
                             );
                         }
-                        if input.get("rtp").is_some() && (scheme != "rtsp" || input["rtp"] != "udp")
+                        if input.get("rtp").is_some()
+                            && (!["rtsp", "rtsp-udp"].contains(&scheme) || input["rtp"] != "udp")
                         {
                             return Err("rtp input option requires RTSP and value udp".into());
                         }
@@ -531,7 +532,8 @@ fn validate_root(root: &Value) -> Result<(), String> {
                         }
                         if ![
                             "testsrc", "http", "https", "hls", "hlss", "tshttp", "tshttps", "rtsp",
-                            "rtsps", "srt", "m4s", "m4ss", "m4f", "m4fs", "publish", "rtp", "srtp",
+                            "rtsps", "rtsp-udp", "srt", "m4s", "m4ss", "m4f", "m4fs", "publish",
+                            "rtp", "srtp",
                         ]
                         .contains(&scheme)
                         {

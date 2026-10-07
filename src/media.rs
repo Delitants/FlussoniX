@@ -507,7 +507,7 @@ impl Engine {
             if translated.starts_with("rtsp://") {
                 cmd.args([
                     "-rtsp_transport",
-                    if inputs[index]["rtp"] == "udp" {
+                    if input.starts_with("rtsp-udp://") || inputs[index]["rtp"] == "udp" {
                         "udp"
                     } else {
                         "tcp"
@@ -581,6 +581,7 @@ impl Engine {
                 || m4s_input
                 || m4f_input
                 || input.starts_with("rtsp://")
+                || input.starts_with("rtsp-udp://")
                 || input.starts_with("rtsps://")
                 || (direct_input.is_some()
                     && inputs[index]["flussonix_rtp"]["profile"] == "elementary"))
@@ -1265,6 +1266,7 @@ pub fn translate_input(input: &str) -> Result<String, String> {
     let scheme = match scheme {
         "hls" | "tshttp" => "http",
         "hlss" | "tshttps" => "https",
+        "rtsp-udp" => "rtsp",
         "http" | "https" | "rtsp" | "srt" => scheme,
         _ => return Err(format!("unsupported input protocol: {scheme}")),
     };

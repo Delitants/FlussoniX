@@ -755,3 +755,56 @@ fn nvidia_hevc_profile_preserves_independent_audio_and_template_inheritance() {
         "hevc_nvenc"
     );
 }
+
+#[test]
+fn rtsp_udp_alias_is_inherited_persisted_and_rejects_incompatible_options() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("alias.json");
+    let store = ConfigStore::open(&path).unwrap();
+    let input = json!({"url":"rtsp-udp://user:owned-secret@camera:554/live?token=owned%3Atoken"});
+    store
+        .put(
+            "templates",
+            "camera-alias",
+            json!({"inputs":[input.clone()]}),
+        )
+        .unwrap();
+    store
+        .put(
+            "streams",
+            "owned-alias",
+            json!({"template":"camera-alias", "static":false}),
+        )
+        .unwrap();
+    assert_eq!(store.effective("owned-alias").unwrap()["inputs"][0], input);
+    for rejected in [
+        json!({"url":"rtsp-udp://camera/live", "rtp":"tcp"}),
+        json!({"url":"rtsp-udp://camera/live", "rtp":true}),
+        json!({"url":"rtsp-udp://camera/live", "flussonix_tls_ca":"/missing/owned-ca.pem"}),
+        json!({"url":"rtsp-udp://camera/live", "flussonix_rtp":{"profile":"mp2t"}}),
+    ] {
+        assert!(
+            store
+                .put("streams", "owned-alias", json!({"inputs":[rejected]}))
+                .is_err()
+        );
+        assert_eq!(store.effective("owned-alias").unwrap()["inputs"][0], input);
+    }
+    store
+        .put(
+            "streams",
+            "redundant",
+            json!({"inputs":[{"url":"rtsp-udp://camera/live", "rtp":"udp"}], "static":false}),
+        )
+        .unwrap();
+    drop(store);
+    let reopened = ConfigStore::open(path).unwrap();
+    assert_eq!(
+        reopened.effective("owned-alias").unwrap()["inputs"][0],
+        input
+    );
+    assert_eq!(
+        reopened.effective("redundant").unwrap()["inputs"][0]["rtp"],
+        "udp"
+    );
+}

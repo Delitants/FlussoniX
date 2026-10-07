@@ -778,16 +778,29 @@ async fn udp_and_tcp_clients_decode_both_tracks_using_one_worker() {
 }
 #[tokio::test]
 async fn udp_input_repackages_both_tracks_into_independently_decoded_hls() {
+    udp_input_roundtrip(false, true).await;
+}
+#[tokio::test]
+async fn udp_alias_input_repackages_both_tracks_and_keeps_the_original_protocol() {
+    udp_input_roundtrip(true, false).await;
+    udp_input_roundtrip(true, true).await;
+}
+async fn udp_input_roundtrip(alias: bool, explicit_udp: bool) {
     let (_d, app, url, c, t, _pool) = fixture_udp("standalone", 2, 100.0).await;
+    let mut input = json!({"url":format!("{}?token=owned%2Dtoken", if alias {url.replacen("rtsp://", "rtsp-udp://", 1)} else {url})});
+    if explicit_udp {
+        input["rtp"] = json!("udp");
+    }
     let d = tempfile::tempdir().unwrap();
     let relay = flussonix::media::Engine::new(d.path(), "ffmpeg");
     let worker = relay
-        .ensure(
-            "roundtrip",
-            &json!({"inputs":[{"url":format!("{url}?token=owned-token"),"rtp":"udp"}]}),
-        )
+        .ensure("roundtrip", &json!({"inputs":[input]}))
         .await
         .unwrap();
+    assert_eq!(
+        worker.stats()["input_protocol"],
+        if alias { "rtsp-udp" } else { "rtsp" }
+    );
     let mut path = None;
     for _ in 0..180 {
         if let Ok(data) = relay.read("roundtrip", "index.m3u8").await {

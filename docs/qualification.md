@@ -403,3 +403,28 @@ supported outbound profile does not imply Basic/Digest viewer or incoming
 publisher authentication, auth-int, SHA-512 variants, international credentials,
 proxy authentication, Authentication-Info negotiation, vendor dialect parity or
 migration/throughput qualification. Exact-head CI remains the publication gate.
+
+
+## RTSP UDP URL alias increment
+
+Owned loopback sources exercise `rtsp-udp://` both alone and with the redundant
+`rtp:"udp"` input option. Independent FFmpeg strictly decodes video and audio
+from the resulting HLS segments; the source must also report actual UDP media
+egress. The canonical `rtsp://` plus `rtp:"udp"` roundtrip remains covered. The
+original alias is retained in worker input statistics, and an escaped token
+query reaches source authorization.
+
+Configuration tests preserve template inheritance, restart persistence and the
+original URL including credentials and query encoding. Contradictory transport
+values, TLS CA configuration on the plaintext alias and direct RTP options must
+fail without replacing the prior saved configuration. The local configuration
+suite passes 24 cases and the RTSP suite passes 18; formatting, Clippy across all
+targets and the normal standalone build pass. Browser regressions cover the
+inherited masked summary, selector values, TCP scheme conversion, redundant UDP
+options and clearing foreign settings when switching RTSP/RTSPS. Exact-head
+full CI and review gate publication.
+
+These fixtures do not use official Flussonic runtime components or production
+streams. The alias adds the existing UDP pull profile; it does not qualify UDP
+publication/push, receiving Basic/Digest negotiation, all codecs over this alias,
+real camera dialects, loss recovery or migration-scale load.

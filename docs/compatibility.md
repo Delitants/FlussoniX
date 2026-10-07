@@ -196,3 +196,20 @@ diagnostics, not vendor push-stat parity. See the [exact push profile](rtsp-push
 This supersedes older outbound RTSP pending statements for the bounded TCP
 profile; complete API, vendor recorder dialects and migration compatibility
 remain to be qualified.
+
+
+## RTSP UDP input URL alias
+
+`rtsp-udp://` is accepted as an input URL in Streams and Templates, preserving
+inheritance and persistence. It selects the existing unicast UDP pull profile;
+`rtp:"udp"` may also be present. The friendly transport selector recognizes both
+forms. Selecting TCP changes only the alias scheme to `rtsp://` and removes the
+UDP option. Credentials and queries retain their original encoding; summaries
+continue masking secrets. Unsupported transport values, direct RTP settings
+and TLS CA settings are rejected before replacing the saved configuration.
+
+This closes the input-scheme gap advertised in the installed reference schema.
+Qualification uses owned FlussoniX sources and independently installed FFmpeg,
+without invoking official components. It does not establish mixed-vendor camera
+interop, UDP publication/push, receiving Basic/Digest policy, `rtsp2`,
+`wait_rtcp`, multicast RTSP or production capacity.
