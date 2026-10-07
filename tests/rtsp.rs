@@ -778,69 +778,76 @@ async fn udp_and_tcp_clients_decode_both_tracks_using_one_worker() {
 }
 #[tokio::test]
 async fn udp_input_repackages_both_tracks_into_independently_decoded_hls() {
-    udp_input_roundtrip(false, true).await;
+    udp_input_roundtrip("rtsp", true).await;
 }
 #[tokio::test]
 async fn udp_alias_input_repackages_both_tracks_and_keeps_the_original_protocol() {
-    udp_input_roundtrip(true, false).await;
-    udp_input_roundtrip(true, true).await;
+    udp_input_roundtrip("rtsp-udp", false).await;
+    udp_input_roundtrip("rtsp-udp", true).await;
 }
-async fn udp_input_roundtrip(alias: bool, explicit_udp: bool) {
+#[tokio::test]
+async fn rtsp2_camera_default_keeps_video_decodable_with_reencoded_audio() {
+    udp_input_roundtrip("rtsp2", true).await;
+}
+async fn udp_input_roundtrip(scheme: &str, explicit_udp: bool) {
     let (_d, app, url, c, t, _pool) = fixture_udp("standalone", 2, 100.0).await;
-    let mut input = json!({"url":format!("{}?token=owned%2Dtoken", if alias {url.replacen("rtsp://", "rtsp-udp://", 1)} else {url})});
+    let mut input = json!({"url":format!("{}?token=owned%2Dtoken", url.replacen("rtsp://", &format!("{scheme}://"), 1))});
     if explicit_udp {
         input["rtp"] = json!("udp");
     }
     let d = tempfile::tempdir().unwrap();
     let relay = flussonix::media::Engine::new(d.path(), "ffmpeg");
-    let worker = relay
-        .ensure("roundtrip", &json!({"inputs":[input]}))
-        .await
-        .unwrap();
-    assert_eq!(
-        worker.stats()["input_protocol"],
-        if alias { "rtsp-udp" } else { "rtsp" }
-    );
-    let mut path = None;
-    for _ in 0..180 {
-        if let Ok(data) = relay.read("roundtrip", "index.m3u8").await {
-            if let Some(name) = String::from_utf8_lossy(&data)
-                .lines()
-                .find(|l| !l.is_empty() && !l.starts_with('#'))
-            {
-                path = Some(name.to_owned());
-                break;
+    let result = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+        let worker = relay
+            .ensure("roundtrip", &json!({"inputs":[input]}))
+            .await
+            .unwrap();
+        assert_eq!(worker.stats()["input_protocol"], scheme);
+        let mut path = None;
+        for _ in 0..180 {
+            if let Ok(data) = relay.read("roundtrip", "index.m3u8").await {
+                if let Some(name) = String::from_utf8_lossy(&data)
+                    .lines()
+                    .find(|l| !l.is_empty() && !l.starts_with('#'))
+                {
+                    path = Some(name.to_owned());
+                    break;
+                }
             }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(
-        path.is_some(),
-        "UDP input should produce HLS: {}",
-        worker.stats()
-    );
-    let media = relay.read("roundtrip", &path.unwrap()).await.unwrap();
-    let file = d.path().join("decode.ts");
-    std::fs::write(&file, media).unwrap();
-    let output = tokio::process::Command::new("ffmpeg")
-        .args(["-nostdin", "-v", "error", "-i"])
-        .arg(file)
-        .args([
-            "-map", "0:v:0", "-map", "0:a:0", "-threads", "1", "-f", "framemd5", "-",
-        ])
-        .kill_on_drop(true)
-        .output()
-        .await
-        .unwrap();
-    assert_decoded(&output);
-    assert!(
-        app.rtsp_udp_egress.load(Ordering::Relaxed) > 100000,
-        "rtp=udp must select UDP, not TCP"
-    );
+        assert!(
+            path.is_some(),
+            "UDP input should produce HLS: {}",
+            worker.stats()
+        );
+        let media = relay.read("roundtrip", &path.unwrap()).await.unwrap();
+        let file = d.path().join("decode.ts");
+        std::fs::write(&file, media).unwrap();
+        let output = tokio::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-i"])
+            .arg(file)
+            .args([
+                "-map", "0:v:0", "-map", "0:a:0", "-threads", "1", "-f", "framemd5", "-",
+            ])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+        assert_decoded(&output);
+        assert!(
+            app.rtsp_udp_egress.load(Ordering::Relaxed) > 100000,
+            "rtp=udp must select UDP, not TCP"
+        );
+    }))
+    .await;
     relay.stop_all().await;
     c.cancel();
     t.await.unwrap().unwrap();
     app.media.stop_all().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }
 #[tokio::test]
 async fn cdn_udp_output_reuses_private_m4s_and_m4f_pulls() {

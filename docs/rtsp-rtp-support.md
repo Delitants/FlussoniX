@@ -131,3 +131,17 @@ query-based receiver authorization and cancellation. No per-destination
 encoder or vendor runtime is used. See [RTSP/RTSPS push](rtsp-push.md).
 Older pending-direction notes above describe their original increments; this
 addition qualifies the documented TCP publishing output subset only.
+
+## RTSP2 camera input alias
+
+`rtsp2://` now selects the existing RTSP/1.0 pull adapter, with TCP by default
+or unicast UDP using `rtp:"udp"`. It retains the original saved URL and input
+statistics. Absent effective `transcoder.acodec`, audio defaults to AAC at the
+configured bitrate or 96 kb/s, using 48 kHz stereo; video retains its normal
+profile. All source audio is encoded by this default, not only G.711. Explicit
+stream/template audio settings win. Defaults follow the input actually selected
+during failover. The friendly primary-input form shows the AAC default and
+keeps the alias when changing transport. See the [bounded compatibility
+profile](compatibility.md#rtsp2-camera-input) and [owned qualification
+fixtures](qualification.md#rtsp2-camera-input-increment). RTSP 2.0, `wait_rtcp`,
+receiving Basic/Digest policy and real-camera dialect parity remain pending.

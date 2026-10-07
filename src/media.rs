@@ -573,7 +573,7 @@ impl Engine {
                 "0:a:0?"
             },
         ]);
-        let profile = crate::transcoder::Profile::resolve(cfg, synthetic)?;
+        let profile = crate::transcoder::Profile::resolve_for_input(cfg, input)?;
         profile.apply(&mut cmd);
         // RTP AAC depacketizers can omit key flags; copied units are independent.
         if profile.audio_copy()
@@ -582,6 +582,7 @@ impl Engine {
                 || m4f_input
                 || input.starts_with("rtsp://")
                 || input.starts_with("rtsp-udp://")
+                || input.starts_with("rtsp2://")
                 || input.starts_with("rtsps://")
                 || (direct_input.is_some()
                     && inputs[index]["flussonix_rtp"]["profile"] == "elementary"))
@@ -1266,7 +1267,7 @@ pub fn translate_input(input: &str) -> Result<String, String> {
     let scheme = match scheme {
         "hls" | "tshttp" => "http",
         "hlss" | "tshttps" => "https",
-        "rtsp-udp" => "rtsp",
+        "rtsp-udp" | "rtsp2" => "rtsp",
         "http" | "https" | "rtsp" | "srt" => scheme,
         _ => return Err(format!("unsupported input protocol: {scheme}")),
     };

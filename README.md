@@ -148,3 +148,11 @@ Streams/Templates now provide separate MPEG-TS and elementary RTP profiles. Elem
 
 
 Configured `publish://` streams also receive [RTSP and RTSPS publications](docs/rtsp-publication.md) on enabled listeners. The friendly receive mode retains the HTTP URL and shows actual RTSP/RTSPS URLs, without displaying passwords in them. ANNOUNCE/SETUP/RECORD use the same publisher password, `on_publish` renewal and exclusive shared worker as HTTP. The initial profile is TCP with H.264/HEVC, AAC-LC and MP2/MP3; UDP publication and outbound RTSP push remain pending.
+
+Camera inputs can use `rtsp2://` to default audio to AAC, including G.711 A-law
+and µ-law sources. Video retains its configured profile (copy by default).
+The camera alias uses RTSP/1.0 with TCP by default; select UDP in the normal
+input form to save `rtp:"udp"` without changing the alias. An explicit stream or
+template audio codec overrides the default. This profile encodes all source
+audio to AAC by default, rather than detecting and selectively replacing G.711;
+see [compatibility details](docs/compatibility.md#rtsp2-camera-input).

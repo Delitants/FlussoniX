@@ -213,3 +213,33 @@ Qualification uses owned FlussoniX sources and independently installed FFmpeg,
 without invoking official components. It does not establish mixed-vendor camera
 interop, UDP publication/push, receiving Basic/Digest policy, `rtsp2`,
 `wait_rtcp`, multicast RTSP or production capacity.
+
+## RTSP2 camera input
+
+Streams and Templates accept `rtsp2://` as a camera input alias. The independent
+FFmpeg adapter receives `rtsp://`; only the scheme changes, preserving encoded
+credentials, paths and queries. Saved configuration and worker input statistics
+retain the original alias. This is RTSP/1.0, not RTSP protocol version 2.0.
+TCP is the default; `rtp:"udp"` selects unicast UDP. The friendly input form
+recognizes both transports without rewriting the camera alias. Plaintext
+`rtsp2` rejects TLS CA and direct RTP settings before changing saved state.
+
+For the currently selected `rtsp2` input, absent effective `transcoder.acodec`
+defaults to AAC. Video retains the existing profile, normally copy. Audio uses
+48 kHz stereo at 96 kb/s unless an effective audio bitrate is configured. This
+bounded camera profile **encodes all source audio**, including audio already in
+AAC; it does not selectively transcode G.711 while copying other audio codecs.
+An explicit stream or inherited template `acodec` wins, including `copy`,
+`aac`, `mp2a` and `mp3`. Copying G.711 does not make it compatible with the shared
+HLS/MPEG-TS worker. Defaults follow each selected fallback input independently;
+canonical `rtsp`, `rtsp-udp` and `rtsps` retain their existing audio defaults.
+The form displays the primary input's default and explains the per-input rule.
+
+Owned PCMA/PCMU camera fixtures qualify default AAC conversion on TCP and UDP,
+source Basic authentication and encoded query preservation, independently
+decoded HLS, explicit MP3/MPEG Layer II overrides and shared-worker reuse.
+Configuration and browser checks cover inheritance, persistence, transport
+changes, secret masking, independent audio controls and clearing foreign TLS
+options. This adds no vendor runtime dependency. Camera dialect parity,
+`wait_rtcp`, receiving Basic/Digest policy, RTSP 2.0, multicast RTSP and
+production-scale migration qualification remain separate gaps.

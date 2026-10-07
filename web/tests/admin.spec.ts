@@ -810,3 +810,27 @@ test('RTSP UDP URL alias inherits and switches transport without losing the addr
  state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0]).toEqual({url});await expect(page.locator('textarea')).toHaveCount(0);
  }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});await request.delete('/streamer/api/v3/templates/'+template,{headers});}
 });
+
+test('RTSP2 camera audio defaults inherit and transport preserves the saved alias',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const template='ui-rtsp2-template',name='ui-rtsp2-stream',url='rtsp2://user:owned-camera-secret@127.0.0.1:19990/camera?token=owned%3Atoken';
+ try{
+ expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{$reset:true,static:false,inputs:[{url}]}})).ok()).toBeTruthy();
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,template,static:false}})).ok()).toBeTruthy();
+ await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Input',exact:true}).click();
+ await expect(page.getByText('1. rtsp2://hidden:hidden@127.0.0.1:19990/camera?token=hidden · TCP',{exact:true})).toBeVisible();
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+ const audio=page.getByLabel('Audio encoding',{exact:true}),rate=page.getByLabel('Audio bitrate (kb/s)',{exact:true}),transport=page.getByLabel('RTSP transport',{exact:true}),input=page.getByLabel('Input URL',{exact:true});
+ await expect(audio).toHaveValue('inherit');await expect(rate).toHaveValue('96');await expect(page.getByLabel('Transcoding',{exact:true})).toHaveValue('inherit');await expect(page.getByLabel('Video bitrate (kb/s)',{exact:true})).toHaveCount(0);
+ await expect(page.getByText(/RTSP2 camera inputs default to AAC/)).toBeVisible();
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ let state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.transcoder).toBeUndefined();expect(state.config_on_disk.inputs).toBeUndefined();
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Input settings',{exact:true}).selectOption('override');await input.fill(url);await expect(transport).toHaveValue('tcp');await transport.selectOption('udp');
+ await audio.selectOption('mp3');await expect(rate).toHaveValue('128');await page.getByRole('button',{name:'Save',exact:true}).click();
+ state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0]).toEqual({url,rtp:'udp'});expect(state.config_on_disk.transcoder).toEqual({acodec:'mp3',ab:128});
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await transport.selectOption('tcp');await expect(input).toHaveValue(url);await audio.selectOption('copy');await expect(rate).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();
+ state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0]).toEqual({url});expect(state.config_on_disk.transcoder).toEqual({acodec:'copy'});
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await audio.selectOption('inherit');await expect(rate).toHaveValue('96');await transport.selectOption('udp');await input.fill('rtsps://localhost:19990/camera');await expect(transport).toHaveCount(0);const ca=page.getByLabel('Trusted CA file',{exact:true});await ca.fill(process.env.FLUSSONIX_TEST_CA_FILE!);await input.fill(url);await expect(ca).toHaveCount(0);await expect(transport).toHaveValue('tcp');await page.getByRole('button',{name:'Save',exact:true}).click();
+ state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0]).toEqual({url});expect(state.config_on_disk.transcoder).toBeUndefined();await expect(page.locator('textarea')).toHaveCount(0);
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});await request.delete('/streamer/api/v3/templates/'+template,{headers});}
+});

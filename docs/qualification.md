@@ -428,3 +428,26 @@ These fixtures do not use official Flussonic runtime components or production
 streams. The alias adds the existing UDP pull profile; it does not qualify UDP
 publication/push, receiving Basic/Digest negotiation, all codecs over this alias,
 real camera dialects, loss recovery or migration-scale load.
+
+## RTSP2 camera input increment
+
+The owned Python RTSP/1.0 camera uses independently FFmpeg-encoded G.711 A-law
+and µ-law samples and a small RTP sender separate from application code. A
+canonical RTSP input with explicit AAC first validates the oracle. Default
+RTSP2 input must produce independently probed and strictly decoded AAC HLS
+on both TCP and UDP, preserving encoded query authorization and camera Basic
+credentials. Source proof records actual transport, emitted RTP bytes and wire
+version. Repeated pulls reuse one worker and one source connection. Explicit
+MP3 and MPEG Layer II profiles must decode to their requested codecs, and the
+existing video/audio roundtrip checks copied video with encoded camera audio.
+Owned workers and camera children are stopped and reaped even on assertion
+failures. No official server, library, production stream or remote CDN is used.
+
+Configuration checks cover template inheritance, restart persistence, invalid
+transport, plaintext TLS and direct RTP options without replacing saved state.
+The browser verifies masked inherited TCP summaries, AAC/96 kb/s defaults with
+copied video, absence of unwanted saved transcoder overrides, explicit MP3/copy
+selection, alias retention on transport changes and removing foreign TLS
+settings. Full exact-head CI and fresh review gate publication. These checks
+qualify the stated camera profile, not receiving viewer Basic/Digest policy,
+selective G.711-only conversion, all camera dialects or migration capacity.

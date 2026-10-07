@@ -498,7 +498,8 @@ fn validate_root(root: &Value) -> Result<(), String> {
                             );
                         }
                         if input.get("rtp").is_some()
-                            && (!["rtsp", "rtsp-udp"].contains(&scheme) || input["rtp"] != "udp")
+                            && (!["rtsp", "rtsp-udp", "rtsp2"].contains(&scheme)
+                                || input["rtp"] != "udp")
                         {
                             return Err("rtp input option requires RTSP and value udp".into());
                         }
@@ -532,8 +533,8 @@ fn validate_root(root: &Value) -> Result<(), String> {
                         }
                         if ![
                             "testsrc", "http", "https", "hls", "hlss", "tshttp", "tshttps", "rtsp",
-                            "rtsps", "rtsp-udp", "srt", "m4s", "m4ss", "m4f", "m4fs", "publish",
-                            "rtp", "srtp",
+                            "rtsps", "rtsp-udp", "rtsp2", "srt", "m4s", "m4ss", "m4f", "m4fs",
+                            "publish", "rtp", "srtp",
                         ]
                         .contains(&scheme)
                         {

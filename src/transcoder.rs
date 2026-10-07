@@ -28,6 +28,15 @@ impl Profile {
     pub(crate) fn resolve(cfg: &Value, synthetic: bool) -> Result<Self, String> {
         Self::resolve_inner(cfg, synthetic, false)
     }
+    pub(crate) fn resolve_for_input(cfg: &Value, input: &str) -> Result<Self, String> {
+        let mut profile = Self::resolve(cfg, input == "testsrc://")?;
+        // Camera G.711 must be encoded for the shared HLS/TS worker. Apply the
+        // alias default only to the selected input; explicit/template audio wins.
+        if input.starts_with("rtsp2://") && cfg["transcoder"].get("acodec").is_none() {
+            profile.audio = "aac";
+        }
+        Ok(profile)
+    }
     pub(crate) fn validate_partial(cfg: &Value) -> Result<Self, String> {
         Self::resolve_inner(
             cfg,
