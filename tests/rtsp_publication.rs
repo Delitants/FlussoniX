@@ -2039,3 +2039,75 @@ async fn rtsps_publication_rejects_plaintext_udp_even_when_plain_rtsp_pool_is_en
     l.end().await;
     task.await.unwrap().unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn continuous_foreign_udp_queue_yields_to_control_reader_on_one_runtime_thread() {
+    let l = Lab::udp(2).await;
+    let mut s = l.socket().await;
+    let (_, h) = announce(&mut s, &l.url, SDP).await;
+    let sid = id(&h);
+    let (_a, _b, ports) = client_pair().await;
+    let (code, h) = setup_udp(&l, &mut s, &sid, &ports).await;
+    assert_eq!(code, 200);
+    let pair = server_pair(&h);
+    assert_eq!(
+        request(&mut s, "RECORD", &l.url, &format!("Session: {sid}\r\n"), "")
+            .await
+            .0,
+        200
+    );
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let start = std::time::Instant::now();
+    // Independent OS threads keep the kernel queue ready even if Tokio cannot run.
+    // A real-time bound guarantees the failing implementation eventually returns.
+    let senders = (0..4)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                let body = [0; 8193];
+                let mut sent = 0;
+                while start.elapsed() < Duration::from_secs(2)
+                    && !stop.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    socket.send_to(&body, pair.0).unwrap();
+                    sent += 1;
+                }
+                sent
+            })
+        })
+        .collect::<Vec<_>>();
+    // Let the reader tasks contend with permanently ready UDP without a timer-based
+    // flood producer accidentally yielding the receiver for us.
+    let mut codes = Vec::new();
+    for _ in 0..10 {
+        codes.push(
+            request(
+                &mut s,
+                "GET_PARAMETER",
+                &l.url,
+                &format!("Session: {sid}\r\n"),
+                "",
+            )
+            .await
+            .0,
+        );
+    }
+    let elapsed = start.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let sent: usize = senders.into_iter().map(|h| h.join().unwrap()).sum();
+    drop(s);
+    l.end().await;
+    eprintln!(
+        "Ten control responses during continuous UDP flood: {elapsed:?}; datagrams sent: {sent}"
+    );
+    assert!(
+        sent > 100,
+        "independent flood must actually send packets: {sent}"
+    );
+    assert!(codes.iter().all(|c| *c == 200));
+    assert!(
+        elapsed < Duration::from_millis(800),
+        "control reader starved for {elapsed:?} during {sent} discarded datagrams"
+    );
+}

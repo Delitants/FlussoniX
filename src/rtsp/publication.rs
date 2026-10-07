@@ -547,6 +547,9 @@ async fn run<W: AsyncWrite + Unpin>(
                 Ok(None)=>{},
                 Err(_)=>break,
             }
+            // Readiness plus try_recv_from does not consume Tokio's task budget.
+            // Even discarded traffic must yield when that budget is exhausted.
+            tokio::task::consume_budget().await;
         },
         }
     }
