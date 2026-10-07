@@ -25,6 +25,12 @@ pub(crate) fn destination(value: &str) -> Option<url::Url> {
             return None;
         }
     }
+    // Parsers may discard empty userinfo, so reject its original authority
+    // marker too. An @ in the path or query is ordinary URI data.
+    let authority = value.split_once("://")?.1.split(['/', '?', '#']).next()?;
+    if authority.contains('@') {
+        return None;
+    }
     let target = url::Url::parse(value).ok()?;
     (matches!(target.scheme(), "rtsp" | "rtsps")
         && target.host_str().is_some()

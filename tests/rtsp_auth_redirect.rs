@@ -330,6 +330,8 @@ async fn callback_rejects_wrong_protocol_unsafe_or_oversized_destinations() {
             "//127.0.0.1/other".into(),
             "rtsp:///other".into(),
             "rtsp://user:secret@127.0.0.1:9/other".into(),
+            "rtsp://@127.0.0.1:9/other".into(),
+            "rtsp://:@127.0.0.1:9/other".into(),
             "rtsp://127.0.0.1:9/other#fragment".into(),
             "rtsp://127.0.0.1:9/path with space".into(),
             "rtsp://127.0.0.1:9/path?x=a\tb".into(),
@@ -354,7 +356,7 @@ async fn callback_rejects_wrong_protocol_unsafe_or_oversized_destinations() {
         lab.backend.omit_location.store(true, Ordering::SeqCst);
         assert_eq!(lab.describe(false, "missing").await.0, 403);
         lab.backend.omit_location.store(false, Ordering::SeqCst);
-        let encoded = "rtsp://127.0.0.1:9/%22%3C%3E%7B%7D%60%7C%5E?x=%25%20%0D%0A";
+        let encoded = "rtsp://127.0.0.1:9/%22%3C%3E%7B%7D%60%7C%5E?x=%25%20%0D%0A&email=a@b";
         lab.target(Some(encoded));
         redirected(lab.describe(false, "encoded").await, encoded);
         assert_eq!(lab.app.media.count().await, 0);

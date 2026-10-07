@@ -561,3 +561,9 @@ checks; raw RTSP destinations require RFC3986 characters and valid percent
 escapes. Eleven routing tests pass, including the shared HTTP grant regression.
 The earlier candidate CI was deliberately cancelled after review found these
 issues; release requires a full successful run of the revised immutable head.
+
+A final minor review case verifies that empty raw userinfo markers (`@` and
+`:@`) are rejected even when URL parsing discards their empty credential
+fields. An encoded-safe destination containing `@` in query data remains
+byte-for-byte intact. The regression failed before the raw-authority check
+and all eleven routing cases pass after it.
