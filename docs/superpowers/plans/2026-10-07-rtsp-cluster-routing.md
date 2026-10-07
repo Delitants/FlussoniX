@@ -9,7 +9,7 @@
 
 ## Global constraints
 - No official Flussonic component or production changes.
-- Native pool<=64; snapshot cache1second, network concurrency8, body<=2MiB, timeout3seconds.
+- Native pool<=64; snapshot cache1second, network concurrency8, body<=2MiB, snapshot timeout500ms, collection phase4500ms, admission timeout3seconds.
 - Existing select hard ceilings/weighted policy; projected2Mbit/s per RTSP request; reservations5seconds.
 - Actual TLS socket never downgrades; no peer credentials in viewer URL.
 - Friendly UI; no JSON inputs. Preserve API/config/environment/listeners on release.

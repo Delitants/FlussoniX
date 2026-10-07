@@ -105,6 +105,7 @@ struct Probe {
     snapshot: Mutex<Option<Value>>,
     reject: AtomicBool,
     pause: AtomicBool,
+    stall: AtomicBool,
     entered: Notify,
     release: Notify,
     key: String,
@@ -137,6 +138,9 @@ async fn intercept(State(p): State<Arc<Probe>>, r: Request<Body>, next: Next) ->
         }
         if path.ends_with("rtsp-routing") {
             p.polls.fetch_add(1, Ordering::SeqCst);
+            if p.stall.load(Ordering::SeqCst) {
+                p.release.notified().await;
+            }
             if let Some(v) = p.snapshot.lock().unwrap().clone() {
                 return axum::Json(v).into_response();
             }
@@ -995,6 +999,31 @@ async fn callback_redirect_precedes_placement_and_internal_ticket_stays_out_of_c
     })
     .catch_unwind()
     .await;
+    lab.stop().await;
+    if let Err(p) = result {
+        std::panic::resume_unwind(p)
+    }
+}
+
+#[tokio::test]
+async fn available_cdn_survives_partial_snapshot_timeout_in_supported_pool() {
+    let mut lab = Lab::new(1000).await;
+    let mut slow = Node::new("cdn", 1000).await;
+    let result=std::panic::AssertUnwindSafe(async {
+        slow.probe.stall.store(true,Ordering::SeqCst);
+        let edge=lab.lb.app.config.snapshot()["peers"][0].clone();
+        lab.lb.app.config.delete("peers","edge").unwrap();
+        for i in 0..63 {lab.lb.app.config.put("peers",&format!("slow-{i}"),json!({"api_url":slow.http,"cluster_key":slow.app.options.peer_key,"flussonix_rtsp_url":slow.plain})).unwrap();}
+        lab.lb.app.config.put("peers","edge",edge).unwrap();
+        assert_eq!(lab.lb.app.config.snapshot()["peers"].as_array().unwrap().last().unwrap()["hostname"],"edge");
+        let started=std::time::Instant::now();
+        let target=location(&lab.lb.describe(false,"region/owned",QS).await);
+        assert!(target.starts_with(&lab.cdn.plain));assert!(started.elapsed()<Duration::from_secs(8));
+        assert_eq!(lab.cdn.probe.admits.load(Ordering::SeqCst),1);assert_eq!(slow.probe.admits.load(Ordering::SeqCst),0);
+        assert_eq!(lab.lb.app.media.count().await,0);
+    }).catch_unwind().await;
+    slow.probe.release.notify_waiters();
+    slow.stop().await;
     lab.stop().await;
     if let Err(p) = result {
         std::panic::resume_unwind(p)

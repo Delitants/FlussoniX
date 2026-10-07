@@ -47,8 +47,10 @@ statistics, configurations or secrets. Factor shared node load generation; prese
 all existing node fields. Cache this snapshot for 1 second with per-peer single
 flight; invalidation on configuration revision, no stale-on-error. Bound pool to
 64 peers, concurrent network snapshot fetches to 8, response body to 2 MiB and
-requests to the existing 3-second management timeout. Placement has an overall
-8-second deadline, including queued snapshot work and retries. Pools above64 fail explicitly.
+native snapshot probes to 500 milliseconds. Collect successful observations for
+at most 4.5 seconds, cancel unfinished probes, then admit using the existing
+3-second management timeout. Placement has an overall 8-second deadline,
+including queued snapshot work and retries. Pools above64 fail explicitly.
 
 Capacity counters retain existing auth-session identity/reconnect-grace semantics;
 a raw-socket quota is not added in this increment.

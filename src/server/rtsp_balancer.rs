@@ -114,6 +114,7 @@ impl App {
                 api.trim_end_matches('/')
             ))
             .header("X-Flussonix-Peer", key)
+            .timeout(Duration::from_millis(500))
             .send()
             .await
             .ok()?;
@@ -257,12 +258,17 @@ impl App {
             Some((load, peer, target, encrypted))
         });
         let mut calls = futures_util::stream::iter(calls).buffer_unordered(8);
-        while let Some(result) = calls.next().await {
+        let snapshot_deadline = tokio::time::sleep(Duration::from_millis(4500));
+        tokio::pin!(snapshot_deadline);
+        loop {
+            let result = tokio::select! { biased; _=&mut snapshot_deadline=>break, result=calls.next()=>result };
+            let Some(result) = result else { break };
             if let Some((load, peer, target, encrypted)) = result {
                 choices.insert(load.name.clone(), (peer, target, encrypted));
                 nodes.push(load);
             }
         }
+        drop(calls); // Cancel unfinished probes; preserve time for admission.
         while let Some(id) = select(&nodes, 0.0) {
             if grant.is_cancelled() {
                 return Err(403);

@@ -48,9 +48,11 @@ configuration or full statistics. Snapshots are cached for one second with
 per-peer single flight; configuration edits invalidate the cache, and failed
 refreshes never reuse expired data. Native pools are limited to 64 peers,
 snapshot fetch concurrency to eight, snapshot bodies to 2 MiB and admission
-responses to 16 KiB. Existing control clients enforce three-second request
-timeouts, verified TLS/custom CAs and no redirect following. Placement has an
-overall eight-second deadline. Failed admission tries each eligible candidate
+responses to 16 KiB. Native snapshot probes time out after 500 milliseconds;
+the collection phase ends after 4.5 seconds and keeps successful observations
+while cancelling unfinished probes. Admission requests retain the existing
+three-second timeout. Verified TLS/custom CAs and no redirect following apply
+to both requests. Placement has an overall eight-second deadline. Failed admission tries each eligible candidate
 at most once. Pending configuration changes and revocation block stale replies.
 
 Selection excludes draining nodes, observations older than ten seconds, full
@@ -75,4 +77,4 @@ M4S. No official Flussonic component is a runtime, build or test dependency.
 
 Ticket-bearing HTTP requests also use control authorization: rejected cross-protocol tickets and valid cleanup redirects leave no phantom HTTP playback slot. The clean media request retains normal authorization and playback accounting. A failing cross-protocol occupancy assertion qualifies this correction.
 
-Serialized control authorization holds pending admission ownership until transfer to a live grant. Cancellation releases it. This prevents concurrent requests from oversubscribing auth capacity during the decision-to-grant scheduling boundary.
+Cached policy decisions retain callback user limits and unique-user policy. Admission rechecks current global and user capacity and constructs the live grant atomically under the same lock. In-flight policy requests retain their cache entry but do not own capacity; cancellation releases any constructed grant. Control requests do not extend playback reconnect grace. Regressions cover warmed cached decisions, callback limits, unique-user revocation, cancellation and a healthy last peer behind 63 stalled snapshot peers.

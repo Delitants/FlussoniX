@@ -264,8 +264,7 @@ Initial DESCRIBE on standalone/CDN nodes accepts backend-selected absolute
 RTSP/RTSPS destinations, with RTSP 302/Location before worker/session startup.
 Cached decisions retain token/template policy and revocation; actual TLS control
 connections reject plaintext destinations on every response. HTTP redirect
-behavior stays separate. This is callback-selected routing, with native RTSP
-adaptive LB reservations still pending. See [contract and qualification](rtsp-auth-redirects.md).
+behavior stays separate. This is callback-selected routing; [native adaptive RTSP LB reservations](rtsp-cluster-routing.md) are implemented as a separate profile. See [contract and qualification](rtsp-auth-redirects.md).
 
 ## Native RTSP cluster routing
 
