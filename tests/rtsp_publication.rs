@@ -246,6 +246,156 @@ fn digest_header(challenge: &str, method: &str, uri: &str, password: &str) -> St
     )
 }
 
+// Independent client derivation; never uses the receiving implementation.
+fn digest_auth_header(challenge: &str, method: &str, uri: &str, nc: &str, cnonce: &str) -> String {
+    use md5::{Digest, Md5};
+    let field = |key: &str| {
+        challenge
+            .split(&format!("{key}=\""))
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let realm = field("realm");
+    let nonce = field("nonce");
+    let h = |s: &str| format!("{:x}", Md5::digest(s.as_bytes()));
+    let response = h(&format!(
+        "{}:{nonce}:{nc}:{cnonce}:auth:{}",
+        h(&format!("publisher:{realm}:owned-publish")),
+        h(&format!("{method}:{uri}"))
+    ));
+    format!(
+        "Digest username=\"publisher\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{response}\", algorithm=MD5, qop=auth, nc={nc}, cnonce=\"{cnonce}\""
+    )
+}
+
+// Rejecting the advertised qop, normalizing hash inputs, or replaying admission breaks this.
+#[tokio::test]
+async fn digest_qop_auth_admits_once_and_binds_connection() {
+    let l = Lab::new("standalone").await;
+    let url = l.url.split('?').next().unwrap();
+    let outcome = std::panic::AssertUnwindSafe(async {
+        for nc in ["00000001", "0000000A"] {
+            let mut s = l.socket().await;
+            let (code, challenge) = announce(&mut s, url, SDP).await;
+            assert_eq!(code, 401);
+            let header = digest_auth_header(&challenge, "ANNOUNCE", url, nc, "owned-client");
+            assert_eq!(
+                request(
+                    &mut s,
+                    "ANNOUNCE",
+                    url,
+                    &format!("Content-Type: application/sdp\r\nAuthorization: {header}\r\n"),
+                    SDP
+                )
+                .await
+                .0,
+                200
+            );
+            assert!(challenge.contains("qop=\"auth\""));
+            assert_eq!(l.app.media.count().await, 0);
+            let mut other = l.socket().await;
+            assert_eq!(
+                request(
+                    &mut other,
+                    "ANNOUNCE",
+                    url,
+                    &format!("Content-Type: application/sdp\r\nAuthorization: {header}\r\n"),
+                    SDP
+                )
+                .await
+                .0,
+                401
+            );
+            assert_eq!(
+                request(
+                    &mut s,
+                    "ANNOUNCE",
+                    url,
+                    &format!("Content-Type: application/sdp\r\nAuthorization: {header}\r\n"),
+                    SDP
+                )
+                .await
+                .0,
+                455
+            );
+        }
+    })
+    .catch_unwind()
+    .await;
+    l.end().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p);
+    }
+}
+
+// Partial qop tuples must not fall back to a valid legacy response.
+#[tokio::test]
+async fn digest_qop_auth_rejects_malformed_and_substituted_fields() {
+    let l = Lab::new("standalone").await;
+    let url = l.url.split('?').next().unwrap();
+    let outcome = std::panic::AssertUnwindSafe(async {
+        for case in 0..19 {
+            let mut s = l.socket().await;
+            let (_, challenge) = announce(&mut s, url, SDP).await;
+            let good = digest_auth_header(&challenge, "ANNOUNCE", url, "00000001", "owned-client");
+            let bad = match case {
+                0 => good.replace(", qop=auth", ""),
+                1 => good.replace(", nc=00000001", ""),
+                2 => good.replace(", cnonce=\"owned-client\"", ""),
+                3 => good.replace("qop=auth", "qop=auth-int"),
+                4 => digest_auth_header(&challenge, "ANNOUNCE", url, "00000000", "owned-client"),
+                5 => digest_auth_header(&challenge, "ANNOUNCE", url, "1", "owned-client"),
+                6 => digest_auth_header(&challenge, "ANNOUNCE", url, "100000001", "owned-client"),
+                7 => digest_auth_header(&challenge, "ANNOUNCE", url, "0000000g", "owned-client"),
+                8 => digest_auth_header(&challenge, "ANNOUNCE", url, "00000001", ""),
+                9 => digest_auth_header(&challenge, "ANNOUNCE", url, "00000001", &"x".repeat(257)),
+                10 => good.replace("owned-client", "substituted"),
+                11 => good.replace("nc=00000001", "nc=00000002"),
+                12 => digest_auth_header(&challenge, "RECORD", url, "00000001", "owned-client"),
+                13 => digest_auth_header(
+                    &challenge,
+                    "ANNOUNCE",
+                    &format!("{url}/other"),
+                    "00000001",
+                    "owned-client",
+                ),
+                14 => good + ", nc=00000002",
+                15 => good + ", qop=auth",
+                16 => good + ", cnonce=\"duplicate\"",
+                17 => digest_header(&challenge, "ANNOUNCE", url, "owned-publish") + ", nc=00000001",
+                _ => {
+                    digest_header(&challenge, "ANNOUNCE", url, "owned-publish")
+                        + ", cnonce=\"owned-client\""
+                }
+            };
+            assert_eq!(
+                request(
+                    &mut s,
+                    "ANNOUNCE",
+                    url,
+                    &format!("Content-Type: application/sdp\r\nAuthorization: {bad}\r\n"),
+                    SDP
+                )
+                .await
+                .0,
+                401,
+                "case {case}"
+            );
+        }
+        assert_eq!(l.app.media.count().await, 0);
+    })
+    .catch_unwind()
+    .await;
+    l.end().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p);
+    }
+}
+
 // Closing on the initial 401 or trusting an unrelated nonce breaks this flow.
 #[tokio::test]
 async fn digest_publisher_challenge_retries_on_same_socket_and_binds_nonce() {
@@ -951,7 +1101,66 @@ async fn qualify_authenticated(
             let _ = tokio::io::copy_bidirectional(&mut plain, &mut encrypted).await;
         }));
     }
+    let mut auth_observation = None;
     if header_auth {
+        // Observe, without altering, the independent publisher's ANNOUNCE header.
+        // Capture only authentication shape; never retain or print credentials.
+        let destination = url::Url::parse(&input_url).unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        input_url = format!("rtsp://{}/owned", proxy.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        auth_observation = Some(rx);
+        auxiliary.push(tokio::spawn(async move {
+            let (mut plain, _) = proxy.accept().await.unwrap();
+            let mut upstream =
+                TcpStream::connect((destination.host_str().unwrap(), destination.port().unwrap()))
+                    .await
+                    .unwrap();
+            let (mut client_read, mut client_write) = plain.split();
+            let (mut server_read, mut server_write) = upstream.split();
+            let forward = async {
+                let mut tx = Some(tx);
+                let mut observed = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = client_read.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    if tx.is_some() {
+                        assert!(
+                            observed.len() + n <= 32768,
+                            "bounded owned control observation"
+                        );
+                        observed.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&observed);
+                        if let Some(start) = text.find("Authorization: Digest ") {
+                            if let Some(end) = text[start..].find("\r\n") {
+                                let header = &text[start..start + end];
+                                let announce = text[..start]
+                                    .lines()
+                                    .rev()
+                                    .find(|line| line.contains(" RTSP/1.0"))
+                                    .is_some_and(|line| line.starts_with("ANNOUNCE "));
+                                let valid = announce
+                                    && header.contains("qop=\"auth\"")
+                                    && header.contains("nc=00000001")
+                                    && header.contains("cnonce=\"");
+                                let _ = tx.take().unwrap().send(valid);
+                                observed.clear();
+                            }
+                        }
+                    }
+                    if server_write.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            let backward = async {
+                let _ = tokio::io::copy(&mut server_read, &mut client_write).await;
+            };
+            tokio::select! { _ = forward => {}, _ = backward => {} }
+        }));
         let mut u = url::Url::parse(&input_url).unwrap();
         u.set_query(None);
         u.set_username("publisher").unwrap();
@@ -982,6 +1191,10 @@ async fn qualify_authenticated(
     })
     .await
     .unwrap();
+    if let Some(observation) = auth_observation {
+        assert!(tokio::time::timeout(Duration::from_secs(2), observation).await.unwrap().unwrap(),
+            "independent FFmpeg must publish with Digest qop-auth");
+    }
     let mut rx = w.subscribe();
     let mut ts = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);

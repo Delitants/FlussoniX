@@ -170,8 +170,8 @@ verified encrypted TCP. See [UDP push bounds](docs/rtsp-push.md#unicast-udp-push
 Native RTSP/RTSPS LB routing now uses measured CDN selection and protocol/token-bound reservations, with friendly public listener fields in Cluster. See [routing, bounds and qualification](docs/rtsp-cluster-routing.md).
 
 
-Incoming RTSP/RTSPS publications also accept Basic headers and bounded legacy
-MD5 Digest challenges using the existing Publisher password. Configure your
+Incoming RTSP/RTSPS publications also accept Basic headers and bounded MD5
+Digest challenges with qop-auth or legacy responses using the existing Publisher password. Configure your
 publisher with `publisher:YOUR_PASSWORD@HOST` userinfo; leave generated URLs free
 of stored credentials. Viewer/admin credentials remain separate. See the
 [receiving authentication profile and limits](docs/rtsp-publication.md#incoming-publisher-basic-and-digest-authentication).

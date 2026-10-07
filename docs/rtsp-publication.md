@@ -64,7 +64,7 @@ To retain owned TS clips and metadata, set `FLUSSONIX_RTSP_RECORD_DIR` to a priv
 
 ## Remaining directions
 
-Dynamic stream creation from publication templates, outbound UDP RTSP push, inbound Basic/Digest publisher or viewer dialects, separate DVB/teletext SDP tracks, long-duration clock/synchronization, mixed-vendor clients and production capacity remain pending. Embedded captions stay on the existing video pipeline; their full publication subtitle matrix is not additional qualification in this stage. Native/HLS/SRT/direct downstream delivery uses the existing shared worker; strict output decoding in this stage is for its common TS, not a new qualification of every downstream protocol.
+Dynamic stream creation from publication templates, additional publisher authentication profiles beyond those below, viewer Basic/Digest, separate DVB/teletext SDP tracks, long-duration clock/synchronization, mixed-vendor clients and production capacity remain pending. Outbound UDP publication has its own [qualified push profile](rtsp-push.md). Embedded captions stay on the existing video pipeline; their full publication subtitle matrix is not additional qualification in this stage. Native/HLS/SRT/direct downstream delivery uses the existing shared worker; strict output decoding in this stage is for its common TS, not a new qualification of every downstream protocol.
 
 Protocol references: [RTSP/1.0](https://www.rfc-editor.org/rfc/rfc2326.html), [FFmpeg RTSP](https://ffmpeg.org/ffmpeg-protocols.html#rtsp), [Flussonic configured publication](https://flussonic.com/doc/fms/live/publish/).
 
@@ -72,7 +72,7 @@ Protocol references: [RTSP/1.0](https://www.rfc-editor.org/rfc/rfc2326.html), [F
 ## Incoming publisher Basic and Digest authentication
 
 The existing effective stream/template **Publisher password** also authorizes
-RTSP/RTSPS ANNOUNCE with preemptive Basic or a legacy MD5 Digest challenge.
+RTSP/RTSPS ANNOUNCE with preemptive Basic or an MD5 Digest challenge.
 For example, an independent FFmpeg publisher can use
 `rtsp://publisher:YOUR_PASSWORD@HOST:PORT/channel?token=YOUR_TOKEN` instead of a
 password query. Percent-encode special userinfo characters. The nonempty ASCII
@@ -81,14 +81,21 @@ user account; the password remains stream-wide and separate from management,
 viewer and peer policy. Passwords retain the existing1024-byte limit.
 
 Protected streams without a password query receive RTSP401 with a Digest
-challenge. This legacy receiving profile uses MD5 with qop omitted; it does not
-advertise or accept auth-int, qop-auth, session algorithms, SHA-256 or userhash.
+challenge advertising `qop="auth"`. Clients using this profile must send
+`qop=auth`, a nonempty printable ASCII cnonce (at most256 bytes), and a nonzero
+eight-hex-digit nc together. The response binds these exact values, method and
+URI. Quoted qop/algorithm values from FFmpeg are accepted. Older publishers may
+still omit all three fields for legacy MD5 authentication; partial tuples fail.
+This compatibility fallback does not enforce qop or strengthen the MD5 hash.
+The listener does not advertise or accept auth-int, session algorithms,
+SHA-256 or userhash.
 Basic is accepted preemptively, while the automatic challenge selects Digest.
 Use RTSPS to encrypt both control and interleaved media. TLS certificate trust
 remains a publisher responsibility.
 
 Each random nonce belongs to one control connection and exact original ANNOUNCE
-URI. Successful admission consumes that negotiation; later methods require the
+URI. Successful admission consumes that negotiation; a second ANNOUNCE cannot
+reuse it and another connection cannot reuse its nonce. Later methods require the
 admitted connection and Session. A nonce from another connection, changed URI,
 realm/method substitution, malformed/duplicate parameters or wrong password
 cannot authorize publication. Three challenges at most and one absolute30-second
@@ -103,7 +110,8 @@ An unprotected stream stays unprotected; supplying a username does not create
 an account. No new JSON or account controls are required.
 
 Owned wire clients qualify Basic admission/session binding, inherited passwords,
-policy edits, callback denial/renewal and credential privacy. Independent FFmpeg
-Digest publishing is strictly decoded through TCP, unicast UDP and a verified
-owned TLS relay. Other receiving authentication algorithms, viewer Basic/Digest,
+policy edits, callback denial/renewal, credential privacy and malformed/substituted
+qop tuples. Independent FFmpeg MD5 qop-auth publishing is observed on ANNOUNCE
+and strictly decoded through TCP, unicast UDP and a verified owned TLS relay.
+Other receiving authentication algorithms, viewer Basic/Digest,
 arbitrary camera/recorder dialects and production capacity remain unqualified.

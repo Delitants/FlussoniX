@@ -277,12 +277,12 @@ Configured inputs follow bounded pre-session native TLS redirects through owned 
 
 ## Incoming RTSP publisher header credentials
 
-Configured RTSP/RTSPS publications accept preemptive Basic and legacy MD5 Digest
-without qop using the effective stream/template publisher password. The username
+Configured RTSP/RTSPS publications accept preemptive Basic and MD5 Digest
+with qop-auth or legacy omitted-qop responses using the effective stream/template publisher password. The username
 is a publisher label, not a management account. Initial401 challenges support
 bounded same-connection retries before callbacks or worker startup; original
 query-password behavior remains available. Independent FFmpeg qualification
-covers decoded H.264/AAC on TCP, UDP and verified TLS. See
+covers observed qop-auth and decoded H.264/AAC on TCP, UDP and verified TLS. See
 [the receiving authentication profile](rtsp-publication.md#incoming-publisher-basic-and-digest-authentication).
 Viewer Basic/Digest, additional incoming algorithms and complete vendor API/auth
 parity remain open.

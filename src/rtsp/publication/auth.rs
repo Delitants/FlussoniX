@@ -19,7 +19,7 @@ impl Auth {
     }
     pub(super) fn challenge(&self) -> String {
         format!(
-            "Digest realm=\"{REALM}\", nonce=\"{}\", algorithm=MD5",
+            "Digest realm=\"{REALM}\", nonce=\"{}\", algorithm=MD5, qop=\"auth\"",
             self.nonce
         )
     }
@@ -69,7 +69,18 @@ impl Auth {
         }
         let p = parameters(value).ok_or(401u16)?;
         if p.keys().any(|k| {
-            !["username", "realm", "nonce", "uri", "response", "algorithm"].contains(&k.as_str())
+            ![
+                "username",
+                "realm",
+                "nonce",
+                "uri",
+                "response",
+                "algorithm",
+                "qop",
+                "nc",
+                "cnonce",
+            ]
+            .contains(&k.as_str())
         }) {
             return Err(401);
         }
@@ -89,12 +100,25 @@ impl Auth {
             return Err(401);
         }
         let hash = |s: &str| format!("{:x}", Md5::digest(s.as_bytes()));
-        let actual = hash(&format!(
-            "{}:{}:{}",
-            hash(&format!("{username}:{REALM}:{secret}")),
-            self.nonce,
-            hash(&format!("{}:{}", r.method, r.uri))
-        ));
+        let a1 = hash(&format!("{username}:{REALM}:{secret}"));
+        let a2 = hash(&format!("{}:{}", r.method, r.uri));
+        let actual = match (p.get("qop"), p.get("nc"), p.get("cnonce")) {
+            (None, None, None) => hash(&format!("{a1}:{}:{a2}", self.nonce)),
+            (Some(qop), Some(nc), Some(cnonce))
+                if qop == "auth"
+                    && nc.len() == 8
+                    && nc.bytes().all(|b| b.is_ascii_hexdigit())
+                    && nc != "00000000"
+                    && !cnonce.is_empty()
+                    && cnonce.len() <= 256
+                    && cnonce.bytes().all(|b| (32..127).contains(&b)) =>
+            {
+                // Initial admission is single-use; the accepted connection then
+                // moves into session handling. Never normalize these hash inputs.
+                hash(&format!("{a1}:{}:{nc}:{cnonce}:auth:{a2}", self.nonce))
+            }
+            _ => return Err(401),
+        };
         bool::from(
             actual
                 .as_bytes()
@@ -151,7 +175,7 @@ fn parameters(mut s: &str) -> Option<HashMap<String, String>> {
             value = text.into();
             s = &s[end..];
         }
-        if fields.len() == 8 || fields.insert(key.to_ascii_lowercase(), value).is_some() {
+        if fields.len() == 9 || fields.insert(key.to_ascii_lowercase(), value).is_some() {
             return None;
         }
         s = s.trim_start_matches([' ', '\t']);

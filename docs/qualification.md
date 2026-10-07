@@ -644,4 +644,32 @@ URLs and updated encoder guidance. Formatting, all-target warnings-denied Clippy
 and the compiled UI pass. Full final-head CI and fresh whole-range review remain
 publication gates. Viewer Basic/Digest, per-user accounts, additional incoming
 Digest algorithms/qop, arbitrary vendor dialects and migration/scale remain open.
+
+## Incoming publisher MD5 qop-auth extension
+
+The receiving challenge now advertises `qop="auth"`. Real wire clients send
+independently derived MD5 responses with complete cnonce/nc/qop fields; successful
+admission, uppercase hexadecimal count hashing, connection nonce isolation and
+rejected second ANNOUNCE are covered. Nineteen malformed/substitution cases cover
+partial tuples, auth-int, zero/nonhex/short/long counts, empty/oversized cnonce,
+changed cnonce/count/method/URI, duplicate fields and orphan legacy fields. No
+worker starts for these pending/failed admissions. Legacy omitted-qop replies
+continue to pass their existing wire regression.
+
+The owned transparent fixture observes the independent FFmpeg publisher's
+ANNOUNCE header using qop-auth, nc and cnonce without altering the request or
+retaining credentials. Published H.264/AAC is strictly decoded through TCP,
+unicast UDP and a verifying owned TLS relay. Before implementation the valid
+qop wire response returned401, and the media fixture detected legacy authentication;
+after implementation all four Digest-focused tests pass. The existing broader
+publication suite remains the regression gate for Basic/query passwords,
+inheritance, callback renewal, policy revocation, fixed retry/deadline bounds,
+ownership and receiving codecs.
+
+This is initial configured publication admission, with a connection/URI-bound
+random server nonce consumed by the session transition. It does not authenticate
+every later RTSP method separately. Legacy fallback remains enabled for client
+compatibility, so qop is not enforced and MD5 is not upgraded. SHA/session
+algorithms, auth-int, viewer Basic/Digest, arbitrary vendor clients and sustained
+capacity remain unqualified. No vendor build/runtime dependency is introduced.
 See [contract and limits](rtsp-publication.md#incoming-publisher-basic-and-digest-authentication).
