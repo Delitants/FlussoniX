@@ -338,6 +338,8 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "hostname",
                     "api_url",
                     "public_payload_url",
+                    "flussonix_rtsp_url",
+                    "flussonix_rtsps_url",
                     "private_payload_url",
                     "cluster_key",
                     "drain",
@@ -352,6 +354,29 @@ fn validate_root(root: &Value) -> Result<(), String> {
             for key in item.as_object().ok_or("item must be an object")?.keys() {
                 if !allowed.contains(&key.as_str()) {
                     return Err(format!("{kind} option {key} is not implemented"));
+                }
+            }
+            for (field, scheme) in [
+                ("flussonix_rtsp_url", "rtsp"),
+                ("flussonix_rtsps_url", "rtsps"),
+            ] {
+                if let Some(value) = item.get(field) {
+                    if *kind != "peers" {
+                        return Err(format!("{field} is peer-only"));
+                    }
+                    let url = value
+                        .as_str()
+                        .and_then(crate::rtsp::redirect::destination)
+                        .ok_or_else(|| format!("{field} requires a safe {scheme} listener URL"))?;
+                    if url.scheme() != scheme
+                        || !matches!(url.path(), "" | "/")
+                        || url.query().is_some()
+                        || url.port() == Some(0)
+                    {
+                        return Err(format!(
+                            "{field} requires a {scheme} listener root without query or path prefix"
+                        ));
+                    }
                 }
             }
             if let Some(id) = item.get("flussonix_content_id") {

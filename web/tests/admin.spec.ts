@@ -855,3 +855,20 @@ test('RTSP push UDP controls roundtrip templates and clear on secure transport s
   data=await(await request.get('/streamer/api/v3/templates/'+name,{headers})).json();expect(data.pushes[0].rtsp_transport).toBeUndefined();expect(data.pushes[0].url).toContain('rtsps://user:owned-secret@');
  }finally{await request.delete('/streamer/api/v3/templates/'+name,{headers});}
 });
+
+test('cluster peer RTSP delivery fields validate save edit and clear',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-rtsp-peer';
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();await page.getByRole('button',{name:'CDN peers',exact:true}).click();await page.getByRole('button',{name:'Add peer',exact:true}).click();
+ await page.getByLabel('Node name',{exact:true}).fill(name);await page.getByLabel('Management URL',{exact:true}).fill('http://127.0.0.1:19998');
+ await page.getByLabel('Public RTSP URL',{exact:true}).fill('https://cdn.example:8554');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Public RTSP URL');
+ await page.getByLabel('Public RTSP URL',{exact:true}).fill('rtsp://cdn.example:8554');await page.getByLabel('Public RTSPS URL',{exact:true}).fill('rtsps://cdn.example:8322');
+ await page.getByLabel('Cluster key',{exact:true}).fill('owned-ui-rtsp-peer-key');await expect(page.getByLabel('Cluster key',{exact:true})).toHaveAttribute('type','password');
+ await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('cell',{name,exact:true})).toBeVisible();
+ let peer=await(await request.get('/streamer/api/v3/cluster/peers/'+name,{headers})).json();expect(peer.flussonix_rtsp_url).toBe('rtsp://cdn.example:8554');expect(peer.flussonix_rtsps_url).toBe('rtsps://cdn.example:8322');
+ await page.getByRole('row').filter({has:page.getByRole('cell',{name,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+ await expect(page.getByLabel('Public RTSP URL',{exact:true})).toHaveValue('rtsp://cdn.example:8554');await expect(page.getByLabel('Public RTSPS URL',{exact:true})).toHaveValue('rtsps://cdn.example:8322');
+ await page.getByLabel('Public RTSP URL',{exact:true}).fill('');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+ peer=await(await request.get('/streamer/api/v3/cluster/peers/'+name,{headers})).json();expect(peer.flussonix_rtsp_url).toBeUndefined();expect(peer.flussonix_rtsps_url).toBe('rtsps://cdn.example:8322');
+ await expect(page.locator('textarea')).toHaveCount(0);
+});
