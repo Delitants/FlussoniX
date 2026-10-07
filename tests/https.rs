@@ -283,7 +283,7 @@ async fn https_lb_excludes_plaintext_peers_before_admission() {
     let count = calls.clone();
     let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let peer_url = format!("http://{}", peer.local_addr().unwrap());
-    let routes=axum::Router::new().route("/flussonix/api/v1/node",axum::routing::get(||async{axum::Json(json!({"streams":[],"limit":1000,"active":0,"reserved":0,"uplink_mbps":1000,"uplink":0.1,"cpu":0.1,"ram":0.1,"drain":false,"age_ms":0}))})).route("/flussonix/api/v1/admit",axum::routing::post(move||{let count=count.clone();async move {count.fetch_add(1,std::sync::atomic::Ordering::SeqCst);axum::Json(json!({"ticket":"owned-ticket"}))}}));
+    let routes=axum::Router::new().route("/flussonix/api/v1/node",axum::routing::get(||async{axum::Json(json!({"role":"cdn","streams":[],"limit":1000,"active":0,"reserved":0,"reserved_mbps":0,"uplink_mbps":1000,"uplink":0.1,"cpu":0.1,"ram":0.1,"drain":false,"age_ms":0}))})).route("/flussonix/api/v1/admit",axum::routing::post(move||{let count=count.clone();async move {count.fetch_add(1,std::sync::atomic::Ordering::SeqCst);axum::Json(json!({"ticket":"owned-ticket"}))}}));
     let task = tokio::spawn(async move { axum::serve(peer, routes).await.unwrap() });
     f.app
         .config
