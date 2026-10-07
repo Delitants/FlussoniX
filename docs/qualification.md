@@ -589,7 +589,7 @@ baseline because it produced no HLS. An initial fixture used an incorrect fMP4
 playlist path; that result is excluded from the feature evidence.
 
 Real TLS cases cover identity/trust/expiry before target application data, strict
-destinations and framing, credentialed input rejection, late SDP/Session/media
+destinations and framing (including Unicode whitespace rejected before networking), credentialed input rejection, late SDP/Session/media
 redirects, exact/changing-query cycles, cancellation during handoff and unused
 listener cleanup. A stalled incomplete header expires under the initial routing
 deadline, while established interleaved media continues beyond it. All fixture

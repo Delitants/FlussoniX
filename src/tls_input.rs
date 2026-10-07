@@ -249,7 +249,7 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
                 return Err(invalid());
             }
             if headers
-                .insert(key.to_ascii_lowercase(), value.trim())
+                .insert(key.to_ascii_lowercase(), value.trim_matches([' ', '\t']))
                 .is_some()
             {
                 return Err(invalid());

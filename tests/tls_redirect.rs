@@ -93,6 +93,8 @@ async fn invalid_redirects_and_credentialed_inputs_never_connect_or_escape() {
         format!("rtsps://{addr}/owned#secret"),
         format!("rtsps://{addr}/bad%"),
         format!("rtsps://{addr}/raw\"quote"),
+        format!("\u{00a0}rtsps://{addr}/owned"),
+        format!("rtsps://{addr}/owned\u{2003}"),
         "rtsps://127.0.0.1:0/owned".into(),
         "/owned".into(),
         String::new(),
@@ -135,10 +137,12 @@ async fn invalid_redirects_and_credentialed_inputs_never_connect_or_escape() {
     ));
     for (wire, credentials) in cases {
         let (bridge, task) = reply_bridge(&c, &c.ca, wire, credentials).await;
+        let response = tokio::select! {
+            accepted = target.accept() => panic!("rejected redirect must not connect: {accepted:?}"),
+            response = send(bridge.local_url(), Duration::from_secs(3)) => response,
+        };
         assert!(
-            send(bridge.local_url(), Duration::from_secs(3))
-                .await
-                .is_empty(),
+            response.is_empty(),
             "rejected redirect must not reach the decoder"
         );
         assert!(
