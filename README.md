@@ -180,3 +180,8 @@ Digest challenges with qop-auth or legacy responses using the existing Publisher
 publisher with `publisher:YOUR_PASSWORD@HOST` userinfo; leave generated URLs free
 of stored credentials. Viewer/admin credentials remain separate. See the
 [receiving authentication profile and limits](docs/rtsp-publication.md#incoming-publisher-basic-and-digest-authentication).
+
+[HTTP Basic input and publisher authentication](docs/http-basic.md) supports
+origin-scoped upstream credentials across plain/secure HLS, TS and native M4
+inputs, plus incoming HTTP(S) publications using the existing Publisher password.
+Protected publications offer a Basic challenge; header/query ambiguity is rejected.

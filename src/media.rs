@@ -538,9 +538,14 @@ impl Engine {
             } else if ["hlss://", "tshttps://", "https://"]
                 .iter()
                 .any(|prefix| input.starts_with(prefix))
+                || url::Url::parse(&translated).is_ok_and(|url| {
+                    matches!(url.scheme(), "http" | "https")
+                        && (!url.username().is_empty() || url.password().is_some())
+                })
             {
                 let live = input.starts_with("tshttps://")
-                    || (input.starts_with("https://")
+                    || input.starts_with("tshttp://")
+                    || ((input.starts_with("https://") || input.starts_with("http://"))
                         && !url::Url::parse(&translated)
                             .is_ok_and(|u| u.path().ends_with(".m3u8")));
                 let proxy = crate::peer_hls::PeerHls::start_external(
@@ -550,7 +555,8 @@ impl Engine {
                 )
                 .await?;
                 translated = proxy.url.clone();
-                // Only the verifier contacts HTTPS sources; no peer key is sent.
+                // Only the origin-scoped fetcher contacts this source. The
+                // decoder receives neither Basic credentials nor a peer key.
                 if !live {
                     cmd.args(["-allowed_extensions", "ALL", "-f", "hls"]);
                 } else {

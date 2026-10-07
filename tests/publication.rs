@@ -113,7 +113,7 @@ async fn denied_publications_never_poll_body_or_start_workers() {
         )
         .unwrap();
     for (uri, code) in [
-        ("/owned/mpegts", 403),
+        ("/owned/mpegts", 401),
         ("/owned/mpegts?password=wrong", 403),
         ("/owned/mpegts?password=owned-publisher&password=wrong", 400),
         ("/missing/mpegts", 404),
@@ -132,6 +132,206 @@ async fn denied_publications_never_poll_body_or_start_workers() {
         assert_eq!(response.status(), code, "{uri}");
         assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(a.media.count().await, 0);
+    }
+}
+
+#[tokio::test]
+async fn basic_http_publication_challenges_and_rejects_ambiguous_or_invalid_credentials_before_body()
+ {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let d = tempfile::tempdir().unwrap();
+    let a = app(d.path());
+    a.config
+        .put(
+            "streams",
+            "owned",
+            json!({"inputs":[{"url":"publish://"}],"password":"p:a@ss% &ü"}),
+        )
+        .unwrap();
+    let basic = |pair: &str| format!("Basic {}", STANDARD.encode(pair));
+    for (header, query, code) in [
+        (None, "", 401),
+        (Some(basic("publisher:wrong")), "", 401),
+        (Some(basic("admin:owned-admin")), "", 401),
+        (Some("Basic !!!".into()), "", 401),
+        (Some(basic("missing-colon")), "", 401),
+        (Some(basic(":p:a@ss% &ü")), "", 401),
+        (Some(basic("pub\nuser:p:a@ss% &ü")), "", 401),
+        (Some(basic("publisher:p:a@ss% &ü")), "?password=wrong", 400),
+    ] {
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = polled.clone();
+        let body = Body::from_stream(futures_util::stream::once(async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"ignored"))
+        }));
+        let mut request = post(&format!("/owned/mpegts{query}"), body);
+        if let Some(header) = header {
+            request
+                .headers_mut()
+                .insert("authorization", header.parse().unwrap());
+        }
+        let response = router(a.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), code);
+        if code == 401 {
+            assert_eq!(
+                response.headers()["www-authenticate"],
+                "Basic realm=\"FlussoniX publisher\", charset=\"UTF-8\""
+            );
+        }
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(a.media.count().await, 0);
+    }
+    let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = polled.clone();
+    let body = Body::from_stream(futures_util::stream::once(async move {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"ignored"))
+    }));
+    let mut request = post("/owned/mpegts", body);
+    request.headers_mut().append(
+        "authorization",
+        basic("publisher:p:a@ss% &ü").parse().unwrap(),
+    );
+    request
+        .headers_mut()
+        .append("authorization", basic("publisher:wrong").parse().unwrap());
+    let response = router(a.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), 400);
+    assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(a.media.count().await, 0);
+    a.media.stop_all().await;
+}
+
+#[tokio::test]
+async fn basic_http_publication_inherits_password_and_delivers_independently_decoded_media() {
+    use axum::serve::ListenerExt;
+    use futures_util::FutureExt;
+    #[path = "support/tls.rs"]
+    mod certificates;
+    for secure in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let a = app(d.path());
+        a.config
+            .put(
+                "templates",
+                "receive",
+                json!({"inputs":[{"url":"publish://"}],"password":"p:a@ss% &ü"}),
+            )
+            .unwrap();
+        a.config
+            .put("streams", "owned", json!({"template":"receive"}))
+            .unwrap();
+        let certificate = certificates::Certificates::new();
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "{}://{}/owned/mpegts",
+            if secure { "https" } else { "http" },
+            tcp.local_addr().unwrap()
+        );
+        let routes = router(a.clone());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let stop = cancel.clone();
+        let tls = certificate.server();
+        let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            if secure {
+                let listener = flussonix::http_tls::Listener::new(tcp, tls).tap_io(|_| {});
+                axum::serve(
+                    listener,
+                    routes.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(stop.cancelled_owned())
+                .await
+                .unwrap();
+            } else {
+                axum::serve(
+                    tcp,
+                    routes.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(stop.cancelled_owned())
+                .await
+                .unwrap();
+            }
+        }));
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(
+                    reqwest::Certificate::from_pem(&std::fs::read(&certificate.ca).unwrap())
+                        .unwrap(),
+                )
+                .build()
+                .unwrap();
+            let challenge = client.post(&url).send().await.unwrap();
+            assert_eq!(challenge.status(), 401);
+            assert!(
+                challenge.headers()["www-authenticate"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("Basic ")
+            );
+            assert_eq!(a.media.count().await, 0);
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
+            let body =
+                reqwest::Body::wrap_stream(futures_util::stream::unfold(rx, |mut rx| async move {
+                    rx.recv().await.map(|chunk| (chunk, rx))
+                }));
+            let upload = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                client
+                    .post(url)
+                    .basic_auth("publisher", Some("p:a@ss% &ü"))
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap()
+            }));
+            for chunk in synthetic_transport().chunks(65537) {
+                tx.send(Ok(bytes::Bytes::copy_from_slice(chunk)))
+                    .await
+                    .unwrap();
+            }
+            until(async || a.media.ready("owned").await).await;
+            let list = a.media.read("owned", "index.m3u8").await.unwrap();
+            let text = String::from_utf8(list.to_vec()).unwrap();
+            let name = text
+                .lines()
+                .find(|line| !line.starts_with('#') && !line.is_empty())
+                .unwrap();
+            let file = d.path().join("basic-publication.ts");
+            std::fs::write(&file, a.media.read("owned", name).await.unwrap()).unwrap();
+            let decoded = tokio::process::Command::new("ffmpeg")
+                .args(["-nostdin", "-v", "error", "-xerror", "-i"])
+                .arg(file)
+                .args([
+                    "-map", "0:v:0", "-map", "0:a:0", "-threads", "1", "-f", "framemd5", "-",
+                ])
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                decoded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&decoded.stderr)
+            );
+            let frames = String::from_utf8(decoded.stdout).unwrap();
+            assert!(frames.lines().filter(|line| line.starts_with("0,")).count() >= 25);
+            assert!(frames.lines().filter(|line| line.starts_with("1,")).count() >= 50);
+            drop(tx);
+            assert_eq!(upload.await.unwrap().status(), 204);
+        })
+        .catch_unwind()
+        .await;
+        a.media.stop_all().await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(6), task)
+            .await
+            .unwrap()
+            .unwrap();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 fn transport_packet() -> bytes::Bytes {
@@ -883,7 +1083,13 @@ async fn peer_discovery_never_discloses_explicit_or_inherited_publisher_secrets(
             .oneshot(post(&format!("/{name}/mpegts"), Body::empty()))
             .await
             .unwrap();
-        assert_eq!(response.status(), 403);
+        assert_eq!(response.status(), 401);
+        assert!(
+            response.headers()["www-authenticate"]
+                .to_str()
+                .unwrap()
+                .starts_with("Basic ")
+        );
         assert_eq!(
             a.config.effective(name).unwrap()["password"],
             "owned-private-publisher",

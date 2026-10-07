@@ -220,6 +220,10 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
         input.split_once("://").ok_or("invalid URL")?.1
     ))
     .map_err(|_| "invalid media URL")?;
+    let authorization = crate::http_basic::take_url_credentials(&mut base)?;
+    if authorization.is_some() && key.is_some() {
+        return Err("HTTP Basic input credentials cannot be combined with a peer key".into());
+    }
     let path = base
         .path()
         .trim_end_matches('/')
@@ -235,11 +239,12 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
     let origin = base.origin();
     let redirects = if key.is_some() {
         reqwest::redirect::Policy::none()
-    } else if scheme == "https" {
+    } else if scheme == "https" || authorization.is_some() {
         reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= 3
-                || attempt.url().scheme() != "https"
                 || attempt.url().origin() != origin
+                || !attempt.url().username().is_empty()
+                || attempt.url().password().is_some()
             {
                 attempt.stop()
             } else {
@@ -254,6 +259,11 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
         .connect_timeout(Duration::from_secs(5))
         .https_only(scheme == "https")
         .redirect(redirects);
+    if let Some(authorization) = authorization {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::AUTHORIZATION, authorization);
+        client = client.default_headers(headers);
+    }
     if scheme == "https" {
         client = client.use_preconfigured_tls((*crate::tls_input::client(ca)?).clone());
     }

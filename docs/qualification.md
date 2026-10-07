@@ -696,3 +696,27 @@ capacity, codec/LAN cost reservation, fairness across equivalent nodes and exact
 Flussonic mode parity remain unqualified. No official component is used for
 building, testing or running this native profile. See
 [policy and limits](native-cluster-pressure.md).
+
+## HTTP Basic upstream and publication profile
+
+The existing upstream URL userinfo and Publisher password configure a bounded
+HTTP Basic profile. Native HTTP-family fetchers remove encoded UTF-8 credentials
+from resource/decoder URLs and apply sensitive Authorization headers only to the
+configured origin. Credentialed plaintext HLS/TS now use the same origin-scoped
+bridge as verified HTTPS. Native M4 control and segment requests share the
+credentials; header credentials cannot be combined with a native peer key.
+
+Owned fixtures independently decode H.264/AAC for HLS/HLSS, TSHTTP/TSHTTPS,
+M4S/M4SS and M4F/M4FS with encoded punctuation and UTF-8 credentials. Wrong
+passwords yield no authorized source media; expired TLS fails before HTTP.
+Redirect tests require successful source authentication and then zero foreign
+contacts. Existing peer-key resource, private-CA and uncredentialed TLS tests
+remain the regression gate.
+
+Incoming HTTP(S) publications use effective stream/template passwords from
+Basic headers, retaining legacy query credentials and `on_publish` policy.
+Password-protected requests without credentials now return401 with a challenge;
+wrong legacy query passwords retain403. Mixed/duplicate credentials are rejected
+before body polling, callbacks and workers. Owned socket clients exercise
+template inheritance and independent decoded delivery over HTTP and verified
+HTTPS. See [configuration, encoding bounds and limits](http-basic.md).

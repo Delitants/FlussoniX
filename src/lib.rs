@@ -33,6 +33,7 @@ pub mod tls_input;
 
 pub mod codec;
 pub mod hevc;
+mod http_basic;
 pub mod http_tls;
 pub mod mpeg_audio;
 pub mod publish;

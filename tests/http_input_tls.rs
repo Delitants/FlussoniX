@@ -30,11 +30,24 @@ struct Source {
     cert: Certificates,
     url: String,
     hits: Arc<AtomicUsize>,
+    authenticated: Arc<AtomicUsize>,
     cancel: CancellationToken,
     task: AbortOnDropHandle<()>,
     _dir: tempfile::TempDir,
 }
 async fn source(expired: bool, redirect: Option<String>) -> Source {
+    source_with_basic(expired, redirect, false, false).await
+}
+fn basic_header() -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    format!("Basic {}", STANDARD.encode("owned+user:p:a@ss% &ü"))
+}
+async fn source_with_basic(
+    expired: bool,
+    redirect: Option<String>,
+    basic: bool,
+    plain: bool,
+) -> Source {
     let dir = tempfile::tempdir().unwrap();
     let cert = Certificates::new();
     if expired {
@@ -53,12 +66,18 @@ async fn source(expired: bool, redirect: Option<String>) -> Source {
     app.config.put("streams","owned",json!({"static":false,"inputs":[{"url":"testsrc://"}],"transcoder":{"encoder":"libx264","vb":400},"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"owned-viewer"))})).unwrap();
     let tcp = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let port = tcp.local_addr().unwrap().port();
-    let url = format!("https://127.0.0.1:{port}");
+    let url = format!(
+        "{}://127.0.0.1:{port}",
+        if plain { "http" } else { "https" }
+    );
     let hits = Arc::new(AtomicUsize::new(0));
+    let authenticated = Arc::new(AtomicUsize::new(0));
     let count = hits.clone();
+    let allowed = authenticated.clone();
     let routes = router(app.clone()).layer(middleware::from_fn(
         move |mut req: Request<Body>, next: Next| {
             let count = count.clone();
+            let allowed = allowed.clone();
             let redirect = redirect.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -66,10 +85,30 @@ async fn source(expired: bool, redirect: Option<String>) -> Source {
                     !req.headers().contains_key("X-Flussonix-Peer"),
                     "external inputs sent a cluster credential"
                 );
-                assert!(
-                    !req.headers().contains_key("Authorization"),
-                    "external inputs sent a management credential"
-                );
+                if basic {
+                    if req
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        != Some(basic_header().as_str())
+                    {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            [("WWW-Authenticate", "Basic realm=\"owned upstream\"")],
+                        )
+                            .into_response();
+                    }
+                    allowed.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    assert!(
+                        !req.headers().contains_key("Authorization"),
+                        "external inputs sent a management credential"
+                    );
+                }
+                if req.uri().path().starts_with("/basic-redirect") {
+                    return (StatusCode::FOUND, [("Location", redirect.clone().unwrap())])
+                        .into_response();
+                }
                 if ["/bad.m3u8", "/stream"].contains(&req.uri().path()) {
                     return (
                         [("Content-Type", "application/vnd.apple.mpegurl")],
@@ -97,24 +136,171 @@ async fn source(expired: bool, redirect: Option<String>) -> Source {
     ));
     let cancel = CancellationToken::new();
     let stop = cancel.clone();
-    let tls = http_tls::Listener::new(tcp, cert.server()).tap_io(|_| {});
+    let tls_config = cert.server();
     let task = AbortOnDropHandle::new(tokio::spawn(async move {
-        axum::serve(
-            tls,
-            routes.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(stop.cancelled_owned())
-        .await
-        .unwrap()
+        if plain {
+            axum::serve(
+                tcp,
+                routes.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(stop.cancelled_owned())
+            .await
+            .unwrap();
+        } else {
+            let tls = http_tls::Listener::new(tcp, tls_config).tap_io(|_| {});
+            axum::serve(
+                tls,
+                routes.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(stop.cancelled_owned())
+            .await
+            .unwrap();
+        }
     }));
     Source {
         app,
         cert,
         url,
         hits,
+        authenticated,
         cancel,
         task,
         _dir: dir,
+    }
+}
+
+fn credentialed_input(src: &Source, scheme: &str, resource: &str, password: &str) -> Value {
+    let mut url = url::Url::parse(&format!("{}/{resource}", src.url)).unwrap();
+    url.set_username("owned+user").unwrap();
+    url.set_password(Some(password)).unwrap();
+    let mut cfg = json!({"inputs":[{"url":format!("{scheme}://{}",url.as_str().split_once("://").unwrap().1)}]});
+    if src.url.starts_with("https:") {
+        cfg["inputs"][0]["flussonix_tls_ca"] = json!(src.cert.ca);
+    }
+    cfg
+}
+
+#[tokio::test]
+async fn basic_upstream_inputs_decode_all_native_http_families() {
+    use futures_util::FutureExt;
+    for scheme in [
+        "hls", "hlss", "tshttp", "tshttps", "m4s", "m4ss", "m4f", "m4fs",
+    ] {
+        let plain = matches!(scheme, "hls" | "tshttp" | "m4s" | "m4f");
+        let src = source_with_basic(false, None, true, plain).await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "ffmpeg");
+        let result = std::panic::AssertUnwindSafe(async {
+            let resource = match scheme {
+                "hls" | "hlss" => "owned/index.m3u8?token=owned-viewer",
+                "tshttp" | "tshttps" => "transport?token=owned-viewer",
+                _ => "owned?token=owned-viewer",
+            };
+            let cfg = credentialed_input(&src, scheme, resource, "p:a@ss% &ü");
+            engine.ensure("basic", &cfg).await.unwrap();
+            decode(&delivered(&engine, "basic").await).await;
+            assert!(src.hits.load(Ordering::SeqCst) > 0);
+            assert_eq!(engine.count().await, 1);
+        })
+        .catch_unwind()
+        .await;
+        engine.stop_all().await;
+        src.stop().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[tokio::test]
+async fn basic_upstream_redirects_never_contact_another_origin() {
+    use futures_util::FutureExt;
+    let (foreign, hits, task) = foreign().await;
+    for scheme in [
+        "hls", "hlss", "tshttp", "tshttps", "m4s", "m4ss", "m4f", "m4fs",
+    ] {
+        let plain = matches!(scheme, "hls" | "tshttp" | "m4s" | "m4f");
+        let src = source_with_basic(false, Some(foreign.clone()), true, plain).await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "ffmpeg");
+        let result = std::panic::AssertUnwindSafe(async {
+            let cfg = credentialed_input(&src, scheme, "basic-redirect", "p:a@ss% &ü");
+            if engine.ensure("basic", &cfg).await.is_ok() {
+                failed(&engine, "basic").await;
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 0, "{scheme}");
+            assert!(
+                src.authenticated.load(Ordering::SeqCst) > 0,
+                "{scheme}: fixture never authenticated the configured origin"
+            );
+        })
+        .catch_unwind()
+        .await;
+        engine.stop_all().await;
+        src.stop().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+    drop(task);
+}
+
+#[tokio::test]
+async fn basic_upstream_denial_and_failed_tls_never_receive_media() {
+    use futures_util::FutureExt;
+    for scheme in [
+        "hls", "hlss", "tshttp", "tshttps", "m4s", "m4ss", "m4f", "m4fs",
+    ] {
+        let plain = matches!(scheme, "hls" | "tshttp" | "m4s" | "m4f");
+        let src = source_with_basic(false, None, true, plain).await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "ffmpeg");
+        let result = std::panic::AssertUnwindSafe(async {
+            let resource = match scheme {
+                "hls" | "hlss" => "owned/index.m3u8?token=owned-viewer",
+                "tshttp" | "tshttps" => "transport?token=owned-viewer",
+                _ => "owned?token=owned-viewer",
+            };
+            let cfg = credentialed_input(&src, scheme, resource, "wrong");
+            if engine.ensure("basic", &cfg).await.is_ok() {
+                failed(&engine, "basic").await;
+            }
+            assert_eq!(src.authenticated.load(Ordering::SeqCst), 0);
+            assert_eq!(src.app.media.count().await, 0);
+        })
+        .catch_unwind()
+        .await;
+        engine.stop_all().await;
+        src.stop().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+    let src = source_with_basic(true, None, true, false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "ffmpeg");
+    let result = std::panic::AssertUnwindSafe(async {
+        let cfg = credentialed_input(
+            &src,
+            "hlss",
+            "owned/index.m3u8?token=owned-viewer",
+            "p:a@ss% &ü",
+        );
+        if engine.ensure("basic", &cfg).await.is_ok() {
+            failed(&engine, "basic").await;
+        }
+        assert_eq!(
+            src.hits.load(Ordering::SeqCst),
+            0,
+            "failed TLS must precede Basic application data"
+        );
+    })
+    .catch_unwind()
+    .await;
+    engine.stop_all().await;
+    src.stop().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
     }
 }
 impl Source {

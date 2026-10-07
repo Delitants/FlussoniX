@@ -300,10 +300,14 @@ impl PeerHls {
         ca: Option<&std::path::Path>,
         external_live: Option<bool>,
     ) -> Result<Self, String> {
-        let origin = Url::parse(input).map_err(|_| "invalid peer media URL")?;
+        let mut origin = Url::parse(input).map_err(|_| "invalid peer media URL")?;
+        let authorization = crate::http_basic::take_url_credentials(&mut origin)?;
+        if authorization.is_some() && key.is_some() {
+            return Err("HTTP Basic input credentials cannot be combined with a peer key".into());
+        }
         let live = external_live.unwrap_or_else(|| origin.path().ends_with("/mpegts"));
-        if external_live.is_some() && origin.scheme() != "https" {
-            return Err("external TLS input requires HTTPS".into());
+        if external_live.is_some() && !matches!(origin.scheme(), "http" | "https") {
+            return Err("external input requires HTTP(S)".into());
         }
         if !permitted(&origin, &origin)
             || (external_live.is_none() && !(origin.path().ends_with(".m3u8") || live))
@@ -344,6 +348,11 @@ impl PeerHls {
             .no_proxy()
             .redirect(redirect)
             .connect_timeout(Duration::from_secs(5));
+        if let Some(authorization) = authorization {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::AUTHORIZATION, authorization);
+            client = client.default_headers(headers);
+        }
         if origin.scheme() == "https" {
             client = client
                 .https_only(true)

@@ -1,5 +1,10 @@
 # HTTP MPEG-TS publication preview
 
+Incoming HTTP(S) publication also supports [HTTP Basic headers](http-basic.md)
+using the existing effective Publisher password. Missing credentials on a
+protected stream now return401 with a Basic challenge; incorrect legacy query
+passwords retain403. Header/query ambiguity is rejected before admission.
+
 v0.9 adds static configured publication. Create a stream or template with the normal **Input mode → Receive a publication** selector. The API input is exactly `publish://` as its sole input. Templates inherit that input and optional publisher password/callback; editing another setting preserves inherited values. Publisher password fields and settings summaries are masked. Templates explain how to create an inheriting stream; the stream form displays its own publication URL, including inherited receive mode. Private cluster discovery sends only playback policy, display metadata and media identity; publisher passwords, callbacks, upstream inputs and raw saved configuration are excluded.
 
 An enabled local stream on a standalone/source/CDN node accepts `POST /{name}/mpegts`. Use MPEG-TS bytes with no content type, `video/mp2t`, or `application/octet-stream`. A `password` query parameter must match the stream/template `password` if configured; `token` goes to the callback. Viewer, management and peer credentials do not bypass these checks. The LB does not accept publications or discover dynamic published names. The v0.10 native HTTPS listener serves this POST handler with the same policy; see [HTTPS delivery](https-delivery.md). RTSPS playback remains separate and does not imply RTSP publication.

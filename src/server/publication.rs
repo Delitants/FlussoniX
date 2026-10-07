@@ -170,11 +170,26 @@ pub async fn receive(app: Arc<App>, request: Request<Body>) -> Response {
         }
         *slot = Some(value.into_owned());
     }
-    if !expected
-        .policy
-        .accepts_password(password.as_deref().unwrap_or(""))
+    if request.headers().get_all("authorization").iter().count() > 1
+        || (password.is_some() && request.headers().contains_key("authorization"))
     {
-        return error(StatusCode::FORBIDDEN, "publication denied");
+        return error(StatusCode::BAD_REQUEST, "ambiguous publication credential");
+    }
+    let header_password = match crate::http_basic::publisher_password(request.headers()) {
+        Ok(value) => value,
+        Err(()) => return basic_challenge(),
+    };
+    if !expected.policy.accepts_password(
+        header_password
+            .as_deref()
+            .or(password.as_deref())
+            .unwrap_or(""),
+    ) {
+        return if password.is_some() {
+            error(StatusCode::FORBIDDEN, "publication denied")
+        } else {
+            basic_challenge()
+        };
     }
     for key in ["user-agent", "referer", "host"] {
         if request
@@ -312,4 +327,15 @@ pub async fn receive(app: Arc<App>, request: Request<Body>) -> Response {
         );
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+fn basic_challenge() -> Response {
+    let mut response = error(StatusCode::UNAUTHORIZED, "publication denied");
+    response.headers_mut().insert(
+        "www-authenticate",
+        axum::http::HeaderValue::from_static(
+            "Basic realm=\"FlussoniX publisher\", charset=\"UTF-8\"",
+        ),
+    );
+    response
 }
