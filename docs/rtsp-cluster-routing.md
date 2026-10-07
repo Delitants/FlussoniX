@@ -42,7 +42,9 @@ Mixed-vendor and arbitrary external-client secure redirects remain unqualified.
 Clients must verify the destination certificate and bound reconnect/redirect
 loops. Exact self-endpoints are excluded; arbitrary DNS aliases and multi-node
 cycles are not detected. Verified RTSPS input bounds its redirect chain and
-rejects downgrades, credentialed delegation and established-session redirects.
+rejects downgrades, cross-origin credential delegation and established-session
+redirects. Configured camera credentials can follow verified redirects within
+the original hostname and port; this does not delegate them across LB/CDN nodes.
 
 The peer-only `GET /flussonix/api/v1/rtsp-routing` endpoint reports compact load,
 role, listener capabilities and fresh native-RTP ready names without stream

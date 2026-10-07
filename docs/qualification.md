@@ -589,9 +589,29 @@ baseline because it produced no HLS. An initial fixture used an incorrect fMP4
 playlist path; that result is excluded from the feature evidence.
 
 Real TLS cases cover identity/trust/expiry before target application data, strict
-destinations and framing (including Unicode whitespace rejected before networking), credentialed input rejection, late SDP/Session/media
+destinations and framing (including Unicode whitespace rejected before networking), cross-origin credential rejection, late SDP/Session/media
 redirects, exact/changing-query cycles, cancellation during handoff and unused
 listener cleanup. A stalled incomplete header expires under the initial routing
 deadline, while established interleaved media continues beyond it. All fixture
 workers and subprocesses are owned and stopped. Whole-head CI and independent
 review gate release. See the [exact scope and limits](secure-rtsp-redirects.md).
+
+### Same-origin credentialed RTSPS redirects
+
+Configured username/password now follows only the original normalized hostname
+and effective port. Real owned TLS fixtures check escaped userinfo preservation,
+target-only path/query, no connection to changed hosts or ports, credential-free
+cycle identity and replacement trust/expiry/identity rejection before handoff.
+Hostname case and default port 322 share the same authority and cycle identity;
+DNS aliases and changed ports do not. A changing-query credentialed chain retains
+the configured userinfo through four handoffs, closes the old TLS sockets and
+rejects a fifth redirect before another connection.
+Independent Basic and Digest MD5/qop-auth camera fixtures require valid initial
+authentication before redirect, then authenticate the final URI and decode both
+H.264 video and AAC audio twice. Digest rotates its nonce with `stale=true` only
+when the cached nonce has a valid password response. Wrong passwords start no
+source. All workers and subprocesses are stopped after each case. The original
+blanket rejection fails the direct handoff and valid-authentication media cases;
+an earlier fixture with incomplete nonce-renewal semantics is excluded from the
+product regression evidence. General camera/realm/algorithm interoperability and
+cross-origin credential forwarding remain outside this qualification.

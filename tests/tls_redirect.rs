@@ -81,7 +81,7 @@ fn local_target(bytes: &[u8]) -> String {
     target.into()
 }
 #[tokio::test]
-async fn invalid_redirects_and_credentialed_inputs_never_connect_or_escape() {
+async fn invalid_redirects_and_cross_origin_credentials_never_connect_or_escape() {
     let c = Certificates::new();
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = target.local_addr().unwrap();

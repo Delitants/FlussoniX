@@ -272,4 +272,4 @@ The native LB profile implements measured RTSP/RTSPS selection, compact cached t
 
 ## Verified RTSPS input redirects
 
-Configured inputs follow bounded pre-session native TLS redirects through owned loopback bridges. Every destination verifies identity and trust before application data. Direct credentialed input behavior remains available; redirected username/password inputs fail closed. See [contract and qualified native topology](secure-rtsp-redirects.md).
+Configured inputs follow bounded pre-session native TLS redirects through owned loopback bridges. Every destination verifies identity and trust before application data. Username/password inputs retain their configured credentials only within the original normalized hostname and effective port; changed origins fail before connecting. Owned Basic and Digest MD5/qop-auth camera-style fixtures independently decode H.264/AAC after redirect. See [contract, qualification and limits](secure-rtsp-redirects.md).

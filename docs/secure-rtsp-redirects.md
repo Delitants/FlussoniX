@@ -16,14 +16,25 @@ The worker owns a loopback RTSP bridge. It intercepts an initial 301/302, verifi
 the next TLS connection, then constructs a new redirect to a fresh owned loopback
 listener. FFmpeg repeats its handshake through that listener. Remote redirect
 responses are never forwarded to the decoder. Location supplies the destination
-path and query; the bridge adds no inherited token or credentials. The CDN still
+path and query; the bridge adds no inherited token. The CDN still
 independently authorizes and consumes its bound admission ticket before media.
 
 Only absolute strict `rtsps` destinations are accepted. Plaintext, other schemes,
 userinfo, fragments, invalid URI escapes, port zero, unsupported 3xx and ambiguous
-headers fail closed. An initial input containing username/password continues to
-support direct playback; it rejects redirects. Basic/Digest redirected camera
-inputs and mixed-vendor redirect interoperability remain unqualified.
+headers fail closed. An input containing username/password can follow redirects
+only to its original normalized hostname and effective port (default 322).
+Changing either is rejected before connecting, including a DNS alias pointing to
+the same server. After verifying the target TLS connection, the bridge copies
+only the originally configured userinfo into the owned loopback handoff. Remote
+Location userinfo remains rejected. URL-cycle comparison excludes credentials.
+
+Owned camera-style fixtures qualify Basic and Digest MD5 with `qop=auth`, a
+stable realm and stale-nonce renewal after redirect. Both profiles independently
+decode H.264/AAC HLS output, reuse one input worker and reject wrong passwords
+before source startup. Use the existing Input URL and TLS CA fields; no extra
+authentication editor is needed. Arbitrary camera dialects, Digest algorithms,
+realm changes, cross-origin credential delegation and mixed-vendor redirect
+interoperability remain unqualified.
 
 The chain permits four redirects after the initial connection and detects exact
 URL cycles. Initial routing has a twenty-second total deadline, including initial
