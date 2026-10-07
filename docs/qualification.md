@@ -375,7 +375,9 @@ Python's base64/hashlib implementations, then forwards unmodified interleaved
 media to an independent FFmpeg recorder. CSeq mapping isolates the recorder's
 sequence space from rejected authentication requests; this is a controlled
 receiver profile, not a qualification of every commercial recorder. The gateway
-checks exact original aggregate/track URIs, query retention, quoted realm/opaque
+asserts media begins only after accepted authenticated RECORD, counts received
+RTP/RTCP independently (zero on every denied session), and checks exact original
+aggregate/track URIs, query retention, quoted realm/opaque
 escaping and monotonically increasing nonce counts before accepting control.
 Basic plus all four MD5/SHA-256 normal/session Digest variants with and without
 qop independently record and strictly decode H.264/AAC. Published RFC7616 MD5 and

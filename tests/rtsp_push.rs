@@ -1295,12 +1295,24 @@ async fn authentication_gateway(
     .unwrap();
     (port, child)
 }
-fn auth_events(dir: &Path) -> Vec<Value> {
+fn gateway_evidence(dir: &Path) -> Vec<Value> {
     std::fs::read_to_string(dir.join("gateway.jsonl"))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+fn auth_events(dir: &Path) -> Vec<Value> {
+    gateway_evidence(dir)
+        .into_iter()
+        .filter(|event| event.get("method").is_some())
+        .collect()
+}
+fn received_auth_media(dir: &Path) -> u64 {
+    let events = gateway_evidence(dir);
+    let summary = events.last().expect("independent receiver summary");
+    assert_eq!(summary["kind"], "summary");
+    summary["media_frames"].as_u64().unwrap()
 }
 
 #[tokio::test]
@@ -1335,6 +1347,7 @@ async fn independent_basic_and_digest_receivers_authenticate_and_decode_both_tra
         received(&mut rx, &path, Some("h264"), "aac").await;
         engine.stop_all().await;
         gateway.wait().await.unwrap();
+        assert!(received_auth_media(dir.path()) > 20);
         let events = auth_events(dir.path());
         assert_eq!(
             events.iter().filter(|e| e["accepted"] == false).count(),
@@ -1418,6 +1431,11 @@ async fn wrong_credentials_and_unsupported_or_ambiguous_challenges_fail_without_
         gateway.wait().await.unwrap();
         rx.kill().await.unwrap();
         rx.wait().await.unwrap();
+        assert_eq!(
+            received_auth_media(dir.path()),
+            0,
+            "independent receiver must observe zero RTP/RTCP"
+        );
         let events = auth_events(dir.path());
         assert_eq!(
             events.len(),
@@ -1475,6 +1493,7 @@ async fn verified_tls_authenticates_the_original_secure_uri_and_decodes_hevc_mp3
     gateway.wait().await.unwrap();
     task.abort();
     let _ = task.await;
+    assert!(received_auth_media(dir.path()) > 20);
     let events = auth_events(dir.path());
     assert!(events.iter().filter(|e| e["accepted"] == true).all(|e| {
         e["target"]
@@ -1632,6 +1651,8 @@ async fn authenticated_and_unsigned_destinations_share_worker_without_credential
     denied_rx.kill().await.unwrap();
     denied_rx.wait().await.unwrap();
     assert_eq!(auth_events(&denied_dir).len(), 2);
+    assert_eq!(received_auth_media(&denied_dir), 0);
+    assert!(received_auth_media(dir.path()) > 20);
     assert!(
         std::fs::read_to_string(dir.path().join("gateway.log"))
             .unwrap()

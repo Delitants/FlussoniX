@@ -41,6 +41,9 @@ rotated = False
 authenticated = False
 forwarded_seq = 0
 pending = {}
+recorded = False
+media_frames = 0
+media_bytes = 0
 
 def quote(value):
     return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
@@ -133,6 +136,10 @@ try:
                     size = 4 + int.from_bytes(data[2:4], 'big')
                     if len(data) < size:
                         break
+                    if sock is local:
+                        media_frames += 1
+                        media_bytes += size - 4
+                        assert authenticated and recorded, 'media before authenticated RECORD'
                     send(remote if sock is local else local, data[:size])
                     buffers[sock] = data[size:]
                     continue
@@ -150,8 +157,11 @@ try:
                 buffers[sock] = data[size:]
                 if sock is remote:
                     seq = int(headers['cseq'])
-                    original_seq = pending[seq]
-                    if int(lines[0].split(' ')[1]) >= 200:
+                    original_seq, pending_method = pending[seq]
+                    code = int(lines[0].split(' ')[1])
+                    if pending_method == 'RECORD' and code == 200:
+                        recorded = True
+                    if code >= 200:
                         del pending[seq]
                     lines = [line if not line.lower().startswith('cseq:') else f'CSeq: {original_seq}' for line in lines]
                     frame = ('\r\n'.join(lines) + '\r\n\r\n').encode() + frame[at + 4:]
@@ -184,7 +194,7 @@ try:
                 # Receiver authority is different, proving Digest used the gateway's
                 # actual request target rather than the publisher loopback endpoint.
                 forwarded_seq += 1
-                pending[forwarded_seq] = int(headers['cseq'])
+                pending[forwarded_seq] = (int(headers['cseq']), method)
                 lines[0] = lines[0].replace(aggregate, f'rtsp://127.0.0.1:{a.receiver}/owned')
                 lines = [line if not line.lower().startswith('cseq:') else f'CSeq: {forwarded_seq}' for line in lines if not line.lower().startswith('authorization:')]
                 frame = ('\r\n'.join(lines) + '\r\n\r\n').encode() + frame[at + 4:]
@@ -192,6 +202,7 @@ try:
 except (EOFError, ConnectionError, OSError):
     pass
 finally:
+    event({'kind': 'summary', 'media_frames': media_frames, 'media_bytes': media_bytes, 'authenticated_record': recorded})
     s.close()
     local.close()
     remote.close()
