@@ -35,12 +35,14 @@ still supported. Restarting a node invalidates all its old tickets.
 Actual TLS transport controls security, including plain URI aliases inside TLS.
 An RTSPS viewer is routed only to RTSPS; a plain RTSP viewer can upgrade when
 only a secure endpoint is configured. TLS framing and downgrade prevention are
-tested using private-CA certificate-verifying clients. Automatic secure multi-hop
-FFmpeg decoding and mixed-vendor client interoperability remain unqualified.
+tested using private-CA certificate-verifying clients. Configured RTSPS workers
+now follow native redirects through an owned bridge and independently decode the
+secure LB/CDN chain; see [verified input redirects](secure-rtsp-redirects.md).
+Mixed-vendor and arbitrary external-client secure redirects remain unqualified.
 Clients must verify the destination certificate and bound reconnect/redirect
 loops. Exact self-endpoints are excluded; arbitrary DNS aliases and multi-node
-cycles are not detected. Existing verified RTSPS input deliberately rejects
-upstream control redirects.
+cycles are not detected. Verified RTSPS input bounds its redirect chain and
+rejects downgrades, credentialed delegation and established-session redirects.
 
 The peer-only `GET /flussonix/api/v1/rtsp-routing` endpoint reports compact load,
 role, listener capabilities and fresh native-RTP ready names without stream

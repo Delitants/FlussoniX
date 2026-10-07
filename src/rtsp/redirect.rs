@@ -1,4 +1,4 @@
-//! Callback-selected viewer destinations, never upstream connections.
+//! Strict RTSP destination URI validation and callback-selected viewer responses.
 use super::Reply;
 
 pub(crate) fn destination(value: &str) -> Option<url::Url> {

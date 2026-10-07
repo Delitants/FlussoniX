@@ -174,6 +174,31 @@ impl Drop for Node {
     }
 }
 impl Node {
+    async fn secure_media(&mut self) -> String {
+        use axum::serve::ListenerExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}", listener.local_addr().unwrap());
+        let listener =
+            flussonix::http_tls::Listener::new(listener, self.cert.server()).tap_io(|stream| {
+                let _ = stream.get_ref().0.set_nodelay(true);
+            });
+        let app = self.app.clone();
+        let probe = self.probe.clone();
+        let stop = self.cancel.clone();
+        self.tasks
+            .push(AbortOnDropHandle::new(tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    router(app)
+                        .layer(middleware::from_fn_with_state(probe, intercept))
+                        .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(stop.cancelled_owned())
+                .await
+                .unwrap();
+            })));
+        url
+    }
     async fn new(role: &str, limit: u64) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let cert = tls_fixture::Certificates::new();
@@ -393,6 +418,57 @@ impl Lab {
     }
 }
 const QS: &str = "token=owned%2Bviewer&customer=a%26b&blank=&client=owned";
+#[tokio::test]
+async fn configured_rtsps_relay_decodes_native_lb_cdn_source_chain() {
+    let mut lab = Lab::new(1000).await;
+    let mut relay = Node::new("standalone", 1000).await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let private = lab.source.secure_media().await;
+        for node in [&lab.lb, &lab.cdn] {
+            node.app.config.put("sources", "origin", json!({"private_payload_url":private,"flussonix_media_tls_ca":lab.source.cert.ca})).unwrap();
+        }
+        assert_eq!(lab.lb.describe(true, "region/owned", "token=wrong").await.0, 403);
+        assert_eq!(lab.cdn.probe.admits.load(Ordering::SeqCst), 0);
+        assert_eq!(lab.source.app.media.count().await, 0);
+        let trust = relay._dir.path().join("cluster-ca.pem");
+        let mut roots = std::fs::read(&lab.lb.cert.ca).unwrap();
+        roots.extend_from_slice(&std::fs::read(&lab.cdn.cert.ca).unwrap());
+        std::fs::write(&trust, roots).unwrap();
+        relay.app.config.put("streams", "relay", json!({"static":false,"inputs":[{"url":format!("{}/region/owned?{QS}", lab.lb.tls),"flussonix_tls_ca":trust}]})).unwrap();
+        let playback = format!("{}/relay/fmp4/index.m3u8", relay.http);
+        let http = client();
+        let ready = tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                let reply = http.get(&playback).send().await.unwrap();
+                if reply.status().is_success() { return true; }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }).await.unwrap_or(false);
+        assert!(ready, "configured verified RTSPS relay must produce HLS");
+        for _ in 0..2 {
+            let output = tokio::time::timeout(Duration::from_secs(30), tokio::process::Command::new("ffmpeg")
+                .args(["-nostdin", "-v", "error", "-i", &playback, "-t", "2", "-map", "0:v:0", "-map", "0:a:0", "-threads", "1", "-f", "framemd5", "-"])
+                .kill_on_drop(true).output()).await.unwrap().unwrap();
+            assert!(output.status.success() && output.stderr.is_empty(), "strict TLS chain decode: {}", String::from_utf8_lossy(&output.stderr));
+            let media = String::from_utf8_lossy(&output.stdout);
+            assert!(media.contains("#media_type 0: video") && media.contains("#media_type 1: audio"));
+            assert!(media.lines().filter(|l| l.starts_with("0,")).count() >= 20);
+            assert!(media.lines().filter(|l| l.starts_with("1,")).count() >= 40);
+        }
+        assert_eq!(lab.lb.app.media.count().await, 0);
+        assert_eq!(lab.cdn.app.media.count().await, 1);
+        assert_eq!(lab.source.app.media.count().await, 1);
+        assert_eq!(relay.app.media.count().await, 1);
+        assert_eq!(lab.source.probe.pulls.load(Ordering::SeqCst), 1, "one shared private M4S pull");
+        assert!(!lab.cdn.probe.bad_key.load(Ordering::SeqCst));
+        assert!(!lab.source.probe.bad_key.load(Ordering::SeqCst));
+    }).catch_unwind().await;
+    relay.stop().await;
+    lab.stop().await;
+    if let Err(p) = result {
+        std::panic::resume_unwind(p)
+    }
+}
 #[tokio::test]
 async fn native_lb_routes_before_media_and_preserves_credentials() {
     let mut lab = Lab::new(1000).await;

@@ -572,8 +572,26 @@ and all eleven routing cases pass after it.
 
 Owned loopback source/CDN/LB tests qualify initial authorization before networking, exact query and secret separation, non-destructive protocol/token/stream/transport ticket mismatch, replay and expiry, shared-cache concurrent reservations and CDN capacity rechecking. They cover malformed/stale/drained/saturated/incompatible/self endpoints, cache invalidation and failed refresh, bounded pools, alternate admission, and configuration/revocation during pending placement. Callback redirects take precedence; internal tickets stay out of callback query data. Verified private-CA clients check actual TLS routing, plain URI aliases and no downgrade. Independent FFmpeg strictly decodes mapped video/audio from two LB requests, verifying one CDN worker and one private M4S pull. All fixtures are owned and stopped after tests.
 
-A failed expiry regression exposed allowed control decisions lingering in playback occupancy. Control admission now retains decision caching without playback linger; valid media admission promotes its grant. A separate unit test checks live ownership and promotion. Friendly peer URL validation/save/edit/clear has browser coverage. Full final-head CI and independent review gate release. Two-second decodes do not establish sustained capacity; secure multi-hop FFmpeg, mixed-vendor dialects and dynamic media cost reservation remain pending. See [full profile](rtsp-cluster-routing.md).
+A failed expiry regression exposed allowed control decisions lingering in playback occupancy. Control admission now retains decision caching without playback linger; valid media admission promotes its grant. A separate unit test checks live ownership and promotion. Friendly peer URL validation/save/edit/clear has browser coverage. Full final-head CI and independent review gate release. Two-second decodes do not establish sustained capacity; at this stage secure multi-hop FFmpeg, mixed-vendor dialects and dynamic media cost reservation were pending. The following verified-input stage qualifies configured native TLS workers. See [full profile](rtsp-cluster-routing.md).
 
 Ticket-bearing HTTP requests also use control authorization: rejected cross-protocol tickets and valid cleanup redirects leave no phantom HTTP playback slot. The clean media request retains normal authorization and playback accounting. A failing cross-protocol occupancy assertion qualifies this correction.
 
 A deterministic concurrency regression yields after constructing the live grant and before returning it to the caller. The initial implementation admitted sixteen distinct control viewers under a one-viewer limit. Atomic admission now constructs the live grant under the same lock as capacity checks; that grant owns capacity through handoff and cancellation. Pending policy checks retain their cache entry without owning capacity. The revised regression requires exactly one allowance. Warmed-cache regressions also verify global and callback user limits, unique-user revocation and independent playback-grace timestamps. A full 64-peer pool regression places a healthy CDN last behind 63 stalled probes and verifies successful routing within the overall deadline.
+
+## Verified RTSPS input redirects
+
+The worker-owned bridge verifies each native redirected destination before
+constructing a local loopback redirect for FFmpeg. An owned source/CDN/LB plus
+configured RTSPS relay independently decodes H.264/AAC for two HLS viewers and
+reuses one verified private HTTPS M4S pull. The direct response regression failed against the old
+blanket-rejection bridge; the corrected native fixture also failed against that
+baseline because it produced no HLS. An initial fixture used an incorrect fMP4
+playlist path; that result is excluded from the feature evidence.
+
+Real TLS cases cover identity/trust/expiry before target application data, strict
+destinations and framing, credentialed input rejection, late SDP/Session/media
+redirects, exact/changing-query cycles, cancellation during handoff and unused
+listener cleanup. A stalled incomplete header expires under the initial routing
+deadline, while established interleaved media continues beyond it. All fixture
+workers and subprocesses are owned and stopped. Whole-head CI and independent
+review gate release. See the [exact scope and limits](secure-rtsp-redirects.md).

@@ -7,6 +7,100 @@ use tokio::{
 #[path = "support/tls.rs"]
 mod tls_fixture;
 use tls_fixture::Certificates;
+async fn control_header<S: tokio::io::AsyncRead + Unpin>(socket: &mut S) -> String {
+    let mut header = vec![];
+    while !header.ends_with(b"\r\n\r\n") && header.len() < 16384 {
+        match socket.read_u8().await {
+            Ok(byte) => header.push(byte),
+            Err(_) => break,
+        }
+    }
+    String::from_utf8(header).unwrap()
+}
+#[tokio::test]
+async fn verified_redirect_uses_owned_loopback_and_delivers_final_tls_response() {
+    use tokio_util::task::AbortOnDropHandle;
+    let c = Certificates::new();
+    let initial = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let edge = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let initial_addr = initial.local_addr().unwrap();
+    let edge_addr = edge.local_addr().unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(c.server());
+    let edge_acceptor = acceptor.clone();
+    let initial_task = AbortOnDropHandle::new(tokio::spawn(async move {
+        let (socket, _) = initial.accept().await.unwrap();
+        let mut socket = acceptor.accept(socket).await.unwrap();
+        assert!(control_header(&mut socket).await.contains("token=initial"));
+        socket.write_all(format!("RTSP/1.0 302 Moved Temporarily\r\nCSeq: 7\r\nLocation: rtsps://{edge_addr}/second?token=edge-only&client=owned\r\n\r\n").as_bytes()).await.unwrap();
+    }));
+    let edge_task = AbortOnDropHandle::new(tokio::spawn(async move {
+        let (socket, _) = edge.accept().await.unwrap();
+        let mut socket = edge_acceptor.accept(socket).await.unwrap();
+        let request = control_header(&mut socket).await;
+        assert!(request.contains("/second?token=edge-only&client=owned"));
+        assert!(!request.contains("token=initial"));
+        socket
+            .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 8\r\nContent-Length: 4\r\n\r\nPONG")
+            .await
+            .unwrap();
+    }));
+    let bridge = Bridge::prepare(
+        &format!("rtsps://{initial_addr}/first?token=initial"),
+        Some(&c.ca),
+    )
+    .await
+    .unwrap();
+    let local = url::Url::parse(bridge.local_url()).unwrap();
+    let mut socket = TcpStream::connect(("127.0.0.1", local.port().unwrap()))
+        .await
+        .unwrap();
+    socket
+        .write_all(
+            format!(
+                "DESCRIBE {} RTSP/1.0\r\nCSeq: 7\r\n\r\n",
+                bridge.local_url()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(3), control_header(&mut socket))
+        .await
+        .unwrap();
+    assert!(
+        response.starts_with("RTSP/1.0 302 "),
+        "verified redirect expected, got {response:?}"
+    );
+    let location = response
+        .lines()
+        .find_map(|line| line.strip_prefix("Location: "))
+        .unwrap();
+    let next = url::Url::parse(location).unwrap();
+    assert_eq!(next.scheme(), "rtsp");
+    assert_eq!(next.host_str(), Some("127.0.0.1"));
+    assert_ne!(next.port(), Some(edge_addr.port()));
+    assert_eq!(next.path(), "/second");
+    assert_eq!(next.query(), Some("token=edge-only&client=owned"));
+    let mut socket = TcpStream::connect(("127.0.0.1", next.port().unwrap()))
+        .await
+        .unwrap();
+    socket
+        .write_all(format!("DESCRIBE {location} RTSP/1.0\r\nCSeq: 8\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut received = vec![];
+    tokio::time::timeout(Duration::from_secs(3), socket.read_to_end(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        received,
+        b"RTSP/1.0 200 OK\r\nCSeq: 8\r\nContent-Length: 4\r\n\r\nPONG"
+    );
+    bridge.close().await;
+    initial_task.await.unwrap();
+    edge_task.await.unwrap();
+}
 async fn upstream(c: &Certificates, bind: &str) -> (String, tokio::task::JoinHandle<usize>) {
     let l = TcpListener::bind(bind).await.unwrap();
     let url = format!(
@@ -206,8 +300,8 @@ async fn unused_verified_bridge_expires_and_releases_listener() {
 }
 
 #[tokio::test]
-async fn verified_input_never_follows_redirect_outside_tls_bridge() {
-    for scheme in ["rtsp", "rtsps"] {
+async fn verified_input_rejects_plaintext_redirect_before_networking() {
+    for scheme in ["rtsp"] {
         let c = Certificates::new();
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();

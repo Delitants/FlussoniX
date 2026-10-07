@@ -43,9 +43,9 @@ Streams/Templates authorization controls configure the backend. This provides
 backend-selected routing; [native adaptive RTSP LB selection/reservation](rtsp-cluster-routing.md) is now a separate implemented profile. It does not
 add Basic/Digest viewer credentials, change publication/push, issue server-driven
 REDIRECT requests for established media, or transparently move a live session.
-The verified RTSPS **input** bridge continues to reject upstream 3xx responses
-so redirects cannot escape its verified connection. Clients following a secure
-viewer redirect must independently verify the destination's certificate.
+The verified RTSPS **input** bridge now handles bounded pre-session redirects
+through verified owned endpoints; see [input scope](secure-rtsp-redirects.md).
+Clients following a secure viewer redirect must verify the destination certificate.
 
 Qualification uses owned callback servers and plain/private-CA TLS listeners
 on unused loopback ports. Tests cover cached exact Location/CSeq framing, no
@@ -57,7 +57,8 @@ Token-free session identity tests cover valid-first RTSP cache access and
 invalid-first/warmed HTTP grant access, without bypass or cache poisoning.
 An independent FFmpeg client follows a plaintext redirect to a separately
 authorized node and strictly decodes both audio and video. Secure redirect
-headers are qualified with a certificate-verifying client; automated secure
-multi-hop media following and mixed-vendor/client dialects remain unqualified.
+headers are qualified with a certificate-verifying client. Configured RTSPS
+workers also qualify the native secure chain; mixed-vendor and arbitrary
+external-client secure redirects remain unqualified.
 All fixture processes are stopped and reaped. No official Flussonic component
 is a runtime, build or test dependency.

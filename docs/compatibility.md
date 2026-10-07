@@ -268,4 +268,8 @@ behavior stays separate. This is callback-selected routing; [native adaptive RTS
 
 ## Native RTSP cluster routing
 
-The native LB profile implements measured RTSP/RTSPS selection, compact cached telemetry, bound five-second tickets and independent CDN authorization. Friendly peer fields configure public RTSP/RTSPS listener roots. Verified TLS never downgrades; independent FFmpeg decodes plaintext LB redirects through a shared private M4S source pull. This is a native extension, not vendor cluster parity; secure automatic multi-hop and sustained capacity remain unqualified. See [profile and limits](rtsp-cluster-routing.md).
+The native LB profile implements measured RTSP/RTSPS selection, compact cached telemetry, bound five-second tickets and independent CDN authorization. Friendly peer fields configure public RTSP/RTSPS listener roots. Verified TLS never downgrades; independent FFmpeg decodes plaintext LB redirects through a shared private M4S source pull. Configured RTSPS workers also qualify the secure native LB/CDN chain through verified owned input bridges. Sustained capacity and mixed-vendor parity remain unqualified. See [profile and limits](rtsp-cluster-routing.md).
+
+## Verified RTSPS input redirects
+
+Configured inputs follow bounded pre-session native TLS redirects through owned loopback bridges. Every destination verifies identity and trust before application data. Direct credentialed input behavior remains available; redirected username/password inputs fail closed. See [contract and qualified native topology](secure-rtsp-redirects.md).

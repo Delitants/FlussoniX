@@ -76,6 +76,8 @@ Playback supports up to eight supported media tracks: one H.264/HEVC video track
 
 Existing `on_play` backends can select an RTSP/RTSPS viewer destination before worker startup. Redirects preserve the backend URL, use the existing decision cache, and reject TLS downgrade. See [callback routing and tested limits](docs/rtsp-auth-redirects.md).
 
+Configured RTSPS inputs follow native TLS redirects through verified owned bridges; see [secure input redirects and limits](docs/secure-rtsp-redirects.md).
+
 ## Replica failover
 
 Set the same optional `flussonix_source_group` on equivalent source relationships and `flussonix_content_id` on their streams or templates. The CDN only switches when content identity and normalized viewer policy match. A disabled, deleted or invalid known origin fails closed. A healthy fallback stays selected; media can reconnect during the switch. These are native extensions, editable through friendly UI fields. See [cluster behavior and limits](docs/cluster-loadbalancing.md#implemented-v05-equivalent-origin-failover).
