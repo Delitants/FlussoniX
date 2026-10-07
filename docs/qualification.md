@@ -532,3 +532,22 @@ frame hashes. Failure logs and the owned source experiment are retained. All med
 processes are owned; no vendor components or production/demo servers are used.
 Full final-head CI and read-only review gate publication. Short recordings do
 not establish sustained capacity, long-duration sync or all recorder dialects.
+
+## RTSP authorization callback routing
+
+The owned real-socket callback test first reproduces RTSP 403 instead of a
+backend-selected redirect. After correction, ten cases check exact original
+Location/CSeq, decision caching without worker/viewer ownership, template policy,
+token denial, TLS downgrade rejection including cached plaintext decisions and
+URI aliases, invalid/missing/oversized destinations, direct self-redirects,
+configuration races, pending/cached revocation and unchanged HTTP behavior.
+An independent FFmpeg client follows a redirect to a separately token-protected
+node and strictly decodes mapped video/audio. That destination rejects the wrong
+token before any worker startup. The redirecting node retains no media worker.
+
+The first pending-revocation fixture incorrectly looked up an inactive entry in
+the active session collection. It now uses the actual session UUID sent to the
+callback; its failure log is retained. Production session visibility is unchanged.
+Verified private-CA TLS clients qualify secure response framing and downgrade
+guards; secure multi-hop decoding, native adaptive RTSP LB routing and real
+vendor/client dialect parity remain separate gates. See [full scope](rtsp-auth-redirects.md).

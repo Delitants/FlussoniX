@@ -160,6 +160,7 @@ pub async fn read_event<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Event, E
 pub fn response(code: u16, cseq: u32, headers: &[(&str, String)], body: &[u8]) -> Vec<u8> {
     let reason = match code {
         200 => "OK",
+        302 => "Moved Temporarily",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",

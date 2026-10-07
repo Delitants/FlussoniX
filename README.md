@@ -74,6 +74,8 @@ This profile serves RTSP 1.0 playback over TCP interleaving or opt-in unicast UD
 
 Playback supports up to eight supported media tracks: one H.264/HEVC video track with up to seven AAC/MP2/MP3 audio tracks, or eight audio-only tracks. Each UDP track receives bounded, rotating RTCP service. The [multitrack profile](docs/rtsp-rtp-support.md#multitrack-playback) records independent decode, selected-track authorization and port-reclamation evidence.
 
+Existing `on_play` backends can select an RTSP/RTSPS viewer destination before worker startup. Redirects preserve the backend URL, use the existing decision cache, and reject TLS downgrade. See [callback routing and tested limits](docs/rtsp-auth-redirects.md).
+
 ## Replica failover
 
 Set the same optional `flussonix_source_group` on equivalent source relationships and `flussonix_content_id` on their streams or templates. The CDN only switches when content identity and normalized viewer policy match. A disabled, deleted or invalid known origin fails closed. A healthy fallback stays selected; media can reconnect during the switch. These are native extensions, editable through friendly UI fields. See [cluster behavior and limits](docs/cluster-loadbalancing.md#implemented-v05-equivalent-origin-failover).

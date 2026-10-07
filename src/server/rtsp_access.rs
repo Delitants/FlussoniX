@@ -1,5 +1,9 @@
 //! RTSP uses exactly the same viewer policy and source/worker fences as HTTP.
 use super::*;
+pub(crate) enum Admission {
+    Playback(Playback),
+    Redirect(String),
+}
 pub(crate) struct Playback {
     pub worker: Arc<Worker>,
     pub grant: Grant,
@@ -25,7 +29,7 @@ impl Drop for Playback {
     }
 }
 impl App {
-    pub(crate) async fn rtsp_admit(&self, viewer: ViewerRequest) -> Result<Playback, u16> {
+    pub(crate) async fn rtsp_admit(&self, viewer: ViewerRequest) -> Result<Admission, u16> {
         if self.options.role == "lb" {
             return Err(501);
         }
@@ -33,7 +37,15 @@ impl App {
         let resolved = self.resolve(&name).await.ok_or(404u16)?;
         let grant = match self.playback_auth.authorize(resolved.policy, viewer).await {
             AuthOutcome::Allowed(g) => g,
-            _ => return Err(403),
+            AuthOutcome::Denied => return Err(403),
+            AuthOutcome::Redirect(target) => {
+                // Redirects hold no media grant. Do not emit a decision from a
+                // configuration changed while its callback was in flight.
+                if self.config.revision() != resolved.revision {
+                    return Err(503);
+                }
+                return Ok(Admission::Redirect(target));
+            }
         };
         if self.config.revision() != resolved.revision {
             self.resolve(&name).await.ok_or(404u16)?;
@@ -63,13 +75,13 @@ impl App {
         if grant.is_cancelled() || worker.is_closed() {
             return Err(403);
         }
-        Ok(Playback {
+        Ok(Admission::Playback(Playback {
             worker,
             grant,
             description,
             name,
             attached: false,
-        })
+        }))
     }
     pub(crate) async fn rtsp_current(&self, playback: &Playback) -> bool {
         !playback.grant.is_cancelled()

@@ -567,7 +567,10 @@ async fn handle(
             host: url.host_str().unwrap().into(),
         };
         let playback = match app.rtsp_admit(viewer).await {
-            Ok(p) => p,
+            Ok(crate::server::rtsp_access::Admission::Playback(p)) => p,
+            Ok(crate::server::rtsp_access::Admission::Redirect(target)) => {
+                return redirect::response(target, &url, secure);
+            }
             Err(code) => return Reply::code(code),
         };
         let body = playback.description.sdp().into_bytes();
@@ -884,3 +887,5 @@ mod tests {
 
 #[cfg(test)]
 mod playback_feedback_tests;
+
+pub(crate) mod redirect;

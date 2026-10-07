@@ -452,7 +452,13 @@ impl PlaybackAuth {
             decision = if response.status().is_success() {
                 Decision::Allow
             } else if response.status() == 302 {
-                match header("location").filter(|url| validate_http(url).is_ok()) {
+                match header("location").filter(|url| {
+                    if r.proto == "rtsp" {
+                        crate::rtsp::redirect::destination(url).is_some()
+                    } else {
+                        validate_http(url).is_ok()
+                    }
+                }) {
                     Some(url) => Decision::Redirect(url.into()),
                     None => Decision::Deny,
                 }

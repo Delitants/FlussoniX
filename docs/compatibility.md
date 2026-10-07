@@ -257,3 +257,12 @@ SETUP tracks retain their IDs, negotiated transport and existing viewer policy.
 UDP feedback from each track receives bounded round-robin service; invalid or
 foreign traffic does not renew authorization or suppress another track's turn.
 See [playback profile, evidence and limits](rtsp-rtp-support.md#multitrack-playback).
+
+## RTSP authorization callback redirects
+
+Initial DESCRIBE on standalone/CDN nodes accepts backend-selected absolute
+RTSP/RTSPS destinations, with RTSP 302/Location before worker/session startup.
+Cached decisions retain token/template policy and revocation; actual TLS control
+connections reject plaintext destinations on every response. HTTP redirect
+behavior stays separate. This is callback-selected routing, with native RTSP
+adaptive LB reservations still pending. See [contract and qualification](rtsp-auth-redirects.md).
