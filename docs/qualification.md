@@ -367,3 +367,37 @@ These are owned loopback qualifications, with no production listeners or vendor
 components. Full Rust/browser/fmt/clippy/build and final exact-head CI remain
 publication gates; this does not qualify all recorder dialects, long-duration
 synchronization or production capacity.
+
+## Outbound RTSP receiver authentication
+
+An independent Python authentication gateway verifies Basic and Digest using
+Python's base64/hashlib implementations, then forwards unmodified interleaved
+media to an independent FFmpeg recorder. CSeq mapping isolates the recorder's
+sequence space from rejected authentication requests; this is a controlled
+receiver profile, not a qualification of every commercial recorder. The gateway
+checks exact original aggregate/track URIs, query retention, quoted realm/opaque
+escaping and monotonically increasing nonce counts before accepting control.
+Basic plus all four MD5/SHA-256 normal/session Digest variants with and without
+qop independently record and strictly decode H.264/AAC. Published RFC7616 MD5 and
+SHA-256 response vectors provide a separate signing check.
+
+A trusted TLS fixture authenticates the original RTSPS hostname/port and strictly
+decodes HEVC/MP3. Untrusted, expired and wrong-name TLS fixtures now contain URL
+credentials and still receive zero application data. A nineteen-second recording
+survives an OPTIONS stale-nonce renewal without reconnecting. Wrong credentials,
+unsupported or ambiguous challenges and repeated fresh stale challenges produce
+no RTP and enter bounded backoff. A delayed authenticated setup still expires
+inside the original startup budget; stopping while authentication is pending
+closes the socket without retry. Authenticated and unsigned destinations share
+one worker while a third destination rejects its different password.
+
+The local RTSP suite passes 22 tests with one explicit GPU opt-in skip; all 78
+library tests pass. The affected browser flows save and inherit masked userinfo,
+retain it when switching RTSP/RTSPS, validate credential encoding and remove
+unsupported userinfo when switching to SRT. Framing still rejects duplicate
+CSeq/Session/Content-Length; only WWW-Authenticate may repeat. No production host,
+stream, configuration or Flussonic component is used by these fixtures. The
+supported outbound profile does not imply Basic/Digest viewer or incoming
+publisher authentication, auth-int, SHA-512 variants, international credentials,
+proxy authentication, Authentication-Info negotiation, vendor dialect parity or
+migration/throughput qualification. Exact-head CI remains the publication gate.

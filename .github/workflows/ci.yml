@@ -19,6 +19,7 @@ jobs:
         run: |
           cargo test --locked --test subtitle_preservation raw_hls_window_is_bounded_and_replacement_does_not_reuse_sequences_or_files -- --exact --test-threads=1
           cargo test --locked --lib rtsp_push -- --test-threads=1
+          cargo test --locked --test rtsp_push independent_basic_and_digest_receivers_authenticate_and_decode_both_tracks -- --exact --test-threads=1
           cargo test --locked --test rtsp_push independent_receiver_decodes_native_rtsp_push -- --exact --test-threads=1
           cargo test --locked --test rtsp_push native_text_preserve_rejects_rtsp_before_connect_and_drop_delivers_audio -- --exact --test-threads=1
       - name: Rust qualification and owned browser caption fixture

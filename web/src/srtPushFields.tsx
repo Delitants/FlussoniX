@@ -28,7 +28,8 @@ export function pushError(value:Item):string|undefined {
   if(protocol(raw)!=='srt') {
    try {
     const u=new URL(raw.url||'');
-    if(!['rtsp:','rtsps:'].includes(u.protocol)||!u.hostname||u.port==='0'||u.username||u.password||u.hash||!u.pathname.replaceAll('/','')||!raw.url||raw.url.length>4096||/[^\x21-\x7e]/.test(raw.url)||/%(?![a-fA-F0-9]{2})/.test(raw.url))return 'Destination URL must use rtsp://HOST/STREAM or rtsps://HOST/STREAM without userinfo or fragments.';
+    if(!['rtsp:','rtsps:'].includes(u.protocol)||!u.hostname||u.port==='0'||u.hash||!u.pathname.replaceAll('/','')||!raw.url||raw.url.length>4096||/[^\x21-\x7e]/.test(raw.url)||/%(?![a-fA-F0-9]{2})/.test(raw.url))return 'Destination URL must use rtsp://HOST/STREAM or rtsps://HOST/STREAM without fragments.';
+    if(u.username||u.password){const username=decodeURIComponent(u.username),password=decodeURIComponent(u.password);if(!username||username.includes(':')||username.length>256||password.length>512||/[^\x20-\x7e]/.test(username+password))return 'Destination URL credentials need a printable ASCII username (up to 256 characters, without a colon) and password (up to 512 characters).';}
     if(owns(raw,'flussonix_tls_ca')&&(u.protocol!=='rtsps:'||typeof raw.flussonix_tls_ca!=='string'||!raw.flussonix_tls_ca.startsWith('/')))return 'RTSPS trusted CA must be an absolute file path, or leave it empty for public roots.';
     for(const [key,max] of [['connect_timeout',30],['retry_timeout',300]] as const)if(owns(raw,key)&&(!Number.isInteger(raw[key])||raw[key]<1||raw[key]>max))return `RTSP ${key==='connect_timeout'?'connection timeout':'retry interval'} must be a whole number from 1 to ${max}.`;
    }catch{return 'Destination URL must use rtsp://HOST/STREAM or rtsps://HOST/STREAM.'}
@@ -68,7 +69,7 @@ export function PushFields({value,inherited,onChange}:{value:Item,inherited?:Ite
   onChange(rows.map((p,n)=>{
   if(n!==i)return p;
   const next:Item={};for(const key of ['url','disabled','comment','connect_timeout','retry_timeout'])if(owns(p,key))next[key]=p[key];
-  try {const u=protocol(p)==='srt'?parsedURL(p.url):new URL(p.url);u.protocol=kind+':';if(kind==='srt'){u.pathname='/';u.search='';}next.url=u.toString();}catch{next.url=kind+'://';}
+  try {const u=protocol(p)==='srt'?parsedURL(p.url):new URL(p.url);u.protocol=kind+':';if(kind==='srt'){u.username='';u.password='';u.pathname='/';u.search='';}next.url=u.toString();}catch{next.url=kind+'://';}
   return next;
  }));
  };
@@ -78,7 +79,7 @@ export function PushFields({value,inherited,onChange}:{value:Item,inherited?:Ite
   {mode==='inherit'&&value.template&&<div className="muted">{pushSummary(inherited||[])}</div>}
   {mode==='override'&&<>{rows.map((p,i)=><div className="form-details" key={i}><h3>Destination {i+1}</h3><div className="form-grid">
    <Field label={`Destination protocol ${i+1}`}><select value={rowProtocol(i,p)} onChange={e=>changeProtocol(i,e.target.value)}><option value="srt">SRT</option><option value="rtsp">RTSP</option><option value="rtsps">RTSPS (verified TLS)</option></select></Field>
-   <Field label={`Destination URL ${i+1}`} help={rowProtocol(i,p)==='srt'?"Receiver address, including its SRT port. URL credentials are hidden.":"Receiver stream address. Query credentials are hidden; Basic/Digest userinfo is not supported."}><input type="password" autoComplete="off" placeholder={rowProtocol(i,p)==='srt'?'srt://receiver.example:9000':rowProtocol(i,p)+'://receiver.example/stream'} value={p.url||''} onChange={e=>set(i,'url',e.target.value)}/></Field>
+   <Field label={`Destination URL ${i+1}`} help={rowProtocol(i,p)==='srt'?"Receiver address, including its SRT port. URL credentials are hidden.":"Receiver stream address. Use USER:PASSWORD@HOST for Basic/Digest authentication; percent-encode special characters. Credentials are hidden."}><input type="password" autoComplete="off" placeholder={rowProtocol(i,p)==='srt'?'srt://receiver.example:9000':rowProtocol(i,p)+'://receiver.example/stream'} value={p.url||''} onChange={e=>set(i,'url',e.target.value)}/></Field>
    {rowProtocol(i,p)==='srt'&&<>
    <Field label={`Stream ID ${i+1}`} help="Optional identifier for the receiver, such as #!::r=channel,m=publish. Hidden because it may contain credentials."><input type="password" autoComplete="off" maxLength={512} value={p.streamid??''} onChange={e=>set(i,'streamid',e.target.value)}/></Field>
    <Field label={`Passphrase ${i+1}`} help="Matching 10–79 ASCII character secrets enable encryption. Empty means plaintext."><input type="password" autoComplete="off" maxLength={79} value={p.passphrase??''} onChange={e=>set(i,'passphrase',e.target.value)}/></Field>

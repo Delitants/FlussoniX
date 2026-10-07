@@ -751,7 +751,7 @@ test('RTSPS push controls save masked credentials and inherit from templates',as
  await page.getByRole('button',{name:'Templates',exact:true}).click();await page.getByRole('button',{name:'Add template',exact:true}).click();
  await page.getByLabel('Template name',{exact:true}).fill(template);await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');await page.getByLabel('Activation',{exact:true}).selectOption('ondemand');
  await page.getByLabel('Destination settings',{exact:true}).selectOption('override');await page.getByLabel('Destination protocol 1',{exact:true}).selectOption('rtsps');
- const url='rtsps://localhost:13220/owned?password=owned-ui-secret';
+ const url='rtsps://user%20name:owned%3Aui-secret@localhost:13220/owned?password=owned-ui-secret';
  await page.getByLabel('Destination URL 1',{exact:true}).fill(url);await expect(page.getByLabel('Destination URL 1',{exact:true})).toHaveAttribute('type','password');
  await page.getByLabel('Destination trusted CA file 1',{exact:true}).fill(ca);await page.getByLabel('Destination enabled 1',{exact:true}).uncheck();
  await expect(page.locator('textarea')).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('cell',{name:template,exact:true})).toBeVisible();
@@ -770,6 +770,7 @@ test('RTSPS push controls save masked credentials and inherit from templates',as
  await page.getByLabel('Destination protocol 1',{exact:true}).selectOption('rtsp');await expect(page.getByLabel('Destination trusted CA file 1',{exact:true})).toHaveCount(0);
  await page.getByRole('button',{name:'Save',exact:true}).click();
  const stream=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(stream.pushes).toEqual([{url:url.replace('rtsps:','rtsp:'),disabled:true}]);
+ await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Destination protocol 1',{exact:true}).selectOption('srt');await expect(page.getByLabel('Destination URL 1',{exact:true})).toHaveValue('srt://localhost:13220/');await page.getByRole('button',{name:'Save',exact:true}).click();const switched=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(switched.pushes).toEqual([{url:'srt://localhost:13220/',disabled:true}]);
  await request.delete('/streamer/api/v3/streams/'+name,{headers});await request.delete('/streamer/api/v3/templates/'+template,{headers});
 });
 
@@ -782,7 +783,7 @@ test('RTSP destination switching removes foreign settings and validates friendly
  await expect(page.getByLabel('Passphrase 1',{exact:true})).toHaveCount(0);await expect(page.getByLabel('Stream ID 1',{exact:true})).toHaveCount(0);
  await page.getByLabel('Destination URL 1',{exact:true}).fill('rtsps://localhost/owned');await page.getByLabel('Destination trusted CA file 1',{exact:true}).fill('relative.pem');
  await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('absolute');
- await page.getByLabel('Destination trusted CA file 1',{exact:true}).fill('');await page.getByLabel('Destination URL 1',{exact:true}).fill('rtsp://user:password@localhost/owned');
+ await page.getByLabel('Destination trusted CA file 1',{exact:true}).fill('');await page.getByLabel('Destination URL 1',{exact:true}).fill('rtsp://user%3Aname:password@localhost/owned');
  await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Destination URL');
  await expect(page.locator('textarea')).toHaveCount(0);expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBeTruthy();
  await page.getByRole('button',{name:'Cancel',exact:true}).click();

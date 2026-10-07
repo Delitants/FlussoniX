@@ -187,9 +187,10 @@ Independent publisher and strict decoder qualification covers the common worker 
 The existing v3 `pushes` subset now accepts four total mixed SRT/RTSP/RTSPS
 destinations in Streams/Templates. Native ANNOUNCE/SETUP/RECORD publishing
 shares the existing RTP packetizer, verifies RTSPS identity and roots, and
-retains query-based receiver credentials. Friendly protocol-specific fields,
+retains query-based receiver credentials and supports Basic/Digest URL
+credentials for the bounded receiver profile. Friendly protocol-specific fields,
 inheritance and explicit empty overrides are available. Unsupported options,
-userinfo authentication, UDP substitution, redirects and retained separate
+unsupported authentication profiles, UDP substitution, redirects and retained separate
 subtitle tracks fail explicitly. Runtime counters are sanitized native
 diagnostics, not vendor push-stat parity. See the [exact push profile](rtsp-push.md).
 This supersedes older outbound RTSP pending statements for the bounded TCP

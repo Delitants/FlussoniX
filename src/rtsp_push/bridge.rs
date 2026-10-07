@@ -34,8 +34,36 @@ struct Session {
 }
 pub(super) struct Bridge {
     url: String,
+    route: Route,
     task: Option<JoinHandle<()>>,
     bytes: Arc<AtomicU64>,
+}
+#[derive(Clone)]
+pub(super) struct Route {
+    local: String,
+    remote: String,
+    path: String,
+}
+impl Route {
+    pub fn upstream(&self, uri: &str) -> io::Result<String> {
+        if uri == "*" {
+            return Ok("*".to_owned());
+        }
+        let suffix = uri
+            .strip_prefix(&self.local)
+            .filter(|s| s.starts_with('/'))
+            .ok_or_else(bad)?;
+        let parsed = url::Url::parse(uri).map_err(|_| bad())?;
+        if parsed.path() != self.path
+            && !parsed
+                .path()
+                .strip_prefix(&self.path)
+                .is_some_and(|s| s.starts_with('/'))
+        {
+            return Err(bad());
+        }
+        Ok(format!("{}{suffix}", self.remote))
+    }
 }
 impl Bridge {
     pub async fn prepare(destination: &Destination) -> io::Result<Self> {
@@ -65,7 +93,12 @@ impl Bridge {
             .map_err(|_| bad())?;
         let local_origin = url[..url::Position::BeforePath].to_string();
         let remote_origin = destination.url[..url::Position::BeforePath].to_string();
-        let path = destination.url.path().to_owned();
+        let route = Route {
+            local: local_origin,
+            remote: remote_origin,
+            path: destination.url.path().to_owned(),
+        };
+        let forwarding = route.clone();
         let bytes = Arc::new(AtomicU64::new(0));
         let progress = bytes.clone();
         let task = tokio::spawn(async move {
@@ -81,15 +114,19 @@ impl Bridge {
             let mut read_local = BufReader::new(read_local);
             let mut read_remote = BufReader::new(read_remote);
             tokio::select! {
-                _=requests(&mut read_local,&mut write_remote,&local_origin,&remote_origin,&path,&state,&progress)=>{},
+                _=requests(&mut read_local,&mut write_remote,&forwarding,&state,&progress)=>{},
                 _=responses(&mut read_remote,&mut write_local,&state)=>{},
             }
         });
         Ok(Self {
             url: url.to_string(),
+            route,
             task: Some(task),
             bytes,
         })
+    }
+    pub fn route(&self) -> Route {
+        self.route.clone()
     }
     pub fn local_url(&self) -> &str {
         &self.url
@@ -178,7 +215,7 @@ pub(super) async fn frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Fr
             || key.is_empty()
             || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
             || value.bytes().any(|b| b < 32 && b != 9 || b == 127)
-            || headers.iter().any(|(k, _)| k == &key)
+            || key != "www-authenticate" && headers.iter().any(|(k, _)| k == &key)
         {
             return Err(bad());
         }
@@ -218,13 +255,10 @@ pub(super) async fn media<W: AsyncWrite + Unpin>(
     write.write_all(body).await?;
     write.flush().await
 }
-#[allow(clippy::too_many_arguments)]
 async fn requests<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     read: &mut R,
     write: &mut W,
-    local: &str,
-    remote: &str,
-    path: &str,
+    route: &Route,
     state: &Arc<Mutex<Session>>,
     bytes: &AtomicU64,
 ) -> io::Result<()> {
@@ -248,24 +282,10 @@ async fn requests<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 }
                 let method = parts[0].to_owned();
                 let uri = parts[1];
-                let translated = if uri == "*" && method == "OPTIONS" {
-                    "*".to_owned()
-                } else {
-                    let suffix = uri
-                        .strip_prefix(local)
-                        .filter(|s| s.starts_with('/'))
-                        .ok_or_else(bad)?;
-                    let parsed = url::Url::parse(uri).map_err(|_| bad())?;
-                    if parsed.path() != path
-                        && !parsed
-                            .path()
-                            .strip_prefix(path)
-                            .is_some_and(|s| s.starts_with('/'))
-                    {
-                        return Err(bad());
-                    }
-                    format!("{remote}{suffix}")
-                };
+                if uri == "*" && method != "OPTIONS" {
+                    return Err(bad());
+                }
+                let translated = route.upstream(uri)?;
                 if method == "ANNOUNCE" && c.body.len() > 16384 {
                     return Err(bad());
                 }
@@ -413,6 +433,30 @@ async fn responses<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn authentication_challenges_can_repeat_without_allowing_duplicate_framing_headers() {
+        let wire = b"RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\nWWW-Authenticate: Basic realm=\"owned\"\r\nWWW-Authenticate: Digest realm=\"owned\", nonce=\"n\"\r\nContent-Length: 0\r\n\r\n";
+        let Frame::Control(control) = frame(&mut &wire[..])
+            .await
+            .expect("multiple challenges are valid")
+        else {
+            panic!("control required")
+        };
+        assert_eq!(
+            control
+                .headers
+                .iter()
+                .filter(|(k, _)| k == "www-authenticate")
+                .count(),
+            2
+        );
+        for header in ["CSeq: 1", "Content-Length: 0", "Session: owned"] {
+            let wire = format!(
+                "RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\nContent-Length: 0\r\nSession: owned\r\n{header}\r\n\r\n"
+            );
+            assert!(frame(&mut wire.as_bytes()).await.is_err());
+        }
+    }
     async fn lab() -> (Bridge, TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();

@@ -1,4 +1,5 @@
 //! Copy-only RTSP publishing; Rust owns verified transport and delivery progress.
+mod auth;
 mod bridge;
 mod client;
 use bytes::Bytes;
@@ -12,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) struct Destination {
     url: url::Url,
+    credentials: Option<auth::Credentials>,
     endpoint: String,
     disabled: bool,
     connect_seconds: u64,
@@ -59,19 +61,16 @@ impl Destination {
                 return Err("Invalid RTSP destination URL encoding".into());
             }
         }
-        let url = url::Url::parse(raw).map_err(|_| "Invalid RTSP destination URL")?;
+        let mut url = url::Url::parse(raw).map_err(|_| "Invalid RTSP destination URL")?;
         if !["rtsp", "rtsps"].contains(&url.scheme())
             || url.host_str().is_none()
             || url.port() == Some(0)
-            || !url.username().is_empty()
-            || url.password().is_some()
             || url.fragment().is_some()
             || url.path().trim_matches('/').is_empty()
         {
-            return Err(
-                "RTSP destination requires a stream path, host and no userinfo or fragment".into(),
-            );
+            return Err("RTSP destination requires a stream path, host and no fragment".into());
         }
+        let credentials = auth::Credentials::take(&mut url)?;
         if object.get("disabled").is_some_and(|v| !v.is_boolean())
             || object
                 .get("comment")
@@ -101,6 +100,7 @@ impl Destination {
         );
         Ok(Self {
             url,
+            credentials,
             endpoint,
             tls,
             disabled: item["disabled"] == true,
@@ -267,7 +267,8 @@ impl State {
         let mut client = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
             client::Client::publish(
-                bridge.local_url(),
+                bridge,
+                self.destination.credentials.clone(),
                 &snapshot.description,
                 stamp_origin,
                 readers,
@@ -320,7 +321,7 @@ impl State {
             };
             tokio::select! {biased;
                 _=tokio::time::sleep_until(due)=>return Err("push_stalled"),
-                response=client.feedback()=>{response?;},
+                response=client.feedback()=>{tokio::time::timeout_at(due,client.handle_feedback(response?)).await.map_err(|_|"push_stalled")??;},
                 _=reports.tick()=>{tokio::time::timeout_at(due,client.reports()).await.map_err(|_|"push_stalled")??;},
                 _=controls.tick()=>{tokio::time::timeout_at(due,client.keepalive()).await.map_err(|_|"push_stalled")??;},
                 _=progress_tick.tick()=>{},

@@ -60,7 +60,9 @@ fn mixed_push_config_roundtrips_inherits_and_rejects_invalid_profiles_without_se
         .unwrap();
     assert_eq!(store.effective("owned").unwrap()["pushes"], json!([]));
     for entry in [
-        json!({"url":"rtsp://user:owned-secret@localhost/channel"}),
+        json!({"url":"rtsp://:owned-secret@localhost/channel"}),
+        json!({"url":"rtsp://user%3Aname:owned-secret@localhost/channel"}),
+        json!({"url":"rtsp://user:owned-secret%0A@localhost/channel"}),
         json!({"url":"rtsp://localhost/"}),
         json!({"url":"rtsp://localhost:0/channel"}),
         json!({"url":"rtsp://localhost/channel#owned-secret"}),
@@ -369,7 +371,7 @@ async fn untrusted_wrong_identity_and_expired_tls_never_forward_rtsp() {
         } else {
             "127.0.0.1"
         };
-        let mut push = json!({"url":format!("rtsps://{host}:{port}/owned?token=owned-secret"),"retry_timeout":10});
+        let mut push = json!({"url":format!("rtsps://user:owned-secret@{host}:{port}/owned?token=owned-secret"),"retry_timeout":10});
         if reason != "untrusted" {
             push["flussonix_tls_ca"] = json!(certificates.ca);
         }
@@ -1240,4 +1242,404 @@ async fn native_text_preserve_rejects_rtsp_before_connect_and_drop_delivers_audi
             let _ = source_task.await;
         }
     }
+}
+
+async fn authentication_gateway(
+    dir: &Path,
+    receiver: u16,
+    profile: &str,
+    rotate: bool,
+    reject: bool,
+    origin_file: Option<&Path>,
+) -> (u16, tokio::process::Child) {
+    let mut command = Command::new("python3");
+    command
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/rtsp_auth_gateway.py"
+        ))
+        .args(["--receiver", &receiver.to_string(), "--profile", profile])
+        .arg("--port-file")
+        .arg(dir.join("gateway.port"))
+        .arg("--events")
+        .arg(dir.join("gateway.jsonl"));
+    if let Some(path) = origin_file {
+        command.arg("--origin-file").arg(path);
+    }
+    if rotate {
+        command.arg("--rotate");
+    }
+    if reject {
+        command.arg("--reject");
+    }
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(dir.join("gateway.log")).unwrap())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let port = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "authentication gateway exited"
+            );
+            if let Ok(text) = std::fs::read_to_string(dir.join("gateway.port")) {
+                break text.parse::<u16>().unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    (port, child)
+}
+fn auth_events(dir: &Path) -> Vec<Value> {
+    std::fs::read_to_string(dir.join("gateway.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn independent_basic_and_digest_receivers_authenticate_and_decode_both_tracks() {
+    for profile in [
+        "basic",
+        "MD5-legacy",
+        "MD5-sess-legacy",
+        "SHA-256-legacy",
+        "SHA-256-sess-legacy",
+        "MD5",
+        "MD5-sess",
+        "SHA-256",
+        "SHA-256-sess",
+    ] {
+        let dir = labdir();
+        let path = dir.path().join("authenticated.ts");
+        let (rx_port, mut rx) = receiver(&path).await;
+        let (port, mut gateway) =
+            authentication_gateway(dir.path(), rx_port, profile, false, false, None).await;
+        let url =
+            format!("rtsp://user%20name:owned%3Asecret@127.0.0.1:{port}/owned?token=owned-query");
+        let engine = owned_engine(dir.path());
+        let worker = engine
+            .ensure(
+                "owned",
+                &json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":url,"retry_timeout":30}]}),
+            )
+            .await
+            .expect("userinfo credentials must configure a native RTSP destination");
+        wait_push(&worker, 0, "sending").await;
+        received(&mut rx, &path, Some("h264"), "aac").await;
+        engine.stop_all().await;
+        gateway.wait().await.unwrap();
+        let events = auth_events(dir.path());
+        assert_eq!(
+            events.iter().filter(|e| e["accepted"] == false).count(),
+            1,
+            "only initial ANNOUNCE is unsigned: {profile}: {events:?}"
+        );
+        for method in ["ANNOUNCE", "SETUP", "RECORD"] {
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e["method"] == method && e["accepted"] == true),
+                "missing authenticated {method} for {profile}"
+            );
+        }
+        let stats = worker.stats()["flussonix_pushes"].to_string();
+        for secret in ["owned:secret", "user%20name", "owned-query", "/owned"] {
+            assert!(!stats.contains(secret), "stats leaked destination data");
+        }
+        assert!(
+            std::fs::read_to_string(dir.path().join("gateway.log"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn digest_nonce_renewal_keeps_media_and_authenticates_options_without_reconnect() {
+    let dir = labdir();
+    let path = dir.path().join("renewed.ts");
+    let (rx_port, mut rx) = receiver_for(&path, 19).await;
+    let (port, mut gateway) =
+        authentication_gateway(dir.path(), rx_port, "SHA-256-sess", true, false, None).await;
+    let engine = owned_engine(dir.path());
+    let worker = engine.ensure("owned", &json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":format!("rtsp://user%20name:owned%3Asecret@127.0.0.1:{port}/owned?token=owned-query"),"retry_timeout":30}]})).await.unwrap();
+    wait_push(&worker, 0, "sending").await;
+    received(&mut rx, &path, Some("h264"), "aac").await;
+    let attempts = worker.stats()["flussonix_pushes"][0]["attempts"].clone();
+    engine.stop_all().await;
+    gateway.wait().await.unwrap();
+    let events = auth_events(dir.path());
+    assert!(
+        events
+            .iter()
+            .any(|e| e["method"] == "OPTIONS" && e["stale"] == true)
+    );
+    assert!(events.iter().any(|e| e["method"] == "OPTIONS"
+        && e["accepted"] == true
+        && e["nonce"] == "owned-nonce-2"));
+    assert_eq!(
+        attempts, 1,
+        "stale challenge must not reconnect or interrupt media"
+    );
+    assert!(
+        std::fs::read_to_string(dir.path().join("gateway.log"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn wrong_credentials_and_unsupported_or_ambiguous_challenges_fail_without_media() {
+    for (profile, reject, password, expected_requests) in [
+        ("basic", false, "wrong-secret", 2),
+        ("MD5", true, "owned%3Asecret", 2),
+        ("unsupported", false, "owned%3Asecret", 1),
+        ("ambiguous", false, "owned%3Asecret", 1),
+        ("stale-loop", false, "owned%3Asecret", 3),
+    ] {
+        let dir = labdir();
+        let path = dir.path().join("denied.ts");
+        let (rx_port, mut rx) = receiver(&path).await;
+        let (port, mut gateway) =
+            authentication_gateway(dir.path(), rx_port, profile, false, reject, None).await;
+        let engine = owned_engine(dir.path());
+        let worker = engine.ensure("owned", &json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":format!("rtsp://user%20name:{password}@127.0.0.1:{port}/owned?token=owned-query"),"retry_timeout":30}]})).await.unwrap();
+        let stats = wait_push(&worker, 0, "retrying").await;
+        assert_eq!(stats["rtp_bytes"], 0);
+        assert_eq!(stats["last_error"], "push_auth_rejected");
+        engine.stop_all().await;
+        gateway.wait().await.unwrap();
+        rx.kill().await.unwrap();
+        rx.wait().await.unwrap();
+        let events = auth_events(dir.path());
+        assert_eq!(
+            events.len(),
+            expected_requests,
+            "bounded challenge attempts: {profile}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| e["method"] == "ANNOUNCE" && e["accepted"] == false)
+        );
+        assert!(
+            std::fs::read_to_string(dir.path().join("gateway.log"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn verified_tls_authenticates_the_original_secure_uri_and_decodes_hevc_mp3() {
+    use tokio_rustls::TlsAcceptor;
+    let dir = labdir();
+    let certificates = tls_fixture::Certificates::new();
+    let path = dir.path().join("authenticated-secure.ts");
+    let (rx_port, mut rx) = receiver(&path).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let origin_file = dir.path().join("original-origin");
+    std::fs::write(&origin_file, format!("rtsps://localhost:{port}")).unwrap();
+    let (gateway_port, mut gateway) = authentication_gateway(
+        dir.path(),
+        rx_port,
+        "SHA-256",
+        false,
+        false,
+        Some(&origin_file),
+    )
+    .await;
+    let acceptor = TlsAcceptor::from(certificates.server());
+    let task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        drop(listener);
+        let mut secure = acceptor.accept(socket).await.unwrap();
+        let mut plain = tokio::net::TcpStream::connect(("127.0.0.1", gateway_port))
+            .await
+            .unwrap();
+        let _ = tokio::io::copy_bidirectional(&mut secure, &mut plain).await;
+    });
+    let engine = owned_engine(dir.path());
+    let worker = engine.ensure("owned", &json!({"inputs":[{"url":"testsrc://"}],"transcoder":{"encoder":"libx265","acodec":"mp3","ab":128},"pushes":[{"url":format!("rtsps://user%20name:owned%3Asecret@localhost:{port}/owned?token=owned-query"),"flussonix_tls_ca":certificates.ca,"retry_timeout":30}]})).await.unwrap();
+    wait_push(&worker, 0, "sending").await;
+    received(&mut rx, &path, Some("hevc"), "mp3").await;
+    engine.stop_all().await;
+    gateway.wait().await.unwrap();
+    task.abort();
+    let _ = task.await;
+    let events = auth_events(dir.path());
+    assert!(events.iter().filter(|e| e["accepted"] == true).all(|e| {
+        e["target"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("rtsps://localhost:{port}/"))
+    }));
+    assert!(
+        std::fs::read_to_string(dir.path().join("gateway.log"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+async fn auth_control(socket: &mut tokio::net::TcpStream) -> (String, u32, String) {
+    use tokio::io::AsyncReadExt;
+    let mut header = Vec::new();
+    while !header.ends_with(b"\r\n\r\n") {
+        assert!(header.len() < 16384);
+        header.push(socket.read_u8().await.unwrap());
+    }
+    let text = String::from_utf8(header).unwrap();
+    let value = |key: &str| {
+        text.lines()
+            .find_map(|line| {
+                line.split_once(':')
+                    .filter(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .map(|(_, v)| v.trim())
+            })
+            .unwrap()
+    };
+    let seq = value("cseq").parse().unwrap();
+    let size: usize = value("content-length").parse().unwrap();
+    assert!(size <= 65536);
+    let mut body = vec![0; size];
+    socket.read_exact(&mut body).await.unwrap();
+    (text.split(' ').next().unwrap().to_owned(), seq, text)
+}
+
+#[tokio::test]
+async fn authentication_retries_share_the_startup_deadline_and_stop_closes_pending_auth() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for cancel in [false, true] {
+        let dir = labdir();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            drop(listener);
+            let (method, seq, request) = auth_control(&mut socket).await;
+            assert_eq!(method, "ANNOUNCE");
+            assert!(!request.contains("Authorization:"));
+            if !cancel {
+                tokio::time::sleep(Duration::from_millis(2800)).await;
+            }
+            socket.write_all(format!("RTSP/1.0 401 Unauthorized\r\nCSeq: {seq}\r\nWWW-Authenticate: Basic realm=\"owned\"\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
+            let (method, next, request) = auth_control(&mut socket).await;
+            assert_eq!(method, "ANNOUNCE");
+            assert_eq!(next, seq + 1);
+            assert!(request.lines().any(|line| {
+                line.split_once(':').is_some_and(|(key, value)| {
+                    key.eq_ignore_ascii_case("authorization")
+                        && value.trim() == "Basic dXNlcjpvd25lZC1zZWNyZXQ="
+                })
+            }));
+            assert!(!request.contains("user:owned-secret@"));
+            if !cancel {
+                tokio::time::sleep(Duration::from_millis(2800)).await;
+                socket
+                    .write_all(
+                        format!("RTSP/1.0 200 OK\r\nCSeq: {next}\r\nContent-Length: 0\r\n\r\n")
+                            .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let (method, _, request) = auth_control(&mut socket).await;
+                assert_eq!(method, "SETUP");
+                assert!(request.lines().any(|line| {
+                    line.split_once(':').is_some_and(|(key, value)| {
+                        key.eq_ignore_ascii_case("authorization")
+                            && value.trim() == "Basic dXNlcjpvd25lZC1zZWNyZXQ="
+                    })
+                }));
+            }
+            ready.send(()).unwrap();
+            let mut byte = [0];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(4), socket.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0,
+                "pending authentication/setup must close without media"
+            );
+        });
+        let engine = owned_engine(dir.path());
+        let started = tokio::time::Instant::now();
+        let worker = engine.ensure("owned", &json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":format!("rtsp://user:owned-secret@127.0.0.1:{port}/owned"),"connect_timeout":4,"retry_timeout":30}]})).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(9), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        if cancel {
+            tokio::time::timeout(Duration::from_secs(2), engine.stop_all())
+                .await
+                .unwrap();
+        } else {
+            let stats = wait_push(&worker, 0, "retrying").await;
+            assert_eq!(stats["last_error"], "push_setup_timeout");
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "challenge retry extended the startup deadline: {:?}",
+                started.elapsed()
+            );
+            engine.stop_all().await;
+        }
+        assert_eq!(worker.stats()["flussonix_pushes"][0]["rtp_bytes"], 0);
+        assert_eq!(worker.stats()["flussonix_pushes"][0]["attempts"], 1);
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn authenticated_and_unsigned_destinations_share_worker_without_credential_crossover() {
+    let dir = labdir();
+    let good = dir.path().join("authenticated.ts");
+    let plain = dir.path().join("unsigned.ts");
+    let denied_dir = dir.path().join("denied");
+    std::fs::create_dir(&denied_dir).unwrap();
+    let (good_rx_port, mut good_rx) = receiver(&good).await;
+    let (plain_port, mut plain_rx) = receiver(&plain).await;
+    let (denied_rx_port, mut denied_rx) = receiver(&denied_dir.join("denied.ts")).await;
+    let (good_port, mut good_gateway) =
+        authentication_gateway(dir.path(), good_rx_port, "basic", false, false, None).await;
+    let (denied_port, mut denied_gateway) =
+        authentication_gateway(&denied_dir, denied_rx_port, "MD5", false, false, None).await;
+    let engine = owned_engine(dir.path());
+    let worker = engine.ensure("owned", &json!({"inputs":[{"url":"testsrc://"}],"pushes":[
+        {"url":format!("rtsp://user%20name:owned%3Asecret@127.0.0.1:{good_port}/owned?token=owned-query"),"retry_timeout":30},
+        {"url":format!("rtsp://127.0.0.1:{plain_port}/owned"),"retry_timeout":30},
+        {"url":format!("rtsp://user%20name:wrong-secret@127.0.0.1:{denied_port}/owned?token=owned-query"),"retry_timeout":30}
+    ]})).await.unwrap();
+    wait_push(&worker, 0, "sending").await;
+    wait_push(&worker, 1, "sending").await;
+    let denied = wait_push(&worker, 2, "retrying").await;
+    assert_eq!(denied["rtp_bytes"], 0);
+    assert_eq!(denied["last_error"], "push_auth_rejected");
+    assert_eq!(engine.count().await, 1);
+    received(&mut good_rx, &good, Some("h264"), "aac").await;
+    received(&mut plain_rx, &plain, Some("h264"), "aac").await;
+    engine.stop_all().await;
+    good_gateway.wait().await.unwrap();
+    denied_gateway.wait().await.unwrap();
+    denied_rx.kill().await.unwrap();
+    denied_rx.wait().await.unwrap();
+    assert_eq!(auth_events(&denied_dir).len(), 2);
+    assert!(
+        std::fs::read_to_string(dir.path().join("gateway.log"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        std::fs::read_to_string(denied_dir.join("gateway.log"))
+            .unwrap()
+            .is_empty()
+    );
 }

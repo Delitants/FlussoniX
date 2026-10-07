@@ -11,16 +11,19 @@ an explicit empty stream override retain their existing semantics.
 {
   "pushes": [
     {"url": "rtsp://receiver.example/live/channel?password=receiver-secret"},
-    {"url": "rtsps://secure.example/live/channel", "flussonix_tls_ca": "/etc/flussonix/receiver-ca.pem"}
+    {"url": "rtsps://receiver:receiver-secret@secure.example/live/channel", "flussonix_tls_ca": "/etc/flussonix/receiver-ca.pem"}
   ]
 }
 ```
 
 RTSP defaults to port 554; RTSPS defaults to 322. A nonempty stream path is
 required. URLs are ASCII, at most 4096 bytes, with valid percent encoding and
-no userinfo, fragment, whitespace or control characters. Query credentials
-are retained for the receiving server. Basic/Digest URL credentials are not
-implemented. `connect_timeout` is 1–30 seconds (default 3);
+no fragment, whitespace or control characters. Query credentials
+are retained for the receiving server. Optional `USER:PASSWORD@HOST` credentials
+are percent-decoded once and stripped from request targets. The decoded username
+is 1–256 printable ASCII characters without a colon; the password is at most
+512 printable ASCII characters and can be empty. Encode spaces and URI punctuation
+in userinfo. Unicode credentials are outside this profile. `connect_timeout` is 1–30 seconds (default 3);
 `retry_timeout` is 1–300 seconds (default 5). `disabled` is boolean and
 `comment` is at most 1024 bytes. Other transport options are rejected.
 
@@ -29,6 +32,29 @@ before sending RTSP. Leave the CA field empty for bundled public roots, or use
 an absolute regular PEM trust file on the sending host; custom roots replace
 public roots. There is no insecure mode or plaintext fallback. Redirects and
 server-directed UDP transport changes are rejected.
+
+Receiver authentication responds to a matching-CSeq 401. The first request is
+unsigned; subsequent ANNOUNCE, SETUP, RECORD and OPTIONS requests use the selected
+challenge on that connection only. Basic and Digest MD5, MD5-sess, SHA-256 and
+SHA-256-sess are supported. Digest accepts legacy challenges without qop or
+chooses `auth` from a qop list. It signs the exact upstream absolute request URI,
+including its original RTSP/RTSPS authority, query and track control suffix.
+Repeated or combined challenges prefer SHA-256 over MD5 over Basic; duplicate
+supported algorithms, malformed parameters and unsupported-only offers fail.
+An unsupported Digest offer cannot fall back to Basic. Domain parameters never
+change the configured destination or authorize a redirect.
+
+Digest stale-nonce renewal requires a changed nonce, `stale=true`, and unchanged
+realm, algorithm and qop. It resets the nonce count and generates a fresh random
+client nonce. Each control exchange permits at most two challenge retries;
+a wrong password or repeated Basic challenge fails immediately after the signed
+request. Setup retries retain the same absolute startup deadline. OPTIONS renewal
+retains its original five-second response deadline while media continues. A new
+connection starts with no cached challenge. Authentication-Info nextnonce and
+rspauth negotiation, proxy authentication and international credential encodings
+are not implemented. These bounds qualify a receiver authentication profile,
+not every vendor recorder's dialect. See [Digest](https://www.rfc-editor.org/rfc/rfc7616)
+and [Basic](https://www.rfc-editor.org/rfc/rfc7617) for their definitions.
 
 The native publisher shares the worker's bounded RTP packetizer and creates no
 per-destination FFmpeg or encoder. Supported retained media is one H.264 or
@@ -50,7 +76,7 @@ reports synchronize tracks, and OPTIONS keeps the session alive. Setup
 requires matching CSeq, stable Session and the exact offered distinct channel
 pairs. A SETUP response may use `mode=record` or the receiver-side
 `mode=receive` alias; playback mode, duplicate options and channel substitutions
-remain rejected. Protocol buffers are bounded: 16 KiB headers, 64 unique headers,
+remain rejected. Protocol buffers are bounded: 16 KiB headers, 64 headers (only WWW-Authenticate may repeat),
 64 KiB bodies, 16 KiB ANNOUNCE and 8 KiB interleaved frames; pending control
 requests are capped at 16. Incoming RTCP must use a negotiated RTCP channel.
 
@@ -83,7 +109,8 @@ strict decoding of every requested audio/video track. This receiver setting
 is not a universal client compatibility claim.
 
 See [qualification](qualification.md#rtsp-and-rtsps-push-qualification) for
-evidence. UDP push, Basic/Digest authentication, dedicated subtitle RTP,
+evidence. UDP push, Basic/Digest viewer or incoming publisher authentication,
+proxy authentication, Digest auth-int/userhash/SHA-512 variants, dedicated subtitle RTP,
 RTSP balancer redirects, all recorder dialects, long-duration synchronization
 and production capacity remain unqualified. No official Flussonic component
 is linked, copied or required by this implementation.

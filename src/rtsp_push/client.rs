@@ -1,5 +1,8 @@
 //! Native publisher consumes immutable shared RTP packets and codec metadata.
-use super::bridge::{self, Frame};
+use super::{
+    auth::{Auth, Credentials},
+    bridge::{self, Frame},
+};
 use crate::rtp::Description;
 use bytes::Bytes;
 use std::{collections::HashMap, time::Duration};
@@ -21,19 +24,23 @@ pub(super) struct Client {
     write: OwnedWriteHalf,
     read: mpsc::Receiver<Result<Frame, std::io::Error>>,
     url: String,
+    route: bridge::Route,
+    auth: Auth,
     seq: u32,
     session: String,
     lanes: HashMap<u32, Lane>,
     report_origin: (tokio::time::Instant, std::time::SystemTime),
-    keepalive: Option<(u32, tokio::time::Instant)>,
+    keepalive: Option<(u32, tokio::time::Instant, u8)>,
 }
 impl Client {
     pub async fn publish(
-        url: &str,
+        bridge: &bridge::Bridge,
+        credentials: Option<Credentials>,
         description: &Description,
         stamp_origin: u64,
         readers: &mut tokio::task::JoinSet<()>,
     ) -> Result<Self, &'static str> {
+        let url = bridge.local_url();
         let parsed = url::Url::parse(url).map_err(|_| "push_setup_failed")?;
         let socket = TcpStream::connect(("127.0.0.1", parsed.port().ok_or("push_setup_failed")?))
             .await
@@ -55,6 +62,8 @@ impl Client {
             write,
             read: rx,
             url: url.into(),
+            route: bridge.route(),
+            auth: Auth::new(credentials),
             seq: 0,
             session: String::new(),
             lanes: HashMap::new(),
@@ -125,7 +134,9 @@ impl Client {
         } else {
             format!("Session: {}\r\n", self.session)
         };
-        let mut wire=format!("{method} {url} RTSP/1.0\r\nCSeq: {}\r\nUser-Agent: FlussoniX\r\n{session}{headers}Content-Length: {}\r\n\r\n",self.seq,body.len()).into_bytes();
+        let target = self.route.upstream(url).map_err(|_| "push_setup_failed")?;
+        let authorization = self.auth.authorization(method, &target)?;
+        let mut wire=format!("{method} {url} RTSP/1.0\r\nCSeq: {}\r\nUser-Agent: FlussoniX\r\n{session}{headers}{authorization}Content-Length: {}\r\n\r\n",self.seq,body.len()).into_bytes();
         wire.extend_from_slice(body);
         tokio::time::timeout(Duration::from_secs(2), self.write.write_all(&wire))
             .await
@@ -133,13 +144,26 @@ impl Client {
             .map_err(|_| "push_connection_closed")?;
         Ok(self.seq)
     }
-    fn accepted(&mut self, frame: Frame, seq: u32) -> Result<bridge::Control, &'static str> {
+    fn checked(frame: Frame, seq: u32) -> Result<bridge::Control, &'static str> {
         let Frame::Control(response) = frame else {
             return Err("push_response_rejected");
         };
-        if response.cseq().map_err(|_| "push_response_rejected")? != seq
-            || !response.start.starts_with("RTSP/1.0 200 ")
-        {
+        if response.cseq().map_err(|_| "push_response_rejected")? != seq {
+            return Err("push_response_rejected");
+        }
+        Ok(response)
+    }
+    fn challenge(&mut self, response: &bridge::Control) -> Result<(), &'static str> {
+        self.auth.challenge(
+            response
+                .headers
+                .iter()
+                .filter(|(k, _)| k == "www-authenticate")
+                .map(|(_, v)| v.as_str()),
+        )
+    }
+    fn accepted(&mut self, response: bridge::Control) -> Result<bridge::Control, &'static str> {
+        if !response.start.starts_with("RTSP/1.0 200 ") {
             return Err("push_rejected");
         }
         if let Some(session) = response.header("session") {
@@ -162,13 +186,24 @@ impl Client {
         headers: &str,
         body: &[u8],
     ) -> Result<bridge::Control, &'static str> {
-        let seq = self.request(method, url, headers, body).await?;
-        let frame = tokio::time::timeout(Duration::from_secs(3), self.read.recv())
-            .await
-            .map_err(|_| "push_setup_timeout")?
-            .ok_or("push_connection_closed")?
-            .map_err(|_| "push_connection_closed")?;
-        self.accepted(frame, seq)
+        for retries in 0..=2 {
+            let seq = self.request(method, url, headers, body).await?;
+            let frame = tokio::time::timeout(Duration::from_secs(3), self.read.recv())
+                .await
+                .map_err(|_| "push_setup_timeout")?
+                .ok_or("push_connection_closed")?
+                .map_err(|_| "push_connection_closed")?;
+            let response = Self::checked(frame, seq)?;
+            if response.start.starts_with("RTSP/1.0 401 ") {
+                if retries == 2 {
+                    return Err("push_auth_rejected");
+                }
+                self.challenge(&response)?;
+            } else {
+                return self.accepted(response);
+            }
+        }
+        Err("push_auth_rejected")
     }
     pub async fn packet(&mut self, packet: &Bytes) -> Result<(), &'static str> {
         if packet.len() < 16 {
@@ -214,11 +249,11 @@ impl Client {
         }
         let url = self.url.clone();
         let seq = self.request("OPTIONS", &url, "", &[]).await?;
-        self.keepalive = Some((seq, tokio::time::Instant::now() + Duration::from_secs(5)));
+        self.keepalive = Some((seq, tokio::time::Instant::now() + Duration::from_secs(5), 0));
         Ok(())
     }
-    pub async fn feedback(&mut self) -> Result<(), &'static str> {
-        let deadline = self.keepalive.map(|(_, at)| at);
+    pub async fn feedback(&mut self) -> Result<Frame, &'static str> {
+        let deadline = self.keepalive.map(|(_, at, _)| at);
         let expired = async {
             if let Some(at) = deadline {
                 tokio::time::sleep_until(at).await
@@ -227,6 +262,11 @@ impl Client {
             }
         };
         let frame = tokio::select! {biased;_=expired=>return Err("push_keepalive_timeout"),frame=self.read.recv()=>frame.ok_or("push_connection_closed")?.map_err(|_|"push_connection_closed")?};
+        Ok(frame)
+    }
+    // Process after the outer select commits to this branch: an authentication
+    // write cannot be cancelled by a ready media packet midway through a request.
+    pub async fn handle_feedback(&mut self, frame: Frame) -> Result<(), &'static str> {
         match frame {
             Frame::Media(channel, body) => {
                 if !self.lanes.values().any(|t| t.rtcp == channel)
@@ -238,8 +278,23 @@ impl Client {
                 Ok(())
             }
             Frame::Control(response) => {
-                let (seq, _) = self.keepalive.take().ok_or("push_response_rejected")?;
-                self.accepted(Frame::Control(response), seq)?;
+                let (seq, deadline, retries) =
+                    self.keepalive.take().ok_or("push_response_rejected")?;
+                let response = Self::checked(Frame::Control(response), seq)?;
+                if response.start.starts_with("RTSP/1.0 401 ") {
+                    if retries == 2 || tokio::time::Instant::now() >= deadline {
+                        return Err("push_auth_rejected");
+                    }
+                    self.challenge(&response)?;
+                    let url = self.url.clone();
+                    let seq =
+                        tokio::time::timeout_at(deadline, self.request("OPTIONS", &url, "", &[]))
+                            .await
+                            .map_err(|_| "push_keepalive_timeout")??;
+                    self.keepalive = Some((seq, deadline, retries + 1));
+                } else {
+                    self.accepted(response)?;
+                }
                 Ok(())
             }
         }
