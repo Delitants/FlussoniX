@@ -40,8 +40,7 @@ remain separate.
 
 No new configuration fields or UI inputs are required. The existing friendly
 Streams/Templates authorization controls configure the backend. This provides
-backend-selected routing; native adaptive RTSP LB selection/reservation is a
-separate task, and the `lb` role still returns 501 for RTSP playback. It does not
+backend-selected routing; [native adaptive RTSP LB selection/reservation](rtsp-cluster-routing.md) is now a separate implemented profile. It does not
 add Basic/Digest viewer credentials, change publication/push, issue server-driven
 REDIRECT requests for established media, or transparently move a live session.
 The verified RTSPS **input** bridge continues to reject upstream 3xx responses

@@ -1185,6 +1185,24 @@ impl Engine {
                 .is_ok_and(|t| t.elapsed().is_ok_and(|age| age.as_secs() < 15))
         })
     }
+    pub(crate) async fn rtsp_ready_names(&self) -> Vec<String> {
+        self.workers
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, w)| {
+                w.alive.load(Ordering::Relaxed)
+                    && !w.is_closed()
+                    && w.recovery
+                        .lock()
+                        .unwrap()
+                        .media_age_ms()
+                        .is_some_and(|age| age < w.input_timeout.as_millis())
+                    && w.wire.rtp.description().is_some_and(|d| d.is_ok())
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
     pub async fn workers(&self) -> Vec<(String, String)> {
         self.workers
             .lock()

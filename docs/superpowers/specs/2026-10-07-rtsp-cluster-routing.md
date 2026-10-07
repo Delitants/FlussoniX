@@ -34,7 +34,9 @@ must not destroy another request's ticket. Expired/missing/replayed tickets retu
 503 before worker acquisition. HTTP tickets cannot admit RTSP and vice versa.
 A successful initial DESCRIBE consumes once and continues on the same connection;
 SETUP/PLAY do not consume again. No extra cleanup redirect. Direct no-ticket playback
-still works. Grant ownership accounts for the pending authorized request while
+still works. Control authorization retains its cached decision but has no playback linger after
+a redirect or rejected ticket; valid media admission promotes the grant to normal
+playback occupancy. Grant ownership accounts for the pending authorized request while
 media starts. Normal media/policy/revocation fences remain authoritative.
 
 ## Routing control and reservations
@@ -45,7 +47,11 @@ statistics, configurations or secrets. Factor shared node load generation; prese
 all existing node fields. Cache this snapshot for 1 second with per-peer single
 flight; invalidation on configuration revision, no stale-on-error. Bound pool to
 64 peers, concurrent network snapshot fetches to 8, response body to 2 MiB and
-requests to the existing 3-second management timeout. Pools above64 fail explicitly.
+requests to the existing 3-second management timeout. Placement has an overall
+8-second deadline, including queued snapshot work and retries. Pools above64 fail explicitly.
+
+Capacity counters retain existing auth-session identity/reconnect-grace semantics;
+a raw-socket quota is not added in this increment.
 
 Use existing select() hard ceilings: age<=10000ms, uplink<0.9 after projected
 request, CPU<0.9, RAM<0.95, session capacity and no drain. Require finite nonnegative
@@ -59,6 +65,7 @@ Peer POST admit accepts optional protocol=http(default)/rtsp/rtsps. RTSP require
 64-hex token hash, eligible role/listener and resolvable stream; no viewer callback,
 grant or media worker is started by admission. Store protocol/token binding and
 five-second expiration in the existing in-memory ledger, plus requested bandwidth.
+The shared ledger has a hard cap of 20000 outstanding reservations.
 Expose reserved_mbps and check summed outstanding bandwidth under the ledger lock.
 Old HTTP requests retain existing behavior and single-use cleanup redirect.
 Failed admission tries another candidate at most once each. Cache is only a ranking

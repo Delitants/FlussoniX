@@ -567,3 +567,13 @@ A final minor review case verifies that empty raw userinfo markers (`@` and
 fields. An encoded-safe destination containing `@` in query data remains
 byte-for-byte intact. The regression failed before the raw-authority check
 and all eleven routing cases pass after it.
+
+## Native RTSP cluster routing
+
+Owned loopback source/CDN/LB tests qualify initial authorization before networking, exact query and secret separation, non-destructive protocol/token/stream/transport ticket mismatch, replay and expiry, shared-cache concurrent reservations and CDN capacity rechecking. They cover malformed/stale/drained/saturated/incompatible/self endpoints, cache invalidation and failed refresh, bounded pools, alternate admission, and configuration/revocation during pending placement. Callback redirects take precedence; internal tickets stay out of callback query data. Verified private-CA clients check actual TLS routing, plain URI aliases and no downgrade. Independent FFmpeg strictly decodes mapped video/audio from two LB requests, verifying one CDN worker and one private M4S pull. All fixtures are owned and stopped after tests.
+
+A failed expiry regression exposed allowed control decisions lingering in playback occupancy. Control admission now retains decision caching without playback linger; valid media admission promotes its grant. A separate unit test checks live ownership and promotion. Friendly peer URL validation/save/edit/clear has browser coverage. Full final-head CI and independent review gate release. Two-second decodes do not establish sustained capacity; secure multi-hop FFmpeg, mixed-vendor dialects and dynamic media cost reservation remain pending. See [full profile](rtsp-cluster-routing.md).
+
+Ticket-bearing HTTP requests also use control authorization: rejected cross-protocol tickets and valid cleanup redirects leave no phantom HTTP playback slot. The clean media request retains normal authorization and playback accounting. A failing cross-protocol occupancy assertion qualifies this correction.
+
+A deterministic concurrency regression pauses after the serialized Allow decision and before live-grant transfer: the initial implementation admitted sixteen distinct control viewers under a one-viewer limit. RAII pending admission retains capacity through grant transfer, cancellation and cache cleanup; the revised regression requires exactly one allowance.

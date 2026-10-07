@@ -164,3 +164,5 @@ see [compatibility details](docs/compatibility.md#rtsp2-camera-input).
 RTSP push destinations support TCP (default) or unicast UDP via the friendly
 Destination RTSP transport control (`rtsp_transport: "udp"`). RTSPS retains
 verified encrypted TCP. See [UDP push bounds](docs/rtsp-push.md#unicast-udp-push).
+
+Native RTSP/RTSPS LB routing now uses measured CDN selection and protocol/token-bound reservations, with friendly public listener fields in Cluster. See [routing, bounds and qualification](docs/rtsp-cluster-routing.md).

@@ -29,13 +29,22 @@ impl Drop for Playback {
     }
 }
 impl App {
-    pub(crate) async fn rtsp_admit(&self, viewer: ViewerRequest) -> Result<Admission, u16> {
-        if self.options.role == "lb" {
-            return Err(501);
-        }
+    pub(crate) async fn rtsp_admit(
+        &self,
+        mut viewer: ViewerRequest,
+        source: &url::Url,
+        secure: bool,
+    ) -> Result<Admission, u16> {
+        let (ticket, clean) = super::rtsp_balancer::strip_ticket(&viewer.qs);
+        viewer.qs = clean;
+        let route_viewer = viewer.clone();
         let name = viewer.name.clone();
         let resolved = self.resolve(&name).await.ok_or(404u16)?;
-        let grant = match self.playback_auth.authorize(resolved.policy, viewer).await {
+        let grant = match self
+            .playback_auth
+            .authorize_control(resolved.policy, viewer)
+            .await
+        {
             AuthOutcome::Allowed(g) => g,
             AuthOutcome::Denied => return Err(403),
             AuthOutcome::Redirect(target) => {
@@ -50,6 +59,19 @@ impl App {
         if self.config.revision() != resolved.revision {
             self.resolve(&name).await.ok_or(404u16)?;
         }
+        if self.options.role == "lb" {
+            if ticket.is_some() {
+                return Err(503);
+            }
+            return self
+                .rtsp_place(&route_viewer, source, secure, &grant, resolved.revision)
+                .await
+                .map(Admission::Redirect);
+        }
+        if let Some(ticket) = ticket {
+            self.rtsp_consume(&ticket, &route_viewer, secure).await?;
+        }
+        grant.playback();
         let (cfg, _) = self.media_config(&name).await.ok_or(404u16)?;
         let signature = crate::media::media_signature(&cfg);
         let check = async {

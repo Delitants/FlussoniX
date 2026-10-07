@@ -266,3 +266,7 @@ Cached decisions retain token/template policy and revocation; actual TLS control
 connections reject plaintext destinations on every response. HTTP redirect
 behavior stays separate. This is callback-selected routing, with native RTSP
 adaptive LB reservations still pending. See [contract and qualification](rtsp-auth-redirects.md).
+
+## Native RTSP cluster routing
+
+The native LB profile implements measured RTSP/RTSPS selection, compact cached telemetry, bound five-second tickets and independent CDN authorization. Friendly peer fields configure public RTSP/RTSPS listener roots. Verified TLS never downgrades; independent FFmpeg decodes plaintext LB redirects through a shared private M4S source pull. This is a native extension, not vendor cluster parity; secure automatic multi-hop and sustained capacity remain unqualified. See [profile and limits](rtsp-cluster-routing.md).

@@ -109,7 +109,7 @@ async fn token_denial_and_lb_role_do_not_start_workers() {
         request(&mut s, "DESCRIBE", &format!("{url}?token=owned-token"), "")
             .await
             .0,
-        501
+        503
     );
     assert_eq!(app.media.count().await, 0);
     c.cancel();

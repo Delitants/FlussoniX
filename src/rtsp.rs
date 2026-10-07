@@ -566,7 +566,7 @@ async fn handle(
             referer: r.headers.get("referer").cloned().unwrap_or_default(),
             host: url.host_str().unwrap().into(),
         };
-        let playback = match app.rtsp_admit(viewer).await {
+        let playback = match app.rtsp_admit(viewer, &url, secure).await {
             Ok(crate::server::rtsp_access::Admission::Playback(p)) => p,
             Ok(crate::server::rtsp_access::Admission::Redirect(target)) => {
                 return redirect::response(target, &url, secure);

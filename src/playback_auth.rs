@@ -160,6 +160,7 @@ struct State {
     next_check: Instant,
     created: Instant,
     last_seen: Instant,
+    playback: bool,
     number: u64,
     generation: u64,
     user_id: String,
@@ -172,6 +173,7 @@ struct Entry {
     state: Mutex<State>,
     flight: AsyncMutex<()>,
     live: AtomicU64,
+    admissions: AtomicU64,
     bytes: AtomicU64,
 }
 impl Entry {
@@ -179,7 +181,16 @@ impl Entry {
         let s = self.state.lock().unwrap();
         self.live.load(Ordering::Relaxed) > 0
             || (matches!(s.decision, Decision::Allow)
-                && s.last_seen.elapsed() < Duration::from_secs(30))
+                && (self.admissions.load(Ordering::Relaxed) > 0
+                    || s.playback && s.last_seen.elapsed() < Duration::from_secs(30)))
+    }
+}
+// Retain the serialized decision's capacity until it becomes a live grant.
+// Dropping a cancelled authorization future releases the same ownership.
+struct PendingAdmission(Arc<Entry>);
+impl Drop for PendingAdmission {
+    fn drop(&mut self) {
+        self.0.admissions.fetch_sub(1, Ordering::Relaxed);
     }
 }
 pub struct Grant {
@@ -187,6 +198,14 @@ pub struct Grant {
     cancel: CancellationToken,
 }
 impl Grant {
+    /// Promote a control admission only once it will acquire playback media.
+    pub(crate) fn playback(&self) {
+        if let Some(e) = &self.entry {
+            let mut s = e.state.lock().unwrap();
+            s.playback = true;
+            s.last_seen = Instant::now();
+        }
+    }
     pub fn peer() -> Self {
         Self {
             entry: None,
@@ -283,6 +302,21 @@ impl PlaybackAuth {
         })
     }
     pub async fn authorize(&self, snapshot: PolicySnapshot, request: ViewerRequest) -> AuthOutcome {
+        self.authorize_inner(snapshot, request, true).await
+    }
+    pub(crate) async fn authorize_control(
+        &self,
+        snapshot: PolicySnapshot,
+        request: ViewerRequest,
+    ) -> AuthOutcome {
+        self.authorize_inner(snapshot, request, false).await
+    }
+    async fn authorize_inner(
+        &self,
+        snapshot: PolicySnapshot,
+        request: ViewerRequest,
+        playback: bool,
+    ) -> AuthOutcome {
         if snapshot.name != request.name {
             return AuthOutcome::Denied;
         }
@@ -305,13 +339,15 @@ impl PlaybackAuth {
             all.retain(|_, e| {
                 let s = e.state.lock().unwrap();
                 e.live.load(Ordering::Relaxed) > 0
+                    || e.admissions.load(Ordering::Relaxed) > 0
                     || s.last_seen.elapsed() < Duration::from_secs(30)
                     || (!matches!(s.decision, Decision::Allow) && s.next_check > Instant::now())
             });
             if !all.contains_key(&identity) && all.len() >= 20_000 {
                 return AuthOutcome::Denied;
             }
-            all.entry(identity)
+            let entry = all
+                .entry(identity)
                 .or_insert_with(|| {
                     Arc::new(Entry {
                         id: uuid::Uuid::new_v4().to_string(),
@@ -322,6 +358,7 @@ impl PlaybackAuth {
                             next_check: Instant::now(),
                             created: Instant::now(),
                             last_seen: Instant::now(),
+                            playback: false,
                             number: 0,
                             generation: 0,
                             user_id: format!("{:x}", Sha256::digest(request.token.as_bytes())),
@@ -331,11 +368,15 @@ impl PlaybackAuth {
                         }),
                         flight: AsyncMutex::new(()),
                         live: AtomicU64::new(0),
+                        admissions: AtomicU64::new(0),
                         bytes: AtomicU64::new(0),
                     })
                 })
-                .clone()
+                .clone();
+            entry.admissions.fetch_add(1, Ordering::Relaxed);
+            entry
         };
+        let _admission = PendingAdmission(entry.clone());
         {
             let mut s = entry.state.lock().unwrap();
             if s.revoked_until.is_some_and(|until| until > Instant::now()) {
@@ -343,8 +384,13 @@ impl PlaybackAuth {
             }
             s.request = request;
             s.last_seen = Instant::now();
+            s.playback |= playback;
         }
         self.refresh(&entry).await;
+        // Model a production thread being preempted between the serialized
+        // decision and transfer to a live grant.
+        #[cfg(test)]
+        tokio::task::yield_now().await;
         let authority = self.authority.lock().unwrap();
         if !authority
             .get(&snapshot.name)
@@ -535,6 +581,7 @@ impl PlaybackAuth {
             all.retain(|_, e| {
                 let s = e.state.lock().unwrap();
                 e.live.load(Ordering::Relaxed) > 0
+                    || e.admissions.load(Ordering::Relaxed) > 0
                     || s.last_seen.elapsed() < Duration::from_secs(30)
                     || (!matches!(s.decision, Decision::Allow) && s.next_check > Instant::now())
             });
@@ -622,6 +669,15 @@ impl PlaybackAuth {
             .filter(|e| e.occupied())
             .count() as u64
     }
+    /// Live authorization holders, excluding cached decisions kept for reconnects.
+    pub fn live_grants(&self) -> u64 {
+        self.entries
+            .lock()
+            .unwrap()
+            .values()
+            .map(|e| e.live.load(Ordering::Relaxed))
+            .sum()
+    }
     pub fn snapshots(&self) -> Vec<Value> {
         self.entries
             .lock()
@@ -642,6 +698,108 @@ impl PlaybackAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn concurrent_control_admissions_hold_capacity_through_grant_transfer() {
+        let auth = PlaybackAuth::new(1);
+        let policy = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let results = futures_util::future::join_all((0..16).map(|i| {
+            auth.authorize_control(
+                policy.clone(),
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "rtsp".into(),
+                    token: i.to_string(),
+                    ..Default::default()
+                },
+            )
+        }))
+        .await;
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, AuthOutcome::Allowed(_)))
+                .count(),
+            1
+        );
+        assert_eq!(auth.live_grants(), 1);
+        drop(results);
+        assert_eq!(auth.active(), 0);
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "rtsp".into(),
+            token: "pending".into(),
+            ..Default::default()
+        };
+        let mut pending = Box::pin(auth.authorize_control(policy.clone(), request.clone()));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        assert_eq!(auth.active(), 1);
+        assert_eq!(auth.live_grants(), 0);
+        auth.age_activity(31);
+        auth.renew_due().await;
+        assert_eq!(auth.active(), 1, "cleanup must retain pending admission");
+        drop(pending);
+        assert_eq!(auth.active(), 0, "cancelled transfer releases capacity");
+        assert!(matches!(
+            auth.authorize_control(
+                policy,
+                ViewerRequest {
+                    token: "after-cancel".into(),
+                    ..request
+                }
+            )
+            .await,
+            AuthOutcome::Allowed(_)
+        ));
+    }
+    #[tokio::test]
+    async fn control_decisions_do_not_linger_in_playback_capacity() {
+        let auth = PlaybackAuth::new(1);
+        let policy = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "rtsp".into(),
+            token: "first".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(control) = auth
+            .authorize_control(policy.clone(), request.clone())
+            .await
+        else {
+            panic!("control")
+        };
+        assert_eq!(auth.active(), 1);
+        assert_eq!(auth.live_grants(), 1);
+        drop(control);
+        assert_eq!(auth.active(), 0);
+        assert_eq!(auth.live_grants(), 0);
+        let AuthOutcome::Allowed(playback) = auth
+            .authorize_control(policy.clone(), request.clone())
+            .await
+        else {
+            panic!("cached control")
+        };
+        playback.playback();
+        drop(playback);
+        assert_eq!(auth.active(), 1);
+        let other = ViewerRequest {
+            token: "other".into(),
+            ..request
+        };
+        assert!(matches!(
+            auth.authorize_control(policy, other).await,
+            AuthOutcome::Denied
+        ));
+    }
     #[test]
     fn session_key_order_is_distinct_even_when_values_are_equal() {
         let a = Policy::from_config(

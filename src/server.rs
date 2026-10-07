@@ -63,6 +63,8 @@ impl Default for Options {
     }
 }
 struct Reservation {
+    kind: rtsp_balancer::Kind,
+    bitrate_mbps: f64,
     stream: String,
     expires: Instant,
 }
@@ -94,6 +96,7 @@ pub struct App {
     cluster_clients: std::sync::Mutex<(u64, HashMap<String, reqwest::Client>)>,
     pub playback_auth: PlaybackAuth,
     reservations: Mutex<HashMap<String, Reservation>>,
+    rtsp_routes: rtsp_balancer::Registry,
     pub egress: Arc<AtomicU64>,
     pub rtsp_egress: Arc<AtomicU64>,
     pub rtsp_udp_egress: Arc<AtomicU64>,
@@ -155,6 +158,7 @@ impl App {
             cluster_clients: std::sync::Mutex::new((0, HashMap::new())),
             playback_auth: PlaybackAuth::new(options.client_limit as usize),
             reservations: Mutex::new(HashMap::new()),
+            rtsp_routes: rtsp_balancer::Registry::default(),
             egress: Arc::new(AtomicU64::new(0)),
             rtsp_egress: Arc::new(AtomicU64::new(0)),
             rtsp_udp_egress: Arc::new(AtomicU64::new(0)),
@@ -359,6 +363,11 @@ impl App {
         for name in names {
             streams.push(json!({"name":name,"ready":self.media.ready(&name).await,"stats":self.stream_stats(&name).await}));
         }
+        let mut node = self.load_node().await;
+        node["streams"] = json!(streams);
+        node
+    }
+    async fn load_node(&self) -> Value {
         let mut metrics = self.telemetry.snapshot(self.options.uplink_mbps);
         metrics["rtsp_push_bytes_out"] = json!(self.media.rtsp_push_egress.load(Ordering::Relaxed));
         metrics["rtsp_udp_bytes_out"] = json!(self.rtsp_udp_egress.load(Ordering::Relaxed));
@@ -370,9 +379,10 @@ impl App {
         let mut reservations = self.reservations.lock().await;
         reservations.retain(|_, v| v.expires > Instant::now());
         let reserved = reservations.len() as u64;
+        let reserved_mbps: f64 = reservations.values().map(|r| r.bitrate_mbps).sum();
         drop(reservations);
         let rtsp_publication = self.rtsp_publication.lock().unwrap().clone();
-        let node = json!({"rtsp_publication":rtsp_publication,"name":self.options.node_name,"role":self.options.role,"uptime":self.started.elapsed().as_secs(),"streams":streams,"uplink_mbps":self.options.uplink_mbps,"active":self.active().await,"reserved":reserved,"limit":self.options.client_limit,"drain":self.options.drain,"http_delivery":self.http_delivery.lock().unwrap().clone()});
+        let node = json!({"rtsp_publication":rtsp_publication,"name":self.options.node_name,"role":self.options.role,"uptime":self.started.elapsed().as_secs(),"reserved_mbps":reserved_mbps,"uplink_mbps":self.options.uplink_mbps,"active":self.active().await,"reserved":reserved,"limit":self.options.client_limit,"drain":self.options.drain,"http_delivery":self.http_delivery.lock().unwrap().clone()});
         metrics
             .as_object_mut()
             .unwrap()
@@ -729,6 +739,9 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
             Err(e) => error(StatusCode::CONFLICT, &e),
         };
     }
+    if tail == "rtsp-routing" && request.method() == "GET" && peer {
+        return json_response(app.rtsp_routing_node().await);
+    }
     if tail == "node" && request.method() == "GET" {
         return json_response(app.node().await);
     }
@@ -736,7 +749,7 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
         let (gpu_profiles, vaapi_profiles) =
             tokio::join!(app.media.gpu_capabilities(), app.media.vaapi_capabilities());
         return json_response(
-            json!({"rtsp_publication":app.rtsp_publication.lock().unwrap().clone(),"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","rtsp-udp (unicast RTP/RTCP)","rtsp2 (RTSP/1.0 camera input, AAC audio default)","rtsps (verified TLS, interleaved TCP)","srt","rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","publish:// (HTTP MPEG-TS; RTSP TCP / opt-in unicast UDP; RTSPS TLS TCP receive; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","srt (caller push / global listener playback, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","rtsp (TCP or unicast UDP publish push; TCP / opt-in unicast UDP playback; H264/HEVC/AAC-LC/MP2/MP3)","rtsps (verified TLS TCP publish push; opt-in TLS TCP playback; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["SDP negotiation","DTLS-SRTP / automatic key negotiation","rtsp Basic / Digest viewer auth","dvr","push protocols beyond SRT/RTSP/RTSPS","srt publication policy / per-stream playback listeners"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA / VAAPI H.264 / HEVC; profile readiness check, no software fallback","gpu_profiles":gpu_profiles,"vaapi_profiles":vaapi_profiles},"direct_srtp":{"available":crate::direct_rtp::crypto::availability(),"profile":"AES_CM_128_HMAC_SHA1_80","library":"independent system libsrtp2"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP redirects"}),
+            json!({"rtsp_publication":app.rtsp_publication.lock().unwrap().clone(),"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","rtsp-udp (unicast RTP/RTCP)","rtsp2 (RTSP/1.0 camera input, AAC audio default)","rtsps (verified TLS, interleaved TCP)","srt","rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","publish:// (HTTP MPEG-TS; RTSP TCP / opt-in unicast UDP; RTSPS TLS TCP receive; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","srt (caller push / global listener playback, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","rtsp (TCP or unicast UDP publish push; TCP / opt-in unicast UDP playback; H264/HEVC/AAC-LC/MP2/MP3)","rtsps (verified TLS TCP publish push; opt-in TLS TCP playback; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["SDP negotiation","DTLS-SRTP / automatic key negotiation","rtsp Basic / Digest viewer auth","dvr","push protocols beyond SRT/RTSP/RTSPS","srt publication policy / per-stream playback listeners"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA / VAAPI H.264 / HEVC; profile readiness check, no software fallback","gpu_profiles":gpu_profiles,"vaapi_profiles":vaapi_profiles},"direct_srtp":{"available":crate::direct_rtp::crypto::availability(),"profile":"AES_CM_128_HMAC_SHA1_80","library":"independent system libsrtp2"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP/RTSP/RTSPS redirects"}),
         );
     }
     if let Some(name) = tail.strip_prefix("stream/") {
@@ -796,15 +809,37 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
         if valid_name(name).is_err() {
             return error(StatusCode::BAD_REQUEST, "invalid name");
         }
-        let n = app.node().await;
-        let expected =
-            b["bitrate_mbps"].as_f64().unwrap_or(2.0).clamp(0.1, 100.0) / app.options.uplink_mbps;
+        let kind = match rtsp_balancer::kind(&b) {
+            Ok(kind) => kind,
+            Err(message) => return error(StatusCode::BAD_REQUEST, &message),
+        };
+        if let rtsp_balancer::Kind::Rtsp { secure, .. } = &kind {
+            let enabled = app.rtsp_publication.lock().unwrap()
+                [if *secure { "rtsps" } else { "rtsp" }]
+            .is_string();
+            if !enabled || !matches!(app.options.role.as_str(), "cdn" | "standalone") {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "RTSP delivery not enabled on CDN",
+                );
+            }
+            if app.resolve(name).await.is_none() {
+                return error(StatusCode::NOT_FOUND, "stream route unavailable");
+            }
+        }
+        let n = app.load_node().await;
+        let bitrate_mbps = b["bitrate_mbps"].as_f64().unwrap_or(2.0).clamp(0.1, 100.0);
+        let expected = bitrate_mbps / app.options.uplink_mbps;
         let mut reservations = app.reservations.lock().await;
         reservations.retain(|_, v| v.expires > Instant::now());
+        let reserved_mbps: f64 = reservations.values().map(|r| r.bitrate_mbps).sum();
         if app.options.drain
+            || reservations.len() >= 20000
             || n["active"].as_u64().unwrap_or(0) + reservations.len() as u64
                 >= app.options.client_limit
-            || n["uplink"].as_f64().unwrap_or(1.0) + expected * (reservations.len() + 1) as f64
+            || n["uplink"].as_f64().unwrap_or(1.0)
+                + reserved_mbps / app.options.uplink_mbps
+                + expected
                 >= 0.9
             || n["cpu"].as_f64().unwrap_or(1.0) >= 0.9
             || n["ram"].as_f64().unwrap_or(1.0) >= 0.95
@@ -815,6 +850,8 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
         reservations.insert(
             ticket.clone(),
             Reservation {
+                kind,
+                bitrate_mbps,
                 stream: name.into(),
                 expires: Instant::now() + Duration::from_secs(5),
             },
@@ -1055,7 +1092,17 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             referer: header(request.headers(), "referer").unwrap_or("").into(),
             host: header(request.headers(), "host").unwrap_or("").into(),
         };
-        match app.playback_auth.authorize(resolved.policy, viewer).await {
+        // Ticket requests only validate and redirect; the subsequent clean
+        // media request owns playback occupancy. Cross-protocol rejection must
+        // not leave a phantom HTTP viewer blocking a valid RTSP reservation.
+        let outcome = if query.contains_key("flussonix_ticket") {
+            app.playback_auth
+                .authorize_control(resolved.policy, viewer)
+                .await
+        } else {
+            app.playback_auth.authorize(resolved.policy, viewer).await
+        };
+        match outcome {
             AuthOutcome::Allowed(g) => g,
             AuthOutcome::Denied => return error(StatusCode::FORBIDDEN, "playback denied"),
             AuthOutcome::Redirect(url) => {
@@ -1089,8 +1136,14 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     }
     if let Some(ticket) = query.get("flussonix_ticket") {
         let mut reservations = app.reservations.lock().await;
-        match reservations.remove(ticket) {
-            Some(r) if r.stream == name && r.expires > Instant::now() => {
+        let valid = reservations.get(ticket).is_some_and(|r| {
+            r.stream == name
+                && r.expires > Instant::now()
+                && matches!(r.kind, rtsp_balancer::Kind::Http)
+        });
+        match valid {
+            true => {
+                reservations.remove(ticket);
                 let clean = url::form_urlencoded::Serializer::new(String::new())
                     .extend_pairs(
                         query
@@ -1388,3 +1441,5 @@ pub(crate) mod rtsp_access;
 pub(crate) mod ts_access;
 
 pub(crate) mod publication;
+
+pub(crate) mod rtsp_balancer;
