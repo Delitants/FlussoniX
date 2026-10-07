@@ -2,6 +2,7 @@
 mod auth;
 mod bridge;
 mod client;
+mod dispatch;
 mod udp;
 use bytes::Bytes;
 use serde_json::{Value, json};
@@ -140,10 +141,16 @@ pub(crate) struct State {
     destination: Destination,
     index: usize,
     counters: Mutex<Counters>,
+    egress: Arc<std::sync::atomic::AtomicU64>,
 }
 impl State {
-    pub fn new(destination: Destination, index: usize) -> Arc<Self> {
+    pub fn new(
+        destination: Destination,
+        index: usize,
+        egress: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            egress,
             counters: Mutex::new(Counters {
                 status: if destination.disabled {
                     "disabled"
@@ -237,7 +244,7 @@ impl State {
         let bridge = tokio::select! {biased;
             _=cancel.cancelled()=>return "push_stopped",
             _=tokio::time::sleep_until(tokio::time::Instant::from_std(connect_deadline))=>return "push_connect_failed",
-            result=bridge::Bridge::prepare(&self.destination)=>match result{Ok(b)=>b,Err(_)=>return "push_connect_failed"}
+            result=bridge::Bridge::prepare(&self.destination,self.egress.clone())=>match result{Ok(b)=>b,Err(_)=>return "push_connect_failed"}
         };
         let mut readers = tokio::task::JoinSet::new();
         let result = tokio::select! {biased;_=cancel.cancelled()=>Err("push_stopped"),result=self.send(worker,&bridge,started,snapshot,&mut readers)=>result};
@@ -301,6 +308,7 @@ impl State {
         let mut last = Instant::now();
         let mut previous = 0;
         let mut pending = None;
+        let mut feedback_used = 0usize;
         let mut pacer = self
             .destination
             .udp
@@ -360,20 +368,65 @@ impl State {
                         .map_err(|_| "push_queue_overflow")
                 }
             };
-            tokio::select! {biased;
-                _=tokio::time::sleep_until(due)=>return Err("push_stalled"),
-                response=client.feedback()=>{tokio::time::timeout_at(due,client.handle_feedback(response?)).await.map_err(|_|"push_stalled")??;},
-                _=reports.tick()=>{tokio::time::timeout_at(due,client.reports()).await.map_err(|_|"push_stalled")??;},
-                _=controls.tick()=>{tokio::time::timeout_at(due,client.keepalive()).await.map_err(|_|"push_stalled")??;},
-                _=progress_tick.tick()=>{},
-                _=paced=>{
-                    let packet=pending.take().unwrap();
-                    tokio::time::timeout_at(due,client.packet(&packet.bytes)).await.map_err(|_|"push_stalled")??;
-                    pacer.as_mut().unwrap().sent(packet.bytes.len()-4,tokio::time::Instant::now());
+            match dispatch::next(
+                due,
+                feedback_used,
+                client.feedback(),
+                async {
+                    reports.tick().await;
+                },
+                async {
+                    controls.tick().await;
+                },
+                async {
+                    progress_tick.tick().await;
+                },
+                paced,
+                next,
+            )
+            .await
+            {
+                dispatch::Turn::Stalled => return Err("push_stalled"),
+                dispatch::Turn::Feedback(response) => {
+                    feedback_used += 1;
+                    tokio::time::timeout_at(due, client.handle_feedback(response?))
+                        .await
+                        .map_err(|_| "push_stalled")??;
                 }
-                packet=next=>{
-                    let packet=packet?;
-                    if pacer.is_some() {pending=Some(packet);} else {tokio::time::timeout_at(due,client.packet(&packet.bytes)).await.map_err(|_|"push_stalled")??;}
+                dispatch::Turn::Reports => {
+                    tokio::time::timeout_at(due, client.reports())
+                        .await
+                        .map_err(|_| "push_stalled")??;
+                }
+                dispatch::Turn::Controls => {
+                    tokio::time::timeout_at(due, client.keepalive())
+                        .await
+                        .map_err(|_| "push_stalled")??;
+                }
+                dispatch::Turn::Progress => {
+                    feedback_used = 0;
+                }
+                dispatch::Turn::Paced => {
+                    let packet = pending.take().unwrap();
+                    tokio::time::timeout_at(due, client.packet(&packet.bytes))
+                        .await
+                        .map_err(|_| "push_stalled")??;
+                    pacer
+                        .as_mut()
+                        .unwrap()
+                        .sent(packet.bytes.len() - 4, tokio::time::Instant::now());
+                    feedback_used = 0;
+                }
+                dispatch::Turn::Packet(packet) => {
+                    let packet = packet?;
+                    if pacer.is_some() {
+                        pending = Some(packet);
+                    } else {
+                        tokio::time::timeout_at(due, client.packet(&packet.bytes))
+                            .await
+                            .map_err(|_| "push_stalled")??;
+                    }
+                    feedback_used = 0;
                 }
             }
         }

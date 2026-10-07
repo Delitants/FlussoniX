@@ -41,6 +41,7 @@ pub(super) struct Bridge {
     pub peer: std::net::IpAddr,
     pub local: std::net::IpAddr,
     pub udp: bool,
+    pub egress: Arc<AtomicU64>,
 }
 #[derive(Clone)]
 pub(super) struct Route {
@@ -70,7 +71,7 @@ impl Route {
     }
 }
 impl Bridge {
-    pub async fn prepare(destination: &Destination) -> io::Result<Self> {
+    pub async fn prepare(destination: &Destination, egress: Arc<AtomicU64>) -> io::Result<Self> {
         let host = destination.url.host_str().unwrap().trim_matches(['[', ']']);
         let port = destination
             .url
@@ -108,6 +109,7 @@ impl Bridge {
         let bytes = Arc::new(AtomicU64::new(0));
         let progress = bytes.clone();
         let udp = destination.udp;
+        let aggregate = egress.clone();
         let task = tokio::spawn(async move {
             let accepted = tokio::time::timeout(Duration::from_secs(8), listener.accept()).await;
             drop(listener);
@@ -121,7 +123,7 @@ impl Bridge {
             let mut read_local = BufReader::new(read_local);
             let mut read_remote = BufReader::new(read_remote);
             tokio::select! {
-                _=requests(&mut read_local,&mut write_remote,&forwarding,&state,&progress,udp)=>{},
+                _=requests(&mut read_local,&mut write_remote,&forwarding,&state,&progress,udp,&aggregate)=>{},
                 _=responses(&mut read_remote,&mut write_local,&state,peer)=>{},
             }
         });
@@ -133,6 +135,7 @@ impl Bridge {
             peer,
             local,
             udp,
+            egress,
         })
     }
     pub fn route(&self) -> Route {
@@ -275,6 +278,7 @@ async fn requests<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     state: &Arc<Mutex<Session>>,
     bytes: &AtomicU64,
     udp: bool,
+    egress: &AtomicU64,
 ) -> io::Result<()> {
     loop {
         match frame(read).await? {
@@ -342,6 +346,7 @@ async fn requests<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     return Err(bad());
                 }
                 media(write, channel, &body).await?;
+                egress.fetch_add((body.len() + 4) as u64, Ordering::Relaxed);
                 if is_rtp {
                     bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
                 }
@@ -489,7 +494,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let destination=Destination::parse(&serde_json::json!({"url":format!("rtsp://127.0.0.1:{port}/owned?password=test-secret")})).unwrap();
-        let bridge = Bridge::prepare(&destination).await.unwrap();
+        let bridge = Bridge::prepare(&destination, Arc::new(AtomicU64::new(0)))
+            .await
+            .unwrap();
         let (remote, _) = listener.accept().await.unwrap();
         let u = url::Url::parse(bridge.local_url()).unwrap();
         let local = TcpStream::connect(("127.0.0.1", u.port().unwrap()))
@@ -592,6 +599,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(bridge.rtp_bytes(), 12);
+        // 8-byte RTCP + 12-byte RTP, with two 4-byte TCP frames. Received
+        // RTCP is excluded and RTP-only destination progress stays unchanged.
+        assert_eq!(bridge.egress.load(Ordering::Relaxed), 28);
         // Reject a frame before allocating or forwarding its advertised oversized payload.
         local.write_all(&[b'$', 0, 0x20, 1]).await.unwrap();
         let mut byte = [0];

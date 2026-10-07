@@ -1929,3 +1929,57 @@ async fn independent_udp_basic_and_digest_receivers_authenticate_and_decode() {
         }
     }
 }
+
+#[tokio::test]
+async fn udp_push_updates_process_uplink_and_keeps_lifetime_bytes_after_stop() {
+    use flussonix::server::{App, Options, router};
+    use futures_util::FutureExt;
+    use tower::ServiceExt;
+    let dir = labdir();
+    let path = dir.path().join("uplink.ts");
+    let (port, mut receiver) = receiver_transport(&path, 3, "udp").await;
+    let source = App::new(
+        dir.path().join("source.json"),
+        dir.path().join("source-media"),
+        Options {
+            admin_password: "owned-admin".into(),
+            peer_key: "owned-peer-key".into(),
+            uplink_interface: "process".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    source.sample_metrics();
+    let result=std::panic::AssertUnwindSafe(async {
+        let worker=source.media.ensure("owned",&json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":format!("rtsp://127.0.0.1:{port}/owned"),"rtsp_transport":"udp","retry_timeout":30}]})).await.unwrap();
+        wait_push(&worker,0,"sending").await;tokio::time::sleep(Duration::from_millis(250)).await;source.sample_metrics();
+        let request=axum::http::Request::builder().uri("/flussonix/api/v1/node").header("Authorization","Basic YWRtaW46b3duZWQtYWRtaW4=").body(axum::body::Body::empty()).unwrap();
+        let response=router(source.clone()).oneshot(request).await.unwrap();assert_eq!(response.status(),200);
+        let body=axum::body::to_bytes(response.into_body(),1048576).await.unwrap();let node:Value=serde_json::from_slice(&body).unwrap();
+        assert!(node["egress_mbps"].as_f64().unwrap()>0.0,"UDP push must contribute to process uplink: {node}");
+        assert!(node["rtsp_egress_mbps"].as_f64().unwrap()>0.0);
+        assert!(node["bytes_out"].as_u64().unwrap()>=worker.stats()["flussonix_pushes"][0]["rtp_bytes"].as_u64().unwrap());
+        received(&mut receiver,&path,Some("h264"),"aac").await;node["bytes_out"].as_u64().unwrap()
+    }).catch_unwind().await;
+    source.media.stop_all().await;
+    if receiver.try_wait().unwrap().is_none() {
+        let _ = receiver.kill().await;
+    }
+    let _ = receiver.wait().await;
+    let before = match result {
+        Ok(before) => before,
+        Err(p) => std::panic::resume_unwind(p),
+    };
+    source.sample_metrics();
+    let request = axum::http::Request::builder()
+        .uri("/flussonix/api/v1/node")
+        .header("Authorization", "Basic YWRtaW46b3duZWQtYWRtaW4=")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = router(source.clone()).oneshot(request).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 1048576)
+        .await
+        .unwrap();
+    let node: Value = serde_json::from_slice(&body).unwrap();
+    assert!(node["bytes_out"].as_u64().unwrap() >= before);
+}

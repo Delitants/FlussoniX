@@ -64,11 +64,15 @@ pub(super) struct Pair {
     pub rtcp: Arc<UdpSocket>,
     pub remote: Option<ClientPorts>,
     ports: ClientPorts,
+    egress: Arc<std::sync::atomic::AtomicU64>,
     drain_rtp: std::net::UdpSocket,
     drain_rtcp: std::net::UdpSocket,
 }
 impl Pair {
-    pub async fn bind(local: IpAddr) -> io::Result<Self> {
+    pub async fn bind(
+        local: IpAddr,
+        egress: Arc<std::sync::atomic::AtomicU64>,
+    ) -> io::Result<Self> {
         for _ in 0..128 {
             let rtp = UdpSocket::bind(SocketAddr::new(local, 0)).await?;
             let port = rtp.local_addr()?.port();
@@ -87,6 +91,7 @@ impl Pair {
                 let drain_rtcp = raw.try_clone()?;
                 let rtcp = UdpSocket::from_std(raw)?;
                 return Ok(Self {
+                    egress,
                     drain_rtp,
                     drain_rtcp,
                     rtp,
@@ -128,6 +133,8 @@ impl Pair {
         if socket.send(body).await? != body.len() {
             return Err(bad());
         }
+        self.egress
+            .fetch_add(body.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }
@@ -187,9 +194,17 @@ mod tests {
     }
     #[tokio::test]
     async fn pair_filters_foreign_feedback_drains_real_queue_and_releases_both_ports() {
-        let mut pair = Pair::bind("127.0.0.1".parse().unwrap()).await.unwrap();
+        let egress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut pair = Pair::bind("127.0.0.1".parse().unwrap(), egress.clone())
+            .await
+            .unwrap();
         let ports = pair.ports();
-        let receiver = Pair::bind("127.0.0.1".parse().unwrap()).await.unwrap();
+        let receiver = Pair::bind(
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
+        .await
+        .unwrap();
         pair.connect("127.0.0.1".parse().unwrap(), receiver.ports())
             .await
             .unwrap();
@@ -220,6 +235,13 @@ mod tests {
         let (n, source) = receiver.rtp.recv_from(&mut data).await.unwrap();
         assert_eq!(&data[..n], b"owned");
         assert_eq!(source.port(), ports.rtp);
+        assert_eq!(egress.load(std::sync::atomic::Ordering::Relaxed), 5);
+        let report = [0x80, 201, 0, 1, 0, 0, 0, 1];
+        pair.send(true, &report).await.unwrap();
+        let (n, source) = receiver.rtcp.recv_from(&mut data).await.unwrap();
+        assert_eq!(&data[..n], &report);
+        assert_eq!(source.port(), ports.rtcp);
+        assert_eq!(egress.load(std::sync::atomic::Ordering::Relaxed), 13);
         drop(pair);
         let a = UdpSocket::bind(("127.0.0.1", ports.rtp)).await.unwrap();
         let b = UdpSocket::bind(("127.0.0.1", ports.rtcp)).await.unwrap();

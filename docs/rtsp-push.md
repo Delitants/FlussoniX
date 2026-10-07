@@ -145,3 +145,15 @@ matrix, Basic/Digest control authentication, strict mapped-track decoding,
 transport rejection and port reclamation. NAT traversal, multicast push,
 scoped IPv6, WAN loss, all recorder dialects and sustained capacity remain
 unqualified. These bounds apply to UDP push; earlier TCP evidence still applies.
+
+The scheduler services due sender reports and OPTIONS before feedback and limits
+a consecutive feedback burst to eight frames before servicing ready media. An
+idle progress tick reopens feedback service within 100 ms. Both TCP and UDP push
+contribute successful outbound RTP/RTCP writes to lifetime node transport
+counters, so `--uplink-interface process` includes them in RTSP/media uplink
+measurements. `rtsp_push_bytes_out` includes application payload and TCP
+interleaving headers; UDP/IP, TCP/IP and TLS record overhead are measured by the
+NIC profile rather than these payload counters. Destination `rtp_bytes` remains
+RTP-only. Counters survive worker stop/replacement and exclude inbound feedback.
+Admitted RTCP checks packet-specific minimum/report lengths, SDES structure and
+final-packet padding; RTPFB/PSFB require their sender/media SSRC header.

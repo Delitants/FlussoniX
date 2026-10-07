@@ -360,6 +360,7 @@ impl App {
             streams.push(json!({"name":name,"ready":self.media.ready(&name).await,"stats":self.stream_stats(&name).await}));
         }
         let mut metrics = self.telemetry.snapshot(self.options.uplink_mbps);
+        metrics["rtsp_push_bytes_out"] = json!(self.media.rtsp_push_egress.load(Ordering::Relaxed));
         metrics["rtsp_udp_bytes_out"] = json!(self.rtsp_udp_egress.load(Ordering::Relaxed));
         metrics["direct_rtp_bytes_out"] = json!(self.media.direct_egress.load(Ordering::Relaxed));
         metrics["srt_bytes_out"] = json!(self.srt_egress.load(Ordering::Relaxed));
@@ -381,7 +382,9 @@ impl App {
     pub fn sample_metrics(&self) {
         self.telemetry.sample_transports(
             self.egress.load(Ordering::Relaxed),
-            self.rtsp_egress.load(Ordering::Relaxed),
+            self.rtsp_egress
+                .load(Ordering::Relaxed)
+                .saturating_add(self.media.rtsp_push_egress.load(Ordering::Relaxed)),
             self.srt_egress.load(Ordering::Relaxed),
             self.media.direct_egress.load(Ordering::Relaxed),
         );

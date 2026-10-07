@@ -91,7 +91,7 @@ impl Client {
             let control = format!("{url}/trackID={}", track.id);
             let mut pair = if bridge.udp {
                 Some(
-                    super::udp::Pair::bind(bridge.local)
+                    super::udp::Pair::bind(bridge.local, bridge.egress.clone())
                         .await
                         .map_err(|_| "push_setup_failed")?,
                 )
@@ -375,16 +375,58 @@ impl Client {
     }
 }
 fn valid_rtcp(body: &[u8]) -> bool {
+    if body.is_empty() || body.len() > 2048 {
+        return false;
+    }
     let mut at = 0;
     while at < body.len() {
         if body.len() - at < 4 || body[at] >> 6 != 2 {
             return false;
         }
         let size = (u16::from_be_bytes([body[at + 2], body[at + 3]]) as usize + 1) * 4;
-        if size > body.len() - at {
+        let Some(packet) = body.get(at..at + size) else {
+            return false;
+        };
+        let padding = if packet[0] & 32 != 0 {
+            let pad = usize::from(*packet.last().unwrap());
+            if at + size != body.len() || pad == 0 || pad > size - 4 {
+                return false;
+            }
+            pad
+        } else {
+            0
+        };
+        let payload = size - padding;
+        let count = usize::from(packet[0] & 31);
+        let valid = match packet[1] {
+            200 => payload == 28 + 24 * count && crate::direct_rtp::packet::valid_rtcp(packet),
+            201 => payload == 8 + 24 * count && crate::direct_rtp::packet::valid_rtcp(packet),
+            202..=204 => crate::direct_rtp::packet::valid_rtcp(packet),
+            205 | 206 => payload >= 12,
+            _ => false,
+        };
+        if !valid {
             return false;
         }
         at += size;
     }
-    at > 0
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_rtcp;
+    #[test]
+    fn malformed_receiver_reports_and_padding_are_rejected() {
+        assert!(valid_rtcp(&[0x80, 201, 0, 1, 0, 0, 0, 1]));
+        for body in [
+            &[0x80, 201, 0, 0][..],
+            &[0x81, 201, 0, 1, 0, 0, 0, 1],
+            &[0xa0, 201, 0, 1, 0, 0, 0, 0],
+            &[0x80, 200, 0, 1, 0, 0, 0, 1],
+            &[0x81, 202, 0, 1, 0, 0, 0, 1],
+        ] {
+            assert!(!valid_rtcp(body), "malformed RTCP admitted: {body:?}");
+        }
+    }
 }

@@ -38,10 +38,14 @@ pub(crate) enum State {
     Rtsp(Arc<crate::rtsp_push::State>),
 }
 impl State {
-    pub fn new(destination: Destination, index: usize) -> Arc<Self> {
+    pub fn new(
+        destination: Destination,
+        index: usize,
+        egress: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Arc<Self> {
         Arc::new(match destination {
             Destination::Srt(d) => Self::Srt(crate::srt_push::State::new(d, index)),
-            Destination::Rtsp(d) => Self::Rtsp(crate::rtsp_push::State::new(d, index)),
+            Destination::Rtsp(d) => Self::Rtsp(crate::rtsp_push::State::new(d, index, egress)),
         })
     }
     pub fn stats(&self) -> Value {

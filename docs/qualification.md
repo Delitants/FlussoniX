@@ -470,7 +470,7 @@ and returns every allocated local pair. The native receiving-node test exercises
 both TCP and UDP: the management password is denied, the publisher password
 starts one worker, and stopping UDP push returns every receiver lease.
 
-The local suites pass 81 library, 26 push, 13 UDP playback and seven RTSPS tests;
+The local suites pass 84 library, 27 push, 13 UDP playback and seven RTSPS tests;
 one push hardware test remains explicitly opt-in. Browser qualification verifies
 friendly UDP selection, persisted template settings, TCP default restoration and
 removal of UDP settings when choosing secure RTSPS. Production code passed the
@@ -480,3 +480,22 @@ missing selector against the previous UI; the new UI passes the same flow.
 All fixtures use owned loopback ports and independent components. Full final-head
 CI remains the release gate. See [transport bounds and remaining interoperability
 limits](rtsp-push.md#unicast-udp-push).
+
+The first read-only review found continuous-feedback priority and missing
+process-uplink accounting; that candidate CI was canceled before release. A
+behavior-preserving extraction of the existing service turn made its priority
+testable. A continuously replenished, bounded 16-frame feedback queue reproduced
+media starvation without queue overflow; ready-periodic-control and malformed-RR
+cases also failed before correction. Feedback service now yields after eight
+frames and due reports/OPTIONS retain priority. An actual UDP push/management
+node regression first observed zero process egress, then requires positive RTSP
+and total process uplink, strictly decodes the receiver and checks lifetime bytes
+remain monotonic after worker stop. Successful RTP and RTCP writes feed the node
+counter without counting received feedback. Final-head checks supersede the
+earlier candidate, and the preview remains protected until they pass.
+
+A later authentication regression exposed a fixture readiness race: its port
+file became visible before its number was written, causing an empty-integer
+parse before any authentication request. The independent gateway now publishes
+that readiness file with an atomic rename. The failed run and its diagnostic
+are retained; successful fixture and full push reruns are required before release.

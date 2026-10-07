@@ -20,7 +20,11 @@ listener = socket.socket()
 listener.bind(('127.0.0.1', 0))
 listener.listen(1)
 port = listener.getsockname()[1]
-Path(a.port_file).write_text(str(port))
+# Publish readiness atomically: readers must never observe an empty prefix.
+port_path = Path(a.port_file)
+port_ready = port_path.with_suffix('.ready.tmp')
+port_ready.write_text(str(port))
+port_ready.replace(port_path)
 listener.settimeout(20)
 local, _ = listener.accept()
 listener.close()
