@@ -273,3 +273,16 @@ The native LB profile implements measured RTSP/RTSPS selection, compact cached t
 ## Verified RTSPS input redirects
 
 Configured inputs follow bounded pre-session native TLS redirects through owned loopback bridges. Every destination verifies identity and trust before application data. Username/password inputs retain their configured credentials only within the original normalized hostname and effective port; changed origins fail before connecting. Owned Basic and Digest MD5/qop-auth camera-style fixtures independently decode H.264/AAC after redirect. See [contract, qualification and limits](secure-rtsp-redirects.md).
+
+
+## Incoming RTSP publisher header credentials
+
+Configured RTSP/RTSPS publications accept preemptive Basic and legacy MD5 Digest
+without qop using the effective stream/template publisher password. The username
+is a publisher label, not a management account. Initial401 challenges support
+bounded same-connection retries before callbacks or worker startup; original
+query-password behavior remains available. Independent FFmpeg qualification
+covers decoded H.264/AAC on TCP, UDP and verified TLS. See
+[the receiving authentication profile](rtsp-publication.md#incoming-publisher-basic-and-digest-authentication).
+Viewer Basic/Digest, additional incoming algorithms and complete vendor API/auth
+parity remain open.

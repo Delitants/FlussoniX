@@ -18,7 +18,7 @@ This build implements persisted Streams/Templates configuration, authenticated m
 | Subtitles | Independent CEA-608/708, selected Level 1 Latin teletext and optional DVB bitmap OCR to selectable WebVTT in TS/fMP4 HLS; friendly channel/service/page and recognition-language controls; original pass-through or filtering; [digital profile](docs/cea708-qualification.md), [teletext profile](docs/teletext-qualification.md), [DVB OCR profile](docs/dvb-qualification.md) |
 | Native cluster | Separate public/private endpoints, source discovery, explicit equivalent-origin failover, LAN pull, uplink/CPU/RAM selection, readiness, drain/stale exclusion, expiring capacity reservations; configurable private CA trust for HTTPS management and HLS/TS/M4F/M4S media |
 
-Required later work includes complete API/schema parity; Flussonic cluster discovery and credential compatibility; additional M4 codec/metadata modes; full publisher policy/session parity; RTSP/RTSPS UDP publication/push, Basic/Digest viewer and incoming publisher authentication and SRTP-protected UDP; SDP/DTLS-SRTP negotiation; SRT publication policy and per-stream listener configuration; cross-origin authenticated HLS input, mutual TLS and automatic certificate rotation, remaining secure push protocols and trusted-proxy integration; full transcoder profiles, additional GPU/HEVC qualification, DVR, distributed session ownership and complete failure/scale qualification. Unsupported saved options return errors. See [qualification](docs/qualification.md) for evidence and limits.
+Required later work includes complete API/schema parity; Flussonic cluster discovery and credential compatibility; additional M4 codec/metadata modes; full publisher policy/session parity; RTSP/RTSPS UDP publication/push, Basic/Digest viewer authentication and additional incoming publisher authentication profiles and SRTP-protected UDP; SDP/DTLS-SRTP negotiation; SRT publication policy and per-stream listener configuration; cross-origin authenticated HLS input, mutual TLS and automatic certificate rotation, remaining secure push protocols and trusted-proxy integration; full transcoder profiles, additional GPU/HEVC qualification, DVR, distributed session ownership and complete failure/scale qualification. Unsupported saved options return errors. See [qualification](docs/qualification.md) for evidence and limits.
 
 DVB text recognition optionally requires independently installed Tesseract and selected language models, such as `tesseract-ocr-eng` and `tesseract-ocr-deu`. Streams/Templates expose a DVB composition page and recognition language without JSON editing. Missing or low-quality recognition reports degradation while AV continues. `FLUSSONIX_TESSERACT` selects a trusted executable at daemon startup.
 
@@ -168,3 +168,10 @@ Destination RTSP transport control (`rtsp_transport: "udp"`). RTSPS retains
 verified encrypted TCP. See [UDP push bounds](docs/rtsp-push.md#unicast-udp-push).
 
 Native RTSP/RTSPS LB routing now uses measured CDN selection and protocol/token-bound reservations, with friendly public listener fields in Cluster. See [routing, bounds and qualification](docs/rtsp-cluster-routing.md).
+
+
+Incoming RTSP/RTSPS publications also accept Basic headers and bounded legacy
+MD5 Digest challenges using the existing Publisher password. Configure your
+publisher with `publisher:YOUR_PASSWORD@HOST` userinfo; leave generated URLs free
+of stored credentials. Viewer/admin credentials remain separate. See the
+[receiving authentication profile and limits](docs/rtsp-publication.md#incoming-publisher-basic-and-digest-authentication).

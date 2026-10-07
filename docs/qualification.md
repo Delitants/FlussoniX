@@ -615,3 +615,33 @@ blanket rejection fails the direct handoff and valid-authentication media cases;
 an earlier fixture with incomplete nonce-renewal semantics is excluded from the
 product regression evidence. General camera/realm/algorithm interoperability and
 cross-origin credential forwarding remain outside this qualification.
+
+
+## Incoming RTSP publisher header authentication
+
+Owned socket regressions admit Basic credentials without a URL password and
+retain stream/Session binding before RECORD. Protected streams issue an MD5
+Digest challenge and accept the correct retry on the same connection; another
+connection cannot reuse that nonce. An independently installed FFmpeg publisher
+strictly decodes H.264/AAC through plain TCP, unicast UDP and an owned verifying
+TLS relay into the common shared worker. This is the legacy MD5/no-qop receiving
+profile, with Basic accepted preemptively.
+
+Adversarial cases reject management/peer/wrong passwords, malformed Basic/Digest,
+method/URI/realm substitution, another algorithm or qop, duplicate parameters,
+trailing commas and simultaneous query/header passwords. Inherited template
+password edits invalidate the old challenge response; the current password can
+still complete that negotiation. Existing callbacks deny otherwise valid
+passwords, renew the same session and omit header credentials from metadata.
+Three401 challenges close failed negotiation; cancellation and a retry midway
+through the absolute30-second deadline release the connection without a worker.
+The first socket REDs rejected Basic with403 and omitted the Digest challenge;
+the challenge-limit RED exposed a fourth-reply off-by-one before correction.
+
+The new targeted socket/media run passes12 tests; two Chromium cases verify
+friendly publisher controls, inheritance, masked saved secrets, enabled listener
+URLs and updated encoder guidance. Formatting, all-target warnings-denied Clippy
+and the compiled UI pass. Full final-head CI and fresh whole-range review remain
+publication gates. Viewer Basic/Digest, per-user accounts, additional incoming
+Digest algorithms/qop, arbitrary vendor dialects and migration/scale remain open.
+See [contract and limits](rtsp-publication.md#incoming-publisher-basic-and-digest-authentication).

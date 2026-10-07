@@ -1,4 +1,5 @@
 //! Bounded receiving sessions share HTTP publisher policy and worker ownership.
+mod auth;
 mod bridge;
 mod reports;
 mod sdp;
@@ -47,6 +48,7 @@ async fn admit(
     peer: SocketAddr,
     secure: bool,
     pool: Option<Arc<udp::Pool>>,
+    auth: &auth::Auth,
 ) -> Result<Session, u16> {
     if app.options.role == "lb" {
         return Err(403);
@@ -75,21 +77,19 @@ async fn admit(
         }
     })?;
     let qs = url.query().unwrap_or("");
-    let mut password = String::new();
+    let mut password = None;
     let mut token = String::new();
     for (k, v) in url.query_pairs() {
         if ["password", "token"].contains(&k.as_ref()) && v.len() > 1024 {
             return Err(400);
         }
         match k.as_ref() {
-            "password" => password = v.into_owned(),
+            "password" => password = Some(v.into_owned()),
             "token" => token = v.into_owned(),
             _ => {}
         }
     }
-    if !expected.policy.accepts_password(&password) {
-        return Err(403);
-    }
+    auth.verify(r, &expected, password.as_deref())?;
     for k in ["user-agent", "referer", "host"] {
         if r.headers.get(k).is_some_and(|v| v.len() > 4096) {
             return Err(400);
@@ -469,7 +469,7 @@ impl Session {
 }
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn receive<W: AsyncWrite + Unpin>(
-    r: Request,
+    mut r: Request,
     controls: &mut mpsc::Receiver<Result<Event, protocol::Error>>,
     write: &mut W,
     app: &Arc<App>,
@@ -478,10 +478,37 @@ pub(super) async fn receive<W: AsyncWrite + Unpin>(
     secure: bool,
     pool: Option<Arc<udp::Pool>>,
 ) -> std::io::Result<()> {
-    let admission = tokio::select! {biased;_=cancel.cancelled()=>return Ok(()),s=admit(&r,app,peer,secure,pool)=>s};
-    let mut s = match admission {
-        Ok(s) => s,
-        Err(code) => return reply(write, cancel, code, r.cseq, &[]).await,
+    let auth = auth::Auth::new(&r.uri);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut challenges = 0;
+    let mut s = loop {
+        let admission = tokio::select! {biased;_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep_until(deadline)=>return Ok(()),s=admit(&r,app,peer,secure,pool.clone(),&auth)=>s};
+        match admission {
+            Ok(s) => break s,
+            Err(401) => {
+                reply(
+                    write,
+                    cancel,
+                    401,
+                    r.cseq,
+                    &[("WWW-Authenticate", auth.challenge())],
+                )
+                .await?;
+                if challenges == 2 {
+                    return Ok(());
+                }
+                challenges += 1;
+                let event = tokio::select! {biased;_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep_until(deadline)=>return Ok(()),event=controls.recv()=>event};
+                match event {
+                    Some(Ok(Event::Request(next))) if next.method == "ANNOUNCE" => r = next,
+                    Some(Ok(Event::Request(next))) => {
+                        return reply(write, cancel, 400, next.cseq, &[]).await;
+                    }
+                    _ => return Ok(()),
+                }
+            }
+            Err(code) => return reply(write, cancel, code, r.cseq, &[]).await,
+        }
     };
     let result = run(&mut s, r.cseq, controls, write, app, cancel).await;
     if let Some(p) = s.publication.take() {

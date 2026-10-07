@@ -190,6 +190,336 @@ async fn setup<S: AsyncRead + AsyncWrite + Unpin>(
 }
 const TRANSPORT: &str = "RTP/AVP/TCP;unicast;interleaved=0-1;mode=record";
 
+// Ignoring Authorization or skipping publisher-password checks breaks this gate.
+#[tokio::test]
+async fn basic_publisher_headers_admit_without_url_password_and_keep_session_binding() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let l = Lab::new("standalone").await;
+    let url = l.url.split('?').next().unwrap();
+    let mut s = l.socket().await;
+    let auth = STANDARD.encode("publisher:owned-publish");
+    let (code, h) = request(
+        &mut s,
+        "ANNOUNCE",
+        url,
+        &format!("Content-Type: application/sdp\r\nAuthorization: Basic {auth}\r\n"),
+        SDP,
+    )
+    .await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        assert_eq!(code, 200);
+        assert_eq!(l.app.media.count().await, 0);
+        assert_eq!(setup(&mut s, &track(url), &id(&h), TRANSPORT).await, 200);
+        assert_eq!(setup(&mut s, &track(url), "foreign", TRANSPORT).await, 454);
+    })
+    .catch_unwind()
+    .await;
+    drop(s);
+    l.end().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p);
+    }
+}
+
+fn digest_header(challenge: &str, method: &str, uri: &str, password: &str) -> String {
+    use md5::{Digest, Md5};
+    let field = |key: &str| {
+        challenge
+            .split(&format!("{key}=\""))
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let realm = field("realm");
+    let nonce = field("nonce");
+    let h = |s: &str| format!("{:x}", Md5::digest(s.as_bytes()));
+    let response = h(&format!(
+        "{}:{nonce}:{}",
+        h(&format!("publisher:{realm}:{password}")),
+        h(&format!("{method}:{uri}"))
+    ));
+    format!(
+        "Digest username=\"publisher\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{response}\", algorithm=MD5"
+    )
+}
+
+// Closing on the initial 401 or trusting an unrelated nonce breaks this flow.
+#[tokio::test]
+async fn digest_publisher_challenge_retries_on_same_socket_and_binds_nonce() {
+    let l = Lab::new("standalone").await;
+    let url = l.url.split('?').next().unwrap();
+    let mut s = l.socket().await;
+    let (code, challenge) = announce(&mut s, url, SDP).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        assert_eq!(code, 401);
+        assert!(challenge.contains("WWW-Authenticate: Digest "));
+        let header = digest_header(&challenge, "ANNOUNCE", url, "owned-publish");
+        let mut other = l.socket().await;
+        assert_eq!(
+            request(
+                &mut other,
+                "ANNOUNCE",
+                url,
+                &format!("Content-Type: application/sdp\r\nAuthorization: {header}\r\n"),
+                SDP
+            )
+            .await
+            .0,
+            401
+        );
+        drop(other);
+        let (code, h) = request(
+            &mut s,
+            "ANNOUNCE",
+            url,
+            &format!("Content-Type: application/sdp\r\nAuthorization: {header}\r\n"),
+            SDP,
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(setup(&mut s, &track(url), &id(&h), TRANSPORT).await, 200);
+        assert_eq!(l.app.media.count().await, 0);
+    })
+    .catch_unwind()
+    .await;
+    drop(s);
+    l.end().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p);
+    }
+}
+
+// Missing scope checks, lax parsing, or accepting management secrets break this table.
+#[tokio::test]
+async fn publisher_header_credentials_reject_substitutions_and_ambiguity() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let l = Lab::new("standalone").await;
+    let url = l.url.split('?').next().unwrap();
+    let outcome = std::panic::AssertUnwindSafe(async {
+        for bad in ["owned-admin", "owned-peer-key", "wrong"] {
+            let mut s = l.socket().await;
+            let h = STANDARD.encode(format!("publisher:{bad}"));
+            assert_eq!(
+                request(
+                    &mut s,
+                    "ANNOUNCE",
+                    url,
+                    &format!("Content-Type: application/sdp\r\nAuthorization: Basic {h}\r\n"),
+                    SDP
+                )
+                .await
+                .0,
+                401
+            );
+        }
+        for header in [
+            "Basic !invalid",
+            "Basic OnNlY3JldA==",
+            "Bearer owned-publish",
+            "Digest username=\"unterminated",
+        ] {
+            let mut s = l.socket().await;
+            assert_eq!(
+                request(
+                    &mut s,
+                    "ANNOUNCE",
+                    url,
+                    &format!("Content-Type: application/sdp\r\nAuthorization: {header}\r\n"),
+                    SDP
+                )
+                .await
+                .0,
+                401
+            );
+        }
+        let good_basic = STANDARD.encode("publisher:owned-publish");
+        let mut s = l.socket().await;
+        assert_eq!(
+            request(
+                &mut s,
+                "ANNOUNCE",
+                &l.url,
+                &format!("Content-Type: application/sdp\r\nAuthorization: Basic {good_basic}\r\n"),
+                SDP
+            )
+            .await
+            .0,
+            400
+        );
+        for change in 0..9 {
+            let mut s = l.socket().await;
+            let (_, challenge) = announce(&mut s, url, SDP).await;
+            let good = digest_header(&challenge, "ANNOUNCE", url, "owned-publish");
+            let bad = match change {
+                0 => digest_header(&challenge, "RECORD", url, "owned-publish"),
+                1 => digest_header(
+                    &challenge,
+                    "ANNOUNCE",
+                    &format!("{url}/foreign"),
+                    "owned-publish",
+                ),
+                2 => digest_header(&challenge, "ANNOUNCE", url, "owned-admin"),
+                3 => good.replace("FlussoniX publisher", "foreign"),
+                4 => good.replace("algorithm=MD5", "algorithm=SHA-256"),
+                5 => good + ", qop=auth, nc=00000001, cnonce=\"other\"",
+                6 => good + ", username=\"publisher\"",
+                7 => good + ",",
+                _ => good + ", opaque=\"foreign\"",
+            };
+            assert_eq!(
+                request(
+                    &mut s,
+                    "ANNOUNCE",
+                    url,
+                    &format!("Content-Type: application/sdp\r\nAuthorization: {bad}\r\n"),
+                    SDP
+                )
+                .await
+                .0,
+                401,
+                "case {change}"
+            );
+        }
+        assert_eq!(l.app.media.count().await, 0);
+    })
+    .catch_unwind()
+    .await;
+    l.end().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p);
+    }
+}
+
+// Resetting the retry limit or acquiring publisher capacity for a challenge fails.
+#[tokio::test]
+async fn publisher_authentication_challenges_are_bounded_and_cancellable() {
+    let l = Lab::new("standalone").await;
+    let url = l.url.split('?').next().unwrap();
+    let mut s = l.socket().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        for _ in 0..3 {
+            assert_eq!(announce(&mut s, url, SDP).await.0, 401);
+        }
+        let mut b = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), s.read_to_end(&mut b))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(b.is_empty());
+        let mut other = l.socket().await;
+        assert_eq!(announce(&mut other, url, SDP).await.0, 401);
+        l.cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), other.read_to_end(&mut b))
+            .await
+            .unwrap()
+            .unwrap();
+    })
+    .catch_unwind()
+    .await;
+    drop(s);
+    l.end().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p);
+    }
+}
+
+// Reusing the challenged snapshot after a template edit accepts an old password.
+#[tokio::test]
+async fn publisher_header_authentication_inherits_and_rechecks_password_changes() {
+    let l = Lab::new("standalone").await;
+    l.app
+        .config
+        .put(
+            "templates",
+            "owned-template",
+            json!({"inputs":[{"url":"publish://"}],"password":"owned-publish"}),
+        )
+        .unwrap();
+    l.app
+        .config
+        .put(
+            "streams",
+            "owned",
+            json!({"$reset":true,"static":false,"template":"owned-template"}),
+        )
+        .unwrap();
+    let url = l.url.split('?').next().unwrap();
+    let mut s = l.socket().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let (_, challenge) = announce(&mut s, url, SDP).await;
+        let old = digest_header(&challenge, "ANNOUNCE", url, "owned-publish");
+        l.app
+            .config
+            .put(
+                "templates",
+                "owned-template",
+                json!({"password":"changed-publish"}),
+            )
+            .unwrap();
+        assert_eq!(
+            request(
+                &mut s,
+                "ANNOUNCE",
+                url,
+                &format!("Content-Type: application/sdp\r\nAuthorization: {old}\r\n"),
+                SDP
+            )
+            .await
+            .0,
+            401
+        );
+        let current = digest_header(&challenge, "ANNOUNCE", url, "changed-publish");
+        let (code, h) = request(
+            &mut s,
+            "ANNOUNCE",
+            url,
+            &format!("Content-Type: application/sdp\r\nAuthorization: {current}\r\n"),
+            SDP,
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(setup(&mut s, &track(url), &id(&h), TRANSPORT).await, 200);
+    })
+    .catch_unwind()
+    .await;
+    drop(s);
+    l.end().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p);
+    }
+}
+
+#[tokio::test]
+async fn publisher_challenge_retry_does_not_extend_absolute_negotiation_deadline() {
+    let l = Lab::new("standalone").await;
+    let url = l.url.split('?').next().unwrap();
+    let mut s = l.socket().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let started = tokio::time::Instant::now();
+        assert_eq!(announce(&mut s, url, SDP).await.0, 401);
+        tokio::time::sleep(Duration::from_secs(16)).await;
+        assert_eq!(announce(&mut s, url, SDP).await.0, 401);
+        let mut b = Vec::new();
+        tokio::time::timeout(Duration::from_secs(16), s.read_to_end(&mut b))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(33));
+        assert!(b.is_empty());
+        assert_eq!(l.app.media.count().await, 0);
+    })
+    .catch_unwind()
+    .await;
+    drop(s);
+    l.end().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p);
+    }
+}
+
 // Removing ANNOUNCE admission or starting FFmpeg during negotiation breaks these tests.
 #[tokio::test]
 async fn announce_setup_wait_for_record_and_bind_session_tracks_and_transport() {
@@ -239,7 +569,16 @@ async fn publisher_password_is_distinct_from_viewer_admin_and_peer_credentials()
         let mut s = l.socket().await;
         let u = l.url.split('?').next().unwrap().to_string() + qs;
         let (code, _) = announce(&mut s, &u, SDP).await;
-        assert_eq!(code, if qs.contains('&') { 400 } else { 403 });
+        assert_eq!(
+            code,
+            if qs.contains('&') {
+                400
+            } else if qs.contains("password=") {
+                403
+            } else {
+                401
+            }
+        );
         assert_eq!(l.app.media.count().await, 0);
     }
     let mut s = l.socket().await;
@@ -555,6 +894,16 @@ async fn qualify_transport(
     tls: bool,
     udp: bool,
 ) {
+    qualify_authenticated(video, audio, profile, tls, udp, false).await;
+}
+async fn qualify_authenticated(
+    video: Option<&str>,
+    audio: &[&str],
+    profile: serde_json::Value,
+    tls: bool,
+    udp: bool,
+    header_auth: bool,
+) {
     assert!(!(tls && udp));
     let l = if udp {
         Lab::udp(16).await
@@ -601,6 +950,13 @@ async fn qualify_transport(
                 .expect("owned TLS certificate must verify");
             let _ = tokio::io::copy_bidirectional(&mut plain, &mut encrypted).await;
         }));
+    }
+    if header_auth {
+        let mut u = url::Url::parse(&input_url).unwrap();
+        u.set_query(None);
+        u.set_username("publisher").unwrap();
+        u.set_password(Some("owned-publish")).unwrap();
+        input_url = u.to_string();
     }
     let mut child = publisher_transport(video, audio, &input_url, if udp { "udp" } else { "tcp" });
     let outcome = std::panic::AssertUnwindSafe(async {
@@ -726,6 +1082,21 @@ async fn independent_h264_aac_publisher_shared_ts_strictly_decodes() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn independent_digest_publisher_strictly_decodes_tcp_udp_and_verified_tls() {
+    for (tls, udp) in [(false, false), (false, true), (true, false)] {
+        qualify_authenticated(
+            Some("libx264"),
+            &["aac"],
+            json!({"encoder":"copy","acodec":"copy"}),
+            tls,
+            udp,
+            true,
+        )
+        .await;
+    }
+}
 #[tokio::test]
 async fn hevc_h264_and_all_audio_publication_codecs_strictly_decode() {
     for v in ["libx264", "libx265"] {
@@ -827,6 +1198,65 @@ async fn callback(
     cfg["on_publish"] = json!(format!("http://{addr}/publish"));
     app.config.put("streams", "owned", cfg).unwrap();
     (rx, task)
+}
+
+// Valid header passwords never replace callback authorization or disclose secrets.
+#[tokio::test]
+async fn publisher_header_authentication_keeps_callback_policy_and_credentials_private() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    for deny in [true, false] {
+        let l = Lab::new("standalone").await;
+        let (mut rx, task) = callback(&l.app, deny).await;
+        let mut s = l.socket().await;
+        let url = l.url.split('?').next().unwrap().to_owned() + "?token=owned-token";
+        let auth = STANDARD.encode("publisher:owned-publish");
+        let outcome = std::panic::AssertUnwindSafe(async {
+            assert_eq!(
+                request(
+                    &mut s,
+                    "ANNOUNCE",
+                    &url,
+                    &format!("Content-Type: application/sdp\r\nAuthorization: Basic {auth}\r\n"),
+                    SDP
+                )
+                .await
+                .0,
+                if deny { 403 } else { 200 }
+            );
+            let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(first["proto"], "rtsp");
+            assert_eq!(first["token"], "owned-token");
+            assert_eq!(first["qs"], "token=owned-token");
+            assert!(!first.to_string().contains("owned-publish"));
+            assert!(!first.to_string().contains(&auth));
+            assert_eq!(l.app.media.count().await, 0);
+            if !deny {
+                let renewed = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(renewed["session_id"], first["session_id"]);
+                assert_eq!(renewed["request_number"], 1);
+                let mut b = Vec::new();
+                tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut b))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        })
+        .catch_unwind()
+        .await;
+        drop(s);
+        task.abort();
+        let _ = task.await;
+        l.end().await;
+        if let Err(p) = outcome {
+            std::panic::resume_unwind(p);
+        }
+    }
 }
 #[tokio::test]
 async fn callback_denial_and_pending_renewal_never_admit_a_worker() {
