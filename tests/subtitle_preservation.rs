@@ -432,10 +432,11 @@ async fn raw_hls_window_is_bounded_and_replacement_does_not_reuse_sequences_or_f
         .write_all(&input)
         .await
         .unwrap();
-    let read = || async {
+    let engine = &e;
+    let read = |retired_boundary: bool| async move {
         tokio::time::timeout(Duration::from_secs(12), async {
             loop {
-                if let Ok(bytes) = e.read("owned", "index.m3u8").await {
+                if let Ok(bytes) = engine.read("owned", "index.m3u8").await {
                     let list = String::from_utf8(bytes.to_vec()).unwrap();
                     let files: Vec<_> = list
                         .lines()
@@ -448,7 +449,9 @@ async fn raw_hls_window_is_bounded_and_replacement_does_not_reuse_sequences_or_f
                         .unwrap()
                         .parse()
                         .unwrap();
-                    if files.len() == 6 {
+                    if files.len() == 6
+                        && (!retired_boundary || list.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1\n"))
+                    {
                         return (list, files, sequence);
                     }
                 }
@@ -458,7 +461,7 @@ async fn raw_hls_window_is_bounded_and_replacement_does_not_reuse_sequences_or_f
         .await
         .unwrap()
     };
-    let (_, files, sequence) = read().await;
+    let (_, files, sequence) = read(false).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let list = String::from_utf8(e.read("owned", "index.m3u8").await.unwrap().to_vec()).unwrap();
     let last_sequence: u64 = list
@@ -499,19 +502,46 @@ async fn raw_hls_window_is_bounded_and_replacement_does_not_reuse_sequences_or_f
         .await
         .unwrap();
     assert!(old_worker.is_closed());
+    // Hold the 25fps fixture just before fourteen seconds. The first six
+    // finalized segments still include the generation's discontinuity marker.
+    let split = input
+        .chunks_exact(188)
+        .enumerate()
+        .filter(|(_, p)| ((u16::from(p[1] & 31) << 8) | u16::from(p[2])) == 256 && p[1] & 0x40 != 0)
+        .nth(349)
+        .unwrap()
+        .0
+        * 188;
     replacement
         .stdin
         .as_mut()
         .unwrap()
-        .write_all(&input)
+        .write_all(&input[..split])
         .await
         .unwrap();
-    let (list, new_files, next) = read().await;
+    let (initial, _, _) = read(false).await;
+    assert!(
+        initial.contains("#EXT-X-DISCONTINUITY\n"),
+        "initial replacement window: {initial}"
+    );
+    assert!(!initial.contains("#EXT-X-DISCONTINUITY-SEQUENCE:"));
+    replacement
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&input[split..])
+        .await
+        .unwrap();
+    let (list, new_files, next) = read(true).await;
     assert!(
         next >= last_sequence + 6,
         "replacement reused a live sequence"
     );
-    assert!(list.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1\n"));
+    assert!(
+        list.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1\n"),
+        "replacement discontinuity history was not observed: {list}"
+    );
+    assert!(!list.contains("#EXT-X-DISCONTINUITY\n"));
     assert!(new_files.iter().all(|f| !files.contains(f)));
     for file in files {
         assert!(
