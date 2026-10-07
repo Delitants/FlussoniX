@@ -351,7 +351,11 @@ rejects an administrator password. Separate retained DVB subtitles and native
 M4F/M4S text fail the destination before connecting; explicit filtering of native
 US/European text still delivers strictly decoded audio. Disabled and publication-waiting streams retain
 the existing on-demand activation rules. Real sockets exercise cancellation
-during stalled TLS and partial RTSP setup.
+during stalled TLS and partial RTSP setup. A delayed real MPEG-TS publication
+consumes ten seconds before an actual TLS ClientHello; the stalled handshake
+still closes within the single thirteen-second startup window and enters retry
+backoff. An early-metadata case separately preserves the shorter two-second
+connection cap. Both cases verify socket cleanup and no retry after stopping.
 
 Bridge cases cover unchanged path/query/track authority translation, matching
 CSeq, redirects, ambiguous lengths, invalid status, UDP/channel substitutions,

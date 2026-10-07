@@ -907,6 +907,164 @@ async fn stop_during_tls_and_partial_setup_closes_owned_connections_without_retr
 }
 
 #[tokio::test]
+async fn early_metadata_keeps_the_shorter_tls_connection_timeout() {
+    use tokio::io::AsyncReadExt;
+    let dir = labdir();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let engine = owned_engine(dir.path());
+    let worker = engine.ensure("owned", &json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":format!("rtsps://127.0.0.1:{port}/owned"),"connect_timeout":2,"retry_timeout":10}]})).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(6), async {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut first = [0; 5];
+        socket.read_exact(&mut first).await.unwrap();
+        assert_eq!(first[0], 22, "actual TLS ClientHello required");
+        let mut remainder = Vec::new();
+        let closure =
+            tokio::time::timeout(Duration::from_secs(3), socket.read_to_end(&mut remainder)).await;
+        if let Ok(ref closure) = closure {
+            assert!(
+                closure.is_ok()
+                    || closure
+                        .as_ref()
+                        .is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset),
+                "expired setup must close its socket: {closure:?}"
+            );
+        }
+        closure.map(|_| ())
+    })
+    .await;
+    engine.stop_all().await;
+    result
+        .expect("early metadata must reach the receiver")
+        .expect("connection timeout must remain shorter than the startup budget");
+    let stats = worker.stats()["flussonix_pushes"][0].clone();
+    assert_eq!(stats["status"], "stopped");
+    assert_eq!(stats["attempts"], 1);
+    assert_eq!(stats["rtp_bytes"], 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), listener.accept())
+            .await
+            .is_err(),
+        "cancelled destination must not retry"
+    );
+}
+
+#[tokio::test]
+async fn delayed_metadata_cannot_extend_stalled_tls_past_the_startup_deadline() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = labdir();
+    let source = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=700:sample_rate=48000",
+            "-t",
+            "5",
+            "-c:a",
+            "mp2",
+            "-b:a",
+            "192k",
+            "-threads",
+            "1",
+            "-f",
+            "mpegts",
+            "pipe:1",
+        ])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(source.status.success(), "owned MP2 source must encode");
+    assert!(source.stdout.len() > 100_000, "real source media required");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let engine = owned_engine(dir.path());
+    let cfg = json!({"inputs":[{"url":"publish://"}],"flussonix_input_timeout":30,"pushes":[{"url":format!("rtsps://127.0.0.1:{port}/owned"),"connect_timeout":8,"retry_timeout":5}]});
+    let mut publication = engine
+        .publish_guarded("owned", &cfg, std::future::ready(true))
+        .await
+        .unwrap();
+    let worker = publication.worker.clone();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while worker.stats()["flussonix_pushes"][0]["attempts"] != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let started = tokio::time::Instant::now();
+    let mut input = publication.stdin.take().unwrap();
+    let (release, hold) = tokio::sync::oneshot::channel();
+    let writer = tokio::spawn(async move {
+        // Metadata consumes ten seconds of the advertised thirteen-second startup window.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        input.write_all(&source.stdout).await.unwrap();
+        let _ = hold.await;
+        drop(input);
+    });
+    let mut saw_tls = false;
+    let result = tokio::time::timeout_at(started + Duration::from_millis(14_500), async {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut first = [0; 5];
+        socket.read_exact(&mut first).await.unwrap();
+        assert_eq!(
+            first[0], 22,
+            "actual TLS ClientHello required before deadline"
+        );
+        saw_tls = true;
+        eprintln!(
+            "Owned delayed source reached actual TLS after {:?}",
+            started.elapsed()
+        );
+        assert!(started.elapsed() >= Duration::from_secs(10));
+        let mut remainder = Vec::new();
+        let closure = socket.read_to_end(&mut remainder).await;
+        assert!(
+            closure.is_ok()
+                || closure
+                    .as_ref()
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset),
+            "expired setup must close its socket: {closure:?}"
+        );
+        loop {
+            let stats = worker.stats()["flussonix_pushes"][0].clone();
+            if stats["status"] == "retrying" {
+                break stats;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    engine.stop_all().await;
+    let _ = release.send(());
+    writer.await.unwrap();
+    assert!(
+        saw_tls,
+        "the fixture must reach TLS before testing socket expiry"
+    );
+    let stats =
+        result.expect("late metadata must not give the stalled handshake a fresh eight seconds");
+    assert_eq!(
+        stats["attempts"], 1,
+        "retry backoff starts after owned socket closure"
+    );
+    assert_eq!(stats["last_error"], "push_connect_failed");
+    assert_eq!(stats["rtp_bytes"], 0);
+    assert_eq!(worker.stats()["flussonix_pushes"][0]["status"], "stopped");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), listener.accept())
+            .await
+            .is_err(),
+        "cancelled destination must not retry"
+    );
+}
+
+#[tokio::test]
 async fn mixed_encrypted_srt_and_rtsp_deliver_from_one_worker_and_stop_owned_sessions() {
     let dir = labdir();
     let rtsp_path = dir.path().join("rtsp.ts");

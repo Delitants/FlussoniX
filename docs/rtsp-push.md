@@ -55,9 +55,12 @@ remain rejected. Protocol buffers are bounded: 16 KiB headers, 64 unique headers
 requests are capped at 16. Incoming RTCP must use a negotiated RTCP channel.
 
 Each destination retries independently. A stalled destination cannot block
-playback or another destination. First RTP delivery must progress within
-`connect_timeout + 5` seconds, then within ten seconds; RTCP and control traffic
-do not reset this deadline. Cancellation closes the sockets and joins owned
+playback or another destination. Each attempt has one startup window of
+`connect_timeout + 5` seconds covering metadata, DNS/TCP/TLS preparation,
+RTSP setup and first RTP delivery. Connection preparation also retains its
+own `connect_timeout` limit within that remaining window. After delivery starts,
+RTP must progress within ten seconds; RTCP and control traffic do not reset
+this deadline. Cancellation closes the sockets and joins owned
 reader/bridge tasks before retry or configuration replacement. Enabled pushes
 keep configured on-demand streams active; disabled entries create no connection.
 Publication streams still wait for their publisher. Destination edits replace

@@ -192,9 +192,10 @@ impl State {
         cancel: &CancellationToken,
     ) -> &'static str {
         let started = Instant::now();
+        let deadline = started + Duration::from_secs(self.destination.connect_seconds + 5);
         let mut probe = crate::ts_profile::Probe::default();
         let mut initial = Vec::new();
-        let metadata = tokio::select! {biased;_=cancel.cancelled()=>return "push_stopped", result=tokio::time::timeout(Duration::from_secs(self.destination.connect_seconds+5),async {
+        let metadata = tokio::select! {biased;_=cancel.cancelled()=>return "push_stopped", result=tokio::time::timeout_at(tokio::time::Instant::from_std(deadline),async {
             while probe.audio.is_none() {
                 let data=receiver.recv().await.map_err(|_|"push_queue_overflow")?;
                 if initial.len()+data.len()>1048576 {return Err("push_metadata_limit");}
@@ -208,7 +209,6 @@ impl State {
             Ok(Err(error)) => return error,
             Err(_) => return "push_metadata_timeout",
         }
-        let deadline = started + Duration::from_secs(self.destination.connect_seconds + 5);
         let snapshot = tokio::select! {biased;
             _=cancel.cancelled()=>return "push_stopped",
             result=tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
@@ -222,7 +222,13 @@ impl State {
                 }
             })=>match result {Ok(Ok(snapshot))=>snapshot,Ok(Err(error))=>return error,Err(_)=>return "push_metadata_timeout"}
         };
-        let bridge = tokio::select! {biased;_=cancel.cancelled()=>return "push_stopped", result=tokio::time::timeout(Duration::from_secs(self.destination.connect_seconds),bridge::Bridge::prepare(&self.destination))=>match result{Ok(Ok(b))=>b,_=>return "push_connect_failed"}};
+        let connect_deadline =
+            (Instant::now() + Duration::from_secs(self.destination.connect_seconds)).min(deadline);
+        let bridge = tokio::select! {biased;
+            _=cancel.cancelled()=>return "push_stopped",
+            _=tokio::time::sleep_until(tokio::time::Instant::from_std(connect_deadline))=>return "push_connect_failed",
+            result=bridge::Bridge::prepare(&self.destination)=>match result{Ok(b)=>b,Err(_)=>return "push_connect_failed"}
+        };
         let mut readers = tokio::task::JoinSet::new();
         let result = tokio::select! {biased;_=cancel.cancelled()=>Err("push_stopped"),result=self.send(worker,&bridge,started,snapshot,&mut readers)=>result};
         readers.abort_all();
