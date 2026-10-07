@@ -111,7 +111,7 @@ This increment does not qualify Main10, layered HEVC, long-duration A/V synchron
 
 ## MPEG audio playback increment
 
-Native copy sources can now serve MPEG-1/2 Layer II (`m2a`) and Layer III (`mp3`) over RTSP TCP interleaving, opt-in unicast UDP and verified RTSPS TCP. Audio-only sources or one H.264/HEVC video track plus one AAC or MPEG audio track are supported; multiple RTSP audio tracks remain explicitly rejected. This extends playback packetization, not CPU/GPU encoding or non-native native-wire origination.
+Native copy sources can now serve MPEG-1/2 Layer II (`m2a`) and Layer III (`mp3`) over RTSP TCP interleaving, opt-in unicast UDP and verified RTSPS TCP. Audio-only sources or one H.264/HEVC video track with AAC or MPEG audio are supported. The multitrack playback profile below qualifies up to eight supported media tracks. This extends playback packetization, not CPU/GPU encoding or non-native native-wire origination.
 
 MPEG audio uses static payload type 14, `MPA/90000` SDP and no AAC configuration/fmtp. Each RTP payload starts with two zero reserved bytes and a two-byte fragment offset; fragmented frames retain the same presentation timestamp and reconstruct the original encoded frame exactly. The marker identifies a talkspurt start, including a discontinuity beyond one 90 kHz tick, rather than every audio-frame end. RTP presentation timing uses native signed DTS/PTS offsets; existing decode-time pacing, RTCP, queue/bootstrap and generation/revocation rules remain shared. If a keyframe has cleared a track's cached packets, RTP-Info maps that absent track to the current GOP decode time rather than stream startup; available tracks retain their actual first-packet sequence and presentation timestamp. See [RFC 2250 MPEG audio packetization](https://www.rfc-editor.org/rfc/rfc2250.html#section-3.5).
 
@@ -119,7 +119,7 @@ Every access unit must contain exactly one complete header-validated frame whose
 
 Owned encoder fixtures qualify stereo Layer II at 32 kHz/384 kb/s, MPEG-2 MP3 at 22.05 kHz/64 kb/s and fragmented MPEG-1 MP3 at 32 kHz/320 kb/s. Independent FFmpeg clients decode TCP, UDP and verified TLS audio/video, and TCP audio-only streams, after a delayed join into the running source. MP3 uses the encoder's normal bit reservoir. Decoded audio has the expected rate and stereo layout and nonconstant PCM; HEVC video retains all independently checked source picture hashes. MPEG audio track revocation closes plaintext and TLS sessions and releases viewer ownership.
 
-These checks do not qualify every MPEG rate/bitrate/channel mode, MPEG-2.5 RTSP, Layer I, long-duration A/V synchronization, multiple RTSP audio tracks, RTSP publication/push, direct RTP/SRTP, GPU, mixed vendor sessions or production capacity. M4F shares the native-copy hub but is not an additional live MPEG RTSP source qualification here.
+These checks do not qualify every MPEG rate/bitrate/channel mode, MPEG-2.5 RTSP, Layer I, long-duration A/V synchronization, RTSP publication/push, direct RTP/SRTP, GPU, mixed vendor sessions or production capacity. M4F shares the native-copy hub but is not an additional live MPEG RTSP source qualification here.
 
 ## RTSP publishing output increment
 
@@ -145,3 +145,40 @@ keeps the alias when changing transport. See the [bounded compatibility
 profile](compatibility.md#rtsp2-camera-input) and [owned qualification
 fixtures](qualification.md#rtsp2-camera-input-increment). RTSP 2.0, `wait_rtcp`,
 receiving Basic/Digest policy and real-camera dialect parity remain pending.
+
+## Multitrack playback
+
+The shared native packetizer advertises up to eight supported media tracks in
+SDP: one H.264/HEVC video track plus up to seven AAC-LC, MPEG Layer II or MP3
+tracks, or eight audio-only tracks. Track IDs need not be sequential and metadata
+order need not put video first. Each SETUP selects its own track, TCP channels or
+unicast UDP port pair. PLAY reports only negotiated tracks in RTP-Info and emits
+only those tracks. URL-token/on_play authorization, revocation and worker fences
+apply to the entire viewer session.
+
+UDP receiver reports are polled across all negotiated tracks with one fixed
+8193-byte receive buffer, without per-track tasks or encoders. A session-owned
+cursor advances after every received datagram, including foreign, oversized or
+invalid feedback. At most eight sockets are examined per poll. Only the existing
+validated receiver-report/SDES profile from the exact negotiated endpoint can
+renew the session. The peer IP, SSRC checks and grant remain authoritative.
+
+Independent FFmpeg decoding covers HEVC with simultaneous AAC/MP2/MP3 over TCP
+and verified RTSPS, the same mixed profile over UDP, eight distinct MP2 tracks
+over UDP, and HEVC with seven AAC tracks over UDP. Recordings explicitly map
+every retained audio track and check its frame count, sample rate and decoded
+content against that track’s separately
+decoded source. Phase-independent tone energy identifies each audio track
+without requiring bit-exact PCM across decoder histories on late joins.
+The owned M4S source is reused by successive viewers. UDP tests reacquire every port pair after the
+recorder exits. A selected third audio track exercises custom TCP channel mapping,
+RTP-Info filtering, session revocation and viewer ownership release. Actual socket
+regressions first reproduce the two-track feedback limit and invalid-feedback
+starvation, then check endpoint, identity and size rejection.
+
+This qualification uses copy-mode owned M4S inputs and short loopback recordings.
+Automatic language selection, SDP subtitle mappings, every native input/encoding
+combination, scoped IPv6, multicast RTSP, long-duration synchronization, real
+recorder/camera dialect parity and production capacity remain unqualified. RTSPS
+continues to carry encrypted TCP media; UDP playback uses the existing optional
+port pool and per-viewer payload rate configuration.

@@ -499,3 +499,36 @@ file became visible before its number was written, causing an empty-integer
 parse before any authentication request. The independent gateway now publishes
 that readiness file with an atomic rename. The failed run and its diagnostic
 are retained; successful fixture and full push reruns are required before release.
+
+## RTSP multitrack playback qualification
+
+Actual socket regressions send valid receiver reports on each of eight tracks
+and queue invalid reports on seven tracks before a valid report on the eighth.
+Both reproduce the old two-socket receive limit before correction. The rotating
+receiver must service all tracks while preserving source endpoint, media SSRC,
+malformed-report and oversized-datagram checks. No additional receive task is
+created per track.
+
+Owned M4S fixtures retain nonsequential IDs and place audio before video in
+metadata. Independently encoded source tones differ per audio track. FFmpeg
+explicitly maps every output audio stream; strict error-free decoded recordings
+check per-stream frame counts, sample rates and tone-energy signatures against separately
+decoded source tracks, detecting swapped or duplicated audio. A half-second
+mono 48 kHz PCM window must retain at least 80% energy at its expected tone and
+match each reference tone energy within 5 percentage points. Profiles
+cover HEVC/AAC/MP2/MP3 over TCP, UDP and verified RTSPS, eight MP2 tracks over UDP,
+and HEVC with seven AAC tracks over UDP. Denied viewers start neither workers
+nor source requests; allowed sequential viewers reuse one native source pull.
+Every UDP lease is reacquired after recording. A selected third audio track
+checks custom interleaved channels, one-entry RTP-Info, revocation and viewer
+ownership cleanup.
+
+The initial generalized test fixture needed a local array binding to outlive an
+async call; its compiler diagnostic is retained. The source-audio oracle also
+needed FFmpeg’s `mp3` input demuxer for Layer II. A direct late-start decode of
+the same saved AAC source reproduced different PCM hashes without this server,
+so audio identity uses phase-independent tone energy rather than exact PCM
+frame hashes. Failure logs and the owned source experiment are retained. All media fixtures and
+processes are owned; no vendor components or production/demo servers are used.
+Full final-head CI and read-only review gate publication. Short recordings do
+not establish sustained capacity, long-duration sync or all recorder dialects.

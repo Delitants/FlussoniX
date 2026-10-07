@@ -59,6 +59,7 @@ struct Session {
     pacer: Option<udp::Pacer>,
     receiver: Option<Receiver>,
     rtp_info: String,
+    feedback_cursor: usize,
 }
 struct Reply {
     code: u16,
@@ -187,17 +188,19 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
             None => None,
         };
         let next = {
-            let (playback, initial, receiver, playing, pending, senders) = match session.as_mut() {
-                Some(s) => (
-                    Some(&s.playback),
-                    Some(&mut s.initial),
-                    Some(&mut s.receiver),
-                    s.playing,
-                    s.pending.is_some(),
-                    Some(&s.senders),
-                ),
-                None => (None, None, None, false, false, None),
-            };
+            let (playback, initial, receiver, playing, pending, senders, feedback_cursor) =
+                match session.as_mut() {
+                    Some(s) => (
+                        Some(&s.playback),
+                        Some(&mut s.initial),
+                        Some(&mut s.receiver),
+                        s.playing,
+                        s.pending.is_some(),
+                        Some(&s.senders),
+                        Some(&mut s.feedback_cursor),
+                    ),
+                    None => (None, None, None, false, false, None, None),
+                };
             let grant = async {
                 if let Some(p) = playback {
                     p.grant.cancelled().await
@@ -232,8 +235,8 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
                 std::future::pending().await
             };
             let feedback = async {
-                if let Some(senders) = senders {
-                    receive_reports(senders).await
+                if let Some((senders, cursor)) = senders.zip(feedback_cursor) {
+                    receive_reports(senders, cursor).await
                 } else {
                     std::future::pending().await
                 }
@@ -371,27 +374,41 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
     }
     Ok(())
 }
-async fn receive_reports(senders: &HashMap<u32, Sender>) -> bool {
-    async fn receive(lease: &udp::Lease, ssrc: u32) -> bool {
-        let mut buffer = [0; 8193];
-        match lease.recv_rtcp(&mut buffer).await {
-            Ok(Some(n)) => udp::valid_receiver_report(&buffer[..n], ssrc),
-            _ => false,
+async fn receive_reports(senders: &HashMap<u32, Sender>, cursor: &mut usize) -> bool {
+    // SDP admits at most eight tracks. Register every socket with the same
+    // connection waker, using one fixed receive buffer and no per-track tasks.
+    let mut tracks = [None; 8];
+    let mut count = 0;
+    for sender in senders.values() {
+        if matches!(sender.delivery, Delivery::Udp { .. }) {
+            tracks[count] = Some(sender);
+            count += 1;
         }
     }
-    let mut tracks = senders
-        .values()
-        .filter_map(|sender| match &sender.delivery {
-            Delivery::Udp { lease, .. } => Some((lease, sender.ssrc)),
-            _ => None,
-        });
-    match (tracks.next(), tracks.next()) {
-        (Some((a, id)), Some((b, other))) => {
-            tokio::select! {result=receive(a,id)=>result,result=receive(b,other)=>result}
-        }
-        (Some((a, id)), None) => receive(a, id).await,
-        _ => std::future::pending().await,
+    if count == 0 {
+        return std::future::pending().await;
     }
+    let mut buffer = [0; 8193];
+    std::future::poll_fn(|cx| {
+        let start = *cursor % count;
+        for offset in 0..count {
+            let index = (start + offset) % count;
+            let sender = tracks[index].unwrap();
+            let Delivery::Udp { lease, .. } = &sender.delivery else {
+                unreachable!()
+            };
+            if let std::task::Poll::Ready(result) = lease.poll_recv_rtcp(cx, &mut buffer) {
+                // Invalid or foreign traffic consumes this track's turn too.
+                *cursor = (index + 1) % count;
+                return std::task::Poll::Ready(match result {
+                    Ok(Some(n)) => udp::valid_receiver_report(&buffer[..n], sender.ssrc),
+                    _ => false,
+                });
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
 }
 async fn deliver<W: tokio::io::AsyncWrite + Unpin>(
     sender: &Sender,
@@ -568,6 +585,7 @@ async fn handle(
             pacer: None,
             receiver: None,
             rtp_info: String::new(),
+            feedback_cursor: 0,
         });
         let mut reply = Reply::code(200);
         reply.headers = vec![
@@ -863,3 +881,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod playback_feedback_tests;

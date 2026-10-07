@@ -247,3 +247,13 @@ production-scale migration qualification remain separate gaps.
 ## Outbound unicast UDP RTSP push
 
 The native `pushes` RTSP profile accepts `rtsp_transport: "udp"`; TCP remains the default and RTSPS rejects plaintext UDP. Per-track owned sockets bind the control peer and negotiated server ports, pace shared native RTP, and carry bounded RTCP. Invalid negotiation closes before RECORD; retries/cancellation release the pairs. Streams/Templates expose a normal transport selector with inheritance. See [UDP push contract and qualification limits](rtsp-push.md#unicast-udp-push). This supersedes older UDP push exclusions only for this bounded unicast profile.
+
+## RTSP multitrack playback
+
+RTSP TCP, opt-in unicast UDP and verified RTSPS TCP share an eight-media-track
+packetizer. The qualified copy-mode native profile includes HEVC plus mixed
+AAC/MP2/MP3, eight MP2 audio tracks, and HEVC plus seven AAC tracks. Selected
+SETUP tracks retain their IDs, negotiated transport and existing viewer policy.
+UDP feedback from each track receives bounded round-robin service; invalid or
+foreign traffic does not renew authorization or suppress another track's turn.
+See [playback profile, evidence and limits](rtsp-rtp-support.md#multitrack-playback).

@@ -235,6 +235,27 @@ impl Lease {
             Err(e) => Err(e),
         }
     }
+    pub(crate) fn poll_recv_rtcp(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        body: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<Option<usize>>> {
+        let mut buffer = tokio::io::ReadBuf::new(body);
+        match self
+            .active
+            .as_ref()
+            .unwrap()
+            .rtcp
+            .poll_recv_from(cx, &mut buffer)
+        {
+            std::task::Poll::Ready(Ok(source)) => {
+                let n = buffer.filled().len();
+                std::task::Poll::Ready(Ok((source == self.peer_rtcp && n <= 8192).then_some(n)))
+            }
+            std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(error)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
     pub async fn recv_rtcp(&self, body: &mut [u8]) -> std::io::Result<Option<usize>> {
         let (n, source) = self.active.as_ref().unwrap().rtcp.recv_from(body).await?;
         Ok((source == self.peer_rtcp && n <= 8192).then_some(n))

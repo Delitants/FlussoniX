@@ -38,8 +38,19 @@ struct Lab {
     hits: Arc<AtomicUsize>,
     expected: HashSet<String>,
     audio: bool,
+    pool: Option<Arc<rtsp::udp::Pool>>,
+    audio_expected: std::collections::HashMap<u32, Vec<f64>>,
 }
 async fn fixture_profile(transport: &str, video: bool, audio: &str) -> Lab {
+    let selected = [audio];
+    fixture_tracks(
+        transport,
+        video,
+        if audio == "none" { &[] } else { &selected },
+    )
+    .await
+}
+async fn fixture_tracks(transport: &str, video: bool, audios: &[&str]) -> Lab {
     let dir = tempfile::tempdir().unwrap();
     let cert = tls_fixture::Certificates::new();
     let mut tracks = vec![Track {
@@ -95,124 +106,130 @@ async fn fixture_profile(transport: &str, video: bool, audio: &str) -> Lab {
         frames.clear();
         HashSet::new()
     };
-    if audio == "aac" {
-        // Independently encode a continuous AAC source, then retain its ADTS payloads.
-        let encoded = tokio::process::Command::new("ffmpeg")
-            .args([
+    let mut audio_expected = std::collections::HashMap::new();
+    for (index, audio) in audios.iter().copied().enumerate() {
+        let id = 88 + index as u32 * 19;
+        let tone = format!("sine=frequency={}:sample_rate=48000", 880 + index * 137);
+        if audio == "aac" {
+            // Independently encode a continuous AAC source, then retain its ADTS payloads.
+            let encoded = tokio::process::Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &tone, "-t", "20", "-c:a", "aac", "-f",
+                    "adts", "pipe:1",
+                ])
+                .output()
+                .await
+                .unwrap();
+            assert!(encoded.status.success());
+            if audios.len() > 1 {
+                audio_expected.insert(
+                    id,
+                    audio_oracle(dir.path(), id, "aac", &encoded.stdout).await,
+                );
+            }
+            tracks.push(Track {
+                id,
+                codec: "aac".into(),
+                config: vec![0x11, 0x88],
+            });
+            let mut at = 0;
+            let mut n = 0;
+            while at < encoded.stdout.len() {
+                let h = &encoded.stdout[at..];
+                let size = (usize::from(h[3] & 3) << 11)
+                    | (usize::from(h[4]) << 3)
+                    | usize::from(h[5] >> 5);
+                frames.push(Frame {
+                    track_id: id,
+                    dts: 90000 + n * 1920,
+                    pts_offset: 0,
+                    key: true,
+                    body: h[7..size].to_vec(),
+                });
+                at += size;
+                n += 1;
+            }
+        } else if audio != "none" {
+            let (codec, encoder, rate, kbps) = match audio {
+                "m2a" => ("m2a", "mp2", 32000u64, 384u64),
+                "mp3" => ("mp3", "libmp3lame", 22050, 64),
+                "mp3-mpeg1" => ("mp3", "libmp3lame", 32000, 320),
+                _ => panic!("unknown owned audio profile"),
+            };
+            let mut cmd = tokio::process::Command::new("ffmpeg");
+            cmd.args([
                 "-v",
                 "error",
                 "-f",
                 "lavfi",
                 "-i",
-                "sine=frequency=880:sample_rate=48000",
+                &tone,
                 "-t",
                 "20",
                 "-c:a",
-                "aac",
+                encoder,
+                "-ar",
+                &rate.to_string(),
+                "-ac",
+                "2",
+                "-b:a",
+                &format!("{kbps}k"),
                 "-f",
-                "adts",
-                "pipe:1",
-            ])
-            .output()
-            .await
-            .unwrap();
-        assert!(encoded.status.success());
-        tracks.push(Track {
-            id: 88,
-            codec: "aac".into(),
-            config: vec![0x11, 0x88],
-        });
-        let mut at = 0;
-        let mut n = 0;
-        while at < encoded.stdout.len() {
-            let h = &encoded.stdout[at..];
-            let size =
-                (usize::from(h[3] & 3) << 11) | (usize::from(h[4]) << 3) | usize::from(h[5] >> 5);
-            frames.push(Frame {
-                track_id: 88,
-                dts: 90000 + n * 1920,
-                pts_offset: 0,
-                key: true,
-                body: h[7..size].to_vec(),
-            });
-            at += size;
-            n += 1;
-        }
-        tracks.reverse(); // Audio metadata precedes video; IDs are nonsequential.
-    } else if audio != "none" {
-        let (codec, encoder, rate, kbps) = match audio {
-            "m2a" => ("m2a", "mp2", 32000u64, 384u64),
-            "mp3" => ("mp3", "libmp3lame", 22050, 64),
-            "mp3-mpeg1" => ("mp3", "libmp3lame", 32000, 320),
-            _ => panic!("unknown owned audio profile"),
-        };
-        let mut cmd = tokio::process::Command::new("ffmpeg");
-        cmd.args([
-            "-v",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=880:sample_rate=48000",
-            "-t",
-            "20",
-            "-c:a",
-            encoder,
-            "-ar",
-            &rate.to_string(),
-            "-ac",
-            "2",
-            "-b:a",
-            &format!("{kbps}k"),
-            "-f",
-            if codec == "m2a" { "mp2" } else { "mp3" },
-        ]);
-        if codec == "mp3" {
-            cmd.args([
-                "-write_xing",
-                "0",
-                "-id3v2_version",
-                "0",
-                "-write_id3v1",
-                "0",
+                if codec == "m2a" { "mp2" } else { "mp3" },
             ]);
-        }
-        cmd.arg("pipe:1");
-        let encoded = cmd.output().await.unwrap();
-        assert!(
-            encoded.status.success(),
-            "{}",
-            String::from_utf8_lossy(&encoded.stderr)
-        );
-        tracks.push(Track {
-            id: 88,
-            codec: codec.into(),
-            config: vec![],
-        });
-        let mut at = 0;
-        let mut n = 0u64;
-        while at < encoded.stdout.len() {
-            let h = &encoded.stdout[at..];
-            assert_eq!(h[0], 255);
-            let version = (h[1] >> 3) & 3;
-            let samples = if codec == "mp3" && version != 3 {
-                576
-            } else {
-                1152
-            };
-            let size = (samples / 8 * kbps * 1000 / rate + u64::from((h[2] >> 1) & 1)) as usize;
-            frames.push(Frame {
-                track_id: 88,
-                dts: 90000 + n * samples * 90000 / rate,
-                pts_offset: 0,
-                key: true,
-                body: h[..size].to_vec(),
+            if codec == "mp3" {
+                cmd.args([
+                    "-write_xing",
+                    "0",
+                    "-id3v2_version",
+                    "0",
+                    "-write_id3v1",
+                    "0",
+                ]);
+            }
+            cmd.arg("pipe:1");
+            let encoded = cmd.output().await.unwrap();
+            assert!(
+                encoded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&encoded.stderr)
+            );
+            if audios.len() > 1 {
+                audio_expected.insert(
+                    id,
+                    audio_oracle(dir.path(), id, "mp3", &encoded.stdout).await,
+                );
+            }
+            tracks.push(Track {
+                id,
+                codec: codec.into(),
+                config: vec![],
             });
-            at += size;
-            n += 1;
+            let mut at = 0;
+            let mut n = 0u64;
+            while at < encoded.stdout.len() {
+                let h = &encoded.stdout[at..];
+                assert_eq!(h[0], 255);
+                let version = (h[1] >> 3) & 3;
+                let samples = if codec == "mp3" && version != 3 {
+                    576
+                } else {
+                    1152
+                };
+                let size = (samples / 8 * kbps * 1000 / rate + u64::from((h[2] >> 1) & 1)) as usize;
+                frames.push(Frame {
+                    track_id: id,
+                    dts: 90000 + n * samples * 90000 / rate,
+                    pts_offset: 0,
+                    key: true,
+                    body: h[..size].to_vec(),
+                });
+                at += size;
+                n += 1;
+            }
         }
-        tracks.reverse();
     }
+    tracks.reverse(); // Nonsequential audio IDs precede video metadata.
     frames.sort_by_key(|f| f.dts);
     let cancel = CancellationToken::new();
     let stop = cancel.clone();
@@ -262,7 +279,8 @@ async fn fixture_profile(transport: &str, video: bool, audio: &str) -> Lab {
     let pool = if transport == "udp" {
         let mut pool = None;
         for _ in 0..8 {
-            let (range, held) = udp_fixture::reserved(4);
+            let (range, held) =
+                udp_fixture::reserved(2 * (audios.len() + usize::from(video)) as u16);
             drop(held);
             match rtsp::udp::Pool::bind("127.0.0.1".parse().unwrap(), range).await {
                 Ok(p) => {
@@ -281,11 +299,12 @@ async fn fixture_profile(transport: &str, video: bool, audio: &str) -> Lab {
     let c = cancel.clone();
     let tls = cert.server();
     let tls_mode = transport == "tls";
+    let served_pool = pool.clone();
     let task = AbortOnDropHandle::new(tokio::spawn(async move {
         if tls_mode {
             rtsp::serve_tls(listener, a, c, tls).await.unwrap()
         } else {
-            rtsp::serve_with_udp(listener, a, c, pool, 100.0)
+            rtsp::serve_with_udp(listener, a, c, served_pool, 100.0)
                 .await
                 .unwrap()
         }
@@ -299,9 +318,89 @@ async fn fixture_profile(transport: &str, video: bool, audio: &str) -> Lab {
         tasks: vec![source_task, task],
         hits,
         expected,
-        audio: audio != "none",
+        audio: !audios.is_empty(),
+        pool,
+        audio_expected,
     }
 }
+async fn audio_oracle(dir: &std::path::Path, id: u32, format: &str, bytes: &[u8]) -> Vec<f64> {
+    let file = dir.join(format!("audio-{id}.{format}"));
+    std::fs::write(&file, bytes).unwrap();
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-f", format, "-i"])
+            .arg(&file)
+            .args([
+                "-t",
+                "2",
+                "-threads",
+                "1",
+                "-ac",
+                "1",
+                "-ar",
+                "48000",
+                "-c:a",
+                "pcm_s16le",
+                "-f",
+                "s16le",
+                "-",
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        output.status.success() && output.stderr.is_empty(),
+        "independent source audio decode {id}/{format}: {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let signature = tone_signature(&output.stdout);
+    let index = ((id - 88) / 19) as usize;
+    assert!(signature[index] > 0.8, "source tone {id}: {signature:?}");
+    for (other, energy) in signature.iter().enumerate() {
+        if other != index {
+            assert!(*energy < 0.02, "source tone identity {id}: {signature:?}");
+        }
+    }
+    signature
+}
+// Project a half-second window of mono 48 kHz PCM onto the fixture's distinct
+// source frequencies. Phase-independent energy tolerates late-join decoder
+// history, while rejecting silence, duplicated tracks and swapped native IDs.
+fn tone_signature(bytes: &[u8]) -> Vec<f64> {
+    assert_eq!(bytes.len() % 2, 0);
+    let samples: Vec<f64> = bytes
+        .chunks_exact(2)
+        .map(|sample| f64::from(i16::from_le_bytes([sample[0], sample[1]])))
+        .skip(4096)
+        .take(24000)
+        .collect();
+    assert_eq!(samples.len(), 24000, "decoded tone window");
+    let power: f64 = samples.iter().map(|sample| sample * sample).sum();
+    assert!(power > 1.0, "decoded tone is silent");
+    (0..8)
+        .map(|index| {
+            let step = std::f64::consts::TAU * (880 + index * 137) as f64 / 48000.0;
+            let (real, imaginary) =
+                samples
+                    .iter()
+                    .enumerate()
+                    .fold((0.0, 0.0), |(real, imaginary), (n, sample)| {
+                        let phase = n as f64 * step;
+                        (
+                            real + sample * phase.cos(),
+                            imaginary + sample * phase.sin(),
+                        )
+                    });
+            2.0 * (real * real + imaginary * imaginary) / (samples.len() as f64 * power)
+        })
+        .collect()
+}
+
 fn hashes(data: &[u8], id: usize) -> HashSet<String> {
     String::from_utf8_lossy(data)
         .lines()
@@ -625,4 +724,321 @@ async fn mpeg_layer_two_and_three_audio_only_playback_decode_original_audio() {
 #[tokio::test]
 async fn mpeg_one_layer_three_large_frames_decode_after_rtp_fragmentation() {
     playback_profile("tcp", true, "mp3-mpeg1").await
+}
+
+async fn multitrack_playback(transport: &str, video: bool, audios: &[&str]) {
+    use futures_util::FutureExt;
+    let lab = fixture_tracks(transport, video, audios).await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let mut socket = connect(&lab).await;
+        assert_eq!(request(&mut socket, "DESCRIBE", &lab.url, "").await.0, 403);
+        assert_eq!(lab.app.media.count().await, 0);
+        assert_eq!(lab.hits.load(Ordering::SeqCst), 0);
+        let protected = format!("{}?token=owned-viewer", lab.url);
+        let (status, _, sdp) = request(&mut socket, "DESCRIBE", &protected, "").await;
+        assert_eq!(status, 200);
+        let sdp = String::from_utf8(sdp).unwrap();
+        assert_eq!(
+            sdp.lines()
+                .filter(|line| line.starts_with("m=audio "))
+                .count(),
+            audios.len()
+        );
+        assert_eq!(
+            sdp.lines()
+                .filter(|line| line.starts_with("a=control:trackID="))
+                .count(),
+            audios.len() + usize::from(video)
+        );
+        // A second receiver joins the same worker after the native source is running.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(socket);
+        let bridge = if transport == "tls" {
+            Some(
+                flussonix::tls_input::Bridge::start(&protected, Some(&lab.cert.ca))
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let decode_url = bridge.as_ref().map(|b| b.local_url()).unwrap_or(&protected);
+        let mut command = tokio::process::Command::new("ffmpeg");
+        command.args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-rtsp_transport",
+            if transport == "udp" { "udp" } else { "tcp" },
+            "-i",
+            decode_url,
+            "-t",
+            "2",
+        ]);
+        if video {
+            command.args(["-map", "0:v:0"]);
+        }
+        command
+            .args(["-map", "0:a", "-threads", "1", "-f", "framemd5", "-"])
+            .kill_on_drop(true);
+        for index in 0..audios.len() {
+            command
+                .args([
+                    "-map",
+                    &format!("0:a:{index}"),
+                    "-t",
+                    "2",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "48000",
+                    "-c:a",
+                    "pcm_s16le",
+                    "-f",
+                    "s16le",
+                ])
+                .arg(lab._dir.path().join(format!("delivered-{index}.pcm")));
+        }
+        let output = tokio::time::timeout(Duration::from_secs(25), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success() && output.stderr.is_empty(),
+            "strict multitrack decode: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        if video {
+            assert_eq!(hashes(&output.stdout, 0), lab.expected);
+        }
+        let mut seen = HashSet::new();
+        // SDP reverses the nonsequential native track order, so map each retained
+        // audio stream in that same order and verify it has its own decoded content.
+        for (index, codec) in audios.iter().rev().enumerate() {
+            let stream = index + usize::from(video);
+            let prefix = format!("{stream},");
+            assert!(
+                text.lines()
+                    .filter(|line| line.starts_with(&prefix))
+                    .count()
+                    >= 40,
+                "missing decoded audio stream {stream}"
+            );
+            let rate = match *codec {
+                "aac" => 48000,
+                "mp3" => 22050,
+                _ => 32000,
+            };
+            assert!(
+                text.lines()
+                    .any(|line| line.starts_with(&format!("#sample_rate {stream}:"))
+                        && line.trim_end().ends_with(&rate.to_string())),
+                "sample rate for stream {stream}"
+            );
+            let content = hashes(&output.stdout, stream);
+            assert!(content.len() >= 10, "nonconstant audio for stream {stream}");
+            let id = 88 + (audios.len() - 1 - index) as u32 * 19;
+            let samples =
+                std::fs::read(lab._dir.path().join(format!("delivered-{index}.pcm"))).unwrap();
+            let signature = tone_signature(&samples);
+            let source = &lab.audio_expected[&id];
+            let identity = ((id - 88) / 19) as usize;
+            assert!(
+                signature[identity] > 0.8,
+                "decoded native audio track {id}: {signature:?}"
+            );
+            for (tone, (actual, expected)) in signature.iter().zip(source).enumerate() {
+                assert!(
+                    (actual - expected).abs() < 0.05,
+                    "track {id}, tone {tone}: {signature:?} vs {source:?}"
+                );
+            }
+            let signature = content.iter().min().unwrap().clone();
+            assert!(seen.insert(signature), "audio streams were duplicated");
+        }
+        assert_eq!(lab.app.media.count().await, 1);
+        assert_eq!(
+            lab.hits.load(Ordering::SeqCst),
+            1,
+            "receivers must share one native source pull"
+        );
+        if let Some(bridge) = bridge {
+            bridge.close().await;
+        }
+        let worker = lab
+            .app
+            .media
+            .ensure("owned", &lab.app.config.effective("owned").unwrap())
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if worker.viewers.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            worker.viewers.load(Ordering::Relaxed),
+            0,
+            "playback ownership must be released"
+        );
+        if let Some(pool) = &lab.pool {
+            // Every playback track must return its lease after the independent
+            // recorder closes; prove all eight pairs can be leased again.
+            let (range, held) = udp_fixture::reserved(2);
+            let _ = range;
+            let ports = rtsp::protocol::ClientPorts {
+                rtp: held[0].local_addr().unwrap().port(),
+                rtcp: held[1].local_addr().unwrap().port(),
+            };
+            let mut leases = Vec::new();
+            for _ in 0..audios.len() + usize::from(video) {
+                leases.push(
+                    pool.lease("127.0.0.1".parse().unwrap(), ports)
+                        .await
+                        .unwrap(),
+                );
+            }
+            assert_eq!(
+                pool.lease("127.0.0.1".parse().unwrap(), ports)
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    })
+    .catch_unwind()
+    .await;
+    lab.stop().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+#[tokio::test]
+async fn multitrack_aac_mpeg_tcp_playback_preserves_distinct_audio_and_hevc() {
+    multitrack_playback("tcp", true, &["aac", "m2a", "mp3"]).await;
+}
+#[tokio::test]
+async fn multitrack_aac_mpeg_verified_tls_playback_preserves_distinct_audio_and_hevc() {
+    multitrack_playback("tls", true, &["aac", "m2a", "mp3"]).await;
+}
+#[tokio::test]
+async fn multitrack_eight_mpeg_audio_udp_playback_decodes_and_reclaims_every_pair() {
+    multitrack_playback("udp", false, &["m2a"; 8]).await;
+}
+
+#[tokio::test]
+async fn multitrack_seven_aac_udp_playback_keeps_dynamic_payloads_distinct() {
+    multitrack_playback("udp", true, &["aac"; 7]).await;
+}
+
+#[tokio::test]
+async fn multitrack_later_audio_selection_and_revocation_preserve_session_ownership() {
+    use futures_util::FutureExt;
+    let lab = fixture_tracks("tcp", true, &["aac", "m2a", "mp3"]).await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let mut socket = connect(&lab).await;
+        let protected = format!("{}?token=owned-viewer", lab.url);
+        let (status, _, body) = request(&mut socket, "DESCRIBE", &protected, "").await;
+        assert_eq!(status, 200);
+        let sdp = String::from_utf8(body).unwrap();
+        let audio = sdp
+            .split("m=")
+            .find(|section| section.contains("a=control:trackID=88\r\n"))
+            .unwrap();
+        let payload: u8 = audio
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .last()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (status, headers, _) = request(
+            &mut socket,
+            "SETUP",
+            &format!("{}/trackID=88", lab.url),
+            "Transport: RTP/AVP/TCP;unicast;interleaved=12-13\r\n",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let session = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("Session: "))
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let (status, headers, _) = request(
+            &mut socket,
+            "PLAY",
+            &lab.url,
+            &format!("Session: {session}\r\n"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let info = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("RTP-Info: "))
+            .unwrap();
+        assert!(
+            info.contains("trackID=88;") && !info.contains(',') && !info.contains("trackID=205")
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut received = 0;
+            while received < 12 {
+                let mut header = [0; 4];
+                socket.read_exact(&mut header).await.unwrap();
+                assert_eq!(header[0], b'$');
+                assert!(
+                    [12, 13].contains(&header[1]),
+                    "unselected track emitted media"
+                );
+                let mut body = vec![0; u16::from_be_bytes([header[2], header[3]]) as usize];
+                socket.read_exact(&mut body).await.unwrap();
+                if header[1] == 12 {
+                    assert!(body.len() >= 12 && body[0] >> 6 == 2);
+                    assert_eq!(body[1] & 127, payload, "selected third audio mapping");
+                    received += 1;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let worker = lab
+            .app
+            .media
+            .ensure("owned", &lab.app.config.effective("owned").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(worker.viewers.load(Ordering::Relaxed), 1);
+        let id = lab.app.playback_auth.snapshots()[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(lab.app.playback_auth.revoke(&id));
+        let mut rest = vec![];
+        tokio::time::timeout(Duration::from_secs(2), socket.read_to_end(&mut rest))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(worker.viewers.load(Ordering::Relaxed), 0);
+        assert_eq!(lab.app.media.count().await, 1);
+        assert_eq!(lab.hits.load(Ordering::SeqCst), 1);
+    })
+    .catch_unwind()
+    .await;
+    lab.stop().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn multitrack_mixed_aac_mpeg_udp_playback_preserves_distinct_audio_and_hevc() {
+    multitrack_playback("udp", true, &["aac", "m2a", "mp3"]).await;
 }
