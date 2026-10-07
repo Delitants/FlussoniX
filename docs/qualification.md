@@ -673,3 +673,26 @@ compatibility, so qop is not enforced and MD5 is not upgraded. SHA/session
 algorithms, auth-int, viewer Basic/Digest, arbitrary vendor clients and sustained
 capacity remain unqualified. No vendor build/runtime dependency is introduced.
 See [contract and limits](rtsp-publication.md#incoming-publisher-basic-and-digest-authentication).
+
+## Native cluster pressure ranking
+
+HTTP and RTSP/RTSPS share maximum normalized uplink/CPU/RAM pressure rather
+than a weighted average. The fixed strict90/90/95percent ceilings remain;
+ready streams receive preference only within0.05 of the best pressure, with
+stable hostname ties. HTTP now uses actual `reserved_mbps` plus the existing
+2Mbps viewer estimate divided by each node's own uplink capacity. Both paths
+reject malformed/negative telemetry and checked count/age overflow.
+
+Six selection regressions cover bottlenecks, readiness, ordering and hard
+limits. Owned authenticated HTTP/RTSP routing fixtures choose a balanced node
+under CPU/RAM or pending-egress pressure, preserving viewer credentials and
+using the real CDN admission ledger. Twelve invalid/incomplete HTTP telemetry
+cases fail without reservations or workers. The existing RTSP cluster suite
+also checks independent decoded private-source playback, verified TLS,
+admission refusal/retry, concurrent LBs, cache invalidation and ticket binding.
+
+These are bounded functional fixtures. Production placement quality, sustained
+capacity, codec/LAN cost reservation, fairness across equivalent nodes and exact
+Flussonic mode parity remain unqualified. No official component is used for
+building, testing or running this native profile. See
+[policy and limits](native-cluster-pressure.md).

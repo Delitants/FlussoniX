@@ -231,30 +231,14 @@ impl App {
             {
                 return None;
             }
-            let capacity = n["uplink_mbps"]
-                .as_f64()
-                .filter(|v| v.is_finite() && *v > 0.0)?;
-            let metric = |key: &str| {
-                n[key]
-                    .as_f64()
-                    .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-            };
-            let reserved = n["reserved_mbps"]
-                .as_f64()
-                .filter(|v| v.is_finite() && *v >= 0.0)?;
-            let load = NodeLoad {
-                name: peer["hostname"].as_str()?.into(),
-                uplink: metric("uplink")? + (reserved + 2.0) / capacity,
-                cpu: metric("cpu")?,
-                ram: metric("ram")?,
-                ready: snapshot.ready.contains(&viewer.name),
-                drain: n["drain"].as_bool().unwrap_or(true) || peer["drain"] == true,
-                age_ms: n["age_ms"]
-                    .as_u64()?
-                    .checked_add(snapshot.when.elapsed().as_millis().try_into().ok()?)?,
-                active: n["active"].as_u64()?.checked_add(n["reserved"].as_u64()?)?,
-                limit: n["limit"].as_u64()?,
-            };
+            let load = NodeLoad::from_telemetry(
+                peer["hostname"].as_str()?,
+                n,
+                snapshot.ready.contains(&viewer.name),
+                peer["drain"] == true,
+                snapshot.when.elapsed().as_millis().try_into().ok()?,
+                2.0,
+            )?;
             Some((load, peer, target, encrypted))
         });
         let mut calls = futures_util::stream::iter(calls).buffer_unordered(8);

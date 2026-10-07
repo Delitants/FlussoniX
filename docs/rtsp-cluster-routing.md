@@ -61,7 +61,9 @@ at most once. Pending configuration changes and revocation block stale replies.
 
 Selection excludes draining nodes, observations older than ten seconds, full
 session capacity, projected uplink at or above 90%, CPU at or above 90%, and RAM
-at or above 95%. It uses the existing weighted score and locality preference.
+at or above 95%. The shared [native pressure policy](native-cluster-pressure.md)
+ranks by the busiest normalized uplink/CPU/RAM resource, with ready preference
+only within0.05 of the lowest pressure and stable hostname ties.
 Capacity counters retain existing authorization-session identities and reconnect
 grace; they are not a separate raw-socket quota. Requests sharing configured
 session keys can share an identity. Each request reserves an estimated 2 Mbit/s

@@ -11,25 +11,86 @@ pub struct NodeLoad {
     pub active: u64,
     pub limit: u64,
 }
-pub fn select(nodes: &[NodeLoad], expected_uplink: f64) -> Option<String> {
-    nodes
-        .iter()
-        .filter(|n| {
-            n.age_ms <= 10000
-                && !n.drain
-                && n.active < n.limit
-                && n.uplink.is_finite()
-                && n.cpu.is_finite()
-                && n.ram.is_finite()
-                && n.uplink + expected_uplink < 0.9
-                && n.cpu < 0.9
-                && n.ram < 0.95
+impl NodeLoad {
+    /// Native telemetry is advisory. Include pending egress and this viewer's cost;
+    /// the selected CDN still owns the final admission reservation.
+    pub fn from_telemetry(
+        name: &str,
+        node: &serde_json::Value,
+        ready: bool,
+        peer_drain: bool,
+        elapsed_ms: u64,
+        expected_mbps: f64,
+    ) -> Option<Self> {
+        if !matches!(node["role"].as_str(), Some("cdn" | "standalone"))
+            || !expected_mbps.is_finite()
+            || expected_mbps < 0.0
+        {
+            return None;
+        }
+        let capacity = node["uplink_mbps"]
+            .as_f64()
+            .filter(|v| v.is_finite() && *v > 0.0)?;
+        let metric = |key: &str| {
+            node[key]
+                .as_f64()
+                .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        };
+        let reserved = node["reserved_mbps"]
+            .as_f64()
+            .filter(|v| v.is_finite() && *v >= 0.0)?;
+        Some(Self {
+            name: name.into(),
+            uplink: metric("uplink")? + (reserved + expected_mbps) / capacity,
+            cpu: metric("cpu")?,
+            ram: metric("ram")?,
+            ready,
+            drain: node["drain"].as_bool().unwrap_or(true) || peer_drain,
+            age_ms: node["age_ms"].as_u64()?.checked_add(elapsed_ms)?,
+            active: node["active"]
+                .as_u64()?
+                .checked_add(node["reserved"].as_u64()?)?,
+            limit: node["limit"].as_u64()?,
         })
-        .min_by(|a, b| score(a, expected_uplink).total_cmp(&score(b, expected_uplink)))
+    }
+}
+
+pub fn select(nodes: &[NodeLoad], expected_uplink: f64) -> Option<String> {
+    if !expected_uplink.is_finite() || expected_uplink < 0.0 {
+        return None;
+    }
+    let eligible = nodes.iter().filter(|n| {
+        n.age_ms <= 10000
+            && !n.drain
+            && n.active < n.limit
+            && n.uplink.is_finite()
+            && n.uplink >= 0.0
+            && n.cpu.is_finite()
+            && n.cpu >= 0.0
+            && n.ram.is_finite()
+            && n.ram >= 0.0
+            && n.uplink + expected_uplink < 0.9
+            && n.cpu < 0.9
+            && n.ram < 0.95
+    });
+    let best = eligible
+        .clone()
+        .map(|n| pressure(n, expected_uplink))
+        .min_by(f64::total_cmp)?;
+    eligible
+        .filter(|n| pressure(n, expected_uplink) <= best + 0.05)
+        .min_by(|a, b| {
+            b.ready
+                .cmp(&a.ready)
+                .then_with(|| pressure(a, expected_uplink).total_cmp(&pressure(b, expected_uplink)))
+                .then_with(|| a.name.cmp(&b.name))
+        })
         .map(|n| n.name.clone())
 }
-fn score(n: &NodeLoad, expected: f64) -> f64 {
-    (n.uplink + expected) * 0.65 + n.cpu * 0.25 + n.ram * 0.1 + if n.ready { 0.0 } else { 0.2 }
+fn pressure(n: &NodeLoad, expected: f64) -> f64 {
+    ((n.uplink + expected) / 0.9)
+        .max(n.cpu / 0.9)
+        .max(n.ram / 0.95)
 }
 
 /// Keep LAN endpoint prefix/query and stream path separate from the selected media scheme.

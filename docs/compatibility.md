@@ -46,6 +46,11 @@ The first release must support the user's **LB → CDN → source over LAN** top
 
 Keep native uplink/CPU/RAM selection and admission reservations in a separate FlussoniX policy namespace. Reference compatibility requires fixtures for stream visibility, redirect path/query/token handling, affinity, failure responses and bitrate units; field names alone do not prove units. HTTP redirect capability does not establish transparent redirection for RTSP, SRT or RTP.
 
+The implemented [native HTTP/RTSP pressure profile](native-cluster-pressure.md)
+uses the busiest normalized uplink/CPU/RAM resource, bounded ready preference,
+actual reserved Mbps and per-node viewer bandwidth estimates. Its fixed defaults
+are distinct from the reference balancer modes; full mode parity remains pending.
+
 ## Protocol scope
 
 | Family | First-release behavior | Compatibility details |

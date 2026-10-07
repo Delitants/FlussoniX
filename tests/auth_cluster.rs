@@ -58,7 +58,7 @@ fn balancer_excludes_stale_drained_full_and_saturated_nodes() {
     let free = node("free", 0.1, false);
     assert_eq!(
         select(&[stale, drained, full, busy, cached, free], 0.02).unwrap(),
-        "cached"
+        "free"
     );
     assert_eq!(select(&[node("saturated", 0.99, true)], 0.02), None);
 }

@@ -103,6 +103,7 @@ struct Probe {
     pulls: AtomicUsize,
     bad_key: AtomicBool,
     snapshot: Mutex<Option<Value>>,
+    http_snapshot: Mutex<Option<Value>>,
     reject: AtomicBool,
     pause: AtomicBool,
     stall: AtomicBool,
@@ -114,6 +115,18 @@ struct Probe {
 }
 async fn intercept(State(p): State<Arc<Probe>>, r: Request<Body>, next: Next) -> Response {
     let path = r.uri().path();
+    if path == "/flussonix/api/v1/node" {
+        if let Some(snapshot) = p.http_snapshot.lock().unwrap().clone() {
+            if r.headers()
+                .get("x-flussonix-peer")
+                .and_then(|s| s.to_str().ok())
+                != Some(&p.key)
+            {
+                p.bad_key.store(true, Ordering::SeqCst);
+            }
+            return axum::Json(snapshot).into_response();
+        }
+    }
     if path == "/owned-auth" {
         p.auth_queries.lock().unwrap().push(
             url::form_urlencoded::parse(r.uri().query().unwrap_or("").as_bytes())
@@ -781,6 +794,110 @@ async fn reservations_expire_and_rpc_requires_peer_protocol_and_content_route() 
 async fn invalidate(lab: &Lab) {
     let peer = lab.lb.app.config.snapshot()["peers"][0].clone();
     lab.lb.app.config.put("peers", "edge", peer).unwrap();
+}
+
+// Exercise real authenticated placement/admission with controlled advisory telemetry.
+#[tokio::test]
+async fn adaptive_http_and_rtsp_routing_obeys_resource_pressure_and_reserved_mbps() {
+    let mut lab = Lab::new(1000).await;
+    let mut alternative = Node::new("cdn", 1000).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        alternative.app.config.put("sources", "origin", lab.cdn.app.config.snapshot()["sources"][0].clone()).unwrap();
+        alternative.measured().await;
+        lab.lb.app.config.put("peers", "alternate", json!({"api_url":alternative.http,"public_payload_url":alternative.http,"cluster_key":alternative.app.options.peer_key,"flussonix_rtsp_url":alternative.plain})).unwrap();
+        let edge_base = get_node(&lab.cdn).await;
+        let alternate_base = get_node(&alternative).await;
+        for resource in ["cpu", "ram", "reserved"] {
+            let mut edge = edge_base.clone();
+            let mut other = alternate_base.clone();
+            for snapshot in [&mut edge, &mut other] {
+                snapshot["cpu"] = json!(0.1); snapshot["ram"] = json!(0.1);
+                snapshot["uplink"] = json!(0.1); snapshot["age_ms"] = json!(0);
+                snapshot["reserved"] = json!(0); snapshot["reserved_mbps"] = json!(0);
+                snapshot["ready"] = json!([]); snapshot["streams"] = json!([]);
+            }
+            match resource {
+                "cpu" => { edge["cpu"] = json!(0.85); other["uplink"] = json!(0.4); },
+                "ram" => { edge["ram"] = json!(0.9); other["uplink"] = json!(0.4); },
+                _ => {
+                    edge["uplink"] = json!(0.2); edge["uplink_mbps"] = json!(100);
+                    edge["reserved"] = json!(1); edge["reserved_mbps"] = json!(50);
+                    other["uplink"] = json!(0.3); other["uplink_mbps"] = json!(1000);
+                }
+            }
+            *lab.cdn.probe.http_snapshot.lock().unwrap() = Some(edge.clone());
+            *alternative.probe.http_snapshot.lock().unwrap() = Some(other.clone());
+            *lab.cdn.probe.snapshot.lock().unwrap() = Some(edge);
+            *alternative.probe.snapshot.lock().unwrap() = Some(other);
+            invalidate(&lab).await;
+            let before = lab.cdn.probe.admits.load(Ordering::SeqCst);
+            let http = client().get(format!("{}/region/owned/index.m3u8?{QS}", lab.lb.http)).send().await.unwrap();
+            assert_eq!(http.status(), 302, "HTTP {resource}");
+            let target = http.headers()["location"].to_str().unwrap();
+            assert!(target.starts_with(&alternative.http), "HTTP {resource} chose {target}");
+            assert!(url::Url::parse(target).unwrap().query_pairs().any(|(k,v)| k=="token" && v=="owned+viewer"));
+            let target = location(&lab.lb.describe(false, "region/owned", QS).await);
+            assert!(target.starts_with(&alternative.plain), "RTSP {resource} chose {target}");
+            assert_eq!(lab.cdn.probe.admits.load(Ordering::SeqCst), before);
+            assert!(!target.contains(&alternative.app.options.peer_key));
+        }
+        assert_eq!(alternative.probe.admits.load(Ordering::SeqCst), 6);
+        assert!(!alternative.probe.bad_key.load(Ordering::SeqCst));
+        for node in [&lab.source, &lab.cdn, &lab.lb, &alternative] { assert_eq!(node.app.media.count().await, 0); }
+    }).catch_unwind().await;
+    alternative.stop().await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p);
+    }
+}
+
+// Missing/invalid native telemetry cannot be interpreted as zero pending cost.
+#[tokio::test]
+async fn http_routing_rejects_invalid_or_incomplete_capacity_telemetry() {
+    let mut lab = Lab::new(1000).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let mut base = get_node(&lab.cdn).await;
+        base["uplink"] = json!(0.1);
+        base["cpu"] = json!(0.1);
+        base["ram"] = json!(0.1);
+        base["reserved"] = json!(1);
+        base["reserved_mbps"] = json!(20);
+        base["age_ms"] = json!(0);
+        for (field, value) in [
+            ("reserved_mbps", Value::Null),
+            ("reserved_mbps", json!(-1)),
+            ("uplink_mbps", json!(0)),
+            ("uplink_mbps", json!(-100)),
+            ("uplink", json!(-0.01)),
+            ("cpu", json!(-0.1)),
+            ("ram", json!(-0.1)),
+            ("reserved", Value::Null),
+            ("active", json!(u64::MAX)),
+            ("role", json!("source")),
+            ("role", json!("lb")),
+            ("age_ms", json!(10001)),
+        ] {
+            let mut snapshot = base.clone();
+            snapshot[field] = value;
+            *lab.cdn.probe.http_snapshot.lock().unwrap() = Some(snapshot);
+            let before = lab.cdn.probe.admits.load(Ordering::SeqCst);
+            let reply = client()
+                .get(format!("{}/region/owned/index.m3u8?{QS}", lab.lb.http))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), 503, "accepted {field}");
+            assert_eq!(lab.cdn.probe.admits.load(Ordering::SeqCst), before);
+        }
+        assert_eq!(lab.cdn.app.media.count().await, 0);
+    })
+    .catch_unwind()
+    .await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p);
+    }
 }
 #[tokio::test]
 async fn routing_excludes_stale_unsafe_incompatible_and_saturated_nodes() {

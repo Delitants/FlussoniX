@@ -871,6 +871,7 @@ async fn balance(
     let peers = root["peers"].as_array().cloned().unwrap_or_default();
     let mut nodes = Vec::new();
     let mut valid = HashMap::new();
+    let probes_started = Instant::now();
     let calls = peers.into_iter().map(|p| {
         let app = app.clone();
         let name = name.to_owned();
@@ -907,33 +908,30 @@ async fn balance(
             let ready = n["streams"]
                 .as_array()
                 .is_some_and(|a| a.iter().any(|s| s["name"] == name && s["ready"] == true));
-            let id = p["hostname"].as_str()?.to_owned();
-            let limit = n["limit"].as_u64()?;
-            let load = NodeLoad {
-                name: id.clone(),
-                uplink: n["uplink"].as_f64()?
-                    + n["reserved"].as_u64().unwrap_or(0) as f64 * 2.0
-                        / n["uplink_mbps"].as_f64()?.max(1.0),
-                cpu: n["cpu"].as_f64()?,
-                ram: n["ram"].as_f64()?,
-                ready,
-                drain: n["drain"].as_bool().unwrap_or(true) || p["drain"] == true,
-                age_ms: n["age_ms"].as_u64().unwrap_or(u64::MAX),
-                active: n["active"].as_u64()? + n["reserved"].as_u64().unwrap_or(0),
-                limit,
-            };
-            Some((load, p))
+            Some((n, p, ready))
         }
     });
-    for (load, p) in futures_util::future::join_all(calls)
+    for (n, p, ready) in futures_util::future::join_all(calls)
         .await
         .into_iter()
         .flatten()
     {
+        let Some(load) = p["hostname"].as_str().and_then(|name| {
+            NodeLoad::from_telemetry(
+                name,
+                &n,
+                ready,
+                p["drain"] == true,
+                probes_started.elapsed().as_millis().try_into().ok()?,
+                2.0,
+            )
+        }) else {
+            continue;
+        };
         valid.insert(load.name.clone(), p);
         nodes.push(load)
     }
-    while let Some(id) = select(&nodes, 0.01) {
+    while let Some(id) = select(&nodes, 0.0) {
         let p = &valid[&id];
         let api = p["api_url"].as_str().unwrap_or("");
         let key = p["cluster_key"].as_str().unwrap_or(&app.options.peer_key);

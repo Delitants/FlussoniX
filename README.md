@@ -169,6 +169,11 @@ verified encrypted TCP. See [UDP push bounds](docs/rtsp-push.md#unicast-udp-push
 
 Native RTSP/RTSPS LB routing now uses measured CDN selection and protocol/token-bound reservations, with friendly public listener fields in Cluster. See [routing, bounds and qualification](docs/rtsp-cluster-routing.md).
 
+Native HTTP and RTSP/RTSPS balancing share [resource-pressure ranking](docs/native-cluster-pressure.md):
+the busiest uplink/CPU/RAM resource determines pressure, ready streams receive
+preference only among similarly loaded nodes, and pending Mbps are included in
+projected delivery load. Final admission remains owned by the CDN.
+
 
 Incoming RTSP/RTSPS publications also accept Basic headers and bounded MD5
 Digest challenges with qop-auth or legacy responses using the existing Publisher password. Configure your

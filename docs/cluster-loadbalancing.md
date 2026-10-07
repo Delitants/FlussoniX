@@ -2,6 +2,12 @@
 
 Full-product design and first-release requirements. Selected native routing/source paths and configured-input recovery are implemented in the preview; full legacy interoperability and failure/scale gates remain open.
 
+The implemented [native pressure profile](native-cluster-pressure.md) shares
+HTTP/RTSP ranking by maximum normalized uplink/CPU/RAM pressure, bounded ready
+preference, actual reserved Mbps and the existing CDN-owned admission ledger.
+The broader policy below remains the full-product design, including resource
+cost models and configurable margins that are not yet implemented.
+
 ## Required topology
 
 The user's deployment has one load balancer, several CDN delivery nodes, and servers that hold or ingest streams. The LB receives a viewer request, selects a CDN using uplink saturation, CPU and RAM, and redirects the viewer. The selected CDN serves an already-running local stream or pulls it from an appropriate source over the local network.
