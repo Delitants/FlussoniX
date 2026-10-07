@@ -403,6 +403,7 @@ fn valid_rtcp(body: &[u8]) -> bool {
             201 => payload == 8 + 24 * count && crate::direct_rtp::packet::valid_rtcp(packet),
             202..=204 => crate::direct_rtp::packet::valid_rtcp(packet),
             205 | 206 => payload >= 12,
+            207 => valid_xr(&packet[..payload]),
             _ => false,
         };
         if !valid {
@@ -413,9 +414,51 @@ fn valid_rtcp(body: &[u8]) -> bool {
     true
 }
 
+// RFC 3611 sections 2-3: skip unknown XR blocks by their declared word lengths.
+// The reserved header bits are ignored, and report contents are not interpreted.
+fn valid_xr(packet: &[u8]) -> bool {
+    if packet.len() < 8 {
+        return false;
+    }
+    let mut at = 8;
+    while at < packet.len() {
+        if packet.len() - at < 4 {
+            return false;
+        }
+        let size = (usize::from(u16::from_be_bytes([packet[at + 2], packet[at + 3]])) + 1) * 4;
+        if size > packet.len() - at {
+            return false;
+        }
+        at += size;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::valid_rtcp;
+    #[test]
+    fn extended_reports_are_bounded_and_ignored() {
+        let empty = [0x80, 207, 0, 1, 0, 0, 0, 1];
+        assert!(valid_rtcp(&empty));
+        let rr = [0x80, 201, 0, 1, 0, 0, 0, 1];
+        assert!(valid_rtcp(&[rr.as_slice(), empty.as_slice()].concat()));
+        // Unknown report types and reserved header bits must be ignored.
+        let blocks = [
+            0x9f, 207, 0, 4, 0, 0, 0, 1, 254, 7, 0, 0, 253, 9, 0, 1, 1, 2, 3, 4,
+        ];
+        assert!(valid_rtcp(&blocks));
+        let padded = [0xa0, 207, 0, 2, 0, 0, 0, 1, 0, 0, 0, 4];
+        assert!(valid_rtcp(&padded));
+        for body in [
+            &[0x80, 207, 0, 0][..],
+            &[0x80, 207, 0, 2, 0, 0, 0, 1, 254, 0, 0, 1],
+            &[0x80, 207, 0, 2, 0, 0, 0, 1, 254, 0, 255, 255],
+            &[0xa0, 207, 0, 2, 0, 0, 0, 1, 254, 0, 0, 1],
+        ] {
+            assert!(!valid_rtcp(body), "malformed XR admitted: {body:?}");
+        }
+    }
     #[test]
     fn malformed_receiver_reports_and_padding_are_rejected() {
         assert!(valid_rtcp(&[0x80, 201, 0, 1, 0, 0, 0, 1]));

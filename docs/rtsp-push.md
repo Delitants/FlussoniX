@@ -157,3 +157,6 @@ NIC profile rather than these payload counters. Destination `rtp_bytes` remains
 RTP-only. Counters survive worker stop/replacement and exclude inbound feedback.
 Admitted RTCP checks packet-specific minimum/report lengths, SDES structure and
 final-packet padding; RTPFB/PSFB require their sender/media SSRC header.
+Extended reports (RTCP XR) are bounded by their packet and block lengths, then
+ignored, including unknown block types ([RFC 3611, sections 2–3](https://www.rfc-editor.org/rfc/rfc3611.html#section-2)).
+Feedback is not used for adaptive loss recovery.
