@@ -720,3 +720,12 @@ wrong legacy query passwords retain403. Mixed/duplicate credentials are rejected
 before body polling, callbacks and workers. Owned socket clients exercise
 template inheritance and independent decoded delivery over HTTP and verified
 HTTPS. See [configuration, encoding bounds and limits](http-basic.md).
+
+
+## HTTP and HTTPS MPEG-TS push qualification
+
+The [native HTTP publishing profile](http-ts-push.md) adds continuous HTTP/HTTPS POST output to the shared mixed-destination framework. `tests/http_push.rs` uses independently owned loopback HTTP/TLS receivers to check saved configuration and template inheritance, percent-encoded Basic credentials and original query delivery, actual codec probing and strict decode of all six H.264/HEVC × AAC/Layer II/MP3 pairs, isolated status retries and redirect refusal, certificate trust/identity/expiry denial before publishing, and stream-stop cleanup. Regional copy fixtures verify every authored CEA-608/708 command and DVB/teletext descriptor/PES payload, filtering of separate tracks and resulting HLS WebVTT alongside both HTTP outputs.
+
+The nonreading-receiver unit first reproduced an HTTP client background dispatcher retaining publisher sockets after cancellation. The adapter now owns its HTTP/1.1 TCP/TLS halves directly; its regression requires no publisher socket remain before the blocked receiver resumes reading. Other socket tests check continued publishing after interim/early successful acknowledgement, bounded excessive or malformed response heads and no output producer after cancellation. Byte counters mean completed local application-body writes and contribute to HTTP transport telemetry; they are not remote decode acknowledgements. Two browser cases exercise masked normal fields, HTTPS trust, template inheritance, switching and mobile validation without JSON editors.
+
+These tests use no official Flussonic binary, library or production endpoint. CPU and copy media profiles are qualified here; HTTP-specific GPU combinations, HLS/M4 push, HTTP/2, proxies, mutual TLS, all recorder dialects, WAN loss, long-duration operation and throughput/production capacity are not claimed. Exact-head full Rust/browser CI and whole-branch review remain release gates.

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 pub(crate) enum Destination {
     Srt(crate::srt_push::Destination),
+    Http(crate::http_push::Destination),
     Rtsp(crate::rtsp_push::Destination),
 }
 pub(crate) fn configuration(cfg: &Value) -> Result<Vec<Destination>, String> {
@@ -22,6 +23,12 @@ pub(crate) fn configuration(cfg: &Value) -> Result<Vec<Destination>, String> {
                 .is_some_and(|u| u.starts_with("rtsp://") || u.starts_with("rtsps://"))
             {
                 crate::rtsp_push::Destination::parse(p).map(Destination::Rtsp)
+            } else if p["url"].as_str().is_some_and(|u| {
+                ["http://", "https://", "tshttp://", "tshttps://"]
+                    .iter()
+                    .any(|prefix| u.starts_with(prefix))
+            }) {
+                crate::http_push::Destination::parse(p).map(Destination::Http)
             } else {
                 let mut destinations =
                     crate::srt_push::configuration(&serde_json::json!({"pushes":[p]}))?;
@@ -35,6 +42,7 @@ pub(crate) fn enabled(cfg: &Value) -> bool {
 }
 pub(crate) enum State {
     Srt(Arc<crate::srt_push::State>),
+    Http(Arc<crate::http_push::State>),
     Rtsp(Arc<crate::rtsp_push::State>),
 }
 impl State {
@@ -42,14 +50,17 @@ impl State {
         destination: Destination,
         index: usize,
         egress: Arc<std::sync::atomic::AtomicU64>,
+        http_egress: Arc<std::sync::atomic::AtomicU64>,
     ) -> Arc<Self> {
         Arc::new(match destination {
+            Destination::Http(d) => Self::Http(crate::http_push::State::new(d, index, http_egress)),
             Destination::Srt(d) => Self::Srt(crate::srt_push::State::new(d, index)),
             Destination::Rtsp(d) => Self::Rtsp(crate::rtsp_push::State::new(d, index, egress)),
         })
     }
     pub fn stats(&self) -> Value {
         match self {
+            Self::Http(s) => s.stats(),
             Self::Srt(s) => s.stats(),
             Self::Rtsp(s) => s.stats(),
         }
@@ -61,6 +72,7 @@ impl State {
         cancel: CancellationToken,
     ) {
         match self.as_ref() {
+            Self::Http(s) => s.clone().run(worker.subscribe(), cancel).await,
             Self::Srt(s) => s.clone().run(ffmpeg, worker.subscribe(), cancel).await,
             Self::Rtsp(s) => {
                 s.clone()

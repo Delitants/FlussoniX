@@ -333,7 +333,7 @@ fn raw_and_encoded_stream_ids_are_accepted_without_accepting_hidden_options() {
         "srt://127.0.0.1:19992?pbkeylen=0",
         "srt://127.0.0.1:19992/path",
         "srt://user:owned-secret-123@receiver:9000",
-        "http://receiver:9000",
+        "hlss://receiver:9000/index.m3u8",
     ] {
         let err = store
             .put("streams", "owned", json!({"pushes":[{"url":url}]}))

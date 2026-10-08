@@ -196,3 +196,7 @@ cache with single flight, bounded probe concurrency/body sizes and original
 freshness clocks. Every viewer still gets a CDN-owned admission reservation;
 configuration changes and revocation block stale redirects. See the
 [cache contract and qualification limits](docs/native-cluster-pressure.md#http-and-https-routing-observations).
+
+### HTTP and HTTPS MPEG-TS push
+
+Streams and Templates now offer continuous HTTP or HTTPS publishing alongside SRT, RTSP and RTSPS, with four mixed destinations sharing one worker. Normal fields provide a masked URL, optional publishing Basic credentials, enabled toggle, timeouts and HTTPS trust file. The native publisher owns its TCP/TLS connection, retries independently and closes stalled or cancelled uploads without a destination FFmpeg process. Local qualification covers H.264/HEVC with AAC, Layer II and MP3, verified TLS, credential handling, regional subtitle carriage/filtering and HLS caption conversion alongside HTTP output. See [configuration and limits](docs/http-ts-push.md).

@@ -27,6 +27,7 @@ pub struct Engine {
     gpu: crate::gpu::Checks,
     pub direct_egress: Arc<AtomicU64>,
     pub rtsp_push_egress: Arc<AtomicU64>,
+    pub http_push_egress: Arc<AtomicU64>,
 }
 #[derive(Clone, Copy)]
 enum PublicationInput {
@@ -194,6 +195,7 @@ impl Engine {
             gpu: crate::gpu::Checks::default(),
             direct_egress: Arc::new(AtomicU64::new(0)),
             rtsp_push_egress: Arc::new(AtomicU64::new(0)),
+            http_push_egress: Arc::new(AtomicU64::new(0)),
         }
     }
     pub async fn gpu_capabilities(&self) -> Value {
@@ -734,7 +736,14 @@ impl Engine {
             pushes: destinations
                 .into_iter()
                 .enumerate()
-                .map(|(i, d)| crate::push::State::new(d, i, self.rtsp_push_egress.clone()))
+                .map(|(i, d)| {
+                    crate::push::State::new(
+                        d,
+                        i,
+                        self.rtsp_push_egress.clone(),
+                        self.http_push_egress.clone(),
+                    )
+                })
                 .collect(),
             direct_input: direct_input.as_ref().map(|i| i.stats.clone()),
             direct_outputs: direct_destinations
