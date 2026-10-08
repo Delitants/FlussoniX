@@ -889,8 +889,21 @@ test('HTTP and HTTPS push controls save masked credentials and inherit through t
   await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Destination protocol 1',{exact:true}).selectOption('srt');await expect(page.getByLabel('Destination URL 1',{exact:true})).toHaveValue('srt://localhost:18443/');await expect(page.getByLabel('Stream ID 1',{exact:true})).toBeVisible();await page.getByRole('button',{name:'Save',exact:true}).click();const cleared=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(cleared.pushes).toEqual([{url:'srt://localhost:18443/',disabled:true}]);
  } finally {await request.delete('/streamer/api/v3/streams/'+name,{headers});await request.delete('/streamer/api/v3/templates/'+template,{headers});}
 });
-test('HTTP push fields validate URLs and timeouts without exposing secrets on mobile',async({page})=>{
+test('HTTP push fields validate URLs and timeouts without exposing secrets on mobile',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const rows=Array.from({length:12},(_,i)=>'ui-http-mobile-row-'+i);
+ try {
+ for(const name of rows)expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,disabled:true,static:false,inputs:[{url:'testsrc://'}]}})).ok()).toBeTruthy();
+ await expect(page.getByRole('button',{name:rows[0],exact:true})).toBeVisible();
  await page.setViewportSize({width:390,height:844});await page.getByRole('button',{name:'Add stream',exact:true}).click();await page.getByLabel('Stream name',{exact:true}).fill('ui-http-validation-'+Date.now());await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');await page.getByLabel('Destination settings',{exact:true}).selectOption('override');await page.getByLabel('Destination protocol 1',{exact:true}).selectOption('http');
  const input=page.getByLabel('Destination URL 1',{exact:true});await input.fill('http://u%3Ax:owned-secret@localhost/owned');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toContainText('Basic authentication');await expect(page.locator('body')).not.toContainText('owned-secret');
- await input.fill('http://localhost/owned?token=owned-secret');await page.getByLabel('Retry interval (seconds) 1',{exact:true}).fill('301');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toContainText('retry interval');await expect(page.getByLabel('Destination trusted CA file 1',{exact:true})).toHaveCount(0);await expect(page.locator('textarea')).toHaveCount(0);expect(await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth)).toBe(false);await page.getByRole('button',{name:'Cancel',exact:true}).click();
+ await input.fill('http://localhost/owned?token=owned-secret');await page.getByLabel('Retry interval (seconds) 1',{exact:true}).fill('301');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toContainText('retry interval');await expect(page.getByLabel('Destination trusted CA file 1',{exact:true})).toHaveCount(0);await expect(page.locator('textarea')).toHaveCount(0);
+ for(const font of ['system-ui','"DejaVu Sans",sans-serif','Arial,sans-serif']) {
+  await page.addStyleTag({content:':root{font-family:'+font+'}'});
+  const layout=await page.evaluate(()=>({viewport:window.innerWidth,width:document.documentElement.scrollWidth,overflow:[...document.querySelectorAll('body *')].map(e=>({element:e.tagName,classes:e.className,right:e.getBoundingClientRect().right,width:e.getBoundingClientRect().width})).filter(e=>e.right>window.innerWidth).slice(0,20)}));
+  expect(layout.width,JSON.stringify({font,...layout})).toBeLessThanOrEqual(layout.viewport);
+  expect(await page.locator('.filterbar').evaluate(e=>[...e.children].every(child=>{const r=child.getBoundingClientRect();return r.left>=0&&r.right<=window.innerWidth;}))).toBeTruthy();
+ }
+ await page.getByRole('button',{name:'Cancel',exact:true}).click();
+ }finally{for(const name of rows)await request.delete('/streamer/api/v3/streams/'+name,{headers});}
 });
