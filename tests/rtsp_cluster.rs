@@ -129,6 +129,7 @@ struct Probe {
     admission_body_size: AtomicUsize,
     admission_chunked: AtomicBool,
     admission_tickets: Mutex<Vec<String>>,
+    admission_body_gate: Mutex<Option<CancellationToken>>,
 }
 struct HttpProbeGuard(Arc<Probe>);
 impl Drop for HttpProbeGuard {
@@ -269,6 +270,16 @@ async fn intercept(State(p): State<Arc<Probe>>, r: Request<Body>, next: Next) ->
             parts
                 .headers
                 .insert("content-length", target.to_string().parse().unwrap());
+            let gate = p.admission_body_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                // Keep headers visible while withholding the entire actual admission body.
+                // Cancellation is sticky, so shutdown cannot lose a release notification.
+                let stream = futures_util::stream::once(async move {
+                    gate.cancelled().await;
+                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from(bytes))
+                });
+                return Response::from_parts(parts, Body::from_stream(stream));
+            }
             return Response::from_parts(parts, Body::from(bytes));
         }
     }
@@ -287,6 +298,9 @@ struct Node {
 }
 impl Drop for Node {
     fn drop(&mut self) {
+        if let Some(gate) = self.probe.admission_body_gate.lock().unwrap().take() {
+            gate.cancel();
+        }
         self.cancel.cancel();
     }
 }
@@ -436,6 +450,9 @@ impl Node {
         request(&mut self.socket(secure).await, "DESCRIBE", &uri, "").await
     }
     async fn stop(&mut self) {
+        if let Some(gate) = self.probe.admission_body_gate.lock().unwrap().take() {
+            gate.cancel();
+        }
         self.probe.http_pause.store(false, Ordering::SeqCst);
         self.probe.http_release.notify_waiters();
         self.app.media.stop_all().await;
@@ -2475,7 +2492,8 @@ async fn oversized_http_admission_is_rejected(chunked: bool) {
         std::panic::resume_unwind(p);
     }
 }
-// Missing announced-length or accumulated-chunk limits must cause these to fail.
+// These completed oversized bodies protect the combined announced/streamed bound.
+// The held-body cases below independently protect early announced-length rejection.
 #[tokio::test]
 async fn http_admission_rejects_oversized_announced_json_for_plain_and_tls_viewers() {
     oversized_http_admission_is_rejected(false).await;
@@ -2670,4 +2688,96 @@ async fn rtsp_admission_preserves_announced_and_chunked_reply_limits_for_both_tr
     if let Err(p) = outcome {
         std::panic::resume_unwind(p);
     }
+}
+
+// The faulty CDN really reserves capacity and issues a ticket, but its oversized
+// Content-Length is visible before any body bytes. Fallback must precede release;
+// the test deadline is shorter than the normal admission request deadline.
+async fn held_announced_admission_falls_back(rtsp: bool) {
+    let mut lab = Lab::new(1000).await;
+    let mut alternative = tied_delivery_peer(&lab).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        lab.cdn.probe.admission_body_size.store(16385, Ordering::SeqCst);
+        alternative.probe.admission_body_size.store(16384, Ordering::SeqCst);
+        for (i, secure) in [false, true].into_iter().enumerate() {
+            let (base, http) = admission_fixture_peer(&mut lab, secure).await;
+            let edge_api = lab.lb.app.config.snapshot()["peers"].as_array().unwrap().iter()
+                .find(|p| p["hostname"] == "edge").unwrap()["api_url"].as_str().unwrap().to_owned();
+            let api = if secure { alternative.secure_media().await } else { alternative.http.clone() };
+            for (name, node, endpoint) in [("edge", &lab.cdn, &edge_api), ("alternate", &alternative, &api)] {
+                lab.lb.app.config.put("peers", name, json!({"api_url":endpoint,"public_payload_url":endpoint,"cluster_key":node.app.options.peer_key,"flussonix_rtsp_url":node.plain,"flussonix_rtsps_url":node.tls,"flussonix_tls_ca":if secure {json!(node.cert.ca)} else {Value::Null}})).unwrap();
+                let mut snapshot = get_node(node).await;
+                snapshot["uplink"] = json!(if name == "edge" {0.1} else {0.4});
+                snapshot["uplink_mbps"] = json!(1000);
+                snapshot["cpu"] = json!(0.1);
+                snapshot["ram"] = json!(0.1);
+                snapshot["active"] = json!(0);
+                snapshot["reserved"] = json!(0);
+                snapshot["reserved_mbps"] = json!(0);
+                snapshot["age_ms"] = json!(0);
+                snapshot["ready"] = json!([]);
+                snapshot["streams"] = json!([]);
+                snapshot["stream_bitrates"] = json!({});
+                *node.probe.http_snapshot.lock().unwrap() = Some(snapshot.clone());
+                *node.probe.snapshot.lock().unwrap() = Some(snapshot);
+            }
+            let gate = CancellationToken::new();
+            *lab.cdn.probe.admission_body_gate.lock().unwrap() = Some(gate.clone());
+            // Observe actual wire headers, including on the verified HTTPS peer.
+            let peer_http = reqwest::Client::builder().no_proxy()
+                .use_preconfigured_tls((*lab.cdn.cert.client()).clone()).build().unwrap();
+            let direct = tokio::time::timeout(Duration::from_millis(1500), peer_http
+                .post(format!("{edge_api}/flussonix/api/v1/admit"))
+                .header("X-Flussonix-Peer", &lab.cdn.app.options.peer_key)
+                .json(&json!({"name":"region/owned","bitrate_mbps":2})).send())
+                .await.expect("announced header must arrive while body is held").unwrap();
+            assert_eq!(direct.status(), 200);
+            assert_eq!(direct.content_length(), Some(16385));
+            assert!(!direct.headers().contains_key("transfer-encoding"));
+            assert!(!gate.is_cancelled());
+            drop(direct);
+            let target = tokio::time::timeout(Duration::from_millis(1500), async {
+                if rtsp {
+                    location(&lab.lb.describe(secure, "region/owned", QS).await)
+                } else {
+                    let response = http.get(format!("{base}/region/owned/index.m3u8?{QS}")).send().await.unwrap();
+                    assert_eq!(response.status(), 302);
+                    response.headers()["location"].to_str().unwrap().to_owned()
+                }
+            }).await.expect("fallback must complete before oversized admission body is released");
+            assert!(!gate.is_cancelled(), "body release must follow the completed placement");
+            let expected = if rtsp { if secure { &alternative.tls } else { &alternative.plain } } else { &api };
+            assert!(target.starts_with(&format!("{expected}/region/owned")), "alternate must own the redirect: {target}");
+            let target = url::Url::parse(&target).unwrap();
+            assert_eq!(target.scheme(), match (rtsp, secure) {(false,false)=>"http",(false,true)=>"https",(true,false)=>"rtsp",(true,true)=>"rtsps"});
+            let query = target.query_pairs().collect::<std::collections::HashMap<_,_>>();
+            assert_eq!(query["token"], "owned+viewer");
+            assert_eq!(query["customer"], "a&b");
+            let ticket = query["flussonix_ticket"].as_ref();
+            assert!(uuid::Uuid::parse_str(ticket).is_ok());
+            assert_eq!(alternative.probe.admission_tickets.lock().unwrap().last().unwrap(), ticket);
+            assert_ne!(lab.cdn.probe.admission_tickets.lock().unwrap().last().unwrap(), ticket);
+            gate.cancel();
+            for (node, count) in [(&lab.cdn, 2*(i+1)), (&alternative, i+1)] {
+                assert_eq!(node.probe.admission_statuses.lock().unwrap().as_slice(), vec![200;count]);
+                assert_eq!(get_actual_node(node).await["reserved"], count);
+                assert!(!node.probe.bad_key.load(Ordering::SeqCst));
+            }
+            for node in [&lab.lb, &lab.cdn, &lab.source, &alternative] {assert_eq!(node.app.media.count().await, 0);}
+            assert_eq!(lab.lb.app.playback_auth.live_grants(), 0);
+        }
+    }).catch_unwind().await;
+    alternative.stop().await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p);
+    }
+}
+#[tokio::test]
+async fn http_admission_rejects_announced_length_before_body_release() {
+    held_announced_admission_falls_back(false).await;
+}
+#[tokio::test]
+async fn rtsp_admission_rejects_announced_length_before_body_release() {
+    held_announced_admission_falls_back(true).await;
 }

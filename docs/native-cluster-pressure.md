@@ -85,7 +85,11 @@ cancelling unfinished probes. Placement has an eight-second overall deadline
 and keeps existing three-second admission request timeouts. HTTP, HTTPS, RTSP
 and RTSPS admission JSON replies share a 16 KiB limit, checked against announced
 lengths and accumulated chunks. A larger reply cannot authorize a redirect;
-placement tries another eligible CDN using its own reservation. Exactly 16 KiB
+placement tries another eligible CDN using its own reservation. Owned integration
+fixtures qualify early announced-length rejection independently of the streamed
+bound: a real CDN advertises an oversized body and withholds it while HTTP,
+verified HTTPS, RTSP and verified RTSPS placement selects another CDN before
+body release. Exactly 16 KiB
 remains accepted. Live grant revocation cancels placement; configuration edits
 and late replies cannot publish obsolete redirects. An unused reservation from
 a rejected reply or a configuration change expires through the existing
