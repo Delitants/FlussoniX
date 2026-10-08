@@ -16,3 +16,4 @@ fieldset{border:1px solid #e2e8f0;border-radius:6px;padding:16px;margin:0 0 20px
 .sdp-preview{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;max-height:24rem;overflow:auto}
 
 @media(max-width:900px){.filterbar{flex-wrap:wrap}}
+.gpu-readiness{margin-bottom:18px}.gpu-readiness ul{padding-left:20px;line-height:1.8}.gpu-readiness li p{margin:4px 0 12px;font-size:12px}

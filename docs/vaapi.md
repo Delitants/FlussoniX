@@ -23,3 +23,47 @@ The [compressed HTTPS upstream publishing profile](http-ts-push.md#compressed-up
 qualifies software decoding of independently encoded H.264/MP3 and HEVC/Layer II
 sources before Intel H.264 hardware encoding and AAC/Layer II/MP3 HTTP/HTTPS
 publishing. HEVC input decoding does not imply HEVC hardware encoding support.
+
+## Dependency and encoder readiness in the admin UI
+
+Config shows GPU transcoding readiness for NVIDIA and VAAPI H.264/HEVC. Selecting
+GPU video encoding in stream or template Processing shows that encoder's default
+profile result. Checks run through the configured independent FFmpeg as the
+FlussoniX service account, using a synthetic frame rather than a stream source.
+A successful initialization means the encoder can run with the tested profile;
+it does not measure capacity or promise that every custom profile will work.
+Custom devices and settings retain their own checks before worker replacement.
+
+The authenticated `/flussonix/api/v1/capabilities` response retains `status` and
+adds an optional `diagnostic` code to each GPU profile when a known dependency or
+hardware failure is recognized. The UI explains missing/not executable FFmpeg,
+missing encoder support, runtime libraries, inaccessible render devices, VAAPI
+driver initialization, NVIDIA driver/API failures and unsupported encoder profiles.
+Unknown failures remain generic. Raw FFmpeg messages, paths from those messages
+and environment contents are never returned. Probes drain stderr with at most
+16 KiB retained and retain the five-second deadline and child reaping.
+
+Results are cached for the daemon lifetime (VAAPI also has bounded profile-cache
+eviction). Restart FlussoniX after installing drivers or changing permissions.
+Reloading the browser does not invalidate server checks. FlussoniX does not install
+packages or silently switch a failed GPU selection to CPU.
+
+For an Ubuntu host using an Intel GPU, independently install its matching userspace
+stack, for example:
+
+```sh
+sudo apt-get install --no-install-recommends intel-media-va-driver libigdgmm12 vainfo
+vainfo --display drm --device /dev/dri/renderD128
+```
+
+Package names and driver coverage vary by distribution and hardware. The service
+account needs access to the render device; containers need the device and matching
+userspace libraries exposed. Intel iHD requires GMM. AMD uses a different VAAPI
+driver; NVIDIA requires its own compatible driver. No official Flussonic component
+is required. `vainfo` is an optional administrator tool, not a FlussoniX dependency.
+
+On the development host, the system Ubuntu Intel media driver 25.3.0+dfsg1-1 and
+GMM 22.8.1+ds1-1 initialize the default H.264 CQP24 profile on UHD Graphics 600.
+The default HEVC encoder profile fails with no usable encoding entrypoint. This
+is a result for that hardware/profile, not a statement about HEVC input decoding
+or all possible driver modes.

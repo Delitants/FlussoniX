@@ -269,3 +269,18 @@ async fn stale_gpu_start_cannot_replace_worker_and_hevc_gpu_captions_reject() {
     assert!(error.contains("GPU conversion is not qualified"), "{error}");
     a.media.stop_all().await;
 }
+
+#[tokio::test]
+async fn missing_nvidia_driver_has_safe_dependency_diagnostic() {
+    let d = tempfile::tempdir().unwrap();
+    let exe = wrapper(
+        d.path(),
+        "echo 'Cannot load libcuda.so.1 /private token=secret' >&2; exit 1",
+    );
+    let (_, body) = capabilities(app(d.path(), &exe), true).await;
+    for p in body["transcoding"]["gpu_profiles"].as_array().unwrap() {
+        assert_eq!(p["status"], "unavailable");
+        assert_eq!(p["diagnostic"], "nvidia_driver_unavailable");
+    }
+    assert!(!body.to_string().contains("token=secret"));
+}

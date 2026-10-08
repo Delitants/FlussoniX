@@ -6,13 +6,15 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{process::Command, sync::OnceCell};
+use tokio::{io::AsyncReadExt, process::Command, sync::OnceCell};
 
 #[derive(Clone, Serialize)]
 pub(crate) struct Readiness {
     encoder: &'static str,
     codec: &'static str,
     status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<&'static str>,
 }
 impl Readiness {
     fn error(&self) -> Option<&'static str> {
@@ -44,10 +46,12 @@ impl Checks {
             .get_or_init(|| async {
                 let mut report = Vec::with_capacity(2);
                 for (encoder, codec) in [("h264_nvenc", "H.264"), ("hevc_nvenc", "HEVC / H.265")] {
+                    let result = check(ffmpeg, encoder).await;
                     report.push(Readiness {
                         encoder,
                         codec,
-                        status: check(ffmpeg, encoder).await,
+                        status: result.status,
+                        diagnostic: result.diagnostic,
                     });
                 }
                 report
@@ -77,6 +81,7 @@ impl Checks {
         };
         Ok(cell
             .get_or_init(|| async {
+                let result = check_profile(ffmpeg, profile).await;
                 Readiness {
                     encoder: key.encoder,
                     codec: if key.encoder == "h264_vaapi" {
@@ -84,7 +89,8 @@ impl Checks {
                     } else {
                         "HEVC / H.265"
                     },
-                    status: check_profile(ffmpeg, profile).await,
+                    status: result.status,
+                    diagnostic: result.diagnostic,
                 }
             })
             .await
@@ -109,6 +115,7 @@ impl Checks {
                             "HEVC / H.265"
                         },
                         status: "probe_failed",
+                        diagnostic: None,
                     }),
             );
         }
@@ -141,7 +148,7 @@ impl Checks {
     }
 }
 
-async fn check(ffmpeg: &str, encoder: &str) -> &'static str {
+async fn check(ffmpeg: &str, encoder: &str) -> Probe {
     let profile = crate::transcoder::Profile::resolve(
         &serde_json::json!({"transcoder":{"encoder":encoder,"acodec":"copy"}}),
         false,
@@ -149,7 +156,48 @@ async fn check(ffmpeg: &str, encoder: &str) -> &'static str {
     .expect("known GPU profile");
     check_profile(ffmpeg, &profile).await
 }
-async fn check_profile(ffmpeg: &str, profile: &crate::transcoder::Profile) -> &'static str {
+struct Probe {
+    status: &'static str,
+    diagnostic: Option<&'static str>,
+}
+impl Probe {
+    fn new(status: &'static str, diagnostic: Option<&'static str>) -> Self {
+        Self { status, diagnostic }
+    }
+}
+
+// Classify only known FFmpeg/libVA messages. Raw process output, paths and
+// environment details must never enter the capabilities or playback responses.
+fn dependency_diagnostic(stderr: &[u8]) -> Option<&'static str> {
+    let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if text.contains("error while loading shared libraries") {
+        Some("runtime_library_missing")
+    } else if text.contains("unknown encoder") || text.contains("encoder not found") {
+        Some("encoder_missing")
+    } else if text.contains("cannot load libcuda")
+        || text.contains("cannot load libnvidia-encode")
+        || text.contains("driver does not support the required nvenc api")
+    {
+        Some("nvidia_driver_unavailable")
+    } else if text.contains("permission denied") {
+        Some("device_permission_denied")
+    } else if text.contains("failed to open") && text.contains("drm device") {
+        Some("device_unavailable")
+    } else if text.contains("libva error:")
+        || text.contains("failed to initialise vaapi connection")
+    {
+        Some("driver_initialization_failed")
+    } else if text.contains("no usable encoding entrypoint")
+        || text.contains("no capable devices found")
+        || text.contains("does not support")
+    {
+        Some("encoder_unsupported")
+    } else {
+        None
+    }
+}
+
+async fn check_profile(ffmpeg: &str, profile: &crate::transcoder::Profile) -> Probe {
     let mut cmd = Command::new(ffmpeg);
     cmd.args([
         "-hide_banner",
@@ -165,22 +213,52 @@ async fn check_profile(ffmpeg: &str, profile: &crate::transcoder::Profile) -> &'
     cmd.args(["-frames:v", "1", "-an", "-f", "null", "-"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let Ok(mut child) = cmd.spawn() else {
-        return "probe_failed";
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return Probe::new(
+                "probe_failed",
+                match error.kind() {
+                    std::io::ErrorKind::NotFound => Some("ffmpeg_missing"),
+                    std::io::ErrorKind::PermissionDenied => Some("ffmpeg_not_executable"),
+                    _ => None,
+                },
+            );
+        }
     };
-    match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-        Ok(Ok(status)) if status.success() => "available",
-        Ok(Ok(_)) => "unavailable",
-        Ok(Err(_)) => {
+    let mut stderr = child.stderr.take().expect("piped probe stderr");
+    let mut captured = Vec::new();
+    // Drain continuously to avoid pipe backpressure, retaining only 16 KiB.
+    // The same deadline covers both exit and pipe closure (including descendants).
+    let drain = async {
+        let mut chunk = [0u8; 4096];
+        loop {
+            let count = stderr.read(&mut chunk).await?;
+            if count == 0 {
+                break;
+            }
+            let keep = count.min((16 * 1024usize).saturating_sub(captured.len()));
+            captured.extend_from_slice(&chunk[..keep]);
+        }
+        Ok::<_, std::io::Error>(())
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(child.wait(), drain)
+    })
+    .await;
+    match outcome {
+        Ok((Ok(status), Ok(()))) if status.success() => Probe::new("available", None),
+        Ok((Ok(_), Ok(()))) => Probe::new("unavailable", dependency_diagnostic(&captured)),
+        Ok(_) => {
             let _ = child.kill().await;
-            "probe_failed"
+            Probe::new("probe_failed", None)
         }
         Err(_) => {
             // kill awaits wait/reaping; do not retain a hung encoder process.
             let _ = child.kill().await;
-            "timed_out"
+            Probe::new("timed_out", None)
         }
     }
 }

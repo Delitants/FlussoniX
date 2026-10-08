@@ -907,3 +907,28 @@ test('HTTP push fields validate URLs and timeouts without exposing secrets on mo
  await page.getByRole('button',{name:'Cancel',exact:true}).click();
  }finally{for(const name of rows)await request.delete('/streamer/api/v3/streams/'+name,{headers});}
 });
+
+test('GPU dependency readiness is visible in Config and selected Processing profile',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const caps=await(await request.get('/flussonix/api/v1/capabilities',{headers})).json();
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ const configGPU=page.getByRole('region',{name:'GPU transcoding readiness',exact:true});
+ await expect(configGPU).toBeVisible();
+ for(const p of [...caps.transcoding.gpu_profiles,...caps.transcoding.vaapi_profiles]){
+  const row=configGPU.getByTestId('gpu-'+p.encoder);
+  await expect(row).toContainText(p.status==='available'?'Ready for GPU encoding':'GPU encoding unavailable');
+ }
+ await expect(configGPU).toContainText('Restart FlussoniX after installing drivers or changing device permissions');
+ await expect(configGPU.locator('input,textarea')).toHaveCount(0);
+ await page.getByRole('button',{name:'Media',exact:false}).click();
+ await page.getByRole('button',{name:'Add stream',exact:true}).click();
+ await page.getByLabel('Transcoding',{exact:true}).selectOption('h264_vaapi');
+ const processing=page.getByRole('dialog').getByRole('region',{name:'GPU transcoding readiness',exact:true});
+ await expect(processing).toBeVisible();
+ await expect(processing.getByTestId('gpu-h264_vaapi')).toBeVisible();
+ await expect(processing.getByTestId('gpu-hevc_vaapi')).toHaveCount(0);
+ await expect(processing).toContainText('Custom devices and settings are checked at stream startup');
+ await page.getByLabel('Transcoding',{exact:true}).selectOption('libx264');
+ await expect(processing).toHaveCount(0);
+ await page.getByRole('button',{name:'Cancel',exact:true}).click();
+});

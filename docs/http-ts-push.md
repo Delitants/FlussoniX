@@ -178,3 +178,12 @@ production throughput/capacity are outside this qualification. Worker CPU/GPU
 selection applies before the adapter; these HTTP tests qualify CPU, copy and the
 named Intel H.264 profile above. No official Flussonic runtime component is linked
 or required.
+
+The private-driver HTTP GPU qualification helpers additionally require
+`LIBVA_DRIVERS_PATH` to name a directory containing the independent qualified
+`iHD_drv_video.so` and `libigdgmm.so.12` files, with that same directory included
+in `LD_LIBRARY_PATH` and `LIBVA_DRIVER_NAME=iHD`. They verify both mapped files
+resolve inside that directory and record their hashes. This deliberately isolated
+test layout is not a production requirement; a normally installed system driver
+and GMM can serve FlussoniX without these variables. See [admin dependency and
+encoder readiness](vaapi.md#dependency-and-encoder-readiness-in-the-admin-ui).

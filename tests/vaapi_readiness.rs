@@ -316,3 +316,85 @@ async fn readiness_uses_selected_device_mode_and_bounded_cache_without_starting_
         "bounded cache evicts idle profiles and rechecks older settings"
     );
 }
+
+#[tokio::test]
+async fn dependency_diagnostics_are_actionable_sanitized_and_output_is_drained() {
+    // Fault injection qualifies classification/supervision, not hardware support.
+    for (message, diagnostic) in [
+        (
+            "libva error: /private/iHD_drv_video.so init failed token=secret",
+            "driver_initialization_failed",
+        ),
+        (
+            "Failed to open /dev/dri/renderD128 as DRM device node. private",
+            "device_unavailable",
+        ),
+        (
+            "Unknown encoder 'h264_vaapi' token=secret",
+            "encoder_missing",
+        ),
+        (
+            "No usable encoding entrypoint found for profile VAProfileHEVCMain (17).",
+            "encoder_unsupported",
+        ),
+        (
+            "error while loading shared libraries: libigdgmm.so.12: cannot open shared object file",
+            "runtime_library_missing",
+        ),
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        let exe = wrapper(
+            d.path(),
+            &format!("echo \"{message}\" >&2; head -c 131072 /dev/zero >&2; exit 1"),
+        );
+        let a = app(d.path(), &exe);
+        let (_, body) = tokio::time::timeout(Duration::from_secs(12), capabilities(a, true))
+            .await
+            .unwrap();
+        for p in body["transcoding"]["vaapi_profiles"].as_array().unwrap() {
+            assert_eq!(p["status"], "unavailable");
+            assert_eq!(p["diagnostic"], diagnostic);
+        }
+        let text = body.to_string();
+        for private in [
+            "token=secret",
+            "/private/",
+            "shared object file",
+            d.path().to_str().unwrap(),
+        ] {
+            assert!(!text.contains(private), "raw diagnostics must not escape");
+        }
+        assert_eq!(probe_count(d.path()), 2);
+    }
+}
+
+#[tokio::test]
+async fn missing_ffmpeg_dependency_is_explicit_without_exposing_path() {
+    let d = tempfile::tempdir().unwrap();
+    let a = app(
+        d.path(),
+        d.path().join("private-missing-ffmpeg").to_str().unwrap(),
+    );
+    let (_, body) = capabilities(a, true).await;
+    for family in ["gpu_profiles", "vaapi_profiles"] {
+        for p in body["transcoding"][family].as_array().unwrap() {
+            assert_eq!(p["status"], "probe_failed");
+            assert_eq!(p["diagnostic"], "ffmpeg_missing");
+        }
+    }
+    assert!(!body.to_string().contains("private-missing"));
+}
+
+#[tokio::test]
+async fn successful_probe_does_not_report_stderr_as_dependency_failure() {
+    let d = tempfile::tempdir().unwrap();
+    let exe = wrapper(
+        d.path(),
+        "echo \"libva error: private diagnostic\" >&2; exit 0",
+    );
+    let (_, body) = capabilities(app(d.path(), &exe), true).await;
+    for p in body["transcoding"]["vaapi_profiles"].as_array().unwrap() {
+        assert_eq!(p["status"], "available");
+        assert!(p.get("diagnostic").is_none());
+    }
+}
