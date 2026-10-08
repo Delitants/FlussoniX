@@ -76,6 +76,9 @@ streamed response bodies are limited to 2 MiB. Only load fields, stream bitrate
 measurements and ready names are retained; full statistics and unrelated node
 metadata are discarded. The original request clock is preserved, so reuse does
 not reset the ten-second resource or three-second bitrate freshness limits.
+All configured peers participate in collection even when other viewers are
+waiting for a failed peer's refresh. Per-peer lock queues do not hide a healthy
+later peer; the shared semaphore still limits network probes to eight.
 
 Collection ends after 4.5 seconds, preserving successful observations and
 cancelling unfinished probes. Placement has an eight-second overall deadline
@@ -128,6 +131,8 @@ HTTP cache fixtures also cover real TLS entry points, per-stream readiness,
 concurrent probe coalescing and budgets, failed expiry, original resource/rate
 aging, changed keys and in-flight configuration/revocation, announced/streamed
 body bounds and placement deadlines.
+The burst fixture places eight timed-out peers before a healthy CDN and checks
+that fourteen concurrent viewers all receive independently admitted redirects.
 Owned HTTP/RTSP cluster fixtures in `tests/rtsp_cluster.rs` exercise authenticated
 placement and real CDN admission using controlled advisory telemetry, including
 actual pending bandwidth on heterogeneous uplinks. Invalid HTTP telemetry

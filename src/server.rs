@@ -961,7 +961,9 @@ async fn balance_inner(
             Some((snapshot, p, ready))
         }
     });
-    let mut calls = futures_util::stream::iter(calls).buffer_unordered(8);
+    // Include every configured peer: waiting on a busy peer's cache mutex must
+    // not hide later healthy candidates. The registry bounds network fetches.
+    let mut calls = futures_util::stream::iter(calls).buffer_unordered(64);
     let deadline = tokio::time::sleep(Duration::from_millis(4500));
     tokio::pin!(deadline);
     let mut observations = Vec::new();

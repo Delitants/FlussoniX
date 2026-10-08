@@ -2103,6 +2103,79 @@ async fn http_snapshot_slow_peer_does_not_delay_a_healthy_candidate_past_probe_d
     }
 }
 #[tokio::test]
+async fn http_snapshot_burst_reaches_a_healthy_peer_after_eight_timed_out_peers() {
+    let mut lab = Lab::new(1000).await;
+    let mut slow = Node::new("cdn", 1000).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        slow.probe.http_pause.store(true, Ordering::SeqCst);
+        let edge = lab.lb.app.config.snapshot()["peers"][0].clone();
+        lab.lb.app.config.delete("peers", "edge").unwrap();
+        for i in 0..8 {
+            lab.lb
+                .app
+                .config
+                .put(
+                    "peers",
+                    &format!("slow-{i}"),
+                    json!({
+                        "api_url":slow.http,"public_payload_url":slow.http,
+                        "cluster_key":slow.app.options.peer_key
+                    }),
+                )
+                .unwrap();
+        }
+        lab.lb.app.config.put("peers", "edge", edge).unwrap();
+        assert_eq!(
+            lab.lb.app.config.snapshot()["peers"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["hostname"],
+            "edge"
+        );
+        lab.cdn.measured().await;
+        *lab.cdn.probe.http_snapshot.lock().unwrap() = Some(healthy_http_snapshot(&lab.cdn).await);
+        let replies = futures_util::future::join_all((0..14).map(|_| http_placement(&lab))).await;
+        let statuses = replies
+            .iter()
+            .map(|r| r.status().as_u16())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![302; 14],
+            "failed peer queues must not hide a healthy later CDN; healthy polls={}, admissions={:?}",
+            lab.cdn.probe.http_polls.load(Ordering::SeqCst),
+            lab.cdn.probe.admission_statuses.lock().unwrap()
+        );
+        for response in replies {
+            assert!(
+                response.headers()["location"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with(&lab.cdn.http)
+            );
+        }
+        assert!(
+            slow.probe.http_polls.load(Ordering::SeqCst) >= 8,
+            "fixture must exercise the timeout batch"
+        );
+        assert_eq!(slow.probe.admits.load(Ordering::SeqCst), 0);
+        assert_eq!(lab.cdn.probe.admits.load(Ordering::SeqCst), 14);
+        assert_eq!(get_actual_node(&lab.cdn).await["reserved"], 14);
+        for node in [&lab.lb, &lab.cdn, &lab.source, &slow] {
+            assert_eq!(node.app.media.count().await, 0);
+        }
+    })
+    .catch_unwind()
+    .await;
+    slow.stop().await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p)
+    }
+}
+
+#[tokio::test]
 async fn http_snapshot_placement_has_an_overall_deadline_across_admission_retries() {
     let mut lab = Lab::new(1000).await;
     let outcome=std::panic::AssertUnwindSafe(async {
