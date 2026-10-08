@@ -99,6 +99,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 #[derive(Default)]
 struct Probe {
     polls: AtomicUsize,
+    routing_active: AtomicUsize,
+    routing_peak: AtomicUsize,
     admits: AtomicUsize,
     pulls: AtomicUsize,
     bad_key: AtomicBool,
@@ -129,6 +131,12 @@ struct HttpProbeGuard(Arc<Probe>);
 impl Drop for HttpProbeGuard {
     fn drop(&mut self) {
         self.0.http_active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+struct RoutingProbeGuard(Arc<Probe>);
+impl Drop for RoutingProbeGuard {
+    fn drop(&mut self) {
+        self.0.routing_active.fetch_sub(1, Ordering::SeqCst);
     }
 }
 async fn intercept(State(p): State<Arc<Probe>>, r: Request<Body>, next: Next) -> Response {
@@ -196,6 +204,9 @@ async fn intercept(State(p): State<Arc<Probe>>, r: Request<Body>, next: Next) ->
         }
         if path.ends_with("rtsp-routing") {
             p.polls.fetch_add(1, Ordering::SeqCst);
+            let active = p.routing_active.fetch_add(1, Ordering::SeqCst) + 1;
+            p.routing_peak.fetch_max(active, Ordering::SeqCst);
+            let _active = RoutingProbeGuard(p.clone());
             tokio::time::sleep(Duration::from_millis(
                 p.routing_delay_ms.load(Ordering::SeqCst) as u64,
             ))
@@ -1764,6 +1775,118 @@ async fn available_cdn_survives_partial_snapshot_timeout_in_supported_pool() {
     slow.stop().await;
     lab.stop().await;
     if let Err(p) = result {
+        std::panic::resume_unwind(p)
+    }
+}
+
+#[tokio::test]
+async fn rtsp_snapshot_burst_reaches_healthy_peer_after_eight_timeouts() {
+    let mut lab = Lab::new(1000).await;
+    let mut slow = Node::new("cdn", 1000).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        // Finish naturally after the daemon's 500ms probe timeout, including
+        // when an assertion fails; no stalled fixture task survives cleanup.
+        slow.probe.routing_delay_ms.store(650, Ordering::SeqCst);
+        let edge = lab.lb.app.config.snapshot()["peers"][0].clone();
+        lab.lb.app.config.delete("peers", "edge").unwrap();
+        for i in 0..8 {
+            lab.lb.app.config.put("peers", &format!("slow-{i}"), json!({
+                "api_url":slow.http,"cluster_key":slow.app.options.peer_key,
+                "flussonix_rtsp_url":slow.plain,"flussonix_rtsps_url":slow.tls
+            })).unwrap();
+        }
+        lab.lb.app.config.put("peers", "edge", edge).unwrap();
+        assert_eq!(lab.lb.app.config.snapshot()["peers"].as_array().unwrap().last().unwrap()["hostname"], "edge");
+        lab.cdn.measured().await;
+        let mut snapshot = healthy_http_snapshot(&lab.cdn).await;
+        snapshot["ready"] = json!([]);
+        *lab.cdn.probe.snapshot.lock().unwrap() = Some(snapshot);
+        let started = std::time::Instant::now();
+        let replies = futures_util::future::join_all((0..14).map(|i| lab.lb.describe(i % 2 != 0, "region/owned", QS))).await;
+        let statuses = replies.iter().map(|r| r.0).collect::<Vec<_>>();
+        assert_eq!(statuses, vec![302; 14], "failed peer queues must not hide healthy RTSP/RTSPS capacity; healthy polls={}, admissions={:?}", lab.cdn.probe.polls.load(Ordering::SeqCst), lab.cdn.probe.admission_statuses.lock().unwrap());
+        assert!(started.elapsed() < Duration::from_secs(8));
+        let mut tickets = std::collections::HashSet::new();
+        for (i, reply) in replies.iter().enumerate() {
+            let target = location(reply);
+            let public = if i % 2 == 0 { &lab.cdn.plain } else { &lab.cdn.tls };
+            assert!(target.starts_with(&format!("{public}/region/owned?")));
+            let parsed = url::Url::parse(&target).unwrap();
+            let query = parsed.query_pairs().collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(query["token"], "owned+viewer");
+            let ticket = query["flussonix_ticket"].to_string();
+            assert!(uuid::Uuid::parse_str(&ticket).is_ok());
+            assert!(tickets.insert(ticket), "every viewer needs a distinct reservation");
+        }
+        assert!(slow.probe.polls.load(Ordering::SeqCst) >= 8);
+        assert_eq!(slow.probe.admits.load(Ordering::SeqCst), 0);
+        assert_eq!(lab.cdn.probe.admits.load(Ordering::SeqCst), 14);
+        assert_eq!(get_actual_node(&lab.cdn).await["reserved"], 14);
+        assert!(!lab.cdn.probe.bad_key.load(Ordering::SeqCst));
+        for node in [&lab.lb, &lab.cdn, &lab.source, &slow] {
+            assert_eq!(node.app.media.count().await, 0);
+        }
+        assert_eq!(lab.lb.app.playback_auth.live_grants(), 0);
+    }).catch_unwind().await;
+    slow.stop().await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p)
+    }
+}
+
+#[tokio::test]
+async fn rtsp_snapshot_probe_budget_is_shared_by_plain_and_verified_tls_viewers() {
+    let mut lab = Lab::new(1000).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        lab.lb.app.config.delete("peers", "edge").unwrap();
+        for i in 0..64 {
+            lab.lb
+                .app
+                .config
+                .put(
+                    "peers",
+                    &format!("peer{i:02}"),
+                    json!({
+                        "api_url":lab.cdn.http,"cluster_key":lab.cdn.app.options.peer_key,
+                        "flussonix_rtsp_url":lab.cdn.plain,"flussonix_rtsps_url":lab.cdn.tls
+                    }),
+                )
+                .unwrap();
+        }
+        lab.cdn.measured().await;
+        let mut snapshot = healthy_http_snapshot(&lab.cdn).await;
+        snapshot["ready"] = json!([]);
+        *lab.cdn.probe.snapshot.lock().unwrap() = Some(snapshot);
+        lab.cdn.probe.routing_delay_ms.store(120, Ordering::SeqCst);
+        let (plain, secure) = tokio::join!(
+            lab.lb.describe(false, "region/owned", QS),
+            lab.lb.describe(true, "region/owned", QS)
+        );
+        assert!(location(&plain).starts_with(&lab.cdn.plain));
+        assert!(location(&secure).starts_with(&lab.cdn.tls));
+        let peak = lab.cdn.probe.routing_peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= 8,
+            "shared RTSP network probe budget exceeded: {peak}"
+        );
+        assert!(peak >= 2, "fixture must exercise concurrent probes");
+        assert_eq!(
+            lab.cdn.probe.polls.load(Ordering::SeqCst),
+            64,
+            "both viewer transports share each peer's successful flight"
+        );
+        assert_eq!(lab.cdn.probe.admits.load(Ordering::SeqCst), 2);
+        assert_eq!(get_actual_node(&lab.cdn).await["reserved"], 2);
+        for node in [&lab.lb, &lab.cdn, &lab.source] {
+            assert_eq!(node.app.media.count().await, 0);
+        }
+        assert!(!lab.cdn.probe.bad_key.load(Ordering::SeqCst));
+    })
+    .catch_unwind()
+    .await;
+    lab.stop().await;
+    if let Err(p) = outcome {
         std::panic::resume_unwind(p)
     }
 }

@@ -238,7 +238,9 @@ impl App {
             )?;
             (load.age_ms <= 10000).then_some((snapshot, peer, target, encrypted))
         });
-        let mut calls = futures_util::stream::iter(calls).buffer_unordered(8);
+        // Slot-lock waiters must not hide a later healthy peer during a burst.
+        // Include the bounded pool; the registry still limits network probes.
+        let mut calls = futures_util::stream::iter(calls).buffer_unordered(64);
         let snapshot_deadline = tokio::time::sleep(Duration::from_millis(4500));
         tokio::pin!(snapshot_deadline);
         let mut observations = Vec::new();

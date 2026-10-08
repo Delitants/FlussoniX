@@ -52,7 +52,13 @@ configuration or full statistics. Snapshots are cached for one second with
 per-peer single flight; configuration edits invalidate the cache, and failed
 refreshes never reuse expired data. Native pools are limited to 64 peers,
 snapshot fetch concurrency to eight, snapshot bodies to 2 MiB and admission
-responses to 16 KiB. Native snapshot probes time out after 500 milliseconds;
+responses to 16 KiB. All configured peers participate in collection, so waiting
+for another viewer's failed refresh cannot hide a later healthy CDN. The eight
+network permits are shared by concurrent RTSP and RTSPS placements. An owned
+burst test checks fourteen mixed viewers behind eight timed-out peers, with
+distinct reservations and verified secure destinations. A separate 64-peer test
+checks the shared network limit and successful refresh coalescing.
+Native snapshot probes time out after 500 milliseconds;
 the collection phase ends after 4.5 seconds and keeps successful observations
 while cancelling unfinished probes. Admission requests retain the existing
 three-second timeout. Verified TLS/custom CAs and no redirect following apply
