@@ -34,9 +34,15 @@ including a cold CDN which has not pulled it yet. Missing or stale measurements
 retain the 2 Mbps migration fallback. Ranking and the outgoing admission hint
 use the same estimate. The CDN reserves the greater of that hint, its own fresh
 local estimate and 2 Mbps; an older LB cannot reduce a known local stream cost.
+Before each admission attempt, the LB rechecks observation ages and recomputes
+the estimate and all unattempted candidates' projected loads. A slow failed
+attempt can expire a measurement; cold candidates excluded by its previous
+cost are then reconsidered using the fallback. Already attempted nodes are
+not retried in that placement.
 CPU and RAM remain observed utilization, without an incremental codec or cold
 pull cost model. The final CDN admission reservation still rechecks measured
-capacity under its own ledger lock. Advisory telemetry neither authorizes a
+capacity and active sessions under its own ledger lock, after any wait for a
+worker observation. Advisory telemetry neither authorizes a
 viewer nor starts a media worker. Routing redirects new requests; established
 viewers stay on their chosen node.
 
@@ -80,6 +86,9 @@ reservations and a CDN's live output overriding a smaller hint. Shared sampler
 unit cases cover peak expiry, decimal Mbps, long gaps, zero events and overflow
 or clock regressions. HTTP/RTSP/RTSPS placement fixtures qualify applying a
 warm peer's measured bitrate to a cold delivery candidate and its real ledger.
+Delayed failed-admission fixtures cover bitrate expiry and cold-node
+reconsideration for both HTTP and RTSP. A blocked-worker regression changes
+measured uplink while admission waits and verifies refusal with no reservation.
 
 The existing cluster integration suites qualify authorized source/CDN delivery,
 private source pulls, secure endpoints, coalescing and admission refusal/retry.

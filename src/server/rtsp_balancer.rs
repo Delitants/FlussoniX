@@ -187,7 +187,6 @@ impl App {
         if peers.len() > 64 || self.config.revision() != revision {
             return Err(503);
         }
-        let mut choices = HashMap::new();
         let calls = peers.into_iter().map(|peer| async move {
             let public = if secure {
                 peer["flussonix_rtsps_url"].as_str()
@@ -251,63 +250,78 @@ impl App {
             }
         }
         drop(calls); // Cancel unfinished probes; preserve time for admission.
-        let observed_at = Instant::now();
-        let elapsed = |snapshot: &Snapshot| {
-            observed_at
-                .duration_since(snapshot.when)
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX)
-        };
-        let observations = observations
-            .into_iter()
-            .filter(|(snapshot, peer, _, _)| {
-                peer["hostname"]
-                    .as_str()
-                    .and_then(|id| {
-                        NodeLoad::from_telemetry(
-                            id,
-                            &snapshot.value,
-                            snapshot.ready.contains(&viewer.name),
-                            peer["drain"] == true,
-                            elapsed(snapshot),
-                            crate::cluster::FALLBACK_MBPS,
-                        )
-                    })
-                    .is_some_and(|load| load.age_ms <= 10000)
-            })
-            .collect::<Vec<_>>();
-        let bitrate_mbps = observations
-            .iter()
-            .filter_map(|(snapshot, _, _, _)| {
-                crate::cluster::observed_bitrate(&snapshot.value, &viewer.name, elapsed(snapshot))
-            })
-            .fold(crate::cluster::FALLBACK_MBPS, f64::max);
-        if !bitrate_mbps.is_finite() || bitrate_mbps > crate::cluster::MAX_HINT_MBPS {
-            return Err(503);
-        }
-        let mut nodes = Vec::new();
-        for (snapshot, peer, target, encrypted) in observations {
-            if let Some(load) = NodeLoad::from_telemetry(
-                peer["hostname"].as_str().unwrap(),
-                &snapshot.value,
-                snapshot.ready.contains(&viewer.name),
-                peer["drain"] == true,
-                elapsed(&snapshot),
-                bitrate_mbps,
-            ) {
-                choices.insert(load.name.clone(), (peer, target, encrypted));
-                nodes.push(load);
+        let mut attempted = HashSet::new();
+        loop {
+            let observed_at = Instant::now();
+            let elapsed = |snapshot: &Snapshot| {
+                observed_at
+                    .duration_since(snapshot.when)
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX)
+            };
+            let valid = observations
+                .iter()
+                .filter(|(snapshot, peer, _, _)| {
+                    peer["hostname"]
+                        .as_str()
+                        .and_then(|id| {
+                            NodeLoad::from_telemetry(
+                                id,
+                                &snapshot.value,
+                                snapshot.ready.contains(&viewer.name),
+                                peer["drain"] == true,
+                                elapsed(snapshot),
+                                crate::cluster::FALLBACK_MBPS,
+                            )
+                        })
+                        .is_some_and(|load| load.age_ms <= 10000)
+                })
+                .collect::<Vec<_>>();
+            let bitrate_mbps = valid
+                .iter()
+                .filter_map(|(snapshot, _, _, _)| {
+                    crate::cluster::observed_bitrate(
+                        &snapshot.value,
+                        &viewer.name,
+                        elapsed(snapshot),
+                    )
+                })
+                .fold(crate::cluster::FALLBACK_MBPS, f64::max);
+            if !bitrate_mbps.is_finite() || bitrate_mbps > crate::cluster::MAX_HINT_MBPS {
+                return Err(503);
             }
-        }
-        while let Some(id) = select(&nodes, 0.0) {
+            let mut nodes = Vec::new();
+            for (snapshot, peer, _, _) in valid {
+                if peer["hostname"]
+                    .as_str()
+                    .is_some_and(|id| attempted.contains(id))
+                {
+                    continue;
+                }
+                if let Some(load) = NodeLoad::from_telemetry(
+                    peer["hostname"].as_str().unwrap(),
+                    &snapshot.value,
+                    snapshot.ready.contains(&viewer.name),
+                    peer["drain"] == true,
+                    elapsed(snapshot),
+                    bitrate_mbps,
+                ) {
+                    nodes.push(load);
+                }
+            }
+            let Some(id) = select(&nodes, 0.0) else { break };
+            attempted.insert(id.clone());
             if grant.is_cancelled() {
                 return Err(403);
             }
             if self.config.revision() != revision {
                 return Err(503);
             }
-            let (peer, target, encrypted) = &choices[&id];
+            let (_, peer, target, encrypted) = observations
+                .iter()
+                .find(|(_, peer, _, _)| peer["hostname"] == id)
+                .unwrap();
             let api = peer["api_url"].as_str().unwrap();
             let key = peer["cluster_key"]
                 .as_str()
@@ -339,7 +353,6 @@ impl App {
                     }
                 }
             }
-            nodes.retain(|n| n.name != id);
         }
         Err(503)
     }

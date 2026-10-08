@@ -368,6 +368,9 @@ impl App {
         node
     }
     async fn load_node(&self) -> Value {
+        // Worker setup can hold this mutex across network awaits. Obtain the
+        // optional stream observation before capturing resource/session load.
+        let stream_bitrates = self.media.output_bitrates().await;
         let mut metrics = self.telemetry.snapshot(self.options.uplink_mbps);
         metrics["rtsp_push_bytes_out"] = json!(self.media.rtsp_push_egress.load(Ordering::Relaxed));
         metrics["rtsp_udp_bytes_out"] = json!(self.rtsp_udp_egress.load(Ordering::Relaxed));
@@ -387,7 +390,7 @@ impl App {
             .as_object_mut()
             .unwrap()
             .extend(node.as_object().unwrap().clone());
-        metrics["stream_bitrates"] = self.media.output_bitrates().await;
+        metrics["stream_bitrates"] = stream_bitrates;
         metrics
     }
     pub fn sample_metrics(&self) {
@@ -843,11 +846,24 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
                 return error(StatusCode::NOT_FOUND, "stream route unavailable");
             }
         }
-        let n = app.load_node().await;
+        // Never acquire the worker mutex under the admission ledger. Any wait
+        // for shared output must finish before the final capacity decision.
+        let observations = json!({"stream_bitrates":app.media.output_bitrates().await});
+        let observed_at = Instant::now();
+        let mut reservations = app.reservations.lock().await;
+        reservations.retain(|_, v| v.expires > Instant::now());
         let bitrate_mbps = hint
             .max(
-                crate::cluster::observed_bitrate(&n, name, 0)
-                    .unwrap_or(crate::cluster::FALLBACK_MBPS),
+                crate::cluster::observed_bitrate(
+                    &observations,
+                    name,
+                    observed_at
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                )
+                .unwrap_or(crate::cluster::FALLBACK_MBPS),
             )
             .max(crate::cluster::FALLBACK_MBPS);
         if !bitrate_mbps.is_finite() || bitrate_mbps > crate::cluster::MAX_HINT_MBPS {
@@ -857,13 +873,12 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
             );
         }
         let expected = bitrate_mbps / app.options.uplink_mbps;
-        let mut reservations = app.reservations.lock().await;
-        reservations.retain(|_, v| v.expires > Instant::now());
+        let n = app.telemetry.snapshot(app.options.uplink_mbps);
+        let active = app.playback_auth.active();
         let reserved_mbps: f64 = reservations.values().map(|r| r.bitrate_mbps).sum();
         if app.options.drain
             || reservations.len() >= 20000
-            || n["active"].as_u64().unwrap_or(0) + reservations.len() as u64
-                >= app.options.client_limit
+            || active + reservations.len() as u64 >= app.options.client_limit
             || n["uplink"].as_f64().unwrap_or(1.0)
                 + reserved_mbps / app.options.uplink_mbps
                 + expected
@@ -896,8 +911,6 @@ async fn balance(
 ) -> Response {
     let root = app.config.snapshot();
     let peers = root["peers"].as_array().cloned().unwrap_or_default();
-    let mut nodes = Vec::new();
-    let mut valid = HashMap::new();
     let probes_started = Instant::now();
     let calls = peers.into_iter().map(|p| {
         let app = app.clone();
@@ -943,61 +956,75 @@ async fn balance(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-    let elapsed_ms = probes_started
-        .elapsed()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX);
-    let observations = observations
-        .into_iter()
-        .filter(|(n, p, ready)| {
-            p["hostname"]
+    let mut attempted = std::collections::HashSet::new();
+    loop {
+        // A failed admission can consume the remaining sample lifetime. Reproject
+        // every observed candidate, including those the previous cost excluded.
+        let elapsed_ms = probes_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let valid = observations
+            .iter()
+            .filter(|(n, p, ready)| {
+                p["hostname"]
+                    .as_str()
+                    .and_then(|id| {
+                        NodeLoad::from_telemetry(
+                            id,
+                            n,
+                            *ready,
+                            p["drain"] == true,
+                            elapsed_ms,
+                            crate::cluster::FALLBACK_MBPS,
+                        )
+                    })
+                    .is_some_and(|load| load.age_ms <= 10000)
+            })
+            .collect::<Vec<_>>();
+        let bitrate_mbps = valid
+            .iter()
+            .filter_map(|(n, _, _)| crate::cluster::observed_bitrate(n, name, elapsed_ms))
+            .fold(crate::cluster::FALLBACK_MBPS, f64::max);
+        if !bitrate_mbps.is_finite() || bitrate_mbps > crate::cluster::MAX_HINT_MBPS {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "stream cost exceeds admission bounds",
+            );
+        }
+        let mut nodes = Vec::new();
+        for (n, p, ready) in valid {
+            if p["hostname"]
                 .as_str()
-                .and_then(|id| {
-                    NodeLoad::from_telemetry(
-                        id,
-                        n,
-                        *ready,
-                        p["drain"] == true,
-                        elapsed_ms,
-                        crate::cluster::FALLBACK_MBPS,
-                    )
-                })
-                .is_some_and(|load| load.age_ms <= 10000)
-        })
-        .collect::<Vec<_>>();
-    let bitrate_mbps = observations
-        .iter()
-        .filter_map(|(n, _, _)| crate::cluster::observed_bitrate(n, name, elapsed_ms))
-        .fold(crate::cluster::FALLBACK_MBPS, f64::max);
-    if !bitrate_mbps.is_finite() || bitrate_mbps > crate::cluster::MAX_HINT_MBPS {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "stream cost exceeds admission bounds",
-        );
-    }
-    for (n, p, ready) in observations {
-        let Some(load) = p["hostname"].as_str().and_then(|name| {
-            NodeLoad::from_telemetry(
-                name,
-                &n,
-                ready,
-                p["drain"] == true,
-                elapsed_ms,
-                bitrate_mbps,
-            )
-        }) else {
-            continue;
-        };
-        valid.insert(load.name.clone(), p);
-        nodes.push(load)
-    }
-    while let Some(id) = select(&nodes, 0.0) {
-        let p = &valid[&id];
+                .is_some_and(|id| attempted.contains(id))
+            {
+                continue;
+            }
+            let Some(load) = p["hostname"].as_str().and_then(|name| {
+                NodeLoad::from_telemetry(
+                    name,
+                    n,
+                    *ready,
+                    p["drain"] == true,
+                    elapsed_ms,
+                    bitrate_mbps,
+                )
+            }) else {
+                continue;
+            };
+            nodes.push(load)
+        }
+        let Some(id) = select(&nodes, 0.0) else { break };
+        attempted.insert(id.clone());
+        let p = &observations
+            .iter()
+            .find(|(_, p, _)| p["hostname"] == id)
+            .unwrap()
+            .1;
         let api = p["api_url"].as_str().unwrap_or("");
         let key = p["cluster_key"].as_str().unwrap_or(&app.options.peer_key);
         let Ok(client) = app.cluster_client(p) else {
-            nodes.retain(|n| n.name != id);
             continue;
         };
         let response = client
@@ -1031,7 +1058,6 @@ async fn balance(
                 }
             }
         }
-        nodes.retain(|n| n.name != id);
     }
     error(StatusCode::SERVICE_UNAVAILABLE, "no available CDN node")
 }
@@ -1430,6 +1456,69 @@ pub fn rewrite_playlist(text: &str, query: &str) -> String {
 mod continuous_session_tests {
     use super::*;
     use tower::ServiceExt;
+    #[tokio::test]
+    async fn admission_refreshes_resources_after_waiting_for_worker_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                role: "cdn".into(),
+                uplink_interface: "process".into(),
+                admin_password: "owned-admin-secret".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            app.sample_metrics();
+            let snapshot = app.telemetry.snapshot(app.options.uplink_mbps);
+            if snapshot["cpu"].as_f64().is_some_and(|v| v < 0.9)
+                && snapshot["ram"].as_f64().is_some_and(|v| v < 0.95)
+            {
+                break;
+            }
+        }
+        let before = app.telemetry.snapshot(app.options.uplink_mbps);
+        assert!(before["cpu"].as_f64().is_some_and(|v| v < 0.9));
+        assert!(before["ram"].as_f64().is_some_and(|v| v < 0.95));
+        assert_eq!(before["uplink"], 0.0);
+        let lock = app.media.hold_startups_for_test().await;
+        let request = router(app.clone()).oneshot(
+            Request::post("/flussonix/api/v1/admit")
+                .header("X-Flussonix-Peer", &app.options.peer_key)
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    json!({"name":"owned","bitrate_mbps":2}).to_string(),
+                ))
+                .unwrap(),
+        );
+        tokio::pin!(request);
+        assert!(
+            futures_util::poll!(&mut request).is_pending(),
+            "worker observation must actually wait"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        app.egress.fetch_add(500_000_000, Ordering::Relaxed);
+        app.sample_metrics();
+        assert!(
+            app.telemetry.snapshot(app.options.uplink_mbps)["uplink"]
+                .as_f64()
+                .unwrap()
+                > 0.9
+        );
+        drop(lock);
+        let response = request.await.unwrap();
+        assert_eq!(
+            response.status(),
+            503,
+            "a worker wait cannot preserve an obsolete low uplink sample"
+        );
+        assert!(app.reservations.lock().await.is_empty());
+        assert_eq!(app.media.count().await, 0);
+    }
     #[tokio::test]
     async fn live_http_body_keeps_viewer_counted_after_inactivity_window() {
         let d = tempfile::tempdir().unwrap();

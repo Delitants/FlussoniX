@@ -113,6 +113,7 @@ struct Probe {
     auth_queries: Mutex<Vec<std::collections::HashMap<String, String>>>,
     auth_target: Mutex<Option<String>>,
     routing_delay_ms: AtomicUsize,
+    admission_delay_ms: AtomicUsize,
 }
 async fn intercept(State(p): State<Arc<Probe>>, r: Request<Body>, next: Next) -> Response {
     let path = r.uri().path();
@@ -163,6 +164,10 @@ async fn intercept(State(p): State<Arc<Probe>>, r: Request<Body>, next: Next) ->
                 return axum::Json(v).into_response();
             }
         } else {
+            tokio::time::sleep(Duration::from_millis(
+                p.admission_delay_ms.load(Ordering::SeqCst) as u64,
+            ))
+            .await;
             p.admits.fetch_add(1, Ordering::SeqCst);
             if p.pause.load(Ordering::SeqCst) {
                 p.entered.notify_one();
@@ -936,6 +941,59 @@ async fn rtsp_stream_rate_expires_during_a_slow_snapshot_response() {
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
+}
+
+async fn expired_bitrate_retry(rtsp: bool) {
+    let mut lab = Lab::new(1000).await;
+    let mut alternative = Node::new("cdn", 1000).await;
+    let outcome=std::panic::AssertUnwindSafe(async {
+        lab.lb.app.config.put("peers","alternate",json!({"api_url":alternative.http,"public_payload_url":alternative.http,"cluster_key":alternative.app.options.peer_key,"flussonix_rtsp_url":alternative.plain})).unwrap();
+        let mut small=get_node(&lab.cdn).await;
+        let mut large=get_node(&alternative).await;
+        for snapshot in [&mut small,&mut large] {
+            snapshot["cpu"]=json!(0.1);snapshot["ram"]=json!(0.1);snapshot["age_ms"]=json!(0);
+            snapshot["reserved"]=json!(0);snapshot["reserved_mbps"]=json!(0);
+        }
+        small["uplink"]=json!(0.1);small["uplink_mbps"]=json!(100);
+        small["ready"]=json!([]);small["streams"]=json!([]);small["stream_bitrates"]=json!({});
+        large["uplink"]=json!(0.2);large["uplink_mbps"]=json!(1000);
+        large["ready"]=json!(["region/owned"]);large["streams"]=json!([{"name":"region/owned","ready":true}]);
+        large["stream_bitrates"]=json!({"region/owned":{"mbps":100,"age_ms":1000}});
+        invalidate(&lab).await;lab.cdn.measured().await;
+        *lab.cdn.probe.snapshot.lock().unwrap()=Some(small.clone());
+        *alternative.probe.snapshot.lock().unwrap()=Some(large.clone());
+        *lab.cdn.probe.http_snapshot.lock().unwrap()=Some(small);
+        *alternative.probe.http_snapshot.lock().unwrap()=Some(large);
+        alternative.probe.reject.store(true,Ordering::SeqCst);
+        alternative.probe.admission_delay_ms.store(2400,Ordering::SeqCst);
+        if rtsp {
+            let target=location(&lab.lb.describe(false,"region/owned",QS).await);
+            assert!(target.starts_with(&lab.cdn.plain));
+        } else {
+            let response=client().get(format!("{}/region/owned/index.m3u8?{QS}",lab.lb.http)).send().await.unwrap();
+            assert_eq!(response.status(),302,"HTTP must reconsider the cold candidate after rate expiry");
+            assert!(response.headers()["location"].to_str().unwrap().starts_with(&lab.cdn.http));
+        }
+        assert_eq!(alternative.probe.admits.load(Ordering::SeqCst),1,"large CDN was attempted first");
+        assert_eq!(lab.cdn.probe.admits.load(Ordering::SeqCst),1,"cold CDN must be reconsidered");
+        *lab.cdn.probe.http_snapshot.lock().unwrap()=None;
+        let ledger=get_node(&lab.cdn).await;
+        assert_eq!(ledger["reserved_mbps"],2.0);assert_eq!(ledger["reserved"],1);
+        for node in [&lab.source,&lab.cdn,&lab.lb,&alternative] {assert_eq!(node.app.media.count().await,0);}
+    }).catch_unwind().await;
+    alternative.stop().await;
+    lab.stop().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+#[tokio::test]
+async fn http_failed_admission_rechecks_stream_bitrate_and_reconsiders_cold_capacity() {
+    expired_bitrate_retry(false).await;
+}
+#[tokio::test]
+async fn rtsp_failed_admission_rechecks_stream_bitrate_and_reconsiders_cold_capacity() {
+    expired_bitrate_retry(true).await;
 }
 
 // Exercise real authenticated placement/admission with controlled advisory telemetry.
