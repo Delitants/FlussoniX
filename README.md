@@ -190,3 +190,9 @@ of stored credentials. Viewer/admin credentials remain separate. See the
 origin-scoped upstream credentials across plain/secure HLS, TS and native M4
 inputs, plus incoming HTTP(S) publications using the existing Publisher password.
 Protected publications offer a Basic challenge; header/query ambiguity is rejected.
+
+Native HTTP/HTTPS load-balancer observations now use a one-second per-peer
+cache with single flight, bounded probe concurrency/body sizes and original
+freshness clocks. Every viewer still gets a CDN-owned admission reservation;
+configuration changes and revocation block stale redirects. See the
+[cache contract and qualification limits](docs/native-cluster-pressure.md#http-and-https-routing-observations).

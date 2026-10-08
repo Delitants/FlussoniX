@@ -19,8 +19,8 @@ no node/peer drain. Pending reservation counts also consume session capacity.
 Missing, negative or invalid metrics, nonpositive uplink capacity, overflowing
 counts/age, and source-only or LB-only roles exclude a candidate. Pending
 bandwidth comes from `reserved_mbps`, rather than assuming every reservation
-has the same cost. HTTP includes probe collection time in observation age;
-RTSP includes the age of its cached snapshot.
+has the same cost. HTTP and RTSP include each observation's response latency, cache age and
+time spent collecting other observations or retrying admission.
 
 Candidates within 0.05 normalized pressure of the best candidate form the
 shortlist. Prefer a ready stream within that set, then lower pressure. Exact
@@ -58,6 +58,39 @@ worker observation. Advisory telemetry neither authorizes a
 viewer nor starts a media worker. Routing redirects new requests; established
 viewers stay on their chosen node.
 
+## HTTP and HTTPS routing observations
+
+Native HTTP/HTTPS placements reuse each configured peer's advisory node
+observation for one second. Concurrent viewers share one successful refresh per
+peer, independently of their stream name or secure viewer transport. Cached
+readiness is looked up for each requested stream; the cache never contains an
+authorization decision or admission ticket. Every placement still asks the CDN
+for its own authoritative reservation. A failed refresh clears expired data,
+and saved configuration revisions invalidate observations before changed peer
+addresses, credentials or trust settings can be used.
+
+The HTTP registry is separate from the existing RTSP registry. HTTP has at most
+64 configured peers and eight simultaneous probe requests per LB, shared across
+concurrent HTTP/HTTPS placements. Each probe has a 500 ms timeout; announced and
+streamed response bodies are limited to 2 MiB. Only load fields, stream bitrate
+measurements and ready names are retained; full statistics and unrelated node
+metadata are discarded. The original request clock is preserved, so reuse does
+not reset the ten-second resource or three-second bitrate freshness limits.
+
+Collection ends after 4.5 seconds, preserving successful observations and
+cancelling unfinished probes. Placement has an eight-second overall deadline
+and keeps existing three-second admission request timeouts. Live grant
+revocation cancels placement; configuration edits and late replies cannot
+publish obsolete redirects. An unused reservation created just before a change
+expires through the existing five-second CDN ledger. HTTPS destinations and
+management CA/identity checks retain the existing no-downgrade and no-redirect
+rules. Probes and reservations start no media worker.
+
+These limits bound advisory work; they do not establish sustained throughput,
+multi-LB coordination or a production memory/latency target. A valid observation
+can remain cached for up to one second after a remote change, so final CDN
+admission remains essential. Failed refreshes are not negatively cached.
+
 ## Shared output measurements
 
 The producer samples bytes from the shared encoded MPEG-TS output. Completed
@@ -91,6 +124,10 @@ exact versus near ties, readiness, hard gates, full-width turns, independent
 candidate sets, retry state and bounded eviction. Owned HTTP/RTSP/RTSPS fixtures
 exercise sequential and concurrent distribution with real CDN reservations,
 refusal fallback and interleaved protocols with different candidate sets.
+HTTP cache fixtures also cover real TLS entry points, per-stream readiness,
+concurrent probe coalescing and budgets, failed expiry, original resource/rate
+aging, changed keys and in-flight configuration/revocation, announced/streamed
+body bounds and placement deadlines.
 Owned HTTP/RTSP cluster fixtures in `tests/rtsp_cluster.rs` exercise authenticated
 placement and real CDN admission using controlled advisory telemetry, including
 actual pending bandwidth on heterogeneous uplinks. Invalid HTTP telemetry

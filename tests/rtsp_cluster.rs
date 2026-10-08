@@ -104,6 +104,15 @@ struct Probe {
     bad_key: AtomicBool,
     snapshot: Mutex<Option<Value>>,
     http_snapshot: Mutex<Option<Value>>,
+    http_polls: AtomicUsize,
+    http_active: AtomicUsize,
+    http_peak: AtomicUsize,
+    http_delay_ms: AtomicUsize,
+    http_pause: AtomicBool,
+    http_entered: Notify,
+    http_release: Notify,
+    http_reply: Mutex<Option<(StatusCode, Vec<u8>)>>,
+    http_chunked: AtomicBool,
     reject: AtomicBool,
     pause: AtomicBool,
     stall: AtomicBool,
@@ -116,10 +125,42 @@ struct Probe {
     admission_delay_ms: AtomicUsize,
     admission_statuses: Mutex<Vec<u16>>,
 }
+struct HttpProbeGuard(Arc<Probe>);
+impl Drop for HttpProbeGuard {
+    fn drop(&mut self) {
+        self.0.http_active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 async fn intercept(State(p): State<Arc<Probe>>, r: Request<Body>, next: Next) -> Response {
     let path = r.uri().path();
     let admission = path == "/flussonix/api/v1/admit";
     if path == "/flussonix/api/v1/node" {
+        p.http_polls.fetch_add(1, Ordering::SeqCst);
+        let active = p.http_active.fetch_add(1, Ordering::SeqCst) + 1;
+        p.http_peak.fetch_max(active, Ordering::SeqCst);
+        let _active = HttpProbeGuard(p.clone());
+        p.http_entered.notify_one();
+        if p.http_pause.load(Ordering::SeqCst) {
+            p.http_release.notified().await;
+        }
+        tokio::time::sleep(Duration::from_millis(
+            p.http_delay_ms.load(Ordering::SeqCst) as u64,
+        ))
+        .await;
+        if let Some((status, bytes)) = p.http_reply.lock().unwrap().clone() {
+            if p.http_chunked.load(Ordering::SeqCst) {
+                let stream = tokio_stream::iter(vec![Ok::<_, std::convert::Infallible>(
+                    bytes::Bytes::from(bytes),
+                )]);
+                return (
+                    status,
+                    [("content-type", "application/json")],
+                    Body::from_stream(stream),
+                )
+                    .into_response();
+            }
+            return (status, [("content-type", "application/json")], bytes).into_response();
+        }
         if let Some(snapshot) = p.http_snapshot.lock().unwrap().clone() {
             if r.headers()
                 .get("x-flussonix-peer")
@@ -207,6 +248,21 @@ impl Drop for Node {
     }
 }
 impl Node {
+    // Use the daemon entry point so TLS requests receive the internal secure marker.
+    async fn secure_delivery(&mut self) -> String {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        let app = self.app.clone();
+        let config = self.cert.server();
+        let cancel = self.cancel.clone();
+        self.tasks
+            .push(AbortOnDropHandle::new(tokio::spawn(async move {
+                flussonix::http_tls::serve(tcp, config, app, cancel)
+                    .await
+                    .unwrap();
+            })));
+        format!("https://{address}")
+    }
     async fn secure_media(&mut self) -> String {
         use axum::serve::ListenerExt;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -337,6 +393,8 @@ impl Node {
         request(&mut self.socket(secure).await, "DESCRIBE", &uri, "").await
     }
     async fn stop(&mut self) {
+        self.probe.http_pause.store(false, Ordering::SeqCst);
+        self.probe.http_release.notify_waiters();
         self.app.media.stop_all().await;
         self.cancel.cancel();
         for task in self.tasks.drain(..) {
@@ -1339,6 +1397,7 @@ async fn http_routing_rejects_invalid_or_incomplete_capacity_telemetry() {
             let mut snapshot = base.clone();
             snapshot[field] = value;
             *lab.cdn.probe.http_snapshot.lock().unwrap() = Some(snapshot);
+            invalidate(&lab).await;
             let before = lab.cdn.probe.admits.load(Ordering::SeqCst);
             let reply = client()
                 .get(format!("{}/region/owned/index.m3u8?{QS}", lab.lb.http))
@@ -1459,11 +1518,16 @@ async fn snapshot_refresh_fails_closed_and_config_invalidates_cached_capabilitie
         assert_eq!(lab.lb.describe(false, "region/owned", QS).await.0, 503);
         assert_eq!(lab.cdn.probe.polls.load(Ordering::SeqCst), 3);
         *lab.cdn.probe.snapshot.lock().unwrap() = None;
+        lab.cdn.measured().await;
+        let primed_at = std::time::Instant::now();
         location(&lab.lb.describe(false, "region/owned", QS).await);
         let before = lab.cdn.probe.polls.load(Ordering::SeqCst);
         invalidate(&lab).await;
-        lab.cdn.measured().await;
         let response = lab.lb.describe(false, "region/owned", QS).await;
+        assert!(
+            primed_at.elapsed() < Duration::from_secs(1),
+            "invalidation assertion must use a still-fresh cached observation"
+        );
         let actual = get_node(&lab.cdn).await;
         assert_eq!(
             response.0,
@@ -1700,6 +1764,399 @@ async fn available_cdn_survives_partial_snapshot_timeout_in_supported_pool() {
     slow.stop().await;
     lab.stop().await;
     if let Err(p) = result {
+        std::panic::resume_unwind(p)
+    }
+}
+
+// The cache must be per peer, never per viewer or stream. Real admission remains
+// authoritative even when concurrent requests share one advisory observation.
+#[tokio::test]
+async fn http_snapshot_coalesces_plain_and_verified_https_viewers_with_real_admission() {
+    let mut lab = Lab::new(1).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let cdn_tls = lab.cdn.secure_media().await;
+        let lb_tls = lab.lb.secure_delivery().await;
+        lab.lb.app.config.put("peers", "edge", json!({"api_url":cdn_tls,"public_payload_url":cdn_tls,"flussonix_tls_ca":lab.cdn.cert.ca})).unwrap();
+        lab.cdn.measured().await;
+        lab.cdn.probe.http_delay_ms.store(100, Ordering::SeqCst);
+        let https = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(12)).use_preconfigured_tls((*lab.lb.cert.client()).clone()).build().unwrap();
+        let plain = client();
+        let replies = futures_util::future::join_all((0..8).map(|i| {
+            let base = if i % 2 == 0 { &lab.lb.http } else { &lb_tls };
+            let c = if i % 2 == 0 { &plain } else { &https };
+            c.get(format!("{base}/region/owned/index.m3u8?{QS}")).send()
+        })).await.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+        assert_eq!(replies.iter().filter(|r| r.status()==302).count(),1);
+        assert_eq!(replies.iter().filter(|r| r.status()==503).count(),7);
+        let destination = replies.iter().find(|r| r.status()==302).unwrap().headers()["location"].to_str().unwrap();
+        assert!(destination.starts_with(&cdn_tls));
+        let parsed=url::Url::parse(destination).unwrap();let query=parsed.query_pairs().collect::<std::collections::HashMap<_,_>>();
+        assert_eq!(query.get("token").map(|v|v.as_ref()),Some("owned+viewer"));
+        assert!(uuid::Uuid::parse_str(query["flussonix_ticket"].as_ref()).is_ok());
+        assert_eq!(lab.cdn.probe.http_polls.load(Ordering::SeqCst),1,"HTTP/HTTPS placements must share one node observation");
+        assert!(!lab.cdn.probe.bad_key.load(Ordering::SeqCst));
+        let actual=get_actual_node(&lab.cdn).await;assert_eq!(actual["reserved"],1);assert_eq!(actual["reserved_mbps"],2.0);
+        for node in [&lab.lb,&lab.cdn,&lab.source] { assert_eq!(node.app.media.count().await,0); }
+    }).catch_unwind().await;
+    lab.stop().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn http_placement(lab: &Lab) -> reqwest::Response {
+    client()
+        .get(format!("{}/region/owned/index.m3u8?{QS}", lab.lb.http))
+        .send()
+        .await
+        .unwrap()
+}
+async fn healthy_http_snapshot(node: &Node) -> Value {
+    let mut v = get_actual_node(node).await;
+    v["uplink"] = json!(0.1);
+    v["cpu"] = json!(0.1);
+    v["ram"] = json!(0.1);
+    v["age_ms"] = json!(0);
+    v["uplink_mbps"] = json!(1000);
+    v["active"] = json!(0);
+    v["reserved"] = json!(0);
+    v["reserved_mbps"] = json!(0);
+    v["streams"] = json!([]);
+    v["stream_bitrates"] = json!({});
+    v
+}
+
+#[tokio::test]
+async fn http_snapshot_is_reused_until_expiry_and_failed_refresh_never_reuses_it() {
+    let mut lab = Lab::new(1000).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        *lab.cdn.probe.http_snapshot.lock().unwrap() = Some(healthy_http_snapshot(&lab.cdn).await);
+        assert_eq!(http_placement(&lab).await.status(), 302);
+        *lab.cdn.probe.http_reply.lock().unwrap() = Some((StatusCode::SERVICE_UNAVAILABLE, vec![]));
+        assert_eq!(
+            http_placement(&lab).await.status(),
+            302,
+            "fresh observation is reusable despite a later unavailable probe"
+        );
+        assert_eq!(lab.cdn.probe.http_polls.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(http_placement(&lab).await.status(), 503);
+        assert_eq!(http_placement(&lab).await.status(), 503);
+        assert_eq!(
+            lab.cdn.probe.http_polls.load(Ordering::SeqCst),
+            3,
+            "failed refresh must not republish old telemetry"
+        );
+        assert_eq!(lab.cdn.probe.admits.load(Ordering::SeqCst), 2);
+        assert_eq!(get_actual_node(&lab.cdn).await["reserved"], 2);
+        assert_eq!(lab.cdn.app.media.count().await, 0);
+    })
+    .catch_unwind()
+    .await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p)
+    }
+}
+
+#[tokio::test]
+async fn http_snapshot_configuration_change_discards_a_delayed_peer_reply() {
+    let mut lab = Lab::new(1000).await;
+    let outcome=std::panic::AssertUnwindSafe(async {
+        *lab.cdn.probe.http_snapshot.lock().unwrap()=Some(healthy_http_snapshot(&lab.cdn).await);
+        lab.cdn.probe.http_pause.store(true,Ordering::SeqCst);
+        let pending=http_placement(&lab);tokio::pin!(pending);
+        tokio::select! { _=lab.cdn.probe.http_entered.notified()=>{}, _=&mut pending=>panic!("placement completed before the probe") }
+        lab.lb.app.config.put("peers","edge",json!({"drain":true})).unwrap();
+        lab.cdn.probe.http_pause.store(false,Ordering::SeqCst);lab.cdn.probe.http_release.notify_waiters();
+        assert_eq!(pending.await.status(),503,"obsolete reply cannot admit or redirect");
+        assert_eq!(lab.cdn.probe.admits.load(Ordering::SeqCst),0);
+        assert_eq!(get_actual_node(&lab.cdn).await["reserved"],0);
+        assert_eq!(http_placement(&lab).await.status(),503);
+    }).catch_unwind().await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p)
+    }
+}
+
+#[tokio::test]
+async fn http_snapshot_configuration_change_blocks_a_late_admission_redirect() {
+    let mut lab = Lab::new(1000).await;
+    let outcome=std::panic::AssertUnwindSafe(async {
+        *lab.cdn.probe.http_snapshot.lock().unwrap()=Some(healthy_http_snapshot(&lab.cdn).await);
+        lab.cdn.probe.pause.store(true,Ordering::SeqCst);
+        let pending=http_placement(&lab);tokio::pin!(pending);
+        tokio::select! { _=lab.cdn.probe.entered.notified()=>{}, _=&mut pending=>panic!("placement completed before admission") }
+        lab.lb.app.config.put("peers","edge",json!({"public_payload_url":"http://other.invalid"})).unwrap();
+        lab.cdn.probe.pause.store(false,Ordering::SeqCst);lab.cdn.probe.release.notify_waiters();
+        assert_eq!(pending.await.status(),503,"a late ticket must not publish an obsolete public endpoint");
+        // The unused reservation expires normally; no worker or access is granted.
+        assert_eq!(get_actual_node(&lab.cdn).await["reserved"],1);
+        assert_eq!(lab.cdn.app.media.count().await,0);
+    }).catch_unwind().await;
+    lab.cdn.probe.pause.store(false, Ordering::SeqCst);
+    lab.cdn.probe.release.notify_waiters();
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p)
+    }
+}
+
+#[tokio::test]
+async fn http_snapshot_rejects_an_oversized_valid_json_observation() {
+    let mut lab = Lab::new(1000).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let mut snapshot = healthy_http_snapshot(&lab.cdn).await;
+        snapshot["padding"] = json!("x".repeat(2 * 1024 * 1024));
+        *lab.cdn.probe.http_reply.lock().unwrap() =
+            Some((StatusCode::OK, serde_json::to_vec(&snapshot).unwrap()));
+        assert_eq!(
+            http_placement(&lab).await.status(),
+            503,
+            "oversized JSON must not create a reservation"
+        );
+        assert_eq!(lab.cdn.probe.admits.load(Ordering::SeqCst), 0);
+        assert_eq!(get_actual_node(&lab.cdn).await["reserved"], 0);
+    })
+    .catch_unwind()
+    .await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p)
+    }
+}
+
+#[tokio::test]
+async fn http_snapshot_cache_age_expires_resource_eligibility() {
+    let mut lab = Lab::new(1000).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let mut snapshot = healthy_http_snapshot(&lab.cdn).await;
+        snapshot["age_ms"] = json!(9750);
+        *lab.cdn.probe.http_snapshot.lock().unwrap() = Some(snapshot);
+        assert_eq!(http_placement(&lab).await.status(), 302);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            http_placement(&lab).await.status(),
+            503,
+            "cache reuse must include original observation age"
+        );
+        assert_eq!(lab.cdn.probe.http_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(lab.cdn.probe.admits.load(Ordering::SeqCst), 1);
+    })
+    .catch_unwind()
+    .await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p)
+    }
+}
+#[tokio::test]
+async fn http_snapshot_cache_age_expires_stream_bitrate_without_refreshing_it() {
+    let mut lab = Lab::new(1000).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let mut snapshot = healthy_http_snapshot(&lab.cdn).await;
+        snapshot["stream_bitrates"] = json!({"region/owned":{"mbps":20,"age_ms":2600}});
+        *lab.cdn.probe.http_snapshot.lock().unwrap() = Some(snapshot);
+        assert_eq!(http_placement(&lab).await.status(), 302);
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert_eq!(http_placement(&lab).await.status(), 302);
+        let actual = get_actual_node(&lab.cdn).await;
+        assert_eq!(actual["reserved"], 2);
+        assert_eq!(
+            actual["reserved_mbps"], 27.0,
+            "25Mbps fresh estimate plus2Mbps expired fallback"
+        );
+        assert_eq!(lab.cdn.probe.http_polls.load(Ordering::SeqCst), 1);
+    })
+    .catch_unwind()
+    .await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p)
+    }
+}
+#[tokio::test]
+async fn http_snapshot_cached_readiness_is_resolved_for_each_stream() {
+    let mut lab = Lab::new(1000).await;
+    let mut alternative = tied_delivery_peer(&lab).await;
+    let outcome=std::panic::AssertUnwindSafe(async {
+        lab.source.app.config.put("streams","region/second",json!({"static":false,"inputs":[{"url":"testsrc://"}],"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"owned+viewer"))})).unwrap();
+        lab.cdn.measured().await;alternative.measured().await;
+        let mut first=healthy_http_snapshot(&lab.cdn).await;let mut second=healthy_http_snapshot(&alternative).await;
+        first["streams"]=json!([{"name":"region/owned","ready":true}]);second["streams"]=json!([{"name":"region/second","ready":true}]);
+        *lab.cdn.probe.http_snapshot.lock().unwrap()=Some(first);*alternative.probe.http_snapshot.lock().unwrap()=Some(second);
+        lab.cdn.probe.http_polls.store(0,Ordering::SeqCst);alternative.probe.http_polls.store(0,Ordering::SeqCst);
+        let one=http_placement(&lab).await;assert_eq!(one.status(),302);assert!(one.headers()["location"].to_str().unwrap().starts_with(&lab.cdn.http));
+        let two=client().get(format!("{}/region/second/index.m3u8?{QS}",lab.lb.http)).send().await.unwrap();assert_eq!(two.status(),302);assert!(two.headers()["location"].to_str().unwrap().starts_with(&alternative.http));
+        assert_eq!(lab.cdn.probe.http_polls.load(Ordering::SeqCst),1);assert_eq!(alternative.probe.http_polls.load(Ordering::SeqCst),1);
+        assert_eq!(get_actual_node(&lab.cdn).await["reserved"],1);assert_eq!(get_actual_node(&alternative).await["reserved"],1);
+        for n in [&lab.lb,&lab.cdn,&lab.source,&alternative] {assert_eq!(n.app.media.count().await,0);}
+    }).catch_unwind().await;
+    alternative.stop().await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p)
+    }
+}
+#[tokio::test]
+async fn http_snapshot_revocation_cancels_an_inflight_admission_without_redirect() {
+    let mut lab = Lab::new(1000).await;
+    let outcome=std::panic::AssertUnwindSafe(async {
+        *lab.cdn.probe.http_snapshot.lock().unwrap()=Some(healthy_http_snapshot(&lab.cdn).await);
+        lab.cdn.probe.pause.store(true,Ordering::SeqCst);
+        let pending=http_placement(&lab);tokio::pin!(pending);
+        tokio::select! { _=lab.cdn.probe.entered.notified()=>{}, _=&mut pending=>panic!("placement completed before admission") }
+        lab.lb.app.playback_auth.invalidate(|_|None);
+        lab.cdn.probe.pause.store(false,Ordering::SeqCst);lab.cdn.probe.release.notify_waiters();
+        assert_eq!(pending.await.status(),403,"revoked grant cannot use a delayed admission reply");
+        assert_eq!(lab.cdn.app.media.count().await,0);assert_eq!(lab.lb.app.media.count().await,0);
+    }).catch_unwind().await;
+    lab.cdn.probe.pause.store(false, Ordering::SeqCst);
+    lab.cdn.probe.release.notify_waiters();
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p)
+    }
+}
+
+#[tokio::test]
+async fn http_snapshot_probe_budget_is_shared_by_concurrent_http_and_https_placements() {
+    let mut lab = Lab::new(1000).await;
+    let outcome=std::panic::AssertUnwindSafe(async {
+        let lb_tls=lab.lb.secure_delivery().await;
+        lab.lb.app.config.delete("peers","edge").unwrap();
+        for i in 0..64 {
+            lab.lb.app.config.put("peers",&format!("peer{i:02}"),json!({"api_url":lab.cdn.http,"public_payload_url":if i<32 {lab.cdn.http.clone()} else {"https://delivery.invalid".to_owned()},"cluster_key":lab.cdn.app.options.peer_key})).unwrap();
+        }
+        lab.cdn.measured().await;
+        *lab.cdn.probe.http_snapshot.lock().unwrap()=Some(healthy_http_snapshot(&lab.cdn).await);
+        lab.cdn.probe.http_delay_ms.store(120,Ordering::SeqCst);
+        let tls=reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(12)).use_preconfigured_tls((*lab.lb.cert.client()).clone()).build().unwrap();
+        let (plain,secure)=tokio::join!(http_placement(&lab),tls.get(format!("{lb_tls}/region/owned/index.m3u8?{QS}")).send());
+        assert_eq!(plain.status(),302);assert_eq!(secure.unwrap().status(),302);
+        assert!(lab.cdn.probe.http_peak.load(Ordering::SeqCst)<=8,"node-wide HTTP probe budget exceeded: {}",lab.cdn.probe.http_peak.load(Ordering::SeqCst));
+        assert_eq!(get_actual_node(&lab.cdn).await["reserved"],2);
+        assert_eq!(lab.cdn.app.media.count().await,0);
+    }).catch_unwind().await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p)
+    }
+}
+
+#[tokio::test]
+async fn http_snapshot_rejects_oversized_streamed_json_without_content_length() {
+    let mut lab = Lab::new(1000).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let mut snapshot = healthy_http_snapshot(&lab.cdn).await;
+        snapshot["padding"] = json!("x".repeat(2 * 1024 * 1024));
+        lab.cdn.probe.http_chunked.store(true, Ordering::SeqCst);
+        *lab.cdn.probe.http_reply.lock().unwrap() =
+            Some((StatusCode::OK, serde_json::to_vec(&snapshot).unwrap()));
+        let direct = client()
+            .get(format!("{}/flussonix/api/v1/node", lab.cdn.http))
+            .send()
+            .await
+            .unwrap();
+        assert!(direct.content_length().is_none());
+        drop(direct);
+        assert_eq!(http_placement(&lab).await.status(), 503);
+        assert_eq!(
+            lab.cdn.probe.admits.load(Ordering::SeqCst),
+            0,
+            "streamed oversized telemetry cannot be admitted"
+        );
+    })
+    .catch_unwind()
+    .await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p)
+    }
+}
+#[tokio::test]
+async fn http_snapshot_slow_peer_does_not_delay_a_healthy_candidate_past_probe_deadline() {
+    let mut lab = Lab::new(1000).await;
+    let mut alternative = tied_delivery_peer(&lab).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        alternative.probe.http_pause.store(true, Ordering::SeqCst);
+        let response = tokio::time::timeout(Duration::from_millis(1500), http_placement(&lab))
+            .await
+            .expect("healthy candidate must remain reachable within the bounded probe phase");
+        assert_eq!(response.status(), 302);
+        assert!(
+            response.headers()["location"]
+                .to_str()
+                .unwrap()
+                .starts_with(&lab.cdn.http)
+        );
+        assert_eq!(alternative.probe.admits.load(Ordering::SeqCst), 0);
+        assert_eq!(get_actual_node(&lab.cdn).await["reserved"], 1);
+    })
+    .catch_unwind()
+    .await;
+    alternative.stop().await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p)
+    }
+}
+#[tokio::test]
+async fn http_snapshot_placement_has_an_overall_deadline_across_admission_retries() {
+    let mut lab = Lab::new(1000).await;
+    let outcome=std::panic::AssertUnwindSafe(async {
+        for i in 0..3 {lab.lb.app.config.put("peers",&format!("other{i}"),json!({"api_url":lab.cdn.http,"public_payload_url":lab.cdn.http,"cluster_key":lab.cdn.app.options.peer_key})).unwrap();}
+        *lab.cdn.probe.http_snapshot.lock().unwrap()=Some(healthy_http_snapshot(&lab.cdn).await);
+        lab.cdn.probe.reject.store(true,Ordering::SeqCst);lab.cdn.probe.admission_delay_ms.store(2900,Ordering::SeqCst);
+        let response=tokio::time::timeout(Duration::from_secs(9),http_placement(&lab)).await.expect("placement must finish within the shared overall budget");
+        assert_eq!(response.status(),503);assert_eq!(get_actual_node(&lab.cdn).await["reserved"],0);
+        assert_eq!(lab.cdn.app.media.count().await,0);
+    }).catch_unwind().await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p)
+    }
+}
+
+#[tokio::test]
+async fn http_snapshot_fresh_cache_is_invalidated_before_using_a_changed_peer_key() {
+    let mut lab = Lab::new(1000).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        lab.cdn.measured().await;
+        let primed_at = std::time::Instant::now();
+        assert_eq!(http_placement(&lab).await.status(), 302);
+        assert_eq!(lab.cdn.probe.http_polls.load(Ordering::SeqCst), 1);
+        lab.lb
+            .app
+            .config
+            .put(
+                "peers",
+                "edge",
+                json!({"cluster_key":"changed-invalid-peer-key"}),
+            )
+            .unwrap();
+        assert_eq!(http_placement(&lab).await.status(), 503);
+        assert!(
+            primed_at.elapsed() < Duration::from_secs(1),
+            "freshness must be established independently of invalidation"
+        );
+        assert_eq!(
+            lab.cdn.probe.http_polls.load(Ordering::SeqCst),
+            2,
+            "saved key must force another authenticated observation"
+        );
+        assert_eq!(
+            lab.cdn.probe.admits.load(Ordering::SeqCst),
+            1,
+            "a failed refreshed observation cannot attempt admission"
+        );
+        assert_eq!(get_actual_node(&lab.cdn).await["reserved"], 1);
+    })
+    .catch_unwind()
+    .await;
+    lab.stop().await;
+    if let Err(p) = outcome {
         std::panic::resume_unwind(p)
     }
 }

@@ -97,6 +97,7 @@ pub struct App {
     pub playback_auth: PlaybackAuth,
     reservations: Mutex<HashMap<String, Reservation>>,
     rtsp_routes: rtsp_balancer::Registry,
+    http_routes: http_balancer::Registry,
     routing_rotation: TieRotation,
     pub egress: Arc<AtomicU64>,
     pub rtsp_egress: Arc<AtomicU64>,
@@ -160,6 +161,7 @@ impl App {
             playback_auth: PlaybackAuth::new(options.client_limit as usize),
             reservations: Mutex::new(HashMap::new()),
             rtsp_routes: rtsp_balancer::Registry::default(),
+            http_routes: http_balancer::Registry::default(),
             routing_rotation: TieRotation::default(),
             egress: Arc::new(AtomicU64::new(0)),
             rtsp_egress: Arc::new(AtomicU64::new(0)),
@@ -910,10 +912,33 @@ async fn balance(
     path: &str,
     query: &HashMap<String, String>,
     secure: bool,
+    grant: &Grant,
+    revision: u64,
 ) -> Response {
+    let work = balance_inner(app, name, path, query, secure, grant, revision);
+    tokio::select! { biased;
+        _=grant.cancelled()=>error(StatusCode::FORBIDDEN,"playback policy changed"),
+        result=tokio::time::timeout(Duration::from_secs(8),work)=>result.unwrap_or_else(|_|error(StatusCode::SERVICE_UNAVAILABLE,"placement deadline exceeded")),
+    }
+}
+async fn balance_inner(
+    app: &Arc<App>,
+    name: &str,
+    path: &str,
+    query: &HashMap<String, String>,
+    secure: bool,
+    grant: &Grant,
+    revision: u64,
+) -> Response {
+    use futures_util::StreamExt;
     let root = app.config.snapshot();
     let peers = root["peers"].as_array().cloned().unwrap_or_default();
-    let probes_started = Instant::now();
+    if peers.len() > 64 || app.config.revision() != revision {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "routing configuration changed",
+        );
+    }
     let calls = peers.into_iter().map(|p| {
         let app = app.clone();
         let name = name.to_owned();
@@ -931,55 +956,59 @@ async fn balance(
             {
                 return None;
             }
-            let api = p["api_url"].as_str()?;
-            let key = p["cluster_key"].as_str().unwrap_or(&app.options.peer_key);
-            let client = app.cluster_client(&p).ok()?;
-            let r = client
-                .get(format!(
-                    "{}/flussonix/api/v1/node",
-                    api.trim_end_matches('/')
-                ))
-                .header("X-Flussonix-Peer", key)
-                .send()
-                .await
-                .ok()?;
-            if !r.status().is_success() {
-                return None;
-            }
-            let n = r.json::<Value>().await.ok()?;
-            let ready = n["streams"]
-                .as_array()
-                .is_some_and(|a| a.iter().any(|s| s["name"] == name && s["ready"] == true));
-            Some((n, p, ready))
+            let snapshot = app.http_snapshot(&p, revision).await?;
+            let ready = snapshot.ready.contains(&name);
+            Some((snapshot, p, ready))
         }
     });
-    let observations = futures_util::future::join_all(calls)
-        .await
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+    let mut calls = futures_util::stream::iter(calls).buffer_unordered(8);
+    let deadline = tokio::time::sleep(Duration::from_millis(4500));
+    tokio::pin!(deadline);
+    let mut observations = Vec::new();
+    loop {
+        let result = tokio::select! {biased; _=&mut deadline=>break,result=calls.next()=>result};
+        let Some(result) = result else {
+            break;
+        };
+        if let Some(observation) = result {
+            observations.push(observation);
+        }
+    }
+    drop(calls);
     let mut attempted = std::collections::HashSet::new();
     let mut turn = None;
     loop {
         // A failed admission can consume the remaining sample lifetime. Reproject
         // every observed candidate, including those the previous cost excluded.
-        let elapsed_ms = probes_started
-            .elapsed()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX);
+        if grant.is_cancelled() {
+            return error(StatusCode::FORBIDDEN, "playback policy changed");
+        }
+        if app.config.revision() != revision {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "routing configuration changed",
+            );
+        }
+        let observed_at = Instant::now();
+        let elapsed = |snapshot: &http_balancer::Snapshot| {
+            observed_at
+                .duration_since(snapshot.when)
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX)
+        };
         let valid = observations
             .iter()
-            .filter(|(n, p, ready)| {
+            .filter(|(snapshot, p, ready)| {
                 p["hostname"]
                     .as_str()
                     .and_then(|id| {
                         NodeLoad::from_telemetry(
                             id,
-                            n,
+                            &snapshot.value,
                             *ready,
                             p["drain"] == true,
-                            elapsed_ms,
+                            elapsed(snapshot),
                             crate::cluster::FALLBACK_MBPS,
                         )
                     })
@@ -988,7 +1017,9 @@ async fn balance(
             .collect::<Vec<_>>();
         let bitrate_mbps = valid
             .iter()
-            .filter_map(|(n, _, _)| crate::cluster::observed_bitrate(n, name, elapsed_ms))
+            .filter_map(|(snapshot, _, _)| {
+                crate::cluster::observed_bitrate(&snapshot.value, name, elapsed(snapshot))
+            })
             .fold(crate::cluster::FALLBACK_MBPS, f64::max);
         if !bitrate_mbps.is_finite() || bitrate_mbps > crate::cluster::MAX_HINT_MBPS {
             return error(
@@ -997,7 +1028,7 @@ async fn balance(
             );
         }
         let mut nodes = Vec::new();
-        for (n, p, ready) in valid {
+        for (snapshot, p, ready) in valid {
             if p["hostname"]
                 .as_str()
                 .is_some_and(|id| attempted.contains(id))
@@ -1007,10 +1038,10 @@ async fn balance(
             let Some(load) = p["hostname"].as_str().and_then(|name| {
                 NodeLoad::from_telemetry(
                     name,
-                    n,
+                    &snapshot.value,
                     *ready,
                     p["drain"] == true,
-                    elapsed_ms,
+                    elapsed(snapshot),
                     bitrate_mbps,
                 )
             }) else {
@@ -1044,6 +1075,15 @@ async fn balance(
         if let Ok(r) = response {
             if r.status().is_success() {
                 if let Ok(body) = r.json::<Value>().await {
+                    if grant.is_cancelled() {
+                        return error(StatusCode::FORBIDDEN, "playback policy changed");
+                    }
+                    if app.config.revision() != revision {
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "routing configuration changed",
+                        );
+                    }
                     if let (Some(public), Some(ticket)) =
                         (p["public_payload_url"].as_str(), body["ticket"].as_str())
                     {
@@ -1215,14 +1255,14 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     }
     // Authorization can await a callback while an equivalent-origin switch
     // changes media without changing the root revision or viewer policy.
-    let Some((cfg, _)) = app.media_config(name).await else {
+    let Some((cfg, revision)) = app.media_config(name).await else {
         return error(StatusCode::NOT_FOUND, "stream unavailable");
     };
     if grant.is_cancelled() {
         return error(StatusCode::FORBIDDEN, "playback policy changed");
     }
     if app.options.role == "lb" {
-        return balance(&app, name, raw_path, &query, secure).await;
+        return balance(&app, name, raw_path, &query, secure, &grant, revision).await;
     }
     if let Some(ticket) = query.get("flussonix_ticket") {
         let mut reservations = app.reservations.lock().await;
@@ -1595,4 +1635,5 @@ pub(crate) mod ts_access;
 
 pub(crate) mod publication;
 
+mod http_balancer;
 pub(crate) mod rtsp_balancer;
