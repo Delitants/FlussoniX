@@ -112,6 +112,7 @@ struct Probe {
     key: String,
     auth_queries: Mutex<Vec<std::collections::HashMap<String, String>>>,
     auth_target: Mutex<Option<String>>,
+    routing_delay_ms: AtomicUsize,
 }
 async fn intercept(State(p): State<Arc<Probe>>, r: Request<Body>, next: Next) -> Response {
     let path = r.uri().path();
@@ -151,6 +152,10 @@ async fn intercept(State(p): State<Arc<Probe>>, r: Request<Body>, next: Next) ->
         }
         if path.ends_with("rtsp-routing") {
             p.polls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(
+                p.routing_delay_ms.load(Ordering::SeqCst) as u64,
+            ))
+            .await;
             if p.stall.load(Ordering::SeqCst) {
                 p.release.notified().await;
             }
@@ -794,6 +799,143 @@ async fn reservations_expire_and_rpc_requires_peer_protocol_and_content_route() 
 async fn invalidate(lab: &Lab) {
     let peer = lab.lb.app.config.snapshot()["peers"][0].clone();
     lab.lb.app.config.put("peers", "edge", peer).unwrap();
+}
+
+#[tokio::test]
+async fn fresh_stream_bitrate_is_applied_to_cold_http_rtsp_and_rtsps_candidates() {
+    let mut lab = Lab::new(1000).await;
+    let mut alternative = Node::new("cdn", 1000).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        alternative.app.config.put("sources", "origin", lab.cdn.app.config.snapshot()["sources"][0].clone()).unwrap();
+        alternative.measured().await;
+        lab.lb.app.config.put("peers", "alternate", json!({"api_url":alternative.http,"public_payload_url":alternative.http,"cluster_key":alternative.app.options.peer_key,"flussonix_rtsp_url":alternative.plain,"flussonix_rtsps_url":alternative.tls})).unwrap();
+        let mut edge = get_node(&lab.cdn).await;
+        let mut other = get_node(&alternative).await;
+        for snapshot in [&mut edge, &mut other] {
+            snapshot["cpu"] = json!(0.1); snapshot["ram"] = json!(0.1);
+            snapshot["age_ms"] = json!(0); snapshot["reserved"] = json!(0);
+            snapshot["reserved_mbps"] = json!(0);
+        }
+        // Warm, smaller edge cannot carry this stream. Its measured cost also
+        // applies to the cold, larger edge, which has no local measurement yet.
+        edge["uplink"] = json!(0.7); edge["uplink_mbps"] = json!(100);
+        edge["ready"] = json!(["region/owned"]);
+        edge["streams"] = json!([{"name":"region/owned","ready":true}]);
+        edge["stream_bitrates"] = json!({"region/owned":{"mbps":20.0,"age_ms":0}});
+        other["uplink"] = json!(0.8); other["uplink_mbps"] = json!(1000);
+        other["ready"] = json!([]); other["streams"] = json!([]);
+        other["stream_bitrates"] = json!({});
+        invalidate(&lab).await;
+        alternative.measured().await;
+        *lab.cdn.probe.http_snapshot.lock().unwrap() = Some(edge.clone());
+        *alternative.probe.http_snapshot.lock().unwrap() = Some(other.clone());
+        *lab.cdn.probe.snapshot.lock().unwrap() = Some(edge);
+        *alternative.probe.snapshot.lock().unwrap() = Some(other);
+        let response = client().get(format!("{}/region/owned/index.m3u8?{QS}",lab.lb.http)).send().await.unwrap();
+        assert_eq!(response.status(),302);
+        let target = response.headers()["location"].to_str().unwrap();
+        assert!(target.starts_with(&alternative.http), "HTTP chose {target}");
+        for secure in [false,true] {
+            let target = location(&lab.lb.describe(secure,"region/owned",QS).await);
+            assert!(target.starts_with(if secure { &alternative.tls } else { &alternative.plain }), "RTSP chose {target}");
+            assert!(url::Url::parse(&target).unwrap().query_pairs().any(|(k,v)|k=="token"&&v=="owned+viewer"));
+            assert!(!target.contains(&alternative.app.options.peer_key));
+        }
+        // Bypass the advisory snapshot to inspect the actual CDN ledger.
+        *alternative.probe.http_snapshot.lock().unwrap() = None;
+        let ledger = get_node(&alternative).await;
+        assert_eq!(ledger["reserved"],3);
+        assert_eq!(ledger["reserved_mbps"],75.0);
+        assert_eq!(lab.cdn.probe.admits.load(Ordering::SeqCst),0);
+        assert!(!alternative.probe.bad_key.load(Ordering::SeqCst));
+        for node in [&lab.source,&lab.cdn,&lab.lb,&alternative] { assert_eq!(node.app.media.count().await,0); }
+    }).catch_unwind().await;
+    alternative.stop().await;
+    lab.stop().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn stale_stream_bitrate_and_source_only_observations_cannot_raise_delivery_cost() {
+    let mut lab = Lab::new(1000).await;
+    let mut alternative = Node::new("cdn", 1000).await;
+    let outcome=std::panic::AssertUnwindSafe(async {
+        lab.lb.app.config.put("peers","alternate",json!({"api_url":alternative.http,"public_payload_url":alternative.http,"cluster_key":alternative.app.options.peer_key,"flussonix_rtsp_url":alternative.plain,"flussonix_rtsps_url":alternative.tls})).unwrap();
+        let mut edge=get_node(&lab.cdn).await;
+        edge["cpu"]=json!(0.1);edge["ram"]=json!(0.1);edge["uplink"]=json!(0.1);
+        edge["age_ms"]=json!(0);edge["reserved"]=json!(0);edge["reserved_mbps"]=json!(0);edge["ready"]=json!([]);
+        edge["stream_bitrates"]=json!({"region/owned":{"mbps":10000,"age_ms":3001}});
+        let mut other=edge.clone();other["role"]=json!("source");
+        other["stream_bitrates"]=json!({"region/owned":{"mbps":f64::MAX,"age_ms":0}});
+        *lab.cdn.probe.snapshot.lock().unwrap()=Some(edge);
+        *alternative.probe.http_snapshot.lock().unwrap()=Some(other.clone());
+        *alternative.probe.snapshot.lock().unwrap()=Some(other);
+        invalidate(&lab).await;
+        // Configuration fsync can delay this single-thread fixture's metric
+        // timer. Warm the real admission node after all persisted edits, then
+        // install the separate advisory HTTP observation.
+        lab.cdn.measured().await;
+        let edge=lab.cdn.probe.snapshot.lock().unwrap().clone().unwrap();
+        *lab.cdn.probe.http_snapshot.lock().unwrap()=Some(edge);
+        let response=client().get(format!("{}/region/owned/index.m3u8?{QS}",lab.lb.http)).send().await.unwrap();
+        if response.status()!=302 {
+            let status=response.status();let error=response.text().await.unwrap();
+            *lab.cdn.probe.http_snapshot.lock().unwrap()=None;
+            let actual=get_node(&lab.cdn).await;
+            panic!("HTTP status {status}, error {error}, edge admits {}, real CDN CPU {}, RAM {}, uplink {}",lab.cdn.probe.admits.load(Ordering::SeqCst),actual["cpu"],actual["ram"],actual["uplink"]);
+        }
+        assert!(response.headers()["location"].to_str().unwrap().starts_with(&lab.cdn.http));
+        for secure in [false,true] {
+            let target=location(&lab.lb.describe(secure,"region/owned",QS).await);
+            assert!(target.starts_with(if secure {&lab.cdn.tls}else{&lab.cdn.plain}));
+        }
+        *lab.cdn.probe.http_snapshot.lock().unwrap()=None;
+        let ledger=get_node(&lab.cdn).await;
+        assert_eq!(ledger["reserved"],3);assert_eq!(ledger["reserved_mbps"],6.0);
+        assert_eq!(alternative.probe.admits.load(Ordering::SeqCst),0);
+        for node in [&lab.source,&lab.cdn,&lab.lb,&alternative]{assert_eq!(node.app.media.count().await,0);}
+    }).catch_unwind().await;
+    alternative.stop().await;
+    lab.stop().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn rtsp_stream_rate_expires_during_a_slow_snapshot_response() {
+    let mut lab = Lab::new(1000).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let mut snapshot = get_node(&lab.cdn).await;
+        snapshot["ready"] = json!([]);
+        snapshot["stream_bitrates"] = json!({"region/owned":{"mbps":20,"age_ms":2980}});
+        snapshot["cpu"] = json!(0.1);
+        snapshot["ram"] = json!(0.1);
+        snapshot["uplink"] = json!(0.1);
+        snapshot["age_ms"] = json!(0);
+        *lab.cdn.probe.snapshot.lock().unwrap() = Some(snapshot);
+        lab.cdn.probe.routing_delay_ms.store(80, Ordering::SeqCst);
+        invalidate(&lab).await;
+        lab.cdn.measured().await;
+        let target = location(&lab.lb.describe(false, "region/owned", QS).await);
+        assert!(target.starts_with(&lab.cdn.plain));
+        let ledger = get_node(&lab.cdn).await;
+        assert_eq!(
+            ledger["reserved_mbps"], 2.0,
+            "a delayed observation must not acquire a fresh timestamp"
+        );
+        for node in [&lab.source, &lab.cdn, &lab.lb] {
+            assert_eq!(node.app.media.count().await, 0);
+        }
+    })
+    .catch_unwind()
+    .await;
+    lab.stop().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 // Exercise real authenticated placement/admission with controlled advisory telemetry.

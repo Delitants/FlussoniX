@@ -108,6 +108,9 @@ impl App {
         let key = peer["cluster_key"]
             .as_str()
             .unwrap_or(&self.options.peer_key);
+        // Start the observation clock before the request. Response latency must
+        // consume freshness rather than granting an old output rate a new age.
+        let when = Instant::now();
         let mut response = client
             .get(format!(
                 "{}/flussonix/api/v1/rtsp-routing",
@@ -141,11 +144,7 @@ impl App {
         if self.config.revision() != revision {
             return None;
         }
-        let snapshot = Arc::new(Snapshot {
-            when: Instant::now(),
-            value,
-            ready,
-        });
+        let snapshot = Arc::new(Snapshot { when, value, ready });
         *cache = Some(snapshot.clone());
         Some(snapshot)
     }
@@ -188,7 +187,6 @@ impl App {
         if peers.len() > 64 || self.config.revision() != revision {
             return Err(503);
         }
-        let mut nodes = Vec::new();
         let mut choices = HashMap::new();
         let calls = peers.into_iter().map(|peer| async move {
             let public = if secure {
@@ -239,20 +237,69 @@ impl App {
                 snapshot.when.elapsed().as_millis().try_into().ok()?,
                 2.0,
             )?;
-            Some((load, peer, target, encrypted))
+            (load.age_ms <= 10000).then_some((snapshot, peer, target, encrypted))
         });
         let mut calls = futures_util::stream::iter(calls).buffer_unordered(8);
         let snapshot_deadline = tokio::time::sleep(Duration::from_millis(4500));
         tokio::pin!(snapshot_deadline);
+        let mut observations = Vec::new();
         loop {
             let result = tokio::select! { biased; _=&mut snapshot_deadline=>break, result=calls.next()=>result };
             let Some(result) = result else { break };
-            if let Some((load, peer, target, encrypted)) = result {
+            if let Some(observation) = result {
+                observations.push(observation);
+            }
+        }
+        drop(calls); // Cancel unfinished probes; preserve time for admission.
+        let observed_at = Instant::now();
+        let elapsed = |snapshot: &Snapshot| {
+            observed_at
+                .duration_since(snapshot.when)
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX)
+        };
+        let observations = observations
+            .into_iter()
+            .filter(|(snapshot, peer, _, _)| {
+                peer["hostname"]
+                    .as_str()
+                    .and_then(|id| {
+                        NodeLoad::from_telemetry(
+                            id,
+                            &snapshot.value,
+                            snapshot.ready.contains(&viewer.name),
+                            peer["drain"] == true,
+                            elapsed(snapshot),
+                            crate::cluster::FALLBACK_MBPS,
+                        )
+                    })
+                    .is_some_and(|load| load.age_ms <= 10000)
+            })
+            .collect::<Vec<_>>();
+        let bitrate_mbps = observations
+            .iter()
+            .filter_map(|(snapshot, _, _, _)| {
+                crate::cluster::observed_bitrate(&snapshot.value, &viewer.name, elapsed(snapshot))
+            })
+            .fold(crate::cluster::FALLBACK_MBPS, f64::max);
+        if !bitrate_mbps.is_finite() || bitrate_mbps > crate::cluster::MAX_HINT_MBPS {
+            return Err(503);
+        }
+        let mut nodes = Vec::new();
+        for (snapshot, peer, target, encrypted) in observations {
+            if let Some(load) = NodeLoad::from_telemetry(
+                peer["hostname"].as_str().unwrap(),
+                &snapshot.value,
+                snapshot.ready.contains(&viewer.name),
+                peer["drain"] == true,
+                elapsed(&snapshot),
+                bitrate_mbps,
+            ) {
                 choices.insert(load.name.clone(), (peer, target, encrypted));
                 nodes.push(load);
             }
         }
-        drop(calls); // Cancel unfinished probes; preserve time for admission.
         while let Some(id) = select(&nodes, 0.0) {
             if grant.is_cancelled() {
                 return Err(403);
@@ -266,7 +313,7 @@ impl App {
                 .as_str()
                 .unwrap_or(&self.options.peer_key);
             if let Ok(client) = self.cluster_client(peer) {
-                let response=client.post(format!("{}/flussonix/api/v1/admit",api.trim_end_matches('/'))).header("X-Flussonix-Peer",key).json(&json!({"name":viewer.name,"protocol":if *encrypted {"rtsps"} else {"rtsp"},"token_hash":token_hash(viewer),"bitrate_mbps":2.0})).send().await;
+                let response=client.post(format!("{}/flussonix/api/v1/admit",api.trim_end_matches('/'))).header("X-Flussonix-Peer",key).json(&json!({"name":viewer.name,"protocol":if *encrypted {"rtsps"} else {"rtsp"},"token_hash":token_hash(viewer),"bitrate_mbps":bitrate_mbps})).send().await;
                 if let Ok(response) = response {
                     if response.status().is_success()
                         && response.content_length().is_none_or(|n| n <= 16384)

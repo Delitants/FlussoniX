@@ -4,6 +4,7 @@ pub mod config;
 pub mod m4f;
 pub mod m4s;
 pub mod media;
+mod media_rate;
 pub mod playback_auth;
 mod push;
 mod rtsp_push;

@@ -172,7 +172,9 @@ Native RTSP/RTSPS LB routing now uses measured CDN selection and protocol/token-
 Native HTTP and RTSP/RTSPS balancing share [resource-pressure ranking](docs/native-cluster-pressure.md):
 the busiest uplink/CPU/RAM resource determines pressure, ready streams receive
 preference only among similarly loaded nodes, and pending Mbps are included in
-projected delivery load. Final admission remains owned by the CDN.
+projected delivery load. Fresh shared output measurements add 25% headroom
+to the viewer estimate, with a 2 Mbps fallback for unknown or stale streams.
+Final admission remains owned by the CDN and rechecks its local stream cost.
 
 
 Incoming RTSP/RTSPS publications also accept Basic headers and bounded MD5

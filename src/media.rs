@@ -65,6 +65,7 @@ pub struct Worker {
     input_timeout: Duration,
     recovery: std::sync::Mutex<crate::recovery::Recovery>,
     pub bytes: AtomicU64,
+    output_rate: std::sync::Mutex<crate::media_rate::OutputRate>,
     pub viewers: Arc<AtomicU64>,
     pub alive: std::sync::atomic::AtomicBool,
     pub wire: Hub,
@@ -115,6 +116,9 @@ impl Worker {
             "stopped"
         };
         let mut stats = json!({"status":status,"pid":self.pid(),"bytes_in":self.bytes.load(Ordering::Relaxed),"online_clients":self.viewers.load(Ordering::Relaxed),"uptime":self.started.elapsed().as_secs(),"input_protocol":self.input_protocol,"input_index":self.input_index,"restart_count":self.restart_count,"retry_in_ms":recovery.retry_in().map(|d|d.as_millis()),"last_error":recovery.last_error(),"media_age_ms":recovery.media_age_ms(),"subtitle_tracks":self.subtitle_tracks,"hls_subtitles":self.hls_subtitles,"hls_captions":self.captions.as_ref().map(|c|c.stats())});
+        let rate = self.output_bitrate();
+        stats["flussonix_output_mbps"] = json!(rate.map(|r| r.0));
+        stats["flussonix_output_rate_age_ms"] = json!(rate.map(|r| r.1));
         if !self.pushes.is_empty() {
             stats["flussonix_pushes"] =
                 json!(self.pushes.iter().map(|p| p.stats()).collect::<Vec<_>>());
@@ -164,6 +168,12 @@ impl Worker {
             });
         }
         stats
+    }
+    fn output_bitrate(&self) -> Option<(f64, u64)> {
+        if !self.alive.load(Ordering::Relaxed) || self.is_closed() {
+            return None;
+        }
+        self.output_rate.lock().unwrap().snapshot(Instant::now())
     }
 }
 impl Engine {
@@ -745,6 +755,7 @@ impl Engine {
             input_timeout: timeout,
             recovery: std::sync::Mutex::new(crate::recovery::Recovery::new(streak)),
             bytes: AtomicU64::new(0),
+            output_rate: std::sync::Mutex::new(crate::media_rate::OutputRate::default()),
             viewers,
             alive: std::sync::atomic::AtomicBool::new(true),
             wire: Hub::new(),
@@ -965,6 +976,7 @@ impl Engine {
                             if let Some(state)=&w.captions{state.observe_ts(&buffer[..n],&mut output_clock,&mut output_decoder);}
                             w.recovery.lock().unwrap().progress();
                             w.bytes.fetch_add(n as u64, Ordering::Relaxed);
+                            w.output_rate.lock().unwrap().record(Instant::now(), n as u64);
                             let _ = w.tx.send(Bytes::copy_from_slice(&buffer[..n]));
                         }
                     }
@@ -1146,6 +1158,19 @@ impl Engine {
             .get(name)
             .map(|w| w.stats())
             .unwrap_or(json!({"status":"waiting","online_clients":0}))
+    }
+    /// Bounded native telemetry; observing a worker never starts or keeps it alive.
+    pub(crate) async fn output_bitrates(&self) -> Value {
+        let workers = self.workers.lock().await;
+        let rates = workers
+            .iter()
+            .filter_map(|(name, worker)| {
+                let (mbps, age_ms) = worker.output_bitrate()?;
+                Some((name.clone(), json!({"mbps":mbps,"age_ms":age_ms})))
+            })
+            .take(256)
+            .collect::<serde_json::Map<String, Value>>();
+        Value::Object(rates)
     }
     pub async fn rtp_sdp(&self, name: &str, index: usize, cfg: &Value) -> Result<String, String> {
         let definitions = crate::direct_rtp::config::outputs(cfg)?;

@@ -387,6 +387,7 @@ impl App {
             .as_object_mut()
             .unwrap()
             .extend(node.as_object().unwrap().clone());
+        metrics["stream_bitrates"] = self.media.output_bitrates().await;
         metrics
     }
     pub fn sample_metrics(&self) {
@@ -809,6 +810,21 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
         if valid_name(name).is_err() {
             return error(StatusCode::BAD_REQUEST, "invalid name");
         }
+        let hint = match b.get("bitrate_mbps") {
+            None => crate::cluster::FALLBACK_MBPS,
+            Some(value) => match value
+                .as_f64()
+                .filter(|v| v.is_finite() && *v > 0.0 && *v <= crate::cluster::MAX_HINT_MBPS)
+            {
+                Some(value) => value,
+                None => {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "bitrate_mbps must be a number greater than zero and at most 1000000",
+                    );
+                }
+            },
+        };
         let kind = match rtsp_balancer::kind(&b) {
             Ok(kind) => kind,
             Err(message) => return error(StatusCode::BAD_REQUEST, &message),
@@ -828,7 +844,18 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
             }
         }
         let n = app.load_node().await;
-        let bitrate_mbps = b["bitrate_mbps"].as_f64().unwrap_or(2.0).clamp(0.1, 100.0);
+        let bitrate_mbps = hint
+            .max(
+                crate::cluster::observed_bitrate(&n, name, 0)
+                    .unwrap_or(crate::cluster::FALLBACK_MBPS),
+            )
+            .max(crate::cluster::FALLBACK_MBPS);
+        if !bitrate_mbps.is_finite() || bitrate_mbps > crate::cluster::MAX_HINT_MBPS {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "stream cost exceeds admission bounds",
+            );
+        }
         let expected = bitrate_mbps / app.options.uplink_mbps;
         let mut reservations = app.reservations.lock().await;
         reservations.retain(|_, v| v.expires > Instant::now());
@@ -911,19 +938,53 @@ async fn balance(
             Some((n, p, ready))
         }
     });
-    for (n, p, ready) in futures_util::future::join_all(calls)
+    let observations = futures_util::future::join_all(calls)
         .await
         .into_iter()
         .flatten()
-    {
+        .collect::<Vec<_>>();
+    let elapsed_ms = probes_started
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let observations = observations
+        .into_iter()
+        .filter(|(n, p, ready)| {
+            p["hostname"]
+                .as_str()
+                .and_then(|id| {
+                    NodeLoad::from_telemetry(
+                        id,
+                        n,
+                        *ready,
+                        p["drain"] == true,
+                        elapsed_ms,
+                        crate::cluster::FALLBACK_MBPS,
+                    )
+                })
+                .is_some_and(|load| load.age_ms <= 10000)
+        })
+        .collect::<Vec<_>>();
+    let bitrate_mbps = observations
+        .iter()
+        .filter_map(|(n, _, _)| crate::cluster::observed_bitrate(n, name, elapsed_ms))
+        .fold(crate::cluster::FALLBACK_MBPS, f64::max);
+    if !bitrate_mbps.is_finite() || bitrate_mbps > crate::cluster::MAX_HINT_MBPS {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stream cost exceeds admission bounds",
+        );
+    }
+    for (n, p, ready) in observations {
         let Some(load) = p["hostname"].as_str().and_then(|name| {
             NodeLoad::from_telemetry(
                 name,
                 &n,
                 ready,
                 p["drain"] == true,
-                probes_started.elapsed().as_millis().try_into().ok()?,
-                2.0,
+                elapsed_ms,
+                bitrate_mbps,
             )
         }) else {
             continue;
@@ -945,7 +1006,7 @@ async fn balance(
                 api.trim_end_matches('/')
             ))
             .header("X-Flussonix-Peer", key)
-            .json(&json!({"name":name,"bitrate_mbps":2.0}))
+            .json(&json!({"name":name,"bitrate_mbps":bitrate_mbps}))
             .send()
             .await;
         if let Ok(r) = response {

@@ -93,6 +93,27 @@ fn pressure(n: &NodeLoad, expected: f64) -> f64 {
         .max(n.ram / 0.95)
 }
 
+/// Unknown rates retain the migration fallback. Callers validate the enclosing
+/// native node separately before using an observation for other candidates.
+pub(crate) const FALLBACK_MBPS: f64 = 2.0;
+pub(crate) const MAX_HINT_MBPS: f64 = 1_000_000.0;
+pub(crate) fn observed_bitrate(
+    node: &serde_json::Value,
+    name: &str,
+    elapsed_ms: u64,
+) -> Option<f64> {
+    let observation = &node["stream_bitrates"][name];
+    let mbps = observation["mbps"]
+        .as_f64()
+        .filter(|v| v.is_finite() && *v > 0.0)?;
+    let age = observation["age_ms"].as_u64()?.checked_add(elapsed_ms)?;
+    if age > crate::media_rate::MAX_AGE_MS {
+        return None;
+    }
+    // Preserve overflow as an unusable cost, never as a smaller fallback.
+    Some((mbps * 1.25).max(FALLBACK_MBPS))
+}
+
 /// Keep LAN endpoint prefix/query and stream path separate from the selected media scheme.
 pub fn source_input_url(endpoint: &str, name: &str, transport: &str) -> Result<String, String> {
     crate::config::valid_name(name)?;
@@ -137,4 +158,52 @@ pub fn source_input_url(endpoint: &str, name: &str, transport: &str) -> Result<S
         "{scheme}://{}",
         url.as_str().split_once("://").unwrap().1
     ))
+}
+
+#[cfg(test)]
+mod bitrate_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn fresh_output_has_headroom_and_a_floor_with_a_strict_age_boundary() {
+        let node = json!({"stream_bitrates":{"owned":{"mbps":20,"age_ms":2999}}});
+        assert_eq!(observed_bitrate(&node, "owned", 1), Some(25.0));
+        assert_eq!(observed_bitrate(&node, "owned", 2), None);
+        let node = json!({"stream_bitrates":{"owned":{"mbps":0.1,"age_ms":0}}});
+        assert_eq!(observed_bitrate(&node, "owned", 0), Some(2.0));
+        assert_eq!(observed_bitrate(&node, "other", 0), None);
+    }
+    #[test]
+    fn malformed_and_overflowing_ages_are_unknown_but_rate_overflow_fails_closed() {
+        for rate in [json!(null), json!("20"), json!(-1), json!(0), json!([])] {
+            assert_eq!(
+                observed_bitrate(
+                    &json!({"stream_bitrates":{"owned":{"mbps":rate,"age_ms":0}}}),
+                    "owned",
+                    0
+                ),
+                None
+            );
+        }
+        for age in [json!(null), json!("0"), json!(-1), json!(u64::MAX)] {
+            assert_eq!(
+                observed_bitrate(
+                    &json!({"stream_bitrates":{"owned":{"mbps":20,"age_ms":age}}}),
+                    "owned",
+                    1
+                ),
+                None
+            );
+        }
+        let cost = observed_bitrate(
+            &json!({"stream_bitrates":{"owned":{"mbps":f64::MAX,"age_ms":0}}}),
+            "owned",
+            0,
+        )
+        .unwrap();
+        assert!(
+            !cost.is_finite(),
+            "overflow must exclude placement rather than under-reserve using fallback"
+        );
+    }
 }
