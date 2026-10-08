@@ -23,6 +23,8 @@ use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 #[allow(dead_code)]
 #[path = "support/caption_fixture.rs"]
 mod captions;
+#[path = "support/http_gpu_push.rs"]
+mod gpu;
 #[allow(dead_code)]
 #[path = "support/srt_subtitle_oracle.rs"]
 mod subtitle_oracle;

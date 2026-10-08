@@ -13,3 +13,8 @@ This first implementation uses 8-bit software decode and hardware upload; hardwa
 ```
 cargo test --locked --test vaapi_media -- --ignored --test-threads=1
 ```
+
+The same Intel H.264 CQP profile now has independent HTTP/HTTPS publishing and
+GPU→CPU→GPU replacement qualification with AAC/MP2/MP3. See the [named hardware,
+test command and limits](http-ts-push.md#intel-gpu-qualification). Hardware tests
+remain opt-in; this does not install a driver or qualify HEVC on this host.

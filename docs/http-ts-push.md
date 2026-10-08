@@ -90,9 +90,52 @@ verified through the resulting English WebVTT cues. HLS subtitle controls and
 original transport filtering remain separate; this is the existing worker policy,
 not a second subtitle converter inside the HTTP adapter.
 
+## Intel GPU qualification
+
+Opt-in tests qualify the existing shared hardware worker with native HTTP and
+verified HTTPS publishing on Intel GeminiLake UHD Graphics 600 (`8086:3185`),
+Linux `6.17.0-41-generic` / `i915`, `/dev/dri/renderD128`, FFmpeg `7.1.1-1ubuntu4.2`, independent Intel
+media driver `25.3.0+dfsg1-1` and GMM `22.8.1+ds1-1`. The driver and its dependency
+were isolated in private test files; no host package or preview environment was
+changed, and neither is distributed with FlussoniX.
+
+The measured profile is 640×360, 25 fps H.264, software decode/hardware upload,
+`h264_vaapi`, CQP 24, low-power disabled, with independent AAC 96 kb/s, MPEG
+Layer II 192 kb/s or MP3 128 kb/s audio at 48 kHz. Each worker sends both outputs
+simultaneously. Tests verify the running encoder arguments and loaded independent
+Intel driver, exact Basic header/path/query, private-CA HTTPS, template inheritance,
+one reused worker, native destination PID zero and separate HTTP egress counters.
+Independent full decoding requires at least 50 video and 80 audio frames per
+output, changing decoded content, correct codecs and zero decoder errors.
+
+A separate GPU→CPU→GPU replacement test decodes both outputs from all three
+generations and verifies old encoder reaping, socket closure and stopped counters.
+Receivers use unused loopback ports and bounded captures; encoders, decoders and
+receivers are stopped after the tests, including assertion failures. These are
+qualification tests for existing functionality, rather than evidence of a new
+production change or a software-fallback implementation.
+
+With an independently installed working driver environment, run:
+
+```
+cargo test --locked --test http_push gpu:: -- --ignored --test-threads=1 --nocapture
+```
+
+A real unsupported-HEVC replacement also rejects without replacing the running
+H.264 GPU worker, interrupting its HTTP/HTTPS uploads or falling back to CPU.
+
+Hardware tests are explicitly ignored in ordinary CI, whose runners lack this
+device. Passing ordinary CI does not qualify GPU delivery. The same host rejects
+the tested `hevc_vaapi` encoder profile; HEVC GPU publishing remains unqualified.
+CBR, low-power encoding, hardware decode, Main10, NVIDIA, GPU subtitle conversion,
+other hardware/driver versions and production throughput need separate evidence.
+The deployed daemon still needs its own usable independent libVA environment;
+these tests do not install a driver or change its capability/readiness checks.
+
 HLS segment push, M4F/M4S push, HTTP/2, proxy authentication, Digest publishing,
 mutual TLS, automatic certificate rotation, every third-party recorder dialect,
 additional media combinations, WAN faults, long-duration synchronization and
 production throughput/capacity are outside this qualification. Worker CPU/GPU
-selection applies before the adapter; these HTTP tests qualify CPU and copy
-profiles. No official Flussonic runtime component is linked or required.
+selection applies before the adapter; these HTTP tests qualify CPU, copy and the
+named Intel H.264 profile above. No official Flussonic runtime component is linked
+or required.

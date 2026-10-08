@@ -144,6 +144,8 @@ The full product scope and design are recorded in [architecture](docs/architectu
 
 Native M4F/M4S UTF-8 text can be selected by track ID for TS/fMP4 HLS WebVTT conversion, independently of native track preservation. See [native subtitle controls and qualification](docs/native-subtitles.md).
 
+Native HTTP/HTTPS MPEG-TS publishing also has [Intel H.264 VAAPI qualification](docs/http-ts-push.md#intel-gpu-qualification) with AAC/MP2/MP3 and live GPU/CPU replacement. The named device/driver profile is opt-in; ordinary CI and encoder discovery do not establish GPU delivery or production capacity.
+
 Native direct [RTP MPEG-TS receive/transmit](docs/direct-rtp.md) supports PT33 unicast/IPv4 multicast, bounded reorder/pacing, RTCP reports, shared-worker destination fan-out and friendly Streams/Templates controls. [SRTP and SRTCP](docs/direct-srtp.md) add authenticated encryption through independent system libsrtp2 with owner-only key-file references and replay protection. Elementary RTP/SRTP uses static SDP; the profile and qualification limits are documented separately from RTSP.
 
 Internal [VAAPI encoding](docs/vaapi.md) adds selected render devices, low-power and quality/bitrate controls with profile-specific readiness checks. Actual H.264 worker encoding was decoded independently on native and HLS outputs with AAC/Layer II/MP3 audio; hardware HEVC remains host-dependent and unqualified on the tested iGPU.
