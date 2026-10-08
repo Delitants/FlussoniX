@@ -334,11 +334,9 @@ impl App {
             if let Ok(client) = self.cluster_client(peer) {
                 let response=client.post(format!("{}/flussonix/api/v1/admit",api.trim_end_matches('/'))).header("X-Flussonix-Peer",key).json(&json!({"name":viewer.name,"protocol":if *encrypted {"rtsps"} else {"rtsp"},"token_hash":token_hash(viewer),"bitrate_mbps":bitrate_mbps})).send().await;
                 if let Ok(response) = response {
-                    if response.status().is_success()
-                        && response.content_length().is_none_or(|n| n <= 16384)
-                    {
+                    if response.status().is_success() {
                         // Bound streamed admission replies as well as announced lengths.
-                        let body = bounded_admission(response).await;
+                        let body = super::admission::read_json(response).await;
                         if let Some(ticket) = body
                             .as_ref()
                             .and_then(|b| b["ticket"].as_str())
@@ -361,16 +359,6 @@ impl App {
         }
         Err(503)
     }
-}
-async fn bounded_admission(mut response: reqwest::Response) -> Option<Value> {
-    let mut bytes = vec![];
-    while let Some(chunk) = response.chunk().await.ok()? {
-        if bytes.len().checked_add(chunk.len())? > 16384 {
-            return None;
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    serde_json::from_slice(&bytes).ok()
 }
 fn append_ticket(target: &str, ticket: &str) -> String {
     format!(

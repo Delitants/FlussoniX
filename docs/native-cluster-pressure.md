@@ -82,10 +82,14 @@ later peer; the shared semaphore still limits network probes to eight.
 
 Collection ends after 4.5 seconds, preserving successful observations and
 cancelling unfinished probes. Placement has an eight-second overall deadline
-and keeps existing three-second admission request timeouts. Live grant
-revocation cancels placement; configuration edits and late replies cannot
-publish obsolete redirects. An unused reservation created just before a change
-expires through the existing five-second CDN ledger. HTTPS destinations and
+and keeps existing three-second admission request timeouts. HTTP, HTTPS, RTSP
+and RTSPS admission JSON replies share a 16 KiB limit, checked against announced
+lengths and accumulated chunks. A larger reply cannot authorize a redirect;
+placement tries another eligible CDN using its own reservation. Exactly 16 KiB
+remains accepted. Live grant revocation cancels placement; configuration edits
+and late replies cannot publish obsolete redirects. An unused reservation from
+a rejected reply or a configuration change expires through the existing
+five-second CDN ledger, without starting media. HTTPS destinations and
 management CA/identity checks retain the existing no-downgrade and no-redirect
 rules. Probes and reservations start no media worker.
 

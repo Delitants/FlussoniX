@@ -126,6 +126,9 @@ struct Probe {
     routing_delay_ms: AtomicUsize,
     admission_delay_ms: AtomicUsize,
     admission_statuses: Mutex<Vec<u16>>,
+    admission_body_size: AtomicUsize,
+    admission_chunked: AtomicBool,
+    admission_tickets: Mutex<Vec<String>>,
 }
 struct HttpProbeGuard(Arc<Probe>);
 impl Drop for HttpProbeGuard {
@@ -239,6 +242,35 @@ async fn intercept(State(p): State<Arc<Probe>>, r: Request<Body>, next: Next) ->
             .lock()
             .unwrap()
             .push(response.status().as_u16());
+        let target = p.admission_body_size.load(Ordering::SeqCst);
+        if response.status().is_success() && target != 0 {
+            // Alter only framing/size after the real CDN issues its reservation.
+            let (mut parts, body) = response.into_parts();
+            let bytes = axum::body::to_bytes(body, 16384).await.unwrap();
+            let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+            p.admission_tickets
+                .lock()
+                .unwrap()
+                .push(value["ticket"].as_str().unwrap().into());
+            value["padding"] = json!("");
+            let length = serde_json::to_vec(&value).unwrap().len();
+            assert!(target >= length);
+            value["padding"] = json!("x".repeat(target - length));
+            let bytes = serde_json::to_vec(&value).unwrap();
+            assert_eq!(bytes.len(), target);
+            if p.admission_chunked.load(Ordering::SeqCst) {
+                parts.headers.remove("content-length");
+                let chunks = bytes
+                    .chunks(4096)
+                    .map(|c| Ok::<_, std::convert::Infallible>(bytes::Bytes::copy_from_slice(c)))
+                    .collect::<Vec<_>>();
+                return Response::from_parts(parts, Body::from_stream(tokio_stream::iter(chunks)));
+            }
+            parts
+                .headers
+                .insert("content-length", target.to_string().parse().unwrap());
+            return Response::from_parts(parts, Body::from(bytes));
+        }
     }
     response
 }
@@ -2354,5 +2386,288 @@ async fn http_snapshot_fresh_cache_is_invalidated_before_using_a_changed_peer_ke
     lab.stop().await;
     if let Err(p) = outcome {
         std::panic::resume_unwind(p)
+    }
+}
+
+async fn admission_fixture_peer(lab: &mut Lab, secure: bool) -> (String, reqwest::Client) {
+    let api = if secure {
+        lab.cdn.secure_media().await
+    } else {
+        lab.cdn.http.clone()
+    };
+    lab.lb.app.config.put("peers", "edge", json!({"api_url":api,"public_payload_url":api,"flussonix_tls_ca":if secure { json!(lab.cdn.cert.ca) } else { Value::Null }})).unwrap();
+    *lab.cdn.probe.http_snapshot.lock().unwrap() = Some(healthy_http_snapshot(&lab.cdn).await);
+    if secure {
+        let base = lab.lb.secure_delivery().await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(12))
+            .use_preconfigured_tls((*lab.lb.cert.client()).clone())
+            .build()
+            .unwrap();
+        (base, client)
+    } else {
+        (lab.lb.http.clone(), client())
+    }
+}
+async fn oversized_http_admission_is_rejected(chunked: bool) {
+    let mut lab = Lab::new(1000).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        lab.cdn
+            .probe
+            .admission_body_size
+            .store(16385, Ordering::SeqCst);
+        lab.cdn
+            .probe
+            .admission_chunked
+            .store(chunked, Ordering::SeqCst);
+        for (i, secure) in [false, true].into_iter().enumerate() {
+            let (base, http) = admission_fixture_peer(&mut lab, secure).await;
+            // Confirm the actual wire framing and real admission before placement.
+            let direct = client()
+                .post(format!("{}/flussonix/api/v1/admit", lab.cdn.http))
+                .header("X-Flussonix-Peer", &lab.cdn.app.options.peer_key)
+                .json(&json!({"name":"region/owned","bitrate_mbps":2}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(direct.status(), 200);
+            assert_eq!(
+                direct.content_length(),
+                if chunked { None } else { Some(16385) }
+            );
+            let bytes = direct.bytes().await.unwrap();
+            assert_eq!(bytes.len(), 16385);
+            let issued: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(uuid::Uuid::parse_str(issued["ticket"].as_str().unwrap()).is_ok());
+            let response = http
+                .get(format!("{base}/region/owned/index.m3u8?{QS}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                503,
+                "oversized CDN admission must not redirect (TLS={secure}, chunked={chunked})"
+            );
+            assert!(!response.headers().contains_key("location"));
+            assert_eq!(
+                lab.cdn.probe.admission_statuses.lock().unwrap().as_slice(),
+                vec![200; 2 * (i + 1)]
+            );
+            assert_eq!(
+                get_actual_node(&lab.cdn).await["reserved"],
+                2 * (i + 1),
+                "unused real reservations retain their normal short expiry"
+            );
+            for node in [&lab.lb, &lab.cdn, &lab.source] {
+                assert_eq!(node.app.media.count().await, 0);
+            }
+            assert_eq!(lab.lb.app.playback_auth.live_grants(), 0);
+        }
+        assert!(!lab.cdn.probe.bad_key.load(Ordering::SeqCst));
+    })
+    .catch_unwind()
+    .await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p);
+    }
+}
+// Missing announced-length or accumulated-chunk limits must cause these to fail.
+#[tokio::test]
+async fn http_admission_rejects_oversized_announced_json_for_plain_and_tls_viewers() {
+    oversized_http_admission_is_rejected(false).await;
+}
+#[tokio::test]
+async fn http_admission_rejects_oversized_chunked_json_for_plain_and_tls_viewers() {
+    oversized_http_admission_is_rejected(true).await;
+}
+#[tokio::test]
+async fn http_admission_accepts_exact_limit_with_announced_and_chunked_tls_replies() {
+    let mut lab = Lab::new(1000).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        lab.cdn
+            .probe
+            .admission_body_size
+            .store(16384, Ordering::SeqCst);
+        let mut count = 0;
+        for secure in [false, true] {
+            let (base, http) = admission_fixture_peer(&mut lab, secure).await;
+            for chunked in [false, true] {
+                lab.cdn
+                    .probe
+                    .admission_chunked
+                    .store(chunked, Ordering::SeqCst);
+                let response = http
+                    .get(format!("{base}/region/owned/index.m3u8?{QS}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 302);
+                let target =
+                    url::Url::parse(response.headers()["location"].to_str().unwrap()).unwrap();
+                assert_eq!(target.scheme(), if secure { "https" } else { "http" });
+                assert_eq!(target.path(), "/region/owned/index.m3u8");
+                let query = target
+                    .query_pairs()
+                    .collect::<std::collections::HashMap<_, _>>();
+                assert_eq!(query["token"], "owned+viewer");
+                assert_eq!(query["customer"], "a&b");
+                let ticket = query["flussonix_ticket"].as_ref();
+                assert!(uuid::Uuid::parse_str(ticket).is_ok());
+                assert_eq!(
+                    lab.cdn
+                        .probe
+                        .admission_tickets
+                        .lock()
+                        .unwrap()
+                        .last()
+                        .unwrap(),
+                    ticket
+                );
+                count += 1;
+                assert_eq!(get_actual_node(&lab.cdn).await["reserved"], count);
+                for node in [&lab.lb, &lab.cdn, &lab.source] {
+                    assert_eq!(node.app.media.count().await, 0);
+                }
+            }
+        }
+        let tickets = lab.cdn.probe.admission_tickets.lock().unwrap();
+        assert_eq!(
+            tickets
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4
+        );
+        assert_eq!(
+            lab.cdn.probe.admission_statuses.lock().unwrap().as_slice(),
+            [200; 4]
+        );
+        assert_eq!(lab.lb.app.playback_auth.live_grants(), 0);
+        assert!(!lab.cdn.probe.bad_key.load(Ordering::SeqCst));
+    })
+    .catch_unwind()
+    .await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p);
+    }
+}
+async fn oversized_http_admission_falls_back(chunked: bool) {
+    let mut lab = Lab::new(1000).await;
+    let mut alternative = tied_delivery_peer(&lab).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        lab.cdn.probe.admission_body_size.store(16385, Ordering::SeqCst);
+        lab.cdn.probe.admission_chunked.store(chunked, Ordering::SeqCst);
+        alternative.probe.admission_body_size.store(16384, Ordering::SeqCst);
+        for (i, secure) in [false, true].into_iter().enumerate() {
+            let (base, http) = admission_fixture_peer(&mut lab, secure).await;
+            let api = if secure { alternative.secure_media().await } else { alternative.http.clone() };
+            lab.lb.app.config.put("peers", "alternate", json!({"api_url":api,"public_payload_url":api,"flussonix_tls_ca":if secure { json!(alternative.cert.ca) } else { Value::Null }})).unwrap();
+            let mut other = healthy_http_snapshot(&alternative).await;
+            other["uplink"] = json!(0.4);
+            *alternative.probe.http_snapshot.lock().unwrap() = Some(other);
+            let response = http.get(format!("{base}/region/owned/index.m3u8?{QS}")).send().await.unwrap();
+            assert_eq!(response.status(), 302);
+            let destination = response.headers()["location"].to_str().unwrap();
+            assert!(destination.starts_with(&format!("{api}/region/owned/index.m3u8?")), "must fall back after oversized admission: {destination}");
+            let parsed = url::Url::parse(destination).unwrap();
+            assert_eq!(parsed.scheme(), if secure { "https" } else { "http" });
+            let query = parsed.query_pairs().collect::<std::collections::HashMap<_,_>>();
+            assert_eq!(query["token"], "owned+viewer");
+            let ticket = query["flussonix_ticket"].as_ref();
+            assert!(uuid::Uuid::parse_str(ticket).is_ok());
+            assert_eq!(alternative.probe.admission_tickets.lock().unwrap().last().unwrap(), ticket);
+            assert_ne!(lab.cdn.probe.admission_tickets.lock().unwrap().last().unwrap(), ticket);
+            for node in [&lab.cdn, &alternative] {
+                assert_eq!(node.probe.admission_statuses.lock().unwrap().as_slice(), vec![200; i+1]);
+                assert_eq!(get_actual_node(node).await["reserved"], i+1);
+                assert!(!node.probe.bad_key.load(Ordering::SeqCst));
+            }
+            for node in [&lab.lb, &lab.cdn, &lab.source, &alternative] { assert_eq!(node.app.media.count().await, 0); }
+            assert_eq!(lab.lb.app.playback_auth.live_grants(), 0);
+        }
+    }).catch_unwind().await;
+    alternative.stop().await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p);
+    }
+}
+#[tokio::test]
+async fn http_admission_oversized_announced_reply_retries_another_cdn_with_its_own_ticket() {
+    oversized_http_admission_falls_back(false).await;
+}
+#[tokio::test]
+async fn http_admission_oversized_chunked_reply_retries_another_cdn_with_its_own_ticket() {
+    oversized_http_admission_falls_back(true).await;
+}
+
+#[tokio::test]
+async fn rtsp_admission_preserves_announced_and_chunked_reply_limits_for_both_transports() {
+    let mut lab = Lab::new(1000).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let mut count = 0;
+        for secure in [false, true] {
+            for (size, chunked, status) in [
+                (16384, false, 302),
+                (16384, true, 302),
+                (16385, false, 503),
+                (16385, true, 503),
+            ] {
+                lab.cdn
+                    .probe
+                    .admission_body_size
+                    .store(size, Ordering::SeqCst);
+                lab.cdn
+                    .probe
+                    .admission_chunked
+                    .store(chunked, Ordering::SeqCst);
+                let reply = lab.lb.describe(secure, "region/owned", QS).await;
+                assert_eq!(
+                    reply.0, status,
+                    "RTSP admission bounds changed (TLS={secure}, size={size}, chunked={chunked})"
+                );
+                if status == 302 {
+                    let target = url::Url::parse(&location(&reply)).unwrap();
+                    assert_eq!(target.scheme(), if secure { "rtsps" } else { "rtsp" });
+                    let ticket = target
+                        .query_pairs()
+                        .find_map(|(k, v)| (k == "flussonix_ticket").then(|| v.into_owned()))
+                        .unwrap();
+                    assert_eq!(
+                        lab.cdn
+                            .probe
+                            .admission_tickets
+                            .lock()
+                            .unwrap()
+                            .last()
+                            .unwrap(),
+                        &ticket
+                    );
+                } else {
+                    assert!(!reply.1.contains("Location:"));
+                }
+                count += 1;
+                assert_eq!(get_actual_node(&lab.cdn).await["reserved"], count);
+            }
+        }
+        assert_eq!(
+            lab.cdn.probe.admission_statuses.lock().unwrap().as_slice(),
+            [200; 8]
+        );
+        for node in [&lab.lb, &lab.cdn, &lab.source] {
+            assert_eq!(node.app.media.count().await, 0);
+        }
+        assert_eq!(lab.lb.app.playback_auth.live_grants(), 0);
+    })
+    .catch_unwind()
+    .await;
+    lab.stop().await;
+    if let Err(p) = outcome {
+        std::panic::resume_unwind(p);
     }
 }

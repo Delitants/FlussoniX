@@ -1076,7 +1076,7 @@ async fn balance_inner(
             .await;
         if let Ok(r) = response {
             if r.status().is_success() {
-                if let Ok(body) = r.json::<Value>().await {
+                if let Some(body) = admission::read_json(r).await {
                     if grant.is_cancelled() {
                         return error(StatusCode::FORBIDDEN, "playback policy changed");
                     }
@@ -1637,5 +1637,6 @@ pub(crate) mod ts_access;
 
 pub(crate) mod publication;
 
+mod admission;
 mod http_balancer;
 pub(crate) mod rtsp_balancer;
