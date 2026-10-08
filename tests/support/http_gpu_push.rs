@@ -1,5 +1,7 @@
 //! Opt-in Intel VAAPI publishing qualification, using real sockets and decoders.
 use super::*;
+#[path = "http_gpu_upstream.rs"]
+mod upstream;
 use std::{collections::HashSet, path::Path, sync::Arc};
 
 fn destination(receiver: &Receiver) -> Value {
@@ -54,6 +56,10 @@ async fn closed(receiver: &Receiver) {
 }
 
 async fn decoded(path: &Path, audio: &str) -> Value {
+    decoded_with_video(path, "h264", audio).await
+}
+
+async fn decoded_with_video(path: &Path, video: &str, audio: &str) -> Value {
     let probe = tokio::process::Command::new("ffprobe")
         .kill_on_drop(true)
         .args(["-v", "error", "-show_streams", "-of", "json"])
@@ -70,7 +76,7 @@ async fn decoded(path: &Path, audio: &str) -> Value {
     assert!(
         tracks
             .iter()
-            .any(|s| s["codec_name"] == "h264" && s["width"] == 640 && s["height"] == 360)
+            .any(|s| s["codec_name"] == video && s["width"] == 640 && s["height"] == 360)
     );
     assert!(
         tracks
@@ -119,7 +125,7 @@ async fn decoded(path: &Path, audio: &str) -> Value {
         "decoded frames: {counts:?}"
     );
     assert!(hashes[0].len() >= 5 && hashes[1].len() >= 2);
-    json!({"video":"h264","audio":audio,"video_frames":counts[0],"audio_frames":counts[1],"strict_decoder_errors":0})
+    json!({"video":video,"audio":audio,"video_frames":counts[0],"audio_frames":counts[1],"strict_decoder_errors":0})
 }
 
 async fn generation(

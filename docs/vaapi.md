@@ -18,3 +18,8 @@ The same Intel H.264 CQP profile now has independent HTTP/HTTPS publishing and
 GPU→CPU→GPU replacement qualification with AAC/MP2/MP3. See the [named hardware,
 test command and limits](http-ts-push.md#intel-gpu-qualification). Hardware tests
 remain opt-in; this does not install a driver or qualify HEVC on this host.
+
+The [compressed HTTPS upstream publishing profile](http-ts-push.md#compressed-upstream-decoding)
+qualifies software decoding of independently encoded H.264/MP3 and HEVC/Layer II
+sources before Intel H.264 hardware encoding and AAC/Layer II/MP3 HTTP/HTTPS
+publishing. HEVC input decoding does not imply HEVC hardware encoding support.

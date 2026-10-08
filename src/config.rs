@@ -540,15 +540,16 @@ fn validate_root(root: &Value) -> Result<(), String> {
                             crate::tls_input::client(Some(std::path::Path::new(path)))?;
                         }
                         if ["hlss", "tshttps", "https"].contains(&scheme) {
-                            let parsed = url::Url::parse(&crate::media::translate_input(u)?)
+                            let mut parsed = url::Url::parse(&crate::media::translate_input(u)?)
                                 .map_err(|_| "invalid HTTPS input URL")?;
-                            if parsed.host_str().is_none()
-                                || parsed.fragment().is_some()
-                                || !parsed.username().is_empty()
-                                || parsed.password().is_some()
-                            {
-                                return Err("HTTPS inputs require a host and forbid embedded credentials or fragments".into());
+                            if parsed.host_str().is_none() || parsed.fragment().is_some() {
+                                return Err(
+                                    "HTTPS inputs require a host and forbid fragments".into()
+                                );
                             }
+                            // Match the origin-scoped fetcher's Basic profile without
+                            // removing userinfo from the persisted input configuration.
+                            crate::http_basic::take_url_credentials(&mut parsed)?;
                         }
                         if scheme == "rtsps" {
                             let parsed = url::Url::parse(u).map_err(|_| "invalid RTSPS URL")?;

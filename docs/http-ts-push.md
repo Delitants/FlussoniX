@@ -99,7 +99,8 @@ media driver `25.3.0+dfsg1-1` and GMM `22.8.1+ds1-1`. The driver and its depende
 were isolated in private test files; no host package or preview environment was
 changed, and neither is distributed with FlussoniX.
 
-The measured profile is 640×360, 25 fps H.264, software decode/hardware upload,
+The original measured source is synthetic lavfi video and sine audio at
+640×360 and 25 fps, with hardware upload and H.264 encoding,
 `h264_vaapi`, CQP 24, low-power disabled, with independent AAC 96 kb/s, MPEG
 Layer II 192 kb/s or MP3 128 kb/s audio at 48 kHz. Each worker sends both outputs
 simultaneously. Tests verify the running encoder arguments and loaded independent
@@ -131,6 +132,44 @@ CBR, low-power encoding, hardware decode, Main10, NVIDIA, GPU subtitle conversio
 other hardware/driver versions and production throughput need separate evidence.
 The deployed daemon still needs its own usable independent libVA environment;
 these tests do not install a driver or change its capability/readiness checks.
+
+### Compressed upstream decoding
+
+`gpu::upstream::` extends the same Intel CQP24 profile with independently
+pre-encoded 8-bit 640×360/25 fps H.264/MP3 and HEVC/Layer II MPEG-TS sources.
+The FlussoniX worker receives actual compressed bytes over a private-CA verified
+`tshttps://` input with percent-encoded Basic credentials and an unchanged query.
+Software decoders feed NV12 hardware upload and `h264_vaapi`; this qualifies
+HEVC **input decoding**, not HEVC hardware encoding. Each source is transcoded
+to H.264 with AAC96, Layer II192 or MP3 128 kb/s at48 kHz, sent simultaneously
+to independent HTTP and verified HTTPS publishing receivers.
+
+The sources themselves and all twelve delivered outputs are fully decoded by
+independent FFprobe/FFmpeg. Assertions require the expected codecs, changing
+content, at least50 video/80 audio frames per output and no strict decoder errors.
+The running encoder must receive only a loopback proxy input without upstream
+credentials, use the actual Intel encoder and map the private Intel driver and
+GMM dependency. Reports capture their resolved paths and SHA256 hashes plus the
+three driver environment variables from the running process. Template inheritance,
+shared-worker reuse, exact input/output Basic headers and paths, sanitized
+statistics, input socket closure, encoder reaping and stopped counters are checked.
+
+A separate denial test supplies an untrusted source CA and wrong input credentials.
+Both must stop the encoder without sending any media, then close input/output
+sockets. A configured receiver may see an empty initial POST; failed TLS must
+precede the upstream HTTP request. Hardware cases
+remain explicitly ignored in ordinary CI. Under a working independent driver:
+
+```
+cargo test --locked --test http_push gpu::upstream:: -- --ignored --test-threads=1 --nocapture
+```
+
+These finite, paced loopback sources originate from synthetic imagery and tones;
+they do not qualify real broadcast defects, live reconnection/failover, every
+compressed codec, native M4/HLS/RTSP/SRT input to this GPU publishing profile,
+hardware decoding, 10-bit input, resolution changes, WAN or sustained capacity.
+No source server encoder runs during delivery. Owned producer and decoder commands
+have deadlines and kill-on-drop; stream and receiver cleanup runs on test panics.
 
 HLS segment push, M4F/M4S push, HTTP/2, proxy authentication, Digest publishing,
 mutual TLS, automatic certificate rotation, every third-party recorder dialect,

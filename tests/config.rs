@@ -586,7 +586,7 @@ fn https_input_ca_settings_inherit_persist_and_reject_plain_or_invalid_trust() {
         json!({"url":"tshttps://localhost/owned","flussonix_tls_ca":false}),
         json!({"url":"hlss://localhost/owned","flussonix_tls_ca":"/no-owned-ca.pem"}),
         json!({"url":"hlss://localhost/owned#fragment","flussonix_tls_ca":cert.ca}),
-        json!({"url":"tshttps://user:password@localhost/owned","flussonix_tls_ca":cert.ca}),
+        json!({"url":"tshttps://bad%3Auser:password@localhost/owned","flussonix_tls_ca":cert.ca}),
         json!({"url":"hlss://","flussonix_tls_ca":cert.ca}),
     ] {
         assert!(
@@ -860,4 +860,52 @@ fn rtsp2_camera_alias_is_inherited_persisted_and_rejects_incompatible_options() 
         reopened.effective("redundant").unwrap()["inputs"][0]["rtp"],
         "udp"
     );
+}
+
+#[test]
+fn secure_http_basic_inputs_save_inherit_restart_and_reject_invalid_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let cert = tls_fixture::Certificates::new();
+    let store = ConfigStore::open(&path).unwrap();
+    for scheme in ["hlss", "tshttps", "https"] {
+        let input = json!({"url":format!("{scheme}://owned%2Buser:p%3Aa%40ss%25%20%26%C3%BC@localhost/live?token=owned"),"flussonix_tls_ca":cert.ca});
+        store
+            .put("templates", "basic", json!({"inputs":[input.clone()]}))
+            .expect("configured secure HTTP inputs must accept valid Basic credentials");
+        store
+            .put(
+                "streams",
+                "inherited",
+                json!({"template":"basic","static":false}),
+            )
+            .unwrap();
+        store
+            .put(
+                "streams",
+                "direct",
+                json!({"inputs":[input.clone()],"static":false}),
+            )
+            .unwrap();
+        assert_eq!(store.effective("inherited").unwrap()["inputs"][0], input);
+        assert_eq!(store.effective("direct").unwrap()["inputs"][0], input);
+        let before = store.snapshot();
+        for kind in ["streams", "templates"] {
+            for authority in [
+                "bad%3Auser:owned-secret",
+                ":owned-secret",
+                "owned:%0Aowned-secret",
+                "owned:%FFowned-secret",
+            ] {
+                let error = store.put(kind,"bad",json!({"inputs":[{"url":format!("{scheme}://{authority}@localhost/live"),"flussonix_tls_ca":cert.ca}]})).unwrap_err();
+                assert!(!error.contains("owned-secret"));
+                assert_eq!(store.snapshot(), before);
+            }
+        }
+        assert!(store.put("streams","bad",json!({"inputs":[{"url":format!("{scheme}://owned:owned-secret@localhost/live#fragment"),"flussonix_tls_ca":cert.ca}]})).is_err());
+        assert_eq!(store.snapshot(), before);
+    }
+    let saved = store.snapshot();
+    drop(store);
+    assert_eq!(ConfigStore::open(&path).unwrap().snapshot(), saved);
 }

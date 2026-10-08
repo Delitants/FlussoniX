@@ -12,7 +12,9 @@ Enter credentials in the existing Input URL field, for example
 characters in the username/password. The profile supports HLS/HLSS, TSHTTP/TSHTTPS,
 raw HTTP(S) HLS/continuous TS and M4S/M4SS/M4F/M4FS inputs. Keep the existing
 TLS CA field for a private CA; secure inputs verify trust and identity before
-sending application data.
+sending application data. Saved HLSS/TSHTTPS/HTTPS input validation uses the same
+Basic parser as the fetcher. Valid UTF-8 credentials persist and inherit through
+templates; invalid pairs and URL fragments reject without changing configuration.
 
 The native fetcher percent-decodes a UTF-8 pair, removes userinfo from resource
 URLs and sends a sensitive Basic header on requests to that configured origin.

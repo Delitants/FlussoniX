@@ -728,7 +728,7 @@ The [native HTTP publishing profile](http-ts-push.md) adds continuous HTTP/HTTPS
 
 The nonreading-receiver unit first reproduced an HTTP client background dispatcher retaining publisher sockets after cancellation. The adapter now owns its HTTP/1.1 TCP/TLS halves directly; its regression requires no publisher socket remain before the blocked receiver resumes reading. Other socket tests check continued publishing after interim/early successful acknowledgement, bounded excessive or malformed response heads and no output producer after cancellation. Byte counters mean completed local application-body writes and contribute to HTTP transport telemetry; they are not remote decode acknowledgements. Two browser cases exercise masked normal fields, HTTPS trust, template inheritance, switching and mobile validation without JSON editors.
 
-These tests use no official Flussonic binary, library or production endpoint. CPU and copy media profiles are qualified here; HTTP-specific GPU combinations, HLS/M4 push, HTTP/2, proxies, mutual TLS, all recorder dialects, WAN loss, long-duration operation and throughput/production capacity are not claimed. Exact-head full Rust/browser CI and whole-branch review remain release gates.
+These tests use no official Flussonic binary, library or production endpoint. CPU and copy media profiles are qualified here; the named Intel GPU profile is recorded below. HLS/M4 push, HTTP/2, proxies, mutual TLS, all recorder dialects, WAN loss, long-duration operation and throughput/production capacity are not claimed. Exact-head full Rust/browser CI and whole-branch review remain release gates.
 
 ## HTTP/HTTPS Intel GPU publishing qualification
 
@@ -737,3 +737,36 @@ Owned opt-in tests exercise Intel GeminiLake UHD600/i915 with independent Intel 
 Hardware cases remain explicitly ignored in ordinary CI. HEVCVAAPI encoding rejects this host profile; NVIDIA, CBR/low-power/hardware decode/Main10, GPU subtitle conversion, broader hardware and sustained capacity/WAN behavior remain unqualified. The daemon requires its own usable independent libVA setup; no host package, current preview environment or official Flussonic component is used or changed. See [exact command and measured profile](http-ts-push.md#intel-gpu-qualification).
 
 A real unsupportedHEVC replacement test additionally requires existingH264GPU uploads to continue on the same encoder, with no CPUfallback or extra publish connection. Named kernel profile:6.17.0-41-generic.
+
+## Compressed upstream Intel HTTP publishing qualification
+
+Two opt-in `http_push gpu::upstream::` cases exercise independently encoded
+8-bit H.264/MP3 and HEVC/Layer II inputs over owned Basic-authenticated, private-CA
+verified HTTPS. Software decoding and NV12 upload feed the actual Intel H.264
+VAAPI CQP24 encoder on the same GeminiLake UHD600/i915 profile above. Each input
+produces AAC, Layer II and MP3 audio with simultaneous plain HTTP and verified
+HTTPS publishing; twelve delivered outputs and both encoded sources undergo full
+independent strict decoding. Reports retain mapped private driver/GMM paths and
+hashes and selected driver variables captured from the running encoder. Worker
+reuse, templates, credential isolation, exact request headers/path/query and
+encoder/input/output cleanup are asserted. Wrong Basic credentials and an
+untrusted CA must yield zero published media and prompt socket/encoder cleanup;
+a receiver may see an empty initial POST. TLS rejection precedes upstream HTTP.
+A saved-config regression reproduced an older rule incorrectly forbidding Basic
+credentials on HLSS/TSHTTPS/HTTPS inputs. Validation now reuses the fetcher's
+credential parser; valid credentials persist and inherit, invalid pairs and
+fragments are rejected without mutation or credential disclosure. No official
+vendor components, host packages or preview environment changes are needed.
+
+This qualifies finite paced compressed sources derived from synthetic pictures
+and tones, not hardware decoding or HEVC hardware encoding. Other input families,
+Main10/resolution changes, reconnect/failover, broadcast defects, WAN and capacity
+remain unqualified for this profile. Ordinary CI explicitly skips hardware cases;
+local hardware evidence is separate. See [command and limits](http-ts-push.md#compressed-upstream-decoding).
+
+Observed host run:2 hardware tests passed in80.26 seconds. All12 published outputs
+had zero strict decoder errors, with minimum196 video and327 audio frames each.
+Both denial cases sent0media and reaped their encoder; each configured receiver
+saw one empty POST. Ordinary related checks passed57 tests with5 hardware cases
+explicitly ignored. The saved-config regression was observed failing before the
+validation fix and passing afterward.
