@@ -175,6 +175,9 @@ preference only among similarly loaded nodes, and pending Mbps are included in
 projected delivery load. Fresh shared output measurements add 25% headroom
 to the viewer estimate, with a 2 Mbps fallback for unknown or stale streams.
 Final admission remains owned by the CDN and rechecks its local stream cost.
+Exact load ties rotate within each candidate set, shared by HTTP and RTSP(S),
+with bounded per-LB history. Unequal load and readiness priorities stay intact;
+this does not establish distributed fairness or production capacity.
 
 
 Incoming RTSP/RTSPS publications also accept Basic headers and bounded MD5

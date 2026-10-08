@@ -114,9 +114,11 @@ struct Probe {
     auth_target: Mutex<Option<String>>,
     routing_delay_ms: AtomicUsize,
     admission_delay_ms: AtomicUsize,
+    admission_statuses: Mutex<Vec<u16>>,
 }
 async fn intercept(State(p): State<Arc<Probe>>, r: Request<Body>, next: Next) -> Response {
     let path = r.uri().path();
+    let admission = path == "/flussonix/api/v1/admit";
     if path == "/flussonix/api/v1/node" {
         if let Some(snapshot) = p.http_snapshot.lock().unwrap().clone() {
             if r.headers()
@@ -174,11 +176,19 @@ async fn intercept(State(p): State<Arc<Probe>>, r: Request<Body>, next: Next) ->
                 p.release.notified().await;
             }
             if p.reject.load(Ordering::SeqCst) {
+                p.admission_statuses.lock().unwrap().push(503);
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
         }
     }
-    next.run(r).await
+    let response = next.run(r).await;
+    if admission {
+        p.admission_statuses
+            .lock()
+            .unwrap()
+            .push(response.status().as_u16());
+    }
+    response
 }
 struct Node {
     _dir: tempfile::TempDir,
@@ -338,7 +348,7 @@ impl Node {
     }
     async fn measured(&self) {
         for _ in 0..60 {
-            let v = get_node(self).await;
+            let v = get_actual_node(self).await;
             if v["cpu"].as_f64().is_some_and(|x| x < 0.9)
                 && v["ram"].as_f64().is_some_and(|x| x < 0.95)
                 && v["uplink"].as_f64().is_some_and(|x| x < 0.8)
@@ -368,6 +378,26 @@ async fn get_node(node: &Node) -> Value {
         .json()
         .await
         .unwrap()
+}
+// Exercise the native route without the advisory-telemetry fixture interceptor.
+async fn get_actual_node(node: &Node) -> Value {
+    use tower::ServiceExt;
+    let response = router(node.app.clone())
+        .oneshot(
+            Request::get("/flussonix/api/v1/node")
+                .header("X-Flussonix-Peer", &node.app.options.peer_key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
 }
 async fn reserve(node: &Node, name: &str, protocol: &str, token: &str) -> reqwest::Response {
     client().post(format!("{}/flussonix/api/v1/admit",node.http)).header("X-Flussonix-Peer",&node.app.options.peer_key).json(&json!({"name":name,"protocol":protocol,"token_hash":format!("{:x}",Sha256::digest(token.as_bytes()))})).send().await.unwrap()
@@ -806,6 +836,234 @@ async fn invalidate(lab: &Lab) {
     lab.lb.app.config.put("peers", "edge", peer).unwrap();
 }
 
+// Keep advisory loads exactly equal while real CDNs still authorize and reserve.
+async fn tied_delivery_peer(lab: &Lab) -> Node {
+    let alternative = Node::new("cdn", 1000).await;
+    alternative
+        .app
+        .config
+        .put(
+            "sources",
+            "origin",
+            lab.cdn.app.config.snapshot()["sources"][0].clone(),
+        )
+        .unwrap();
+    lab.lb.app.config.put("peers", "alternate", json!({"api_url":alternative.http,"public_payload_url":alternative.http,"cluster_key":alternative.app.options.peer_key,"flussonix_rtsp_url":alternative.plain,"flussonix_rtsps_url":alternative.tls})).unwrap();
+    lab.cdn.measured().await;
+    alternative.measured().await;
+    for node in [&lab.cdn, &alternative] {
+        let mut snapshot = get_node(node).await;
+        snapshot["uplink"] = json!(0.1);
+        snapshot["uplink_mbps"] = json!(1000);
+        snapshot["cpu"] = json!(0.1);
+        snapshot["ram"] = json!(0.1);
+        snapshot["active"] = json!(0);
+        snapshot["reserved"] = json!(0);
+        snapshot["reserved_mbps"] = json!(0);
+        snapshot["age_ms"] = json!(0);
+        snapshot["ready"] = json!([]);
+        snapshot["streams"] = json!([]);
+        snapshot["stream_bitrates"] = json!({});
+        *node.probe.http_snapshot.lock().unwrap() = Some(snapshot.clone());
+        *node.probe.snapshot.lock().unwrap() = Some(snapshot);
+    }
+    alternative
+}
+
+async fn placement_target(lb: &Node, protocol: usize) -> String {
+    if protocol == 0 {
+        let response = client()
+            .get(format!("{}/region/owned/index.m3u8?{QS}", lb.http))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 302);
+        response.headers()["location"].to_str().unwrap().to_owned()
+    } else {
+        location(&lb.describe(protocol == 2, "region/owned", QS).await)
+    }
+}
+
+fn targets_node(target: &str, node: &Node, protocol: usize) -> bool {
+    target.starts_with(match protocol {
+        0 => &node.http,
+        1 => &node.plain,
+        _ => &node.tls,
+    })
+}
+
+// Removing either caller's rotating selection must concentrate its six redirects.
+#[tokio::test]
+async fn exact_pressure_ties_distribute_http_rtsp_and_rtsps_redirects() {
+    let mut lab = Lab::new(1000).await;
+    let mut alternative = tied_delivery_peer(&lab).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        for protocol in 0..3 {
+            let mut counts = [0, 0];
+            for _ in 0..6 {
+                let target = placement_target(&lab.lb, protocol).await;
+                if targets_node(&target, &lab.cdn, protocol) {
+                    counts[0] += 1;
+                } else {
+                    assert!(targets_node(&target, &alternative, protocol));
+                    counts[1] += 1;
+                }
+                let query = url::Url::parse(&target).unwrap();
+                assert!(
+                    query
+                        .query_pairs()
+                        .any(|(k, v)| k == "token" && v == "owned+viewer")
+                );
+                assert!(
+                    query
+                        .query_pairs()
+                        .any(|(k, v)| k == "flussonix_ticket" && uuid::Uuid::parse_str(&v).is_ok())
+                );
+                assert!(!target.contains(&alternative.app.options.peer_key));
+            }
+            assert_eq!(counts, [3, 3], "protocol {protocol} must share exact ties");
+        }
+        for node in [&lab.cdn, &alternative] {
+            *node.probe.http_snapshot.lock().unwrap() = None;
+            let actual = get_node(node).await;
+            assert_eq!(actual["reserved"], 9);
+            assert_eq!(actual["reserved_mbps"], 18.0);
+            assert!(!node.probe.bad_key.load(Ordering::SeqCst));
+        }
+        for node in [&lab.source, &lab.cdn, &lab.lb, &alternative] {
+            assert_eq!(node.app.media.count().await, 0);
+        }
+    })
+    .catch_unwind()
+    .await;
+    alternative.stop().await;
+    lab.stop().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+// Fixed or non-atomic turns can concentrate concurrent requests.
+#[tokio::test]
+async fn concurrent_mixed_protocol_ties_share_one_lb_rotation() {
+    let mut lab = Lab::new(1000).await;
+    let mut alternative = tied_delivery_peer(&lab).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let lb = &lab.lb;
+        let targets = futures_util::future::join_all(
+            (0..24).map(|i| async move { (i % 3, placement_target(lb, i % 3).await) }),
+        )
+        .await;
+        let mut counts = [0, 0];
+        for (protocol, target) in targets {
+            if targets_node(&target, &lab.cdn, protocol) {
+                counts[0] += 1;
+            } else {
+                assert!(targets_node(&target, &alternative, protocol));
+                counts[1] += 1;
+            }
+        }
+        assert_eq!(counts, [12, 12]);
+        for node in [&lab.cdn, &alternative] {
+            *node.probe.http_snapshot.lock().unwrap() = None;
+            let actual = get_node(node).await;
+            assert_eq!(actual["reserved"], 12);
+            assert_eq!(actual["reserved_mbps"], 24.0);
+            assert!(!node.probe.bad_key.load(Ordering::SeqCst));
+        }
+        for node in [&lab.source, &lab.cdn, &lab.lb, &alternative] {
+            assert_eq!(node.app.media.count().await, 0);
+        }
+    })
+    .catch_unwind()
+    .await;
+    alternative.stop().await;
+    lab.stop().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+// A failed peer uses the same placement turn; it cannot consume the next request's turn.
+#[tokio::test]
+async fn tied_admission_retry_keeps_the_request_rotation_turn() {
+    let mut lab = Lab::new(1000).await;
+    let mut alternative = tied_delivery_peer(&lab).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        alternative.probe.reject.store(true, Ordering::SeqCst);
+        for protocol in 0..3 {
+            assert!(targets_node(
+                &placement_target(&lab.lb, protocol).await,
+                &lab.cdn,
+                protocol
+            ));
+        }
+        assert_eq!(alternative.probe.admits.load(Ordering::SeqCst), 2);
+        assert_eq!(lab.cdn.probe.admits.load(Ordering::SeqCst), 3);
+        *alternative.probe.http_snapshot.lock().unwrap() = None;
+        assert_eq!(get_node(&alternative).await["reserved"], 0);
+        for node in [&lab.source, &lab.cdn, &lab.lb, &alternative] {
+            assert_eq!(node.app.media.count().await, 0);
+        }
+    })
+    .catch_unwind()
+    .await;
+    alternative.stop().await;
+    lab.stop().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+// A global counter aliases the two-node RTSPS set while HTTP visits three nodes.
+#[tokio::test]
+async fn different_protocol_candidate_sets_keep_independent_tie_rotations() {
+    let mut lab = Lab::new(1000).await;
+    let mut alternative = tied_delivery_peer(&lab).await;
+    let mut third = Node::new("cdn", 1000).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        third.app.config.put("sources", "origin", lab.cdn.app.config.snapshot()["sources"][0].clone()).unwrap();
+        lab.lb.app.config.put("peers", "third", json!({"api_url":third.http,"public_payload_url":third.http,"cluster_key":third.app.options.peer_key,"flussonix_rtsp_url":third.plain})).unwrap();
+        lab.cdn.measured().await; alternative.measured().await; third.measured().await;
+        let snapshot = lab.cdn.probe.http_snapshot.lock().unwrap().clone().unwrap();
+        *third.probe.http_snapshot.lock().unwrap() = Some(snapshot.clone());
+        // Third has no RTSPS public endpoint; its HTTP telemetry remains eligible.
+        *third.probe.snapshot.lock().unwrap() = Some(snapshot);
+        let mut http_counts = [0, 0, 0];
+        let mut secure_counts = [0, 0];
+        for _ in 0..6 {
+            let target = placement_target(&lab.lb, 0).await;
+            if targets_node(&target, &lab.cdn, 0) { http_counts[0] += 1; }
+            else if targets_node(&target, &alternative, 0) { http_counts[1] += 1; }
+            else { assert!(targets_node(&target, &third, 0)); http_counts[2] += 1; }
+            let target = placement_target(&lab.lb, 2).await;
+            if targets_node(&target, &lab.cdn, 2) { secure_counts[0] += 1; }
+            else { assert!(targets_node(&target, &alternative, 2)); secure_counts[1] += 1; }
+        }
+        if http_counts != [2, 2, 2] || secure_counts != [3, 3] {
+            for (label,node) in [("edge",&lab.cdn),("alternate",&alternative),("third",&third)] {
+                *node.probe.http_snapshot.lock().unwrap() = None;
+                let actual = get_node(node).await;
+                eprintln!("{label}: admissions {:?}; cpu {}, ram {}, uplink {}, age {}",node.probe.admission_statuses.lock().unwrap(),actual["cpu"],actual["ram"],actual["uplink"],actual["age_ms"]);
+            }
+        }
+        assert_eq!(http_counts, [2, 2, 2]);
+        assert_eq!(secure_counts, [3, 3]);
+        for (node, want) in [(&lab.cdn,5),(&alternative,5),(&third,2)] {
+            *node.probe.http_snapshot.lock().unwrap() = None;
+            assert_eq!(get_node(node).await["reserved"], want);
+            assert!(!node.probe.bad_key.load(Ordering::SeqCst));
+        }
+        for node in [&lab.source, &lab.cdn, &lab.lb, &alternative, &third] { assert_eq!(node.app.media.count().await, 0); }
+    }).catch_unwind().await;
+    third.stop().await;
+    alternative.stop().await;
+    lab.stop().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 #[tokio::test]
 async fn fresh_stream_bitrate_is_applied_to_cold_http_rtsp_and_rtsps_candidates() {
     let mut lab = Lab::new(1000).await;
@@ -1180,7 +1438,17 @@ async fn routing_excludes_stale_unsafe_incompatible_and_saturated_nodes() {
 async fn snapshot_refresh_fails_closed_and_config_invalidates_cached_capabilities() {
     let mut lab = Lab::new(1000).await;
     let result = std::panic::AssertUnwindSafe(async {
-        location(&lab.lb.describe(false, "region/owned", QS).await);
+        let response = lab.lb.describe(false, "region/owned", QS).await;
+        let actual = get_actual_node(&lab.cdn).await;
+        assert_eq!(
+            response.0,
+            302,
+            "initial capacity: CPU {}, age {}; admissions {:?}",
+            actual["cpu"],
+            actual["age_ms"],
+            lab.cdn.probe.admission_statuses.lock().unwrap()
+        );
+        location(&response);
         assert_eq!(lab.cdn.probe.polls.load(Ordering::SeqCst), 1);
         location(&lab.lb.describe(false, "region/owned", QS).await);
         assert_eq!(lab.cdn.probe.polls.load(Ordering::SeqCst), 1);
@@ -1194,7 +1462,20 @@ async fn snapshot_refresh_fails_closed_and_config_invalidates_cached_capabilitie
         location(&lab.lb.describe(false, "region/owned", QS).await);
         let before = lab.cdn.probe.polls.load(Ordering::SeqCst);
         invalidate(&lab).await;
-        location(&lab.lb.describe(false, "region/owned", QS).await);
+        lab.cdn.measured().await;
+        let response = lab.lb.describe(false, "region/owned", QS).await;
+        let actual = get_node(&lab.cdn).await;
+        assert_eq!(
+            response.0,
+            302,
+            "after config: cpu {}, ram {}, uplink {}, age {}; admissions {:?}",
+            actual["cpu"],
+            actual["ram"],
+            actual["uplink"],
+            actual["age_ms"],
+            lab.cdn.probe.admission_statuses.lock().unwrap()
+        );
+        location(&response);
         assert_eq!(lab.cdn.probe.polls.load(Ordering::SeqCst), before + 1);
     })
     .catch_unwind()

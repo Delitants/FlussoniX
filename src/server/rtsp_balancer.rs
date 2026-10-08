@@ -251,6 +251,7 @@ impl App {
         }
         drop(calls); // Cancel unfinished probes; preserve time for admission.
         let mut attempted = HashSet::new();
+        let mut turn = None;
         loop {
             let observed_at = Instant::now();
             let elapsed = |snapshot: &Snapshot| {
@@ -310,7 +311,9 @@ impl App {
                     nodes.push(load);
                 }
             }
-            let Some(id) = select(&nodes, 0.0) else { break };
+            let Some(id) = self.routing_rotation.select(&nodes, 0.0, &mut turn) else {
+                break;
+            };
             attempted.insert(id.clone());
             if grant.is_cancelled() {
                 return Err(403);

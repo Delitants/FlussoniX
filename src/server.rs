@@ -1,6 +1,6 @@
 use crate::{
     auth::{Credentials, Role},
-    cluster::{NodeLoad, select},
+    cluster::{NodeLoad, TieRotation},
     config::{ConfigStore, KINDS, valid_name},
     media::{Engine, Worker},
     playback_auth::{AuthOutcome, Grant, PlaybackAuth, Policy, PolicySnapshot, ViewerRequest},
@@ -97,6 +97,7 @@ pub struct App {
     pub playback_auth: PlaybackAuth,
     reservations: Mutex<HashMap<String, Reservation>>,
     rtsp_routes: rtsp_balancer::Registry,
+    routing_rotation: TieRotation,
     pub egress: Arc<AtomicU64>,
     pub rtsp_egress: Arc<AtomicU64>,
     pub rtsp_udp_egress: Arc<AtomicU64>,
@@ -159,6 +160,7 @@ impl App {
             playback_auth: PlaybackAuth::new(options.client_limit as usize),
             reservations: Mutex::new(HashMap::new()),
             rtsp_routes: rtsp_balancer::Registry::default(),
+            routing_rotation: TieRotation::default(),
             egress: Arc::new(AtomicU64::new(0)),
             rtsp_egress: Arc::new(AtomicU64::new(0)),
             rtsp_udp_egress: Arc::new(AtomicU64::new(0)),
@@ -957,6 +959,7 @@ async fn balance(
         .flatten()
         .collect::<Vec<_>>();
     let mut attempted = std::collections::HashSet::new();
+    let mut turn = None;
     loop {
         // A failed admission can consume the remaining sample lifetime. Reproject
         // every observed candidate, including those the previous cost excluded.
@@ -1015,7 +1018,9 @@ async fn balance(
             };
             nodes.push(load)
         }
-        let Some(id) = select(&nodes, 0.0) else { break };
+        let Some(id) = app.routing_rotation.select(&nodes, 0.0, &mut turn) else {
+            break;
+        };
         attempted.insert(id.clone());
         let p = &observations
             .iter()

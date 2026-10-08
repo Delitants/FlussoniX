@@ -23,10 +23,22 @@ has the same cost. HTTP includes probe collection time in observation age;
 RTSP includes the age of its cached snapshot.
 
 Candidates within 0.05 normalized pressure of the best candidate form the
-shortlist. Prefer a ready stream within that set, then lower pressure, then
-lexicographically smaller configured hostname for a stable tie. A ready node
+shortlist. Prefer a ready stream within that set, then lower pressure. Exact
+ties at that preferred readiness and pressure rotate across sorted configured
+hostnames. A ready node
 outside the margin receives no locality advantage. These are fixed native
 defaults; no new legacy API mode or UI policy setting is introduced.
+
+Rotation belongs to each LB process and is shared by HTTP and RTSP/RTSPS.
+Different tied candidate sets have independent cursors, so interleaving
+protocols with different available listeners cannot concentrate their requests
+through a single global counter. At most 64 recently used sets are retained;
+fixed-size SHA-256 keys identify sorted, length-prefixed hostnames. The least
+recently used set is evicted when a new set needs space. A new, evicted or
+restarted set begins with its alphabetically first hostname. Singleton sets
+need no cursor. A request takes one turn from its first tied set and retains it
+through retries, even if refusal or expired telemetry changes the remaining
+set. Selection holds no rotation lock across a network request.
 
 The viewer estimate is divided by each node's own capacity. A fresh rate from
 any valid observed native CDN applies to every candidate for that stream,
@@ -73,7 +85,12 @@ cost beyond the numeric admission bounds fails closed with 503.
 ## Qualification and limits
 
 `tests/cluster_pressure.rs` exercises CPU/RAM bottlenecks, bounded readiness
-preference, stable ties, invalid metrics/estimates and the existing hard gates.
+preference, deterministic stateless selection, invalid metrics/estimates and
+the existing hard gates. Rotation unit cases cover probe-order independence,
+exact versus near ties, readiness, hard gates, full-width turns, independent
+candidate sets, retry state and bounded eviction. Owned HTTP/RTSP/RTSPS fixtures
+exercise sequential and concurrent distribution with real CDN reservations,
+refusal fallback and interleaved protocols with different candidate sets.
 Owned HTTP/RTSP cluster fixtures in `tests/rtsp_cluster.rs` exercise authenticated
 placement and real CDN admission using controlled advisory telemetry, including
 actual pending bandwidth on heterogeneous uplinks. Invalid HTTP telemetry
@@ -93,9 +110,11 @@ measured uplink while admission waits and verifies refusal with no reservation.
 The existing cluster integration suites qualify authorized source/CDN delivery,
 private source pulls, secure endpoints, coalescing and admission refusal/retry.
 This increment does not measure production placement quality, sustained load,
-multi-LB fairness, LAN bottlenecks or GPU/CPU cost reservation. Equal-pressure
-hostname ties are deterministic and can concentrate equivalent new requests;
-distributed fairness remains future work. The rate is an advisory shared TS
+multi-LB fairness, LAN bottlenecks or GPU/CPU cost reservation. Rotation covers
+exact ties on one LB with a retained candidate set; it is not weighted fairness,
+per-stream affinity or a distributed policy. Independent LBs and restarts can
+begin at the same hostname; changing sets or frequent eviction can still bias
+traffic. Distributed fairness remains future work. The rate is an advisory shared TS
 estimate with headroom, not exact per-protocol network overhead or an ABR
 rendition/viewer cost model. Cold streams with no fresh observation still use
 2 Mbps until they produce a measurement. Bursts, changing codecs/configuration,
