@@ -32,7 +32,9 @@ profile result. Checks run through the configured independent FFmpeg as the
 FlussoniX service account, using a synthetic frame rather than a stream source.
 A successful initialization means the encoder can run with the tested profile;
 it does not measure capacity or promise that every custom profile will work.
-Custom devices and settings retain their own checks before worker replacement.
+Custom VAAPI devices and settings retain their own checks before worker replacement.
+NVIDIA readiness checks use the default encoder profile; they do not separately
+validate every selected custom setting.
 
 The authenticated `/flussonix/api/v1/capabilities` response retains `status` and
 adds an optional `diagnostic` code to each GPU profile when a known dependency or

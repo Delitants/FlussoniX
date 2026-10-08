@@ -20,7 +20,7 @@ export function GPUReadiness({transcoding,error,encoder}:{transcoding?:Transcodi
    <strong>{p.encoder.endsWith('_vaapi')?'VAAPI':'NVIDIA'} · {p.codec}</strong> — {p.status==='available'?'Ready for GPU encoding':'GPU encoding unavailable'}
    {p.status!=='available'&&<p>{guidance[p.diagnostic||'']||(p.status==='timed_out'?'The encoder check timed out. Check the GPU and driver health.':'The encoder could not initialize. Check FFmpeg, the GPU driver and service permissions.')}</p>}
   </li>)}</ul>}
-  <p className="muted">Default profile checks run as the FlussoniX service account. VAAPI uses /dev/dri/renderD128, constant quality 24 and low power off. Custom devices and settings are checked at stream startup. Initialization does not measure streaming capacity.</p>
+  <p className="muted">Default profile checks run as the FlussoniX service account. VAAPI uses /dev/dri/renderD128, constant quality 24 and low power off. Custom VAAPI devices and settings are checked at stream startup. NVIDIA checks use default encoder settings. Initialization does not measure streaming capacity.</p>
   <p className="muted">Restart FlussoniX after installing drivers or changing device permissions to refresh cached checks. GPU failures never switch silently to CPU.</p>
  </section>;
 }

@@ -927,7 +927,7 @@ test('GPU dependency readiness is visible in Config and selected Processing prof
  await expect(processing).toBeVisible();
  await expect(processing.getByTestId('gpu-h264_vaapi')).toBeVisible();
  await expect(processing.getByTestId('gpu-hevc_vaapi')).toHaveCount(0);
- await expect(processing).toContainText('Custom devices and settings are checked at stream startup');
+ await expect(processing).toContainText('Custom VAAPI devices and settings are checked at stream startup');
  await page.getByLabel('Transcoding',{exact:true}).selectOption('libx264');
  await expect(processing).toHaveCount(0);
  await page.getByRole('button',{name:'Cancel',exact:true}).click();
