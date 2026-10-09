@@ -143,7 +143,11 @@ impl Drop for RoutingProbeGuard {
         self.0.routing_active.fetch_sub(1, Ordering::SeqCst);
     }
 }
-async fn intercept(State(p): State<Arc<Probe>>, r: Request<Body>, next: Next) -> Response {
+async fn intercept(
+    State((p, app)): State<(Arc<Probe>, Arc<App>)>,
+    r: Request<Body>,
+    next: Next,
+) -> Response {
     let path = r.uri().path();
     let admission = path == "/flussonix/api/v1/admit";
     if path == "/flussonix/api/v1/node" {
@@ -239,6 +243,18 @@ async fn intercept(State(p): State<Arc<Probe>>, r: Request<Body>, next: Next) ->
     }
     let response = next.run(r).await;
     if admission {
+        if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+            let actual = get_actual_app(&app).await;
+            eprintln!(
+                "native admission rejected: cpu={}, ram={}, uplink={}, age={}, active={}, reserved={}",
+                actual["cpu"],
+                actual["ram"],
+                actual["uplink"],
+                actual["age_ms"],
+                actual["active"],
+                actual["reserved"]
+            );
+        }
         p.admission_statuses
             .lock()
             .unwrap()
@@ -335,8 +351,8 @@ impl Node {
             .push(AbortOnDropHandle::new(tokio::spawn(async move {
                 axum::serve(
                     listener,
-                    router(app)
-                        .layer(middleware::from_fn_with_state(probe, intercept))
+                    router(app.clone())
+                        .layer(middleware::from_fn_with_state((probe, app), intercept))
                         .into_make_service_with_connect_info::<std::net::SocketAddr>(),
                 )
                 .with_graceful_shutdown(stop.cancelled_owned())
@@ -377,7 +393,7 @@ impl Node {
         tasks.push(AbortOnDropHandle::new(tokio::spawn(async move {
             axum::serve(
                 http,
-                router(a).layer(middleware::from_fn_with_state(p, intercept)),
+                router(a.clone()).layer(middleware::from_fn_with_state((p, a), intercept)),
             )
             .with_graceful_shutdown(stop.cancelled_owned())
             .await
@@ -406,6 +422,10 @@ impl Node {
         let stop = cancel.clone();
         tasks.push(AbortOnDropHandle::new(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(100));
+            // TLS fixture setup can stall this single-thread runtime. Catch-up
+            // samples have no CPU tick delta and correctly fail native admission;
+            // keep each fixture measurement separated by a full interval instead.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {_=stop.cancelled()=>break,_=interval.tick()=>a.sample_metrics()}
             }
@@ -499,11 +519,14 @@ async fn get_node(node: &Node) -> Value {
 }
 // Exercise the native route without the advisory-telemetry fixture interceptor.
 async fn get_actual_node(node: &Node) -> Value {
+    get_actual_app(&node.app).await
+}
+async fn get_actual_app(app: &Arc<App>) -> Value {
     use tower::ServiceExt;
-    let response = router(node.app.clone())
+    let response = router(app.clone())
         .oneshot(
             Request::get("/flussonix/api/v1/node")
-                .header("X-Flussonix-Peer", &node.app.options.peer_key)
+                .header("X-Flussonix-Peer", &app.options.peer_key)
                 .body(Body::empty())
                 .unwrap(),
         )
