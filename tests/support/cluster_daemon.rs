@@ -51,6 +51,8 @@ impl Daemon {
                 .env("FLUSSONIX_ADMIN_USER", "owned-cluster")
                 .env("FLUSSONIX_ADMIN_PASSWORD", "owned-management")
                 .env("FLUSSONIX_PEER_KEY", &self.key)
+                // This owned fixture has no SRT listener, regardless of the shell.
+                .env_remove("FLUSSONIX_SRT_PLAY_PASSPHRASE")
                 .env("RUST_LOG", "error")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())

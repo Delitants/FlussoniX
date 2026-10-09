@@ -20,7 +20,7 @@
 
 ## Review Focus
 
-- Cached media cannot prove recovery: require a new CDN PID, fresh bytes and a changed on-disk playlist before playback.
+- Cached media cannot prove recovery: require a new CDN PID, fresh bytes and a changed on-disk playlist before playback, then bind HTTP playlist/segment bytes to that observed generation.
 - Shared worker behavior: concurrent viewers retain the same copy PID.
 - Authentication: anonymous playlist/segment denial and ticket replay rejection before and after recovery.
 - TLS trust: independent CAs are explicitly trusted; no insecure verification switches.
@@ -28,7 +28,7 @@
 
 ### Task 1: Real-daemon cluster qualification
 
-**Files:** Create tests/cluster_native_recovery.rs and tests/support/cluster_daemon.rs; update docs/qualification.md and docs/cluster-loadbalancing.md.
+**Files:** Create tests/cluster_native_recovery.rs and tests/support/cluster_daemon.rs; update docs/qualification.md, docs/cluster-loadbalancing.md and .github/workflows/ci.yml.
 
 **Interfaces:** Consume ConfigStore::put, CLI HTTPS startup JSON and peer-authenticated GET /flussonix/api/v1/node. Produce one ordinary CPU regression and two opt-in GPU native TLS cases.
 
@@ -36,6 +36,6 @@
 - [x] Verify the regression fails with temporary background source refresh disabled; restore production source and run GREEN.
 - [x] Run opt-in H.264 VAAPI M4SS and M4FS cases; record origin driver mappings, CDN copy arguments, strict decode counts and observation latency.
 - [x] Run related cluster tests, fmt and clippy. Expected: all pass.
-- [ ] Obtain one fresh read-only review; fix Important/Critical issues with targeted negative controls.
+- [x] Obtain one fresh read-only review; fix Important/Critical issues with targeted negative controls.
 - [ ] Publish the reviewed branch and require exact-head full Rust/browser CI before fast-forward publication to main.
 - [ ] Restore original shared daemon artifact, verify preview identity/config/assets, archive evidence and remove owned test worktree.

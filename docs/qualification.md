@@ -879,10 +879,10 @@ bytes remain identical. Owned daemons and encoder children are cleaned up even
 after failed assertions.
 
 Observed local run: the CPU M4SS case and Intel H.264 VAAPI CQP24/AAC96 M4SS and
-M4FS cases passed in 69.10 seconds. Six protected HLS outputs were strictly
+M4FS cases passed in 74.10 seconds. Six protected HLS outputs were strictly
 decoded with zero errors, each yielding 50 video/94 audio frames. Hardware
-recovery observations were 3.954 seconds (M4SS) and 8.892 seconds (M4FS); CPU
-recovery was 4.474 seconds. These are shutdown-request-to-fresh-generation
+recovery observations were 7.795 seconds (M4SS) and 8.803 seconds (M4FS); CPU
+recovery was 4.366 seconds. These are shutdown-request-to-fresh-generation
 observations on synthetic 640×360/25fps,48kHz sources, excluding offline decode;
 they are not first-frame timing or a production SLA. Process evidence confirms
 system FFmpeg, the independently installed Intel driver and origin GPU encoding
@@ -897,3 +897,12 @@ Hardware cases remain opt-in; ordinary CI runs the CPU contract. Full vendor
 dialect interoperability, seamless output continuity, repeated faults/failback,
 HEVC hardware encoding/decoding, WAN/soak and capacity remain separate gates.
 See [commands and exact measurement boundaries](cluster-loadbalancing.md).
+
+Independent review identified that disk generation alone did not bind the decoded
+HTTP response to recovered media. The harness now preserves that observed
+identifier, requires every delivered playlist segment to use it, and checks the
+downloaded segment hash against the completed file in that generation. Replaying
+the saved pre-fault playlist fails at the intended HTTP generation assertion.
+An inherited SRT passphrase also reproduced an unrelated CLI startup failure;
+owned HTTPS-only fixtures now clear it. CI additionally runs the CPU regression
+with a harmless exported SRT setting to retain that environment-isolation check.

@@ -22,6 +22,8 @@ jobs:
           cargo test --locked --test rtsp_push independent_basic_and_digest_receivers_authenticate_and_decode_both_tracks -- --exact --test-threads=1
           cargo test --locked --test rtsp_push independent_receiver_decodes_native_rtsp_push -- --exact --test-threads=1
           cargo test --locked --test rtsp_push native_text_preserve_rejects_rtsp_before_connect_and_drop_delivers_audio -- --exact --test-threads=1
+      - name: Owned cluster daemon environment isolation
+        run: FLUSSONIX_SRT_PLAY_PASSPHRASE=owned-unused-SRT-setting cargo test --locked --test cluster_native_recovery daemon_recovers_equivalent_native_tls_origin_without_viewer_requests -- --exact --test-threads=1
       - name: Rust qualification and owned browser caption fixture
         run: |
           mkdir -p .runtime

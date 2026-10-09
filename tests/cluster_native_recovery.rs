@@ -160,15 +160,44 @@ async fn admit(client: &reqwest::Client, lb: &Daemon, cdn: &Daemon) -> String {
     assert_eq!(client.get(ticket).send().await.unwrap().status(), 503);
     canonical
 }
+fn playlist_generation(list: &str) -> String {
+    let files: Vec<_> = list
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .map(|line| line.split('?').next().unwrap().rsplit('/').next().unwrap())
+        .collect();
+    let generation = files
+        .first()
+        .expect("playlist contains a completed segment")
+        .rsplit_once('_')
+        .expect("owned segment generation prefix")
+        .0;
+    assert!(
+        files
+            .iter()
+            .all(|file| file.starts_with(&format!("{generation}_"))),
+        "playlist mixes worker generations"
+    );
+    generation.to_owned()
+}
 async fn playback(
     client: &reqwest::Client,
     canonical: &str,
     cdn: &Daemon,
-    generation: &str,
+    label: &str,
+    expected_generation: &str,
 ) -> Value {
     let response = client.get(canonical).send().await.unwrap();
     assert_eq!(response.status(), 200);
     let list = response.text().await.unwrap();
+    assert_eq!(
+        playlist_generation(&list),
+        expected_generation,
+        "HTTP playback must serve the observed worker generation"
+    );
+    if label == "before" {
+        std::fs::write(cdn.directory.path().join("before-playlist.m3u8"), &list).unwrap();
+    }
     let segment = list
         .lines()
         .rfind(|l| !l.starts_with('#') && !l.is_empty())
@@ -178,7 +207,7 @@ async fn playback(
     anonymous.set_query(None);
     assert_eq!(client.get(anonymous).send().await.unwrap().status(), 403);
     let data = client
-        .get(url)
+        .get(url.clone())
         .send()
         .await
         .unwrap()
@@ -187,9 +216,24 @@ async fn playback(
         .bytes()
         .await
         .unwrap();
-    let path = cdn.directory.path().join(format!("{generation}.ts"));
-    std::fs::write(&path, data).unwrap();
-    decode(&path).await
+    let filename = url.path_segments().unwrap().next_back().unwrap();
+    let produced = cdn
+        .directory
+        .path()
+        .join("media")
+        .join(format!("{:x}", Sha256::digest(STREAM.as_bytes())))
+        .join(filename);
+    assert_eq!(
+        Sha256::digest(&data),
+        Sha256::digest(std::fs::read(produced).unwrap()),
+        "decoded HTTP body must match the observed generation's completed segment"
+    );
+    let path = cdn.directory.path().join(format!("{label}.ts"));
+    std::fs::write(&path, &data).unwrap();
+    let mut report = decode(&path).await;
+    report["generation"] = json!(expected_generation);
+    report["segment_sha256"] = json!(format!("{:x}", Sha256::digest(&data)));
+    report
 }
 async fn qualification(transport: &str, encoder: &str) {
     let mut nodes = [
@@ -346,16 +390,9 @@ async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str) -> Value {
     assert_eq!(nodes[2].owned_encoders(), [first_pid]);
     assert!(nodes[1].owned_encoders().is_empty());
     assert!(nodes[3].owned_encoders().is_empty());
-    let before_decode = playback(&client, &canonical, &nodes[2], "before").await;
     let before_playlist = nodes[2].playlist().unwrap();
-    let old_generation = before_playlist
-        .lines()
-        .find(|l| !l.starts_with('#') && !l.is_empty())
-        .unwrap()
-        .rsplit_once('_')
-        .unwrap()
-        .0
-        .to_string();
+    let old_generation = playlist_generation(&before_playlist);
+    let before_decode = playback(&client, &canonical, &nodes[2], "before", &old_generation).await;
     let fault = Instant::now();
     assert!(
         nodes[0].stop().await,
@@ -363,23 +400,21 @@ async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str) -> Value {
     );
     assert!(!Path::new(&format!("/proc/{origin_a_pid}")).exists());
     // Only read-only node GETs below. No playback request can trigger recovery.
-    let second = tokio::time::timeout(Duration::from_secs(30), async {
+    let (second, observed_playlist) = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let s = stats(&nodes[2].node(&client).await);
+            let playlist = nodes[2].playlist().unwrap_or_default();
             if s["upstream_source"] == "b"
                 && s["source_switches"] == 1
                 && s["status"] == "running"
                 && s["pid"] != first["pid"]
                 && s["bytes_in"].as_u64().is_some_and(|v| v > 250_000)
-                && nodes[2].playlist().is_some_and(|p| {
-                    p != before_playlist
-                        && p.lines().any(|l| !l.starts_with('#') && !l.is_empty())
-                        && p.lines()
-                            .filter(|l| !l.starts_with('#') && !l.is_empty())
-                            .all(|l| !l.starts_with(&old_generation))
-                })
+                && playlist
+                    .lines()
+                    .any(|l| !l.starts_with('#') && !l.is_empty())
+                && playlist_generation(&playlist) != old_generation
             {
-                break s;
+                break (s, playlist);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -397,7 +432,8 @@ async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str) -> Value {
     assert_eq!(nodes[1].owned_encoders(), [origin_b_pid]);
     assert_eq!(nodes[2].owned_encoders(), [second_pid]);
     assert!(nodes[3].owned_encoders().is_empty());
-    let after_decode = playback(&client, &canonical, &nodes[2], "after").await;
+    let new_generation = playlist_generation(&observed_playlist);
+    let after_decode = playback(&client, &canonical, &nodes[2], "after", &new_generation).await;
     let new_canonical = admit(&client, &nodes[3], &nodes[2]).await;
     let concurrent =
         futures_util::future::join_all((0..6).map(|_| client.get(&new_canonical).send())).await;
