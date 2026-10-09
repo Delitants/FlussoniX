@@ -166,7 +166,7 @@ cargo test --locked --test http_push gpu::upstream:: -- --ignored --test-threads
 
 These finite, paced loopback sources originate from synthetic imagery and tones;
 they do not qualify real broadcast defects, live reconnection/failover, every
-compressed codec, native M4/HLS/RTSP/SRT input to this GPU publishing profile,
+compressed codec, HLS/RTSP/SRT input to this GPU publishing profile,
 hardware decoding, 10-bit input, resolution changes, WAN or sustained capacity.
 No source server encoder runs during delivery. Owned producer and decoder commands
 have deadlines and kill-on-drop; stream and receiver cleanup runs on test panics.
@@ -187,3 +187,52 @@ resolve inside that directory and record their hashes. This deliberately isolate
 test layout is not a production requirement; a normally installed system driver
 and GMM can serve FlussoniX without these variables. See [admin dependency and
 encoder readiness](vaapi.md#dependency-and-encoder-readiness-in-the-admin-ui).
+
+
+### Native M4 source decoding
+
+`gpu::native::` qualifies the same Intel H.264 CQP24 software-decode/hardware-encode
+profile with M4S frame records and M4F single chunks. Plain `m4s://` / `m4f://`
+and verified private-CA `m4ss://` / `m4fs://` inputs carry H.264/MP3 or HEVC/Layer II
+at 8-bit 640×360/25fps. Each of the eight input combinations is transcoded to
+H.264 with AAC96, Layer II192 or MP3 128kbps at48kHz and sent concurrently to
+HTTP and verified HTTPS receivers:24 cases and48 strictly decoded outputs.
+
+The fixture begins with independent FFmpeg-encoded TS. FlussoniX's TS decoder and
+native record/sample-table packers construct the native source; this is not an
+independent vendor dialect writer or proof of full Flussonic interoperability.
+Independent FFmpeg fully decodes both the original and the native TS remux with
+identical frame counts. The finite M4F source serves only two-track windows,
+excluding its audio-only trailing window to maintain stable live metadata.
+Published outputs require at least50 video/80 audio frames, changing content and
+zero strict decoder errors. The worker receives compressed media over `pipe:0`,
+uses software decoding and NV12 upload, and must map the actual independent Intel
+driver and GMM. This qualifies HEVC input, not HEVC hardware encoding.
+
+Native control and every M4F segment request must retain the exact percent-encoded
+Basic identity and token query, with no cluster peer header. Publishing uses its
+separate Basic identity; neither identity appears in encoder arguments or worker
+statistics. Template inheritance, one shared encoder, closed input/output sockets,
+reaped encoder and frozen egress counters are asserted. Wrong source Basic,
+untrusted CA and denied M4F segments must start no media encoder and send no media.
+A destination may see one empty initial POST while native metadata is pending;
+that connection must close. Failed TLS precedes upstream HTTP.
+
+These opt-in hardware tests use the independently installed system driver/GMM
+without special libVA variables. Expected mapped files default to the system
+paths; `FLUSSONIX_HTTP_GPU_IHD_FILE` and `FLUSSONIX_HTTP_GPU_GMM_FILE` may select
+other independently installed files. `FLUSSONIX_HTTP_GPU_EVIDENCE_DIR` retains
+source/remux/output TS and reports, including mapped dependency hashes and the
+running encoder's three driver-related environment variables.
+
+```
+cargo test --locked --test http_push gpu::native:: -- --ignored --test-threads=1 --nocapture
+```
+
+A nonignored source/remux and M4 packer characterization also runs in ordinary CI;
+it does not qualify hardware. Finite paced loopback sources, owned TLS and bounded
+captures do not qualify vendor packed-GOP dialects, M4F multiple chunks, Main10,
+hardware decoding, HEVC GPU encoding, other GPUs/drivers, subtitles in this
+matrix, live recovery, mixed-vendor clusters, WAN faults or sustained capacity.
+No official Flussonic component is used; all owned test media processes and
+listeners are stopped, including on assertion failures.

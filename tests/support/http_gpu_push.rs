@@ -1,5 +1,7 @@
 //! Opt-in Intel VAAPI publishing qualification, using real sockets and decoders.
 use super::*;
+#[path = "http_gpu_native.rs"]
+mod native;
 #[path = "http_gpu_upstream.rs"]
 mod upstream;
 use std::{collections::HashSet, path::Path, sync::Arc};

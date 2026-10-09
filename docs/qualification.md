@@ -770,3 +770,19 @@ Both denial cases sent0media and reaped their encoder; each configured receiver
 saw one empty POST. Ordinary related checks passed57 tests with5 hardware cases
 explicitly ignored. The saved-config regression was observed failing before the
 validation fix and passing afterward.
+
+
+## Native M4 input Intel HTTP publishing qualification
+
+Opt-in `http_push gpu::native::` tests cover plaintext and verified TLS M4S/M4F
+source pulls into Intel H.264 VAAPI CQP24 HTTP and verified HTTPS publishing.
+H.264/MP3 and HEVC/Layer II compressed sources, each with AAC/Layer II/MP3 output,
+produce24 cases and48 strictly decoded outputs on the named GeminiLake profile.
+Source original/remux frame counts match; actual pipe input, encoder and mapped
+system driver/GMM are checked. Basic/query credentials remain on native control
+and segment requests and are distinct from publication identity. Denials start no
+media encoder and send no media, though one empty initial POST is allowed while
+metadata is pending. Socket/process cleanup and frozen counters are asserted.
+Ordinary CI runs the fixture characterization and explicitly ignores the two
+hardware cases. Native records use FlussoniX packers, so full vendor dialect
+interoperability is not implied. See [commands and exact limits](http-ts-push.md#native-m4-source-decoding).
