@@ -32,6 +32,41 @@ It excludes subsequent offline decoding. This loopback synthetic-source profile
 is a functional qualification, not a first-frame SLA, seamless playback,
 hardware decoding, HEVC GPU encoding, WAN/soak or capacity benchmark.
 
+## Repeated native TLS origin failover
+
+The repeated-failure scenario adds an A → B → A sequence to the same owned
+four-daemon profile. After the first automatic switch, A is restored at its
+original HTTPS address with unchanged configuration and trust. For 16 seconds,
+read-only observations require B's CDN PID and media generation to remain stable,
+input bytes to advance, and A to remain an idle standby. Restoring the preferred
+origin must not interrupt a healthy fallback.
+
+Actual playback refreshes demand before the next fault. The harness verifies B
+is still selected, stops B and its encoder, then makes no playback request until
+read-only observations prove a second automatic source switch to A, a replacement
+CDN PID, over 250kB of fresh input and a third distinct playlist generation.
+Protected HTTP playlist and segment bytes are bound to each observed generation
+before independent strict video/audio decode. Each active CDN generation copies
+codecs, the LB never encodes, retired PIDs are absent, concurrent viewers share
+the replacement, tickets reject replay and anonymous media remains denied.
+Saved configuration must stay byte-for-byte unchanged.
+
+```sh
+# Ordinary CPU profile (also runs in normal CI).
+cargo test --locked --test cluster_native_recovery daemon_retains_healthy_fallback_then_recovers_a_second_origin_failure -- --exact --nocapture --test-threads=1
+# Opt-in Intel H.264 VAAPI profiles over verified M4SS and M4FS.
+cargo test --locked --test cluster_native_recovery repeated_gpu_origin_failures -- --ignored --nocapture --test-threads=1
+```
+
+Set `FLUSSONIX_CLUSTER_RECOVERY_EVIDENCE_DIR` as above for the `*-repeated.json`
+reports. They retain both fault-to-fresh-generation observations, the healthy
+fallback observation and decode/process evidence for all three generations.
+The second interval starts at fallback shutdown; it excludes the preceding
+standby-restoration observation and subsequent decoding. These bounded loopback
+checks do not establish long-duration stability, gapless playback, arbitrary
+fault sequences, forced failback to a healthy preferred node or production
+capacity. No vendor component participates.
+
 The implemented [native pressure profile](native-cluster-pressure.md) shares
 HTTP/RTSP ranking by maximum normalized uplink/CPU/RAM pressure, bounded ready
 preference, actual reserved Mbps and the existing CDN-owned admission ledger.

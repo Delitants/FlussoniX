@@ -924,3 +924,41 @@ The post-review serial hardware repetition passes all three blackout cases in 11
 The recovery startup guard now validates only the candidate stream's current sessions in the primary cache, grouped by stream and existing session identity. It checks current published policy, real playback activity and all authorization deadlines/cancellation flags. The per-pass demand carries a stream name and original activity timestamp, never frozen permission. Retired entries and control-only replacements cannot reuse old playback demand. New foreground playback remains visible during post-startup cleanup, so revoking an earlier session does not terminate a shared worker serving a later valid viewer.
 
 The contention regression first failed with the old whole-map algorithm because a candidate check waited for an unrelated stream's locked session state. Literal cases retain expiry, overdue checks, cancellation, denial, revocation, invalid-token, policy-removal/change and Stop behavior after demand collection. Independent review exposed a shared-worker teardown race in the initial reference-only design; a deterministic regression reproduces it before the cache grouping fix. Global cache admission/eviction and the once-per-pass scan remain; no production capacity or measured throughput claim is made. See the [design](superpowers/specs/2026-10-08-recovery-auth-performance.md) and [plan](superpowers/plans/2026-10-08-recovery-auth-performance.md).
+
+## Repeated native TLS origin failover
+
+The owned-daemon recovery harness now exercises A → B → A. After initial
+protected LB/CDN playback and automatic failover to B, it restores A without
+changing endpoint, trust or configuration. Sixteen seconds of read-only
+observation require B's PID/generation to remain stable and receive fresh media,
+while the restored standby has no encoder. A real playback request refreshes
+demand before stopping B; only telemetry and disk reads are then allowed until
+the CDN automatically returns to A with a new PID, fresh input and a third media
+generation. Each generation's protected HTTP output is hash-bound to the
+observed completed segment and independently decoded. Origin encoding is never
+repeated at the CDN. Reaped old processes, shared replacement workers, anonymous
+denial, single-use tickets and unchanged saved configuration remain assertions.
+
+One temporary production mutation made a restored primary preempt its healthy
+fallback; the new CPU test failed at the sticky-source assertion. A second
+mutation disabled equivalence candidates after the first switch; initial
+failover and standby observation succeeded, then second automatic recovery
+timed out. Original production source was restored byte-for-byte before normal
+qualification. These controls establish that the new assertions catch the
+intended breaks, rather than passing on cached media or a foreground restart.
+
+The CPU M4SS case is an ordinary regression; Intel H.264 VAAPI M4SS/M4FS cases
+remain opt-in. This increment adds qualification to existing behavior, not new
+source-selection policy. See [commands and measurement limits](cluster-loadbalancing.md#repeated-native-tls-origin-failover).
+
+The final serial local matrix passed all three cases in 105.40 seconds: CPU
+M4SS plus independently installed Intel H.264 VAAPI CQP24/AAC96 M4SS and M4FS.
+All nine generation/hash-bound HTTP outputs decoded 50 video and 94 audio frames
+with zero strict errors. First/second fault-to-observed-generation intervals
+were 4.331/3.234 seconds for CPU M4SS, 3.732/7.809 seconds for GPU M4SS and
+8.867/7.662 seconds for GPU M4FS. The healthy-fallback observations lasted
+16.031–16.117 seconds. These measurements include shutdown, supervisor cadence,
+worker startup and media collection, exclude subsequent offline decode, and
+are neither first-frame latency nor availability or capacity guarantees.
+Owned daemons and encoders were reaped after every case. Runtime/UI source,
+host packages and preview configuration are unchanged by this increment.

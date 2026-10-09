@@ -13,6 +13,21 @@ mod tls_fixture;
 use daemon::Daemon;
 
 const STREAM: &str = "region/owned";
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scenario {
+    Failover,
+    Blackout,
+    Repeated,
+}
+impl Scenario {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Failover => "",
+            Self::Blackout => "-blackout",
+            Self::Repeated => "-repeated",
+        }
+    }
+}
 fn stats(node: &Value) -> Value {
     node["streams"]
         .as_array()
@@ -243,14 +258,14 @@ async fn playback(
     report["segment_sha256"] = json!(format!("{:x}", Sha256::digest(&data)));
     report
 }
-async fn qualification(transport: &str, encoder: &str, blackout: bool) {
+async fn qualification(transport: &str, encoder: &str, scenario: Scenario) {
     let mut nodes = [
         Daemon::new("a"),
         Daemon::new("b"),
         Daemon::new("cdn"),
         Daemon::new("lb"),
     ];
-    let outcome = std::panic::AssertUnwindSafe(run(&mut nodes, transport, encoder, blackout))
+    let outcome = std::panic::AssertUnwindSafe(run(&mut nodes, transport, encoder, scenario))
         .catch_unwind()
         .await;
     let mut clean = true;
@@ -264,16 +279,14 @@ async fn qualification(transport: &str, encoder: &str, blackout: bool) {
         Ok(report) => {
             assert!(clean, "owned daemon/encoder shutdown");
             println!(
-                "cluster recovery: encoder={encoder}, transport={transport}, resume_ms={}, strict_decoded_outputs=2",
-                report["automatic_resume_ms"]
+                "cluster recovery: encoder={encoder}, transport={transport}, resume_ms={}, strict_decoded_outputs={}",
+                report["automatic_resume_ms"], report["strict_decoded_outputs"]
             );
             if let Ok(directory) = std::env::var("FLUSSONIX_CLUSTER_RECOVERY_EVIDENCE_DIR") {
                 std::fs::create_dir_all(&directory).unwrap();
                 std::fs::write(
-                    Path::new(&directory).join(format!(
-                        "{encoder}-{transport}{}.json",
-                        if blackout { "-blackout" } else { "" }
-                    )),
+                    Path::new(&directory)
+                        .join(format!("{encoder}-{transport}{}.json", scenario.suffix())),
                     serde_json::to_vec_pretty(&report).unwrap(),
                 )
                 .unwrap();
@@ -294,35 +307,80 @@ async fn qualification(transport: &str, encoder: &str, blackout: bool) {
 
 #[tokio::test]
 async fn daemon_recovers_equivalent_native_tls_origin_without_viewer_requests() {
-    qualification("m4s", "libx264", false).await;
+    qualification("m4s", "libx264", Scenario::Failover).await;
 }
 #[tokio::test]
 #[ignore = "requires independently installed Intel H.264 VAAPI driver and render device"]
 async fn daemon_recovers_gpu_origins_over_verified_m4s_tls() {
-    qualification("m4s", "h264_vaapi", false).await;
+    qualification("m4s", "h264_vaapi", Scenario::Failover).await;
 }
 #[tokio::test]
 #[ignore = "requires independently installed Intel H.264 VAAPI driver and render device"]
 async fn daemon_recovers_gpu_origins_over_verified_m4f_tls() {
-    qualification("m4f", "h264_vaapi", false).await;
+    qualification("m4f", "h264_vaapi", Scenario::Failover).await;
 }
 
 #[tokio::test]
 async fn daemon_recovers_complete_origin_blackout_without_viewer_requests() {
-    qualification("m4s", "libx264", true).await;
+    qualification("m4s", "libx264", Scenario::Blackout).await;
 }
 #[tokio::test]
 #[ignore = "requires independently installed Intel H.264 VAAPI driver and render device"]
 async fn daemon_recovers_gpu_origin_blackout_over_verified_m4s_tls() {
-    qualification("m4s", "h264_vaapi", true).await;
+    qualification("m4s", "h264_vaapi", Scenario::Blackout).await;
 }
 #[tokio::test]
 #[ignore = "requires independently installed Intel H.264 VAAPI driver and render device"]
 async fn daemon_recovers_gpu_origin_blackout_over_verified_m4f_tls() {
-    qualification("m4f", "h264_vaapi", true).await;
+    qualification("m4f", "h264_vaapi", Scenario::Blackout).await;
 }
 
-async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str, blackout: bool) -> Value {
+#[tokio::test]
+async fn daemon_retains_healthy_fallback_then_recovers_a_second_origin_failure() {
+    qualification("m4s", "libx264", Scenario::Repeated).await;
+}
+#[tokio::test]
+#[ignore = "requires independently installed Intel H.264 VAAPI driver and render device"]
+async fn daemon_recovers_repeated_gpu_origin_failures_over_verified_m4s_tls() {
+    qualification("m4s", "h264_vaapi", Scenario::Repeated).await;
+}
+#[tokio::test]
+#[ignore = "requires independently installed Intel H.264 VAAPI driver and render device"]
+async fn daemon_recovers_repeated_gpu_origin_failures_over_verified_m4f_tls() {
+    qualification("m4f", "h264_vaapi", Scenario::Repeated).await;
+}
+
+// This observation cannot start media or renew demand: only telemetry and disk reads.
+async fn observe_recovery(
+    client: &reqwest::Client,
+    cdn: &Daemon,
+    previous: &Value,
+    previous_generation: &str,
+    expected_source: &str,
+    expected_switches: u64,
+) -> (Value, String) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let s = stats(&cdn.node(client).await);
+            let playlist = cdn.playlist().unwrap_or_default();
+            if s["upstream_source"] == expected_source
+                && s["source_switches"] == expected_switches
+                && s["status"] == "running"
+                && s["pid"] != previous["pid"]
+                && s["bytes_in"].as_u64().is_some_and(|v| v > 250_000)
+                && playlist.lines().any(|l| !l.starts_with('#') && !l.is_empty())
+                && playlist_generation(&playlist) != previous_generation
+            {
+                break (s, playlist);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("automatic recovery to {expected_source} after {expected_switches} switches must produce fresh media without viewer requests"))
+}
+
+async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str, scenario: Scenario) -> Value {
     for (index, name) in [(0, "a"), (1, "b")] {
         let transcoder = if encoder == "h264_vaapi" {
             json!({"encoder":encoder,"qp":24,"acodec":"aac","ab":96})
@@ -425,7 +483,7 @@ async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str, blackout: 
         "origin shutdown must reap its encoder"
     );
     assert!(!Path::new(&format!("/proc/{origin_a_pid}")).exists());
-    if blackout {
+    if scenario == Scenario::Blackout {
         assert!(nodes[1].stop().await, "stop every owned origin");
         tokio::time::timeout(Duration::from_secs(16), async {
             loop {
@@ -451,27 +509,8 @@ async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str, blackout: 
         );
     }
     // Only read-only node GETs below. No playback request can trigger recovery.
-    let (second, observed_playlist) = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let s = stats(&nodes[2].node(&client).await);
-            let playlist = nodes[2].playlist().unwrap_or_default();
-            if s["upstream_source"] == "b"
-                && s["source_switches"] == 1
-                && s["status"] == "running"
-                && s["pid"] != first["pid"]
-                && s["bytes_in"].as_u64().is_some_and(|v| v > 250_000)
-                && playlist
-                    .lines()
-                    .any(|l| !l.starts_with('#') && !l.is_empty())
-                && playlist_generation(&playlist) != old_generation
-            {
-                break (s, playlist);
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("real supervisor switches and produces fresh media without viewer requests");
+    let (second, observed_playlist) =
+        observe_recovery(&client, &nodes[2], &first, &old_generation, "b", 1).await;
     assert_eq!(second["input_protocol"], format!("{transport}s"));
     let automatic_resume_ms = fault.elapsed().as_millis();
     let second_pid = u32::try_from(second["pid"].as_u64().unwrap()).unwrap();
@@ -489,11 +528,116 @@ async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str, blackout: 
     let concurrent =
         futures_util::future::join_all((0..6).map(|_| client.get(&new_canonical).send())).await;
     assert!(concurrent.into_iter().all(|r| r.unwrap().status() == 200));
-    tokio::time::sleep(Duration::from_secs(11)).await;
+    let repeated = if scenario == Scenario::Repeated {
+        let address = nodes[0].url.clone();
+        assert!(nodes[0].unchanged());
+        nodes[0].start("a", "source").await;
+        assert_eq!(
+            nodes[0].url, address,
+            "restored origin keeps its configured endpoint"
+        );
+        assert_eq!(nodes[0].node(&client).await["role"], "source");
+
+        // Three supervisor intervals include a periodic source metadata refresh.
+        // Do not make a media request while proving that restoration is non-disruptive.
+        let restored = Instant::now();
+        let before_bytes = stats(&nodes[2].node(&client).await)["bytes_in"]
+            .as_u64()
+            .unwrap();
+        while restored.elapsed() < Duration::from_secs(16) {
+            let s = stats(&nodes[2].node(&client).await);
+            assert_eq!(
+                s["upstream_source"], "b",
+                "restored primary must not displace a healthy fallback"
+            );
+            assert_eq!(s["source_switches"], 1);
+            assert_eq!(s["pid"], second["pid"]);
+            assert_eq!(s["status"], "running");
+            assert_eq!(
+                playlist_generation(&nodes[2].playlist().unwrap()),
+                new_generation
+            );
+            assert!(
+                nodes[0].owned_encoders().is_empty(),
+                "restoring a standby must not start redundant ingestion"
+            );
+            assert_eq!(nodes[1].owned_encoders(), [origin_b_pid]);
+            assert_eq!(nodes[2].owned_encoders(), [second_pid]);
+            assert!(nodes[3].owned_encoders().is_empty());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let stable = stats(&nodes[2].node(&client).await);
+        assert_eq!(stable["upstream_source"], "b");
+        assert_eq!(stable["source_switches"], 1);
+        assert_eq!(stable["pid"], second["pid"]);
+        assert!(stable["bytes_in"].as_u64().unwrap() > before_bytes + 250_000);
+        let stable_ms = restored.elapsed().as_millis();
+
+        // Real playback renews demand before the next fault, never during its observation.
+        let refresh = client.get(&new_canonical).send().await.unwrap();
+        assert_eq!(refresh.status(), 200);
+        drop(refresh);
+        let at_fault = stats(&nodes[2].node(&client).await);
+        assert_eq!(at_fault["upstream_source"], "b");
+        assert_eq!(at_fault["source_switches"], 1);
+        assert_eq!(at_fault["pid"], second["pid"]);
+        let second_fault = Instant::now();
+        assert!(
+            nodes[1].stop().await,
+            "fallback shutdown must reap its encoder"
+        );
+        assert!(!Path::new(&format!("/proc/{origin_b_pid}")).exists());
+        let (returned, returned_playlist) =
+            observe_recovery(&client, &nodes[2], &second, &new_generation, "a", 2).await;
+        let second_resume_ms = second_fault.elapsed().as_millis();
+        assert_eq!(returned["input_protocol"], format!("{transport}s"));
+        let returned_pid = u32::try_from(returned["pid"].as_u64().unwrap()).unwrap();
+        assert!(!Path::new(&format!("/proc/{second_pid}")).exists());
+        let returned_generation = playlist_generation(&returned_playlist);
+        assert_ne!(
+            returned_generation, old_generation,
+            "returning origin must not reuse pre-fault media"
+        );
+        let origin = stats(&nodes[0].node(&client).await);
+        let origin_pid = u32::try_from(origin["pid"].as_u64().unwrap()).unwrap();
+        assert_ne!(origin_pid, origin_a_pid);
+        let returned_origin = process(origin_pid, encoder);
+        let returned_cdn = process(returned_pid, "copy");
+        assert_eq!(nodes[0].owned_encoders(), [origin_pid]);
+        assert!(nodes[1].owned_encoders().is_empty());
+        assert_eq!(nodes[2].owned_encoders(), [returned_pid]);
+        assert!(nodes[3].owned_encoders().is_empty());
+        let returned_decode = playback(
+            &client,
+            &new_canonical,
+            &nodes[2],
+            "returned",
+            &returned_generation,
+        )
+        .await;
+        let returned_canonical = admit(&client, &nodes[3], &nodes[2]).await;
+        let reloads =
+            futures_util::future::join_all((0..6).map(|_| client.get(&returned_canonical).send()))
+                .await;
+        assert!(reloads.into_iter().all(|r| r.unwrap().status() == 200));
+        assert_eq!(nodes[2].owned_encoders(), [returned_pid]);
+        let confirmed = stats(&nodes[2].node(&client).await);
+        assert_eq!(confirmed["upstream_source"], "a");
+        assert_eq!(confirmed["source_switches"], 2);
+        assert_eq!(confirmed["pid"], returned["pid"]);
+        json!({"stable_fallback_ms":stable_ms,"stable_fallback_bytes":stable["bytes_in"].as_u64().unwrap()-before_bytes,
+            "second_automatic_resume_ms":second_resume_ms,"returned_origin":returned_origin,
+            "returned_cdn":returned_cdn,"returned_decode":returned_decode,"source_switches":2})
+    } else {
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        Value::Null
+    };
     let sticky = stats(&nodes[2].node(&client).await);
-    assert_eq!(sticky["pid"], second["pid"]);
-    assert_eq!(sticky["upstream_source"], "b");
-    assert_eq!(sticky["source_switches"], 1);
+    if scenario != Scenario::Repeated {
+        assert_eq!(sticky["pid"], second["pid"]);
+        assert_eq!(sticky["upstream_source"], "b");
+        assert_eq!(sticky["source_switches"], 1);
+    }
     for index in [2, 3] {
         assert_eq!(
             client
@@ -508,5 +652,7 @@ async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str, blackout: 
     assert!(nodes.iter().all(Daemon::unchanged));
     json!({"transport":transport,"encoder":encoder,"automatic_resume_ms":automatic_resume_ms,
             "before_origin":before_origin,"after_origin":after_origin,"before_cdn":before_cdn,"after_cdn":after_cdn,
-            "before_decode":before_decode,"after_decode":after_decode,"source_switches":1,"read_only_recovery_observation":true,"complete_blackout":blackout})
+            "before_decode":before_decode,"after_decode":after_decode,"source_switches":if scenario==Scenario::Repeated {2}else{1},
+            "strict_decoded_outputs":if scenario==Scenario::Repeated {3}else{2},"repeated":repeated,
+            "read_only_recovery_observation":true,"complete_blackout":scenario==Scenario::Blackout})
 }
