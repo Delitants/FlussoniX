@@ -23,7 +23,7 @@ CPU encoding uses libx264 plus AAC. NVIDIA configuration is exposed, but no GPU 
 
 HLS and M4 windows are bounded; live subscribers use bounded shared queues and disconnect on lag. There is a 256-worker implementation limit. This build has not been benchmarked for production stream/viewer counts. v0.2 samples Linux CPU/RAM and aggregate TX bytes on the selected interface independently of management requests. HTTP media egress is reported separately; explicit process mode is available. Unknown/warmup/reset/stale metrics exclude new admissions. Balancing applies resource headroom and authoritative CDN reservations; it does not promise perfect uplink prediction.
 
-API compatibility is a subset. Collection default ordering is by name; `sort=-name` and literal substring `q` are implemented, while full projection/filter/sort semantics, configuration-text formats and many operations remain open. API credentials/listeners/resource limits are startup settings rather than the complete vendor config contract. Unknown saved options fail validation. Viewer session counts expire after 30 seconds of inactivity when no continuous response remains open; global cross-node session ownership remains open.
+API compatibility is a subset. Collection default ordering is by name; `sort=-name`, literal substring `q`, and nested `select` for Streams/Templates collections are implemented. General filtering, composite sorting, reference default ordering, dynamic cursor parity, selection on other collections/items, configuration-text formats and many operations remain open. API credentials/listeners/resource limits are startup settings rather than the complete vendor config contract. Unknown saved options fail validation. Viewer session counts expire after 30 seconds of inactivity when no continuous response remains open; global cross-node session ownership remains open.
 
 For testing, keep management endpoints on a trusted interface or reach them through SSH forwarding. The daemon currently serves HTTP, so HTTPS delivery requires a separately configured TLS terminator. The dedicated test instances must use separate directories, accounts, units and unused ports; never replace or restart existing Flussonic services.
 
@@ -1005,3 +1005,21 @@ collection, and exclude subsequent HTTP decoding and native metadata checks.
 They are bounded loopback observations, not first-frame latency or availability
 guarantees. No runtime/UI source, host package or preview setting changes in
 this qualification increment.
+
+
+## Streams/Templates collection field selection
+
+Six real-router tests cover nested effective settings and explicit disk fields,
+required stream names, template rows without implicit identity fields, whole
+objects/arrays, sibling selection and query-order parent/child overlap. Literal
+expected responses also cover empty/unknown selectors, unsupported scalar/array
+traversal, a deeply nested unknown path, unchanged collection envelopes, search
+and reverse-name cursor pages, view authentication and unchanged item GETs.
+Five tests first failed because full rows were returned; the pre-existing auth
+and default-response regression passed. The API/configuration suite then passed
+all 36 cases with the independent Rust selector. Selected GETs preserve both
+in-memory and disk configuration and create no workers.
+
+This qualifies collection field selection within the documented
+[scope and limits](compatibility.md#implemented-collection-field-selection); it
+does not establish general collection query or complete API parity.

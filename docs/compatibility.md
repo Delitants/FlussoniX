@@ -40,6 +40,33 @@ Some UI behaviors depend on private routes, such as explicit input selection. Re
 
 Reference: [management API](https://flussonic.com/doc/api/reference/). Detailed route metadata comes from the bundled public and private schemas recorded in the evidence inventory.
 
+### Implemented collection field selection
+
+Authenticated GET `/streams` and `/templates` support comma-separated `select`
+fields, including dotted object paths such as
+`select=name,title,transcoder.vb,stats.status,config_on_disk.template`.
+Selection applies to each returned row after effective configuration, search,
+ordering and pagination. It does not change `estimated_count`, `next`, `prev`
+or `timing`, save configuration, or start a worker. Without `select`, existing
+full responses are preserved. Item GET and other collections are unchanged.
+
+Selecting a whole object or array preserves that value. Dotted paths traverse
+objects; array element projection and scalar traversal are unsupported and
+omitted. Unknown fields are omitted; an existing object with no matching child
+is returned as `{}`. An explicitly empty selector returns `{}` per template
+and only the required `name` per stream. Stream rows always retain `name`,
+matching the reference schema's required identity field. Wildcards and JSON
+path syntax are not supported. Overlapping parent/child selectors resolve in
+query order: a later parent selects the whole value; a later child narrows it.
+
+The contract is grounded in the installed 26.04.1 schema, read-only inspection
+of its collection selector, and the public
+[API design principles](https://flussonic.com/doc/fms/api/flussonic-api-design/#limiting-the-field-set-of-the-result).
+Unknown/non-object paths are handled without reproducing reference exceptions.
+The tests and implementation use no vendor components. General filtering,
+composite sorting, reference default ordering and dynamic cursor parity remain
+separate compatibility tasks.
+
 ## Cluster and load-balancing contract
 
 The first release must support the user's **LB → CDN → source over LAN** topology, with local-stream reuse and on-demand pulls. Preserve peers, sources, public/private/API addresses, source filters and the four reference balancer modes. [Detailed design and routing matrix](cluster-loadbalancing.md)

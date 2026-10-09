@@ -723,12 +723,20 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(100)
         .clamp(1, 1000);
-    let page = items
+    let mut page = items
         .into_iter()
         .skip(offset)
         .take(limit)
         .collect::<Vec<_>>();
     let mut result = json!({"estimated_count":total,"timing":{},"next":if offset+page.len()<total{Some(STANDARD.encode(format!("%24position_gt={}",offset+page.len()-1)))}else{None::<String>},"prev":null});
+    if matches!(kind, "streams" | "templates")
+        && let Some(select) = query.get("select")
+    {
+        let selection = crate::api_select::Selection::new(select);
+        for row in &mut page {
+            *row = selection.project(row, kind == "streams");
+        }
+    }
     result[kind] = json!(page);
     json_response(result)
 }
