@@ -362,7 +362,7 @@ async fn filtered_sorted_pages_keep_counts_and_cursor_envelope() {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["streams"], json!([{"name":name,"title":"News"}]));
         assert_eq!(body["estimated_count"], 3);
-        assert_eq!(body["prev"], Value::Null);
+        assert_eq!(body["prev"].is_string(), index > 0);
         assert_eq!(body["timing"], json!({}));
         cursor = body["next"].as_str().map(str::to_owned);
         assert_eq!(cursor.is_some(), index < 2);

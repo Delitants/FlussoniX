@@ -23,7 +23,7 @@ CPU encoding uses libx264 plus AAC. NVIDIA configuration is exposed, but no GPU 
 
 HLS and M4 windows are bounded; live subscribers use bounded shared queues and disconnect on lag. There is a 256-worker implementation limit. This build has not been benchmarked for production stream/viewer counts. v0.2 samples Linux CPU/RAM and aggregate TX bytes on the selected interface independently of management requests. HTTP media egress is reported separately; explicit process mode is available. Unknown/warmup/reset/stale metrics exclude new admissions. Balancing applies resource headroom and authoritative CDN reservations; it does not promise perfect uplink prediction.
 
-API compatibility is a subset. Collection default ordering is by name; `sort=-name`, literal substring `q`, nested `select`, and the documented scalar filtering profile for Streams/Templates collections are implemented. Complete filter/schema coverage, composite sorting, reference default ordering, dynamic cursor parity, selection on other collections/items, configuration-text formats and many operations remain open. API credentials/listeners/resource limits are startup settings rather than the complete vendor config contract. Unknown saved options fail validation. Viewer session counts expire after 30 seconds of inactivity when no continuous response remains open; global cross-node session ownership remains open.
+API compatibility is a subset. Collection default ordering is by name; composite scalar sorting, literal substring `q`, nested `select`, scalar filtering and the documented value-based cursor profile for Streams/Templates collections are implemented. Complete filter/schema coverage, reference default ordering, full vendor cursor parity, selection on other collections/items, configuration-text formats and many operations remain open. API credentials/listeners/resource limits are startup settings rather than the complete vendor config contract. Unknown saved options fail validation. Viewer session counts expire after 30 seconds of inactivity when no continuous response remains open; global cross-node session ownership remains open.
 
 For testing, keep management endpoints on a trusted interface or reach them through SSH forwarding. The daemon currently serves HTTP, so HTTPS delivery requires a separately configured TLS terminator. The dedicated test instances must use separate directories, accounts, units and unused ports; never replace or restart existing Flussonic services.
 
@@ -1068,3 +1068,28 @@ peer is still sending. The test now accepts only EOF or `ConnectionReset`, keeps
 its five-second deadline, checks worker closure before cleanup and verifies
 actual RTSP success responses. It joins its owned flood task and stops the lab
 before asserting the captured outcome. No RTSP runtime behavior changes.
+
+
+## Value-based Streams/Templates cursor qualification
+
+Eleven new router regressions first failed against positional pagination; three
+additional boundary cases already passed and protect retained behavior. The
+independent implementation qualifies forward continuation after insertion or
+deletion before the boundary and deletion of the boundary row, nearest backward
+pages in normal order, mixed composite directions and identity ties, template
+projection without identity, inherited/saved/runtime keys, and count semantics.
+Lossless signed/unsigned integers and equal floating-point keys are exercised
+alongside mixed scalars, missing values and literal null-sentinel identities.
+
+Tests bind native cursors to collection, sort, filter and search while permitting
+changed page size/projection. They cover inbound reference identity bounds,
+legacy positional input, maximum-position exhaustion, invalid encodings and
+schema/type/context rejection after authorization, oversized outgoing boundaries,
+empty navigation, unchanged other-collection envelopes, saved configuration and
+no media-worker startup. A disposable daemon HTTP smoke additionally exercises
+opaque forward/backward continuation and deleted anchors on an allocated port;
+its process is stopped and reaped. Existing operator configuration is preserved.
+
+See the [implemented cursor profile and limits](compatibility.md#implemented-value-based-collection-cursors).
+This is not full vendor compound-cursor parity or a stable snapshot of changing
+sort values. Normal build, tests and runtime remain independent of Flussonic.

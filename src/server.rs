@@ -706,9 +706,13 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     if let Some(q) = query.get("q") {
         items.retain(|v| v.to_string().to_lowercase().contains(&q.to_lowercase()));
     }
-    if matches!(kind, "streams" | "templates") {
-        let sort = crate::api_sort::Sort::new(query.get("sort").map(String::as_str));
-        items.sort_by(|left, right| sort.compare(left, right));
+    let total = items.len();
+    let (mut page, next, prev) = if matches!(kind, "streams" | "templates") {
+        let page = match crate::api_cursor::paginate(items, kind, &query) {
+            Ok(page) => page,
+            Err(message) => return error(StatusCode::BAD_REQUEST, message),
+        };
+        (page.items, page.next, page.prev)
     } else {
         items.sort_by_key(|v| {
             v["name"]
@@ -720,27 +724,32 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         if query.get("sort").is_some_and(|s| s == "-name") {
             items.reverse()
         }
-    }
-    let total = items.len();
-    let offset = query
-        .get("cursor")
-        .and_then(|s| STANDARD.decode(s).ok())
-        .and_then(|b| String::from_utf8(b).ok())
-        .map(|s| parse_query(Some(&s)))
-        .and_then(|p| p.get("$position_gt").and_then(|v| v.parse::<usize>().ok()))
-        .map(|p| p + 1)
-        .unwrap_or(0);
-    let limit = query
-        .get("limit")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(100)
-        .clamp(1, 1000);
-    let mut page = items
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .collect::<Vec<_>>();
-    let mut result = json!({"estimated_count":total,"timing":{},"next":if offset+page.len()<total{Some(STANDARD.encode(format!("%24position_gt={}",offset+page.len()-1)))}else{None::<String>},"prev":null});
+        let offset = query
+            .get("cursor")
+            .and_then(|s| STANDARD.decode(s).ok())
+            .and_then(|b| String::from_utf8(b).ok())
+            .map(|s| parse_query(Some(&s)))
+            .and_then(|p| p.get("$position_gt").and_then(|v| v.parse::<usize>().ok()))
+            .map(|p| p.saturating_add(1))
+            .unwrap_or(0);
+        let limit = query
+            .get("limit")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(100)
+            .clamp(1, 1000);
+        let page = items
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>();
+        let next = if offset.saturating_add(page.len()) < total {
+            Some(STANDARD.encode(format!("%24position_gt={}", offset + page.len() - 1)))
+        } else {
+            None
+        };
+        (page, next, None)
+    };
+    let mut result = json!({"estimated_count":total,"timing":{},"next":next,"prev":prev});
     if matches!(kind, "streams" | "templates")
         && let Some(select) = query.get("select")
     {

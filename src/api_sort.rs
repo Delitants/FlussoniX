@@ -1,4 +1,5 @@
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Number, Value};
 use std::cmp::Ordering;
 
 /// Scalar collection ordering. Paths are compiled once per request; identity
@@ -33,6 +34,92 @@ impl<'a> Sort<'a> {
             }
         }
         Ordering::Equal
+    }
+
+    pub(crate) fn specification(&self) -> &[(Vec<&'a str>, bool)] {
+        &self.fields
+    }
+
+    pub(crate) fn identity_direction(&self) -> Option<bool> {
+        match self.fields.as_slice() {
+            [(path, descending)] if path == &["name"] => Some(*descending),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn keys(&self, row: &Value) -> Vec<Key> {
+        self.fields
+            .iter()
+            .map(|(path, _)| match scalar(row, path) {
+                Scalar::Missing => Key::Missing,
+                Scalar::Integer(value) => Key::Integer(if value < 0 {
+                    Number::from(value as i64)
+                } else {
+                    Number::from(value as u64)
+                }),
+                Scalar::Text(value) => Key::Text(value.to_owned()),
+                Scalar::Float(value) => Key::Float(value.to_bits()),
+                Scalar::Boolean(value) => Key::Boolean(value),
+            })
+            .collect()
+    }
+
+    pub(crate) fn valid_keys(&self, keys: &[Key]) -> bool {
+        keys.len() == self.fields.len()
+            && self.fields.iter().zip(keys).all(|((path, _), key)| {
+                if path == &["name"] {
+                    return matches!(key, Key::Text(_));
+                }
+                match key {
+                    Key::Integer(value) => value.is_i64() || value.is_u64(),
+                    Key::Float(bits) => f64::from_bits(*bits).is_finite(),
+                    Key::Text(value) => value != "null" && value != "undefined",
+                    _ => true,
+                }
+            })
+    }
+
+    /// Only used with keys validated against this exact sort specification.
+    pub(crate) fn compare_keys(&self, row: &Value, keys: &[Key]) -> Ordering {
+        for ((path, descending), key) in self.fields.iter().zip(keys) {
+            let order = scalar(row, path).compare(key.scalar());
+            if order != Ordering::Equal {
+                return if *descending { order.reverse() } else { order };
+            }
+        }
+        Ordering::Equal
+    }
+}
+
+/// Preserve number types and exact floating-point bits through JSON round trips.
+#[derive(Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub(crate) enum Key {
+    Missing,
+    Integer(Number),
+    Text(String),
+    Float(u64),
+    Boolean(bool),
+}
+
+impl Key {
+    fn scalar(&self) -> Scalar<'_> {
+        match self {
+            Self::Missing => Scalar::Missing,
+            Self::Integer(value) => value
+                .as_i64()
+                .map(i128::from)
+                .or_else(|| value.as_u64().map(i128::from))
+                .map_or(Scalar::Missing, Scalar::Integer),
+            Self::Text(value) => Scalar::Text(value),
+            Self::Float(bits) => Scalar::Float(f64::from_bits(*bits)),
+            Self::Boolean(value) => Scalar::Boolean(*value),
+        }
     }
 }
 

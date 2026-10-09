@@ -127,17 +127,22 @@ async fn select_keeps_search_sort_counts_and_cursor_pages_based_on_unprojected_r
     .await;
     assert_eq!(
         first,
-        json!({"estimated_count":2,"next":"JTI0cG9zaXRpb25fZ3Q9MA==","prev":null,"timing":{},"streams":[{"name":"gamma","static":false}]})
+        json!({"estimated_count":2,"next":first["next"],"prev":null,"timing":{},"streams":[{"name":"gamma","static":false}]})
     );
+    assert!(first["next"].is_string());
+    let cursor = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("cursor", first["next"].as_str().unwrap())
+        .finish();
     let second = selected(
         &app,
-        "/streamer/api/v3/streams?select=static&q=Needle&sort=-name&limit=1&cursor=JTI0cG9zaXRpb25fZ3Q9MA%3D%3D",
+        &format!("/streamer/api/v3/streams?select=static&q=Needle&sort=-name&limit=1&{cursor}"),
     )
     .await;
     assert_eq!(
         second,
-        json!({"estimated_count":2,"next":null,"prev":null,"timing":{},"streams":[{"name":"alpha","static":false}]})
+        json!({"estimated_count":2,"next":null,"prev":second["prev"],"timing":{},"streams":[{"name":"alpha","static":false}]})
     );
+    assert!(second["prev"].is_string());
     let absent = selected(&app, "/streamer/api/v3/streams?select=name&q=not-present").await;
     assert_eq!(
         absent,

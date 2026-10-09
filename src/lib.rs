@@ -1,3 +1,4 @@
+mod api_cursor;
 mod api_filter;
 mod api_select;
 mod api_sort;

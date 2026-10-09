@@ -66,7 +66,7 @@ of its collection selector, and the public
 [API design principles](https://flussonic.com/doc/fms/api/flussonic-api-design/#limiting-the-field-set-of-the-result).
 Unknown/non-object paths are handled without reproducing reference exceptions.
 The tests and implementation use no vendor components. Reference default
-ordering and dynamic cursor parity remain separate tasks.
+ordering and full vendor cursor parity remain separate tasks.
 
 ### Implemented scalar collection filtering
 
@@ -95,7 +95,7 @@ indices, other collections/items, complete reference field coverage, enum and
 format validation, conflicting parent/child predicates, and exact vendor error
 payloads remain unqualified. Repeated identical query keys retain the existing
 last-value behavior. Filters do not mutate configuration or start media workers.
-Pagination retains the current position cursor; dynamic cursor parity is pending.
+Pagination now uses the [value-based cursor profile](#implemented-value-based-collection-cursors); full vendor cursor parity remains pending.
 
 This independent profile is grounded in read-only inspection of the installed
 26.04.1 collection/schema modules, the official
@@ -135,8 +135,61 @@ This independently implemented scalar profile follows the official
 and read-only inspection of the installed 26.04.1 collection comparator and
 [public handler](https://github.com/flussonic/openapi_handler). Vendor ordering
 of complete arrays/objects, implicit position/default-key parity and sort-key
-cursors across changing snapshots remain unqualified. The current position
-cursor is retained; repeated pages are deterministic for a fixed snapshot.
+cursors across changing snapshots remain unqualified as vendor parity. The
+[independent value-based cursor profile](#implemented-value-based-collection-cursors)
+now continues the supported scalar order across insertions and deletions.
+
+## Implemented value-based collection cursors
+
+Streams and Templates collections return opaque `next` and `prev` tokens.
+URL-encode a token as the next request's `cursor`; retain the collection, sort,
+filter and search arguments. `limit` and `select` may change. Omitted sort and
+explicit `sort=name` share the same context. Counts describe the current filtered
+collection before the cursor and page limit. Empty pages have null navigation.
+Item GET and other collections keep their existing contracts.
+
+The independent native token is standard Base64 of a URL query containing one
+`$flussonix_cursor` value. Its versioned JSON contains a SHA-256 digest of the
+collection, canonical sort specification and filter/search arguments, direction,
+and typed scalar boundary values, including identity. Integers retain signed and
+unsigned 64-bit precision; floating-point values use finite IEEE-754 bit patterns.
+The token is opaque continuation state, not an authorization credential or a
+signed snapshot. Management authorization applies on every request.
+
+Forward pages contain rows strictly after the saved boundary. Backward pages
+contain the nearest preceding rows in normal sort order. The boundary remains
+usable if its row is deleted; adding or deleting earlier rows does not shift a
+forward continuation. All current filters and sorting run before boundary
+comparison; projection runs afterward. Each request sees the current collection.
+Changing a row's sort keys, filter membership or runtime statistics can move it
+across a boundary; snapshot isolation and exactly-once traversal during such
+changes are not promised. New rows before an already-passed boundary are not
+included in its forward continuation.
+
+Inbound legacy `$position_gt=<nonnegative integer>` tokens remain accepted,
+including safe exhaustion at the platform's maximum integer. For identity-only
+`name` or `-name` sorting, reference `name_gt` / `name_lt` bounds are accepted;
+backward bounds include `$reversed=true`. An optional reference `$position_gt`
+or `$position_lt` is validated and treated as redundant with the unique name.
+For example, Base64 of `$position_gt=2&name_gt=a1` continues ascending names
+strictly after `a1`. These incoming reference/legacy tokens lack native context
+binding. New responses always return the native profile, even after legacy input.
+
+Malformed Base64, URL escapes or UTF-8; duplicate inner query keys; unsupported
+reference compound bounds; native schema/version/context/key mismatches; and
+nonfinite or nonscalar boundary values return HTTP 400 after authentication.
+Tokens are limited to 24,000 encoded bytes and 16,384 decoded URL-query bytes.
+If an outgoing sort boundary exceeds either limit, the request returns HTTP 400
+with guidance to choose smaller scalar sort fields. Tokens should be echoed,
+not constructed or edited by clients. Changing even equivalent filter spellings
+may require restarting from the first page because argument values are bound.
+
+This profile follows the official
+[cursor API design](https://flussonic.com/doc/fms/api/flussonic-api-design/#cursors)
+and read-only reference inspection, without a vendor build/runtime dependency.
+Full vendor compound-cursor serialization, implicit position/default ordering,
+and reference filtering quirks remain unqualified. Vendor clients that decode or
+construct other cursor dialects require further interoperability qualification.
 
 ## Cluster and load-balancing contract
 
