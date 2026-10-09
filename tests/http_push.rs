@@ -37,6 +37,7 @@ struct Capture {
     requests: AtomicUsize,
     active: AtomicUsize,
     max_active: AtomicUsize,
+    publication_trace: Mutex<Option<Arc<Mutex<PublicationTrace>>>>,
     bodies: Mutex<Vec<Arc<Mutex<Vec<u8>>>>>,
     data: Mutex<Vec<u8>>,
     paths: Mutex<Vec<String>>,
@@ -48,13 +49,36 @@ impl Drop for Active {
         self.0.active.fetch_sub(1, Ordering::SeqCst);
     }
 }
+// Shared across the two destinations only for supervisor qualification.
+#[derive(Default)]
+struct PublicationTrace {
+    retired_pid: u32,
+    retired_encoder_alive_at_post: bool,
+    generation_overlap: bool,
+    active: std::collections::HashMap<usize, usize>,
+}
+struct PublicationGuard {
+    trace: Arc<Mutex<PublicationTrace>>,
+    generation: usize,
+}
+impl Drop for PublicationGuard {
+    fn drop(&mut self) {
+        *self
+            .trace
+            .lock()
+            .unwrap()
+            .active
+            .get_mut(&self.generation)
+            .unwrap() -= 1;
+    }
+}
 #[derive(Clone)]
 struct ReceiverState {
     capture: Arc<Capture>,
     cancel: CancellationToken,
 }
 async fn receive(State(s): State<ReceiverState>, r: Request<Body>) -> axum::response::Response {
-    s.capture.requests.fetch_add(1, Ordering::SeqCst);
+    let generation = s.capture.requests.fetch_add(1, Ordering::SeqCst);
     s.capture.paths.lock().unwrap().push(r.uri().to_string());
     s.capture.headers.lock().unwrap().push(
         r.headers()
@@ -73,6 +97,33 @@ async fn receive(State(s): State<ReceiverState>, r: Request<Body>) -> axum::resp
         }
         return status.into_response();
     }
+    // Sample ordering before consuming ANY replacement body bytes. Hold the
+    // same trace lock for admission and drop across both HTTP destinations.
+    let _publication = s
+        .capture
+        .publication_trace
+        .lock()
+        .unwrap()
+        .clone()
+        .map(|trace| {
+            let mut state = trace.lock().unwrap();
+            if generation > 0
+                && state.retired_pid > 0
+                && std::path::Path::new(&format!("/proc/{}", state.retired_pid)).exists()
+            {
+                state.retired_encoder_alive_at_post = true;
+            }
+            if state
+                .active
+                .iter()
+                .any(|(old, count)| *old != generation && *count > 0)
+            {
+                state.generation_overlap = true;
+            }
+            *state.active.entry(generation).or_default() += 1;
+            drop(state);
+            PublicationGuard { trace, generation }
+        });
     let active = s.capture.active.fetch_add(1, Ordering::SeqCst) + 1;
     s.capture.max_active.fetch_max(active, Ordering::SeqCst);
     let data_session = Arc::new(Mutex::new(Vec::new()));

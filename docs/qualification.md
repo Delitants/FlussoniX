@@ -832,15 +832,16 @@ read-only management stats are polled. Plain M4S/M4F reconnect carries H.264/MP3
 verified TLS M4S↔M4F fallback carries HEVC/Layer II. Intel H.264 VAAPI CQP24 and
 AAC96 output use the same independently installed driver profile above.
 
-Observed local run: two opt-in hardware tests passed in86.25 seconds. Four
+Observed local run: two opt-in hardware tests passed in86.45 seconds. Four
 scenarios produced eight encoder generations and16 independently decoded
 outputs with zero strict errors and minima of93 video/175 audio frames. Source
-loss to both replacement captures exceeding250kB measured6.109–6.655 seconds.
+loss to both replacement captures exceeding250kB measured6.076–6.656 seconds.
 The ordinary CPU fallback case passed in20.18 seconds and resumed in7.705
 seconds, adding four strictly decoded outputs. These local measurements include
 supervisor scheduling, startup and collection; they are not a production SLA or
-first-frame timing. Old uploads do not overlap replacements and cannot append
-more media; old/final encoders are reaped, saved config bytes remain identical,
+first-frame timing. A shared receiver trace requires the retired PID absent at replacement POST
+admission before any body bytes and detects generation overlap across both
+destinations. Old uploads cannot append more media; old/final encoders are reaped, saved config bytes remain identical,
 and graceful daemon shutdown releases its port and source/output sockets.
 
 This increment adds tests and documentation for the existing supervisor. No
@@ -852,4 +853,9 @@ cases stay ignored in ordinary CI; its CPU regression covers autonomous recovery
 A temporary mutation disabling only background reconciliation failed the CPU
 regression at the intended replacement-output timeout; the daemon still started
 and initially published. The source was restored before normal checks.
+Independent review found that an initial late PID assertion missed ordering at
+replacement admission. The trace above corrects it; a live owned-PID negative
+control fails at the intended admission assertion. Owned leaked encoders are
+cleaned even after a successful daemon exit, and independent source closure is
+awaited within a bounded interval.
 See [commands and measurement boundaries](http-ts-push.md#automatic-native-source-recovery).

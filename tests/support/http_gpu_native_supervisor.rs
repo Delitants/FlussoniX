@@ -89,7 +89,8 @@ impl Daemon {
             }
         };
         // Failed assertions must not leave our known encoder children running.
-        if !clean {
+        let mut leaked = false;
+        {
             for pid in &self.encoders {
                 let process = PathBuf::from(format!("/proc/{pid}"));
                 let owned_media = self.directory.join("media");
@@ -102,6 +103,7 @@ impl Daemon {
                         })
                     })
                 {
+                    leaked = true;
                     // Exact executable plus this test's unique output directory.
                     unsafe {
                         libc::kill(*pid as i32, libc::SIGKILL);
@@ -109,7 +111,8 @@ impl Daemon {
                 }
             }
         }
-        clean
+        // A successful daemon exit cannot conceal a leaked owned encoder.
+        clean && !leaked
     }
 }
 impl Drop for Daemon {
@@ -187,6 +190,10 @@ async fn supervisor_case(
     };
     let directory = tempfile::tempdir().unwrap();
     let mut receivers = [Receiver::new(false).await, Receiver::new(true).await];
+    let publication_trace = Arc::new(Mutex::new(PublicationTrace::default()));
+    for receiver in &receivers {
+        *receiver.capture.publication_trace.lock().unwrap() = Some(publication_trace.clone());
+    }
     let store = ConfigStore::open(directory.path().join("config.json")).unwrap();
     let mut inputs = vec![source.input()];
     if let Some(alternate) = &alternate {
@@ -224,10 +231,18 @@ async fn supervisor_case(
         assert_eq!(first["input_index"], 0);
         if let Some(alternate) = &alternate { assert_eq!(alternate.capture.requests.load(Ordering::SeqCst), 0); }
         tokio::time::sleep(Duration::from_secs(3)).await;
+        publication_trace.lock().unwrap().retired_pid = first_pid;
         let fault = Instant::now();
         if alternate.is_some() { source.stop().await; } else { source.disconnect_current(); }
         let second = delivering(&mut daemon, &receivers, 1).await;
         let resumed_ms = fault.elapsed().as_millis();
+        {
+            let trace = publication_trace.lock().unwrap();
+            assert!(!trace.retired_encoder_alive_at_post, "replacement POST started while retired encoder still existed");
+            assert!(!trace.generation_overlap, "replacement POST overlaps a retired upload on either destination");
+            assert_eq!(trace.active.get(&0), Some(&0));
+            assert_eq!(trace.active.get(&1), Some(&2));
+        }
         assert_eq!(second["input_index"], if fallback.is_some() {1} else {0});
         let second_pid = u32::try_from(second["pid"].as_u64().unwrap()).unwrap();
         assert_ne!(first_pid, second_pid);
@@ -258,7 +273,11 @@ async fn supervisor_case(
         assert_eq!(std::fs::read(directory.path().join("config.json")).unwrap(), config_bytes);
         assert!(daemon.stop().await, "SIGTERM gracefully shuts down daemon and encoders");
         for pid in &daemon.encoders { assert!(!Path::new(&format!("/proc/{pid}")).exists()); }
-        assert_eq!(active.capture.active.load(Ordering::SeqCst), 0);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while active.capture.active.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("independent source body closes after daemon shutdown");
         for receiver in &receivers { closed(receiver).await; }
         let final_sizes: Vec<_> = receivers.iter().map(|r| session_len(r, 1)).collect();
         for generation in 0..2 {
@@ -268,7 +287,7 @@ async fn supervisor_case(
                 "arguments":if generation==0 {&first_args} else {&args},
                 "dependencies":if generation==0 {&first_driver} else {&driver},
                 "automatic_resume_ms":resumed_ms,"restart_count":1,"old_encoder_reaped":true,
-                "new_encoder_reaped":true,"no_recovery_or_playback_request":true,"upload_generations_overlap":false}));
+                "new_encoder_reaped":true,"no_recovery_or_playback_request":true,"upload_generations_overlap":false,"retired_encoder_absent_at_replacement_post":true}));
             fixture.retain(&name);
         }
         assert_eq!(receivers.iter().map(|r| session_len(r, 1)).collect::<Vec<_>>(), final_sizes);

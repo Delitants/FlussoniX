@@ -302,9 +302,10 @@ cargo test --locked --test http_push gpu::native::supervisor:: -- --ignored --te
 
 Receivers retain separately bounded captures for each POST; all four outputs per
 scenario independently decode with changing media, zero strict errors and the
-existing minimum frame counts. Old encoders must be gone before replacement
-output, uploads must not overlap, retired captures must stay frozen, and the
-restart count must advance once to the expected input. Basic/query identities,
+existing minimum frame counts. At replacement POST admission, the retired PID
+must be absent before any body bytes are consumed. A shared receiver trace
+forbids old/new generation overlap across both destinations. Retired captures
+must stay frozen, and the restart count must advance once to the expected input. Basic/query identities,
 source trust, actual encoder/driver mappings and saved config bytes are checked.
 SIGTERM must reap the final encoder, release the daemon port and close sources
 and uploads. The optional native evidence directory retains each generation.
