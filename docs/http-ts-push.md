@@ -239,3 +239,43 @@ hardware decoding, HEVC GPU encoding, other GPUs/drivers, subtitles in this
 matrix, live recovery, mixed-vendor clusters, WAN faults or sustained capacity.
 No official Flussonic component is used; all owned test media processes and
 listeners are stopped, including on assertion failures.
+
+
+### Native source recovery
+
+`gpu::native::recovery::` extends the named Intel H.264 CQP24 profile with
+source-loss and replacement tests. Plain M4S and M4F connections carrying
+H.264/MP3 are closed after real output delivery and reconnected to the same
+listener. Verified TLS M4S→M4F and M4F→M4S fallback cases carry HEVC/Layer II;
+the configured alternate must remain unused while the primary is healthy.
+All cases encode H.264/AAC96 and publish HTTP and verified HTTPS concurrently.
+
+Each old and replacement generation must independently decode both outputs,
+with the same codec, changing-content and minimum-frame assertions as the
+native matrix. The tests wait separately for cancellation and actual encoder
+reaping, require old input/output sockets to close, and ensure dead-generation
+publication counters stay frozen. Two simultaneous recovery requests must
+share one replacement worker, advance the restart count once and select the
+correct configured input. Basic identities, query, verified source CA,
+independent driver/GMM mappings and saved stream/template configuration are
+preserved. The final replacement is also stopped and reaped.
+
+```
+cargo test --locked --test http_push gpu::native::recovery:: -- --ignored --test-threads=1 --nocapture
+```
+
+An ordinary CI case uses CPU H.264 encoding and plaintext M4S→M4F fallback,
+with verified HTTPS publishing. It exercises the same socket, decoded-media,
+coalescing and lifecycle assertions without requiring a GPU. Hardware cases
+remain opt-in. Optional evidence output uses the native-matrix environment
+variables described above.
+
+This harness explicitly calls the existing recovery entry point after the
+failure and cooldown. It does not qualify autonomous daemon/cluster failover
+latency, seamless output sessions or uninterrupted timestamps across encoder
+generations: upload sockets close and new POSTs begin. Reports record source
+loss through collected replacement output, including decoding the previous
+capture; this is not a network outage or performance measurement. Finite
+owned native fixtures retain the packer/vendor-dialect limits above. Repeated
+failure streaks, source failback, changing codec/resolution, WAN faults,
+long-duration operation and mixed-vendor recovery remain unqualified.

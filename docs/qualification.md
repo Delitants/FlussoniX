@@ -796,3 +796,27 @@ metadata is pending. Socket/process cleanup and frozen counters are asserted.
 Ordinary CI runs the fixture characterization and explicitly ignores the two
 hardware cases. Native records use FlussoniX packers, so full vendor dialect
 interoperability is not implied. See [commands and exact limits](http-ts-push.md#native-m4-source-decoding).
+
+
+## Native input publishing recovery qualification
+
+The native HTTP publishing recovery fixtures close an already delivering source
+connection or stop the primary source listener. Plain M4S/M4F reconnect cases
+use H.264/MP3; verified TLS M4S↔M4F ordered fallback cases use HEVC/Layer II.
+The named Intel H.264 CQP24 encoder produces AAC96 with concurrent HTTP and
+verified HTTPS publishing. Each generation's delivered outputs are independently
+strictly decoded. Tests require the inactive fallback to remain unused before
+failure, old source/upload closure and encoder reaping, one replacement worker
+for concurrent recovery calls, correct input index/restart count, preserved
+configuration and credentials, and frozen old-generation counters. An ordinary
+CPU case runs the same fallback contract in CI. These tests qualify the existing
+recovery entry point; no production implementation or preview settings change.
+See [commands and lifecycle boundaries](http-ts-push.md#native-source-recovery).
+
+Observed local run: the ordinary CPU case passed, and two opt-in Intel tests
+passed in73.64 seconds. Four hardware recovery scenarios produced eight encoder
+generations and16 independently decoded HTTP/HTTPS outputs, with zero strict
+decoder errors and minima of93 video/175 audio frames. The CPU scenario added
+four decoded outputs. The first local test run exposed a fixture assumption that
+cancellation meant reaping had completed; the corrected test waits on the existing
+worker completion state before asserting process exit. Production code is unchanged.

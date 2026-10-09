@@ -1,5 +1,7 @@
 //! Native M4 source -> software decode -> Intel VAAPI -> native HTTP publishing.
 use super::*;
+#[path = "http_gpu_native_recovery.rs"]
+mod recovery;
 use axum::routing::get;
 use bytes::Bytes;
 use flussonix::{
@@ -251,6 +253,7 @@ fn input_header() -> String {
 }
 struct Source {
     protocol: &'static str,
+    disconnect: Arc<Mutex<CancellationToken>>,
     address: String,
     cert: Option<tls_fixture::Certificates>,
     capture: Arc<Capture>,
@@ -272,6 +275,8 @@ impl Source {
         let cap = capture.clone();
         let cancel = CancellationToken::new();
         let body_cancel = cancel.clone();
+        let disconnect = Arc::new(Mutex::new(CancellationToken::new()));
+        let request_disconnect = disconnect.clone();
         let routes = Router::new().route(
             "/{*path}",
             get(move |req: Request<Body>| {
@@ -279,6 +284,7 @@ impl Source {
                 let chunks = chunks.clone();
                 let segments = segments.clone();
                 let cancel = body_cancel.clone();
+                let disconnect = request_disconnect.lock().unwrap().clone();
                 async move {
                     cap.requests.fetch_add(1, Ordering::SeqCst);
                     cap.paths.lock().unwrap().push(req.uri().to_string());
@@ -299,20 +305,24 @@ impl Source {
                         cap.active.fetch_add(1, Ordering::SeqCst);
                         let active = Active(cap);
                         let body = futures_util::stream::unfold(
-                            (0usize, chunks, cancel, active),
-                            |(at, chunks, cancel, active)| async move {
+                            (0usize, chunks, cancel, disconnect, active),
+                            |(at, chunks, cancel, disconnect, active)| async move {
                                 if at >= chunks.len() {
-                                    cancel.cancelled().await;
+                                    tokio::select! {
+                                        _ = cancel.cancelled() => {},
+                                        _ = disconnect.cancelled() => {},
+                                    }
                                     return None;
                                 }
                                 tokio::select! {
                                     biased;
                                     _ = cancel.cancelled() => return None,
+                                    _ = disconnect.cancelled() => return None,
                                     _ = tokio::time::sleep(chunks[at].0) => {}
                                 }
                                 Some((
                                     Ok::<_, std::io::Error>(chunks[at].1.clone()),
-                                    (at + 1, chunks, cancel, active),
+                                    (at + 1, chunks, cancel, disconnect, active),
                                 ))
                             },
                         );
@@ -348,6 +358,7 @@ impl Source {
         }));
         Self {
             protocol,
+            disconnect,
             address,
             cert,
             capture,
@@ -369,6 +380,13 @@ impl Source {
             input["flussonix_tls_ca"] = json!(cert.ca);
         }
         input
+    }
+    fn disconnect_current(&self) {
+        let previous = std::mem::replace(
+            &mut *self.disconnect.lock().unwrap(),
+            CancellationToken::new(),
+        );
+        previous.cancel();
     }
     async fn stop(&mut self) {
         self.cancel.cancel();
