@@ -238,7 +238,7 @@ impl Engine {
             return Err("stream does not accept publications".into());
         }
         let worker = self
-            .ensure_mode(name, cfg, true, current, Some(mode))
+            .ensure_mode(name, cfg, true, current, Some(mode), None)
             .await?;
         let stdin = worker.publisher_stdin.lock().unwrap().take();
         Ok(Publication { worker, stdin })
@@ -262,7 +262,17 @@ impl Engine {
         touch_demand: bool,
         current: impl std::future::Future<Output = bool>,
     ) -> Result<Arc<Worker>, String> {
-        self.ensure_mode(name, cfg, touch_demand, current, None)
+        self.ensure_mode(name, cfg, touch_demand, current, None, None)
+            .await
+    }
+    pub(crate) async fn recover_demand_guarded(
+        &self,
+        name: &str,
+        cfg: &Value,
+        last_playback: Instant,
+        current: impl std::future::Future<Output = bool>,
+    ) -> Result<Arc<Worker>, String> {
+        self.ensure_mode(name, cfg, false, current, None, Some(last_playback))
             .await
     }
     async fn ensure_mode(
@@ -272,6 +282,7 @@ impl Engine {
         touch_demand: bool,
         current: impl std::future::Future<Output = bool>,
         publishing: Option<PublicationInput>,
+        last_playback: Option<Instant>,
     ) -> Result<Arc<Worker>, String> {
         let subtitle_tracks = crate::config::subtitle_tracks(cfg)?;
         let destinations = crate::push::configuration(cfg)?;
@@ -313,7 +324,9 @@ impl Engine {
         let mut index = 0;
         let mut restart_count = 0;
         let mut streak = 0;
-        let mut last_access = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let mut last_access = Arc::new(std::sync::Mutex::new(
+            last_playback.unwrap_or_else(Instant::now),
+        ));
         let mut viewers = Arc::new(AtomicU64::new(0));
         if let Some(w) = workers.get(name) {
             if touch_demand {
@@ -1409,6 +1422,40 @@ mod lifecycle_tests {
             tokio::task::yield_now().await;
         }
     }
+    #[tokio::test]
+    async fn blackout_recovery_seeds_actual_playback_clock_and_fences_queued_demand() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        let cfg = json!({"inputs":[{"url":"testsrc://"}]});
+        let seen = Instant::now() - Duration::from_secs(20);
+        let worker = app
+            .media
+            .recover_demand_guarded("owned", &cfg, seen, std::future::ready(true))
+            .await
+            .unwrap();
+        assert!(
+            worker.idle_seconds() >= 20,
+            "background startup renewed playback demand"
+        );
+        app.media.stop_all().await;
+        let blocked = app.media.workers.lock().await;
+        let allowed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = allowed.clone();
+        let a = app.clone();
+        let task =
+            tokio::spawn(async move {
+                a.media
+                    .recover_demand_guarded("owned", &cfg, seen, async move {
+                        flag.load(Ordering::SeqCst)
+                    })
+                    .await
+            });
+        allowed.store(false, Ordering::SeqCst);
+        drop(blocked);
+        assert!(task.await.unwrap().is_err());
+        assert!(app.media.workers().await.is_empty());
+    }
+
     #[tokio::test]
     async fn queued_stale_start_cannot_replace_the_current_worker() {
         let d = tempfile::tempdir().unwrap();

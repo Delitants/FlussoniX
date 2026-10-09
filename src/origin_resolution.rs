@@ -206,18 +206,19 @@ impl App {
         root: &Value,
         revision: u64,
     ) -> Option<Resolved> {
-        let policy = if m.available && m.config["disabled"] != true {
+        let policy = if m.known && !m.denied && m.config["disabled"] != true {
             Policy::from_config(&m.config, root).ok()
         } else {
             None
         };
-        self.playback_auth
-            .publish(name, policy)
-            .map(|policy| Resolved {
-                config: m.config.clone(),
-                policy,
-                revision,
-            })
+        let policy = self.playback_auth.publish(name, policy)?;
+        // Temporary route unavailability is not an authoritative policy denial.
+        // Existing sessions can renew, but no request receives an available route.
+        m.available.then(|| Resolved {
+            config: m.config.clone(),
+            policy,
+            revision,
+        })
     }
     async fn install_origin(
         &self,
@@ -533,6 +534,158 @@ mod cache_tests {
         assert!(!crate::srt_push::enabled(&normalized));
     }
     use super::*;
+    #[tokio::test]
+    async fn local_override_fences_a_queued_mirror_restart_even_with_identical_media() {
+        let d = tempfile::tempdir().unwrap();
+        let app = App::new(
+            d.path().join("config.json"),
+            d.path().join("media"),
+            Options {
+                admin_password: "owned-recovery-admin".into(),
+                peer_key: "owned-recovery-peer".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let config = json!({"name":"owned","static":false,"inputs":[{"url":"testsrc://"}]});
+        let snapshot = app
+            .playback_auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&config, &app.config.snapshot()).unwrap()),
+            )
+            .unwrap();
+        let AuthOutcome::Allowed(grant) = app
+            .playback_auth
+            .authorize(
+                snapshot,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "hls".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("initial demand")
+        };
+        drop(grant);
+        app.config.put("streams", "owned", config.clone()).unwrap();
+        assert!(
+            !app.recovery_current("owned", &crate::media::media_signature(&config), true)
+                .await,
+            "queued mirror recovery must not start a new local on-demand definition"
+        );
+    }
+
+    #[tokio::test]
+    async fn blackout_recovery_rejects_expiry_revocation_denial_removal_and_policy_changes() {
+        for boundary in [
+            "valid",
+            "expired",
+            "revoked",
+            "denied",
+            "removed",
+            "local-disabled",
+            "policy",
+            "lb",
+        ] {
+            let d = tempfile::tempdir().unwrap();
+            let app = App::new(
+                d.path().join("config.json"),
+                d.path().join("media"),
+                Options {
+                    admin_password: "owned-recovery-admin".into(),
+                    peer_key: "owned-recovery-peer".into(),
+                    role: if boundary == "lb" { "lb" } else { "cdn" }.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            app.config
+                .put("sources", "a", json!({"api_url":"http://127.0.0.1:9"}))
+                .unwrap();
+            let root = app.config.snapshot();
+            let mut mirror = Mirror {
+                when: Instant::now(),
+                source: root["sources"][0].clone(),
+                config: json!({"name":"owned", "static":false, "inputs":[{"url":"testsrc://"}]}),
+                known: true,
+                available: true,
+                denied: false,
+                serial: 1,
+                switches: 0,
+            };
+            let resolved = app
+                .publish_resolved("owned", &mirror, &root, app.config.revision())
+                .unwrap();
+            let AuthOutcome::Allowed(grant) = app
+                .playback_auth
+                .authorize(
+                    resolved.policy,
+                    ViewerRequest {
+                        name: "owned".into(),
+                        proto: "hls".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+            else {
+                panic!("initial playback")
+            };
+            drop(grant);
+            mirror.available = false;
+            assert!(
+                app.publish_resolved("owned", &mirror, &root, app.config.revision())
+                    .is_none()
+            );
+            app.mirrors
+                .lock()
+                .await
+                .insert("owned".into(), mirror.clone());
+            // An unrelated save/revalidation must preserve policy during a transport outage.
+            app.invalidate_sessions().await;
+            assert!(!app.playback_auth.recovery_demand().is_empty());
+            match boundary {
+                "expired" => app.playback_auth.age_activity(31),
+                "revoked" => {
+                    let id = app.playback_auth.snapshots()[0]["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    assert!(app.playback_auth.revoke(&id));
+                }
+                "denied" => {
+                    mirror.denied = true;
+                    app.publish_resolved("owned", &mirror, &root, app.config.revision());
+                }
+                "removed" => {
+                    app.config.delete("sources", "a").unwrap();
+                }
+                "local-disabled" => {
+                    app.config
+                        .put("streams", "owned", json!({"disabled":true,"static":false}))
+                        .unwrap();
+                }
+                "policy" => {
+                    mirror.config["flussonix_token_sha256"] = json!("a".repeat(64));
+                    app.publish_resolved("owned", &mirror, &root, app.config.revision());
+                }
+                _ => {}
+            }
+            mirror.available = !mirror.denied;
+            app.mirrors.lock().await.insert("owned".into(), mirror);
+            app.reconcile().await;
+            let count = app.media.count().await;
+            app.media.stop_all().await;
+            assert_eq!(
+                count,
+                usize::from(boundary == "valid"),
+                "boundary {boundary}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn completed_probe_capacity_is_reclaimed_for_new_stream_lookup() {
         let d = tempfile::tempdir().unwrap();

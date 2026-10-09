@@ -158,6 +158,8 @@ struct State {
     request: ViewerRequest,
     decision: Decision,
     next_check: Instant,
+    // Retry scheduling must not extend the permission used for autonomous restart.
+    allowed_until: Instant,
     created: Instant,
     last_seen: Instant,
     playback_seen: Option<Instant>,
@@ -286,6 +288,8 @@ impl PlaybackAuth {
                 }
                 s.cancel.cancel();
                 s.generation += 1;
+                s.playback_seen = None;
+                s.allowed_until = Instant::now();
                 s.available = policy
                     .as_ref()
                     .is_some_and(|p| p.identity(&s.request) == *identity);
@@ -363,6 +367,7 @@ impl PlaybackAuth {
                             request: request.clone(),
                             decision: Decision::Unknown,
                             next_check: Instant::now(),
+                            allowed_until: Instant::now(),
                             created: Instant::now(),
                             last_seen: Instant::now(),
                             playback_seen: None,
@@ -615,6 +620,9 @@ impl PlaybackAuth {
         s.unique = unique;
         s.decision = decision;
         s.next_check = Instant::now() + Duration::from_secs(seconds);
+        if matches!(s.decision, Decision::Allow) {
+            s.allowed_until = s.next_check;
+        }
     }
     fn retry(&self, entry: &Entry, generation: u64) {
         let mut s = entry.state.lock().unwrap();
@@ -727,6 +735,39 @@ impl PlaybackAuth {
             .map(|e| e.live.load(Ordering::Relaxed))
             .sum()
     }
+    /// Recent admitted playback only. Observing recovery demand never renews activity.
+    pub(crate) fn recovery_demand(&self) -> HashMap<String, Instant> {
+        let authority = self.authority.lock().unwrap();
+        let entries = self.entries.lock().unwrap();
+        let now = Instant::now();
+        let mut demand = HashMap::new();
+        for entry in entries.values() {
+            let state = entry.state.lock().unwrap();
+            let Some(seen) = state.playback_seen else {
+                continue;
+            };
+            if now.duration_since(seen) >= Duration::from_secs(30)
+                || !matches!(state.decision, Decision::Allow)
+                || !state.available
+                || state.cancel.is_cancelled()
+                || state.next_check <= now
+                || state.allowed_until <= now
+                || state.revoked_until.is_some_and(|until| until > now)
+                || !state.policy.accepts_token(&state.request.token)
+                || !authority
+                    .get(&state.request.name)
+                    .is_some_and(|current| current.policy.as_ref() == Some(&state.policy))
+            {
+                continue;
+            }
+            demand
+                .entry(state.request.name.clone())
+                .and_modify(|latest: &mut Instant| *latest = (*latest).max(seen))
+                .or_insert(seen);
+        }
+        demand
+    }
+
     pub fn snapshots(&self) -> Vec<Value> {
         self.entries
             .lock()
@@ -752,6 +793,163 @@ impl PlaybackAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn recovery_demand_requires_recent_playback_and_current_authorization() {
+        let auth = PlaybackAuth::new(8);
+        let policy = Policy::from_config(&json!({}), &json!({})).unwrap();
+        let snapshot = auth.publish("owned", Some(policy.clone())).unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "hls".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(control) = auth
+            .authorize_control(snapshot.clone(), request.clone())
+            .await
+        else {
+            panic!("control admission")
+        };
+        assert!(
+            auth.recovery_demand().is_empty(),
+            "control-only grant is not playback demand"
+        );
+        drop(control);
+        let AuthOutcome::Allowed(playback) =
+            auth.authorize(snapshot.clone(), request.clone()).await
+        else {
+            panic!("playback admission")
+        };
+        drop(playback);
+        let activity = auth.recovery_demand()["owned"];
+        assert_eq!(
+            auth.recovery_demand()["owned"],
+            activity,
+            "observation must not touch demand"
+        );
+        auth.age_activity(31);
+        assert!(
+            auth.recovery_demand().is_empty(),
+            "expired demand cannot resume"
+        );
+        let AuthOutcome::Allowed(playback) =
+            auth.authorize(snapshot.clone(), request.clone()).await
+        else {
+            panic!("new playback")
+        };
+        drop(playback);
+        assert!(!auth.recovery_demand().is_empty());
+        auth.force_reauth("owned");
+        assert!(
+            auth.recovery_demand().is_empty(),
+            "overdue authorization must be renewed first"
+        );
+        auth.renew_due().await;
+        assert!(!auth.recovery_demand().is_empty());
+        let id = auth.snapshots()[0]["id"].as_str().unwrap().to_owned();
+        assert!(auth.revoke(&id));
+        assert!(
+            auth.recovery_demand().is_empty(),
+            "revoked demand cannot resume"
+        );
+        auth.publish("owned", None);
+        assert!(auth.recovery_demand().is_empty());
+    }
+
+    #[tokio::test]
+    async fn changed_policy_and_invalid_token_cannot_retain_recovery_demand() {
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "hls".into(),
+            token: "before".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(playback) = auth.authorize(snapshot, request).await else {
+            panic!("initial playback")
+        };
+        drop(playback);
+        assert!(!auth.recovery_demand().is_empty());
+        let changed = Policy::from_config(
+            &json!({"flussonix_token_sha256":format!("{:x}", Sha256::digest(b"after"))}),
+            &json!({}),
+        )
+        .unwrap();
+        auth.publish("owned", Some(changed));
+        assert!(auth.recovery_demand().is_empty());
+        auth.renew_due().await;
+        assert!(auth.recovery_demand().is_empty());
+    }
+
+    #[tokio::test]
+    async fn policy_renewal_after_change_cannot_reuse_previous_playback_demand() {
+        let backend = ControlBackend::new(false).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "hls".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(grant) = auth.authorize(snapshot, request).await else {
+            panic!("initial playback")
+        };
+        drop(grant);
+        let changed = Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap();
+        auth.publish("owned", Some(changed));
+        auth.renew_due().await;
+        let demand = auth.recovery_demand();
+        backend.close().await;
+        assert!(
+            demand.is_empty(),
+            "renewing a changed policy must not restore the prior policy's playback demand"
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_retry_cannot_extend_expired_recovery_authorization() {
+        let backend = ControlBackend::with_duration(false, 1).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let AuthOutcome::Allowed(grant) = auth
+            .authorize(
+                snapshot,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "hls".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("initial authorization")
+        };
+        drop(grant);
+        assert!(!auth.recovery_demand().is_empty());
+        backend.close().await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        auth.renew_due().await;
+        assert!(
+            auth.recovery_demand().is_empty(),
+            "callback retry extended an expired allow for recovery"
+        );
+    }
+
     struct ControlBackend {
         url: String,
         calls: Arc<AtomicU64>,
@@ -760,6 +958,9 @@ mod tests {
     }
     impl ControlBackend {
         async fn new(unique: bool) -> Self {
+            Self::with_duration(unique, 3600).await
+        }
+        async fn with_duration(unique: bool, duration: u64) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}/auth", listener.local_addr().unwrap());
             let calls = Arc::new(AtomicU64::new(0));
@@ -774,7 +975,7 @@ mod tests {
                         async move {
                             count.fetch_add(1, Ordering::Relaxed);
                             let mut headers = axum::http::HeaderMap::new();
-                            headers.insert("x-authduration", "3600".parse().unwrap());
+                            headers.insert("x-authduration", duration.to_string().parse().unwrap());
                             headers.insert("x-userid", "account".parse().unwrap());
                             if unique {
                                 if q["token"] == "a" {

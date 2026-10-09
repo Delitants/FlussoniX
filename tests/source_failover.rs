@@ -598,3 +598,28 @@ async fn delayed_authorization_uses_the_new_origin_without_replacing_its_worker(
     cleanup([a, b, cdn]).await;
     backend.abort();
 }
+
+#[tokio::test]
+async fn complete_blackout_recovers_recent_authorized_demand_without_new_viewer() {
+    let _load = MEDIA_TESTS.acquire().await.unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let (a, b, cdn) = setup(d.path(), "m4s").await;
+    assert_eq!(play(&cdn).await.status(), 200);
+    a.mode.store(1, Ordering::Relaxed);
+    b.mode.store(1, Ordering::Relaxed);
+    kill_cdn_worker(&cdn).await;
+    cdn.app.reconcile().await;
+    assert_eq!(cdn.app.media.count().await, 0, "blackout must stop media");
+    let stopped = selected(&cdn).await;
+    assert_eq!(stopped["stats"]["source_available"], false);
+    a.mode.store(0, Ordering::Relaxed);
+    b.mode.store(0, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    cdn.app.reconcile().await;
+    let recovered = cdn.app.media.count().await;
+    cleanup([a, b, cdn]).await;
+    assert_eq!(
+        recovered, 1,
+        "restored origin must restart recent authorized demand without another viewer"
+    );
+}

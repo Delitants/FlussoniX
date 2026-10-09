@@ -257,24 +257,44 @@ impl App {
             Some((config, self.config.revision()))
         })
     }
-    async fn recover_current(&self, name: &str, config: &Value, _revision: u64) {
+    async fn recovery_current(&self, name: &str, signature: &str, demand: bool) -> bool {
+        self.media_config(name).await.is_some_and(|(config, _)| {
+            config["disabled"] != true && crate::media::media_signature(&config) == signature
+        }) && (!demand
+            || self.config.effective(name).is_none()
+                && self.playback_auth.recovery_demand().contains_key(name))
+    }
+    async fn recover_current(&self, name: &str, config: &Value, revision: u64) {
+        self.recover_with_demand(name, config, revision, None).await;
+    }
+    async fn recover_with_demand(
+        &self,
+        name: &str,
+        config: &Value,
+        _revision: u64,
+        activity: Option<Instant>,
+    ) {
         let signature = crate::media::media_signature(config);
-        if !self.media_config(name).await.is_some_and(|(c, _)| {
-            c["disabled"] != true && crate::media::media_signature(&c) == signature
-        }) {
+        if !self
+            .recovery_current(name, &signature, activity.is_some())
+            .await
+        {
             return;
         }
-        let check = async {
-            self.media_config(name).await.is_some_and(|(c, _)| {
-                c["disabled"] != true && crate::media::media_signature(&c) == signature
-            })
+        let check = self.recovery_current(name, &signature, activity.is_some());
+        let result = if let Some(activity) = activity {
+            self.media
+                .recover_demand_guarded(name, config, activity, check)
+                .await
+        } else {
+            self.media.ensure_guarded(name, config, false, check).await
         };
-        if let Ok(worker) = self.media.ensure_guarded(name, config, false, check).await {
-            // A save can race filesystem/child startup. Stop only the exact
-            // stale attempt; a later request may already have replaced it.
-            if !self.media_config(name).await.is_some_and(|(c, _)| {
-                c["disabled"] != true && crate::media::media_signature(&c) == signature
-            }) {
+        if let Ok(worker) = result {
+            // Retire only the exact stale attempt after asynchronous startup.
+            if !self
+                .recovery_current(name, &signature, activity.is_some())
+                .await
+            {
                 self.media.stop_if_current(name, &worker).await;
             }
         }
@@ -300,6 +320,25 @@ impl App {
                 }
             } else {
                 self.media.stop(&name).await;
+            }
+        }
+        if self.options.role != "lb" {
+            let workers = self
+                .media
+                .workers()
+                .await
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<std::collections::HashSet<_>>();
+            for (name, activity) in self.playback_auth.recovery_demand() {
+                // This path restores a discovered pull, never a configured on-demand stream.
+                if !workers.contains(&name)
+                    && self.config.effective(&name).is_none()
+                    && let Some((config, revision)) = self.media_config(&name).await
+                {
+                    self.recover_with_demand(&name, &config, revision, Some(activity))
+                        .await;
+                }
             }
         }
         let root = self.config.snapshot();
@@ -333,7 +372,7 @@ impl App {
                 let cfg = crate::config::effective(root, name).or_else(|| {
                     mirrors
                         .get(name)
-                        .filter(|m| m.available)
+                        .filter(|m| m.known && !m.denied)
                         .map(|m| m.config.clone())
                 })?;
                 if cfg["disabled"] == true {

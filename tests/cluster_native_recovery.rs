@@ -148,7 +148,15 @@ async fn admit(client: &reqwest::Client, lb: &Daemon, cdn: &Daemon) -> String {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 302);
+    if response.status() != 302 {
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        panic!(
+            "owned LB admission failed: {status} {body}; LB={} CDN={}",
+            lb.node(client).await,
+            cdn.node(client).await
+        );
+    }
     let ticket = response.headers()["location"].to_str().unwrap().to_string();
     assert!(ticket.starts_with(&cdn.url));
     assert!(ticket.contains("flussonix_ticket="));
@@ -235,14 +243,14 @@ async fn playback(
     report["segment_sha256"] = json!(format!("{:x}", Sha256::digest(&data)));
     report
 }
-async fn qualification(transport: &str, encoder: &str) {
+async fn qualification(transport: &str, encoder: &str, blackout: bool) {
     let mut nodes = [
         Daemon::new("a"),
         Daemon::new("b"),
         Daemon::new("cdn"),
         Daemon::new("lb"),
     ];
-    let outcome = std::panic::AssertUnwindSafe(run(&mut nodes, transport, encoder))
+    let outcome = std::panic::AssertUnwindSafe(run(&mut nodes, transport, encoder, blackout))
         .catch_unwind()
         .await;
     let mut clean = true;
@@ -262,7 +270,10 @@ async fn qualification(transport: &str, encoder: &str) {
             if let Ok(directory) = std::env::var("FLUSSONIX_CLUSTER_RECOVERY_EVIDENCE_DIR") {
                 std::fs::create_dir_all(&directory).unwrap();
                 std::fs::write(
-                    Path::new(&directory).join(format!("{encoder}-{transport}.json")),
+                    Path::new(&directory).join(format!(
+                        "{encoder}-{transport}{}.json",
+                        if blackout { "-blackout" } else { "" }
+                    )),
                     serde_json::to_vec_pretty(&report).unwrap(),
                 )
                 .unwrap();
@@ -283,20 +294,35 @@ async fn qualification(transport: &str, encoder: &str) {
 
 #[tokio::test]
 async fn daemon_recovers_equivalent_native_tls_origin_without_viewer_requests() {
-    qualification("m4s", "libx264").await;
+    qualification("m4s", "libx264", false).await;
 }
 #[tokio::test]
 #[ignore = "requires independently installed Intel H.264 VAAPI driver and render device"]
 async fn daemon_recovers_gpu_origins_over_verified_m4s_tls() {
-    qualification("m4s", "h264_vaapi").await;
+    qualification("m4s", "h264_vaapi", false).await;
 }
 #[tokio::test]
 #[ignore = "requires independently installed Intel H.264 VAAPI driver and render device"]
 async fn daemon_recovers_gpu_origins_over_verified_m4f_tls() {
-    qualification("m4f", "h264_vaapi").await;
+    qualification("m4f", "h264_vaapi", false).await;
 }
 
-async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str) -> Value {
+#[tokio::test]
+async fn daemon_recovers_complete_origin_blackout_without_viewer_requests() {
+    qualification("m4s", "libx264", true).await;
+}
+#[tokio::test]
+#[ignore = "requires independently installed Intel H.264 VAAPI driver and render device"]
+async fn daemon_recovers_gpu_origin_blackout_over_verified_m4s_tls() {
+    qualification("m4s", "h264_vaapi", true).await;
+}
+#[tokio::test]
+#[ignore = "requires independently installed Intel H.264 VAAPI driver and render device"]
+async fn daemon_recovers_gpu_origin_blackout_over_verified_m4f_tls() {
+    qualification("m4f", "h264_vaapi", true).await;
+}
+
+async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str, blackout: bool) -> Value {
     for (index, name) in [(0, "a"), (1, "b")] {
         let transcoder = if encoder == "h264_vaapi" {
             json!({"encoder":encoder,"qp":24,"acodec":"aac","ab":96})
@@ -399,6 +425,31 @@ async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str) -> Value {
         "origin shutdown must reap its encoder"
     );
     assert!(!Path::new(&format!("/proc/{origin_a_pid}")).exists());
+    if blackout {
+        assert!(nodes[1].stop().await, "stop every owned origin");
+        tokio::time::timeout(Duration::from_secs(16), async {
+            loop {
+                let stopped = stats(&nodes[2].node(&client).await);
+                if stopped["source_available"] == false && nodes[2].owned_encoders().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("complete blackout stops CDN media");
+        assert!(nodes.iter().all(|node| node.owned_encoders().is_empty()));
+        let address = nodes[1].url.clone();
+        assert!(
+            nodes[1].unchanged(),
+            "restoration must retain origin configuration"
+        );
+        nodes[1].start("b", "source").await;
+        assert_eq!(
+            nodes[1].url, address,
+            "restoration must not change the configured route"
+        );
+    }
     // Only read-only node GETs below. No playback request can trigger recovery.
     let (second, observed_playlist) = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -457,5 +508,5 @@ async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str) -> Value {
     assert!(nodes.iter().all(Daemon::unchanged));
     json!({"transport":transport,"encoder":encoder,"automatic_resume_ms":automatic_resume_ms,
             "before_origin":before_origin,"after_origin":after_origin,"before_cdn":before_cdn,"after_cdn":after_cdn,
-            "before_decode":before_decode,"after_decode":after_decode,"source_switches":1,"read_only_recovery_observation":true})
+            "before_decode":before_decode,"after_decode":after_decode,"source_switches":1,"read_only_recovery_observation":true,"complete_blackout":blackout})
 }

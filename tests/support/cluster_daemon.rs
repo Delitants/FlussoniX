@@ -27,9 +27,18 @@ impl Daemon {
     }
     pub async fn start(&mut self, name: &str, role: &str) {
         self.config = std::fs::read(self.directory.path().join("config.json")).unwrap();
+        let listener = if self.url.is_empty() {
+            "127.0.0.1:0".to_owned()
+        } else {
+            url::Url::parse(&self.url)
+                .unwrap()
+                .socket_addrs(|| None)
+                .unwrap()[0]
+                .to_string()
+        };
         self.child = Some(
             tokio::process::Command::new(env!("CARGO_BIN_EXE_flussonix"))
-                .args(["--https-only", "--https-listen", "127.0.0.1:0"])
+                .args(["--https-only", "--https-listen", &listener])
                 .arg("--https-cert")
                 .arg(&self.cert.cert)
                 .arg("--https-key")
