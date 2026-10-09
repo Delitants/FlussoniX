@@ -65,8 +65,8 @@ The contract is grounded in the installed 26.04.1 schema, read-only inspection
 of its collection selector, and the public
 [API design principles](https://flussonic.com/doc/fms/api/flussonic-api-design/#limiting-the-field-set-of-the-result).
 Unknown/non-object paths are handled without reproducing reference exceptions.
-The tests and implementation use no vendor components. Composite sorting,
-reference default ordering and dynamic cursor parity remain separate tasks.
+The tests and implementation use no vendor components. Reference default
+ordering and dynamic cursor parity remain separate tasks.
 
 ### Implemented scalar collection filtering
 
@@ -102,6 +102,39 @@ This independent profile is grounded in read-only inspection of the installed
 [collection query design](https://flussonic.com/doc/fms/api/flussonic-api-design/#filtering-collections)
 and [open-source handler](https://github.com/flussonic/openapi_handler).
 No vendor schema, bytecode or source is needed to build, test or run these filters.
+
+### Implemented composite scalar collection sorting
+
+Authenticated GET `/streams` and `/templates` accept comma-separated scalar
+sort fields, for example `sort=title,-position` or
+`sort=transcoder.vb,-stats.online_clients`. Each field is ascending unless
+prefixed with `-`; the first differing field decides the order. Dotted paths
+traverse objects in the returned effective stream or saved template row.
+Ordering precedes pagination and `select`, so fields omitted from the response
+can still determine order. Filters, search and collection envelopes retain
+their existing behavior. Default ordering remains ascending `name`. Ascending
+`name` breaks ties unless explicitly requested, including explicit `-name`.
+
+Integers compare numerically without loss of signed/unsigned 64-bit precision.
+Strings use case-sensitive UTF-8 lexical order; booleans sort `false` before
+`true`. Mixed scalar types follow the inspected reference's ordering: missing,
+integer, string, floating-point number, boolean. JSON null and the strings
+`null`/`undefined` count as missing; an empty string is present. Descending
+reverses that field's complete ordering, including missing values.
+
+Unknown paths, object/array values, array indices, scalar traversal and empty
+terms contribute no ordering; subsequent fields and identity still apply.
+Duplicate fields retain query order. No wildcards, JSONPath, leading `+`, or
+whitespace normalization are provided. Item GET and other collections retain
+their existing behavior. Sorting neither saves configuration nor starts media.
+
+This independently implemented scalar profile follows the official
+[sorting design](https://flussonic.com/doc/fms/api/flussonic-api-design/#sorting-collections)
+and read-only inspection of the installed 26.04.1 collection comparator and
+[public handler](https://github.com/flussonic/openapi_handler). Vendor ordering
+of complete arrays/objects, implicit position/default-key parity and sort-key
+cursors across changing snapshots remain unqualified. The current position
+cursor is retained; repeated pages are deterministic for a fixed snapshot.
 
 ## Cluster and load-balancing contract
 

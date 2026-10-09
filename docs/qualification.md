@@ -1041,3 +1041,20 @@ the same profile on an OS-allocated port and reaps its owned process.
 
 This is a bounded profile, not full collection/schema compatibility. See
 [implemented fields and limits](compatibility.md#implemented-scalar-collection-filtering).
+
+## Composite Streams/Templates sorting qualification
+
+Eight real-router regressions first failed against name-only ordering and pass
+with the independent scalar comparator. Literal expected rows qualify numeric
+and composite sort directions, ascending identity ties and explicit reverse
+identity, inherited/saved/runtime paths, and ordering on unselected fields.
+They cover signed/unsigned integer boundaries beyond floating-point precision,
+mixed scalar types, case-sensitive Unicode text, null/text sentinels, empty
+strings, and deterministic fallback for unsupported or deeply nested paths.
+Filtered search plus one-row cursor pages preserves counts and envelopes.
+Read-only view authorization, default ordering, unchanged peer sorting, saved
+configuration and no media-worker startup are verified separately.
+
+This qualifies the [composite scalar profile](compatibility.md#implemented-composite-scalar-collection-sorting).
+Complete object/array ordering, reference implicit default keys and dynamic
+sort-key cursors remain outside this profile.

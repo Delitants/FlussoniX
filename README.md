@@ -9,7 +9,7 @@ This build implements persisted Streams/Templates configuration, authenticated m
 | Feature | Current implementation |
 |---|---|
 | Admin UI | Labeled forms for Streams, Templates, Config and Cluster; staged validation/apply; no JSON input required |
-| API | `/streamer/api/v3` subset; CRUD, partial updates, reset, inheritance, validation without applying, collection cursors |
+| API | `/streamer/api/v3` subset; CRUD, partial updates, reset, inheritance, validation without applying, collection filtering, field selection, composite scalar sorting and cursors |
 | Authentication | Separate edit/view credentials; Basic and legacy base64 Bearer; structured/string `on_play` callbacks; scheduled viewer renewal, revocation and local limits across streams; publication password and POST on_publish renewal; separate peer key |
 | Input | Direct MPEG-TS and elementary RTP/SRTP with static SDP; HLS/HLSS, TSHTTP/TSHTTPS, M4S AVC/HEVC with AAC/Layer II/III frame modes, AVC/AAC packed-GOP modes, M4F qualified single-chunk sample tables; HTTP MPEG-TS, RTSP TCP/opt-in unicast UDP and RTSPS encrypted TCP publication to publish:// streams; RTSP pull, verified RTSPS TCP pull and SRT receive adapters |
 | Output | Direct MPEG-TS and elementary RTP/SRTP with static SDP; SRT caller and RTSP/verified RTSPS TCP pushes with optional Basic/Digest receiver authentication; opt-in shared SRT listener playback with optional enforced encryption; HLS with TS or fMP4 segments, HTTP MPEG-TS, Original M4S frame/GOP relay, generated frame output; M4F signals with original or generated live segments; optional RTSP 1.0 TCP-interleaved or opt-in unicast UDP H.264/HEVC with optional AAC-LC or MPEG-1/2 Layer II/III playback; optional RTSPS TLS TCP playback |

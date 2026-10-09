@@ -706,15 +706,20 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     if let Some(q) = query.get("q") {
         items.retain(|v| v.to_string().to_lowercase().contains(&q.to_lowercase()));
     }
-    items.sort_by_key(|v| {
-        v["name"]
-            .as_str()
-            .or(v["hostname"].as_str())
-            .unwrap_or("")
-            .to_owned()
-    });
-    if query.get("sort").is_some_and(|s| s == "-name") {
-        items.reverse()
+    if matches!(kind, "streams" | "templates") {
+        let sort = crate::api_sort::Sort::new(query.get("sort").map(String::as_str));
+        items.sort_by(|left, right| sort.compare(left, right));
+    } else {
+        items.sort_by_key(|v| {
+            v["name"]
+                .as_str()
+                .or(v["hostname"].as_str())
+                .unwrap_or("")
+                .to_owned()
+        });
+        if query.get("sort").is_some_and(|s| s == "-name") {
+            items.reverse()
+        }
     }
     let total = items.len();
     let offset = query

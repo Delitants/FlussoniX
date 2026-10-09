@@ -1,5 +1,6 @@
 mod api_filter;
 mod api_select;
+mod api_sort;
 pub mod auth;
 pub mod cluster;
 pub mod config;
