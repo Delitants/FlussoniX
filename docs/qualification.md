@@ -859,3 +859,41 @@ control fails at the intended admission assertion. Owned leaked encoders are
 cleaned even after a successful daemon exit, and independent source closure is
 awaited within a bounded interval.
 See [commands and measurement boundaries](http-ts-push.md#automatic-native-source-recovery).
+
+## Automatic native TLS cluster recovery with GPU origins
+
+`tests/cluster_native_recovery.rs` qualifies the existing equivalent-origin
+resolver with four real daemons: two sources, one CDN and one LB. Each daemon
+uses an HTTPS-only OS-selected loopback listener and an independent trusted CA.
+Distinct origin peer keys protect M4SS/M4FS pulls; matching content identity,
+source group and viewer-token policy authorize the equivalent replica.
+
+After initial protected LB/CDN playback, the harness gracefully stops the owned
+primary source daemon and encoder. Recovery observation makes only read-only
+peer-authenticated node GETs. A different CDN PID, over 250kB of new input and a
+playlist from a new media generation are required before another playback
+request. Origin H.264/AAC encoding remains upstream; CDN video/audio arguments
+must both use copy. Anonymous playlists/segments remain denied, LB tickets are
+single-use, concurrent reloads retain one CDN worker, and saved configuration
+bytes remain identical. Owned daemons and encoder children are cleaned up even
+after failed assertions.
+
+Observed local run: the CPU M4SS case and Intel H.264 VAAPI CQP24/AAC96 M4SS and
+M4FS cases passed in 69.10 seconds. Six protected HLS outputs were strictly
+decoded with zero errors, each yielding 50 video/94 audio frames. Hardware
+recovery observations were 3.954 seconds (M4SS) and 8.892 seconds (M4FS); CPU
+recovery was 4.474 seconds. These are shutdown-request-to-fresh-generation
+observations on synthetic 640×360/25fps,48kHz sources, excluding offline decode;
+they are not first-frame timing or a production SLA. Process evidence confirms
+system FFmpeg, the independently installed Intel driver and origin GPU encoding
+without vendor mappings or repeat encoding at the CDN.
+
+A temporary mutation disabling background source refresh still started and
+served the primary, then failed the ordinary CPU regression at its intended
+automatic-recovery timeout. Production source was restored before qualification.
+The initial fixture run used an incorrect telemetry field and was corrected
+against the actual exported `uplink` metric; no product code change was needed.
+Hardware cases remain opt-in; ordinary CI runs the CPU contract. Full vendor
+dialect interoperability, seamless output continuity, repeated faults/failback,
+HEVC hardware encoding/decoding, WAN/soak and capacity remain separate gates.
+See [commands and exact measurement boundaries](cluster-loadbalancing.md).

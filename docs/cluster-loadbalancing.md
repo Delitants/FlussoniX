@@ -2,6 +2,36 @@
 
 Full-product design and first-release requirements. Selected native routing/source paths and configured-input recovery are implemented in the preview; full legacy interoperability and failure/scale gates remain open.
 
+The real-daemon native TLS recovery profile uses two equivalent origins, a CDN
+and an LB, each with an independent trusted test CA and HTTPS-only listener.
+The ordinary CPU regression runs with `cargo test --locked --test
+cluster_native_recovery`. On a host with the independently installed Intel
+H.264 VAAPI driver and `/dev/dri/renderD128`, run the hardware cases with:
+
+```sh
+cargo test --locked --test cluster_native_recovery -- --ignored --nocapture --test-threads=1
+```
+
+Origins use the same content identity, source group and viewer-token policy,
+with distinct peer keys. The primary origin is stopped after protected playback
+through an LB ticket. Until automatic source switching produces a fresh CDN
+generation, the harness makes only read-only node telemetry requests. It never
+calls reconciliation or makes a new media request to stimulate recovery.
+Both native routes use verified TLS: M4SS and M4FS are selected from secure
+source endpoints. Encoding stays at the origin; CDN worker arguments must use
+codec copy. Protected before/after HLS segments undergo independent strict
+audio/video decoding. Reload/concurrent requests share the CDN worker, anonymous
+playlists/segments remain denied, and admission tickets cannot be replayed.
+
+Set `FLUSSONIX_CLUSTER_RECOVERY_EVIDENCE_DIR` to a local directory to retain
+JSON reports containing origin/CDN process arguments, loaded Intel driver
+hashes, decoder frame counts and recovery observation time. Timing starts when
+the harness requests primary-origin shutdown and ends after a replacement CDN
+PID has received over 250kB and published a playlist from a different generation.
+It excludes subsequent offline decoding. This loopback synthetic-source profile
+is a functional qualification, not a first-frame SLA, seamless playback,
+hardware decoding, HEVC GPU encoding, WAN/soak or capacity benchmark.
+
 The implemented [native pressure profile](native-cluster-pressure.md) shares
 HTTP/RTSP ranking by maximum normalized uplink/CPU/RAM pressure, bounded ready
 preference, actual reserved Mbps and the existing CDN-owned admission ledger.
