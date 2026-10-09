@@ -1061,3 +1061,10 @@ configuration and no media-worker startup are verified separately.
 This qualifies the [composite scalar profile](compatibility.md#implemented-composite-scalar-collection-sorting).
 Complete object/array ordering, reference implicit default keys and dynamic
 sort-key cursors remain outside this profile.
+
+The first full qualification run exposed an existing RTSP control-flood test's
+assumption of graceful EOF during media expiry. TCP may instead reset while the
+peer is still sending. The test now accepts only EOF or `ConnectionReset`, keeps
+its five-second deadline, checks worker closure before cleanup and verifies
+actual RTSP success responses. It joins its owned flood task and stops the lab
+before asserting the captured outcome. No RTSP runtime behavior changes.

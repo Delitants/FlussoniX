@@ -1648,14 +1648,26 @@ async fn control_flood_does_not_hide_media_stall() {
         }
     });
     let mut body = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), read.read_to_end(&mut body))
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(w.is_closed());
-    assert!(!body.is_empty());
+    let disconnected =
+        tokio::time::timeout(Duration::from_secs(5), read.read_to_end(&mut body)).await;
+    let worker_closed = w.is_closed();
     flood.abort();
+    let _ = flood.await;
+    drop(read);
     l.end().await;
+    // The peer is still writing at expiry. TCP may reset rather than send FIN
+    // when closing with unread data (RFC1122 section4.2.2.13). Other I/O errors
+    // and an unexpired connection still fail this stall/lifecycle regression.
+    let disconnected = disconnected.expect("Control traffic must not hide the media deadline");
+    assert!(
+        disconnected.is_ok()
+            || disconnected.is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionReset)
+    );
+    assert!(worker_closed, "Expired publisher worker must close");
+    assert!(
+        body.starts_with(b"RTSP/1.0 200"),
+        "Control replies must precede expiry"
+    );
 }
 #[tokio::test]
 async fn pending_initial_callback_is_revoked_when_configuration_changes() {
