@@ -623,3 +623,33 @@ async fn complete_blackout_recovers_recent_authorized_demand_without_new_viewer(
         "restored origin must restart recent authorized demand without another viewer"
     );
 }
+
+#[tokio::test]
+async fn explicit_stop_keeps_discovered_pull_stopped_until_new_playback() {
+    let _load = MEDIA_TESTS.acquire().await.unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let (a, b, cdn) = setup(d.path(), "m4s").await;
+    assert_eq!(play(&cdn).await.status(), 200);
+    let response = client()
+        .post(format!(
+            "{}/streamer/api/v3/streams/region/news/stop",
+            cdn.url
+        ))
+        .basic_auth("admin", Some("owned-management"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    cdn.app.reconcile().await;
+    let stopped = cdn.app.media.count().await;
+    assert_eq!(
+        play(&cdn).await.status(),
+        200,
+        "a later real viewer can start normally"
+    );
+    cleanup([a, b, cdn]).await;
+    assert_eq!(
+        stopped, 0,
+        "explicit stop must not be undone by retained recovery activity"
+    );
+}

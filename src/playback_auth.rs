@@ -172,6 +172,13 @@ struct State {
     revoked_until: Option<Instant>,
     cancel: CancellationToken,
 }
+impl State {
+    fn cancel_playback(&mut self) {
+        self.cancel.cancel();
+        self.playback_seen = None;
+        self.allowed_until = Instant::now();
+    }
+}
 struct Entry {
     id: String,
     state: Mutex<State>,
@@ -205,6 +212,9 @@ impl Grant {
     pub(crate) fn playback(&self) {
         if let Some(e) = &self.entry {
             let mut s = e.state.lock().unwrap();
+            if self.cancel.is_cancelled() {
+                return;
+            }
             let now = Instant::now();
             s.playback_seen = Some(now);
             s.last_seen = now;
@@ -224,8 +234,11 @@ impl Grant {
     }
     pub fn add_bytes(&self, bytes: usize) {
         if let Some(e) = &self.entry {
-            e.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
             let mut s = e.state.lock().unwrap();
+            if self.cancel.is_cancelled() {
+                return;
+            }
+            e.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
             let now = Instant::now();
             s.last_seen = now;
             if s.playback_seen.is_some() {
@@ -286,10 +299,8 @@ impl PlaybackAuth {
                 if s.request.name != name {
                     continue;
                 }
-                s.cancel.cancel();
+                s.cancel_playback();
                 s.generation += 1;
-                s.playback_seen = None;
-                s.allowed_until = Instant::now();
                 s.available = policy
                     .as_ref()
                     .is_some_and(|p| p.identity(&s.request) == *identity);
@@ -435,7 +446,7 @@ impl PlaybackAuth {
                             for e in others {
                                 let mut other = e.state.lock().unwrap();
                                 if other.user_id == s.user_id {
-                                    other.cancel.cancel();
+                                    other.cancel_playback();
                                     other.decision = Decision::Deny;
                                     other.next_check = s.next_check;
                                     other.generation += 1;
@@ -603,7 +614,7 @@ impl PlaybackAuth {
             for e in others {
                 let mut other = e.state.lock().unwrap();
                 if other.user_id == current_user {
-                    other.cancel.cancel();
+                    other.cancel_playback();
                     other.decision = Decision::Deny;
                     other.next_check = Instant::now() + Duration::from_secs(seconds);
                     other.generation += 1;
@@ -611,7 +622,7 @@ impl PlaybackAuth {
             }
         }
         if !matches!(decision, Decision::Allow) {
-            s.cancel.cancel();
+            s.cancel_playback();
         } else if s.cancel.is_cancelled() {
             s.cancel = CancellationToken::new();
         }
@@ -682,12 +693,29 @@ impl PlaybackAuth {
             return false;
         };
         let mut s = e.state.lock().unwrap();
-        s.cancel.cancel();
+        s.cancel_playback();
         s.decision = Decision::Deny;
         s.next_check = Instant::now() + Duration::from_secs(180);
         s.revoked_until = Some(s.next_check);
         s.generation += 1;
         true
+    }
+    /// An operator stop retires activity and in-flight admissions, not the policy.
+    pub(crate) fn stop_playback(&self, name: &str) {
+        let mut authority = self.authority.lock().unwrap();
+        if let Some(current) = authority.get_mut(name) {
+            current.revision += 1;
+        }
+        for entry in self.entries.lock().unwrap().values() {
+            let mut state = entry.state.lock().unwrap();
+            if state.request.name == name {
+                let permission_deadline = state.allowed_until;
+                state.cancel_playback();
+                state.allowed_until = permission_deadline;
+                state.cancel = CancellationToken::new();
+                state.generation += 1;
+            }
+        }
     }
     pub fn force_reauth(&self, name: &str) -> usize {
         let all = self.entries.lock().unwrap();
@@ -950,9 +978,186 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stale_control_grant_cannot_repopulate_activity_after_policy_change() {
+        let backend = ControlBackend::new(false).await;
+        let auth = PlaybackAuth::new(8);
+        let old = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "rtsp".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(control) = auth.authorize_control(old, request).await else {
+            panic!("old control")
+        };
+        auth.publish(
+            "owned",
+            Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+        );
+        assert!(control.is_cancelled());
+        control.playback();
+        control.add_bytes(10);
+        auth.renew_due().await;
+        let demand = auth.recovery_demand();
+        drop(control);
+        backend.close().await;
+        assert!(
+            demand.is_empty(),
+            "canceled control grant repopulated new-policy demand"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_bytes_cannot_refresh_activity_from_a_new_grant() {
+        let auth = PlaybackAuth::new(8);
+        let config = json!({});
+        let old = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&config, &config).unwrap()),
+            )
+            .unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "hls".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(stale) = auth.authorize(old, request.clone()).await else {
+            panic!("old playback")
+        };
+        auth.publish("owned", None);
+        let current = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&config, &config).unwrap()),
+            )
+            .unwrap();
+        let AuthOutcome::Allowed(fresh) = auth.authorize(current, request).await else {
+            panic!("new playback")
+        };
+        drop(fresh);
+        auth.age_activity(31);
+        assert!(stale.is_cancelled());
+        stale.add_bytes(10);
+        assert!(
+            auth.recovery_demand().is_empty(),
+            "canceled byte accounting renewed another grant's activity"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_playback_cannot_resume_through_control_only_allow() {
+        canceled_playback_cannot_resume_through_control_only_allow(false).await;
+    }
+    #[tokio::test]
+    async fn preempted_playback_cannot_resume_through_control_only_allow() {
+        canceled_playback_cannot_resume_through_control_only_allow(true).await;
+    }
+    async fn canceled_playback_cannot_resume_through_control_only_allow(unique: bool) {
+        let backend = ControlBackend::with_duration(unique, 1).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "rtsp".into(),
+            token: "b".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(playback) =
+            auth.authorize(snapshot.clone(), request.clone()).await
+        else {
+            panic!("initial playback")
+        };
+        if unique {
+            let other = ViewerRequest {
+                token: "a".into(),
+                ..request.clone()
+            };
+            let AuthOutcome::Allowed(preemption) =
+                auth.authorize_control(snapshot.clone(), other).await
+            else {
+                panic!("preemption")
+            };
+            drop(preemption);
+        } else {
+            backend.deny.store(true, Ordering::SeqCst);
+            auth.force_reauth("owned");
+            auth.renew_due().await;
+            backend.deny.store(false, Ordering::SeqCst);
+        }
+        assert!(playback.is_cancelled());
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let AuthOutcome::Allowed(control) = auth.authorize_control(snapshot, request).await else {
+            panic!("later control")
+        };
+        let demand = auth.recovery_demand();
+        drop(control);
+        drop(playback);
+        backend.close().await;
+        assert!(
+            demand.is_empty(),
+            "control revived canceled playback; unique={unique}"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_stop_fences_old_grants_and_snapshots_but_allows_new_playback() {
+        let auth = PlaybackAuth::new(8);
+        let policy = Policy::from_config(&json!({}), &json!({})).unwrap();
+        let snapshot = auth.publish("owned", Some(policy.clone())).unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "hls".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(old) = auth.authorize(snapshot.clone(), request.clone()).await
+        else {
+            panic!("initial playback")
+        };
+        auth.stop_playback("owned");
+        assert!(old.is_cancelled());
+        old.playback();
+        old.add_bytes(10);
+        assert!(auth.recovery_demand().is_empty());
+        assert!(
+            matches!(
+                auth.authorize(snapshot, request.clone()).await,
+                AuthOutcome::Denied
+            ),
+            "queued pre-stop admission passed"
+        );
+        drop(old);
+        let snapshot = auth.publish("owned", Some(policy)).unwrap();
+        let AuthOutcome::Allowed(control) = auth
+            .authorize_control(snapshot.clone(), request.clone())
+            .await
+        else {
+            panic!("post-stop control")
+        };
+        drop(control);
+        assert!(auth.recovery_demand().is_empty());
+        let AuthOutcome::Allowed(new) = auth.authorize(snapshot, request).await else {
+            panic!("post-stop playback")
+        };
+        assert!(!new.is_cancelled());
+        assert!(!auth.recovery_demand().is_empty());
+    }
+
     struct ControlBackend {
         url: String,
         calls: Arc<AtomicU64>,
+        deny: Arc<std::sync::atomic::AtomicBool>,
         stop: CancellationToken,
         task: tokio_util::task::AbortOnDropHandle<()>,
     }
@@ -965,6 +1170,8 @@ mod tests {
             let url = format!("http://{}/auth", listener.local_addr().unwrap());
             let calls = Arc::new(AtomicU64::new(0));
             let count = calls.clone();
+            let deny = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reject = deny.clone();
             let router = axum::Router::new().route(
                 "/auth",
                 axum::routing::get(
@@ -972,6 +1179,7 @@ mod tests {
                         HashMap<String, String>,
                     >| {
                         let count = count.clone();
+                        let reject = reject.clone();
                         async move {
                             count.fetch_add(1, Ordering::Relaxed);
                             let mut headers = axum::http::HeaderMap::new();
@@ -984,7 +1192,14 @@ mod tests {
                             } else {
                                 headers.insert("x-max-sessions", "1".parse().unwrap());
                             }
-                            (axum::http::StatusCode::OK, headers)
+                            (
+                                if reject.load(Ordering::SeqCst) {
+                                    axum::http::StatusCode::FORBIDDEN
+                                } else {
+                                    axum::http::StatusCode::OK
+                                },
+                                headers,
+                            )
                         }
                     },
                 ),
@@ -1000,6 +1215,7 @@ mod tests {
             Self {
                 url,
                 calls,
+                deny,
                 stop,
                 task,
             }

@@ -579,6 +579,76 @@ mod cache_tests {
     }
 
     #[tokio::test]
+    async fn explicit_stop_fences_an_already_queued_mirror_recovery() {
+        let d = tempfile::tempdir().unwrap();
+        let app = App::new(
+            d.path().join("config.json"),
+            d.path().join("media"),
+            Options {
+                admin_password: "owned-stop-admin".into(),
+                peer_key: "owned-stop-peer-key".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.config
+            .put("sources", "a", json!({"api_url":"http://127.0.0.1:9"}))
+            .unwrap();
+        let root = app.config.snapshot();
+        let config = json!({"name":"owned","static":false,"inputs":[{"url":"testsrc://"}]});
+        let mirror = Mirror {
+            when: Instant::now(),
+            source: root["sources"][0].clone(),
+            config: config.clone(),
+            available: true,
+            denied: false,
+            known: true,
+            serial: 1,
+            switches: 0,
+        };
+        let resolved = app
+            .publish_resolved("owned", &mirror, &root, app.config.revision())
+            .unwrap();
+        app.mirrors.lock().await.insert("owned".into(), mirror);
+        let AuthOutcome::Allowed(grant) = app
+            .playback_auth
+            .authorize(
+                resolved.policy,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "hls".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("recent demand")
+        };
+        drop(grant);
+        let activity = app.playback_auth.recovery_demand()["owned"];
+        let blocked = app.media.hold_startups_for_test().await;
+        let a = app.clone();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            entered.send(()).unwrap();
+            a.recover_with_demand("owned", &config, a.config.revision(), Some(activity))
+                .await;
+        });
+        waiting.await.unwrap();
+        assert!(
+            !task.is_finished(),
+            "recovery must be queued behind the engine lock"
+        );
+        app.playback_auth.stop_playback("owned");
+        drop(blocked);
+        task.await.unwrap();
+        assert!(
+            app.media.workers().await.is_empty(),
+            "queued recovery survived explicit stop"
+        );
+    }
+
+    #[tokio::test]
     async fn blackout_recovery_rejects_expiry_revocation_denial_removal_and_policy_changes() {
         for boundary in [
             "valid",

@@ -599,7 +599,9 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     }
     if let Some(name) = name {
         if kind == "streams" && method == "POST" && name.ends_with("/stop") {
-            app.media.stop(name.trim_end_matches("/stop")).await;
+            let name = name.trim_end_matches("/stop");
+            app.playback_auth.stop_playback(name);
+            app.media.stop(name).await;
             return json_response(json!({"status":"stopped"}));
         }
         if method == "GET" {
