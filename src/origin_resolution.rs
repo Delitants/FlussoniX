@@ -570,10 +570,15 @@ mod cache_tests {
             panic!("initial demand")
         };
         drop(grant);
+        let demand = app.playback_auth.recovery_demand().remove("owned").unwrap();
         app.config.put("streams", "owned", config.clone()).unwrap();
         assert!(
-            !app.recovery_current("owned", &crate::media::media_signature(&config), true)
-                .await,
+            !app.recovery_current(
+                "owned",
+                &crate::media::media_signature(&config),
+                Some(&demand)
+            )
+            .await,
             "queued mirror recovery must not start a new local on-demand definition"
         );
     }
@@ -625,13 +630,13 @@ mod cache_tests {
             panic!("recent demand")
         };
         drop(grant);
-        let activity = app.playback_auth.recovery_demand()["owned"];
+        let demand = app.playback_auth.recovery_demand().remove("owned").unwrap();
         let blocked = app.media.hold_startups_for_test().await;
         let a = app.clone();
         let (entered, waiting) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             entered.send(()).unwrap();
-            a.recover_with_demand("owned", &config, a.config.revision(), Some(activity))
+            a.recover_with_demand("owned", &config, a.config.revision(), Some(&demand))
                 .await;
         });
         waiting.await.unwrap();

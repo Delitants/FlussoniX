@@ -178,6 +178,19 @@ impl State {
         self.playback_seen = None;
         self.allowed_until = Instant::now();
     }
+    fn recovery_activity(&self, current: Option<&Policy>, now: Instant) -> Option<Instant> {
+        let seen = self.playback_seen?;
+        (now.duration_since(seen) < Duration::from_secs(30)
+            && matches!(self.decision, Decision::Allow)
+            && self.available
+            && !self.cancel.is_cancelled()
+            && self.next_check > now
+            && self.allowed_until > now
+            && !self.revoked_until.is_some_and(|until| until > now)
+            && current == Some(&self.policy)
+            && self.policy.accepts_token(&self.request.token))
+        .then_some(seen)
+    }
 }
 struct Entry {
     id: String,
@@ -186,6 +199,12 @@ struct Entry {
     live: AtomicU64,
     admissions: AtomicU64,
     bytes: AtomicU64,
+}
+/// Per-pass candidates, never cached permission. Guards revalidate their live entries.
+pub(crate) struct RecoveryDemand {
+    pub(crate) activity: Instant,
+    name: String,
+    entries: Vec<(String, Arc<Entry>)>,
 }
 impl Entry {
     fn occupied(&self) -> bool {
@@ -764,36 +783,55 @@ impl PlaybackAuth {
             .sum()
     }
     /// Recent admitted playback only. Observing recovery demand never renews activity.
-    pub(crate) fn recovery_demand(&self) -> HashMap<String, Instant> {
+    pub(crate) fn recovery_demand(&self) -> HashMap<String, RecoveryDemand> {
         let authority = self.authority.lock().unwrap();
         let entries = self.entries.lock().unwrap();
-        let now = Instant::now();
         let mut demand = HashMap::new();
-        for entry in entries.values() {
+        for (identity, entry) in entries.iter() {
             let state = entry.state.lock().unwrap();
-            let Some(seen) = state.playback_seen else {
+            let current = authority
+                .get(&state.request.name)
+                .and_then(|current| current.policy.as_ref());
+            let Some(seen) = state.recovery_activity(current, Instant::now()) else {
                 continue;
             };
-            if now.duration_since(seen) >= Duration::from_secs(30)
-                || !matches!(state.decision, Decision::Allow)
-                || !state.available
-                || state.cancel.is_cancelled()
-                || state.next_check <= now
-                || state.allowed_until <= now
-                || state.revoked_until.is_some_and(|until| until > now)
-                || !state.policy.accepts_token(&state.request.token)
-                || !authority
-                    .get(&state.request.name)
-                    .is_some_and(|current| current.policy.as_ref() == Some(&state.policy))
-            {
-                continue;
-            }
-            demand
-                .entry(state.request.name.clone())
-                .and_modify(|latest: &mut Instant| *latest = (*latest).max(seen))
-                .or_insert(seen);
+            let candidate =
+                demand
+                    .entry(state.request.name.clone())
+                    .or_insert_with(|| RecoveryDemand {
+                        activity: seen,
+                        name: state.request.name.clone(),
+                        entries: Vec::new(),
+                    });
+            candidate.activity = candidate.activity.max(seen);
+            candidate.entries.push((identity.clone(), entry.clone()));
         }
         demand
+    }
+    /// Check only this pass's candidate sessions, preserving authority -> entries -> state order.
+    pub(crate) fn recovery_allowed(&self, name: &str, demand: &RecoveryDemand) -> bool {
+        if demand.name != name {
+            return false;
+        }
+        let authority = self.authority.lock().unwrap();
+        let current = authority
+            .get(name)
+            .and_then(|current| current.policy.as_ref());
+        if current.is_none() {
+            return false;
+        }
+        let entries = self.entries.lock().unwrap();
+        demand.entries.iter().any(|(identity, entry)| {
+            // A retained Arc must not revive an evicted or replaced cache entry.
+            entries
+                .get(identity)
+                .is_some_and(|cached| Arc::ptr_eq(cached, entry))
+                && {
+                    let state = entry.state.lock().unwrap();
+                    state.request.name == name
+                        && state.recovery_activity(current, Instant::now()).is_some()
+                }
+        })
     }
 
     pub fn snapshots(&self) -> Vec<Value> {
@@ -821,6 +859,203 @@ impl PlaybackAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn candidate_fixture() -> (Arc<PlaybackAuth>, RecoveryDemand, Arc<Entry>, Arc<Entry>) {
+        let auth = Arc::new(PlaybackAuth::new(128));
+        let policy = Policy::from_config(
+            &json!({"flussonix_token_sha256":format!("{:x}", Sha256::digest(b"owned"))}),
+            &json!({}),
+        )
+        .unwrap();
+        for name in ["owned", "unrelated"] {
+            let snapshot = auth.publish(name, Some(policy.clone())).unwrap();
+            let AuthOutcome::Allowed(grant) = auth
+                .authorize(
+                    snapshot,
+                    ViewerRequest {
+                        name: name.into(),
+                        proto: "hls".into(),
+                        token: "owned".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+            else {
+                panic!("owned candidate admission")
+            };
+            drop(grant);
+        }
+        let find = |name| {
+            auth.entries
+                .lock()
+                .unwrap()
+                .values()
+                .find(|entry| entry.state.lock().unwrap().request.name == name)
+                .unwrap()
+                .clone()
+        };
+        let candidate = find("owned");
+        let unrelated = find("unrelated");
+        let demand = auth.recovery_demand().remove("owned").unwrap();
+        (auth, demand, candidate, unrelated)
+    }
+
+    // A whole-cache scan makes this check wait for another stream's byte accounting.
+    #[tokio::test]
+    async fn candidate_recovery_does_not_wait_for_unrelated_session_state() {
+        let (auth, demand, _, unrelated) = candidate_fixture().await;
+        let blocked = unrelated.state.lock().unwrap();
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (finished, result) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            finished
+                .send(auth.recovery_allowed("owned", &demand))
+                .unwrap();
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before_release = result.recv_timeout(Duration::from_secs(1));
+        drop(blocked);
+        thread.join().unwrap();
+        assert_eq!(
+            before_release.ok(),
+            Some(true),
+            "candidate recovery waited for an unrelated session lock"
+        );
+    }
+
+    // Capturing a candidate must never freeze its permission or renew its activity.
+    #[tokio::test]
+    async fn candidate_recovery_rechecks_current_authorization_after_capture() {
+        for (boundary, expected) in [
+            ("valid", true),
+            ("wrong-name", false),
+            ("expired-playback", false),
+            ("missing-playback", false),
+            ("callback-due", false),
+            ("expired-allow", false),
+            ("denied", false),
+            ("unknown", false),
+            ("redirect", false),
+            ("unavailable", false),
+            ("canceled", false),
+            ("revoked", false),
+            ("invalid-token", false),
+            ("policy-changed", false),
+            ("authority-removed", false),
+            ("operator-stop", false),
+            ("unrelated-policy-changed", true),
+        ] {
+            let (auth, demand, entry, _) = candidate_fixture().await;
+            let now = Instant::now();
+            match boundary {
+                "policy-changed" | "unrelated-policy-changed" => {
+                    let name = if boundary == "policy-changed" {
+                        "owned"
+                    } else {
+                        "unrelated"
+                    };
+                    auth.publish(
+                        name,
+                        Some(Policy::from_config(&json!({}), &json!({})).unwrap()),
+                    );
+                }
+                "authority-removed" => {
+                    auth.publish("owned", None);
+                }
+                "operator-stop" => auth.stop_playback("owned"),
+                "revoked" => {
+                    assert!(auth.revoke(&entry.id));
+                }
+                _ => {
+                    let mut state = entry.state.lock().unwrap();
+                    match boundary {
+                        "valid" | "wrong-name" => {}
+                        "expired-playback" => {
+                            state.playback_seen = Some(now - Duration::from_secs(30))
+                        }
+                        "missing-playback" => state.playback_seen = None,
+                        "callback-due" => state.next_check = now,
+                        "expired-allow" => state.allowed_until = now,
+                        "denied" => state.decision = Decision::Deny,
+                        "unknown" => state.decision = Decision::Unknown,
+                        "redirect" => {
+                            state.decision = Decision::Redirect("http://localhost/".into())
+                        }
+                        "unavailable" => state.available = false,
+                        "canceled" => state.cancel.cancel(),
+                        "invalid-token" => state.request.token = "invalid".into(),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            let before = entry.state.lock().unwrap().playback_seen;
+            let name = if boundary == "wrong-name" {
+                "unrelated"
+            } else {
+                "owned"
+            };
+            assert_eq!(auth.recovery_allowed(name, &demand), expected, "{boundary}");
+            assert_eq!(
+                entry.state.lock().unwrap().playback_seen,
+                before,
+                "observation changed activity: {boundary}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_recovery_rejects_retired_and_replaced_cache_entries() {
+        let (auth, demand, entry, _) = candidate_fixture().await;
+        let policy = entry.state.lock().unwrap().policy.clone();
+        let request = entry.state.lock().unwrap().request.clone();
+        auth.entries
+            .lock()
+            .unwrap()
+            .retain(|_, cached| !Arc::ptr_eq(cached, &entry));
+        assert!(
+            !auth.recovery_allowed("owned", &demand),
+            "retired entry authorized recovery"
+        );
+        let snapshot = auth.publish("owned", Some(policy)).unwrap();
+        let AuthOutcome::Allowed(control) = auth.authorize_control(snapshot, request).await else {
+            panic!("replacement control admission")
+        };
+        assert!(
+            !auth.recovery_allowed("owned", &demand),
+            "replaced identity reused a retired entry's demand"
+        );
+        assert!(
+            !auth.recovery_demand().contains_key("owned"),
+            "control-only replacement became demand"
+        );
+        drop(control);
+    }
+
+    #[tokio::test]
+    async fn candidate_recovery_accepts_any_current_captured_session() {
+        let (auth, old_demand, first, _) = candidate_fixture().await;
+        let policy = first.state.lock().unwrap().policy.clone();
+        let mut request = first.state.lock().unwrap().request.clone();
+        request.ip = "another-viewer".into();
+        let snapshot = auth.publish("owned", Some(policy)).unwrap();
+        let AuthOutcome::Allowed(second) = auth.authorize(snapshot, request).await else {
+            panic!("second playback")
+        };
+        let current_demand = auth.recovery_demand().remove("owned").unwrap();
+        assert!(auth.revoke(&first.id));
+        assert!(
+            !auth.recovery_allowed("owned", &old_demand),
+            "uncaptured activity must wait for the next pass"
+        );
+        assert!(
+            auth.recovery_allowed("owned", &current_demand),
+            "another captured session is still authorized"
+        );
+        assert!(auth.revoke(&second.entry.as_ref().unwrap().id));
+        assert!(!auth.recovery_allowed("owned", &current_demand));
+    }
+
     #[tokio::test]
     async fn recovery_demand_requires_recent_playback_and_current_authorization() {
         let auth = PlaybackAuth::new(8);
@@ -848,9 +1083,9 @@ mod tests {
             panic!("playback admission")
         };
         drop(playback);
-        let activity = auth.recovery_demand()["owned"];
+        let activity = auth.recovery_demand()["owned"].activity;
         assert_eq!(
-            auth.recovery_demand()["owned"],
+            auth.recovery_demand()["owned"].activity,
             activity,
             "observation must not touch demand"
         );

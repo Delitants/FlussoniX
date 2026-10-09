@@ -1,0 +1,9 @@
+# Candidate-scoped recovery authorization
+
+Recovery currently enumerates all authorization entries once to discover demand, then rebuilds that whole map at each startup guard. Remove those repeated scans without relaxing authorization or changing public APIs, configuration, UI, or playback behavior.
+
+The once-per-pass enumeration produces an ephemeral `RecoveryDemand` per stream: its latest real playback timestamp and references to eligible cached sessions, keyed by their existing cache identity. Each guard checks only those sessions against the current cache membership, current published policy and current mutable authorization state. A candidate snapshot is never permission. Keep authority -> entries -> state lock order, exact worker retirement, local stream precedence, the 30-second activity bound, actual allow deadline, callback renewal deadline, revocation, cancellation, denial, policy changes and operator Stop. New activity on sessions absent from a snapshot can wait for the next reconciliation pass.
+
+No persistent demand index or ledger is introduced. The existing 20,000-entry cache bounds each pass's references; reference ownership must not prevent cache eviction or allow retired/replaced entries to authorize recovery. Guard cost is proportional to that candidate's captured sessions, with no whole-map construction, unrelated session state locks or unrelated token hashing. This is an algorithmic improvement, not a production throughput claim.
+
+Qualification must reproduce unrelated-session contention before the optimization, verify membership and authorization boundaries after capture, run existing source/queued-stop and real-daemon blackout regressions, then run full exact-head CI. Preserve preview environment, settings and web assets when publishing the verified artifact. Clean up all owned media fixtures.

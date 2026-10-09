@@ -3,7 +3,9 @@ use crate::{
     cluster::{NodeLoad, TieRotation},
     config::{ConfigStore, KINDS, valid_name},
     media::{Engine, Worker},
-    playback_auth::{AuthOutcome, Grant, PlaybackAuth, Policy, PolicySnapshot, ViewerRequest},
+    playback_auth::{
+        AuthOutcome, Grant, PlaybackAuth, Policy, PolicySnapshot, RecoveryDemand, ViewerRequest,
+    },
 };
 use axum::{
     Router,
@@ -257,12 +259,18 @@ impl App {
             Some((config, self.config.revision()))
         })
     }
-    async fn recovery_current(&self, name: &str, signature: &str, demand: bool) -> bool {
+    async fn recovery_current(
+        &self,
+        name: &str,
+        signature: &str,
+        demand: Option<&RecoveryDemand>,
+    ) -> bool {
         self.media_config(name).await.is_some_and(|(config, _)| {
             config["disabled"] != true && crate::media::media_signature(&config) == signature
-        }) && (!demand
-            || self.config.effective(name).is_none()
-                && self.playback_auth.recovery_demand().contains_key(name))
+        }) && demand.is_none_or(|demand| {
+            self.config.effective(name).is_none()
+                && self.playback_auth.recovery_allowed(name, demand)
+        })
     }
     async fn recover_current(&self, name: &str, config: &Value, revision: u64) {
         self.recover_with_demand(name, config, revision, None).await;
@@ -272,29 +280,23 @@ impl App {
         name: &str,
         config: &Value,
         _revision: u64,
-        activity: Option<Instant>,
+        demand: Option<&RecoveryDemand>,
     ) {
         let signature = crate::media::media_signature(config);
-        if !self
-            .recovery_current(name, &signature, activity.is_some())
-            .await
-        {
+        if !self.recovery_current(name, &signature, demand).await {
             return;
         }
-        let check = self.recovery_current(name, &signature, activity.is_some());
-        let result = if let Some(activity) = activity {
+        let check = self.recovery_current(name, &signature, demand);
+        let result = if let Some(demand) = demand {
             self.media
-                .recover_demand_guarded(name, config, activity, check)
+                .recover_demand_guarded(name, config, demand.activity, check)
                 .await
         } else {
             self.media.ensure_guarded(name, config, false, check).await
         };
         if let Ok(worker) = result {
             // Retire only the exact stale attempt after asynchronous startup.
-            if !self
-                .recovery_current(name, &signature, activity.is_some())
-                .await
-            {
+            if !self.recovery_current(name, &signature, demand).await {
                 self.media.stop_if_current(name, &worker).await;
             }
         }
@@ -330,13 +332,13 @@ impl App {
                 .into_iter()
                 .map(|(name, _)| name)
                 .collect::<std::collections::HashSet<_>>();
-            for (name, activity) in self.playback_auth.recovery_demand() {
+            for (name, demand) in self.playback_auth.recovery_demand() {
                 // This path restores a discovered pull, never a configured on-demand stream.
                 if !workers.contains(&name)
                     && self.config.effective(&name).is_none()
                     && let Some((config, revision)) = self.media_config(&name).await
                 {
-                    self.recover_with_demand(&name, &config, revision, Some(activity))
+                    self.recover_with_demand(&name, &config, revision, Some(&demand))
                         .await;
                 }
             }
