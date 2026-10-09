@@ -411,6 +411,57 @@ async fn unsupported_paths_and_empty_duplicate_fields_have_deterministic_fallbac
 }
 
 #[tokio::test]
+async fn valid_null_text_identities_remain_literal_in_default_and_tie_ordering() {
+    let (_dir, app) = fixture();
+    for name in ["undefined", "null", "alpha", "beta", "delta", "gamma"] {
+        app.config
+            .put("streams", name, json!({"template":"base","position":7}))
+            .unwrap();
+    }
+    let expected = ["alpha", "beta", "delta", "gamma", "null", "undefined"];
+    let (status, body) = get(&app, "streams", &[], true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    for sort in ["name", "position", "unknown", ""] {
+        names(&app, "streams", sort, &expected).await;
+    }
+    names(
+        &app,
+        "streams",
+        "-name",
+        &["undefined", "null", "gamma", "delta", "beta", "alpha"],
+    )
+    .await;
+    for name in ["undefined", "null"] {
+        app.config
+            .put("templates", name, json!({"static":false}))
+            .unwrap();
+    }
+    names(
+        &app,
+        "templates",
+        "name",
+        &["base", "null", "sport", "undefined"],
+    )
+    .await;
+    names(
+        &app,
+        "templates",
+        "unknown",
+        &["base", "null", "sport", "undefined"],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn sorting_preserves_auth_config_and_other_collections() {
     let (dir, app) = fixture();
     let before = app.config.snapshot();

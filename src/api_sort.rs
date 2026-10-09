@@ -86,8 +86,48 @@ fn scalar<'a>(row: &'a Value, path: &[&str]) -> Scalar<'a> {
                 number.as_f64().map_or(Scalar::Missing, Scalar::Float)
             }
         }
-        Value::String(text) if text != "null" && text != "undefined" => Scalar::Text(text),
+        // These are valid literal identities. Preserve existing name ordering
+        // and its tie-breaker even when an identity spells a null sentinel.
+        Value::String(text) if path == ["name"] || (text != "null" && text != "undefined") => {
+            Scalar::Text(text)
+        }
         Value::Bool(value) => Scalar::Boolean(*value),
         _ => Scalar::Missing,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Sort;
+    use serde_json::json;
+
+    #[test]
+    fn distinct_runtime_statistics_drive_composite_scalar_order() {
+        let rows = [
+            json!({"name":"alpha","stats":{"status":"waiting","online_clients":0}}),
+            json!({"name":"beta","stats":{"status":"error","online_clients":20}}),
+            json!({"name":"gamma","stats":{"status":"online","online_clients":10}}),
+            json!({"name":"delta","stats":{"status":"online","online_clients":2}}),
+        ];
+        for (expression, expected) in [
+            (
+                "stats.status,-stats.online_clients",
+                ["beta", "gamma", "delta", "alpha"],
+            ),
+            ("stats.online_clients", ["alpha", "delta", "gamma", "beta"]),
+            ("-stats.online_clients", ["beta", "gamma", "delta", "alpha"]),
+        ] {
+            let mut sorted = rows.clone();
+            let sort = Sort::new(Some(expression));
+            sorted.sort_by(|left, right| sort.compare(left, right));
+            assert_eq!(
+                sorted
+                    .iter()
+                    .map(|row| row["name"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{expression}"
+            );
+        }
     }
 }

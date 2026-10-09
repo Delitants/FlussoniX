@@ -1044,13 +1044,16 @@ This is a bounded profile, not full collection/schema compatibility. See
 
 ## Composite Streams/Templates sorting qualification
 
-Eight real-router regressions first failed against name-only ordering and pass
-with the independent scalar comparator. Literal expected rows qualify numeric
+Eight real-router regressions first failed against name-only ordering; a ninth
+exposed null-sentinel handling of valid literal identities during review. All
+pass with the independent scalar comparator. Literal expected rows qualify numeric
 and composite sort directions, ascending identity ties and explicit reverse
 identity, inherited/saved/runtime paths, and ordering on unselected fields.
 They cover signed/unsigned integer boundaries beyond floating-point precision,
 mixed scalar types, case-sensitive Unicode text, null/text sentinels, empty
 strings, and deterministic fallback for unsupported or deeply nested paths.
+An additional comparator test uses distinct runtime status and viewer-count
+values to qualify primary and secondary statistics ordering independently.
 Filtered search plus one-row cursor pages preserves counts and envelopes.
 Read-only view authorization, default ordering, unchanged peer sorting, saved
 configuration and no media-worker startup are verified separately.

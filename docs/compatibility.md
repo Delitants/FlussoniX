@@ -121,6 +121,8 @@ Strings use case-sensitive UTF-8 lexical order; booleans sort `false` before
 integer, string, floating-point number, boolean. JSON null and the strings
 `null`/`undefined` count as missing; an empty string is present. Descending
 reverses that field's complete ordering, including missing values.
+The top-level identity `name` always remains literal text, including valid names
+`null` and `undefined`, preserving existing default and identity tie ordering.
 
 Unknown paths, object/array values, array indices, scalar traversal and empty
 terms contribute no ordering; subsequent fields and identity still apply.
