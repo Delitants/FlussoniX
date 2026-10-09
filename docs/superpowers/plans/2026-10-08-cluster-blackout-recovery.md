@@ -29,7 +29,7 @@ Consumes: Task 1 recovery contract; existing daemon TLS/media decode helpers.
 - [x] Pin no restart after expiry/removal/denial and stale queued-start guards with deterministic unit/integration coverage.
 - [x] Run related regressions, fmt and warnings-denied Clippy; commit.
 - [x] Request one fresh read-only whole-branch review; fix Important/Critical findings in one TDD pass.
-- [x] Run full exact-head CI; publish and upgrade the preview using preserved configuration/environment/assets and rollback binary. Verify health and process cleanup.
+- [ ] Run full exact-head CI; publish and upgrade the preview using preserved configuration/environment/assets and rollback binary. Verify health and process cleanup.
 
 ## Execution ledger
 
@@ -37,4 +37,4 @@ Preflight: existing authority/entry locks use authority -> entries -> state; rec
 
 Implementation candidate: `4808d53`; 128 library and 57 related integration tests pass after one review fix pass. Meaningful RED/GREEN evidence covers blackout restart, local precedence, changed policy, callback-retry deadline, stale control promotion/byte accounting, denial/unique preemption, management Stop and queued restart/admission fencing.
 
-Final review found two Important authorization/lifecycle gaps, both fixed: canceled activity generations and explicit operator Stop. One Minor remains deferred: startup guards scan the whole authorization cache; candidate-specific validation is the next performance optimization. No measured capacity claim is made. Serial final hardware repetition, full exact-head CI and preserved preview upgrade remain release gates, with observations recorded outside the tracked tree to avoid changing the commit being qualified.
+Final review found two Important authorization/lifecycle gaps, both fixed: canceled activity generations and explicit operator Stop. One Minor remains deferred: startup guards scan the whole authorization cache; candidate-specific validation is the next performance optimization. No measured capacity claim is made. Serial post-review CPU/iGPU M4S/M4F blackout repetition and warnings-denied Clippy pass. Full exact-head CI and preserved preview upgrade remain release gates, with observations recorded outside the tracked tree to avoid changing the commit being qualified.
