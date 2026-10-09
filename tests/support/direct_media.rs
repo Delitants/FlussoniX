@@ -57,17 +57,36 @@ async fn run_profile(video: Option<&str>, secure: bool, fixture: Option<&Path>, 
         "-analyzeduration",
         "1000000",
     ]);
-    if secure {
+    let receiver_input = if secure {
+        // Retain the independent SRTP protocol receiver and its input key.
         rx.args([
             "-srtp_in_suite",
             "AES_CM_128_HMAC_SHA1_80",
             "-srtp_in_params",
             &key,
         ]);
-    }
+        format!("{scheme}://127.0.0.1:{output}?timeout=18000000")
+    } else {
+        // Explicit MP2T SDP avoids the RTP URL payload probe's socket reopen.
+        let sdp = d.path().join("receiver.sdp");
+        std::fs::write(&sdp, format!(
+            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=Owned MP2T receiver\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video {output} RTP/AVP 33\r\na=rtpmap:33 MP2T/90000\r\n"
+        )).unwrap();
+        rx.args([
+            "-protocol_whitelist",
+            "file,udp,rtp",
+            "-localaddr",
+            "127.0.0.1",
+            "-listen_timeout",
+            "18",
+            "-f",
+            "sdp",
+        ]);
+        sdp.to_str().unwrap().to_owned()
+    };
     rx.args([
         "-i",
-        &format!("{scheme}://127.0.0.1:{output}?timeout=18000000"),
+        &receiver_input,
         "-t",
         "6",
         "-map",

@@ -308,6 +308,16 @@ A deterministic delayed-join regression exposed an existing RTP-Info fallback us
 
 Native direct MP2T/PT33 receive/transmit adds unicast IPv4/IPv6 and explicit-interface IPv4 multicast, bounded packet reordering and pacing, compound RTCP reports, shared TS destination fan-out and process-mode uplink accounting. [RTP](direct-rtp.md) and [SRTP/SRTCP](direct-srtp.md) document the precise configuration, key-loading contract and operating limits. Streams/Templates use labeled transport fields with whole-list inheritance and clearing, without JSON input. libsrtp2 is an independent optional system runtime dependency for secure transport.
 
+The owned direct RTP AV matrix receiver now uses explicit SDP for MP2T/PT33.
+The independent SRTP protocol receiver retains its input-key options. CI exposed
+a plaintext receiver startup race: FFmpeg's RTP URL header
+probe closes its socket before reopening it through SDP, briefly exposing the
+connected sender to ICMP errors. Network traces confirm one RTP bind with the
+explicit SDP fixture; all original codec, frame-count and strict-decoding checks
+remain. This is a test fixture correction, with no product transport change.
+See [FFmpeg's RTP header implementation](https://github.com/FFmpeg/FFmpeg/blob/n7.1.1/libavformat/rtsp.c#L2355-L2463).
+
+
 Independent FFmpeg receivers qualify H.264 and HEVC copy delivery with AAC, MPEG Layer II and MP3, plus audio-only, and internal CPU H.264/AAC transcoding through RTP and SRTP. Codec identity, decoded frame counts, successful strict decode and empty decoder error output are required. Native UDP tests exercise source/SSRC pinning, malformed frames, wrapping sequences, multicast feedback, occupied ports, sparse flush, fan-out and cancellation. Crypto tests cover confidentiality, RTP/SRTCP authentication and replay, plaintext exclusion, unsafe/missing files, malformed authenticated candidates, retained candidate rollover state and replacement by a new key-file reference. A compiled public 2.7 C-header probe confirms the narrow Rust policy ABI. No proprietary runtime component is loaded.
 
 Owned CEA-608/708 and DVB/teletext fixtures traverse both direct transports with exact descriptor languages and original PES checks, original-track filtering, independent HLS conversion/pass-through/drop settings and strict H.264/HEVC AV decode. An independently authored RFC2250 framer feeds FFmpeg's raw RTP/SRTP protocol: the FFmpeg `rtp_mpegts` muxer's nested TS context otherwise replaces subtitle language metadata with `und` before reception. The fixture correction retains exact metadata assertions; it does not reconstruct missing upstream metadata in the product. Qualification is on fresh SRTP epochs; continued receiver sessions cross sequence rollover, while unsignalled new receivers after rollover fail closed and require coordinated source restart.
