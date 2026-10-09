@@ -53,9 +53,11 @@ full responses are preserved. Item GET and other collections are unchanged.
 Selecting a whole object or array preserves that value. Dotted paths traverse
 objects; array element projection and scalar traversal are unsupported and
 omitted. Unknown fields are omitted; an existing object with no matching child
-is returned as `{}`. An explicitly empty selector returns `{}` per template
-and only the required `name` per stream. Stream rows always retain `name`,
-matching the reference schema's required identity field. Wildcards and JSON
+is returned as `{}`, except for the required names below. An explicitly empty
+selector returns `{}` per template
+and only the required `name` per stream. Stream rows always retain `name`;
+selected `config_on_disk` objects also retain their `name`, matching the
+reference schema's required identity fields. Wildcards and JSON
 path syntax are not supported. Overlapping parent/child selectors resolve in
 query order: a later parent selects the whole value; a later child narrows it.
 

@@ -83,9 +83,9 @@ async fn streams_select_nested_effective_fields_and_retain_required_name_without
     assert_eq!(
         body,
         json!({"estimated_count":3,"next":null,"prev":null,"timing":{},"streams":[
-            {"name":"alpha","title":"Needle first","static":false,"transcoder":{"vb":600},"stats":{"status":"waiting"},"config_on_disk":{"template":"base"}},
-            {"name":"beta","title":"Other","static":false,"transcoder":{"vb":600},"stats":{"status":"waiting"},"config_on_disk":{"template":"base"}},
-            {"name":"gamma","title":"Needle last","static":false,"transcoder":{"vb":600},"stats":{"status":"waiting"},"config_on_disk":{"template":"base"}}
+            {"name":"alpha","title":"Needle first","static":false,"transcoder":{"vb":600},"stats":{"status":"waiting"},"config_on_disk":{"name":"alpha","template":"base"}},
+            {"name":"beta","title":"Other","static":false,"transcoder":{"vb":600},"stats":{"status":"waiting"},"config_on_disk":{"name":"beta","template":"base"}},
+            {"name":"gamma","title":"Needle last","static":false,"transcoder":{"vb":600},"stats":{"status":"waiting"},"config_on_disk":{"name":"gamma","template":"base"}}
         ]})
     );
     assert_eq!(app.config.snapshot(), before);
@@ -231,4 +231,30 @@ async fn selection_preserves_auth_and_default_collection_and_item_get_responses(
     assert_eq!(item["title"], "Needle first");
     assert_eq!(item["transcoder"]["ab"], 64);
     assert_eq!(app.media.count().await, 0);
+}
+
+#[tokio::test]
+async fn selecting_disk_configuration_retains_its_required_stream_identity() {
+    let (_dir, app) = fixture();
+    for select in [
+        "config_on_disk.template",
+        "config_on_disk.unknown",
+        "config_on_disk.name.child",
+    ] {
+        let body = selected(&app, &format!("/streamer/api/v3/streams?select={select}")).await;
+        let expected = if select == "config_on_disk.template" {
+            json!([
+                {"name":"alpha","config_on_disk":{"name":"alpha","template":"base"}},
+                {"name":"beta","config_on_disk":{"name":"beta","template":"base"}},
+                {"name":"gamma","config_on_disk":{"name":"gamma","template":"base"}}
+            ])
+        } else {
+            json!([
+                {"name":"alpha","config_on_disk":{"name":"alpha"}},
+                {"name":"beta","config_on_disk":{"name":"beta"}},
+                {"name":"gamma","config_on_disk":{"name":"gamma"}}
+            ])
+        };
+        assert_eq!(body["streams"], expected, "select={select}");
+    }
 }

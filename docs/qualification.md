@@ -1009,15 +1009,18 @@ this qualification increment.
 
 ## Streams/Templates collection field selection
 
-Six real-router tests cover nested effective settings and explicit disk fields,
-required stream names, template rows without implicit identity fields, whole
-objects/arrays, sibling selection and query-order parent/child overlap. Literal
+Seven real-router tests cover nested effective settings and explicit disk fields,
+required stream and selected disk configuration names, template rows without
+implicit identity fields, whole objects/arrays, sibling selection and query-order
+parent/child overlap. Literal
 expected responses also cover empty/unknown selectors, unsupported scalar/array
 traversal, a deeply nested unknown path, unchanged collection envelopes, search
 and reverse-name cursor pages, view authentication and unchanged item GETs.
 Five tests first failed because full rows were returned; the pre-existing auth
 and default-response regression passed. The API/configuration suite then passed
-all 36 cases with the independent Rust selector. Selected GETs preserve both
+all 37 cases with the independent Rust selector. A subsequent targeted red test
+exposed omission of the required nested disk name; the corrected selector
+retains it even when a missing disk child is requested. Selected GETs preserve both
 in-memory and disk configuration and create no workers.
 
 This qualifies collection field selection within the documented

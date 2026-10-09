@@ -25,12 +25,27 @@ impl<'a> Selection<'a> {
             for path in &self.paths {
                 copy_path(source, &mut selected, path);
             }
-            // stream_config_specific requires name even when not selected.
-            if stream && let Some(name) = source.get("name") {
-                selected.insert("name".into(), name.clone());
+            if stream {
+                // Both stream_config and config_on_disk's stream_config_stripped
+                // include stream_config_specific, whose name is required.
+                retain_name(source, &mut selected);
+                if let (Some(disk), Some(disk_selection)) = (
+                    source.get("config_on_disk").and_then(Value::as_object),
+                    selected
+                        .get_mut("config_on_disk")
+                        .and_then(Value::as_object_mut),
+                ) {
+                    retain_name(disk, disk_selection);
+                }
             }
         }
         Value::Object(selected)
+    }
+}
+
+fn retain_name(source: &Map<String, Value>, selected: &mut Map<String, Value>) {
+    if let Some(name) = source.get("name") {
+        selected.insert("name".into(), name.clone());
     }
 }
 
