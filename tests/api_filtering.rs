@@ -429,3 +429,76 @@ async fn integer_comparison_preserves_precision_and_signed_unsigned_boundaries()
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }
+
+#[tokio::test]
+async fn encoder_and_audio_bitrate_filters_distinguish_inherited_and_saved_native_fields() {
+    let (_dir, app) = fixture();
+    app.config
+        .put("templates", "base", json!({"transcoder":{"ab":64}}))
+        .unwrap();
+    app.config
+        .put(
+            "templates",
+            "sport",
+            json!({"transcoder":{"encoder":"libx265","ab":128}}),
+        )
+        .unwrap();
+    app.config
+        .put(
+            "streams",
+            "beta",
+            json!({"transcoder":{"encoder":"libx264","ab":96}}),
+        )
+        .unwrap();
+    names(
+        &app,
+        "streams",
+        &[("transcoder.encoder", "libx265")],
+        &["delta"],
+    )
+    .await;
+    names(
+        &app,
+        "streams",
+        &[("transcoder.ab", "64")],
+        &["alpha", "gamma"],
+    )
+    .await;
+    names(
+        &app,
+        "streams",
+        &[("transcoder.ab_gt", "64"), ("transcoder.ab_lte", "96")],
+        &["beta"],
+    )
+    .await;
+    names(
+        &app,
+        "streams",
+        &[
+            ("config_on_disk.transcoder.encoder", "libx264"),
+            ("config_on_disk.transcoder.ab", "96"),
+        ],
+        &["beta"],
+    )
+    .await;
+    names(
+        &app,
+        "streams",
+        &[
+            ("config_on_disk.transcoder.encoder_is", "null"),
+            ("config_on_disk.transcoder.ab_is", "null"),
+        ],
+        &["alpha", "delta", "gamma"],
+    )
+    .await;
+    names(
+        &app,
+        "templates",
+        &[
+            ("transcoder.encoder", "libx265"),
+            ("transcoder.ab_gte", "128"),
+        ],
+        &["sport"],
+    )
+    .await;
+}
