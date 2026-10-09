@@ -10,6 +10,25 @@ use flussonix::{
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, path::PathBuf};
 
+fn assert_frames(tracks: &[Track], expected: &[Frame], actual: &[Frame]) {
+    assert_eq!(actual.len(), expected.len());
+    for track in tracks {
+        let samples = |frames: &[Frame]| {
+            frames
+                .iter()
+                .filter(|f| f.track_id == track.id)
+                .map(|f| (f.dts, f.pts_offset, f.key, f.body.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            samples(actual),
+            samples(expected),
+            "native track {}",
+            track.id
+        );
+    }
+}
+
 struct Fixture {
     tracks: Vec<Track>,
     frames: Vec<Frame>,
@@ -148,6 +167,40 @@ impl Fixture {
                     chunks.push((Duration::from_millis(200), Bytes::from(data)));
                 }
             }
+            let mut decoder = flussonix::m4s::Decoder::default();
+            let mut decoded = vec![];
+            let mut infos = 0;
+            for (_, bytes) in &chunks {
+                for part in bytes.chunks(211) {
+                    for event in decoder.push(part).unwrap() {
+                        match event {
+                            flussonix::m4s::Event::Info { tracks, .. } => {
+                                assert_eq!(tracks, self.tracks);
+                                infos += 1;
+                            }
+                            flussonix::m4s::Event::Frame {
+                                track_id,
+                                dts,
+                                pts_offset,
+                                key,
+                                body,
+                                ..
+                            } => {
+                                decoded.push(Frame {
+                                    track_id,
+                                    dts,
+                                    pts_offset,
+                                    key,
+                                    body,
+                                });
+                            }
+                            other => panic!("unexpected native fixture record: {other:?}"),
+                        }
+                    }
+                }
+            }
+            assert_eq!(infos, 1);
+            assert_frames(&self.tracks, &self.frames, &decoded);
         } else {
             for n in 0..9u64 {
                 let part: Vec<_> = self
@@ -168,7 +221,7 @@ impl Fixture {
                 let body = flussonix::m4f::pack(&self.tracks, &part, 180000).unwrap();
                 let (unpacked, frames) = flussonix::m4f::unpack(&body).unwrap();
                 assert_eq!(unpacked, self.tracks);
-                assert_eq!(frames.len(), part.len());
+                assert_frames(&self.tracks, &part, &frames);
                 let stamp = chrono::DateTime::from_timestamp(1700000000 + n as i64 * 2, 0)
                     .unwrap()
                     .format("%Y/%m/%d/%H/%M/%S")
@@ -416,6 +469,10 @@ async fn m4s_m4f_plain_and_verified_tls_inputs_publish_gpu_aac_mp2_mp3() {
                     let cfg = store.effective("owned-gpu").unwrap();
                     let (worker, args) = generation(&engine, &receivers, &cfg, "h264_vaapi").await;
                     let driver = dependencies(&worker);
+                    let audio_encoder = if audio == "mp3" { "libmp3lame" } else { audio };
+                    assert!(args.windows(2).any(|v| v == ["-c:a", audio_encoder]));
+                    let bitrate = format!("{ab}k");
+                    assert!(args.windows(2).any(|v| v == ["-b:a", bitrate.as_str()]));
                     assert!(args.windows(2).any(|v| v == ["-i", "pipe:0"]));
                     assert!(!args.iter().any(|v| v == "lavfi" || v == "-hwaccel"));
                     let diagnostics = format!("{} {:?}", worker.stats(), args);

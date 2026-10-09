@@ -202,7 +202,10 @@ The fixture begins with independent FFmpeg-encoded TS. FlussoniX's TS decoder an
 native record/sample-table packers construct the native source; this is not an
 independent vendor dialect writer or proof of full Flussonic interoperability.
 Independent FFmpeg fully decodes both the original and the native TS remux with
-identical frame counts. The finite M4F source serves only two-track windows,
+identical frame counts. Native records are parsed back with exact per-track
+payload, DTS, composition offset and keyframe equality; M4S parsing also uses
+fragmented record boundaries. Actual audio encoder and bitrate arguments are
+asserted for every hardware case. The finite M4F source serves only two-track windows,
 excluding its audio-only trailing window to maintain stable live metadata.
 Published outputs require at least50 video/80 audio frames, changing content and
 zero strict decoder errors. The worker receives compressed media over `pipe:0`,
