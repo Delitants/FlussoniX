@@ -200,11 +200,39 @@ struct Entry {
     admissions: AtomicU64,
     bytes: AtomicU64,
 }
-/// Per-pass candidates, never cached permission. Guards revalidate their live entries.
+/// Per-pass stream/activity only, never cached permission or retained session ownership.
 pub(crate) struct RecoveryDemand {
     pub(crate) activity: Instant,
     name: String,
-    entries: Vec<(String, Arc<Entry>)>,
+}
+/// The primary session cache: grouping avoids an additional index or recovery ledger.
+#[derive(Default)]
+struct Entries {
+    by_stream: HashMap<String, HashMap<String, Arc<Entry>>>,
+}
+impl Entries {
+    fn values(&self) -> impl Iterator<Item = &Arc<Entry>> {
+        self.by_stream
+            .values()
+            .flat_map(|sessions| sessions.values())
+    }
+    fn iter(&self) -> impl Iterator<Item = (&String, &Arc<Entry>)> {
+        self.by_stream.values().flat_map(|sessions| sessions.iter())
+    }
+    fn len(&self) -> usize {
+        self.by_stream.values().map(HashMap::len).sum()
+    }
+    fn contains_key(&self, name: &str, identity: &str) -> bool {
+        self.by_stream
+            .get(name)
+            .is_some_and(|sessions| sessions.contains_key(identity))
+    }
+    fn retain(&mut self, mut keep: impl FnMut(&String, &Arc<Entry>) -> bool) {
+        self.by_stream.retain(|_, sessions| {
+            sessions.retain(|identity, entry| keep(identity, entry));
+            !sessions.is_empty()
+        });
+    }
 }
 impl Entry {
     fn occupied(&self) -> bool {
@@ -280,7 +308,7 @@ pub enum AuthOutcome {
 }
 pub struct PlaybackAuth {
     authority: Mutex<HashMap<String, Authority>>,
-    entries: Mutex<HashMap<String, Arc<Entry>>>,
+    entries: Mutex<Entries>,
     client: reqwest::Client,
     callbacks: Semaphore,
     limit: usize,
@@ -289,7 +317,7 @@ impl PlaybackAuth {
     pub fn new(limit: usize) -> Self {
         Self {
             authority: Mutex::new(HashMap::new()),
-            entries: Mutex::new(HashMap::new()),
+            entries: Mutex::new(Entries::default()),
             client: reqwest::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(3))
@@ -384,10 +412,13 @@ impl PlaybackAuth {
                     || s.last_seen.elapsed() < Duration::from_secs(30)
                     || (!matches!(s.decision, Decision::Allow) && s.next_check > Instant::now())
             });
-            if !all.contains_key(&identity) && all.len() >= 20_000 {
+            if !all.contains_key(&request.name, &identity) && all.len() >= 20_000 {
                 return AuthOutcome::Denied;
             }
             let entry = all
+                .by_stream
+                .entry(request.name.clone())
+                .or_default()
                 .entry(identity)
                 .or_insert_with(|| {
                     Arc::new(Entry {
@@ -787,7 +818,7 @@ impl PlaybackAuth {
         let authority = self.authority.lock().unwrap();
         let entries = self.entries.lock().unwrap();
         let mut demand = HashMap::new();
-        for (identity, entry) in entries.iter() {
+        for entry in entries.values() {
             let state = entry.state.lock().unwrap();
             let current = authority
                 .get(&state.request.name)
@@ -801,14 +832,12 @@ impl PlaybackAuth {
                     .or_insert_with(|| RecoveryDemand {
                         activity: seen,
                         name: state.request.name.clone(),
-                        entries: Vec::new(),
                     });
             candidate.activity = candidate.activity.max(seen);
-            candidate.entries.push((identity.clone(), entry.clone()));
         }
         demand
     }
-    /// Check only this pass's candidate sessions, preserving authority -> entries -> state order.
+    /// Check the candidate's current sessions, preserving authority -> entries -> state order.
     pub(crate) fn recovery_allowed(&self, name: &str, demand: &RecoveryDemand) -> bool {
         if demand.name != name {
             return false;
@@ -821,16 +850,12 @@ impl PlaybackAuth {
             return false;
         }
         let entries = self.entries.lock().unwrap();
-        demand.entries.iter().any(|(identity, entry)| {
-            // A retained Arc must not revive an evicted or replaced cache entry.
-            entries
-                .get(identity)
-                .is_some_and(|cached| Arc::ptr_eq(cached, entry))
-                && {
-                    let state = entry.state.lock().unwrap();
-                    state.request.name == name
-                        && state.recovery_activity(current, Instant::now()).is_some()
-                }
+        entries.by_stream.get(name).is_some_and(|sessions| {
+            sessions.values().any(|entry| {
+                let state = entry.state.lock().unwrap();
+                state.request.name == name
+                    && state.recovery_activity(current, Instant::now()).is_some()
+            })
         })
     }
 
@@ -1033,7 +1058,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn candidate_recovery_accepts_any_current_captured_session() {
+    async fn candidate_recovery_accepts_new_and_existing_current_sessions() {
         let (auth, old_demand, first, _) = candidate_fixture().await;
         let policy = first.state.lock().unwrap().policy.clone();
         let mut request = first.state.lock().unwrap().request.clone();
@@ -1045,8 +1070,8 @@ mod tests {
         let current_demand = auth.recovery_demand().remove("owned").unwrap();
         assert!(auth.revoke(&first.id));
         assert!(
-            !auth.recovery_allowed("owned", &old_demand),
-            "uncaptured activity must wait for the next pass"
+            auth.recovery_allowed("owned", &old_demand),
+            "new valid foreground demand must keep its shared recovery worker"
         );
         assert!(
             auth.recovery_allowed("owned", &current_demand),

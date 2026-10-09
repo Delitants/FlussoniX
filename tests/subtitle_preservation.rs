@@ -482,17 +482,31 @@ async fn raw_hls_window_is_bounded_and_replacement_does_not_reuse_sequences_or_f
             .find(|p| p.join("index.m3u8").exists())
             .unwrap()
     };
-    let retained = std::fs::read_dir(&directory)
-        .unwrap()
-        .filter(|e| {
-            e.as_ref()
-                .unwrap()
-                .path()
-                .extension()
-                .is_some_and(|x| x == "ts")
-        })
-        .count();
-    assert!(retained <= 9, "raw segments leaked: {retained}");
+    let retained = || {
+        std::fs::read_dir(&directory)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "ts")
+            })
+            .count()
+    };
+    // The public list is renamed before the asynchronous pruning pass completes.
+    // Wait for that pass instead of assuming the earlier 200ms delay settled it.
+    let pruned = tokio::time::timeout(Duration::from_secs(12), async {
+        while retained() > 9 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        pruned.is_ok(),
+        "raw segments failed to prune: {}",
+        retained()
+    );
     let old_worker = publisher.worker.clone();
     let mut changed = cfg.clone();
     changed["title"] = json!("replacement");

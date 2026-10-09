@@ -295,10 +295,20 @@ impl App {
             self.media.ensure_guarded(name, config, false, check).await
         };
         if let Ok(worker) = result {
-            // Retire only the exact stale attempt after asynchronous startup.
-            if !self.recovery_current(name, &signature, demand).await {
-                self.media.stop_if_current(name, &worker).await;
-            }
+            self.finish_recovery(name, &signature, demand, &worker)
+                .await;
+        }
+    }
+    async fn finish_recovery(
+        &self,
+        name: &str,
+        signature: &str,
+        demand: Option<&RecoveryDemand>,
+        worker: &Arc<Worker>,
+    ) {
+        // Retire only the exact stale attempt after asynchronous startup.
+        if !self.recovery_current(name, signature, demand).await {
+            self.media.stop_if_current(name, worker).await;
         }
     }
     pub async fn reconcile(&self) {

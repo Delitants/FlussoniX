@@ -584,6 +584,104 @@ mod cache_tests {
     }
 
     #[tokio::test]
+    async fn new_authorized_viewer_keeps_a_published_recovery_worker_after_original_revoke() {
+        let d = tempfile::tempdir().unwrap();
+        let app = App::new(
+            d.path().join("config.json"),
+            d.path().join("media"),
+            Options {
+                admin_password: "owned-race-admin".into(),
+                peer_key: "owned-race-peer".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.config
+            .put("sources", "a", json!({"api_url":"http://127.0.0.1:9"}))
+            .unwrap();
+        let root = app.config.snapshot();
+        let config = json!({"name":"owned","static":false,"inputs":[{"url":"testsrc://"}]});
+        let mirror = Mirror {
+            when: Instant::now(),
+            source: root["sources"][0].clone(),
+            config: config.clone(),
+            available: true,
+            denied: false,
+            known: true,
+            serial: 1,
+            switches: 0,
+        };
+        let resolved = app
+            .publish_resolved("owned", &mirror, &root, app.config.revision())
+            .unwrap();
+        app.mirrors.lock().await.insert("owned".into(), mirror);
+        let request = |ip: &str| ViewerRequest {
+            name: "owned".into(),
+            proto: "hls".into(),
+            ip: ip.into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(first) = app
+            .playback_auth
+            .authorize(resolved.policy.clone(), request("first"))
+            .await
+        else {
+            panic!("first playback")
+        };
+        let first_id = app
+            .playback_auth
+            .snapshots()
+            .into_iter()
+            .find(|s| s["ip"] == "first")
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let demand = app.playback_auth.recovery_demand().remove("owned").unwrap();
+        let signature = crate::media::media_signature(&config);
+        assert!(
+            app.recovery_current("owned", &signature, Some(&demand))
+                .await
+        );
+        let worker = app
+            .media
+            .recover_demand_guarded(
+                "owned",
+                &config,
+                demand.activity,
+                app.recovery_current("owned", &signature, Some(&demand)),
+            )
+            .await
+            .unwrap();
+        // Deterministically interleave foreground acquisition after publication and before cleanup.
+        let AuthOutcome::Allowed(second) = app
+            .playback_auth
+            .authorize(resolved.policy, request("second"))
+            .await
+        else {
+            panic!("new playback")
+        };
+        let foreground = app
+            .media
+            .ensure_guarded("owned", &config, true, std::future::ready(true))
+            .await
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&worker, &foreground));
+        assert!(app.playback_auth.revoke(&first_id));
+        assert!(first.is_cancelled());
+        app.finish_recovery("owned", &signature, Some(&demand), &worker)
+            .await;
+        let survived = !worker.is_closed() && app.media.count().await == 1;
+        let second_allowed = !second.is_cancelled();
+        app.media.stop_all().await;
+        assert!(second_allowed, "new viewer unexpectedly lost authorization");
+        assert!(
+            survived,
+            "recovery stopped the shared worker serving a new authorized viewer"
+        );
+    }
+
+    #[tokio::test]
     async fn explicit_stop_fences_an_already_queued_mirror_recovery() {
         let d = tempfile::tempdir().unwrap();
         let app = App::new(
