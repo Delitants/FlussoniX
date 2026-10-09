@@ -36,6 +36,8 @@ struct Capture {
     redirect: Mutex<Option<String>>,
     requests: AtomicUsize,
     active: AtomicUsize,
+    max_active: AtomicUsize,
+    bodies: Mutex<Vec<Arc<Mutex<Vec<u8>>>>>,
     data: Mutex<Vec<u8>>,
     paths: Mutex<Vec<String>>,
     headers: Mutex<Vec<String>>,
@@ -71,12 +73,21 @@ async fn receive(State(s): State<ReceiverState>, r: Request<Body>) -> axum::resp
         }
         return status.into_response();
     }
-    s.capture.active.fetch_add(1, Ordering::SeqCst);
+    let active = s.capture.active.fetch_add(1, Ordering::SeqCst) + 1;
+    s.capture.max_active.fetch_max(active, Ordering::SeqCst);
+    let data_session = Arc::new(Mutex::new(Vec::new()));
+    s.capture.bodies.lock().unwrap().push(data_session.clone());
     let _active = Active(s.capture.clone());
     let mut body = r.into_body().into_data_stream();
     loop {
         tokio::select! { biased; _=s.cancel.cancelled()=>break, chunk=body.next()=>match chunk {
-            Some(Ok(bytes)) => { let mut data=s.capture.data.lock().unwrap(); let n=bytes.len().min((4*1024*1024usize).saturating_sub(data.len())); data.extend_from_slice(&bytes[..n]); },
+            Some(Ok(bytes)) => {
+                for capture in [&s.capture.data, data_session.as_ref()] {
+                    let mut data = capture.lock().unwrap();
+                    let n = bytes.len().min((4*1024*1024usize).saturating_sub(data.len()));
+                    data.extend_from_slice(&bytes[..n]);
+                }
+            },
             _=>break,
         } }
     }

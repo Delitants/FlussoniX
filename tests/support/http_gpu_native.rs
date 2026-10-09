@@ -2,6 +2,8 @@
 use super::*;
 #[path = "http_gpu_native_recovery.rs"]
 mod recovery;
+#[path = "http_gpu_native_supervisor.rs"]
+mod supervisor;
 use axum::routing::get;
 use bytes::Bytes;
 use flussonix::{
@@ -406,7 +408,11 @@ impl Drop for Source {
 }
 
 fn dependencies(worker: &flussonix::media::Worker) -> Value {
-    let proc = PathBuf::from(format!("/proc/{}", worker.pid()));
+    dependencies_pid(worker.pid())
+}
+
+fn dependencies_pid(pid: u32) -> Value {
+    let proc = PathBuf::from(format!("/proc/{pid}"));
     let maps = std::fs::read_to_string(proc.join("maps")).unwrap();
     let mut records = vec![];
     for (prefix, variable, default) in [

@@ -279,3 +279,41 @@ capture; this is not a network outage or performance measurement. Finite
 owned native fixtures retain the packer/vendor-dialect limits above. Repeated
 failure streaks, source failback, changing codec/resolution, WAN faults,
 long-duration operation and mixed-vendor recovery remain unqualified.
+
+
+### Automatic native source recovery
+
+`gpu::native::supervisor::` runs the actual `flussonix` executable with its
+five-second background supervisor on an OS-selected loopback port. An on-demand
+stream inherits an encoder and simultaneous HTTP/verified HTTPS destinations
+from a template. Startup and source loss are followed only by authenticated,
+read-only management stats GETs. There is no playback request, config mutation,
+manual reconciliation or explicit recovery call to keep it alive or restart it.
+
+The ordinary CI case qualifies CPU H.264 M4S→M4F fallback. Two opt-in Intel
+H.264 VAAPI cases qualify same-source M4S/M4F reconnection with H.264/MP3 and
+verified TLS M4S↔M4F fallback with HEVC/Layer II. Output is H.264/AAC96 under the
+same CQP24/system-driver profile above; this does not imply HEVC GPU encoding.
+
+```
+cargo test --locked --test http_push gpu::native::supervisor:: -- --test-threads=1
+cargo test --locked --test http_push gpu::native::supervisor:: -- --ignored --test-threads=1 --nocapture
+```
+
+Receivers retain separately bounded captures for each POST; all four outputs per
+scenario independently decode with changing media, zero strict errors and the
+existing minimum frame counts. Old encoders must be gone before replacement
+output, uploads must not overlap, retired captures must stay frozen, and the
+restart count must advance once to the expected input. Basic/query identities,
+source trust, actual encoder/driver mappings and saved config bytes are checked.
+SIGTERM must reap the final encoder, release the daemon port and close sources
+and uploads. The optional native evidence directory retains each generation.
+
+`automatic_resume_ms` measures source disconnection until both replacement
+receivers have collected more than250kB while stats report a running worker.
+Independent decoding happens after shutdown, so its duration is excluded.
+This is a finite local observation with a20-second test bound, not an SLA,
+first-frame continuity measurement or seamless session promise. Publishers start
+new POSTs. Automatic cluster discovery/equivalent-origin switching, source
+failback, repeated faults, changing media profiles, mixed-vendor dialects and
+WAN/capacity qualification remain separate gates.

@@ -15,7 +15,11 @@ fn destination(receiver: &Receiver) -> Value {
 }
 
 fn encoder_arguments(worker: &flussonix::media::Worker, encoder: &str) -> Vec<String> {
-    let process = std::path::PathBuf::from(format!("/proc/{}", worker.pid()));
+    encoder_arguments_pid(worker.pid(), encoder)
+}
+
+fn encoder_arguments_pid(pid: u32, encoder: &str) -> Vec<String> {
+    let process = std::path::PathBuf::from(format!("/proc/{pid}"));
     assert_eq!(
         std::fs::read_link(process.join("exe")).unwrap(),
         std::fs::canonicalize("/usr/bin/ffmpeg").unwrap()

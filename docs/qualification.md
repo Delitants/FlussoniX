@@ -820,3 +820,36 @@ decoder errors and minima of93 video/175 audio frames. The CPU scenario added
 four decoded outputs. The first local test run exposed a fixture assumption that
 cancellation meant reaping had completed; the corrected test waits on the existing
 worker completion state before asserting process exit. Production code is unchanged.
+
+
+## Automatic daemon native publishing recovery qualification
+
+`gpu::native::supervisor::` runs the actual daemon and its five-second background
+supervisor. An on-demand stream with template-inherited HTTP/verified HTTPS
+publishing reconnects or switches to its ordered alternate without a new media
+request, config save, explicit recovery call or manual reconciliation. Only
+read-only management stats are polled. Plain M4S/M4F reconnect carries H.264/MP3;
+verified TLS M4S↔M4F fallback carries HEVC/Layer II. Intel H.264 VAAPI CQP24 and
+AAC96 output use the same independently installed driver profile above.
+
+Observed local run: two opt-in hardware tests passed in86.25 seconds. Four
+scenarios produced eight encoder generations and16 independently decoded
+outputs with zero strict errors and minima of93 video/175 audio frames. Source
+loss to both replacement captures exceeding250kB measured6.109–6.655 seconds.
+The ordinary CPU fallback case passed in20.18 seconds and resumed in7.705
+seconds, adding four strictly decoded outputs. These local measurements include
+supervisor scheduling, startup and collection; they are not a production SLA or
+first-frame timing. Old uploads do not overlap replacements and cannot append
+more media; old/final encoders are reaped, saved config bytes remain identical,
+and graceful daemon shutdown releases its port and source/output sockets.
+
+This increment adds tests and documentation for the existing supervisor. No
+runtime/UI implementation, preview settings, host packages or official vendor
+components change. Automatic cluster discovery/equivalent-origin switching,
+repeated faults/failback, seamless output continuity, mixed-vendor native dialects,
+WAN/soak/capacity and additional GPU profiles remain unqualified here. Hardware
+cases stay ignored in ordinary CI; its CPU regression covers autonomous recovery.
+A temporary mutation disabling only background reconciliation failed the CPU
+regression at the intended replacement-output timeout; the daemon still started
+and initially published. The source was restored before normal checks.
+See [commands and measurement boundaries](http-ts-push.md#automatic-native-source-recovery).
