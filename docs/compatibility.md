@@ -65,9 +65,43 @@ The contract is grounded in the installed 26.04.1 schema, read-only inspection
 of its collection selector, and the public
 [API design principles](https://flussonic.com/doc/fms/api/flussonic-api-design/#limiting-the-field-set-of-the-result).
 Unknown/non-object paths are handled without reproducing reference exceptions.
-The tests and implementation use no vendor components. General filtering,
-composite sorting, reference default ordering and dynamic cursor parity remain
-separate compatibility tasks.
+The tests and implementation use no vendor components. Composite sorting,
+reference default ordering and dynamic cursor parity remain separate tasks.
+
+### Implemented scalar collection filtering
+
+Authenticated collection GET `/streams` and `/templates` accept scalar filters
+before search, ordering, counts, pagination and `select`. Implemented fields are
+`name`, `title`, `comment`, `template`, `position`, `static`, `disabled`, and the
+native transcoder profile's `transcoder.encoder`, `transcoder.vb`,
+`transcoder.ab`. Streams additionally support those paths under `config_on_disk`
+and `stats.status`, `stats.online_clients`, `stats.alive`. Filters read actual
+returned values: an absent runtime `alive` is not synthesized as `false`.
+Streams use effective inherited configuration; Templates use saved fields.
+
+`field=value1,value2` performs typed list membership; different predicates are
+combined with AND. `_lt`, `_lte`, `_gt`, `_gte` compare values of the field's
+scalar type, and `_ne` excludes a value. Numeric comparisons preserve integer
+precision. Booleans accept only `true`/`false`; invalid integer or boolean values
+return HTTP 400 after authentication. `_like` on strings is a case-sensitive
+literal substring match, including Unicode: `%`, `_`, and regex characters have
+no special meaning. Non-string `_like` is rejected. `_is=null` and
+`_is_not=null` test absence, JSON null, or the reference's text sentinels `null`
+and `undefined`; missing values never satisfy equality, ranges or substring
+matching. Missing values do satisfy `_ne`.
+
+Unknown fields and unsupported paths are ignored. Object/array filtering, array
+indices, other collections/items, complete reference field coverage, enum and
+format validation, conflicting parent/child predicates, and exact vendor error
+payloads remain unqualified. Repeated identical query keys retain the existing
+last-value behavior. Filters do not mutate configuration or start media workers.
+Pagination retains the current position cursor; dynamic cursor parity is pending.
+
+This independent profile is grounded in read-only inspection of the installed
+26.04.1 collection/schema modules, the official
+[collection query design](https://flussonic.com/doc/fms/api/flussonic-api-design/#filtering-collections)
+and [open-source handler](https://github.com/flussonic/openapi_handler).
+No vendor schema, bytecode or source is needed to build, test or run these filters.
 
 ## Cluster and load-balancing contract
 

@@ -696,6 +696,13 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
             }
         }
     }
+    if matches!(kind, "streams" | "templates") {
+        let filters = match crate::api_filter::Filters::parse(&query, kind == "streams") {
+            Ok(filters) => filters,
+            Err(message) => return error(StatusCode::BAD_REQUEST, &message),
+        };
+        items.retain(|row| filters.matches(row));
+    }
     if let Some(q) = query.get("q") {
         items.retain(|v| v.to_string().to_lowercase().contains(&q.to_lowercase()));
     }

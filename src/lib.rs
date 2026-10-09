@@ -1,3 +1,4 @@
+mod api_filter;
 mod api_select;
 pub mod auth;
 pub mod cluster;
