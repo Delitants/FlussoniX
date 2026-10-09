@@ -962,3 +962,46 @@ worker startup and media collection, exclude subsequent offline decode, and
 are neither first-frame latency nor availability or capacity guarantees.
 Owned daemons and encoders were reaped after every case. Runtime/UI source,
 host packages and preview configuration are unchanged by this increment.
+
+## HEVC and MPEG-audio native TLS cluster recovery
+
+The owned four-daemon profile adds CPU HEVC with MPEG Layer II at 192 kb/s or
+MP3 at 128 kb/s over both M4SS and M4FS. Its origin process checks retain the
+requested video/audio encoders, while independently probed and strictly decoded
+protected HLS TS segments establish the codecs actually delivered before and after automatic
+failover. Both tracks must decode with changing content and empty decoder
+errors. Protected CDN M4S metadata must retain literal `hevc`/`m2a` or
+`hevc`/`mp3` identities; original H.264/AAC cases retain their existing scope.
+The codec-specific evidence files avoid overwriting different audio profiles.
+
+Source switching must still be observed through read-only telemetry and disk
+reads before any post-fault playback request. Generation/hash binding, fresh
+received bytes, codec copy at the CDN, one shared worker, anonymous denial,
+single-use LB tickets, retired child reaping and unchanged saved configuration
+remain required. These are ordinary CPU regressions and require no GPU or
+official component. See [commands and limits](cluster-loadbalancing.md#hevc-and-mpeg-audio-native-tls-recovery).
+
+Temporary encoder-option overrides forced H.264 in place of HEVC, then MP3 in
+place of Layer II. Both controls failed at the independently probed delivered
+codec assertions. Production source was restored byte-for-byte before normal
+qualification.
+
+The final ordinary suite passed seven cases in 180.31 seconds, with six
+hardware cases explicitly ignored. The four added profiles produced eight
+generation/hash-bound outputs: 400 decoded video frames and 668 audio frames,
+zero strict decoder errors, and matching native codec identities. Native and
+HLS requests retained one CDN PID and the same observed generation. Measured
+fault-to-observed-replacement intervals were:
+
+| Origin audio | Native TLS route | Observed replacement |
+|---|---|---|
+| Layer II, 192 kb/s | M4SS | 3.415 s |
+| Layer II, 192 kb/s | M4FS | 9.357 s |
+| MP3, 128 kb/s | M4SS | 3.296 s |
+| MP3, 128 kb/s | M4FS | 9.389 s |
+
+Intervals include shutdown, supervisor cadence, startup and fresh-media
+collection, and exclude subsequent HTTP decoding and native metadata checks.
+They are bounded loopback observations, not first-frame latency or availability
+guarantees. No runtime/UI source, host package or preview setting changes in
+this qualification increment.

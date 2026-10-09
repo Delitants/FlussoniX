@@ -67,6 +67,38 @@ checks do not establish long-duration stability, gapless playback, arbitrary
 fault sequences, forced failback to a healthy preferred node or production
 capacity. No vendor component participates.
 
+## HEVC and MPEG-audio native TLS recovery
+
+The same four owned HTTPS-only daemons also exercise CPU `libx265` origins
+with Layer II (`mp2a`, 192 kb/s) or MP3 (`mp3`, 128 kb/s), at 640×360/25 fps
+and 48 kHz audio. Each combination runs over both verified M4SS and M4FS
+source routes. The CDN copies video and audio; the LB starts no encoder.
+The initial and replacement HLS MPEG-TS outputs must retain HEVC and the
+requested MPEG audio layer, contain changing decoded video/audio, and pass
+strict independent FFmpeg decoding. HTTP bytes remain bound to the observed
+generation's completed segment. Protected CDN M4S metadata must also retain
+`hevc` plus `m2a` or `mp3`, including when its upstream transport is M4FS.
+
+These four cases run in ordinary CI without a GPU or vendor component:
+
+```sh
+cargo test --locked --test cluster_native_recovery daemon_recovers_hevc_ -- --nocapture --test-threads=1
+```
+
+The existing authorization, TLS trust, ticket replay, shared-worker, automatic
+source-switch, retired-process and unchanged-configuration checks apply.
+Recovery observation makes no playback requests. Native metadata inspection
+occurs only alongside actual playback, before the fault or after read-only
+observation has established a fresh replacement generation. Evidence uses
+`libx265-mp2a-m4s.json`, `libx265-mp2a-m4f.json`, `libx265-mp3-m4s.json` and
+`libx265-mp3-m4f.json` under `FLUSSONIX_CLUSTER_RECOVERY_EVIDENCE_DIR`.
+
+This profile qualifies a single equivalent-origin failover and native codec
+retention, not browser HEVC/MPEG-audio support, HEVC GPU encoding, Main10,
+parameter-set changes, multiple audio tracks, mixed-vendor interoperability,
+gapless delivery or sustained capacity. The repeated-failure and blackout
+profiles above retain their separately stated H.264/AAC coverage.
+
 The implemented [native pressure profile](native-cluster-pressure.md) shares
 HTTP/RTSP ranking by maximum normalized uplink/CPU/RAM pressure, bounded ready
 preference, actual reserved Mbps and the existing CDN-owned admission ledger.

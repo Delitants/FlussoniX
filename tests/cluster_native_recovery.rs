@@ -1,5 +1,5 @@
 //! Real supervisor + equivalent origins + verified native TLS + LB admission.
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -13,6 +13,34 @@ mod tls_fixture;
 use daemon::Daemon;
 
 const STREAM: &str = "region/owned";
+#[derive(Clone, Copy)]
+struct MediaProfile<'a> {
+    encoder: &'a str,
+    audio: &'a str,
+    audio_encoder: &'a str,
+    audio_bitrate: u16,
+    video_codec: &'a str,
+    audio_codec: &'a str,
+    native_audio: &'a str,
+}
+const HEVC_LAYER_II: MediaProfile<'static> = MediaProfile {
+    encoder: "libx265",
+    audio: "mp2a",
+    audio_encoder: "mp2",
+    audio_bitrate: 192,
+    video_codec: "hevc",
+    audio_codec: "mp2",
+    native_audio: "m2a",
+};
+const HEVC_MP3: MediaProfile<'static> = MediaProfile {
+    encoder: "libx265",
+    audio: "mp3",
+    audio_encoder: "libmp3lame",
+    audio_bitrate: 128,
+    video_codec: "hevc",
+    audio_codec: "mp3",
+    native_audio: "mp3",
+};
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scenario {
     Failover,
@@ -87,7 +115,23 @@ fn process(pid: u32, encoder: &str) -> Value {
     }
     json!({"pid":pid,"arguments":args,"driver":driver})
 }
-async fn decode(path: &Path) -> Value {
+fn origin_process(pid: u32, profile: MediaProfile<'_>) -> Value {
+    let report = process(pid, profile.encoder);
+    let arguments: Vec<_> = report["arguments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["-c:a", profile.audio_encoder]),
+        "origin must use the requested audio encoder"
+    );
+    report
+}
+async fn decode(path: &Path, profile: MediaProfile<'_>) -> Value {
     let probe = tokio::time::timeout(
         Duration::from_secs(20),
         tokio::process::Command::new("/usr/bin/ffprobe")
@@ -103,16 +147,19 @@ async fn decode(path: &Path) -> Value {
     let metadata: Value = serde_json::from_slice(&probe.stdout).unwrap();
     let tracks = metadata["streams"].as_array().unwrap();
     assert_eq!(tracks.len(), 2);
-    assert!(
-        tracks
-            .iter()
-            .any(|s| s["codec_name"] == "h264" && s["width"] == 640 && s["height"] == 360)
+    let video = tracks.iter().find(|s| s["codec_type"] == "video").unwrap();
+    let audio = tracks.iter().find(|s| s["codec_type"] == "audio").unwrap();
+    assert_eq!(
+        video["codec_name"], profile.video_codec,
+        "delivered video codec"
     );
-    assert!(
-        tracks
-            .iter()
-            .any(|s| s["codec_name"] == "aac" && s["sample_rate"] == "48000")
+    assert_eq!(video["width"], 640);
+    assert_eq!(video["height"], 360);
+    assert_eq!(
+        audio["codec_name"], profile.audio_codec,
+        "delivered audio layer"
     );
+    assert_eq!(audio["sample_rate"], "48000");
     let output = tokio::time::timeout(
         Duration::from_secs(20),
         tokio::process::Command::new("/usr/bin/ffmpeg")
@@ -155,7 +202,38 @@ async fn decode(path: &Path) -> Value {
         "decoded frames {counts:?}"
     );
     assert!(hashes[0].len() >= 5 && hashes[1].len() >= 2);
-    json!({"video_frames":counts[0],"audio_frames":counts[1],"strict_decoder_errors":0})
+    json!({"video_codec":video["codec_name"],"audio_codec":audio["codec_name"],
+        "video_frames":counts[0],"audio_frames":counts[1],"strict_decoder_errors":0})
+}
+
+async fn native_codecs(client: &reqwest::Client, cdn: &Daemon, profile: MediaProfile<'_>) -> Value {
+    let endpoint = format!("{}/{STREAM}/m4s", cdn.url);
+    assert_eq!(client.get(&endpoint).send().await.unwrap().status(), 403);
+    let response = client
+        .get(format!("{endpoint}?token=owned-viewer"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut stream = response.bytes_stream();
+    let mut decoder = flussonix::m4s::Decoder::default();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let body = stream.next().await.unwrap().unwrap();
+            for event in decoder.push(&body).unwrap() {
+                if let flussonix::m4s::Event::Info { tracks, .. }
+                | flussonix::m4s::Event::Gop { tracks, .. } = event
+                {
+                    let mut codecs: Vec<_> = tracks.iter().map(|t| t.codec.as_str()).collect();
+                    codecs.sort_unstable();
+                    assert_eq!(codecs, [profile.video_codec, profile.native_audio]);
+                    return json!(codecs);
+                }
+            }
+        }
+    })
+    .await
+    .expect("native output must expose the requested codec identities")
 }
 async fn admit(client: &reqwest::Client, lb: &Daemon, cdn: &Daemon) -> String {
     let response = client
@@ -209,6 +287,7 @@ async fn playback(
     cdn: &Daemon,
     label: &str,
     expected_generation: &str,
+    profile: MediaProfile<'_>,
 ) -> Value {
     let response = client.get(canonical).send().await.unwrap();
     assert_eq!(response.status(), 200);
@@ -253,19 +332,51 @@ async fn playback(
     );
     let path = cdn.directory.path().join(format!("{label}.ts"));
     std::fs::write(&path, &data).unwrap();
-    let mut report = decode(&path).await;
+    let mut report = decode(&path, profile).await;
+    if profile.video_codec == "hevc" {
+        let pid = stats(&cdn.node(client).await)["pid"].as_u64().unwrap();
+        report["native_codecs"] = native_codecs(client, cdn, profile).await;
+        assert_eq!(
+            stats(&cdn.node(client).await)["pid"],
+            pid,
+            "native and HLS playback must share the selected CDN worker"
+        );
+        assert_eq!(cdn.owned_encoders(), [u32::try_from(pid).unwrap()]);
+        assert_eq!(
+            playlist_generation(&cdn.playlist().unwrap()),
+            expected_generation
+        );
+        report["native_worker_pid"] = json!(pid);
+    }
     report["generation"] = json!(expected_generation);
     report["segment_sha256"] = json!(format!("{:x}", Sha256::digest(&data)));
     report
 }
 async fn qualification(transport: &str, encoder: &str, scenario: Scenario) {
+    qualification_profile(
+        transport,
+        MediaProfile {
+            encoder,
+            audio: "aac",
+            audio_encoder: "aac",
+            audio_bitrate: 96,
+            video_codec: "h264",
+            audio_codec: "aac",
+            native_audio: "aac",
+        },
+        scenario,
+    )
+    .await;
+}
+async fn qualification_profile(transport: &str, profile: MediaProfile<'_>, scenario: Scenario) {
+    let encoder = profile.encoder;
     let mut nodes = [
         Daemon::new("a"),
         Daemon::new("b"),
         Daemon::new("cdn"),
         Daemon::new("lb"),
     ];
-    let outcome = std::panic::AssertUnwindSafe(run(&mut nodes, transport, encoder, scenario))
+    let outcome = std::panic::AssertUnwindSafe(run(&mut nodes, transport, profile, scenario))
         .catch_unwind()
         .await;
     let mut clean = true;
@@ -279,14 +390,21 @@ async fn qualification(transport: &str, encoder: &str, scenario: Scenario) {
         Ok(report) => {
             assert!(clean, "owned daemon/encoder shutdown");
             println!(
-                "cluster recovery: encoder={encoder}, transport={transport}, resume_ms={}, strict_decoded_outputs={}",
-                report["automatic_resume_ms"], report["strict_decoded_outputs"]
+                "cluster recovery: encoder={encoder}, audio={}, transport={transport}, resume_ms={}, strict_decoded_outputs={}",
+                profile.audio, report["automatic_resume_ms"], report["strict_decoded_outputs"]
             );
             if let Ok(directory) = std::env::var("FLUSSONIX_CLUSTER_RECOVERY_EVIDENCE_DIR") {
                 std::fs::create_dir_all(&directory).unwrap();
+                let audio_suffix = if profile.audio == "aac" {
+                    String::new()
+                } else {
+                    format!("-{}", profile.audio)
+                };
                 std::fs::write(
-                    Path::new(&directory)
-                        .join(format!("{encoder}-{transport}{}.json", scenario.suffix())),
+                    Path::new(&directory).join(format!(
+                        "{encoder}{audio_suffix}-{transport}{}.json",
+                        scenario.suffix()
+                    )),
                     serde_json::to_vec_pretty(&report).unwrap(),
                 )
                 .unwrap();
@@ -350,6 +468,23 @@ async fn daemon_recovers_repeated_gpu_origin_failures_over_verified_m4f_tls() {
     qualification("m4f", "h264_vaapi", Scenario::Repeated).await;
 }
 
+#[tokio::test]
+async fn daemon_recovers_hevc_layer_ii_over_verified_m4s_tls() {
+    qualification_profile("m4s", HEVC_LAYER_II, Scenario::Failover).await;
+}
+#[tokio::test]
+async fn daemon_recovers_hevc_layer_ii_over_verified_m4f_tls() {
+    qualification_profile("m4f", HEVC_LAYER_II, Scenario::Failover).await;
+}
+#[tokio::test]
+async fn daemon_recovers_hevc_mp3_over_verified_m4s_tls() {
+    qualification_profile("m4s", HEVC_MP3, Scenario::Failover).await;
+}
+#[tokio::test]
+async fn daemon_recovers_hevc_mp3_over_verified_m4f_tls() {
+    qualification_profile("m4f", HEVC_MP3, Scenario::Failover).await;
+}
+
 // This observation cannot start media or renew demand: only telemetry and disk reads.
 async fn observe_recovery(
     client: &reqwest::Client,
@@ -380,12 +515,18 @@ async fn observe_recovery(
     .unwrap_or_else(|_| panic!("automatic recovery to {expected_source} after {expected_switches} switches must produce fresh media without viewer requests"))
 }
 
-async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str, scenario: Scenario) -> Value {
+async fn run(
+    nodes: &mut [Daemon; 4],
+    transport: &str,
+    profile: MediaProfile<'_>,
+    scenario: Scenario,
+) -> Value {
+    let encoder = profile.encoder;
     for (index, name) in [(0, "a"), (1, "b")] {
         let transcoder = if encoder == "h264_vaapi" {
-            json!({"encoder":encoder,"qp":24,"acodec":"aac","ab":96})
+            json!({"encoder":encoder,"qp":24,"acodec":profile.audio,"ab":profile.audio_bitrate})
         } else {
-            json!({"encoder":encoder,"vb":1200,"acodec":"aac","ab":96})
+            json!({"encoder":encoder,"vb":1200,"acodec":profile.audio,"ab":profile.audio_bitrate})
         };
         nodes[index]
             .store()
@@ -468,7 +609,7 @@ async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str, scenario: 
     let first_pid = u32::try_from(first["pid"].as_u64().unwrap()).unwrap();
     let origin_a = stats(&nodes[0].node(&client).await);
     let origin_a_pid = u32::try_from(origin_a["pid"].as_u64().unwrap()).unwrap();
-    let before_origin = process(origin_a_pid, encoder);
+    let before_origin = origin_process(origin_a_pid, profile);
     let before_cdn = process(first_pid, "copy");
     assert_eq!(nodes[0].owned_encoders(), [origin_a_pid]);
     assert_eq!(nodes[2].owned_encoders(), [first_pid]);
@@ -476,7 +617,15 @@ async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str, scenario: 
     assert!(nodes[3].owned_encoders().is_empty());
     let before_playlist = nodes[2].playlist().unwrap();
     let old_generation = playlist_generation(&before_playlist);
-    let before_decode = playback(&client, &canonical, &nodes[2], "before", &old_generation).await;
+    let before_decode = playback(
+        &client,
+        &canonical,
+        &nodes[2],
+        "before",
+        &old_generation,
+        profile,
+    )
+    .await;
     let fault = Instant::now();
     assert!(
         nodes[0].stop().await,
@@ -517,13 +666,21 @@ async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str, scenario: 
     assert!(!Path::new(&format!("/proc/{first_pid}")).exists());
     let origin_b = stats(&nodes[1].node(&client).await);
     let origin_b_pid = u32::try_from(origin_b["pid"].as_u64().unwrap()).unwrap();
-    let after_origin = process(origin_b_pid, encoder);
+    let after_origin = origin_process(origin_b_pid, profile);
     let after_cdn = process(second_pid, "copy");
     assert_eq!(nodes[1].owned_encoders(), [origin_b_pid]);
     assert_eq!(nodes[2].owned_encoders(), [second_pid]);
     assert!(nodes[3].owned_encoders().is_empty());
     let new_generation = playlist_generation(&observed_playlist);
-    let after_decode = playback(&client, &canonical, &nodes[2], "after", &new_generation).await;
+    let after_decode = playback(
+        &client,
+        &canonical,
+        &nodes[2],
+        "after",
+        &new_generation,
+        profile,
+    )
+    .await;
     let new_canonical = admit(&client, &nodes[3], &nodes[2]).await;
     let concurrent =
         futures_util::future::join_all((0..6).map(|_| client.get(&new_canonical).send())).await;
@@ -601,7 +758,7 @@ async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str, scenario: 
         let origin = stats(&nodes[0].node(&client).await);
         let origin_pid = u32::try_from(origin["pid"].as_u64().unwrap()).unwrap();
         assert_ne!(origin_pid, origin_a_pid);
-        let returned_origin = process(origin_pid, encoder);
+        let returned_origin = origin_process(origin_pid, profile);
         let returned_cdn = process(returned_pid, "copy");
         assert_eq!(nodes[0].owned_encoders(), [origin_pid]);
         assert!(nodes[1].owned_encoders().is_empty());
@@ -613,6 +770,7 @@ async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str, scenario: 
             &nodes[2],
             "returned",
             &returned_generation,
+            profile,
         )
         .await;
         let returned_canonical = admit(&client, &nodes[3], &nodes[2]).await;
@@ -650,7 +808,7 @@ async fn run(nodes: &mut [Daemon; 4], transport: &str, encoder: &str, scenario: 
         );
     }
     assert!(nodes.iter().all(Daemon::unchanged));
-    json!({"transport":transport,"encoder":encoder,"automatic_resume_ms":automatic_resume_ms,
+    json!({"transport":transport,"encoder":encoder,"audio":profile.audio,"automatic_resume_ms":automatic_resume_ms,
             "before_origin":before_origin,"after_origin":after_origin,"before_cdn":before_cdn,"after_cdn":after_cdn,
             "before_decode":before_decode,"after_decode":after_decode,"source_switches":if scenario==Scenario::Repeated {2}else{1},
             "strict_decoded_outputs":if scenario==Scenario::Repeated {3}else{2},"repeated":repeated,
