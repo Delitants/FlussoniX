@@ -142,3 +142,54 @@ async fn not_found_is_authoritative_and_redirects_do_not_forward_peer_credential
     task.abort();
     t2.abort();
 }
+
+#[tokio::test]
+async fn excluded_streams_do_not_send_metadata_requests_or_peer_credentials() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let (url, task) = serve(Router::new().fallback(get(move || {
+        c.fetch_add(1, Ordering::SeqCst);
+        async { axum::Json(json!({"name":"news"})) }
+    })))
+    .await;
+    let source = json!({"api_url":url,"except":["news", "region/*", "space name", "日本語/番組"]});
+    let client = client();
+    for name in [
+        "news",
+        "region/one",
+        "region/deep/two",
+        "space name",
+        "日本語/番組",
+    ] {
+        assert_eq!(
+            query(&client, &source, name, "owned-peer-key")
+                .await
+                .unwrap_err(),
+            LookupFailure::Absent,
+            "{name}"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    for name in [
+        "News",
+        "region",
+        "regional/one",
+        "news/one",
+        "space name 2",
+        "日本語/別番組",
+    ] {
+        assert!(
+            query(&client, &source, name, "owned-peer-key")
+                .await
+                .is_ok(),
+            "{name}"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
+    task.abort();
+    let _ = task.await;
+}

@@ -932,3 +932,31 @@ test('GPU dependency readiness is visible in Config and selected Processing prof
  await expect(processing).toHaveCount(0);
  await page.getByRole('button',{name:'Cancel',exact:true}).click();
 });
+
+test('source exclusions use editable stream patterns and persist removal without JSON',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-exclusion-source';
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();await page.getByRole('button',{name:'Source servers',exact:true}).click();
+ await page.getByRole('button',{name:'Add source',exact:true}).click();
+ await page.getByLabel('Node name',{exact:true}).fill(name);await page.getByLabel('Management URL',{exact:true}).fill('http://127.0.0.1:19998');
+ await page.getByRole('button',{name:'Add exclusion',exact:true}).click({timeout:8000});
+ await page.getByLabel('Excluded stream or prefix 1',{exact:true}).fill('region*');
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ await expect(page.getByRole('dialog',{name:'Add source'}).getByRole('alert')).toContainText('prefix/*');
+ expect((await request.get(`/streamer/api/v3/cluster/sources/${name}`,{headers})).status()).toBe(404);
+ await page.getByLabel('Excluded stream or prefix 1',{exact:true}).fill('region/*');
+ await page.getByRole('button',{name:'Add exclusion',exact:true}).click();await page.getByLabel('Excluded stream or prefix 2',{exact:true}).fill('space name');
+ await page.screenshot({path:'../.runtime/screenshots/source-exclusions.png',fullPage:true});
+ await expect(page.locator('textarea')).toHaveCount(0);
+ await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('cell',{name,exact:true})).toBeVisible();
+ let saved=await(await request.get(`/streamer/api/v3/cluster/sources/${name}`,{headers})).json();expect(saved.except).toEqual(['region/*','space name']);
+ const edit=()=>page.getByRole('row').filter({has:page.getByRole('cell',{name,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+ await edit();await expect(page.getByLabel('Excluded stream or prefix 1',{exact:true})).toHaveValue('region/*');
+ await page.getByRole('button',{name:'Remove exclusion 1',exact:true}).click();
+ await expect(page.getByLabel('Excluded stream or prefix 1',{exact:true})).toHaveValue('space name');
+ await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('cell',{name,exact:true})).toBeVisible();
+ saved=await(await request.get(`/streamer/api/v3/cluster/sources/${name}`,{headers})).json();expect(saved.except).toEqual(['space name']);
+ await edit();await page.getByRole('button',{name:'Remove exclusion 1',exact:true}).click();await page.getByRole('button',{name:'Save',exact:true}).click();
+ await expect(page.getByRole('cell',{name,exact:true})).toBeVisible();saved=await(await request.get(`/streamer/api/v3/cluster/sources/${name}`,{headers})).json();expect(saved.except).toEqual([]);
+ expect((await request.delete(`/streamer/api/v3/cluster/sources/${name}`,{headers})).ok()).toBeTruthy();
+});

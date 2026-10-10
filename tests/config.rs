@@ -909,3 +909,73 @@ fn secure_http_basic_inputs_save_inherit_restart_and_reject_invalid_credentials(
     drop(store);
     assert_eq!(ConfigStore::open(&path).unwrap().snapshot(), saved);
 }
+
+#[test]
+fn source_exclusions_persist_and_can_be_cleared() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("config.json");
+    let s = flussonix::config::ConfigStore::open(&path).unwrap();
+    s.put("sources", "origin", serde_json::json!({"api_url":"http://127.0.0.1:19990","except":["news", "region/*", "space name", "日本語/番組"]})).expect("source exclusions must save");
+    let reopened = flussonix::config::ConfigStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.snapshot()["sources"][0]["except"],
+        serde_json::json!(["news", "region/*", "space name", "日本語/番組"])
+    );
+    s.put("sources", "origin", serde_json::json!({"except":[]}))
+        .unwrap();
+    assert_eq!(s.snapshot()["sources"][0]["except"], serde_json::json!([]));
+    s.put("sources", "origin", serde_json::json!({"except":null}))
+        .unwrap();
+    assert!(s.snapshot()["sources"][0].get("except").is_none());
+    s.put(
+        "sources",
+        "origin",
+        serde_json::json!({"except":vec!["n".repeat(256);1024]}),
+    )
+    .expect("documented pattern and list boundaries must be accepted");
+}
+
+#[test]
+fn malformed_or_non_source_exclusions_do_not_change_saved_configuration() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("config.json");
+    let s = flussonix::config::ConfigStore::open(&path).unwrap();
+    s.put(
+        "sources",
+        "origin",
+        serde_json::json!({"api_url":"http://127.0.0.1:19990"}),
+    )
+    .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let revision = s.revision();
+    for invalid in [
+        serde_json::json!("news"),
+        serde_json::json!([1]),
+        serde_json::json!([""]),
+        serde_json::json!(["*"]),
+        serde_json::json!(["region*"]),
+        serde_json::json!(["a/*/b"]),
+        serde_json::json!(["a//b"]),
+        serde_json::json!(["a/../b"]),
+        serde_json::json!(["a?b"]),
+        serde_json::json!(["a\nb"]),
+        serde_json::json!(["a".repeat(257)]),
+        serde_json::json!(vec!["news"; 1025]),
+    ] {
+        assert!(
+            s.put("sources", "origin", serde_json::json!({"except":invalid}))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(s.revision(), revision);
+    }
+    for kind in ["peers", "streams", "templates"] {
+        let row = if kind == "peers" {
+            serde_json::json!({"api_url":"http://127.0.0.1:19990","except":["news"]})
+        } else {
+            serde_json::json!({"static":false,"inputs":[{"url":"testsrc://"}],"except":["news"]})
+        };
+        assert!(s.put(kind, "wrong", row).is_err());
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}

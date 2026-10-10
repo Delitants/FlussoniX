@@ -653,3 +653,59 @@ async fn explicit_stop_keeps_discovered_pull_stopped_until_new_playback() {
         "explicit stop must not be undone by retained recovery activity"
     );
 }
+
+#[tokio::test]
+async fn excluding_all_origins_stops_an_existing_pull_and_revokes_its_viewer() {
+    let _load = MEDIA_TESTS.acquire().await.unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let (a, b, cdn) = setup(d.path(), "m4s").await;
+    let initial = play(&cdn).await.status();
+    let worker_before = cdn.app.media.count().await;
+    let viewer_before = cdn
+        .app
+        .playback_auth
+        .snapshots()
+        .iter()
+        .any(|s| s["is_open"] == true);
+    // Exclude the unused replica first; updating the selected source must not
+    // replace it with a replica that the operator has also excluded.
+    cdn.app
+        .config
+        .put("sources", "b", json!({"except":["region/*"]}))
+        .unwrap();
+    let updated = client()
+        .put(format!("{}/streamer/api/v3/cluster/sources/a", cdn.url))
+        .basic_auth("admin", Some("owned-management"))
+        .json(&json!({"except":["region/news"]}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    let worker_after = cdn.app.media.count().await;
+    let viewer_after = cdn
+        .app
+        .playback_auth
+        .snapshots()
+        .iter()
+        .any(|s| s["is_open"] == true);
+    let blocked = client()
+        .get(format!(
+            "{}/region/news/index.m3u8?token=viewer-owned",
+            cdn.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    cdn.app.reconcile().await;
+    let recovered = cdn.app.media.count().await;
+    cleanup([a, b, cdn]).await;
+    assert_eq!(initial, 200);
+    assert_eq!(worker_before, 1);
+    assert!(viewer_before);
+    assert_eq!(updated, 200);
+    assert_eq!(worker_after, 0);
+    assert!(!viewer_after);
+    assert_eq!(blocked, 404);
+    assert_eq!(recovered, 0);
+}

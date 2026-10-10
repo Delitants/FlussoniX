@@ -90,8 +90,9 @@ saved and no media worker is started by collection reads.
 
 This extends field selection over the existing native cluster representation.
 Sources still use the native `hostname` identity and endpoint fields; reference
-URL-keyed source configuration, source filters, cluster sorting/filtering/cursor
-parity and complete cluster schema compatibility remain separate requirements.
+URL-keyed source configuration, static `only` activation, source `prefix` mapping,
+cluster sorting/filtering/cursor parity and complete cluster schema compatibility
+remain separate requirements. The native `except` blacklist is described below.
 
 ### Implemented scalar collection filtering
 
@@ -476,3 +477,12 @@ covers observed qop-auth and decoded H.264/AAC on TCP, UDP and verified TLS. See
 [the receiving authentication profile](rtsp-publication.md#incoming-publisher-basic-and-digest-authentication).
 Viewer Basic/Digest, additional incoming algorithms and complete vendor API/auth
 parity remain open.
+
+
+### Cluster source exclusions
+
+Native source rows accept `except` as an array of exact stream names or subtree patterns such as `region/*`. Matching is case sensitive: `region/*` blocks `region/news` and `region/deep/news`, but allows `region` and `regional/news`. Spaces and Unicode names are literal. A source accepts at most 1,024 patterns, each at most 256 UTF-8 bytes including `/*`; other wildcard forms and invalid stream paths are rejected atomically. Omit the field or use `[]` to allow all names. A management merge patch with `except: null` removes the override.
+
+Exclusions apply to that source before metadata requests and during cold discovery and replica selection. Other allowed sources can provide the same stream, subject to existing content identity, group and viewer policy checks for failover. Locally configured streams retain precedence. Updating a source through the management API invalidates its cached routes and viewer authorization; reconciliation stops stale pulls. In-flight metadata from the previous configuration revision cannot reinstall the excluded route. The source editor has labeled Add/Remove exclusion rows and client validation.
+
+This implements the blacklist portion of the [reference source behavior](https://flussonic.com/doc/fms/cluster/restreaming/). `only` is a static activation policy in the reference, not an allowlist that hides other streams, and remains pending. URL-keyed source identity, source `prefix` mapping and full legacy source discovery/interoperability also remain pending. Source rows continue to use native `hostname`, management/private endpoints and the existing authenticated native metadata protocol.

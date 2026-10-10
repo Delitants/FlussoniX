@@ -1,6 +1,6 @@
 //! Sticky source selection and publication fencing. Lives beneath server to keep authority private.
 use super::*;
-use crate::source_directory::{LookupFailure, query};
+use crate::source_directory::{LookupFailure, allows, query};
 use futures_util::{StreamExt, stream};
 enum OriginState {
     Ready,
@@ -418,6 +418,7 @@ impl App {
                     .filter(|s| {
                         *s != &m.source
                             && s["drain"] != true
+                            && allows(s, name)
                             && s["flussonix_source_group"].as_str() == group
                     })
                     .cloned()
@@ -428,7 +429,7 @@ impl App {
         } else {
             sources
                 .iter()
-                .filter(|s| s["drain"] != true)
+                .filter(|s| s["drain"] != true && allows(s, name))
                 .cloned()
                 .collect()
         };
@@ -487,7 +488,7 @@ impl App {
                 .await;
         }
         // An unresolved tombstone fences a late cold lookup after newer publication.
-        if let Some(source) = sources.first() {
+        if let Some(source) = sources.iter().find(|source| allows(source, name)) {
             return self
                 .install_origin(
                     name,
@@ -912,5 +913,218 @@ mod cache_tests {
         );
         assert!(app.source_lookups.lock().await.len() < 10000);
         assert!(app.mirrors.lock().await.len() < 10000);
+    }
+}
+
+#[cfg(test)]
+mod exclusion_tests {
+    use super::*;
+    use axum::{extract::Path as AxumPath, http::StatusCode, response::IntoResponse, routing::get};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
+
+    struct Origin {
+        url: String,
+        calls: Arc<AtomicUsize>,
+        mode: Arc<AtomicUsize>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for Origin {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+    async fn origin() -> Origin {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mode = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (c, m, e, r) = (
+            calls.clone(),
+            mode.clone(),
+            entered.clone(),
+            release.clone(),
+        );
+        let routes = axum::Router::new().route("/flussonix/api/v1/stream/{*name}",get(move |headers: HeaderMap, AxumPath(name): AxumPath<String>| {
+            let (c,m,e,r) = (c.clone(),m.clone(),e.clone(),r.clone());
+            async move {
+                assert_eq!(headers["X-Flussonix-Peer"], "owned-exclusion-peer-key");
+                c.fetch_add(1, Ordering::SeqCst);
+                match m.load(Ordering::SeqCst) {
+                    1 => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    2 => {e.notify_one();r.notified().await;},
+                    _ => (),
+                }
+                axum::Json(json!({"name":name,"static":false,"inputs":[{"url":"testsrc://"}],"flussonix_content_id":"owned-replica"})).into_response()
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+        Origin {
+            url,
+            calls,
+            mode,
+            entered,
+            release,
+            task,
+        }
+    }
+    fn app(dir: &std::path::Path) -> Arc<App> {
+        App::new(
+            dir.join("config.json"),
+            dir.join("media"),
+            Options {
+                admin_password: "owned-exclusion-admin".into(),
+                peer_key: "owned-exclusion-peer-key".into(),
+                ffmpeg: "/owned-exclusion-no-media-process".into(),
+                role: "cdn".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+    fn source(app: &App, name: &str, origin: &Origin, except: Value) {
+        app.config.put("sources", name,json!({"api_url":origin.url,"private_payload_url":origin.url,"flussonix_source_group":"owned-group","except":except})).unwrap();
+    }
+    async fn update(app: &Arc<App>, patch: Value) {
+        use base64::Engine;
+        let response = router(app.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/streamer/api/v3/cluster/sources/a")
+                    .header(
+                        "Authorization",
+                        format!(
+                            "Basic {}",
+                            base64::engine::general_purpose::STANDARD
+                                .encode("admin:owned-exclusion-admin")
+                        ),
+                    )
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(patch.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn excluded_sources_are_skipped_and_an_allowed_origin_can_be_cached() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        let a = origin().await;
+        let b = origin().await;
+        source(&app, "a", &a, json!(["region/*"]));
+        source(&app, "b", &b, json!([]));
+        let resolved = app.resolve("region/news").await.unwrap();
+        assert_eq!(
+            resolved.config["inputs"][0]["url"],
+            format!(
+                "hls://{}/region/news/index.m3u8",
+                b.url.trim_start_matches("http://")
+            )
+        );
+        assert!(app.resolve("region/news").await.is_some());
+        assert_eq!(a.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(app.media.count().await, 0);
+    }
+    #[tokio::test]
+    async fn local_stream_precedence_survives_source_exclusions() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        let a = origin().await;
+        source(&app, "a", &a, json!(["region/*"]));
+        app.config
+            .put(
+                "streams",
+                "region/news",
+                json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+            )
+            .unwrap();
+        let resolved = app.resolve("region/news").await.unwrap();
+        assert_eq!(resolved.config["inputs"][0]["url"], "testsrc://");
+        assert_eq!(a.calls.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn failover_skips_an_excluded_replica() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        let a = origin().await;
+        let b = origin().await;
+        let c = origin().await;
+        source(&app, "a", &a, json!([]));
+        source(&app, "b", &b, json!(["region/news"]));
+        source(&app, "c", &c, json!([]));
+        assert!(app.resolve("region/news").await.is_some());
+        a.mode.store(1, Ordering::SeqCst);
+        app.mirrors
+            .lock()
+            .await
+            .get_mut("region/news")
+            .unwrap()
+            .when = Instant::now() - Duration::from_secs(11);
+        let resolved = app.resolve("region/news").await.unwrap();
+        assert_eq!(
+            resolved.config["inputs"][0]["url"],
+            format!(
+                "hls://{}/region/news/index.m3u8",
+                c.url.trim_start_matches("http://")
+            )
+        );
+        assert_eq!(b.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            app.stream_stats("region/news").await["upstream_source"],
+            "c"
+        );
+        assert_eq!(app.stream_stats("region/news").await["source_switches"], 1);
+    }
+    #[tokio::test]
+    async fn adding_an_exclusion_revokes_a_cached_route_and_clearing_it_restores_discovery() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        let a = origin().await;
+        source(&app, "a", &a, json!([]));
+        assert!(app.resolve("region/news").await.is_some());
+        assert!(app.media_config("region/news").await.is_some());
+        update(&app, json!({"except":["region/*"]})).await;
+        assert!(app.media_config("region/news").await.is_none());
+        assert!(app.resolve("region/news").await.is_none());
+        assert_eq!(a.calls.load(Ordering::SeqCst), 1);
+        let saved = crate::config::ConfigStore::open(d.path().join("config.json")).unwrap();
+        assert_eq!(
+            saved.snapshot()["sources"][0]["except"],
+            json!(["region/*"])
+        );
+        update(&app, json!({"except":null})).await;
+        assert!(app.resolve("region/news").await.is_some());
+        assert_eq!(a.calls.load(Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn an_exclusion_update_fences_metadata_already_in_flight() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        let a = origin().await;
+        source(&app, "a", &a, json!([]));
+        a.mode.store(2, Ordering::SeqCst);
+        let pending = {
+            let app = app.clone();
+            tokio::spawn(async move { app.resolve("region/news").await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), a.entered.notified())
+            .await
+            .unwrap();
+        update(&app, json!({"except":["region/news"]})).await;
+        a.release.notify_one();
+        assert!(pending.await.unwrap().is_none());
+        assert!(app.media_config("region/news").await.is_none());
+        assert!(app.resolve("region/news").await.is_none());
+        assert_eq!(a.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(app.media.count().await, 0);
     }
 }

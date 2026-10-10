@@ -7,6 +7,20 @@ pub enum LookupFailure {
     Absent,
     Invalid,
 }
+/// Source-local blacklist. Configuration accepts exact names or a terminal `/*`.
+/// A subtree pattern does not exclude its parent name or a similar sibling prefix.
+pub(crate) fn allows(source: &Value, name: &str) -> bool {
+    !source["except"].as_array().is_some_and(|patterns| {
+        patterns.iter().filter_map(Value::as_str).any(|pattern| {
+            pattern == name
+                || pattern
+                    .strip_suffix('*')
+                    .filter(|p| p.ends_with('/'))
+                    .is_some_and(|prefix| name.starts_with(prefix) && name.len() > prefix.len())
+        })
+    })
+}
+
 pub async fn query(
     client: &reqwest::Client,
     source: &Value,
@@ -15,6 +29,9 @@ pub async fn query(
 ) -> Result<Value, LookupFailure> {
     tokio::time::timeout(Duration::from_millis(750), async {
         crate::config::valid_name(name).map_err(|_| LookupFailure::Invalid)?;
+        if !allows(source, name) {
+            return Err(LookupFailure::Absent);
+        }
         let mut url = url::Url::parse(source["api_url"].as_str().ok_or(LookupFailure::Invalid)?)
             .map_err(|_| LookupFailure::Invalid)?;
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {

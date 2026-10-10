@@ -345,6 +345,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "drain",
                     "flussonix_transport",
                     "flussonix_source_group",
+                    "except",
                     "flussonix_tls_ca",
                     "flussonix_media_tls_ca",
                 ],
@@ -381,6 +382,24 @@ fn validate_root(root: &Value) -> Result<(), String> {
             }
             if let Some(id) = item.get("flussonix_content_id") {
                 valid_identity(id)?;
+            }
+            if let Some(except) = item.get("except") {
+                if *kind != "sources" {
+                    return Err("except is source-only".into());
+                }
+                let patterns = except
+                    .as_array()
+                    .filter(|p| p.len() <= 1024)
+                    .ok_or("except must be an array of at most 1024 stream patterns")?;
+                for pattern in patterns {
+                    let pattern = pattern.as_str().ok_or("except patterns must be strings")?;
+                    let name = pattern.strip_suffix("/*").unwrap_or(pattern);
+                    if pattern.len() > 256 || name.contains('*') || valid_name(name).is_err() {
+                        return Err(
+                            "except requires exact stream names or prefix/* patterns".into()
+                        );
+                    }
+                }
             }
             if let Some(group) = item.get("flussonix_source_group") {
                 if *kind != "sources" {
