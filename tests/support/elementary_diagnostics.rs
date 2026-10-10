@@ -63,6 +63,7 @@ struct State {
     limit: u64,
     capped: bool,
     retention_failed: bool,
+    packet_taps: Vec<Value>,
     previous_write_ms: u128,
     start: Instant,
     stage: &'static str,
@@ -106,6 +107,7 @@ impl State {
         let observation_start = Instant::now();
         self.activity.set("observe_processes");
         let mut value = json!({"elapsed_ms":self.start.elapsed().as_millis(),"event":event,"stage":self.stage,"processes":observations(&self.targets)});
+        value["packet_taps"] = json!(self.packet_taps);
         if let Some(worker) = self.worker.as_ref().and_then(Weak::upgrade) {
             self.activity.set("observe_worker");
             value["worker"] = worker.stats();
@@ -150,6 +152,7 @@ enum Event {
     Worker(Target, Weak<Worker>),
     Stage(&'static str),
     Captures(Vec<DatagramCapture>),
+    PacketTap(Value, Option<DatagramCapture>),
 }
 pub struct Evidence {
     activity: Activity,
@@ -188,6 +191,7 @@ impl Evidence {
             limit,
             capped: false,
             retention_failed: false,
+            packet_taps: Vec::new(),
             previous_write_ms: 0,
             start: Instant::now(),
             stage: "fixture_start",
@@ -241,6 +245,19 @@ impl Evidence {
                                     }
                                 }
                                 "captures_saved"
+                            }
+                            Event::PacketTap(summary, capture) => {
+                                state.retention_failed |=
+                                    summary["incomplete"].as_bool() != Some(false);
+                                if let Some(capture) = capture {
+                                    state.activity.set("save_packet_tap");
+                                    if capture.save().is_err() {
+                                        state.retention_failed = true;
+                                        eprintln!("Owned packet tap retention failed");
+                                    }
+                                }
+                                state.packet_taps.push(summary);
+                                "packet_tap_saved"
                             }
                             Event::Stage(stage) => {
                                 state.stage = stage;
@@ -314,6 +331,13 @@ impl Evidence {
             Arc::downgrade(worker),
         ));
     }
+    #[allow(
+        dead_code,
+        reason = "packet taps are optional Linux fixture diagnostics"
+    )]
+    pub fn save_packet_tap(&self, summary: Value, capture: Option<DatagramCapture>) {
+        self.notify(Event::PacketTap(summary, capture));
+    }
     pub fn save_captures(&self, captures: Vec<DatagramCapture>) {
         self.notify(Event::Captures(captures));
     }
@@ -366,7 +390,7 @@ fn bounded(path: &Path) -> io::Result<String> {
     }
     String::from_utf8(data).map_err(io::Error::other)
 }
-fn identity(pid: u32) -> io::Result<(u64, String)> {
+pub(super) fn identity(pid: u32) -> io::Result<(u64, String)> {
     let stat = bounded(Path::new(&format!("/proc/{pid}/stat")))?;
     let (_, rest) = stat
         .rsplit_once(')')

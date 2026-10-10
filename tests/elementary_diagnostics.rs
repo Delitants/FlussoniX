@@ -568,3 +568,29 @@ fn blocked_artifact_operation(capture: bool) {
         "Private paths must not be logged"
     );
 }
+
+#[test]
+fn incomplete_packet_tap_is_retained_and_marks_terminal_evidence_incomplete() {
+    let source = tempfile::tempdir().unwrap();
+    let artifact = tempfile::tempdir().unwrap();
+    let evidence = Evidence::start(source.path(), artifact.path()).unwrap();
+    let path = artifact.path().join("boundary-public.packets");
+    let mut capture = diagnostics::DatagramCapture::new(path.clone());
+    capture.append(b"owned synthetic datagram").unwrap();
+    evidence.save_packet_tap(
+        serde_json::json!({"boundary":"source_to_public","incomplete":true,"kernel_drops":7}),
+        Some(capture),
+    );
+    drop(evidence);
+    let records = entries(artifact.path());
+    let summary = records
+        .iter()
+        .find_map(|r| r["packet_taps"].as_array().and_then(|a| a.first()))
+        .expect("Packet tap summary must be retained");
+    assert_eq!(summary["kernel_drops"], 7);
+    assert_eq!(records.last().unwrap()["incomplete"], true);
+    assert_eq!(
+        &std::fs::read(path).unwrap()[4..],
+        b"owned synthetic datagram"
+    );
+}

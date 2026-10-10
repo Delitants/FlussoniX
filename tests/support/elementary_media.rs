@@ -7,6 +7,9 @@ use tokio::process::Command;
 mod decoder_readiness;
 #[path = "elementary_diagnostics.rs"]
 mod elementary_diagnostics;
+#[cfg(target_os = "linux")]
+#[path = "elementary_packet_taps.rs"]
+mod elementary_packet_taps;
 fn ports() -> (u16, Vec<UdpSocket>) {
     for _ in 0..64 {
         let a = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -99,6 +102,12 @@ pub async fn qualify(
     secure_input: bool,
     secure_output: bool,
 ) {
+    let fixture_origin = std::time::Instant::now();
+    let packet_taps = match std::env::var("FLUSSONIX_ELEMENTARY_PACKET_TAPS") {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(value) if value == "1" => true,
+        _ => panic!("FLUSSONIX_ELEMENTARY_PACKET_TAPS must be 1 or unset"),
+    };
     let d = tempfile::tempdir().unwrap();
     let ffmpeg =
         std::env::var("FLUSSONIX_TEST_FFMPEG").unwrap_or_else(|_| "/usr/bin/ffmpeg".into());
@@ -126,6 +135,11 @@ pub async fn qualify(
             );
             elementary_diagnostics::create_case_directory(Path::new(&base), &name).unwrap()
         });
+    assert!(
+        !packet_taps
+            || (cfg!(target_os = "linux") && artifact.is_some() && ffmpeg == "/usr/bin/ffmpeg"),
+        "Packet taps require Linux, the owned system FFmpeg fixture and a fresh artifact directory"
+    );
     let evidence = artifact
         .as_ref()
         .map(|out| elementary_diagnostics::Evidence::start(d.path(), out).unwrap());
@@ -138,6 +152,18 @@ pub async fn qualify(
         evidence.watch_process("native_test_process", std::process::id());
     }
     let (input, reserved) = ports();
+    #[cfg(target_os = "linux")]
+    let public_tap = packet_taps.then(|| {
+        elementary_packet_taps::Tap::public(
+            &reserved[..(audio.len() + usize::from(video.is_some())) * 2],
+            evidence.as_ref().unwrap(),
+            artifact.as_ref().unwrap(),
+            fixture_origin,
+        )
+        .expect("Owned packet tap setup failed; Linux CAP_NET_RAW is required")
+    });
+    #[cfg(target_os = "linux")]
+    let decoder_tap = None;
     let (input_sdp, output_sdp) = (d.path().join("input.sdp"), d.path().join("output.sdp"));
     let mut sender = Command::new(&ffmpeg);
     sender.args([
@@ -283,6 +309,11 @@ pub async fn qualify(
     .unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
     let engine = Engine::new(d.path().join("media"), executable.to_str().unwrap());
+    // Shadow the moved guard so unwinding stops capture before dropping the engine.
+    #[cfg(target_os = "linux")]
+    let mut public_tap = public_tap;
+    #[cfg(target_os = "linux")]
+    let mut decoder_tap = decoder_tap;
     if profile["encoder"]
         .as_str()
         .is_some_and(|e| e.ends_with("_vaapi"))
@@ -365,6 +396,25 @@ pub async fn qualify(
             !local.is_empty() && local.iter().all(|s| s.starts_with(&loopback)),
             "Private decoder UDP sockets must bind loopback: {local:?}"
         );
+        #[cfg(target_os = "linux")]
+        if packet_taps {
+            let ports = local
+                .iter()
+                .map(|address| {
+                    u16::from_str_radix(address.rsplit_once(':').unwrap().1, 16).unwrap()
+                })
+                .collect::<Vec<_>>();
+            decoder_tap = Some(
+                elementary_packet_taps::Tap::decoder(
+                    worker.pid(),
+                    &ports,
+                    evidence.as_ref().unwrap(),
+                    artifact.as_ref().unwrap(),
+                    fixture_origin,
+                )
+                .expect("Owned decoder packet tap setup failed"),
+            );
+        }
     }
     std::fs::write(&output_sdp, &text).unwrap();
     // Keep public receiver ports continuously owned. A test-only UDP forwarder
@@ -492,8 +542,24 @@ pub async fn qualify(
     }
     let stats = worker.stats();
     stage("worker_shutdown");
+    // Stop while the input/decoder still own their destination ports. Submit the
+    // in-memory recordings only after the worker has stopped.
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(tap) = &mut public_tap {
+            tap.stop();
+        }
+        if let Some(tap) = &mut decoder_tap {
+            tap.stop();
+        }
+    }
     engine.stop_all().await;
     stage("worker_stopped");
+    #[cfg(target_os = "linux")]
+    {
+        drop(public_tap);
+        drop(decoder_tap);
+    }
     if let Some(evidence) = &evidence {
         evidence.save_captures(captures);
     }
