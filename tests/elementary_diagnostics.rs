@@ -355,3 +355,15 @@ fn datagram_capture_preserves_framing_and_rejects_overflow_without_partial_data(
         0o600
     );
 }
+
+#[test]
+fn sdp_retention_caps_sanitized_output_before_creating_file() {
+    let source = tempfile::tempdir().unwrap();
+    let artifact = tempfile::tempdir().unwrap();
+    let input = "a\n".repeat(400_000);
+    assert!(input.len() < 1024 * 1024);
+    std::fs::write(source.path().join("input.sdp"), input).unwrap();
+    drop(Evidence::start(source.path(), artifact.path()).unwrap());
+    assert!(!artifact.path().join("input.sdp").exists());
+    assert_eq!(entries(artifact.path()).last().unwrap()["incomplete"], true);
+}

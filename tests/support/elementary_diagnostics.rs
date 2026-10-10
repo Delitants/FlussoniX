@@ -452,6 +452,22 @@ fn preserve(source: &Path, artifact: &Path) -> bool {
             if input.metadata()?.len() > limit {
                 return Err(io::Error::other("artifact exceeds retention limit"));
             }
+            let sanitized = if name.ends_with(".sdp") {
+                let mut text = String::new();
+                (&input).take(limit).read_to_string(&mut text)?;
+                let mut sanitized = Vec::new();
+                for line in text.lines().filter(|line| !line.starts_with("a=crypto:")) {
+                    writeln!(sanitized, "{line}\r")?;
+                }
+                if sanitized.len() as u64 > limit {
+                    return Err(io::Error::other(
+                        "sanitized artifact exceeds retention limit",
+                    ));
+                }
+                Some(sanitized)
+            } else {
+                None
+            };
             let mut output = OpenOptions::new()
                 .create(true)
                 .truncate(true)
@@ -459,12 +475,8 @@ fn preserve(source: &Path, artifact: &Path) -> bool {
                 .mode(0o600)
                 .open(artifact.join(name))?;
             output.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            if name.ends_with(".sdp") {
-                let mut text = String::new();
-                input.take(limit).read_to_string(&mut text)?;
-                for line in text.lines().filter(|line| !line.starts_with("a=crypto:")) {
-                    writeln!(output, "{line}\r")?;
-                }
+            if let Some(sanitized) = sanitized {
+                output.write_all(&sanitized)?;
             } else {
                 io::copy(&mut input.take(limit), &mut output)?;
             }
