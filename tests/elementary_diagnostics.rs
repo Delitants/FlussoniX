@@ -170,10 +170,10 @@ fn exited_process_loses_observation_instead_of_reusing_its_last_socket_state() {
     drop(evidence);
     let records = entries(artifact.path());
     let final_record = records.last().unwrap();
-    let process = final_record["processes"]
-        .as_array()
-        .unwrap()
+    let process = records
         .iter()
+        .rev()
+        .flat_map(|r| r["processes"].as_array().into_iter().flatten())
         .find(|p| p["role"] == "child")
         .unwrap();
     assert_eq!(process["observation"], "unavailable");
@@ -192,6 +192,11 @@ fn blocked_evidence_writer_does_not_block_fixture_stage_notifications() {
     let (complete, release) = mpsc::channel();
     let reader = std::thread::spawn(move || {
         let mut input = std::fs::File::open(path).unwrap();
+        // A small real pipe capacity ensures the bounded notification queue can fill it.
+        assert_eq!(
+            unsafe { libc::fcntl(input.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) },
+            4096
+        );
         let stages_completed = release.recv_timeout(Duration::from_secs(2)).is_ok();
         let mut bytes = Vec::new();
         input.read_to_end(&mut bytes).unwrap();
@@ -215,4 +220,138 @@ fn blocked_evidence_writer_does_not_block_fixture_stage_notifications() {
     assert_eq!(final_record["event"], "finished");
     assert_eq!(final_record["stage"], "backpressured_writer");
     assert!(final_record["dropped_commands"].as_u64().unwrap() > 0);
+}
+#[test]
+fn assertion_unwinding_does_not_wait_for_a_blocked_evidence_writer_to_release() {
+    blocked_terminal_writer(true);
+}
+#[test]
+fn normal_teardown_timeout_is_reported_as_incomplete() {
+    blocked_terminal_writer(false);
+}
+fn blocked_terminal_writer(unwind: bool) {
+    use std::{ffi::CString, io::Read, os::unix::ffi::OsStrExt, sync::mpsc, time::Duration};
+    let source = tempfile::tempdir().unwrap();
+    let artifact = tempfile::tempdir().unwrap();
+    let path = artifact.path().join("boundary-evidence.jsonl");
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let (complete, release) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut input = std::fs::File::open(path).unwrap();
+        // A small real pipe capacity ensures the bounded notification queue can fill it.
+        assert_eq!(
+            unsafe { libc::fcntl(input.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) },
+            4096
+        );
+        let unwind_completed = release.recv_timeout(Duration::from_secs(6)).is_ok();
+        let mut bytes = Vec::new();
+        input.read_to_end(&mut bytes).unwrap();
+        (unwind_completed, bytes)
+    });
+    let result = std::panic::catch_unwind(|| {
+        let evidence = Evidence::start(source.path(), artifact.path()).unwrap();
+        evidence.watch_process("native_test_process", std::process::id());
+        for _ in 0..1000 {
+            evidence.stage("blocked_terminal_writer");
+        }
+        if unwind {
+            panic!("controlled fixture failure while evidence writer remains blocked");
+        }
+        drop(evidence);
+    });
+    let _ = complete.send(());
+    let (completed, bytes) = reader.join().unwrap();
+    assert!(result.is_err());
+    assert!(completed, "Unwinding waited for writer release");
+    let text = String::from_utf8(bytes).unwrap();
+    let final_record: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    assert_eq!(
+        final_record["event"],
+        if unwind { "unwinding" } else { "finished" }
+    );
+    assert_eq!(final_record["stage"], "blocked_terminal_writer");
+    assert_eq!(final_record["shutdown_timed_out"], true);
+}
+
+#[test]
+fn capped_evidence_retains_terminal_failure_stage_and_marks_incompleteness() {
+    let source = tempfile::tempdir().unwrap();
+    let artifact = tempfile::tempdir().unwrap();
+    let result = std::panic::catch_unwind(|| {
+        let evidence = Evidence::start_limited(source.path(), artifact.path(), 1024).unwrap();
+        evidence.watch_process("native_test_process", std::process::id());
+        for _ in 0..20 {
+            evidence.stage("near_evidence_cap");
+        }
+        evidence.stage("failed_after_evidence_cap");
+        panic!("controlled failure after evidence cap");
+    });
+    assert!(result.is_err());
+    let records = entries(artifact.path());
+    let final_record = records.last().unwrap();
+    assert_eq!(final_record["event"], "unwinding");
+    assert_eq!(final_record["stage"], "failed_after_evidence_cap");
+    assert_eq!(final_record["incomplete"], true);
+    assert!(records.iter().any(|r| r["event"] == "evidence_capped"));
+    assert!(
+        std::fs::metadata(artifact.path().join("boundary-evidence.jsonl"))
+            .unwrap()
+            .len()
+            <= 1024
+    );
+}
+
+#[test]
+fn worker_log_retention_enforces_size_limit_and_private_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let source = tempfile::tempdir().unwrap();
+    let artifact = tempfile::tempdir().unwrap();
+    std::fs::write(source.path().join("worker.log"), "owned decoder error").unwrap();
+    drop(Evidence::start(source.path(), artifact.path()).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(artifact.path().join("worker.log")).unwrap(),
+        "owned decoder error"
+    );
+    assert_eq!(
+        std::fs::metadata(artifact.path().join("worker.log"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(source.path().join("worker.log"), vec![0; 1024 * 1024 + 1]).unwrap();
+    drop(Evidence::start(source.path(), second.path()).unwrap());
+    assert!(!second.path().join("worker.log").exists());
+    assert_eq!(entries(second.path()).last().unwrap()["incomplete"], true);
+}
+#[test]
+fn datagram_capture_preserves_framing_and_rejects_overflow_without_partial_data() {
+    use diagnostics::DatagramCapture;
+    use std::os::unix::fs::PermissionsExt;
+    let artifact = tempfile::tempdir().unwrap();
+    let path = artifact.path().join("packets.rtp");
+    let mut capture = DatagramCapture::new(path.clone());
+    capture.append(&[1, 2, 3]).unwrap();
+    capture.append(&[4, 5]).unwrap();
+    assert!(capture.append(&vec![0; 4 * 1024 * 1024]).is_err());
+    assert!(
+        !path.exists(),
+        "Capture must not write files while delivery is active"
+    );
+    let source = tempfile::tempdir().unwrap();
+    let evidence = Evidence::start(source.path(), artifact.path()).unwrap();
+    evidence.stage("worker_stopped");
+    evidence.save_captures(vec![capture]);
+    drop(evidence);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        [0, 0, 0, 3, 1, 2, 3, 0, 0, 0, 2, 4, 5]
+    );
+    assert_eq!(
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }

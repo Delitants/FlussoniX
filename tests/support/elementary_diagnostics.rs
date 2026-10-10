@@ -24,17 +24,46 @@ struct Target {
 struct State {
     file: File,
     bytes: u64,
+    limit: u64,
     capped: bool,
+    retention_failed: bool,
     previous_write_ms: u128,
     start: Instant,
     stage: &'static str,
     targets: BTreeMap<&'static str, Target>,
     worker: Option<Weak<Worker>>,
     dropped: Arc<AtomicU64>,
+    shutdown_timed_out: Arc<AtomicBool>,
 }
 impl State {
     fn record(&mut self, event: &str, emitted: Option<Instant>) {
-        if self.capped {
+        let terminal = matches!(event, "finished" | "unwinding");
+        if self.capped && !terminal {
+            return;
+        }
+        if terminal {
+            let stage: String = self
+                .stage
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .take(64)
+                .collect();
+            let value = json!({"event":event,"stage":stage,"elapsed_ms":self.start.elapsed().as_millis(),
+                "incomplete":self.capped || self.retention_failed || self.shutdown_timed_out.load(Ordering::Relaxed) || self.dropped.load(Ordering::Relaxed)>0,
+                "shutdown_timed_out":self.shutdown_timed_out.load(Ordering::Relaxed),"dropped_commands":self.dropped.load(Ordering::Relaxed)});
+            let mut bytes = serde_json::to_vec(&value).unwrap();
+            bytes.push(b'\n');
+            if self.bytes + bytes.len() as u64 <= self.limit {
+                if self
+                    .file
+                    .write_all(&bytes)
+                    .and_then(|_| self.file.flush())
+                    .is_err()
+                {
+                    eprintln!("Owned media terminal evidence write failed");
+                }
+                self.bytes += bytes.len() as u64;
+            }
             return;
         }
         let observation_start = Instant::now();
@@ -48,6 +77,7 @@ impl State {
         value["event_queue_delay_ms"] = emitted
             .map(|t| t.elapsed().as_millis())
             .map_or(Value::Null, |n| json!(n));
+        value["shutdown_timed_out"] = json!(self.shutdown_timed_out.load(Ordering::Relaxed));
         value["dropped_commands"] = json!(self.dropped.load(Ordering::Relaxed));
         value["observation_ms"] = json!(observation_start.elapsed().as_millis());
         value["previous_evidence_write_ms"] = json!(self.previous_write_ms);
@@ -55,7 +85,7 @@ impl State {
             return;
         };
         bytes.push(b'\n');
-        if self.bytes + bytes.len() as u64 > FILE_LIMIT - 128 {
+        if self.bytes + bytes.len() as u64 > self.limit - 512 {
             self.capped = true;
             bytes = b"{\"event\":\"evidence_capped\",\"observation\":\"incomplete\"}\n".to_vec();
         }
@@ -77,8 +107,11 @@ enum Event {
     Process(&'static str, Target),
     Worker(Target, Weak<Worker>),
     Stage(&'static str),
+    Captures(Vec<DatagramCapture>),
 }
 pub struct Evidence {
+    completion: mpsc::Receiver<()>,
+    shutdown_timed_out: Arc<AtomicBool>,
     sender: Option<mpsc::SyncSender<(Instant, Event)>>,
     thread: Option<JoinHandle<()>>,
     final_stage: Arc<Mutex<&'static str>>,
@@ -87,6 +120,12 @@ pub struct Evidence {
 }
 impl Evidence {
     pub fn start(source: &Path, artifact: &Path) -> io::Result<Self> {
+        Self::start_limited(source, artifact, FILE_LIMIT)
+    }
+    pub fn start_limited(source: &Path, artifact: &Path, limit: u64) -> io::Result<Self> {
+        if !(1024..=FILE_LIMIT).contains(&limit) {
+            return Err(io::Error::other("invalid evidence limit"));
+        }
         std::fs::create_dir_all(artifact)?;
         std::fs::set_permissions(artifact, std::fs::Permissions::from_mode(0o700))?;
         let file = OpenOptions::new()
@@ -97,16 +136,20 @@ impl Evidence {
             .open(artifact.join("boundary-evidence.jsonl"))?;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         let dropped = Arc::new(AtomicU64::new(0));
+        let shutdown_timed_out = Arc::new(AtomicBool::new(false));
         let mut state = State {
             file,
             bytes: 0,
+            limit,
             capped: false,
+            retention_failed: false,
             previous_write_ms: 0,
             start: Instant::now(),
             stage: "fixture_start",
             targets: BTreeMap::new(),
             worker: None,
             dropped: dropped.clone(),
+            shutdown_timed_out: shutdown_timed_out.clone(),
         };
         // This initial write happens before any media process or socket starts.
         state.record("started", None);
@@ -117,6 +160,7 @@ impl Evidence {
         let terminal_unwind = unwinding.clone();
         let source = source.to_path_buf();
         let artifact = artifact.to_path_buf();
+        let (finished, completion) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             let deadline = state.start + Duration::from_secs(60);
             let mut next_sample = Instant::now() + Duration::from_millis(100);
@@ -141,6 +185,15 @@ impl Evidence {
                                 state.worker = Some(worker);
                                 "process_registered"
                             }
+                            Event::Captures(captures) => {
+                                for capture in captures {
+                                    if capture.save().is_err() {
+                                        state.retention_failed = true;
+                                        eprintln!("Owned datagram capture retention failed");
+                                    }
+                                }
+                                "captures_saved"
+                            }
                             Event::Stage(stage) => {
                                 state.stage = stage;
                                 "stage"
@@ -149,6 +202,7 @@ impl Evidence {
                         state.record(label, Some(emitted));
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        state.retention_failed |= preserve(&source, &artifact);
                         state.stage = *terminal_stage.lock().unwrap();
                         state.record(
                             if terminal_unwind.load(Ordering::Relaxed) {
@@ -158,7 +212,7 @@ impl Evidence {
                             },
                             None,
                         );
-                        preserve(&source, &artifact);
+                        let _ = finished.send(());
                         return;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -174,6 +228,8 @@ impl Evidence {
             }
         });
         Ok(Self {
+            completion,
+            shutdown_timed_out,
             sender: Some(sender),
             thread: Some(thread),
             final_stage,
@@ -208,6 +264,9 @@ impl Evidence {
             Arc::downgrade(worker),
         ));
     }
+    pub fn save_captures(&self, captures: Vec<DatagramCapture>) {
+        self.notify(Event::Captures(captures));
+    }
     pub fn stage(&self, stage: &'static str) {
         // Never hold this tiny metadata lock during proc reads or file writes.
         *self.final_stage.lock().unwrap() = stage;
@@ -219,8 +278,28 @@ impl Drop for Evidence {
         self.unwinding
             .store(std::thread::panicking(), Ordering::Relaxed);
         self.sender.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        let failure = match self.completion.recv_timeout(Duration::from_secs(2)) {
+            Ok(()) => self.thread.take().unwrap().join().is_err(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = self.thread.take().unwrap().join();
+                true
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.shutdown_timed_out.store(true, Ordering::Relaxed);
+                // Blocking filesystem I/O cannot safely be interrupted. Detach this
+                // test-only observer; it owns no media child and no strong worker reference.
+                self.thread.take();
+                true
+            }
+        };
+        if failure {
+            eprintln!(
+                "Owned media evidence incomplete at stage {}: observer did not finish",
+                *self.final_stage.lock().unwrap()
+            );
+            if !std::thread::panicking() {
+                panic!("Owned media evidence incomplete: observer did not finish");
+            }
         }
     }
 }
@@ -346,7 +425,8 @@ fn observe(target: &Target) -> io::Result<(String, Vec<Value>, usize)> {
     }
     Ok((state, rows, races))
 }
-fn preserve(source: &Path, artifact: &Path) {
+fn preserve(source: &Path, artifact: &Path) -> bool {
+    let mut failed = false;
     // The allowlist excludes inline keys, wrapper arguments and any host configuration.
     for name in [
         "input.sdp",
@@ -354,6 +434,7 @@ fn preserve(source: &Path, artifact: &Path) {
         "receiver.sdp",
         "sender.log",
         "receiver.log",
+        "worker.log",
         "received.ts",
         "worker.ts",
     ] {
@@ -390,7 +471,46 @@ fn preserve(source: &Path, artifact: &Path) {
             Ok(())
         };
         if save().is_err() {
+            failed = true;
             eprintln!("Owned media artifact retention failed: {name}");
         }
+    }
+    failed
+}
+// Owned datagrams are buffered during delivery and saved only after media shutdown.
+pub struct DatagramCapture {
+    path: std::path::PathBuf,
+    bytes: Vec<u8>,
+}
+impl DatagramCapture {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            bytes: Vec::new(),
+        }
+    }
+    pub fn append(&mut self, packet: &[u8]) -> io::Result<()> {
+        let size = self
+            .bytes
+            .len()
+            .checked_add(4)
+            .and_then(|n| n.checked_add(packet.len()));
+        if size.is_none_or(|n| n > 4 * 1024 * 1024) {
+            return Err(io::Error::other("owned datagram capture exceeds limit"));
+        }
+        self.bytes
+            .extend_from_slice(&(packet.len() as u32).to_be_bytes());
+        self.bytes.extend_from_slice(packet);
+        Ok(())
+    }
+    pub fn save(self) -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(self.path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(&self.bytes)
     }
 }

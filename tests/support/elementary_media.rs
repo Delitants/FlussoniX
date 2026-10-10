@@ -269,7 +269,7 @@ pub async fn qualify(
     let (output, reserved) = ports();
     // Always retain worker diagnostics until this fixture finishes. Startup
     // failures must report the actual independent decoder error in CI.
-    let diagnostics = artifact.as_deref().unwrap_or(d.path());
+    let diagnostics = d.path();
     let executable = diagnostics.join("owned-ffmpeg");
     let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
     std::fs::write(
@@ -464,20 +464,25 @@ pub async fn qualify(
         socket.set_nonblocking(true).unwrap();
         let socket = tokio::net::UdpSocket::from_std(socket).unwrap();
         let c = cancel.clone();
-        let mut dump = artifact
-            .as_ref()
-            .map(|out| std::fs::File::create(out.join(format!("output-{i}.rtp"))).unwrap());
+        let mut dump = artifact.as_ref().map(|out| {
+            elementary_diagnostics::DatagramCapture::new(out.join(format!("output-{i}.rtp")))
+        });
         relay.spawn(async move { let mut bytes=[0;2048]; loop {
-            let n = tokio::select! {biased;_=c.cancelled()=>return,r=socket.recv_from(&mut bytes)=>r.unwrap().0};
-            if let Some(dump) = &mut dump { use std::io::Write; dump.write_all(&(n as u32).to_be_bytes()).unwrap();dump.write_all(&bytes[..n]).unwrap(); }
-            tokio::select! {biased;_=c.cancelled()=>return,r=socket.send_to(&bytes[..n], ("127.0.0.1", private + i as u16))=>{let _=r;}}
-        }});
+            let n = tokio::select! {biased;_=c.cancelled()=>break,r=socket.recv_from(&mut bytes)=>r.unwrap().0};
+            if let Some(dump) = &mut dump { dump.append(&bytes[..n]).unwrap(); }
+            tokio::select! {biased;_=c.cancelled()=>break,r=socket.send_to(&bytes[..n], ("127.0.0.1", private + i as u16))=>{let _=r;}}
+        } dump});
     }
     stage("media_delivery");
     let result = tokio::time::timeout(Duration::from_secs(15), receiver.wait()).await;
     stage("receiver_wait_complete");
     cancel.cancel();
-    while relay.join_next().await.is_some() {}
+    let mut captures = Vec::new();
+    while let Some(result) = relay.join_next().await {
+        if let Some(capture) = result.unwrap() {
+            captures.push(capture);
+        }
+    }
     record_cancel.cancel();
     recording.await.unwrap();
     let _ = sender.kill().await;
@@ -490,6 +495,9 @@ pub async fn qualify(
     stage("worker_shutdown");
     engine.stop_all().await;
     stage("worker_stopped");
+    if let Some(evidence) = &evidence {
+        evidence.save_captures(captures);
+    }
     if let Some(out) = &artifact {
         std::fs::write(
             out.join("worker-stats.json"),
