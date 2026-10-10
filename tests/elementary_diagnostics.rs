@@ -144,7 +144,7 @@ fn unrelated_process_sockets_are_not_attributed_to_watched_child() {
         .flat_map(|r| r["processes"].as_array().into_iter().flatten())
         .filter(|p| p["role"] == "child" && p["observation"] == "available")
         .collect();
-    assert!(!observations.is_empty());
+    assert!(!observations.is_empty(), "{records:?}");
     assert!(
         observations
             .iter()
