@@ -241,8 +241,7 @@ fn ordinary_backwards_source_pes_clock_is_rejected_after_sample_clock_correction
     let adts = [255, 241, 76, 128, 1, 31, 252, 42];
     let cc = first
         .chunks_exact(188)
-        .filter(|p| p[1] & 31 == 1 && p[2] == 0)
-        .last()
+        .rfind(|p| p[1] & 31 == 1 && p[2] == 0)
         .unwrap()[3]
         & 15;
     let mut cc = (cc + 1) & 15;
