@@ -37,11 +37,27 @@ pub fn create_case_directory(base: &Path, name: &str) -> io::Result<std::path::P
 }
 const READ_LIMIT: u64 = 1024 * 1024;
 const FILE_LIMIT: u64 = 8 * 1024 * 1024;
+// This lock protects only two small values. Never hold it across observations or I/O.
+#[derive(Clone)]
+struct Activity(Arc<Mutex<(&'static str, Instant)>>);
+impl Activity {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(("starting", Instant::now()))))
+    }
+    fn set(&self, operation: &'static str) {
+        *self.0.lock().unwrap() = (operation, Instant::now());
+    }
+    fn snapshot(&self) -> (&'static str, u128) {
+        let (operation, started) = *self.0.lock().unwrap();
+        (operation, started.elapsed().as_millis())
+    }
+}
 struct Target {
     pid: u32,
     start_ticks: Option<u64>,
 }
 struct State {
+    activity: Activity,
     file: File,
     bytes: u64,
     limit: u64,
@@ -62,6 +78,7 @@ impl State {
             return;
         }
         if terminal {
+            self.activity.set("write_terminal");
             let stage: String = self
                 .stage
                 .chars()
@@ -87,10 +104,13 @@ impl State {
             return;
         }
         let observation_start = Instant::now();
+        self.activity.set("observe_processes");
         let mut value = json!({"elapsed_ms":self.start.elapsed().as_millis(),"event":event,"stage":self.stage,"processes":observations(&self.targets)});
         if let Some(worker) = self.worker.as_ref().and_then(Weak::upgrade) {
+            self.activity.set("observe_worker");
             value["worker"] = worker.stats();
         }
+        self.activity.set("observe_host_pressure");
         value["host_io_pressure"] = bounded(Path::new("/proc/pressure/io"))
             .ok()
             .map_or(Value::Null, Value::String);
@@ -101,6 +121,7 @@ impl State {
         value["dropped_commands"] = json!(self.dropped.load(Ordering::Relaxed));
         value["observation_ms"] = json!(observation_start.elapsed().as_millis());
         value["previous_evidence_write_ms"] = json!(self.previous_write_ms);
+        self.activity.set("serialize_observation");
         let Ok(mut bytes) = serde_json::to_vec(&value) else {
             return;
         };
@@ -109,6 +130,7 @@ impl State {
             self.capped = true;
             bytes = b"{\"event\":\"evidence_capped\",\"observation\":\"incomplete\"}\n".to_vec();
         }
+        self.activity.set("write_observation");
         let write_start = Instant::now();
         if self
             .file
@@ -130,6 +152,7 @@ enum Event {
     Captures(Vec<DatagramCapture>),
 }
 pub struct Evidence {
+    activity: Activity,
     completion: mpsc::Receiver<()>,
     shutdown_timed_out: Arc<AtomicBool>,
     sender: Option<mpsc::SyncSender<(Instant, Event)>>,
@@ -157,7 +180,9 @@ impl Evidence {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         let dropped = Arc::new(AtomicU64::new(0));
         let shutdown_timed_out = Arc::new(AtomicBool::new(false));
+        let activity = Activity::new();
         let mut state = State {
+            activity: activity.clone(),
             file,
             bytes: 0,
             limit,
@@ -186,6 +211,7 @@ impl Evidence {
             let mut next_sample = Instant::now() + Duration::from_millis(100);
             let mut sampling = true;
             loop {
+                state.activity.set("wait_for_event");
                 let event = if sampling {
                     receiver.recv_timeout(next_sample.saturating_duration_since(Instant::now()))
                 } else {
@@ -195,6 +221,7 @@ impl Evidence {
                 };
                 match event {
                     Ok((emitted, event)) => {
+                        state.activity.set("handle_event");
                         let label = match event {
                             Event::Process(role, target) => {
                                 state.targets.insert(role, target);
@@ -207,6 +234,7 @@ impl Evidence {
                             }
                             Event::Captures(captures) => {
                                 for capture in captures {
+                                    state.activity.set("save_datagram_capture");
                                     if capture.save().is_err() {
                                         state.retention_failed = true;
                                         eprintln!("Owned datagram capture retention failed");
@@ -222,7 +250,7 @@ impl Evidence {
                         state.record(label, Some(emitted));
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        state.retention_failed |= preserve(&source, &artifact);
+                        state.retention_failed |= preserve(&source, &artifact, &state.activity);
                         state.stage = *terminal_stage.lock().unwrap();
                         state.record(
                             if terminal_unwind.load(Ordering::Relaxed) {
@@ -232,6 +260,7 @@ impl Evidence {
                             },
                             None,
                         );
+                        state.activity.set("finished");
                         let _ = finished.send(());
                         return;
                     }
@@ -248,6 +277,7 @@ impl Evidence {
             }
         });
         Ok(Self {
+            activity,
             completion,
             shutdown_timed_out,
             sender: Some(sender),
@@ -313,12 +343,15 @@ impl Drop for Evidence {
             }
         };
         if failure {
-            eprintln!(
-                "Owned media evidence incomplete at stage {}: observer did not finish",
-                *self.final_stage.lock().unwrap()
+            let stage = *self.final_stage.lock().unwrap();
+            let (operation, elapsed) = self.activity.snapshot();
+            let message = format!(
+                "Owned media evidence incomplete: observer did not finish; stage={stage}; operation={operation}; operation_elapsed_ms={elapsed}; shutdown_timed_out={}",
+                self.shutdown_timed_out.load(Ordering::Relaxed)
             );
+            eprintln!("{message}");
             if !std::thread::panicking() {
-                panic!("Owned media evidence incomplete: observer did not finish");
+                panic!("{message}");
             }
         }
     }
@@ -445,19 +478,20 @@ fn observe(target: &Target) -> io::Result<(String, Vec<Value>, usize)> {
     }
     Ok((state, rows, races))
 }
-fn preserve(source: &Path, artifact: &Path) -> bool {
+fn preserve(source: &Path, artifact: &Path, activity: &Activity) -> bool {
     let mut failed = false;
     // The allowlist excludes inline keys, wrapper arguments and any host configuration.
-    for name in [
-        "input.sdp",
-        "output.sdp",
-        "receiver.sdp",
-        "sender.log",
-        "receiver.log",
-        "worker.log",
-        "received.ts",
-        "worker.ts",
+    for (name, operation) in [
+        ("input.sdp", "retain_input.sdp"),
+        ("output.sdp", "retain_output.sdp"),
+        ("receiver.sdp", "retain_receiver.sdp"),
+        ("sender.log", "retain_sender.log"),
+        ("receiver.log", "retain_receiver.log"),
+        ("worker.log", "retain_worker.log"),
+        ("received.ts", "retain_received.ts"),
+        ("worker.ts", "retain_worker.ts"),
     ] {
+        activity.set(operation);
         let from = source.join(name);
         if !from.exists() {
             continue;

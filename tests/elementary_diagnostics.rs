@@ -262,7 +262,18 @@ fn blocked_terminal_writer(unwind: bool) {
     });
     let _ = complete.send(());
     let (completed, bytes) = reader.join().unwrap();
-    assert!(result.is_err());
+    let failure = result.expect_err("Blocked evidence writer must report incomplete evidence");
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .unwrap();
+    if unwind {
+        assert!(message.contains("controlled fixture failure"), "{message}");
+    } else {
+        assert!(message.contains("operation=write_observation"), "{message}");
+        assert!(message.contains("shutdown_timed_out=true"), "{message}");
+    }
     assert!(completed, "Unwinding waited for writer release");
     let text = String::from_utf8(bytes).unwrap();
     let final_record: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
@@ -437,5 +448,123 @@ fn existing_empty_case_or_directory_alias_is_not_reclaimed() {
     assert_eq!(
         target.path().metadata().unwrap().permissions().mode() & 0o777,
         0o750
+    );
+}
+
+#[test]
+fn blocked_source_retention_timeout_identifies_the_active_operation() {
+    blocked_artifact_operation(false);
+}
+#[test]
+fn blocked_capture_retention_timeout_identifies_the_active_operation() {
+    blocked_artifact_operation(true);
+}
+fn blocked_artifact_operation(capture: bool) {
+    use std::{
+        ffi::CString,
+        os::unix::ffi::OsStrExt,
+        time::{Duration, Instant},
+    };
+    let source = tempfile::tempdir().unwrap();
+    let artifact = tempfile::tempdir().unwrap();
+    let path = if capture {
+        artifact.path().join("output-0.rtp")
+    } else {
+        source.path().join("input.sdp")
+    };
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    // Keep a real FIFO open without draining it. Source retention waits for EOF;
+    // a capture larger than the real pipe capacity waits for a reader to drain it.
+    let mut pipe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) },
+        4096
+    );
+    if !capture {
+        use std::io::Write;
+        pipe.write_all(b"v=0\r\n").unwrap();
+    }
+    let evidence = Evidence::start(source.path(), artifact.path()).unwrap();
+    evidence.stage("owned_retention_blocked");
+    if capture {
+        let mut packets = diagnostics::DatagramCapture::new(path);
+        packets.append(&[0; 8192]).unwrap();
+        evidence.save_captures(vec![packets]);
+    }
+    let teardown = std::thread::spawn(move || drop(evidence));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let mut available: libc::c_int = 0;
+        assert_eq!(
+            unsafe { libc::ioctl(pipe.as_raw_fd(), libc::FIONREAD, &mut available) },
+            0
+        );
+        if (capture && available > 0) || (!capture && available == 0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Observer never reached owned blocked I/O"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let failure = teardown
+        .join()
+        .expect_err("Blocked observer must fail unchanged completion deadline");
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .unwrap();
+    // Release real backpressure before asserting, then wait for detached observer
+    // completion so the owned temporary paths outlive all retention operations.
+    if capture {
+        use std::io::Read;
+        let mut bytes = [0; 8196];
+        pipe.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes[..4], &8192u32.to_be_bytes());
+    }
+    drop(pipe);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let records = entries(artifact.path());
+        if records.last().is_some_and(|v| v["event"] == "finished") {
+            assert_eq!(records.last().unwrap()["shutdown_timed_out"], true);
+            assert_eq!(records.last().unwrap()["incomplete"], true);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Released observer did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let operation = if capture {
+        "save_datagram_capture"
+    } else {
+        "retain_input.sdp"
+    };
+    assert!(
+        message.contains(&format!("operation={operation}")),
+        "{message}"
+    );
+    let elapsed = message
+        .split("operation_elapsed_ms=")
+        .nth(1)
+        .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|s| s.parse::<u128>().ok());
+    assert!(elapsed.is_some_and(|ms| ms >= 1000), "{message}");
+    assert!(
+        !message.contains(source.path().to_str().unwrap()),
+        "Private paths must not be logged"
+    );
+    assert!(
+        !message.contains(artifact.path().to_str().unwrap()),
+        "Private paths must not be logged"
     );
 }
