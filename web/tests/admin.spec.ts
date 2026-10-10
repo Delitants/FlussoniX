@@ -960,3 +960,28 @@ test('source exclusions use editable stream patterns and persist removal without
  await expect(page.getByRole('cell',{name,exact:true})).toBeVisible();saved=await(await request.get(`/streamer/api/v3/cluster/sources/${name}`,{headers})).json();expect(saved.except).toEqual([]);
  expect((await request.delete(`/streamer/api/v3/cluster/sources/${name}`,{headers})).ok()).toBeTruthy();
 });
+
+test('source URL identity supports friendly create edit staging and delete',async({page,request})=>{
+ test.setTimeout(60000);
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const key='m4ss://ui-url-source.invalid:8443';const uri='/streamer/api/v3/cluster/sources/'+encodeURIComponent(key);
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();await page.getByRole('button',{name:'Source servers',exact:true}).click();await page.getByRole('button',{name:'Add source',exact:true}).click();
+ await page.getByLabel('Source identity',{exact:true}).selectOption('url',{timeout:8000});
+ await page.getByLabel('Source address',{exact:true}).fill('m4s://user:password@ui-url-source.invalid');
+ await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog',{name:'Add source'}).getByRole('alert')).toContainText('without credentials');
+ await page.getByLabel('Source address',{exact:true}).fill(key);
+ await expect(page.getByLabel('Management trusted CA file',{exact:true})).toBeVisible();
+ await expect(page.locator('textarea')).toHaveCount(0);
+ await page.screenshot({path:'../.runtime/screenshots/source-url-identity.png',fullPage:true});
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ const row=()=>page.getByRole('row').filter({has:page.getByRole('cell',{name:key,exact:true})});
+ await expect(row()).toBeVisible();let saved=await(await request.get(uri,{headers})).json();expect(saved.url).toBe(key);expect(saved.hostname).toBeUndefined();expect(saved.api_url).toBe('https://ui-url-source.invalid:8443/');expect(saved.flussonix_transport).toBe('m4s');
+ await row().getByRole('button',{name:'Edit',exact:true}).click();await expect(page.getByLabel('Source address',{exact:true})).toHaveAttribute('readonly','');await expect(page.getByLabel('Source identity',{exact:true})).toBeDisabled();
+ await page.getByRole('button',{name:'Add exclusion',exact:true}).click();await page.getByLabel('Excluded stream or prefix 1',{exact:true}).fill('blocked/*');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(row()).toBeVisible();
+ saved=await(await request.get(uri,{headers})).json();expect(saved.except).toEqual(['blocked/*']);
+ await page.getByRole('button',{name:'Config',exact:true}).click();await page.getByRole('button',{name:'Source servers',exact:true}).first().click();await row().getByRole('button',{name:'Edit',exact:true}).click();await page.getByLabel('Excluded stream or prefix 1',{exact:true}).fill('changed/*');await page.getByRole('button',{name:'Stage changes',exact:true}).click();
+ expect((await(await request.get(uri,{headers})).json()).except).toEqual(['blocked/*']);await page.getByRole('button',{name:'Validate',exact:true}).click();await expect(page.getByRole('status')).toContainText('Saved state has not changed');await page.getByRole('button',{name:'Save & apply',exact:true}).click();await expect(page.getByRole('status')).toContainText('saved and applied');
+ expect((await(await request.get(uri,{headers})).json()).except).toEqual(['changed/*']);
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();await page.getByRole('button',{name:'Source servers',exact:true}).click();
+ page.once('dialog',d=>d.accept());await row().getByRole('button',{name:'Delete',exact:true}).click();await expect(row()).toHaveCount(0);expect((await request.get(uri,{headers})).status()).toBe(404);
+});

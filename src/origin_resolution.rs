@@ -120,7 +120,7 @@ impl App {
             .get(name)
             .filter(|m| m.known && self.config.effective(name).is_none())
         {
-            stats["upstream_source"] = m.source["hostname"].clone();
+            stats["upstream_source"] = json!(crate::config::item_key("sources", &m.source));
             stats["source_group"] = m.source["flussonix_source_group"].clone();
             stats["source_switches"] = json!(m.switches);
             stats["source_available"] = json!(m.available);
@@ -264,7 +264,10 @@ impl App {
             }
             let switches = old.map_or(0, |m| {
                 m.switches.saturating_add(u64::from(
-                    m.known && known && m.source["hostname"] != source["hostname"],
+                    m.known
+                        && known
+                        && crate::config::item_key("sources", &m.source)
+                            != crate::config::item_key("sources", source),
                 ))
             });
             let mirror = Mirror {

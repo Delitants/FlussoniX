@@ -709,3 +709,48 @@ async fn excluding_all_origins_stops_an_existing_pull_and_revokes_its_viewer() {
     assert_eq!(blocked, 404);
     assert_eq!(recovered, 0);
 }
+
+// Break caught: URL-only replicas compare two absent hostnames and report no source switch.
+#[tokio::test]
+async fn url_keyed_source_replicas_pull_and_switch_with_correct_identity() {
+    let _load = MEDIA_TESTS.acquire().await.unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let (a, b, cdn) = setup(d.path(), "m4s").await;
+    for alias in ["a", "b"] {
+        cdn.app.config.delete("sources", alias).unwrap();
+    }
+    let a_key = format!("m4s://{}", a.url.strip_prefix("http://").unwrap());
+    let b_key = format!("m4s://{}", b.url.strip_prefix("http://").unwrap());
+    for (key, secret) in [
+        (&a_key, "source-a-owned-key"),
+        (&b_key, "source-b-owned-key"),
+    ] {
+        cdn.app
+            .config
+            .put(
+                "sources",
+                key,
+                json!({"cluster_key":secret,"flussonix_source_group":"owned-replicas"}),
+            )
+            .unwrap();
+    }
+    let initial = play(&cdn).await.status();
+    if initial != 200 {
+        cleanup([a, b, cdn]).await;
+        assert_eq!(initial, 200);
+        return;
+    }
+    let first = selected(&cdn).await;
+    let session = cdn.app.playback_auth.snapshots()[0]["id"].clone();
+    kill_cdn_worker(&cdn).await;
+    cdn.app.reconcile().await;
+    let second = selected(&cdn).await;
+    let after = play(&cdn).await.status();
+    let same_session = cdn.app.playback_auth.snapshots()[0]["id"] == session;
+    cleanup([a, b, cdn]).await;
+    assert_eq!(first["stats"]["upstream_source"], a_key);
+    assert_eq!(second["stats"]["upstream_source"], b_key);
+    assert_eq!(second["stats"]["source_switches"], 1);
+    assert_eq!(after, 200);
+    assert!(same_session);
+}

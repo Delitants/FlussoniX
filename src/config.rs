@@ -42,12 +42,13 @@ pub struct ConfigStore {
 impl ConfigStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref().to_owned();
-        let data = if path.exists() {
+        let mut data = if path.exists() {
             serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?
         } else {
             json!({"streams":[],"templates":[],"peers":[],"sources":[],"auth_backends":[]})
         };
+        normalize_sources(&mut data)?;
         validate_root(&data)?;
         Ok(Self {
             path,
@@ -70,7 +71,8 @@ impl ConfigStore {
         self.data.lock().unwrap().clone()
     }
     pub fn validate(&self, patch: Value) -> Result<Value, String> {
-        let next = merge(&self.snapshot(), &patch);
+        let mut next = merge(&self.snapshot(), &patch);
+        normalize_sources(&mut next)?;
         validate_root(&next)?;
         Ok(next)
     }
@@ -99,7 +101,8 @@ impl ConfigStore {
     }
     pub fn replace(&self, patch: Value) -> Result<Value, String> {
         let mut data = self.data.lock().unwrap();
-        let next = merge(&data, &patch);
+        let mut next = merge(&data, &patch);
+        normalize_sources(&mut next)?;
         validate_root(&next)?;
         self.save(&next)?;
         *data = next.clone();
@@ -110,21 +113,29 @@ impl ConfigStore {
         if !KINDS.contains(&kind) {
             return Err("unknown collection".into());
         }
-        valid_name(name)?;
+        valid_key(kind, name)?;
         if !patch.is_object() {
             return Err("configuration must be an object".into());
+        }
+        if kind == "sources"
+            && name.contains("://")
+            && patch
+                .get("url")
+                .is_some_and(|v| !v.is_null() && v.as_str() != Some(name))
+        {
+            return Err("source URL must match the request identity".into());
         }
         let mut data = self.data.lock().unwrap();
         let mut next = data.clone();
         let items = next[kind]
             .as_array_mut()
             .ok_or("collection must be an array")?;
-        let index = items
-            .iter()
-            .position(|x| x["name"] == name || x["hostname"] == name);
+        let index = items.iter().position(|x| item_key(kind, x) == Some(name));
         let old = index.map(|i| items[i].clone()).unwrap_or(json!({}));
         let mut item = merge(&old, &patch);
-        item[if matches!(kind, "peers" | "sources") {
+        item[if kind == "sources" && name.contains("://") {
+            "url"
+        } else if matches!(kind, "peers" | "sources") {
             "hostname"
         } else {
             "name"
@@ -134,8 +145,16 @@ impl ConfigStore {
         } else {
             items.push(item.clone())
         }
+        normalize_sources(&mut next)?;
         validate_root(&next)?;
         self.save(&next)?;
+        let item = next[kind]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| item_key(kind, row) == Some(name))
+            .unwrap()
+            .clone();
         *data = next;
         self.revision.fetch_add(1, Ordering::Release);
         Ok(item)
@@ -150,7 +169,7 @@ impl ConfigStore {
             .as_array_mut()
             .ok_or("collection must be an array")?;
         let before = items.len();
-        items.retain(|x| x["name"] != name && x["hostname"] != name);
+        items.retain(|x| item_key(kind, x) != Some(name));
         let removed = items.len() != before;
         validate_root(&next)?;
         self.save(&next)?;
@@ -246,6 +265,68 @@ pub fn hls_subtitles(cfg: &Value) -> Result<&'static str, String> {
         _ => Err("HLS subtitle mode must be passthrough, convert or drop".into()),
     }
 }
+/// Stable collection identity; URL-keyed sources coexist with existing native aliases.
+pub fn item_key<'a>(kind: &str, item: &'a Value) -> Option<&'a str> {
+    match kind {
+        "sources" => item.get("url").or_else(|| item.get("hostname"))?.as_str(),
+        "peers" => item["hostname"].as_str(),
+        _ => item["name"].as_str(),
+    }
+}
+fn valid_key(kind: &str, key: &str) -> Result<(), String> {
+    if kind == "sources" && key.contains("://") {
+        source_address(key).map(|_| ())
+    } else {
+        valid_name(key)
+    }
+}
+/// A source identity is a server root, never a stream path or credential carrier.
+fn source_address(raw: &str) -> Result<(String, &'static str), String> {
+    let invalid = || {
+        "source URL requires m4f/m4fs/m4s/m4ss://HOST[:PORT], without credentials, path, query or fragment".to_string()
+    };
+    if raw.len() > 4096
+        || raw.bytes().any(|b| !(0x21..=0x7e).contains(&b))
+        || raw.contains(['@', '?', '#', '\\', '%'])
+    {
+        return Err(invalid());
+    }
+    let (scheme, authority) = raw.split_once("://").ok_or_else(invalid)?;
+    let (http, transport) = match scheme {
+        "m4f" => ("http", "m4f"),
+        "m4fs" => ("https", "m4f"),
+        "m4s" => ("http", "m4s"),
+        "m4ss" => ("https", "m4s"),
+        _ => return Err(invalid()),
+    };
+    let authority = authority.strip_suffix('/').unwrap_or(authority);
+    if authority.is_empty() || authority.contains('/') || authority.ends_with(':') {
+        return Err(invalid());
+    }
+    let endpoint = url::Url::parse(&format!("{http}://{authority}")).map_err(|_| invalid())?;
+    if endpoint.host_str().is_none() || endpoint.port() == Some(0) || endpoint.path() != "/" {
+        return Err(invalid());
+    }
+    Ok((endpoint.to_string(), transport))
+}
+fn normalize_sources(root: &mut Value) -> Result<(), String> {
+    for source in root
+        .get_mut("sources")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(raw) = source.get("url") {
+            let (api, transport) =
+                source_address(raw.as_str().ok_or("source URL must be a string")?)?;
+            let row = source.as_object_mut().ok_or("source must be an object")?;
+            row.entry("api_url").or_insert(json!(api));
+            row.entry("flussonix_transport").or_insert(json!(transport));
+        }
+    }
+    Ok(())
+}
+
 pub fn valid_name(name: &str) -> Result<(), String> {
     if name.is_empty()
         || name.len() > 256
@@ -300,14 +381,15 @@ fn validate_root(root: &Value) -> Result<(), String> {
             .ok_or_else(|| format!("{kind} must be an array"))?;
         let mut names = std::collections::HashSet::new();
         for item in items {
-            let name = item[if matches!(*kind, "sources" | "peers") {
-                "hostname"
+            let name = item_key(kind, item).ok_or("missing collection identity")?;
+            if *kind == "sources" && item.get("url").is_some() {
+                source_address(name)?;
             } else {
-                "name"
-            }]
-            .as_str()
-            .ok_or("missing name/hostname")?;
-            valid_name(name)?;
+                valid_name(name)?;
+            }
+            if *kind == "sources" && item.get("url").is_some() && item.get("hostname").is_some() {
+                return Err("source requires either url or hostname, not both".into());
+            }
             if !names.insert(name) {
                 return Err("duplicate name".into());
             }
@@ -336,6 +418,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                 ],
                 "peers" | "sources" => &[
                     "hostname",
+                    "url",
                     "api_url",
                     "public_payload_url",
                     "flussonix_rtsp_url",
@@ -380,6 +463,9 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     }
                 }
             }
+            if *kind == "peers" && item.get("url").is_some() {
+                return Err("source URL identity is source-only".into());
+            }
             if let Some(id) = item.get("flussonix_content_id") {
                 valid_identity(id)?;
             }
@@ -414,6 +500,9 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "private_payload_url",
                     "url",
                 ] {
+                    if *kind == "sources" && field == "url" {
+                        continue;
+                    }
                     if let Some(v) = item.get(field) {
                         let url =
                             url::Url::parse(v.as_str().ok_or("endpoint must be a URL string")?)

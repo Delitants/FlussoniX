@@ -332,3 +332,6 @@ CA bundles must exist on every receiving node; files are not distributed from th
 
 
 Native sources now support the reference `except` blacklist for exact names and `prefix/*` subtree patterns. This is source-local: an allowed origin can still supply an excluded name from another origin. Configuration changes fence cached/in-flight routes and reconciliation stops stale workers. The UI exposes ordinary exclusion rows. See [source exclusions](compatibility.md#cluster-source-exclusions) for bounds and the remaining URL identity, prefix mapping and static `only` gaps.
+
+
+Native origin rows may use either an existing `hostname` alias or a URL primary key (`m4f`, `m4fs`, `m4s`, `m4ss` server root). URL rows infer their native HTTP(S) discovery endpoint and media transport unless explicitly overridden. The private media endpoint still supports LAN separation and its own trust profile. Resolver fencing, policy/content/group equivalence and source-local exclusions apply to both identities; selected-source telemetry and switch counts use the actual identity. See [the URL source profile](compatibility.md#url-keyed-cluster-source-configuration).

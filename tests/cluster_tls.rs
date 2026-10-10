@@ -108,6 +108,9 @@ async fn media_endpoint(app: Arc<App>) -> MediaEndpoint {
     }
 }
 async fn topology(transport: &str, separate_media: bool) {
+    topology_with_source_identity(transport, separate_media, false).await;
+}
+async fn topology_with_source_identity(transport: &str, separate_media: bool, url_identity: bool) {
     let source = node("source").await;
     let cdn = node("cdn").await;
     let lb = node("lb").await;
@@ -117,10 +120,23 @@ async fn topology(transport: &str, separate_media: bool) {
         None
     };
     source.app.config.put("streams","region/owned",json!({"static":false,"inputs":[{"url":"testsrc://"}],"transcoder":{"encoder":"libx264","vb":900},"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"owned-viewer"))})).unwrap();
+    let source_id = if url_identity {
+        format!(
+            "{transport}s://{}",
+            source.url.strip_prefix("https://").unwrap()
+        )
+    } else {
+        "origin".into()
+    };
     for app in [&cdn.app, &lb.app] {
-        app.config.put("sources","origin",json!({"api_url":source.url,"flussonix_tls_ca":source.cert.ca,"flussonix_transport":transport})).unwrap();
+        let row = if url_identity {
+            json!({"flussonix_tls_ca":source.cert.ca})
+        } else {
+            json!({"api_url":source.url,"flussonix_tls_ca":source.cert.ca,"flussonix_transport":transport})
+        };
+        app.config.put("sources", &source_id, row).unwrap();
         if let Some(private) = &private {
-            app.config.put("sources","origin",json!({"private_payload_url":private.url,"flussonix_media_tls_ca":private.cert.ca})).unwrap();
+            app.config.put("sources",&source_id,json!({"private_payload_url":private.url,"flussonix_media_tls_ca":private.cert.ca})).unwrap();
         }
     }
     lb.app
@@ -567,4 +583,14 @@ async fn private_hls_and_ts_custom_ca_redirects_never_reach_another_origin() {
     }
     foreign.abort();
     let _ = foreign.await;
+}
+
+// Break caught: inferred secure URL endpoints or transport fail in real native discovery/media.
+#[tokio::test]
+async fn url_keyed_m4ss_source_uses_verified_tls_for_discovery_and_media() {
+    topology_with_source_identity("m4s", false, true).await;
+}
+#[tokio::test]
+async fn url_keyed_m4fs_source_preserves_original_segments_over_verified_tls() {
+    topology_with_source_identity("m4f", false, true).await;
 }

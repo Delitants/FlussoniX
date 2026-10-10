@@ -625,7 +625,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
                     .as_array()
                     .and_then(|v| {
                         v.iter()
-                            .find(|v| v["name"] == name || v["hostname"] == name)
+                            .find(|v| crate::config::item_key(kind, v) == Some(name))
                     })
                     .cloned()
             };
@@ -714,13 +714,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         };
         (page.items, page.next, page.prev)
     } else {
-        items.sort_by_key(|v| {
-            v["name"]
-                .as_str()
-                .or(v["hostname"].as_str())
-                .unwrap_or("")
-                .to_owned()
-        });
+        items.sort_by_key(|v| crate::config::item_key(kind, v).unwrap_or("").to_owned());
         if query.get("sort").is_some_and(|s| s == "-name") {
             items.reverse()
         }
