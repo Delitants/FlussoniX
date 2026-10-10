@@ -203,6 +203,56 @@ fn sustained_audio_clock_compression_closes_the_generation_at_a_quarter_second()
         "clock rejection must be terminal"
     );
 }
+#[test]
+fn audio_clock_overlap_limit_accepts_22500_ticks_and_rejects_22501() {
+    // Fourteen literal 48kHz AAC-LC frames advance from 90000 to 116880.
+    // The next PES clock is nondecreasing but exactly 250ms (or one tick more)
+    // behind the sample clock. No value is calculated by the implementation.
+    let adts = [255, 241, 76, 128, 1, 31, 252, 42];
+    for (source, accepted) in [(94380, true), (94379, false)] {
+        let mut data = Muxer::new(&[track("aac", 1, &[0x11, 0x90])])
+            .unwrap()
+            .tables();
+        let mut cc = 0;
+        data.extend(packets(256, &pes(&adts.repeat(14), 90000), &mut cc));
+        let mut decoder = Decoder::default();
+        let first = decoder.push(&data).unwrap();
+        assert_eq!(samples(&first).last().unwrap().dts, 114960);
+        let next = decoder.push(&packets(256, &pes(&adts, source), &mut cc));
+        if accepted {
+            let next = next.unwrap();
+            assert!(
+                matches!(next.as_slice(), [Event::Frame(f)] if f.dts == 116880 && f.body == [42])
+            );
+        } else {
+            assert!(next.is_err());
+            assert!(decoder.finish().is_err());
+        }
+    }
+}
+#[test]
+fn ordinary_backwards_source_pes_clock_is_rejected_after_sample_clock_correction() {
+    let mut decoder = Decoder::default();
+    let first = mux(
+        &[track("aac", 1, &[0x11, 0x90])],
+        &[frame(1, 90000, &[42]), frame(1, 90001, &[42])],
+    );
+    decoder.push(&first).unwrap();
+    let adts = [255, 241, 76, 128, 1, 31, 252, 42];
+    let cc = first
+        .chunks_exact(188)
+        .filter(|p| p[1] & 31 == 1 && p[2] == 0)
+        .last()
+        .unwrap()[3]
+        & 15;
+    let mut cc = (cc + 1) & 15;
+    assert!(
+        decoder
+            .push(&packets(256, &pes(&adts, 90000), &mut cc))
+            .is_err()
+    );
+    assert!(decoder.finish().is_err());
+}
 fn stamp(value: u64, kind: u8) -> [u8; 5] {
     [
         kind << 4 | ((value >> 29) as u8 & 14) | 1,

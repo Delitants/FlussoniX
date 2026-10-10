@@ -3,6 +3,8 @@ use flussonix::media::Engine;
 use serde_json::{Value, json};
 use std::{net::UdpSocket, path::Path, time::Duration};
 use tokio::process::Command;
+#[path = "decoder_readiness.rs"]
+mod decoder_readiness;
 fn ports() -> (u16, Vec<UdpSocket>) {
     for _ in 0..64 {
         let a = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -418,10 +420,11 @@ pub async fn qualify(
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let ready = (private..private + track * 2).all(|p| {
-                UdpSocket::bind(("127.0.0.1", p))
-                    .is_err_and(|e| e.kind() == std::io::ErrorKind::AddrInUse)
-            });
+            let ready = decoder_readiness::ready(
+                receiver.id().unwrap(),
+                &(private..private + track * 2).collect::<Vec<_>>(),
+            )
+            .unwrap();
             if ready {
                 break;
             }
