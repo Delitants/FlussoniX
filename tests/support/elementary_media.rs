@@ -5,6 +5,8 @@ use std::{net::UdpSocket, path::Path, time::Duration};
 use tokio::process::Command;
 #[path = "decoder_readiness.rs"]
 mod decoder_readiness;
+#[path = "elementary_diagnostics.rs"]
+mod elementary_diagnostics;
 fn ports() -> (u16, Vec<UdpSocket>) {
     for _ in 0..64 {
         let a = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -125,6 +127,17 @@ pub async fn qualify(
             std::fs::create_dir_all(&p).unwrap();
             p
         });
+    let evidence = artifact
+        .as_ref()
+        .map(|out| elementary_diagnostics::Evidence::start(d.path(), out).unwrap());
+    let stage = |name| {
+        if let Some(evidence) = &evidence {
+            evidence.stage(name);
+        }
+    };
+    if let Some(evidence) = &evidence {
+        evidence.watch_process("native_test_process", std::process::id());
+    }
     let (input, reserved) = ports();
     let (input_sdp, output_sdp) = (d.path().join("input.sdp"), d.path().join("output.sdp"));
     let mut sender = Command::new(&ffmpeg);
@@ -219,7 +232,12 @@ pub async fn qualify(
         .stdout(std::process::Stdio::null())
         .stderr(std::fs::File::create(d.path().join("sender.log")).unwrap())
         .kill_on_drop(true);
+    stage("sender_spawn");
     let mut sender = sender.spawn().unwrap();
+    if let Some(evidence) = &evidence {
+        evidence.watch_process("sender", sender.id().unwrap());
+    }
+    stage("sender_sdp_startup");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if std::fs::read(&input_sdp).is_ok_and(|b| b.starts_with(b"v=0") && b.ends_with(b"\n"))
@@ -257,7 +275,7 @@ pub async fn qualify(
     std::fs::write(
         &executable,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexec {} \"$@\" 2> {}\n",
+            "#!/bin/sh\numask 077\nprintf '%s\\n' \"$@\" > {}\nexec {} \"$@\" 2> {}\n",
             quote(&diagnostics.join("worker-args.txt")),
             quote(Path::new(&ffmpeg)),
             quote(&diagnostics.join("worker.log"))
@@ -287,7 +305,12 @@ pub async fn qualify(
     if secure_output {
         cfg["flussonix_rtp_outputs"][0]["flussonix_rtp"]["key_file"] = json!(key_path);
     }
+    stage("worker_spawn");
     let worker = engine.ensure("owned", &cfg).await.unwrap();
+    if let Some(evidence) = &evidence {
+        evidence.watch_worker(&worker);
+    }
+    stage("worker_sdp_startup");
     let record_cancel = tokio_util::sync::CancellationToken::new();
     let mut ts = worker.subscribe();
     let mut record = std::fs::File::create(d.path().join("worker.ts")).unwrap();
@@ -310,19 +333,7 @@ pub async fn qualify(
         }
     })
     .await
-    .unwrap_or_else(|_| {
-        if let Some(out) = &artifact {
-            for file in ["input.sdp", "sender.log"] {
-                let _ = std::fs::copy(d.path().join(file), out.join(file));
-            }
-            std::fs::write(
-                out.join("worker-stats.json"),
-                serde_json::to_vec_pretty(&worker.stats()).unwrap(),
-            )
-            .unwrap();
-        }
-        panic!("SDP startup: {}", worker.stats())
-    });
+    .unwrap_or_else(|_| panic!("SDP startup: {}", worker.stats()));
     if ffmpeg == "/usr/bin/ffmpeg" {
         // Plaintext decoder sockets may only exist on the trusted loopback
         // boundary, even though public sockets are authenticated separately.
@@ -384,6 +395,7 @@ pub async fn qualify(
     std::fs::set_permissions(&receiver_sdp, std::fs::Permissions::from_mode(0o600)).unwrap();
     drop(private_reserved);
     let received = d.path().join("received.ts");
+    stage("receiver_spawn");
     let mut receiver = Command::new(&ffmpeg)
         .args([
             "-nostdin",
@@ -418,6 +430,10 @@ pub async fn qualify(
         .kill_on_drop(true)
         .spawn()
         .unwrap();
+    if let Some(evidence) = &evidence {
+        evidence.watch_process("receiver", receiver.id().unwrap());
+    }
+    stage("receiver_socket_startup");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let ready = decoder_readiness::ready(
@@ -457,7 +473,9 @@ pub async fn qualify(
             tokio::select! {biased;_=c.cancelled()=>return,r=socket.send_to(&bytes[..n], ("127.0.0.1", private + i as u16))=>{let _=r;}}
         }});
     }
+    stage("media_delivery");
     let result = tokio::time::timeout(Duration::from_secs(15), receiver.wait()).await;
+    stage("receiver_wait_complete");
     cancel.cancel();
     while relay.join_next().await.is_some() {}
     record_cancel.cancel();
@@ -469,44 +487,18 @@ pub async fn qualify(
         let _ = receiver.wait().await;
     }
     let stats = worker.stats();
+    stage("worker_shutdown");
     engine.stop_all().await;
-    if let Ok(base) = std::env::var("FLUSSONIX_ELEMENTARY_ARTIFACT_DIR") {
-        let out = Path::new(&base).join(format!(
-            "{}-{}-{}-{}-{}",
-            video.unwrap_or("audio"),
-            audio.join("-"),
-            profile["encoder"].as_str().unwrap_or("copy"),
-            secure_input,
-            secure_output
-        ));
-        std::fs::create_dir_all(&out).unwrap();
-        for file in [
-            "input.sdp",
-            "output.sdp",
-            "receiver.sdp",
-            "sender.log",
-            "receiver.log",
-            "received.ts",
-            "worker.ts",
-        ] {
-            let from = d.path().join(file);
-            if from.exists() {
-                if file == "receiver.sdp" && secure_output {
-                    let cleaned = std::fs::read_to_string(from)
-                        .unwrap()
-                        .lines()
-                        .filter(|l| !l.starts_with("a=crypto:"))
-                        .collect::<Vec<_>>()
-                        .join("\r\n");
-                    std::fs::write(out.join(file), cleaned).unwrap();
-                } else {
-                    std::fs::copy(from, out.join(file)).unwrap();
-                }
-            }
-        }
+    stage("worker_stopped");
+    if let Some(out) = &artifact {
         std::fs::write(
             out.join("worker-stats.json"),
             serde_json::to_vec_pretty(&stats).unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            out.join("worker-stats.json"),
+            std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
     }
@@ -542,7 +534,10 @@ pub async fn qualify(
             }
         })
         .collect();
+    stage("probe_worker_recording");
     decode(&d.path().join("worker.ts"), output_video, &expected).await;
+    stage("probe_receiver_recording");
     decode(&received, output_video, &expected).await;
+    stage("qualified");
     assert!(!Path::new(&format!("/proc/{}", worker.pid())).exists());
 }

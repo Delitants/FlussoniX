@@ -25,9 +25,20 @@ jobs:
       - name: Owned cluster daemon environment isolation
         run: FLUSSONIX_SRT_PLAY_PASSPHRASE=owned-unused-SRT-setting cargo test --locked --test cluster_native_recovery daemon_recovers_equivalent_native_tls_origin_without_viewer_requests -- --exact --test-threads=1
       - name: Rust qualification and owned browser caption fixture
+        id: rust_qualification
+        env:
+          FLUSSONIX_ELEMENTARY_ARTIFACT_DIR: ${{ runner.temp }}/flussonix-elementary-evidence
         run: |
           mkdir -p .runtime
           FLUSSONIX_NATIVE_AUDIO_FIXTURE_FILE="$PWD/.runtime/owned-native-audio.m4s" FLUSSONIX_NATIVE_FIXTURE_FILE="$PWD/.runtime/owned-native.m4s" FLUSSONIX_DVB_FIXTURE_FILE="$PWD/.runtime/owned-dvb.ts" FLUSSONIX_TELETEXT_FIXTURE_FILE="$PWD/.runtime/owned-teletext.ts" FLUSSONIX_708_FIXTURE_FILE="$PWD/.runtime/owned-708.ts" FLUSSONIX_CAPTION_FIXTURE_FILE="$PWD/.runtime/owned-captions.ts" cargo test --locked -- --test-threads=1
+      - name: Retain owned elementary media failure evidence
+        if: failure() && steps.rust_qualification.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: elementary-media-failure-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/flussonix-elementary-evidence/
+          retention-days: 3
+          if-no-files-found: warn
       - uses: actions/setup-node@v7
         with:
           node-version: 22
