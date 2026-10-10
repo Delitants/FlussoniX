@@ -77,10 +77,7 @@ pub fn udp_packet(packet: &[u8]) -> Option<(u16, u16, &[u8])> {
     ))
 }
 
-use super::{
-    decoder_readiness,
-    elementary_diagnostics::{DatagramCapture, Evidence},
-};
+use super::elementary_diagnostics::{DatagramCapture, Evidence};
 use serde_json::{Value, json};
 use std::{
     net::UdpSocket,
@@ -102,34 +99,47 @@ pub struct Tap<'a> {
     done: mpsc::Receiver<(Value, DatagramCapture)>,
     thread: Option<JoinHandle<()>>,
     outcome: Option<(Value, Option<DatagramCapture>)>,
+    owner: Owner,
 }
 impl<'a> Tap<'a> {
+    #[allow(
+        dead_code,
+        reason = "reservation validation is exercised independently of media startup"
+    )]
     pub fn public(
         reserved: &[UdpSocket],
         evidence: &'a Evidence,
         artifact: &Path,
         origin: Instant,
     ) -> io::Result<Self> {
-        let ports = reserved
-            .iter()
-            .map(|socket| {
-                let address = socket.local_addr()?;
-                if address.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
-                    return Err(io::Error::other(
-                        "packet tap requires owned loopback sockets",
-                    ));
-                }
-                Ok(address.port())
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        Self::start(
-            &ports,
-            "source_to_public",
-            evidence,
-            artifact,
-            origin,
-            json!({"ownership":"fixture_reserved_public_ports"}),
-        )
+        let result = (|| {
+            let ports = reserved
+                .iter()
+                .map(|socket| {
+                    let address = socket.local_addr()?;
+                    if address.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+                        return Err(io::Error::other(
+                            "packet tap requires owned loopback sockets",
+                        ));
+                    }
+                    Ok(address.port())
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let owner = Owner::snapshot(std::process::id(), &ports)?;
+            Self::start(owner, "source_to_public", evidence, artifact, origin)
+        })();
+        Self::report_activation(result, "source_to_public", evidence)
+    }
+    pub fn native_input(
+        pid: u32,
+        ports: &[u16],
+        evidence: &'a Evidence,
+        artifact: &Path,
+        origin: Instant,
+    ) -> io::Result<Self> {
+        let result = Owner::snapshot(pid, ports)
+            .and_then(|owner| Self::start(owner, "source_to_public", evidence, artifact, origin));
+        Self::report_activation(result, "source_to_public", evidence)
     }
     pub fn decoder(
         pid: u32,
@@ -138,45 +148,37 @@ impl<'a> Tap<'a> {
         artifact: &Path,
         origin: Instant,
     ) -> io::Result<Self> {
-        let start_ticks = super::elementary_diagnostics::identity(pid)?.0;
-        if ports.is_empty()
-            || !decoder_readiness::ready(pid, ports)?
-            || super::elementary_diagnostics::identity(pid)?.0 != start_ticks
-        {
-            return Err(io::Error::other(
-                "private tap requires the owned decoder sockets",
-            ));
+        let result = Owner::snapshot(pid, ports)
+            .and_then(|owner| Self::start(owner, "relay_to_decoder", evidence, artifact, origin));
+        Self::report_activation(result, "relay_to_decoder", evidence)
+    }
+    fn report_activation(
+        result: io::Result<Self>,
+        boundary: &'static str,
+        evidence: &Evidence,
+    ) -> io::Result<Self> {
+        if let Err(error) = &result {
+            evidence.save_packet_tap(json!({"boundary":boundary,"incomplete":true,"observation":"unavailable","setup_os_error":error.raw_os_error()}),None);
         }
-        Self::start(
-            ports,
-            "relay_to_decoder",
-            evidence,
-            artifact,
-            origin,
-            json!({"ownership":"decoder_fd_inodes_at_activation", "pid":pid, "start_ticks":start_ticks}),
-        )
+        result
     }
     fn start(
-        ports: &[u16],
+        owner: Owner,
         boundary: &'static str,
         evidence: &'a Evidence,
         artifact: &Path,
         origin: Instant,
-        ownership: Value,
     ) -> io::Result<Self> {
-        let socket = match packet_socket(ports) {
-            Ok(socket) => socket,
-            Err(error) => {
-                evidence.save_packet_tap(json!({"boundary":boundary,"incomplete":true,"observation":"unavailable","setup_os_error":error.raw_os_error()}),None);
-                return Err(error);
-            }
-        };
+        let ports = owner.sockets.keys().copied().collect::<Vec<_>>();
+        let socket = packet_socket(&ports)?;
+        let ownership =
+            json!({"pid":owner.pid,"start_ticks":owner.start_ticks,"socket_inodes":owner.sockets});
         let activated = origin.elapsed().as_nanos() as u64;
         let stop = Arc::new(AtomicBool::new(false));
         let cancellation = stop.clone();
         let (finished, done) = mpsc::channel();
         let mut capture = DatagramCapture::new(artifact.join(format!("{boundary}.packets")));
-        let ports = ports.to_vec();
+
         let thread = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut records = 0u64;
@@ -296,7 +298,7 @@ impl<'a> Tap<'a> {
             let summary = json!({"boundary":boundary,"ports":ports,"ownership":ownership,
                 "observation":"kernel_loopback_host_copy","application_receipt_proven":false,
                 "coverage_start_ns":activated,"coverage_end_ns":coverage_end,
-                "private_startup_not_observed":boundary=="relay_to_decoder",
+                "startup_not_observed":true,
                 "records":records,"outgoing_copies_ignored":duplicates_ignored,
                 "kernel_packets":if available {Some(stats.packets)} else {None},
                 "kernel_drops":if available {Some(stats.drops)} else {None},
@@ -313,6 +315,7 @@ impl<'a> Tap<'a> {
             done,
             thread: Some(thread),
             outcome: None,
+            owner,
         })
     }
 }
@@ -394,7 +397,7 @@ impl Tap<'_> {
                         None,
                     )
                 } else {
-                    (summary, Some(capture))
+                    enforce_owner(&self.owner, summary, capture)
                 }
             }
             Err(_) => {
@@ -414,4 +417,62 @@ impl Drop for Tap<'_> {
         let (summary, capture) = self.outcome.take().unwrap();
         self.evidence.save_packet_tap(summary, capture);
     }
+}
+
+pub struct Owner {
+    pid: u32,
+    start_ticks: u64,
+    sockets: std::collections::BTreeMap<u16, u64>,
+}
+impl Owner {
+    pub fn snapshot(pid: u32, ports: &[u16]) -> io::Result<Self> {
+        // Only retry a transient descriptor-scan race. Missing/changed owners or
+        // sockets are never converted to successful evidence, and media is not retried.
+        let mut race = None;
+        for _ in 0..4 {
+            match super::elementary_diagnostics::udp_ownership(pid, ports) {
+                Ok((start_ticks, sockets)) => {
+                    return Ok(Self {
+                        pid,
+                        start_ticks,
+                        sockets,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => race = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(race.unwrap())
+    }
+}
+pub fn enforce_owner(
+    owner: &Owner,
+    mut summary: Value,
+    capture: DatagramCapture,
+) -> (Value, Option<DatagramCapture>) {
+    let ports = owner.sockets.keys().copied().collect::<Vec<_>>();
+    let unchanged = Owner::snapshot(owner.pid, &ports)
+        .is_ok_and(|now| now.start_ticks == owner.start_ticks && now.sockets == owner.sockets);
+    if unchanged {
+        summary["ownership_at_stop"] = json!("unchanged");
+        (summary, Some(capture))
+    } else {
+        summary["ownership_at_stop"] = json!("unavailable_or_changed");
+        summary["observation"] = json!("unavailable");
+        summary["incomplete"] = json!(true);
+        summary["discarded_records"] = summary["records"].clone();
+        summary["records"] = json!(0);
+        (summary, None)
+    }
+}
+pub fn check_capability(evidence: &Evidence) -> io::Result<()> {
+    // Protocol zero and no bind: the capability check receives no traffic.
+    let raw = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if raw == -1 {
+        let error = io::Error::last_os_error();
+        evidence.save_packet_tap(json!({"boundary":"source_to_public","incomplete":true,"observation":"unavailable","setup_os_error":error.raw_os_error()}),None);
+        return Err(error);
+    }
+    drop(unsafe { OwnedFd::from_raw_fd(raw) });
+    Ok(())
 }

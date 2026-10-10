@@ -153,17 +153,10 @@ pub async fn qualify(
     }
     let (input, reserved) = ports();
     #[cfg(target_os = "linux")]
-    let public_tap = packet_taps.then(|| {
-        elementary_packet_taps::Tap::public(
-            &reserved[..(audio.len() + usize::from(video.is_some())) * 2],
-            evidence.as_ref().unwrap(),
-            artifact.as_ref().unwrap(),
-            fixture_origin,
-        )
-        .expect("Owned packet tap setup failed; Linux CAP_NET_RAW is required")
-    });
-    #[cfg(target_os = "linux")]
-    let decoder_tap = None;
+    if packet_taps {
+        elementary_packet_taps::check_capability(evidence.as_ref().unwrap())
+            .expect("Owned packet tap setup failed; Linux CAP_NET_RAW is required");
+    }
     let (input_sdp, output_sdp) = (d.path().join("input.sdp"), d.path().join("output.sdp"));
     let mut sender = Command::new(&ffmpeg);
     sender.args([
@@ -311,9 +304,9 @@ pub async fn qualify(
     let engine = Engine::new(d.path().join("media"), executable.to_str().unwrap());
     // Shadow the moved guard so unwinding stops capture before dropping the engine.
     #[cfg(target_os = "linux")]
-    let mut public_tap = public_tap;
+    let mut public_tap = None;
     #[cfg(target_os = "linux")]
-    let mut decoder_tap = decoder_tap;
+    let mut decoder_tap = None;
     if profile["encoder"]
         .as_str()
         .is_some_and(|e| e.ends_with("_vaapi"))
@@ -398,6 +391,17 @@ pub async fn qualify(
         );
         #[cfg(target_os = "linux")]
         if packet_taps {
+            public_tap = Some(
+                elementary_packet_taps::Tap::native_input(
+                    std::process::id(),
+                    &(input..input + (audio.len() + usize::from(video.is_some())) as u16 * 2)
+                        .collect::<Vec<_>>(),
+                    evidence.as_ref().unwrap(),
+                    artifact.as_ref().unwrap(),
+                    fixture_origin,
+                )
+                .expect("Owned native input packet tap setup failed"),
+            );
             let ports = local
                 .iter()
                 .map(|address| {

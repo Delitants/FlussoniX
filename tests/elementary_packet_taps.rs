@@ -1,6 +1,4 @@
 #![cfg(target_os = "linux")]
-#[path = "support/decoder_readiness.rs"]
-mod decoder_readiness;
 #[allow(dead_code)]
 #[path = "support/elementary_diagnostics.rs"]
 mod elementary_diagnostics;
@@ -128,6 +126,9 @@ fn private_capture_rejects_sockets_owned_by_another_process_before_activation() 
         result.is_err(),
         "Foreign port ownership must fail before capture activation"
     );
+    drop(result);
+    drop(evidence);
+    assert_unavailable(artifact.path());
 }
 #[test]
 fn public_capture_rejects_a_wildcard_reservation_before_activation() {
@@ -144,4 +145,82 @@ fn public_capture_rejects_a_wildcard_reservation_before_activation() {
         )
         .is_err()
     );
+    drop(evidence);
+    assert_unavailable(artifact.path());
+}
+
+fn assert_unavailable(path: &std::path::Path) {
+    let entries: Vec<serde_json::Value> =
+        std::fs::read_to_string(path.join("boundary-evidence.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+    assert!(
+        entries
+            .iter()
+            .flat_map(|v| v["packet_taps"].as_array().into_iter().flatten())
+            .any(|v| v["observation"] == "unavailable" && v["incomplete"] == true),
+        "Unavailable tap must be explicit"
+    );
+    assert_eq!(entries.last().unwrap()["incomplete"], true);
+}
+#[test]
+fn exited_owner_rebound_port_discards_ambiguous_datagrams() {
+    use std::{
+        io::BufRead,
+        process::{Command, Stdio},
+    };
+    let mut child=Command::new("python3").args(["-u","-c","import socket,sys; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); sys.stdin.read(1)"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let port = line.trim().parse::<u16>().unwrap();
+    let witness = taps::Owner::snapshot(child.id(), &[port]);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let witness = witness.unwrap();
+    let rebound = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
+    discard_later_owner(witness, rebound);
+}
+#[test]
+fn same_process_rebound_socket_inode_discards_ambiguous_datagrams() {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let witness = taps::Owner::snapshot(std::process::id(), &[port]).unwrap();
+    drop(socket);
+    let rebound = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
+    discard_later_owner(witness, rebound);
+}
+fn discard_later_owner(witness: taps::Owner, rebound: std::net::UdpSocket) {
+    let source = tempfile::tempdir().unwrap();
+    let artifact = tempfile::tempdir().unwrap();
+    let evidence = elementary_diagnostics::Evidence::start(source.path(), artifact.path()).unwrap();
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let marker = b"later-owned-synthetic-marker-must-not-be-retained";
+    sender
+        .send_to(marker, rebound.local_addr().unwrap())
+        .unwrap();
+    rebound
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut bytes = [0u8; 128];
+    let n = rebound.recv(&mut bytes).unwrap();
+    assert_eq!(&bytes[..n], marker);
+    let path = artifact.path().join("ambiguous.packets");
+    let mut capture = elementary_diagnostics::DatagramCapture::new(path.clone());
+    capture.append(&bytes[..n]).unwrap();
+    let (summary, capture) = taps::enforce_owner(
+        &witness,
+        serde_json::json!({"boundary":"source_to_public","incomplete":false}),
+        capture,
+    );
+    evidence.save_packet_tap(summary, capture);
+    drop(evidence);
+    assert!(
+        !path.exists(),
+        "The whole ambiguous trace must be discarded after ownership changes"
+    );
+    assert_unavailable(artifact.path());
 }

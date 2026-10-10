@@ -390,7 +390,7 @@ fn bounded(path: &Path) -> io::Result<String> {
     }
     String::from_utf8(data).map_err(io::Error::other)
 }
-pub(super) fn identity(pid: u32) -> io::Result<(u64, String)> {
+fn identity(pid: u32) -> io::Result<(u64, String)> {
     let stat = bounded(Path::new(&format!("/proc/{pid}/stat")))?;
     let (_, rest) = stat
         .rsplit_once(')')
@@ -501,6 +501,52 @@ fn observe(target: &Target) -> io::Result<(String, Vec<Value>, usize)> {
         return Err(io::Error::other("process identity changed"));
     }
     Ok((state, rows, races))
+}
+// Reuse the bounded observer and identity checks for capture-retention ownership.
+#[allow(
+    dead_code,
+    reason = "ownership snapshots are used only by optional packet taps"
+)]
+pub(super) fn udp_ownership(pid: u32, ports: &[u16]) -> io::Result<(u64, BTreeMap<u16, u64>)> {
+    if ports.is_empty() || ports.len() > 8 || ports.contains(&0) {
+        return Err(io::Error::other("invalid owned UDP scope"));
+    }
+    let start_ticks = identity(pid)?.0;
+    let (state, rows, races) = observe(&Target {
+        pid,
+        start_ticks: Some(start_ticks),
+    })?;
+    if state == "Z" {
+        return Err(io::Error::other("UDP ownership unavailable"));
+    }
+    if races != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "UDP ownership descriptor race",
+        ));
+    }
+    let loopback = format!("{:08X}", u32::from_ne_bytes([127, 0, 0, 1]));
+    let mut found = BTreeMap::new();
+    for row in rows {
+        let Some(port) = row["local_port"]
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+        else {
+            continue;
+        };
+        if ports.contains(&port) && row["local_ip_hex"] == loopback {
+            let inode = row["inode"]
+                .as_u64()
+                .ok_or_else(|| io::Error::other("missing UDP inode"))?;
+            if found.insert(port, inode).is_some() {
+                return Err(io::Error::other("ambiguous UDP ownership"));
+            }
+        }
+    }
+    if found.len() != ports.len() {
+        return Err(io::Error::other("owned UDP sockets unavailable"));
+    }
+    Ok((start_ticks, found))
 }
 fn preserve(source: &Path, artifact: &Path, activity: &Activity) -> bool {
     let mut failed = false;
