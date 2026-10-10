@@ -49,12 +49,18 @@ impl Audio {
         self.base + self.samples * 90000 / u64::from(self.format.map_or(1, |f| f.1))
     }
     fn seed(&mut self, dts: u64) -> Result<(), String> {
-        if let Some(last) = self.last {
-            if dts < last || dts.abs_diff(self.next()) > 60 * 90000 {
+        if self.last.is_some() {
+            let next = self.next();
+            // The transport decoder independently checks monotonic PES DTS.
+            // A corrected source clock can nevertheless put its next complete
+            // audio frame inside the preceding frame's decoded sample span.
+            // Retain the sample clock through bounded overlap; never compress
+            // encoded audio duration or accumulate unlimited AV drift.
+            if dts.abs_diff(next) > 60 * 90000 || next.saturating_sub(dts) > 90000 / 4 {
                 return Err("worker audio timestamp discontinuity".into());
             }
             // PES clocks are integral ticks. Preserve fractional frame duration across PES.
-            if dts.abs_diff(self.next()) <= 1 {
+            if dts <= next || dts.abs_diff(next) <= 1 {
                 return Ok(());
             }
         }

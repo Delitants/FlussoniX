@@ -23,6 +23,7 @@ struct Lane {
 pub struct Input {
     lanes: Vec<Lane>,
     reservations: Vec<(UdpSocket, UdpSocket)>,
+    reservation_inodes: Vec<u64>,
     session: Session,
     pub stats: Arc<Stats>,
 }
@@ -74,11 +75,16 @@ impl Input {
         *stats.status.lock().unwrap() = "starting";
         let mut lanes = vec![];
         let mut reservations = vec![];
+        let mut reservation_inodes = vec![];
         for track in &session.tracks {
             let mut public = settings.clone();
             public.address.set_port(track.port);
             let pair = Pair::receive(&public)?;
             let reserved = reserve()?;
+            use std::os::fd::AsRawFd;
+            for socket in [&reserved.0, &reserved.1] {
+                reservation_inodes.push(super::readiness::socket_inode(socket.as_raw_fd())?);
+            }
             let target = reserved
                 .0
                 .local_addr()
@@ -107,35 +113,54 @@ impl Input {
         Ok(Self {
             lanes,
             reservations,
+            reservation_inodes,
             session,
             stats,
         })
     }
     pub async fn run<W: AsyncWrite + Unpin>(
+        self,
+        writer: W,
+        cancel: CancellationToken,
+    ) -> Result<(), String> {
+        self.run_decoder(writer, cancel, None).await
+    }
+    pub(crate) async fn run_owned<W: AsyncWrite + Unpin>(
+        self,
+        writer: W,
+        cancel: CancellationToken,
+        decoder_pid: u32,
+    ) -> Result<(), String> {
+        self.run_decoder(writer, cancel, Some(decoder_pid)).await
+    }
+    async fn run_decoder<W: AsyncWrite + Unpin>(
         mut self,
         mut writer: W,
         cancel: CancellationToken,
+        decoder_pid: Option<u32>,
     ) -> Result<(), String> {
         let stats = self.stats.clone();
         let ports: Vec<_> = self.lanes.iter().map(|lane| lane.target.port()).collect();
         let sdp = self.session.decoder_sdp(&ports);
         self.reservations.clear();
-        let initialized: Result<bool, String> = tokio::select! {biased;_=cancel.cancelled()=>Ok(false),result=tokio::time::timeout(Duration::from_secs(2),async{writer.write_all(sdp.as_bytes()).await?;writer.shutdown().await})=>match result{Ok(Ok(()))=>Ok(true),Ok(Err(_))=>Err("Elementary decoder SDP write failed".into()),Err(_)=>Err("Elementary decoder SDP write stalled".into())}};
+        let initialized: Result<bool, &'static str> = tokio::select! {biased;_=cancel.cancelled()=>Ok(false),result=tokio::time::timeout(Duration::from_secs(2),async{writer.write_all(sdp.as_bytes()).await?;writer.shutdown().await})=>match result{Ok(Ok(()))=>Ok(true),Ok(Err(_))=>Err("Elementary decoder SDP write failed"),Err(_)=>Err("Elementary decoder SDP write stalled")}};
         // Unix ChildStdin::shutdown is a no-op. Drop the owned pipe to deliver
         // EOF before FFmpeg can parse the full SDP and bind its decoder sockets.
         drop(writer);
         let result = match initialized {
-            Ok(true) => self.receive(&cancel).await,
+            Ok(true) => self.receive(&cancel, decoder_pid).await,
             Ok(false) => Ok(()),
             Err(e) => Err(e),
         };
         *stats.status.lock().unwrap() = if result.is_err() { "failed" } else { "stopped" };
-        if result.is_err() {
-            *stats.error.lock().unwrap() = Some("Elementary RTP input closed");
-        }
-        result
+        *stats.error.lock().unwrap() = result.as_ref().err().copied();
+        result.map_err(str::to_owned)
     }
-    async fn receive(&mut self, cancel: &CancellationToken) -> Result<(), String> {
+    async fn receive(
+        &mut self,
+        cancel: &CancellationToken,
+        decoder_pid: Option<u32>,
+    ) -> Result<(), &'static str> {
         // Do not admit public datagrams until the owned decoder has opened every
         // private pair. The shared loopback trust boundary matches other worker bridges.
         let decoder_ports: Vec<_> = self
@@ -145,7 +170,11 @@ impl Input {
             .collect();
         let ready: Result<(), &'static str> = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if super::readiness::bound(&decoder_ports)? {return Ok(());}
+                let ready = match decoder_pid {
+                    Some(pid) => super::readiness::owned(&decoder_ports, pid, &self.reservation_inodes)?,
+                    None => super::readiness::bound(&decoder_ports)?,
+                };
+                if ready {return Ok(());}
                 tokio::select! { _=cancel.cancelled()=>return Ok(()), _=tokio::time::sleep(Duration::from_millis(10))=>{} }
             }
         }).await.map_err(|_| "Elementary RTP decoder did not bind")?;
@@ -170,7 +199,7 @@ impl Input {
                     child.cancel();
                 }
                 Err(_) => {
-                    error.get_or_insert("Elementary RTP relay task failed".into());
+                    error.get_or_insert("Elementary RTP relay task failed");
                     child.cancel();
                 }
             }
@@ -186,10 +215,14 @@ async fn send(
     bytes: &[u8],
     to: Option<SocketAddr>,
     cancel: &CancellationToken,
-) -> Result<(), String> {
-    tokio::select! {biased;_=cancel.cancelled()=>Ok(()),result=tokio::time::timeout(Duration::from_secs(2),async{match to{Some(to)=>socket.send_to(bytes,to).await,None=>socket.send(bytes).await}})=>{let n=result.map_err(|_|"Elementary RTP relay write stalled")?.map_err(|_|"Elementary RTP relay write failed")?;if n!=bytes.len(){return Err("Elementary RTP relay datagram truncated".into());}Ok(())}}
+) -> Result<(), &'static str> {
+    tokio::select! {biased;_=cancel.cancelled()=>Ok(()),result=tokio::time::timeout(Duration::from_secs(2),async{match to{Some(to)=>socket.send_to(bytes,to).await,None=>socket.send(bytes).await}})=>{let n=result.map_err(|_|"Elementary RTP relay write stalled")?.map_err(|_|"Elementary RTP relay write failed")?;if n!=bytes.len(){return Err("Elementary RTP relay datagram truncated");}Ok(())}}
 }
-async fn relay(mut lane: Lane, stats: Arc<Stats>, cancel: CancellationToken) -> Result<(), String> {
+async fn relay(
+    mut lane: Lane,
+    stats: Arc<Stats>,
+    cancel: CancellationToken,
+) -> Result<(), &'static str> {
     let mut buffer = [0; control::MAX_PACKET + 11];
     let mut rtcp = [0; 2049];
     let mut feedback = [0; 2049];

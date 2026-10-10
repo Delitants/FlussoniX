@@ -815,7 +815,7 @@ impl Engine {
                     let c = cancel.clone();
                     let w = w.clone();
                     tasks.push(tokio::spawn(async move {
-                        if input.run(writer, c.clone()).await.is_err() {
+                        if input.run_owned(writer, c.clone(), w.pid()).await.is_err() {
                             w.failed("input_closed");
                             c.cancel();
                         }

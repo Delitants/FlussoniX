@@ -150,6 +150,59 @@ fn aac_adts_header_is_removed_and_asc_is_observed() {
     assert_eq!(t[0].config, [0x11, 0x90]);
     assert_eq!(samples(&events)[0].body, [1, 2, 3, 4]);
 }
+#[test]
+fn small_audio_pes_corrections_cannot_overlap_decoded_samples() {
+    // Literal source-clock pattern from an owned AAC/SRTP recording: a late
+    // clock correction compressed six complete audio frames into a few ticks.
+    let stamps = [
+        90000, 91920, 91922, 91924, 91926, 91928, 91929, 93780, 95700, 120000,
+    ];
+    let frames: Vec<_> = stamps
+        .into_iter()
+        .map(|dts| frame(3, dts, &[1, 2, 3, 4]))
+        .collect();
+    let events = decode(&mux(&[track("aac", 3, &[0x11, 0x90])], &frames), 79);
+    let got = samples(&events);
+    assert_eq!(
+        got.iter().map(|f| f.dts).collect::<Vec<_>>(),
+        [
+            90000, 91920, 93840, 95760, 97680, 99600, 101520, 103440, 105360, 120000
+        ]
+    );
+    assert!(got.iter().all(|f| f.body == [1, 2, 3, 4]));
+}
+#[test]
+fn mpeg_audio_corrections_keep_sample_duration_and_fractional_remainder() {
+    for (codec, body, expected) in [
+        ("m2a", MP2, [90000, 92160, 94320, 96480, 98640]),
+        ("mp3", MP3, [90000, 92351, 94702, 97053, 99404]),
+    ] {
+        let frames: Vec<_> = [90000, 90001, 90002, 90003, 90004]
+            .into_iter()
+            .map(|dts| frame(7, dts, body))
+            .collect();
+        let events = decode(&mux(&[track(codec, 7, &[])], &frames), 187);
+        let got = samples(&events);
+        assert_eq!(got.iter().map(|f| f.dts).collect::<Vec<_>>(), expected);
+        assert!(got.iter().all(|f| f.body == body));
+    }
+}
+#[test]
+fn sustained_audio_clock_compression_closes_the_generation_at_a_quarter_second() {
+    let frames: Vec<_> = (0..14)
+        .map(|i| frame(3, 90000 + i, &[1, 2, 3, 4]))
+        .collect();
+    let mut decoder = Decoder::default();
+    let result = decoder.push(&mux(&[track("aac", 3, &[0x11, 0x90])], &frames));
+    assert!(
+        result.is_err(),
+        "compressed source timestamps must not accumulate unbounded AV drift"
+    );
+    assert!(
+        decoder.finish().is_err(),
+        "clock rejection must be terminal"
+    );
+}
 fn stamp(value: u64, kind: u8) -> [u8; 5] {
     [
         kind << 4 | ((value >> 29) as u8 & 14) | 1,

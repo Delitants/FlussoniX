@@ -22,6 +22,103 @@ fn rtp(seq: u16, ssrc: u32, payload: &[u8]) -> Vec<u8> {
     b
 }
 #[tokio::test]
+async fn sdp_pipe_failure_retains_the_specific_static_input_diagnostic() {
+    let d = tempfile::tempdir().unwrap();
+    let p = port();
+    let file = d.path().join("owned.sdp");
+    std::fs::write(&file,format!("v=0\no=- 0 0 IN IP4 127.0.0.1\ns=Owned\nc=IN IP4 127.0.0.1\nt=0 0\nm=video {p} RTP/AVP 96\na=rtpmap:96 H264/90000\na=fmtp:96 packetization-mode=1\n")).unwrap();
+    let cfg=Settings::input(&json!({"url":format!("rtp://127.0.0.1:{p}"),"flussonix_rtp":{"profile":"elementary","sdp_file":file}})).unwrap().unwrap();
+    let input = Input::bind(&cfg).await.unwrap();
+    let stats = input.stats.clone();
+    let (writer, reader) = tokio::io::duplex(32768);
+    drop(reader);
+    let error = input
+        .run(writer, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error, "Elementary decoder SDP write failed");
+    assert_eq!(
+        stats.snapshot()["last_error"],
+        "Elementary decoder SDP write failed"
+    );
+    assert_eq!(stats.snapshot()["status"], "failed");
+    for n in [p, p + 1] {
+        assert!(UdpSocket::bind(("127.0.0.1", n)).is_ok());
+    }
+}
+#[tokio::test]
+async fn engine_does_not_admit_media_to_sockets_owned_by_another_process() {
+    use flussonix::media::Engine;
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let p = port();
+    let file = d.path().join("owned.sdp");
+    let normalized = d.path().join("decoder.sdp");
+    std::fs::write(&file,format!("v=0\no=- 0 0 IN IP4 127.0.0.1\ns=Owned\nc=IN IP4 127.0.0.1\nt=0 0\nm=video {p} RTP/AVP 96\na=rtpmap:96 H264/90000\na=fmtp:96 packetization-mode=1\n")).unwrap();
+    // This owned decoder process consumes its real SDP pipe but opens no UDP
+    // sockets. The test process claims those ports, simulating a foreign bind
+    // during the reservation handoff. The engine must never deliver to it.
+    let decoder = d.path().join("decoder.py");
+    std::fs::write(&decoder, format!("#!/usr/bin/python3\nimport sys,time,pathlib\npathlib.Path({:?}).write_text(sys.stdin.read())\ntime.sleep(20)\n", normalized.to_str().unwrap())).unwrap();
+    std::fs::set_permissions(&decoder, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = Engine::new(d.path().join("media"), decoder.to_str().unwrap());
+    let worker = engine.ensure("owned", &json!({"inputs":[{"url":format!("rtp://127.0.0.1:{p}"),"flussonix_rtp":{"profile":"elementary","sdp_file":file,"jitter_ms":0}}],"transcoder":{"encoder":"copy","acodec":"copy"},"flussonix_input_timeout":15})).await.unwrap();
+    let result = async {
+        let text = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(s) = std::fs::read_to_string(&normalized) {
+                    if s.ends_with('\n') {
+                        break s;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "owned decoder did not read SDP".to_owned())?;
+        let local: u16 = text
+            .lines()
+            .find(|l| l.starts_with("m=video "))
+            .ok_or("decoder SDP has no video track")?
+            .split_whitespace()
+            .nth(1)
+            .ok_or("decoder SDP has no video port")?
+            .parse::<u16>()
+            .map_err(|e| e.to_string())?;
+        let foreign = AsyncUdp::bind(("127.0.0.1", local))
+            .await
+            .map_err(|e| e.to_string())?;
+        let _control = AsyncUdp::bind(("127.0.0.1", local + 1))
+            .await
+            .map_err(|e| e.to_string())?;
+        let sender = AsyncUdp::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| e.to_string())?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        sender
+            .send_to(&rtp(1, 123, &[0x65, 1]), ("127.0.0.1", p))
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut bytes = [0; 1600];
+        let leaked = tokio::time::timeout(Duration::from_millis(300), foreign.recv(&mut bytes))
+            .await
+            .is_ok();
+        Ok::<_, String>((leaked, worker.stats()))
+    }
+    .await;
+    engine.stop_all().await;
+    let (leaked, stats) = result.unwrap();
+    assert!(
+        !leaked,
+        "port occupancy admitted media to a foreign decoder"
+    );
+    assert_eq!(stats["direct_rtp_input"]["packets"], 0);
+    assert_eq!(stats["direct_rtp_input"]["status"], "starting");
+    for n in [p, p + 1] {
+        assert!(UdpSocket::bind(("127.0.0.1", n)).is_ok());
+    }
+}
+#[tokio::test]
 async fn cancellation_before_private_decoder_binding_releases_every_public_pair() {
     let d = tempfile::tempdir().unwrap();
     let p = port();

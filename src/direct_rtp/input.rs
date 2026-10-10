@@ -170,4 +170,15 @@ impl Input {
             Implementation::Elementary(input) => input.run(writer, cancel).await,
         }
     }
+    pub(crate) async fn run_owned<W: AsyncWrite + Unpin>(
+        self,
+        writer: W,
+        cancel: CancellationToken,
+        decoder_pid: u32,
+    ) -> Result<(), String> {
+        match self.inner {
+            Implementation::Mp2t(input) => input.run(writer, cancel).await,
+            Implementation::Elementary(input) => input.run_owned(writer, cancel, decoder_pid).await,
+        }
+    }
 }
