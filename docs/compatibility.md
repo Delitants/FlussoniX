@@ -48,7 +48,8 @@ fields, including dotted object paths such as
 Selection applies to each returned row after effective configuration, search,
 ordering and pagination. It does not change `estimated_count`, `next`, `prev`
 or `timing`, save configuration, or start a worker. Without `select`, existing
-full responses are preserved. Item GET and other collections are unchanged.
+full responses are preserved. Item GET is unchanged. Cluster peer/source
+collections additionally support the profile below; other collections are unchanged.
 
 Selecting a whole object or array preserves that value. Dotted paths traverse
 objects; array element projection and scalar traversal are unsupported and
@@ -67,6 +68,30 @@ of its collection selector, and the public
 Unknown/non-object paths are handled without reproducing reference exceptions.
 The tests and implementation use no vendor components. Reference default
 ordering and full vendor cursor parity remain separate tasks.
+
+### Cluster collection field selection
+
+Authenticated GET `/cluster/peers` and `/cluster/sources` also accept the same
+comma-separated `select` paths, for example
+`select=hostname,private_payload_url` or `select=drain,flussonix_source_group`.
+Selection runs after the existing search, ordering and positional pagination,
+preserving counts, navigation and timing. Without `select`, full rows remain
+unchanged. Item GET ignores `select` as before. Both view and edit management
+credentials can read selected rows; projection does not replace authorization.
+
+Empty or unknown-only selections return `{}` per row; cluster rows have no
+automatically retained identity. Scalar child paths are omitted. Whole values,
+object traversal and overlapping paths follow the selector rules above. Only
+fields present in the current saved row can be selected; projection does not
+synthesize peer telemetry, reference source fields or runtime state. Selecting
+`hostname` does not include endpoints or `cluster_key`; explicitly selecting a
+saved field retains its existing management visibility. No configuration is
+saved and no media worker is started by collection reads.
+
+This extends field selection over the existing native cluster representation.
+Sources still use the native `hostname` identity and endpoint fields; reference
+URL-keyed source configuration, source filters, cluster sorting/filtering/cursor
+parity and complete cluster schema compatibility remain separate requirements.
 
 ### Implemented scalar collection filtering
 

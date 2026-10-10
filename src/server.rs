@@ -750,7 +750,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         (page, next, None)
     };
     let mut result = json!({"estimated_count":total,"timing":{},"next":next,"prev":prev});
-    if matches!(kind, "streams" | "templates")
+    if matches!(kind, "streams" | "templates" | "peers" | "sources")
         && let Some(select) = query.get("select")
     {
         let selection = crate::api_select::Selection::new(select);

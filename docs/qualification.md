@@ -1108,3 +1108,17 @@ The independent media receiver fixture now observes the actual receiver socket o
 A controlled comparison freshly compiled the unchanged prior production source and ran the strict plaintext six-codec matrix with the same passive receiver fixture; all cases passed. An earlier comparison had reused candidate Cargo artifacts and is excluded from baseline evidence. The passing controlled comparison leaves the earlier HEVC/MP3 picture-loss location unconfirmed.
 
 A later bounded investigation at revision `08e4cb7` ran the unchanged plaintext six-codec matrix three times with fresh owned packet captures. All 18 cases passed strict worker and receiver decoding, including nine HEVC cases and three HEVC/MP3 cases. Across the shared sequence intervals, 4,728 public-input and private-decoder RTP packets matched byte for byte, with no internal sequence gaps or reported native input loss. All 36 capture summaries report unchanged destination ownership and zero packet-socket drops. Six private packets precede their lane's first captured public sequence and lie outside common startup coverage. These kernel-path observations do not prove userspace receipt; startup and socket handoff remain unobserved. The historical failure did not reproduce, its cause remains unresolved, and no production media repair is established.
+
+## Cluster collection field selection qualification
+
+Seven real-router regressions first fail against full-row cluster responses.
+They qualify explicit peer/source field selection, native source group and
+boolean values, empty/unknown/scalar-child selectors, duplicate and deep
+unknown paths, and management authentication. Search, ordering, counts and
+cursor continuation operate before projection, including a changed field set
+between pages. Default collection, item and unrelated collection responses,
+saved configuration bytes and zero media-worker startup are preserved.
+
+This qualifies [field selection over the native cluster representation](compatibility.md#cluster-collection-field-selection),
+not URL-keyed reference source configuration, peer telemetry or full cluster
+query/schema parity. No official component is a build, runtime or test dependency.
