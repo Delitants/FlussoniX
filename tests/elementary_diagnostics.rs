@@ -367,3 +367,75 @@ fn sdp_retention_caps_sanitized_output_before_creating_file() {
     assert!(!artifact.path().join("input.sdp").exists());
     assert_eq!(entries(artifact.path()).last().unwrap()["incomplete"], true);
 }
+
+#[test]
+fn reused_case_cannot_mix_prior_recordings_with_a_new_startup_failure() {
+    let base = tempfile::tempdir().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    std::fs::write(source.path().join("worker.ts"), b"prior worker recording").unwrap();
+    std::fs::write(
+        source.path().join("received.ts"),
+        b"prior receiver recording",
+    )
+    .unwrap();
+    let case = diagnostics::create_case_directory(base.path(), "owned-case").unwrap();
+    let first = Evidence::start(source.path(), &case).unwrap();
+    first.stage("qualified");
+    drop(first);
+    std::fs::write(case.join("caller-note.txt"), b"keep this caller file").unwrap();
+    let prior: std::collections::BTreeMap<_, _> = std::fs::read_dir(&case)
+        .unwrap()
+        .map(|p| {
+            let p = p.unwrap().path();
+            (p.file_name().unwrap().to_owned(), std::fs::read(p).unwrap())
+        })
+        .collect();
+    let empty_source = tempfile::tempdir().unwrap();
+    let second = diagnostics::create_case_directory(base.path(), "owned-case")
+        .and_then(|out| Evidence::start(empty_source.path(), &out));
+    let error = match second {
+        Err(error) => error,
+        Ok(evidence) => {
+            evidence.stage("failed_before_recording");
+            drop(evidence);
+            panic!("A second run was admitted into the previous case directory");
+        }
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    let current: std::collections::BTreeMap<_, _> = std::fs::read_dir(&case)
+        .unwrap()
+        .map(|p| {
+            let p = p.unwrap().path();
+            (p.file_name().unwrap().to_owned(), std::fs::read(p).unwrap())
+        })
+        .collect();
+    assert_eq!(
+        current, prior,
+        "Previous evidence and caller files must survive unchanged"
+    );
+}
+
+#[test]
+fn existing_empty_case_or_directory_alias_is_not_reclaimed() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let base = tempfile::tempdir().unwrap();
+    let reserved = diagnostics::create_case_directory(base.path(), "reserved").unwrap();
+    let target = tempfile::tempdir().unwrap();
+    std::fs::write(target.path().join("caller-note.txt"), b"untouched target").unwrap();
+    std::fs::set_permissions(target.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+    symlink(target.path(), base.path().join("alias")).unwrap();
+    for name in ["reserved", "alias"] {
+        let error = diagnostics::create_case_directory(base.path(), name).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+    assert!(reserved.read_dir().unwrap().next().is_none());
+    assert!(base.path().join("alias").is_symlink());
+    assert_eq!(
+        std::fs::read(target.path().join("caller-note.txt")).unwrap(),
+        b"untouched target"
+    );
+    assert_eq!(
+        target.path().metadata().unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+}

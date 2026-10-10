@@ -15,6 +15,26 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
+// Case paths are reserved before the fixture starts collecting any evidence.
+pub fn create_case_directory(base: &Path, name: &str) -> io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::create_dir_all(base)?;
+    let path = base.join(name);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&path)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "elementary evidence case already exists; choose a new empty artifact directory",
+                )
+            } else {
+                error
+            }
+        })?;
+    Ok(path)
+}
 const READ_LIMIT: u64 = 1024 * 1024;
 const FILE_LIMIT: u64 = 8 * 1024 * 1024;
 struct Target {

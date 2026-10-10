@@ -116,16 +116,15 @@ pub async fn qualify(
     let artifact = std::env::var("FLUSSONIX_ELEMENTARY_ARTIFACT_DIR")
         .ok()
         .map(|base| {
-            let p = Path::new(&base).join(format!(
+            let name = format!(
                 "{}-{}-{}-{}-{}",
                 video.unwrap_or("audio"),
                 audio.join("-"),
                 profile["encoder"].as_str().unwrap_or("copy"),
                 secure_input,
                 secure_output
-            ));
-            std::fs::create_dir_all(&p).unwrap();
-            p
+            );
+            elementary_diagnostics::create_case_directory(Path::new(&base), &name).unwrap()
         });
     let evidence = artifact
         .as_ref()
