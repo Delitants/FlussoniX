@@ -109,6 +109,9 @@ pub(crate) fn selected_static(source: &Value, name: &str) -> bool {
     if !allows(source, name) {
         return false;
     }
+    if source.get("only").is_none() {
+        return true;
+    }
     let relative = source["prefix"]
         .as_str()
         .and_then(|p| name.strip_prefix(p))

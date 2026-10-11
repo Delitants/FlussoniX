@@ -369,11 +369,16 @@ fn validate_root(root: &Value) -> Result<(), String> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|s| s["only"].as_array().is_some_and(|a| !a.is_empty()))
+        .filter(|s| {
+            !s.get("only")
+                .is_some_and(|v| v.as_array().is_some_and(Vec::is_empty))
+        })
         .count()
         > 64
     {
-        return Err("at most 64 sources may request eager activation".into());
+        return Err(
+            "at most 64 sources may keep streams active; set other sources to On demand".into(),
+        );
     }
     let mut groups = std::collections::HashMap::new();
     for source in root["sources"].as_array().into_iter().flatten() {

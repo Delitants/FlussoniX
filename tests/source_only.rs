@@ -137,6 +137,14 @@ async fn node(a: Arc<App>) -> (String, tokio::task::JoinHandle<()>) {
 }
 #[tokio::test]
 async fn only_starts_native_media_without_viewers_and_preserves_demand_visibility() {
+    exercise_native_activation(Some(json!(["news", "weather/*", "sports/*", "dynamic"]))).await;
+}
+// Break caught: omitted only never polls or starts eligible static streams.
+#[tokio::test]
+async fn default_source_starts_static_media_and_preserves_policy_and_local_precedence() {
+    exercise_native_activation(None).await;
+}
+async fn exercise_native_activation(only: Option<Value>) {
     let d = tempfile::tempdir().unwrap();
     let source = app(d.path(), "source", "source");
     let cdn = app(d.path(), "cdn", "cdn");
@@ -146,6 +154,8 @@ async fn only_starts_native_media_without_viewers_and_preserves_demand_visibilit
         ("region/eu/sports/live", true),
         ("region/eu/dynamic", false),
         ("region/other/news", true),
+        ("region/eu/local", true),
+        ("region/eu/disabled", true),
     ] {
         source.config.put("streams",name,json!({"static":static_,"inputs":[{"url":"testsrc://"}],"flussonix_content_id":"owned-content"})).unwrap();
     }
@@ -157,8 +167,23 @@ async fn only_starts_native_media_without_viewers_and_preserves_demand_visibilit
             json!({"flussonix_token_sha256":"a".repeat(64)}),
         )
         .unwrap();
+    source
+        .config
+        .put("streams", "region/eu/disabled", json!({"disabled":true}))
+        .unwrap();
+    cdn.config
+        .put(
+            "streams",
+            "region/eu/local",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
     let (url, task) = node(source.clone()).await;
-    cdn.config.put("sources","owned",json!({"api_url":url,"private_payload_url":url,"flussonix_transport":"m4s","prefix":"region/eu","only":["news","weather/*","sports/*","dynamic"],"except":["sports/*"]})).unwrap();
+    let mut origin = json!({"api_url":url,"private_payload_url":url,"flussonix_transport":"m4s","prefix":"region/eu","except":["sports/*"]});
+    if let Some(only) = only {
+        origin["only"] = only;
+    }
+    cdn.config.put("sources", "owned", origin).unwrap();
     source
         .media
         .ensure(
@@ -296,6 +321,14 @@ async fn malformed_inventory_is_rejected_as_a_whole_before_metadata_queries() {
 }
 #[tokio::test]
 async fn changed_source_fences_inflight_inventory_and_lb_never_polls() {
+    exercise_activation_fence(Some(json!(["news"]))).await;
+}
+// Break caught: default polling bypasses source-revision fencing or runs on LB nodes.
+#[tokio::test]
+async fn default_source_edit_fences_inventory_and_lb_never_polls() {
+    exercise_activation_fence(None).await;
+}
+async fn exercise_activation_fence(only: Option<Value>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let d = tempfile::tempdir().unwrap();
     let cdn = app(d.path(), "cdn", "cdn");
@@ -320,13 +353,15 @@ async fn changed_source_fences_inflight_inventory_and_lb_never_polls() {
     let url = format!("http://{}", l.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(l, routes).await.unwrap() });
     for a in [&cdn, &lb] {
-        a.config
-            .put("sources", "owned", json!({"api_url":url,"only":["news"]}))
-            .unwrap();
+        let mut source = json!({"api_url":url});
+        if let Some(only) = only.clone() {
+            source["only"] = only;
+        }
+        a.config.put("sources", "owned", source).unwrap();
     }
     lb.reconcile().await;
     let lb_status = activation_status(&lb).await;
-    assert_eq!(count.load(Ordering::SeqCst), 0);
+    let lb_polls = count.load(Ordering::SeqCst);
     let a = cdn.clone();
     let job = tokio::spawn(async move { a.reconcile().await });
     let arrived = tokio::time::timeout(Duration::from_secs(2), entered.notified()).await;
@@ -338,6 +373,7 @@ async fn changed_source_fences_inflight_inventory_and_lb_never_polls() {
     let status = activation_status(&cdn).await;
     server.abort();
     let _ = server.await;
+    assert_eq!(lb_polls, 0);
     assert!(arrived.is_ok(), "inventory was never requested");
     assert_eq!(status["wanted_streams"], 0);
     assert_eq!(lb_status["wanted_streams"], 0);
@@ -502,4 +538,94 @@ async fn concurrent_reconciliation_keeps_inventory_polling_within_node_bound() {
         "concurrent activation launched {observed} inventory polls"
     );
     assert_eq!(activation_status(&cdn).await["wanted_streams"], 0);
+}
+
+// Break caught: absent-only sources evade the shared eager-source admission budget.
+#[test]
+fn default_sources_share_eager_limit_and_empty_only_opts_out_atomically() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("config.json");
+    let s = ConfigStore::open(&p).unwrap();
+    let mut sources = (0..65)
+        .map(|i| json!({"hostname":format!("source-{i}"),"api_url":"http://origin.invalid"}))
+        .collect::<Vec<_>>();
+    let before = s.snapshot();
+    let revision = s.revision();
+    let invalid = s.replace(json!({"sources":sources}));
+    assert!(invalid.is_err(), "65 default-active sources were admitted");
+    assert_eq!(s.snapshot(), before);
+    assert_eq!(s.revision(), revision);
+    sources[0]["only"] = json!([]);
+    s.replace(json!({"sources":sources})).unwrap();
+    let saved = s.snapshot();
+    let disk = std::fs::read(&p).unwrap();
+    let revision = s.revision();
+    assert!(s.put("sources", "source-0", json!({"only":null})).is_err());
+    assert!(
+        s.put("sources", "source-0", json!({"only":["news"]}))
+            .is_err()
+    );
+    assert!(
+        s.put(
+            "sources",
+            "source-0",
+            json!({"$reset":true,"api_url":"http://origin.invalid"})
+        )
+        .is_err()
+    );
+    assert_eq!(s.snapshot(), saved);
+    assert_eq!(s.revision(), revision);
+    assert_eq!(std::fs::read(&p).unwrap(), disk);
+    assert_eq!(ConfigStore::open(&p).unwrap().snapshot(), saved);
+    s.put("sources", "source-1", json!({"only":[]})).unwrap();
+    assert!(
+        s.put("sources", "source-0", json!({"only":null}))
+            .unwrap()
+            .get("only")
+            .is_none()
+    );
+    let invalid_path = d.path().join("invalid.json");
+    std::fs::write(&invalid_path,serde_json::to_vec(&json!({"sources":sources.iter().map(|row|{let mut row=row.clone();row.as_object_mut().unwrap().remove("only");row}).collect::<Vec<_>>()})).unwrap()).unwrap();
+    assert!(ConfigStore::open(&invalid_path).is_err());
+}
+
+// Break caught: opting out still polls or hides ordinary native discovery.
+#[tokio::test]
+async fn empty_only_skips_inventory_and_preserves_on_demand_discovery() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let d = tempfile::tempdir().unwrap();
+    let cdn = app(d.path(), "cdn", "cdn");
+    let count = Arc::new(AtomicUsize::new(0));
+    let c = count.clone();
+    let routes=axum::Router::new().route("/flussonix/api/v1/source-streams",axum::routing::get(move||{c.fetch_add(1,Ordering::SeqCst);async{axum::Json(json!({"streams":[{"name":"news","static":true,"disabled":false}]}))}}))
+      .route("/flussonix/api/v1/stream/{*name}",axum::routing::get(|axum::extract::Path(name):axum::extract::Path<String>|async move{axum::Json(json!({"name":name,"disabled":false,"flussonix_content_id":"owned-demand","flussonix_token_sha256":"a".repeat(64)}))}));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+    cdn.config
+        .put("sources", "owned", json!({"api_url":url,"only":[]}))
+        .unwrap();
+    cdn.reconcile().await;
+    let status = activation_status(&cdn).await;
+    let workers = cdn.media.workers().await;
+    let polls = count.load(Ordering::SeqCst);
+    let response = router(cdn.clone())
+        .oneshot(
+            Request::get("/news/index.m3u8")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let code = response.status();
+    task.abort();
+    let _ = task.await;
+    cdn.media.stop_all().await;
+    assert_eq!(polls, 0);
+    assert!(workers.is_empty());
+    assert_eq!(status["wanted_streams"], 0);
+    assert_eq!(
+        code, 403,
+        "discovered playback must enforce the source policy"
+    );
 }

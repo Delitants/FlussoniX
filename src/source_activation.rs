@@ -1,4 +1,4 @@
-//! Bounded explicit native source static demand, separate from viewer demand.
+//! Bounded native source static demand, separate from viewer demand.
 use super::*;
 use futures_util::{StreamExt, stream};
 use std::collections::{BTreeMap, BTreeSet};
@@ -102,7 +102,10 @@ impl App {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|s| s["only"].as_array().is_some_and(|a| !a.is_empty()))
+            .filter(|s| {
+                !s.get("only")
+                    .is_some_and(|v| v.as_array().is_some_and(Vec::is_empty))
+            })
             .cloned()
             .collect::<Vec<_>>();
         let due = {
