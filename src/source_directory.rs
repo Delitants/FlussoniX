@@ -7,9 +7,23 @@ pub enum LookupFailure {
     Absent,
     Invalid,
 }
-/// Source-local blacklist. Configuration accepts exact names or a terminal `/*`.
+/// Select a source namespace without renaming the upstream stream. Exclusions
+/// are relative to that namespace; without a prefix they use full stream names.
 /// A subtree pattern does not exclude its parent name or a similar sibling prefix.
 pub(crate) fn allows(source: &Value, name: &str) -> bool {
+    let name = if let Some(prefix) = source.get("prefix") {
+        let Some(relative) = prefix
+            .as_str()
+            .and_then(|p| name.strip_prefix(p))
+            .and_then(|tail| tail.strip_prefix('/'))
+            .filter(|tail| !tail.is_empty())
+        else {
+            return false;
+        };
+        relative
+    } else {
+        name
+    };
     !source["except"].as_array().is_some_and(|patterns| {
         patterns.iter().filter_map(Value::as_str).any(|pattern| {
             pattern == name

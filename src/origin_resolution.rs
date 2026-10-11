@@ -1017,6 +1017,113 @@ mod exclusion_tests {
     }
 
     #[tokio::test]
+    async fn prefixes_scope_cold_lookup_and_equivalent_replica_failover() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        let a = origin().await;
+        let b = origin().await;
+        let c = origin().await;
+        let e = origin().await;
+        for (name, origin, prefix, except) in [
+            ("a", &a, "region/eu", json!([])),
+            ("b", &b, "region", json!([])),
+            ("c", &c, "region", json!(["news"])),
+            ("d", &e, "region", json!([])),
+        ] {
+            source(&app, name, origin, except);
+            app.config
+                .put("sources", name, json!({"prefix":prefix}))
+                .unwrap();
+        }
+        let first = app.resolve("region/news").await.unwrap();
+        assert_eq!(first.config["name"], "region/news");
+        assert_eq!(
+            first.config["inputs"][0]["url"],
+            format!(
+                "hls://{}/region/news/index.m3u8",
+                b.url.trim_start_matches("http://")
+            )
+        );
+        b.mode.store(1, Ordering::SeqCst);
+        app.mirrors
+            .lock()
+            .await
+            .get_mut("region/news")
+            .unwrap()
+            .when = Instant::now() - Duration::from_secs(11);
+        let second = app.resolve("region/news").await.unwrap();
+        assert_eq!(
+            second.config["inputs"][0]["url"],
+            format!(
+                "hls://{}/region/news/index.m3u8",
+                e.url.trim_start_matches("http://")
+            )
+        );
+        assert_eq!(a.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(c.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            app.stream_stats("region/news").await["upstream_source"],
+            "d"
+        );
+        assert_eq!(app.stream_stats("region/news").await["source_switches"], 1);
+        let calls_before_local = e.calls.load(Ordering::SeqCst);
+        app.config
+            .put(
+                "streams",
+                "region/news",
+                json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+            )
+            .unwrap();
+        assert_eq!(
+            app.resolve("region/news").await.unwrap().config["inputs"][0]["url"],
+            "testsrc://"
+        );
+        assert_eq!(e.calls.load(Ordering::SeqCst), calls_before_local);
+    }
+
+    #[tokio::test]
+    async fn changing_a_prefix_revokes_cached_routes_and_removal_restores_discovery() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        let a = origin().await;
+        source(&app, "a", &a, json!([]));
+        app.config
+            .put("sources", "a", json!({"prefix":"region"}))
+            .unwrap();
+        assert!(app.resolve("region/news").await.is_some());
+        update(&app, json!({"prefix":"other"})).await;
+        assert!(app.media_config("region/news").await.is_none());
+        assert!(app.resolve("region/news").await.is_none());
+        assert_eq!(a.calls.load(Ordering::SeqCst), 1);
+        update(&app, json!({"prefix":null})).await;
+        assert!(app.resolve("region/news").await.is_some());
+        assert_eq!(a.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_prefix_update_fences_metadata_already_in_flight() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        let a = origin().await;
+        source(&app, "a", &a, json!([]));
+        a.mode.store(2, Ordering::SeqCst);
+        let pending = {
+            let app = app.clone();
+            tokio::spawn(async move { app.resolve("region/news").await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), a.entered.notified())
+            .await
+            .unwrap();
+        update(&app, json!({"prefix":"other"})).await;
+        a.release.notify_one();
+        assert!(pending.await.unwrap().is_none());
+        assert!(app.media_config("region/news").await.is_none());
+        assert!(app.resolve("region/news").await.is_none());
+        assert_eq!(a.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(app.media.count().await, 0);
+    }
+
+    #[tokio::test]
     async fn excluded_sources_are_skipped_and_an_allowed_origin_can_be_cached() {
         let d = tempfile::tempdir().unwrap();
         let app = app(d.path());

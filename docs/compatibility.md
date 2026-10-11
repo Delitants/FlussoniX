@@ -89,10 +89,10 @@ saved field retains its existing management visibility. No configuration is
 saved and no media worker is started by collection reads.
 
 This extends field selection over the existing native cluster representation.
-Sources still use the native `hostname` identity and endpoint fields; reference
-URL-keyed source configuration, static `only` activation, source `prefix` mapping,
-cluster sorting/filtering/cursor parity and complete cluster schema compatibility
-remain separate requirements. The native `except` blacklist is described below.
+Sources retain native endpoint fields and support hostname or URL identities.
+Static `only` activation, mixed-vendor metadata discovery, cluster
+sorting/filtering/cursor parity and complete cluster schema compatibility remain
+separate requirements. Source identity, prefix and exclusions are described below.
 
 ### Implemented scalar collection filtering
 
@@ -481,11 +481,11 @@ parity remain open.
 
 ### Cluster source exclusions
 
-Native source rows accept `except` as an array of exact stream names or subtree patterns such as `region/*`. Matching is case sensitive: `region/*` blocks `region/news` and `region/deep/news`, but allows `region` and `regional/news`. Spaces and Unicode names are literal. A source accepts at most 1,024 patterns, each at most 256 UTF-8 bytes including `/*`; other wildcard forms and invalid stream paths are rejected atomically. Omit the field or use `[]` to allow all names. A management merge patch with `except: null` removes the override.
+Native source rows accept `except` as an array of exact stream names or subtree patterns such as `region/*`. The following examples use no source prefix; with a prefix, patterns are relative as described below. Matching is case sensitive: `region/*` blocks `region/news` and `region/deep/news`, but allows `region` and `regional/news`. Spaces and Unicode names are literal. A source accepts at most 1,024 patterns, each at most 256 UTF-8 bytes including `/*`; other wildcard forms and invalid stream paths are rejected atomically. Omit the field or use `[]` for no exclusions within the selected source namespace. A management merge patch with `except: null` removes the override.
 
 Exclusions apply to that source before metadata requests and during cold discovery and replica selection. Other allowed sources can provide the same stream, subject to existing content identity, group and viewer policy checks for failover. Locally configured streams retain precedence. Updating a source through the management API invalidates its cached routes and viewer authorization; reconciliation stops stale pulls. In-flight metadata from the previous configuration revision cannot reinstall the excluded route. The source editor has labeled Add/Remove exclusion rows and client validation.
 
-This implements the blacklist portion of the [reference source behavior](https://flussonic.com/doc/fms/cluster/restreaming/). `only` is a static activation policy in the reference, not an allowlist that hides other streams, and remains pending. Source `prefix` mapping and full legacy source discovery/interoperability remain pending; the URL identity profile below adds bounded source CRUD. Source rows continue to use native `hostname`, management/private endpoints and the existing authenticated native metadata protocol.
+This implements the blacklist portion of the [reference source behavior](https://flussonic.com/doc/fms/cluster/restreaming/). `only` is a static activation policy in the reference, not an allowlist that hides other streams, and remains pending. The source prefix profile below selects a remote namespace; full legacy source discovery/interoperability remains pending. The URL identity profile adds bounded source CRUD. Source rows retain hostname or URL identities, native management/private endpoints and the existing authenticated native metadata protocol.
 
 
 ### URL-keyed cluster source configuration
@@ -496,4 +496,13 @@ For example, PUT `/streamer/api/v3/cluster/sources/m4s%3A%2F%2Forigin.example%3A
 
 The same normalization applies to config validation, replacement and startup imports. Validation does not save; startup does not rewrite the file. Source updates retain configuration revision fencing, viewer authority invalidation and worker reconciliation. URL identities appear in source lists, selected fields, selected-origin telemetry and replica switch accounting. The source editor provides a Source identity selector and a fixed Source address field, alongside existing endpoint controls and staged Config editing.
 
-This closes the bounded native source identity/CRUD gap against the [reference API schema](https://flussonic.com/doc/api/reference/). It does not implement vendor source inventory/metadata messages, `prefix` mapping, static `only` activation, group configuration or full source/schema interoperability. Installed Flussonic components remain reference material only.
+This closes the bounded native source identity/CRUD gap against the [reference API schema](https://flussonic.com/doc/api/reference/). It does not implement vendor source inventory/metadata messages, static `only` activation, group configuration or full source/schema interoperability. Installed Flussonic components remain reference material only.
+
+
+### Cluster source prefix namespace
+
+Native hostname and URL sources accept an optional `prefix` string. It selects remote names below that exact namespace without renaming: `prefix: "region/eu"` makes `region/eu/news` eligible and keeps that full name in viewer URLs, authenticated metadata requests and private media pulls. It does not select `news`, `region/eu` itself, `region/europe/news` or a different case. Local streams retain precedence. A prefix is a nonempty valid media name of at most 256 UTF-8 bytes; wildcards, empty path segments, dot traversal, control characters and trailing slashes are rejected atomically. Missing prefix selects all namespaces. Merge `prefix: null` or reset the source to remove it.
+
+With a prefix, `except` patterns are relative to it. For `prefix: "region/eu"`, `except: ["news", "sports/*"]` excludes `region/eu/news` and descendants of `region/eu/sports/`; it allows `region/eu/news/one` and the parent `region/eu/sports`. Without a prefix, exclusions use full names as before. Namespace and exclusion checks run before metadata requests and peer credentials, including cold discovery and equivalent replica selection. Changing or removing a prefix retains source revision fencing, viewer invalidation and worker reconciliation.
+
+The source editor provides a normal Stream prefix input and explains relative exclusions in direct Cluster and staged Config editing. This bounded native behavior follows the [reference source schema](https://flussonic.com/doc/api/reference/) and read-only inspection of source prefix matching and exclusion expansion. It does not implement name renaming, source inventory discovery, static `only` activation, group configuration or mixed-vendor metadata interoperability. Vendor files are inspection material only and remain absent from build, runtime and test fixtures.

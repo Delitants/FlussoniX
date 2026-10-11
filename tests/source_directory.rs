@@ -21,6 +21,78 @@ fn client() -> reqwest::Client {
         .build()
         .unwrap()
 }
+// Break caught: prefix misses reach upstream, exclusions use local full names, or lookup strips names.
+#[tokio::test]
+async fn source_prefix_filters_requests_and_exclusions_are_relative_without_renaming() {
+    use std::sync::{Arc, Mutex};
+    let names = Arc::new(Mutex::new(Vec::new()));
+    let captured = names.clone();
+    let (url, task) = serve(Router::new().route(
+        "/endpoint/flussonix/api/v1/stream/{*name}",
+        get(
+            move |h: HeaderMap, axum::extract::Path(name): axum::extract::Path<String>| {
+                assert_eq!(h["X-Flussonix-Peer"], "specific-owned-key");
+                captured.lock().unwrap().push(name.clone());
+                async move { axum::Json(json!({"name":name})) }
+            },
+        ),
+    ))
+    .await;
+    let source = json!({"api_url":format!("{url}/endpoint"),"cluster_key":"specific-owned-key","prefix":"region/eu","except":["news","sports/*","space name","日本語/番組"]});
+    let client = client();
+    for name in [
+        "news",
+        "region/eu",
+        "region/europe/news",
+        "other/region/eu/news",
+        "region/eu/news",
+        "region/eu/sports/one",
+        "region/eu/sports/deep/two",
+        "region/eu/space name",
+        "region/eu/日本語/番組",
+    ] {
+        assert_eq!(
+            query(&client, &source, name, "unused-default-key")
+                .await
+                .unwrap_err(),
+            LookupFailure::Absent,
+            "{name}"
+        );
+    }
+    assert!(
+        names.lock().unwrap().is_empty(),
+        "nonmatching/excluded names sent peer credentials"
+    );
+    for name in [
+        "region/eu/News",
+        "region/eu/news/one",
+        "region/eu/sports",
+        "region/eu/sporting/one",
+        "region/eu/space name 2",
+        "region/eu/日本語/別番組",
+    ] {
+        assert_eq!(
+            query(&client, &source, name, "unused-default-key")
+                .await
+                .unwrap()["name"],
+            name
+        );
+    }
+    let got = names.lock().unwrap().clone();
+    task.abort();
+    let _ = task.await;
+    assert_eq!(
+        got,
+        [
+            "region/eu/News",
+            "region/eu/news/one",
+            "region/eu/sports",
+            "region/eu/sporting/one",
+            "region/eu/space name 2",
+            "region/eu/日本語/別番組"
+        ]
+    );
+}
 #[tokio::test]
 async fn query_preserves_prefix_encoded_name_and_source_specific_key() {
     let router = Router::new().route(

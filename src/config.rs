@@ -428,6 +428,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "drain",
                     "flussonix_transport",
                     "flussonix_source_group",
+                    "prefix",
                     "except",
                     "flussonix_tls_ca",
                     "flussonix_media_tls_ca",
@@ -468,6 +469,17 @@ fn validate_root(root: &Value) -> Result<(), String> {
             }
             if let Some(id) = item.get("flussonix_content_id") {
                 valid_identity(id)?;
+            }
+            if let Some(prefix) = item.get("prefix") {
+                let prefix = prefix
+                    .as_str()
+                    .ok_or("source prefix must be a name string")?;
+                if *kind != "sources" || prefix.contains('*') || valid_name(prefix).is_err() {
+                    return Err(
+                        "source prefix requires a valid name without wildcards or a trailing slash"
+                            .into(),
+                    );
+                }
             }
             if let Some(except) = item.get("except") {
                 if *kind != "sources" {

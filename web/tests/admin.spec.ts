@@ -985,3 +985,21 @@ test('source URL identity supports friendly create edit staging and delete',asyn
  await page.getByRole('button',{name:'Cluster',exact:true}).click();await page.getByRole('button',{name:'Source servers',exact:true}).click();
  page.once('dialog',d=>d.accept());await row().getByRole('button',{name:'Delete',exact:true}).click();await expect(row()).toHaveCount(0);expect((await request.get(uri,{headers})).status()).toBe(404);
 });
+
+// Break caught: source editors cannot configure namespace selection or remove it.
+test('source prefix supports friendly direct and staged namespace editing',async({page,request})=>{
+ test.setTimeout(60000);
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const key='m4s://ui-prefix-source.invalid:8080';const uri='/streamer/api/v3/cluster/sources/'+encodeURIComponent(key);
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();await page.getByRole('button',{name:'Source servers',exact:true}).click();await page.getByRole('button',{name:'Add source',exact:true}).click();
+ await page.getByLabel('Source identity',{exact:true}).selectOption('url');await page.getByLabel('Source address',{exact:true}).fill(key);
+ await page.getByLabel('Stream prefix',{exact:true}).fill('region/*',{timeout:8000});await page.getByRole('button',{name:'Save',exact:true}).click();
+ await expect(page.getByRole('dialog',{name:'Add source'}).getByRole('alert')).toContainText('prefix');expect((await request.get(uri,{headers})).status()).toBe(404);
+ await page.getByLabel('Stream prefix',{exact:true}).fill('region/eu');await page.getByRole('button',{name:'Add exclusion',exact:true}).click();await page.getByLabel('Excluded stream or prefix 1',{exact:true}).fill('news');
+ await expect(page.locator('textarea')).toHaveCount(0);await page.screenshot({path:'../.runtime/screenshots/source-prefix.png',fullPage:true});await page.getByRole('button',{name:'Save',exact:true}).click();
+ const row=()=>page.getByRole('row').filter({has:page.getByRole('cell',{name:key,exact:true})});await expect(row()).toBeVisible();let saved=await(await request.get(uri,{headers})).json();expect(saved.prefix).toBe('region/eu');expect(saved.except).toEqual(['news']);
+ await row().getByRole('button',{name:'Edit',exact:true}).click();await expect(page.getByLabel('Stream prefix',{exact:true})).toHaveValue('region/eu');await page.getByRole('button',{name:'Cancel',exact:true}).click();
+ await page.getByRole('button',{name:'Config',exact:true}).click();await page.getByRole('button',{name:'Source servers',exact:true}).first().click();await row().getByRole('button',{name:'Edit',exact:true}).click();await page.getByLabel('Stream prefix',{exact:true}).fill('other');await page.getByRole('button',{name:'Stage changes',exact:true}).click();
+ expect((await(await request.get(uri,{headers})).json()).prefix).toBe('region/eu');await page.getByRole('button',{name:'Validate',exact:true}).click();await expect(page.getByRole('status')).toContainText('Saved state has not changed');await page.getByRole('button',{name:'Save & apply',exact:true}).click();await expect(page.getByRole('status')).toContainText('saved and applied');expect((await(await request.get(uri,{headers})).json()).prefix).toBe('other');
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();await page.getByRole('button',{name:'Source servers',exact:true}).click();await row().getByRole('button',{name:'Edit',exact:true}).click();await page.getByLabel('Stream prefix',{exact:true}).fill('');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(row()).toBeVisible();saved=await(await request.get(uri,{headers})).json();expect(saved.prefix).toBeUndefined();expect(saved.except).toEqual(['news']);expect((await request.delete(uri,{headers})).ok()).toBeTruthy();
+});

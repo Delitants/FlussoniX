@@ -710,6 +710,67 @@ async fn excluding_all_origins_stops_an_existing_pull_and_revokes_its_viewer() {
     assert_eq!(recovered, 0);
 }
 
+// Break caught: prefix changes leave a cached native worker and viewer authorized outside its namespace.
+#[tokio::test]
+async fn changing_source_prefix_stops_an_existing_pull_and_revokes_its_viewer() {
+    let _load = MEDIA_TESTS.acquire().await.unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let (a, b, cdn) = setup(d.path(), "m4s").await;
+    for name in ["a", "b"] {
+        cdn.app
+            .config
+            .put("sources", name, json!({"prefix":"region"}))
+            .unwrap();
+    }
+    let initial = play(&cdn).await.status();
+    let worker_before = cdn.app.media.count().await;
+    let viewer_before = cdn
+        .app
+        .playback_auth
+        .snapshots()
+        .iter()
+        .any(|s| s["is_open"] == true);
+    cdn.app
+        .config
+        .put("sources", "b", json!({"prefix":"other"}))
+        .unwrap();
+    let updated = client()
+        .put(format!("{}/streamer/api/v3/cluster/sources/a", cdn.url))
+        .basic_auth("admin", Some("owned-management"))
+        .json(&json!({"prefix":"other"}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    let worker_after = cdn.app.media.count().await;
+    let viewer_after = cdn
+        .app
+        .playback_auth
+        .snapshots()
+        .iter()
+        .any(|s| s["is_open"] == true);
+    let blocked = client()
+        .get(format!(
+            "{}/region/news/index.m3u8?token=viewer-owned",
+            cdn.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    cdn.app.reconcile().await;
+    let recovered = cdn.app.media.count().await;
+    cleanup([a, b, cdn]).await;
+    assert_eq!(initial, 200);
+    assert_eq!(worker_before, 1);
+    assert!(viewer_before);
+    assert_eq!(updated, 200);
+    assert_eq!(worker_after, 0);
+    assert!(!viewer_after);
+    assert_eq!(blocked, 404);
+    assert_eq!(recovered, 0);
+}
+
 // Break caught: URL-only replicas compare two absent hostnames and report no source switch.
 #[tokio::test]
 async fn url_keyed_source_replicas_pull_and_switch_with_correct_identity() {
