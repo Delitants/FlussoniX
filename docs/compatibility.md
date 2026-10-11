@@ -546,7 +546,7 @@ policy, provenance/loop gates and HLS/MPEG-TS carriage remain unqualified.
 
 ### Local source/group viewer-policy gate
 
-An independent [local policy library](vendor-viewer-policy.md) composes explicit source/group callback and token layers using native viewer authorization. Whole callback replacement, normalized field agreement between groups, explicit public decisions and strict unsupported/malformed-policy rejection are supported. It deliberately rejects conflicting group precedence and unresolved templates. Native source behavior is unchanged; inventory group metadata, resolver/activation wiring, live vendor authentication and full source/group parity remain unqualified.
+An independent [local policy library](vendor-viewer-policy.md) composes explicit source/group callback and token layers using native viewer authorization. Whole callback replacement, normalized field agreement between groups, explicit public decisions and strict unsupported/malformed-policy rejection are supported. It deliberately rejects conflicting group precedence and unresolved templates. Native source behavior is unchanged; live inventory group encoding, resolver/activation wiring, live vendor authentication and full source/group parity remain unqualified.
 
 
 ### Vendor inventory membership facts
