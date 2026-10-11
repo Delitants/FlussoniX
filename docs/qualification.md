@@ -1190,3 +1190,38 @@ The first default-activation CI run (`38125668253`, candidate `c372bc2`) failed 
 
 
 The second default-activation CI run (`38127268694`, candidate `8f8c50c`) passed the complete Rust qualification but failed one browser assertion: a page-wide inventory error locator matched three unavailable sources. Default activation correctly makes other configured sources report their own failures; the assertion had assumed a unique page-wide message. A controlled second unavailable source reproduces the strict-locator failure locally. The test now asserts the message within each exact source status paragraph and cleans up both owned source rows even on failure. Production code, message text, deadlines and media behavior remain unchanged. Both focused browser journeys must pass, followed by fresh immutable-head full CI and review. This correction does not qualify vendor inventory interoperability.
+## Independent vendor inventory wire-client qualification
+
+The [Flussonic HTTP inventory client](vendor-source-inventory.md) is a bounded
+library building block; daemon source selection and routing remain native.
+Four literal SHA-1 inventory-authentication vectors cover zero/current-scale
+Unix timestamps, colon-containing keys and UTF-8 keys. The values were computed
+through Python hashlib and system OpenSSL; the Rust client uses `ring`.
+An owned two-page HTTP fixture also checks captured current-time credentials
+against OpenSSL and confirms that an opaque URL-like cursor stays a single
+query value on the configured origin and proxy path.
+
+The 16 HTTP/HTTPS cases check complete-chain publication, cross-page duplicate
+names, malformed names/flags/provenance/envelopes/cursors, cursor cycles,
+aggregate bytes and rows, advertised excessive lengths and chunked bodies,
+complete/incomplete page caps, one deadline over pagination and body reads,
+HTTP errors, redirect confinement, URL/key validation and verified custom CA,
+untrusted, wrong-name and expired certificates. Native source/schema/auth,
+namespace, activation, failover and TLS checks also pass: 261 distinct local
+Rust tests in the serial related regression set. Formatting, warnings-denied
+all-targets Clippy and the candidate daemon build pass. All owned fixture tasks and
+short-lived certificate/hash processes are canceled or reaped.
+
+The initial nonfunctional interface failed all 15 original HTTP/HTTPS cases
+and the literal-vector test. A separate regression then reproduced accepting
+an HTTP 202 body as a complete inventory under a generic success-status check.
+The final client requires HTTP 200 and all 16 HTTP/HTTPS cases pass. A
+request-time window assertion uses the observed operation's start/end clocks,
+avoiding an unrelated fixed post-test timing assumption.
+
+This qualifies independent fixture behavior, not live reference Cluster
+authentication or a mixed-vendor deployment. Effective source/group viewer
+policy, inheritance, provenance/loop rules, private M4S/M4F name binding and
+credential refresh, HLS/MPEG-TS credential carriage and daemon/UI vendor-mode
+integration remain pending. Build/runtime/tests require no official Flussonic
+component. The existing preview configuration and credentials are preserved.

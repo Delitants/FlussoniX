@@ -368,6 +368,7 @@ dependencies = [
  "md-5",
  "percent-encoding",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

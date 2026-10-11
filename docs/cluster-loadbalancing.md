@@ -237,6 +237,13 @@ Legacy nodes cannot enforce the native reservation protocol. Use conservative pe
 
 ## Pulling from source servers
 
+The independent [Flussonic inventory wire client](vendor-source-inventory.md)
+provides bounded authenticated pagination as a library building block. Native
+sources continue using the existing source directory. Vendor source routing
+still requires qualification of local source/group viewer policy, provenance
+and stream-scoped private-media authentication; inventory receipt alone is
+not an authorization grant.
+
 After authorization, the CDN resolves the canonical stream and effective output configuration. A fresh compatible local stream is reused. Otherwise, the stream supervisor coalesces concurrent requests into one start operation, chooses an authorized source candidate and starts M4F or M4S over its private endpoint.
 
 Choose among equivalent source candidates by configured priority/authority, stream freshness, LAN reachability and source egress headroom. Source load is separate from CDN public-uplink load. Do not treat different streams with a coincidentally identical name as interchangeable.

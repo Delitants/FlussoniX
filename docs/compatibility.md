@@ -523,3 +523,7 @@ Successful inventory leases last 30 seconds. Temporary failures retain the prior
 This changes admission for existing native configurations with more than 64 default-active sources. Set excess sources to On demand (`only: []`) before starting or importing them. Validation, startup and API edits reject over-limit configurations atomically; no configuration is rewritten automatically.
 
 Production scale/capacity, vendor inventory and mixed-vendor metadata interoperability, and complete source/group configuration parity remain unqualified.
+
+### Flussonic inventory wire client
+
+An explicit [Flussonic HTTP inventory client](vendor-source-inventory.md) is available as a library building block. It reads authenticated, paginated `/-/streams` inventory with one deadline and aggregate limits, verified HTTPS and no redirects or credential fallback. It returns typed discovery facts only after the entire chain validates, including static/disabled flags and known or unknown provenance. The native source schema, editor, resolver and activation paths remain unchanged; the daemon does not select this client yet. Live hashed Cluster authentication, effective viewer-policy composition, relay-loop rules and private M4S/M4F authentication must be qualified before exposing vendor source routing. Independent HTTP/HTTPS fixtures require no official Flussonic component.

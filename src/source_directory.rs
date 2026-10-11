@@ -1,6 +1,7 @@
 //! Bounded native source metadata lookup. App supplies its no-redirect HTTP(S) client.
 use serde_json::Value;
 use std::time::Duration;
+pub mod flussonic;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LookupFailure {
     Unavailable,
