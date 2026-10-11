@@ -71,9 +71,6 @@ fn every_complete_source_option_must_be_supported() {
         ("extra", json!({"on_play":"deny"})),
         ("drain", json!(true)),
         ("hostname", json!("alias")),
-        ("api_url", json!("http://private.invalid")),
-        ("private_payload_url", json!("https://private.invalid")),
-        ("flussonix_tls_ca", json!("/ca.pem")),
         ("protocols", json!(["hls"])),
         ("stats", json!({})),
     ] {

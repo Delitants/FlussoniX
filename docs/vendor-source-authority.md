@@ -9,7 +9,7 @@ executable or library is needed to build, test or run it.
 ## Complete supported profile
 
 `SourceAuthority::new(source, auth_backends)` validates every supplied field
-before extracting any policy layer. It accepts a complete object in this
+and rejects unknown fields before projecting policy layers. It accepts a complete object in this
 explicit supported subset, not arbitrary Flussonic configuration or a native
 FlussoniX source object after normalization. The only source fields are:
 
@@ -21,6 +21,8 @@ FlussoniX source object after normalization. The only source fields are:
 | `only`, `except` | Optional arrays of at most 1024 exact names or `prefix/*` patterns, each at most 256 UTF-8 bytes. Existing native visibility/selection semantics apply. |
 | `on_play`, `flussonix_token_sha256` | Explicit local policy fields supported by the [policy gate](vendor-viewer-policy.md). |
 | `group_config` | Optional map of local group names to complete supported group objects. |
+| `api_url`, `private_payload_url` | Optional explicit management/private HTTP(S) roots; [client binding](vendor-source-binding.md) defines defaults and confinement. |
+| `flussonix_tls_ca`, `flussonix_media_tls_ca` | Optional independent absolute PEM CA paths for the respective HTTPS leg; trust is captured during profile construction. |
 
 A group object permits only `name`, `on_play` and `flussonix_token_sha256`.
 An optional `name` must equal its map key exactly; it is validated before being
@@ -31,10 +33,10 @@ policy gate's strict array of local `name`/HTTP(S) `url` entries.
 
 Unknown fields and unsupported rules fail rather than being discarded. This
 includes templates, `extra`, country/domain/protocol restrictions, `cache`,
-`dvr`, `segment_duration`, `drain`, statistics, native normalized fields,
-management/private endpoint overrides and custom CA fields. These features need
-explicit implementation before this profile can accept them. No endpoint is
-contacted and no transport is selected by this configuration library.
+`dvr`, `segment_duration`, `drain`, statistics and unsupported native normalized
+fields. These features need explicit implementation before
+this profile can accept them. The profile prepares independent clients without
+contacting endpoints; no daemon transport is selected by this library.
 
 The combined serialized JSON value
 `{"source": source, "auth_backends": auth_backends}` is limited to 1 MiB.
@@ -103,7 +105,11 @@ configuration before this authority. Copied policy values cannot substitute for
 a fresh publication check.
 
 Live positive/negative Cluster authentication, sender group/provenance encoding,
-aliases, actual relay-loop prevention, template/group parity, endpoint/trust
-binding and HLS/TS credential carriage remain qualification gates. Viewer
+aliases, actual relay-loop prevention, template/group parity, live endpoint identity
+qualification and HLS/TS credential carriage remain qualification gates. Viewer
 permission must precede private media requests, and workers must retain subtitle
 preserve/convert/drop behavior. Vendor routing remains disabled.
+
+The [configured-source binding](vendor-source-binding.md) adds opaque complete-fetch
+results and current-profile media construction. Plain/manual candidates remain
+metadata-only and cannot be substituted at the bound entry point.

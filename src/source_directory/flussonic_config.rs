@@ -1,11 +1,18 @@
 //! Complete local source projection and metadata-candidate publication fencing.
 //! Independent of daemon configuration/routing; no vendor runtime components.
+mod binding;
+use super::flussonic::InventoryClient;
 use super::{
     flussonic::{CandidateKind, EligibilityFailure, InventoryStream},
     flussonic_policy::{PolicyFailure, PolicySet},
 };
-use crate::playback_auth::Policy;
+use crate::{
+    m4_ingest::flussonic::{MediaOrigin, Transport},
+    playback_auth::Policy,
+};
+pub use binding::{BindingFailure, BoundCandidate, BoundInventory};
 use serde_json::{Map, Value, json};
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 const MAX_PROFILE_BYTES: usize = 1024 * 1024;
@@ -30,6 +37,8 @@ pub enum ProjectionFailure {
 struct Profile {
     source: Value,
     policies: PolicySet,
+    inventory: InventoryClient,
+    media: MediaOrigin,
 }
 impl Profile {
     fn parse(source: &Value, backends: &Value) -> Result<Self, ProjectionFailure> {
@@ -49,10 +58,15 @@ impl Profile {
                 "on_play",
                 "flussonix_token_sha256",
                 "group_config",
+                "api_url",
+                "private_payload_url",
+                "flussonix_tls_ca",
+                "flussonix_media_tls_ca",
             ],
         )?;
         let url = source["url"].as_str().ok_or(ProjectionFailure::Invalid)?;
-        crate::config::source_address(url).map_err(|_| ProjectionFailure::Invalid)?;
+        let (default_root, protocol) =
+            crate::config::source_address(url).map_err(|_| ProjectionFailure::Invalid)?;
         source["cluster_key"]
             .as_str()
             .filter(|key| !key.is_empty() && key.len() <= 4096)
@@ -99,11 +113,35 @@ impl Profile {
                 groups.insert(name.clone(), project_policy(group));
             }
         }
+        let api = optional_text(source, "api_url")?.unwrap_or(&default_root);
+        let private = optional_text(source, "private_payload_url")?.unwrap_or(api);
+        let key = source["cluster_key"]
+            .as_str()
+            .expect("validated privileged key");
+        let inventory = InventoryClient::new(
+            api,
+            key,
+            optional_text(source, "flussonix_tls_ca")?.map(Path::new),
+        )
+        .map_err(|_| ProjectionFailure::Invalid)?;
+        let media = MediaOrigin::new(
+            private,
+            if protocol == "m4f" {
+                Transport::M4f
+            } else {
+                Transport::M4s
+            },
+            key,
+            optional_text(source, "flussonix_media_tls_ca")?.map(Path::new),
+        )
+        .map_err(|_| ProjectionFailure::Invalid)?;
         let policies = PolicySet::new(&project_policy(object), &Value::Object(groups), backends)
             .map_err(ProjectionFailure::Policy)?;
         Ok(Self {
             source: source.clone(),
             policies,
+            inventory,
+            media,
         })
     }
 }
@@ -132,6 +170,22 @@ impl SourceAuthority {
         self.state
             .lock()
             .map_err(|_| ProjectionFailure::Unavailable)
+    }
+    fn current(
+        &self,
+        revision: u64,
+        profile: &Arc<Profile>,
+    ) -> Result<MutexGuard<'_, State>, ProjectionFailure> {
+        let state = self.state()?;
+        if state.revision != revision
+            || !state
+                .profile
+                .as_ref()
+                .is_some_and(|p| Arc::ptr_eq(p, profile))
+        {
+            return Err(ProjectionFailure::Stale);
+        }
+        Ok(state)
     }
     pub fn snapshot(&self) -> Result<SourceSnapshot, ProjectionFailure> {
         let state = self.state()?;
@@ -172,15 +226,7 @@ impl SourceAuthority {
         candidate: &Candidate,
         commit: impl FnOnce(CandidateView<'_>) -> T,
     ) -> Result<T, ProjectionFailure> {
-        let state = self.state()?;
-        if state.revision != candidate.revision
-            || !state
-                .profile
-                .as_ref()
-                .is_some_and(|p| Arc::ptr_eq(p, &candidate.profile))
-        {
-            return Err(ProjectionFailure::Stale);
-        }
+        let state = self.current(candidate.revision, &candidate.profile)?;
         // Keep state alive through commit: replacement/removal cannot interleave.
         let result = commit(CandidateView {
             source: candidate.profile.source["url"]
@@ -275,4 +321,15 @@ fn bounded(value: &Value, limit: usize) -> Result<(), ProjectionFailure> {
         return Err(ProjectionFailure::Limit);
     }
     Ok(())
+}
+
+fn optional_text<'a>(source: &'a Value, field: &str) -> Result<Option<&'a str>, ProjectionFailure> {
+    source
+        .get(field)
+        .map(|v| {
+            v.as_str()
+                .filter(|s| !s.is_empty() && s.len() <= 4096)
+                .ok_or(ProjectionFailure::Invalid)
+        })
+        .transpose()
 }

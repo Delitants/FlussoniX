@@ -33,67 +33,8 @@ impl MediaInput {
         key: &str,
         ca: Option<&Path>,
     ) -> Result<Self, String> {
-        let invalid = || "invalid private media configuration".to_owned();
-        if root.len() > 4096
-            || root.chars().any(|c| c.is_control() || c.is_whitespace())
-            || root.contains('\\')
-            || key.is_empty()
-            || key.len() > 4096
-        {
-            return Err(invalid());
-        }
-        crate::config::valid_name(name).map_err(|_| invalid())?;
-        let mut base = Url::parse(root).map_err(|_| invalid())?;
-        if !matches!(base.scheme(), "http" | "https")
-            || base.host_str().is_none()
-            || base.port() == Some(0)
-            || !base.username().is_empty()
-            || base.password().is_some()
-            || base.query().is_some()
-            || base.fragment().is_some()
-            || ca.is_some() && base.scheme() != "https"
-        {
-            return Err(invalid());
-        }
-        {
-            let mut segments = base.path_segments_mut().map_err(|_| invalid())?;
-            segments.pop_if_empty();
-            for segment in name.split('/') {
-                segments.push(segment);
-            }
-        }
-        let mut control = base.clone();
-        control
-            .path_segments_mut()
-            .map_err(|_| invalid())?
-            .push(if transport == Transport::M4f {
-                "m4f"
-            } else {
-                "m4s"
-            });
-        let mut client = reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(Duration::from_secs(5))
-            .https_only(base.scheme() == "https")
-            .redirect(reqwest::redirect::Policy::none());
-        if base.scheme() == "https" {
-            client = client.use_preconfigured_tls(
-                (*crate::tls_input::client(ca).map_err(|_| invalid())?).clone(),
-            );
-        }
-        let client = client.build().map_err(|_| invalid())?;
-        Ok(Self {
-            requests: Requests {
-                client,
-                base,
-                control,
-                is_m4f: transport == Transport::M4f,
-                auth: RequestAuth::Flussonic {
-                    key: key.into(),
-                    name: name.into(),
-                },
-            },
-        })
+        crate::config::valid_name(name).map_err(|_| invalid_media_configuration())?;
+        MediaOrigin::new(root, transport, key, ca)?.input(name)
     }
     /// One input session. Reopening the same client obtains fresh credentials;
     /// the caller owns retry/backoff and cancellation. Metadata precedes TS
@@ -114,6 +55,96 @@ impl MediaInput {
         )
         .await
     }
+}
+
+/// Frozen private origin, key, transport and prepared TLS client. Shared only
+/// inside a validated source profile; creating an input never rereads CA files.
+pub(crate) struct MediaOrigin {
+    base: Url,
+    transport: Transport,
+    key: Box<str>,
+    client: reqwest::Client,
+}
+impl MediaOrigin {
+    pub(crate) fn new(
+        root: &str,
+        transport: Transport,
+        key: &str,
+        ca: Option<&Path>,
+    ) -> Result<Self, String> {
+        let invalid = invalid_media_configuration;
+        if root.len() > 4096
+            || root.chars().any(|c| c.is_control() || c.is_whitespace())
+            || root.contains('\\')
+            || key.is_empty()
+            || key.len() > 4096
+        {
+            return Err(invalid());
+        }
+        let base = Url::parse(root).map_err(|_| invalid())?;
+        if !matches!(base.scheme(), "http" | "https")
+            || base.host_str().is_none()
+            || base.port() == Some(0)
+            || !base.username().is_empty()
+            || base.password().is_some()
+            || base.query().is_some()
+            || base.fragment().is_some()
+            || ca.is_some() && base.scheme() != "https"
+        {
+            return Err(invalid());
+        }
+        let mut builder = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(5))
+            .https_only(base.scheme() == "https")
+            .redirect(reqwest::redirect::Policy::none());
+        if base.scheme() == "https" {
+            builder = builder.use_preconfigured_tls(
+                (*crate::tls_input::client(ca).map_err(|_| invalid())?).clone(),
+            );
+        }
+        Ok(Self {
+            base,
+            transport,
+            key: key.into(),
+            client: builder.build().map_err(|_| invalid())?,
+        })
+    }
+    pub(crate) fn input(&self, name: &str) -> Result<MediaInput, String> {
+        let invalid = invalid_media_configuration;
+        crate::config::valid_name(name).map_err(|_| invalid())?;
+        let mut base = self.base.clone();
+        {
+            let mut segments = base.path_segments_mut().map_err(|_| invalid())?;
+            segments.pop_if_empty();
+            for segment in name.split('/') {
+                segments.push(segment);
+            }
+        }
+        let mut control = base.clone();
+        control.path_segments_mut().map_err(|_| invalid())?.push(
+            if self.transport == Transport::M4f {
+                "m4f"
+            } else {
+                "m4s"
+            },
+        );
+        Ok(MediaInput {
+            requests: Requests {
+                client: self.client.clone(),
+                base,
+                control,
+                is_m4f: self.transport == Transport::M4f,
+                auth: RequestAuth::Flussonic {
+                    key: self.key.clone(),
+                    name: name.into(),
+                },
+            },
+        })
+    }
+}
+fn invalid_media_configuration() -> String {
+    "invalid private media configuration".to_owned()
 }
 
 pub(super) fn media_headers(key: &str, name: &str, timestamp: u64) -> HeaderMap {

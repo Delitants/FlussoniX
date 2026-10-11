@@ -1294,3 +1294,18 @@ closed. Exact configured-count, full-group/source-policy/backend byte and combin
 The [independent authority](vendor-source-authority.md) does not govern the daemon's
 global configuration or verify actual origin topology. Vendor routing remains
 disabled pending live interoperability, leases, global fencing and integration.
+
+
+### Configured-source inventory and private-media binding
+
+Owned random-port HTTP/TLS fixtures exercise mapped defaults and split proxy
+origins, literal names, local policy, distinct legacy credentials, transport
+selection, atomic invalid edits, cross-authority and stale/late-result fencing.
+A gated response tests replacement/removal after a request begins, including
+lookup errors. Full-chain failure and cancellation retain no detached fetch.
+Independent management/private trust is captured at profile construction; changed
+CA files cannot mutate an existing client, while valid replacement invalidates
+old candidates. Redirect and rejected-auth paths do not probe alternate origins.
+The [binding library](vendor-source-binding.md) does not attest topology or grant
+viewer access, revoke exported inputs, acquire global daemon authority or enable
+vendor routing. Live interoperability and daemon integration remain pending.

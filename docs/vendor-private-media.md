@@ -91,3 +91,11 @@ This qualifies the explicit client's fixture behavior. It does not qualify
 live vendor authentication, aliases, HLS/MPEG-TS credential carriage, source/
 group policy inheritance, discovered-name provenance, loop prevention,
 daemon/UI integration, or production scale.
+
+
+The independent [configured-source binding](vendor-source-binding.md) now retains
+validated endpoints, key, transport and per-leg TLS trust under one source profile.
+Opaque complete inventory results produce candidates for current-profile media
+construction; stale fetch success/errors and cross-authority publication fail.
+This remains library-only: actual topology, live interoperability, global daemon
+fences, leases and worker/session lifetime still gate vendor routing.
