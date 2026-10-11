@@ -1,4 +1,5 @@
-//! Independent M4 HTTP ingest. Native peer credentials never follow redirects.
+//! Independent M4 HTTP ingest. Privileged peer credentials never follow redirects.
+pub mod flussonic;
 use crate::{
     m4s::{Decoder, Event, PackedGop, Track},
     wire::{Hub, Segment},
@@ -192,23 +193,11 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
     key: Option<&str>,
     stdin: &mut W,
     hub: Option<&Hub>,
-    mut metadata: Option<oneshot::Sender<Vec<Track>>>,
+    metadata: Option<oneshot::Sender<Vec<Track>>>,
     subtitles: PullOptions<'_>,
 ) -> Result<(), String> {
-    let PullOptions {
-        ca,
-        preserve,
-        detected,
-        conversion,
-    } = subtitles;
+    let ca = subtitles.ca;
     let is_m4f = input.starts_with("m4f");
-    let policy = SubtitlePolicy {
-        preserve,
-        copy: hub.is_some(),
-        sparse: is_m4f,
-        detected,
-        conversion,
-    };
     let suffix = if is_m4f { "/m4f" } else { "/m4s" };
     let scheme = if input.starts_with("m4ss://") || input.starts_with("m4fs://") {
         "https"
@@ -268,17 +257,80 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
         client = client.use_preconfigured_tls((*crate::tls_input::client(ca)?).clone());
     }
     let client = client.build().map_err(|_| "cannot build input client")?;
-    let mut request = client
-        .get(control)
-        .header("X-Supported", "prepush,drop_status");
-    if let Some(key) = key {
-        request = request.header("X-Flussonix-Peer", key)
+    let requests = Requests {
+        client,
+        base,
+        control,
+        auth: RequestAuth::Native(key.map(Into::into)),
+        is_m4f,
+    };
+    consume(&requests, stdin, hub, metadata, subtitles).await
+}
+
+// Both explicit vendor and native inputs consume the same independent framing,
+// codec, subtitle, metadata and worker bridge implementation.
+struct Requests {
+    client: reqwest::Client,
+    base: url::Url,
+    control: url::Url,
+    auth: RequestAuth,
+    is_m4f: bool,
+}
+enum RequestAuth {
+    Native(Option<Box<str>>),
+    Flussonic { key: Box<str>, name: Box<str> },
+}
+impl Requests {
+    fn get(&self, url: url::Url) -> Result<reqwest::RequestBuilder, String> {
+        let request = self.client.get(url);
+        Ok(match &self.auth {
+            RequestAuth::Native(Some(key)) => request.header("X-Flussonix-Peer", key.as_ref()),
+            RequestAuth::Native(None) => request,
+            RequestAuth::Flussonic { key, name } => {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| "media authentication clock unavailable")?
+                    .as_secs();
+                request.headers(flussonic::media_headers(key, name, timestamp))
+            }
+        })
     }
+    fn accepts(&self, status: reqwest::StatusCode) -> bool {
+        match self.auth {
+            RequestAuth::Flussonic { .. } => status == reqwest::StatusCode::OK,
+            RequestAuth::Native(_) => status.is_success(),
+        }
+    }
+}
+async fn consume<W: AsyncWrite + Unpin>(
+    requests: &Requests,
+    stdin: &mut W,
+    hub: Option<&Hub>,
+    mut metadata: Option<oneshot::Sender<Vec<Track>>>,
+    subtitles: PullOptions<'_>,
+) -> Result<(), String> {
+    let PullOptions {
+        preserve,
+        detected,
+        conversion,
+        ..
+    } = subtitles;
+    let is_m4f = requests.is_m4f;
+    let policy = SubtitlePolicy {
+        preserve,
+        copy: hub.is_some(),
+        sparse: is_m4f,
+        detected,
+        conversion,
+    };
+    let request = requests
+        .get(requests.control.clone())?
+        .header("X-Supported", "prepush,drop_status");
     let response = tokio::time::timeout(Duration::from_secs(10), request.send())
         .await
         .map_err(|_| "media setup timed out")?
         .map_err(|_| "media connection failed")?;
-    if !response.status().is_success() {
+    if !requests.accepts(response.status()) {
         return Err("source rejected input".into());
     }
     let mut stream = response.bytes_stream();
@@ -299,14 +351,11 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
                 if seen.contains(&n.name) {
                     continue;
                 }
-                let mut url = base.clone();
-                url.set_path(&format!("{}/{}", base.path(), n.name));
-                let mut request = client.get(url).timeout(Duration::from_secs(10));
-                if let Some(key) = key {
-                    request = request.header("X-Flussonix-Peer", key)
-                }
+                let mut url = requests.base.clone();
+                url.set_path(&format!("{}/{}", requests.base.path(), n.name));
+                let request = requests.get(url)?.timeout(Duration::from_secs(10));
                 let response = request.send().await.map_err(|_| "M4F fetch failed")?;
-                if !response.status().is_success() {
+                if !requests.accepts(response.status()) {
                     return Err("M4F segment denied".into());
                 }
                 let mut body = BytesMut::new();

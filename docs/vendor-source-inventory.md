@@ -85,8 +85,10 @@ build or run these tests.
 Before exposing a vendor source mode, qualify live positive/negative Cluster
 authentication, effective source/group viewer-policy composition and template
 inheritance. Missing policy information must not become a public grant.
-Qualify M4S/M4F stream-scoped private-media headers, URL/name binding,
-segment requests and reconnects separately. HLS/MPEG-TS credential carriage
+The explicit [private-media library client](vendor-private-media.md) separately
+qualifies M4S/M4F stream-scoped headers, literal URL/name binding, segment
+requests and reopened sessions against independent fixtures; live reference
+authentication and aliases remain pending. HLS/MPEG-TS credential carriage
 also needs its own evidence. Preserve native prefix/except/only semantics,
 local precedence, revision fencing, inventory leases, capacity limits and
 relay-loop prevention during integration. Missing provenance must not be

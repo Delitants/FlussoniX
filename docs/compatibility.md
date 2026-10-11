@@ -527,3 +527,18 @@ Production scale/capacity, vendor inventory and mixed-vendor metadata interopera
 ### Flussonic inventory wire client
 
 An explicit [Flussonic HTTP inventory client](vendor-source-inventory.md) is available as a library building block. It reads authenticated, paginated `/-/streams` inventory with one deadline and aggregate limits, verified HTTPS and no redirects or credential fallback. It returns typed discovery facts only after the entire chain validates, including static/disabled flags and known or unknown provenance. The native source schema, editor, resolver and activation paths remain unchanged; the daemon does not select this client yet. Live hashed Cluster authentication, effective viewer-policy composition, relay-loop rules and private M4S/M4F authentication must be qualified before exposing vendor source routing. Independent HTTP/HTTPS fixtures require no official Flussonic component.
+
+
+### Flussonic private-media wire client
+
+The explicit [private-media library client](vendor-private-media.md) signs M4S
+connections and M4F control/segment requests with stream-scoped Cluster
+headers, independently of the inventory credential. It encodes literal stream
+names once, regenerates credentials per request, verifies private TLS and
+rejects all redirects, fallback schemes and non-200 responses. Both transports
+share the existing independent decoder and worker bridge.
+
+This client does not expose vendor source selection in the daemon or UI.
+Independent fixtures cover authenticated HEVC/m2a/MP3 samples and request
+lifetimes. Live vendor key/name/alias interoperability, source/group viewer
+policy, provenance/loop gates and HLS/MPEG-TS carriage remain unqualified.

@@ -1225,3 +1225,35 @@ policy, inheritance, provenance/loop rules, private M4S/M4F name binding and
 credential refresh, HLS/MPEG-TS credential carriage and daemon/UI vendor-mode
 integration remain pending. Build/runtime/tests require no official Flussonic
 component. The existing preview configuration and credentials are preserved.
+
+
+## Independent vendor private-media client qualification
+
+The [explicit M4F/M4S media client](vendor-private-media.md) is a library
+building block, separate from source routing and viewer authorization. Four
+literal media-authentication vectors bind decimal Unix seconds, UTF-8 keys
+and original UTF-8 stream names; inventory and media digests remain distinct.
+The literal vectors were derived independently with Python hashlib and OpenSSL.
+
+Ten owned HTTP/TLS regressions exercise actual input consumption and captured
+credentials against system OpenSSL: canonical Unicode/space/percent names and
+proxy prefixes, HEVC/m2a/MP3 metadata and preserved wire samples, credentials
+refreshed for segments and reopened sessions, an independent receiver denying
+the wrong key, control/segment redirects, HTTP failures and partial/asynchronous
+responses, malformed signal confinement, constructor validation, cancellation
+of held control/segment bodies, custom trust, untrusted roots, wrong server
+identity and expired certificates. Interface-only stubs fail all ten HTTP/TLS
+checks and the literal-vector check before implementation.
+
+Native input parsing, Basic credentials, TLS, metadata ordering and subtitle
+handling retain their existing paths through the shared decoder/worker bridge.
+Related regressions and full immutable-head CI must pass before publication
+and preview replacement; their exact results are retained with release evidence.
+No vendor server, library or executable is required by tests. All owned fixture
+tasks and short-lived hash/certificate processes are canceled or reaped.
+
+This does not establish live vendor positive/negative authentication, alias
+semantics, HLS/TS credential carriage, effective source/group viewer policy,
+provenance/loop rules, daemon/UI integration or production capacity. Historical
+HEVC loss, socket-observation and parallel UDP readiness issues are not claimed
+fixed by this increment.

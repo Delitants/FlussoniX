@@ -348,3 +348,12 @@ Native source `prefix` selects an exact remote namespace without rewriting strea
 
 
 Native activation uses a bounded authenticated source inventory to keep all eligible enabled remote static streams pulled by default, or selected streams with nonempty `only`. An empty `only` list selects On demand and skips inventory polling. The friendly editor exposes all three modes. All static and Selected share a 64-source limit; existing configurations above that limit require excess sources to be set to On demand before startup/import. Nonmatching streams remain on demand; source exclusions and namespaces still apply. Inventory failure reporting is visible on the Source servers page. Static demand does not renew viewer demand or grant playback authorization, and LB nodes stay free of eager workers. See [activation contract, resource limits and remaining compatibility gaps](compatibility.md#explicit-native-source-static-activation).
+
+
+An explicit [vendor M4F/M4S private-media client](vendor-private-media.md) now
+provides a separate library foundation for stream-scoped hashed credentials,
+verified private TLS and request-origin confinement. It shares native media
+decoding but is not selected by source activation or routing. No vendor source
+mode or automatic native/vendor fallback is introduced. Effective source/group
+viewer policy, discovered-name provenance and loop checks remain integration
+gates; live vendor authentication and HLS/TS carriage need separate qualification.
