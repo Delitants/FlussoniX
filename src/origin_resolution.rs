@@ -11,12 +11,13 @@ enum OriginState {
 #[derive(Clone)]
 pub(super) struct Ticket {
     id: uuid::Uuid,
-    done: tokio::sync::watch::Sender<bool>,
+    pub(super) done: tokio::sync::watch::Sender<bool>,
 }
 struct Lookup {
     old: Option<Mirror>,
     ticket: Ticket,
     deadline: tokio::time::Instant,
+    activation_only: bool,
 }
 impl Drop for Lookup {
     fn drop(&mut self) {
@@ -24,7 +25,13 @@ impl Drop for Lookup {
     }
 }
 impl App {
-    async fn begin_lookup(&self, name: &str, root: &Value, revision: u64) -> Option<Lookup> {
+    async fn begin_lookup(
+        &self,
+        name: &str,
+        root: &Value,
+        revision: u64,
+        activation_only: bool,
+    ) -> Option<Lookup> {
         let mut tickets = self.source_lookups.lock().await;
         tickets.retain(|_, t| !*t.done.borrow());
         if tickets.len() >= 10000 && !tickets.contains_key(name) {
@@ -50,6 +57,7 @@ impl App {
                 old,
                 ticket,
                 deadline: tokio::time::Instant::now() + Duration::from_secs(3),
+                activation_only,
             }
         })
     }
@@ -57,16 +65,18 @@ impl App {
         loop {
             let tickets = self.source_lookups.lock().await;
             let Some(ticket) = tickets.get(name).cloned() else {
-                let mirrors = self.mirrors.lock().await;
+                let mut mirrors = self.mirrors.lock().await;
                 return self.config.at_revision(revision, |root| {
                     mirrors
-                        .get(name)
+                        .get_mut(name)
                         .filter(|m| {
                             root["sources"]
                                 .as_array()
                                 .is_some_and(|s| s.contains(&m.source))
                         })
-                        .and_then(|m| self.publish_resolved(name, m, root, revision))
+                        .and_then(|m| {
+                            self.publish_claimed(name, m, root, revision, lookup.activation_only)
+                        })
                 })?;
             };
             drop(tickets);
@@ -82,16 +92,18 @@ impl App {
             {
                 continue;
             }
-            let mirrors = self.mirrors.lock().await;
+            let mut mirrors = self.mirrors.lock().await;
             return self.config.at_revision(revision, |root| {
                 mirrors
-                    .get(name)
+                    .get_mut(name)
                     .filter(|m| {
                         root["sources"]
                             .as_array()
                             .is_some_and(|s| s.contains(&m.source))
                     })
-                    .and_then(|m| self.publish_resolved(name, m, root, revision))
+                    .and_then(|m| {
+                        self.publish_claimed(name, m, root, revision, lookup.activation_only)
+                    })
             })?;
         }
     }
@@ -155,7 +167,7 @@ impl App {
         }
         due.sort_by_key(|(when, _)| *when);
         stream::iter(due.into_iter().take(64).map(|(_, name)| async move {
-            self.resolve(&name).await;
+            self.resolve_for_activation(&name).await;
         }))
         .buffer_unordered(16)
         .collect::<Vec<_>>()
@@ -198,6 +210,17 @@ impl App {
                 .unwrap_or(&self.options.peer_key)
         );
         Ok(c)
+    }
+    fn publish_claimed(
+        &self,
+        name: &str,
+        m: &mut Mirror,
+        root: &Value,
+        revision: u64,
+        activation_only: bool,
+    ) -> Option<Resolved> {
+        m.activation_only &= activation_only;
+        self.publish_resolved(name, m, root, revision)
     }
     fn publish_resolved(
         &self,
@@ -245,23 +268,28 @@ impl App {
             if crate::config::effective(root, name).is_some() {
                 return None;
             }
-            let current = mirrors.get(name);
-            if current.map(|m| m.serial) != old.map(|m| m.serial) {
+            let full = mirrors.len() >= 10000;
+            let current = mirrors.get_mut(name);
+            if current.as_ref().map(|m| m.serial) != old.map(|m| m.serial) {
                 return current
                     .filter(|m| {
                         root["sources"]
                             .as_array()
                             .is_some_and(|s| s.contains(&m.source))
                     })
-                    .and_then(|m| self.publish_resolved(name, m, root, revision));
+                    .and_then(|m| {
+                        self.publish_claimed(name, m, root, revision, lookup.activation_only)
+                    });
             }
             if !root["sources"]
                 .as_array()
                 .is_some_and(|s| s.contains(source))
-                || mirrors.len() >= 10000 && current.is_none()
+                || full && current.is_none()
             {
                 return None;
             }
+            let activation_only =
+                lookup.activation_only && current.as_ref().is_none_or(|m| m.activation_only);
             let switches = old.map_or(0, |m| {
                 m.switches.saturating_add(u64::from(
                     m.known
@@ -277,6 +305,7 @@ impl App {
                 available,
                 denied: matches!(state, OriginState::Denied),
                 known,
+                activation_only,
                 serial: old.map_or(Some(1), |m| m.serial.checked_add(1))?,
                 switches,
             };
@@ -286,8 +315,24 @@ impl App {
         })?
     }
     pub(super) async fn resolve(&self, name: &str) -> Option<Resolved> {
+        self.resolve_origin(name, false).await
+    }
+    pub(super) async fn resolve_for_activation(&self, name: &str) -> Option<Resolved> {
+        self.resolve_origin(name, true).await
+    }
+    async fn resolve_origin(&self, name: &str, activation_only: bool) -> Option<Resolved> {
+        // Claim before local fast paths too: a local policy can replace an old mirror's authority.
+        if !activation_only && let Some(mirror) = self.mirrors.lock().await.get_mut(name) {
+            mirror.activation_only = false;
+        }
         let revision = self.config.revision();
         if let Some(c) = self.config.effective(name) {
+            // Claim the final mirror again under the publication lock: it may
+            // have arrived after the initial claim and before the local save.
+            let mut mirrors = self.mirrors.lock().await;
+            if !activation_only && let Some(mirror) = mirrors.get_mut(name) {
+                mirror.activation_only = false;
+            }
             return self.resolved(name, c, revision);
         }
         let root = self.config.snapshot();
@@ -306,23 +351,27 @@ impl App {
                 // Stats acquisition may yield while a newer lookup publishes a
                 // denial or switches origins. Publish the current mirror under
                 // its lock, never the snapshot taken before that await.
-                let mirrors = self.mirrors.lock().await;
+                let mut mirrors = self.mirrors.lock().await;
                 return self.config.at_revision(revision, |root| {
                     mirrors
-                        .get(name)
+                        .get_mut(name)
                         .filter(|current| {
                             root["sources"]
                                 .as_array()
                                 .is_some_and(|s| s.contains(&current.source))
                         })
-                        .and_then(|current| self.publish_resolved(name, current, root, revision))
+                        .and_then(|current| {
+                            self.publish_claimed(name, current, root, revision, activation_only)
+                        })
                 })?;
             }
             if !m.available && m.when.elapsed() < Duration::from_secs(1) {
                 return None;
             }
         }
-        let lookup = self.begin_lookup(name, &root, revision).await?;
+        let lookup = self
+            .begin_lookup(name, &root, revision, activation_only)
+            .await?;
         let old = lookup.old.clone();
         let deadline = lookup.deadline;
         let mut authority = None;
@@ -612,6 +661,7 @@ mod cache_tests {
             available: true,
             denied: false,
             known: true,
+            activation_only: false,
             serial: 1,
             switches: 0,
         };
@@ -710,6 +760,7 @@ mod cache_tests {
             available: true,
             denied: false,
             known: true,
+            activation_only: false,
             serial: 1,
             switches: 0,
         };
@@ -788,6 +839,7 @@ mod cache_tests {
                 source: root["sources"][0].clone(),
                 config: json!({"name":"owned", "static":false, "inputs":[{"url":"testsrc://"}]}),
                 known: true,
+                activation_only: false,
                 available: true,
                 denied: false,
                 serial: 1,
@@ -901,6 +953,7 @@ mod cache_tests {
                     available: false,
                     denied: false,
                     known: false,
+                    activation_only: false,
                     serial: 1,
                     switches: 0,
                 },
@@ -909,7 +962,7 @@ mod cache_tests {
         drop(mirrors);
         drop(tickets);
         assert!(
-            app.begin_lookup("real-stream", &root, app.config.revision())
+            app.begin_lookup("real-stream", &root, app.config.revision(), false)
                 .await
                 .is_some(),
             "failed probes permanently exhausted discovery"
@@ -1236,5 +1289,109 @@ mod exclusion_tests {
         assert!(app.resolve("region/news").await.is_none());
         assert_eq!(a.calls.load(Ordering::SeqCst), 1);
         assert_eq!(app.media.count().await, 0);
+    }
+}
+
+#[cfg(test)]
+mod activation_claim_tests {
+    use super::*;
+    // Break caught: a cold request consumes a newer eager route without claiming
+    // its authority; reclamation between resolve and authorize then denies it.
+    #[tokio::test]
+    async fn demand_return_paths_claim_activation_authority_before_authorization() {
+        for path in 0..5 {
+            let dir = tempfile::tempdir().unwrap();
+            let app = App::new(
+                dir.path().join("config.json"),
+                dir.path().join("media"),
+                Options {
+                    admin_password: "owned-admin".into(),
+                    peer_key: "owned-claim-peer".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let source = app
+                .config
+                .put(
+                    "sources",
+                    "owned",
+                    json!({"api_url":"http://127.0.0.1:9","only":["warm/*"]}),
+                )
+                .unwrap();
+            let name = format!("warm/{path}");
+            let config = json!({"name":name,"static":false,"inputs":[{"url":"testsrc://"}]});
+            if path == 3 {
+                app.config.put("streams", &name, config.clone()).unwrap();
+            }
+            let root = app.config.snapshot();
+            let revision = app.config.revision();
+            let lookup = app
+                .begin_lookup(&name, &root, revision, false)
+                .await
+                .unwrap();
+            app.mirrors.lock().await.insert(
+                name.clone(),
+                Mirror {
+                    when: Instant::now(),
+                    config: config.clone(),
+                    source: source.clone(),
+                    available: true,
+                    denied: false,
+                    known: true,
+                    activation_only: true,
+                    serial: 1,
+                    switches: 0,
+                },
+            );
+            let resolved = match path {
+                0 => {
+                    app.install_origin(
+                        &name,
+                        &lookup,
+                        &source,
+                        config,
+                        OriginState::Ready,
+                        revision,
+                    )
+                    .await
+                }
+                1 => {
+                    app.source_lookups.lock().await.remove(&name);
+                    app.latest_lookup(&name, &lookup, revision).await
+                }
+                2 => {
+                    let newer = app
+                        .begin_lookup(&name, &root, revision, true)
+                        .await
+                        .unwrap();
+                    drop(newer);
+                    app.latest_lookup(&name, &lookup, revision).await
+                }
+                _ => app.resolve(&name).await,
+            }
+            .unwrap();
+            drop(lookup);
+            app.reclaim_source_activation_metadata().await;
+            let retained = app.mirrors.lock().await.contains_key(&name);
+            let admitted = matches!(
+                app.playback_auth
+                    .authorize(
+                        resolved.policy,
+                        ViewerRequest {
+                            name: name.clone(),
+                            proto: "hls".into(),
+                            ip: "owned".into(),
+                            ..Default::default()
+                        }
+                    )
+                    .await,
+                AuthOutcome::Allowed(_)
+            );
+            assert!(
+                retained && admitted,
+                "demand return path {path} lost its pending authority"
+            );
+        }
     }
 }

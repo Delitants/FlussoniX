@@ -61,10 +61,40 @@ impl App {
         let state = self.source_activation.lock().await;
         self.config.read(|root| json!({"wanted_streams":state.wanted(root).len(),"sources":state.current(root).map(|(key,e)| json!({"source":key,"last_error":e.error,"inventory_streams":e.names.len(),"lease_valid":e.confirmed.is_some_and(|when| when.elapsed()<Duration::from_secs(30))})).collect::<Vec<_>>()}))
     }
+    pub(super) async fn reclaim_source_activation_metadata(&self) {
+        let wanted = {
+            let state = self.source_activation.lock().await;
+            self.config.read(|root| state.wanted(root))
+        };
+        let workers = self
+            .media
+            .workers()
+            .await
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<BTreeSet<_>>();
+        // Match resolver order and exclude in-flight lookups. Request consumers
+        // claim the final mirror under this lock before publishing any snapshot.
+        let tickets = self.source_lookups.lock().await;
+        let mut mirrors = self.mirrors.lock().await;
+        mirrors.retain(|name, mirror| {
+            !mirror.activation_only
+                || wanted.contains(name)
+                || workers.contains(name)
+                || tickets
+                    .get(name)
+                    .is_some_and(|ticket| !*ticket.done.borrow())
+                || !self.playback_auth.forget_unobserved_activation(name)
+        });
+    }
     pub(super) async fn refresh_source_activation(&self) {
         if self.options.role == "lb" {
             return;
         }
+        // All reconciliation entry points share one bounded activation pass.
+        let Ok(_pass) = self.source_activation_refresh.try_lock() else {
+            return;
+        };
         let (root, revision) = self
             .config
             .read(|root| (root.clone(), self.config.revision()));
@@ -159,6 +189,7 @@ impl App {
         .buffer_unordered(16)
         .collect::<Vec<_>>()
         .await;
+        self.reclaim_source_activation_metadata().await;
         let names = {
             let mut state = self.source_activation.lock().await;
             self.config
@@ -184,7 +215,7 @@ impl App {
             if self.config.effective(&name).is_some() {
                 return;
             }
-            let Some(resolved) = self.resolve(&name).await else {
+            let Some(resolved) = self.resolve_for_activation(&name).await else {
                 return;
             };
             let revision = resolved.revision;
@@ -299,6 +330,134 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|s| s["last_error"] != "capacity")
+        );
+    }
+
+    // Break caught: historical eager discoveries fill both route and authority caches.
+    #[tokio::test]
+    async fn warm_name_churn_reclaims_unconsumed_metadata_and_preserves_demand_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-cache-peer".into(),
+                role: "cdn".into(),
+                ffmpeg: "/owned-cache-no-ffmpeg".into(),
+                uplink_interface: "process".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let selected = Arc::new(std::sync::Mutex::new("old/0/0".to_owned()));
+        let picked = selected.clone();
+        let routes=axum::Router::new()
+          .route("/flussonix/api/v1/source-streams",axum::routing::get(move || {let picked=picked.clone();async move {
+              axum::Json(json!({"streams":[{"name":picked.lock().unwrap().clone(),"static":true,"disabled":false}]}))
+          }}))
+          .route("/flussonix/api/v1/stream/{*name}",axum::routing::get(|axum::extract::Path(name):axum::extract::Path<String>|async move {
+              axum::Json(json!({"name":name,"static":true,"disabled":false,"flussonix_content_id":"owned-cache"}))
+          }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(l, routes).await.unwrap() });
+        app.config
+            .put(
+                "sources",
+                "owned",
+                json!({"api_url":url,"flussonix_transport":"m4s","only":["old/*","warm/*"]}),
+            )
+            .unwrap();
+        app.refresh_source_activation().await;
+        app.media.stop_all().await;
+        let seed = app.mirrors.lock().await["old/0/0"].clone();
+        let viewer = app.resolve("viewer").await.unwrap();
+        let AuthOutcome::Allowed(grant) = app
+            .playback_auth
+            .authorize(
+                viewer.policy,
+                ViewerRequest {
+                    name: "viewer".into(),
+                    proto: "hls".into(),
+                    ip: "owned".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("owned viewer denied")
+        };
+        app.resolve("denied").await.unwrap();
+        {
+            let mut mirrors = app.mirrors.lock().await;
+            let denied = mirrors.get_mut("denied").unwrap();
+            denied.denied = true;
+            denied.available = false;
+        }
+        app.playback_auth.publish("denied", None);
+        let mut observations = Vec::new();
+        for round in 0..2 {
+            let root = app.config.snapshot();
+            {
+                let mut mirrors = app.mirrors.lock().await;
+                mirrors.retain(|name, _| name == "viewer" || name == "denied");
+                for n in 0..9998 {
+                    let name = format!("old/{round}/{n}");
+                    let mut mirror = seed.clone();
+                    mirror.config["name"] = json!(name);
+                    mirror.when = Instant::now() - Duration::from_secs(31);
+                    // Include background-only denied metadata in the churn budget.
+                    if n % 2 == 0 {
+                        mirror.denied = true;
+                        mirror.available = false;
+                    }
+                    app.playback_auth.publish(
+                        &name,
+                        Some(Policy::from_config(&mirror.config, &root).unwrap()),
+                    );
+                    if mirror.denied {
+                        app.playback_auth.publish(&name, None);
+                    }
+                    mirrors.insert(name, mirror);
+                }
+            }
+            *selected.lock().unwrap() = format!("warm/{round}");
+            {
+                let mut state = app.source_activation.lock().await;
+                let e = state.entries.get_mut("owned").unwrap();
+                e.attempted = None;
+                e.confirmed = Some(Instant::now() - Duration::from_secs(31));
+            }
+            app.refresh_source_activation().await;
+            let warm = app
+                .mirrors
+                .lock()
+                .await
+                .contains_key(&format!("warm/{round}"));
+            let ondemand = app.resolve(&format!("on-demand/{round}")).await.is_some();
+            let mirrors = app.mirrors.lock().await;
+            observations.push((
+                warm,
+                ondemand,
+                mirrors.contains_key("viewer"),
+                mirrors.get("denied").is_some_and(|m| m.denied),
+            ));
+            drop(mirrors);
+            app.media.stop_all().await;
+        }
+        server.abort();
+        let _ = server.await;
+        app.media.stop_all().await;
+        assert!(
+            observations
+                .iter()
+                .all(|row| *row == (true, true, true, true)),
+            "historical activation metadata blocked current discovery or lost demand authority: {observations:?}"
+        );
+        assert!(
+            !grant.is_cancelled(),
+            "cache reclamation revoked an admitted viewer"
         );
     }
 }

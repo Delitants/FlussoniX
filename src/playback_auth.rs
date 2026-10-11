@@ -725,6 +725,17 @@ impl PlaybackAuth {
         .collect::<Vec<_>>()
         .await;
     }
+    /// Only the owner of an unconsumed activation route may call this. No request
+    /// snapshot has escaped that route; any authorization entry prevents removal.
+    pub(crate) fn forget_unobserved_activation(&self, name: &str) -> bool {
+        let mut authority = self.authority.lock().unwrap();
+        let entries = self.entries.lock().unwrap();
+        if entries.by_stream.contains_key(name) {
+            return false;
+        }
+        authority.remove(name);
+        true
+    }
     pub fn invalidate(&self, policy_for: impl Fn(&str) -> Option<Policy>) {
         let names = self
             .authority

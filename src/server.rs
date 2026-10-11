@@ -78,6 +78,8 @@ struct Mirror {
     available: bool,
     denied: bool,
     known: bool,
+    // True until any request consumes this background-only route.
+    activation_only: bool,
     serial: u64,
     switches: u64,
 }
@@ -111,6 +113,7 @@ pub struct App {
     mirrors: Mutex<HashMap<String, Mirror>>,
     source_queries: tokio::sync::Semaphore,
     source_activation: Mutex<source_activation::State>,
+    source_activation_refresh: Mutex<()>,
     pub(crate) publishers: Arc<tokio::sync::Semaphore>,
     source_lookups: Mutex<HashMap<String, origin_resolution::Ticket>>,
 }
@@ -176,6 +179,7 @@ impl App {
             mirrors: Mutex::new(HashMap::new()),
             source_queries: tokio::sync::Semaphore::new(64),
             source_activation: Mutex::new(source_activation::State::default()),
+            source_activation_refresh: Mutex::new(()),
             publishers: Arc::new(tokio::sync::Semaphore::new(64)),
             source_lookups: Mutex::new(HashMap::new()),
         });

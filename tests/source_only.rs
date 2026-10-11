@@ -142,6 +142,7 @@ async fn only_starts_native_media_without_viewers_and_preserves_demand_visibilit
     let cdn = app(d.path(), "cdn", "cdn");
     for (name, static_) in [
         ("region/eu/news", true),
+        ("region/eu/weather/live", true),
         ("region/eu/sports/live", true),
         ("region/eu/dynamic", false),
         ("region/other/news", true),
@@ -157,7 +158,7 @@ async fn only_starts_native_media_without_viewers_and_preserves_demand_visibilit
         )
         .unwrap();
     let (url, task) = node(source.clone()).await;
-    cdn.config.put("sources","owned",json!({"api_url":url,"private_payload_url":url,"flussonix_transport":"m4s","prefix":"region/eu","only":["news","sports/*","dynamic"],"except":["sports/*"]})).unwrap();
+    cdn.config.put("sources","owned",json!({"api_url":url,"private_payload_url":url,"flussonix_transport":"m4s","prefix":"region/eu","only":["news","weather/*","sports/*","dynamic"],"except":["sports/*"]})).unwrap();
     source
         .media
         .ensure(
@@ -166,22 +167,34 @@ async fn only_starts_native_media_without_viewers_and_preserves_demand_visibilit
         )
         .await
         .unwrap();
+    source
+        .media
+        .ensure(
+            "region/eu/weather/live",
+            &source.config.effective("region/eu/weather/live").unwrap(),
+        )
+        .await
+        .unwrap();
     let result = async {
         cdn.reconcile().await;
         for _ in 0..100 {
-            if cdn.media.ready("region/eu/news").await {
+            if cdn.media.ready("region/eu/news").await
+                && cdn.media.ready("region/eu/weather/live").await
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let warm = cdn.media.ready("region/eu/news").await;
-        let forbidden = cdn
+        let warm = cdn.media.ready("region/eu/news").await
+            && cdn.media.ready("region/eu/weather/live").await;
+        let mut forbidden = cdn
             .media
             .workers()
             .await
             .into_iter()
             .map(|(n, _)| n)
             .collect::<Vec<_>>();
+        forbidden.sort();
         let (edge, edge_task) = node(cdn.clone()).await;
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -225,7 +238,7 @@ async fn only_starts_native_media_without_viewers_and_preserves_demand_visibilit
         result.0,
         "selected static media never became ready without a viewer"
     );
-    assert_eq!(result.1, vec!["region/eu/news"]);
+    assert_eq!(result.1, vec!["region/eu/news", "region/eu/weather/live"]);
     assert!(
         matches!(result.4,Ok(status) if status==403),
         "warm peer pull bypassed viewer policy: {:?}",
@@ -421,4 +434,72 @@ async fn aggregate_inventory_capacity_is_reported_without_unbounded_growth() {
         "{status}"
     );
     assert!(cdn.media.workers().await.is_empty());
+}
+
+// Break caught: concurrent source edits start a second inventory batch above the node-wide limit.
+#[tokio::test]
+async fn concurrent_reconciliation_keeps_inventory_polling_within_node_bound() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let d = tempfile::tempdir().unwrap();
+    let cdn = app(d.path(), "cdn", "cdn");
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (a, p, e, r) = (
+        active.clone(),
+        peak.clone(),
+        entered.clone(),
+        release.clone(),
+    );
+    let routes = axum::Router::new().route(
+        "/flussonix/api/v1/source-streams",
+        axum::routing::get(move || {
+            let (a, p, e, r) = (a.clone(), p.clone(), e.clone(), r.clone());
+            async move {
+                let n = a.fetch_add(1, Ordering::SeqCst) + 1;
+                p.fetch_max(n, Ordering::SeqCst);
+                if n >= 16 {
+                    e.notify_one();
+                }
+                r.notified().await;
+                a.fetch_sub(1, Ordering::SeqCst);
+                axum::Json(json!({"streams":[]}))
+            }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(l, routes).await.unwrap() });
+    for n in 0..16 {
+        cdn.config
+            .put(
+                "sources",
+                &format!("source-{n}"),
+                json!({"api_url":url,"only":["news"]}),
+            )
+            .unwrap();
+    }
+    let c = cdn.clone();
+    let first = tokio::spawn(async move { c.reconcile().await });
+    let ready = tokio::time::timeout(Duration::from_millis(500), entered.notified()).await;
+    cdn.config
+        .put("sources", "source-0", json!({"only":["fresh"]}))
+        .unwrap();
+    let c = cdn.clone();
+    let second = tokio::spawn(async move { c.reconcile().await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let observed = peak.load(Ordering::SeqCst);
+    release.notify_waiters();
+    first.await.unwrap();
+    second.await.unwrap();
+    server.abort();
+    let _ = server.await;
+    cdn.media.stop_all().await;
+    assert!(ready.is_ok(), "first inventory batch did not enter");
+    assert!(
+        observed <= 16,
+        "concurrent activation launched {observed} inventory polls"
+    );
+    assert_eq!(activation_status(&cdn).await["wanted_streams"], 0);
 }

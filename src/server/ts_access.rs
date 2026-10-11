@@ -183,6 +183,7 @@ mod tests {
                 available: true,
                 denied: false,
                 known: true,
+                activation_only: false,
                 serial: 1,
                 switches: 0,
             },
