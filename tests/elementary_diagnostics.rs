@@ -128,17 +128,45 @@ fn unrelated_process_sockets_are_not_attributed_to_watched_child() {
     let source = tempfile::tempdir().unwrap();
     let artifact = tempfile::tempdir().unwrap();
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let mut child = std::process::Command::new("sleep")
-        .arg("5")
+    // Stop after exec and shell startup: sampling a just-spawned sleep can race
+    // startup descriptor closes, correctly producing only partial observations.
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "kill -STOP $$"])
         .spawn()
         .unwrap();
-    let evidence = Evidence::start(source.path(), artifact.path()).unwrap();
-    evidence.watch_process("child", child.id());
-    evidence.stage("owned_sockets_only");
-    drop(evidence);
-    child.kill().unwrap();
-    child.wait().unwrap();
-    let records = entries(artifact.path());
+    let result = std::panic::catch_unwind(|| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let stopped = loop {
+            let mut status = 0;
+            // This is our own child. WNOHANG bounds readiness; WUNTRACED observes
+            // its stop without reaping it or modifying any other process.
+            let observed = unsafe {
+                libc::waitpid(
+                    child.id() as libc::pid_t,
+                    &mut status,
+                    libc::WUNTRACED | libc::WNOHANG,
+                )
+            };
+            if observed == child.id() as libc::pid_t {
+                break libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGSTOP;
+            }
+            if observed < 0 || std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert!(stopped, "owned child did not signal post-exec readiness");
+        let evidence = Evidence::start(source.path(), artifact.path()).unwrap();
+        evidence.watch_process("child", child.id());
+        evidence.stage("owned_sockets_only");
+        drop(evidence);
+        entries(artifact.path())
+    });
+    // Reap even if readiness, observation or evidence assertions panic.
+    let _ = child.kill();
+    let waited = child.wait();
+    let records = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    waited.unwrap();
     let observations: Vec<_> = records
         .iter()
         .flat_map(|r| r["processes"].as_array().into_iter().flatten())
@@ -153,7 +181,6 @@ fn unrelated_process_sockets_are_not_attributed_to_watched_child() {
     );
     drop(socket);
 }
-
 #[test]
 fn exited_process_loses_observation_instead_of_reusing_its_last_socket_state() {
     let source = tempfile::tempdir().unwrap();
