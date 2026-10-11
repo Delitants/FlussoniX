@@ -666,3 +666,297 @@ async fn https_inventory_verifies_custom_trust_identity_and_expiry() {
         assert_eq!(untrusted, Err(LookupFailure::Unavailable));
     }
 }
+
+// Break caught: absent membership is silently coerced to an explicit empty list,
+// or Unicode, spaces, case and literal percent sequences are rewritten.
+#[tokio::test]
+async fn group_membership_preserves_omission_empty_and_literal_names() {
+    let server = fixture(json!({"streams":[
+        {"name":"unknown"},
+        {"name":"none","groups":[]},
+        {"name":"grouped","groups":["日本語/番組","news HD","News","news","percent%2Fgroup"],
+         "on_play":"true","inputs":[{"url":"http://untrusted.invalid"}]}
+    ]}))
+    .await;
+    let rows = InventoryClient::new(&server.url, "owned-key", None)
+        .unwrap()
+        .inventory()
+        .await;
+    server.stop().await;
+    let rows = rows.unwrap();
+    assert_eq!(rows[0].groups, None);
+    assert_eq!(rows[1].groups, Some(vec![]));
+    assert_eq!(
+        rows[2].groups.as_deref(),
+        Some(
+            ["日本語/番組", "news HD", "News", "news", "percent%2Fgroup"]
+                .map(str::to_owned)
+                .as_slice()
+        )
+    );
+    assert!(!format!("{rows:?}").contains("untrusted.invalid"));
+}
+
+// Break caught: malformed membership is ignored, or duplicate/invalid group
+// names can bypass a locally configured policy.
+#[tokio::test]
+async fn malformed_or_duplicate_memberships_invalidate_inventory() {
+    for groups in [
+        json!(null),
+        json!("news"),
+        json!({"news":true}),
+        json!([null]),
+        json!([1]),
+        json!([true]),
+        json!([{}]),
+        json!([["news"]]),
+        json!([""]),
+        json!(["../bad"]),
+        json!(["a//b"]),
+        json!(["a?token=x"]),
+        json!(["a#x"]),
+        json!(["a\\b"]),
+        json!(["a\nb"]),
+        json!(["news", "news"]),
+        json!(["日本語", "日本語"]),
+    ] {
+        let server = fixture(json!({"streams":[{"name":"one","groups":groups}]})).await;
+        let result = InventoryClient::new(&server.url, "owned-key", None)
+            .unwrap()
+            .inventory()
+            .await;
+        server.stop().await;
+        assert_eq!(result, Err(LookupFailure::Invalid), "{groups}");
+    }
+}
+
+// Break caught: off-by-one limits, counting Unicode characters instead of bytes,
+// or requiring group names to be globally unique rather than per stream.
+#[tokio::test]
+async fn membership_count_and_name_bytes_accept_exact_boundaries() {
+    for (groups, valid) in [
+        (
+            json!((0..64).map(|i| format!("g{i}")).collect::<Vec<_>>()),
+            true,
+        ),
+        (
+            json!((0..65).map(|i| format!("g{i}")).collect::<Vec<_>>()),
+            false,
+        ),
+        (json!(["x".repeat(256)]), true),
+        (json!(["x".repeat(257)]), false),
+        (json!([format!("{}x", "界".repeat(85))]), true),
+        (json!(["界".repeat(86)]), false),
+    ] {
+        let server = fixture(
+            json!({"streams":[{"name":"one","groups":groups},{"name":"two","groups":groups}]}),
+        )
+        .await;
+        let result = InventoryClient::new(&server.url, "owned-key", None)
+            .unwrap()
+            .inventory()
+            .await;
+        server.stop().await;
+        if valid {
+            let rows = result.unwrap();
+            assert_eq!(rows[0].groups, rows[1].groups);
+        } else {
+            assert_eq!(result, Err(LookupFailure::Invalid));
+        }
+    }
+}
+
+// Break caught: a later malformed membership returns earlier rows, or skipped
+// disabled/on-demand/relay rows escape complete-chain validation.
+#[tokio::test]
+async fn bad_later_membership_rejects_complete_inventory_for_every_row_kind() {
+    for flags in [
+        json!({}),
+        json!({"disabled":true}),
+        json!({"static":false}),
+        json!({"named_by":"remote"}),
+    ] {
+        let server = Server::start(Router::new().route(
+            "/-/streams",
+            get(move |RawQuery(q): RawQuery| {
+                let mut row = flags.clone();
+                row["name"] = json!("later");
+                row["groups"] = json!(["bad", "bad"]);
+                async move {
+                    body(if q.is_none() {
+                        json!({"streams":[{"name":"first","groups":[]}],"next":"b"})
+                    } else {
+                        json!({"streams":[row]})
+                    })
+                }
+            }),
+        ))
+        .await;
+        let result = InventoryClient::new(&server.url, "owned-key", None)
+            .unwrap()
+            .inventory()
+            .await;
+        server.stop().await;
+        assert_eq!(result, Err(LookupFailure::Invalid));
+    }
+}
+
+// Break caught: the membership budget resets for each page or rejects its exact
+// aggregate boundary. Shared groups on different rows count but are not duplicates.
+#[tokio::test]
+async fn membership_budget_is_shared_across_all_pages() {
+    for total in [10000usize, 10001] {
+        let count = Arc::new(AtomicUsize::new(0));
+        let hits = count.clone();
+        let server=Server::start(Router::new().route("/-/streams",get(move |RawQuery(q):RawQuery| {
+            hits.fetch_add(1,Ordering::SeqCst);
+            async move {
+                let (start,end,next)=if q.is_none(){(0,80,json!("b"))}else{(80,total.div_ceil(64),Value::Null)};
+                body(json!({"streams":(start..end).map(|i|json!({"name":format!("s{i}"),"groups":(0..64.min(total-i*64)).map(|g|format!("g{g}")).collect::<Vec<_>>()})).collect::<Vec<_>>(),"next":next}))
+            }
+        }))).await;
+        let result = InventoryClient::new(&server.url, "owned-key", None)
+            .unwrap()
+            .inventory()
+            .await;
+        server.stop().await;
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        if total == 10000 {
+            assert_eq!(
+                result
+                    .unwrap()
+                    .iter()
+                    .map(|r| r.groups.as_ref().unwrap().len())
+                    .sum::<usize>(),
+                10000
+            );
+        } else {
+            assert_eq!(result, Err(LookupFailure::Invalid));
+        }
+    }
+}
+
+// Break caught: locally initialized on-demand streams are dropped or disabled,
+// relayed, external, unknown-origin or missing-membership streams become candidates.
+#[tokio::test]
+async fn local_origin_candidates_require_explicit_membership_and_provenance() {
+    use flussonix::source_directory::flussonic::{CandidateKind, EligibilityFailure};
+    let server = fixture(json!({"streams":[
+        {"name":"configured","named_by":"config","groups":[]},
+        {"name":"published","named_by":"user","groups":["news"],"static":false},
+        {"name":"disabled","named_by":"config","groups":[],"disabled":true},
+        {"name":"unknown","groups":[]},
+        {"name":"relayed","named_by":"remote","groups":[]},
+        {"name":"external","named_by":"external","groups":[]},
+        {"name":"no-groups","named_by":"config"}
+    ]}))
+    .await;
+    let rows = InventoryClient::new(&server.url, "owned-key", None)
+        .unwrap()
+        .inventory()
+        .await;
+    server.stop().await;
+    assert_eq!(
+        rows.unwrap()
+            .iter()
+            .map(|r| r.local_origin_candidate())
+            .collect::<Vec<_>>(),
+        [
+            Ok(CandidateKind::Static),
+            Ok(CandidateKind::OnDemand),
+            Err(EligibilityFailure::Disabled),
+            Err(EligibilityFailure::UnknownProvenance),
+            Err(EligibilityFailure::Relayed),
+            Err(EligibilityFailure::External),
+            Err(EligibilityFailure::UnknownGroups)
+        ]
+    );
+}
+
+// Break caught: manually constructed or mutated public facts bypass the same
+// literal-name/membership validation enforced on the wire.
+#[test]
+fn mutated_inventory_facts_cannot_become_local_candidates() {
+    use flussonix::source_directory::flussonic::{EligibilityFailure, InventoryStream};
+    let valid = InventoryStream {
+        name: "news".into(),
+        is_static: true,
+        disabled: false,
+        named_by: Some(StreamProvenance::Config),
+        groups: Some(vec![]),
+    };
+    let mut row = valid.clone();
+    row.name = "../news".into();
+    assert_eq!(
+        row.local_origin_candidate(),
+        Err(EligibilityFailure::Invalid)
+    );
+    for groups in [
+        vec!["".into()],
+        vec!["news".into(), "news".into()],
+        (0..65).map(|i| format!("g{i}")).collect(),
+    ] {
+        let mut row = valid.clone();
+        row.groups = Some(groups);
+        assert_eq!(
+            row.local_origin_candidate(),
+            Err(EligibilityFailure::Invalid)
+        );
+    }
+}
+
+// Break caught: missing inventory groups bypass a locally configured group
+// policy, or group order chooses a public grant instead of rejecting conflicts.
+#[tokio::test]
+async fn explicit_inventory_groups_compose_only_local_policy() {
+    use flussonix::source_directory::flussonic::EligibilityFailure;
+    use flussonix::source_directory::flussonic_policy::{PolicyFailure, PolicySet};
+    let policies = PolicySet::new(
+        &json!({"on_play":"true"}),
+        &json!({
+            "protected":{"on_play":"https://billing.invalid/check"},"public":{"on_play":"true"}
+        }),
+        &json!([]),
+    )
+    .unwrap();
+    let server = fixture(json!({"streams":[
+        {"name":"missing","named_by":"config","on_play":"true"},
+        {"name":"none","named_by":"config","groups":[]},
+        {"name":"protected","named_by":"config","groups":["protected"],"on_play":"true"},
+        {"name":"conflict","named_by":"config","groups":["public","protected"]},
+        {"name":"reversed","named_by":"config","groups":["protected","public"]}
+    ]}))
+    .await;
+    let rows = InventoryClient::new(&server.url, "owned-key", None)
+        .unwrap()
+        .inventory()
+        .await;
+    server.stop().await;
+    let rows = rows.unwrap();
+    assert_eq!(
+        rows[0].local_origin_candidate(),
+        Err(EligibilityFailure::UnknownGroups)
+    );
+    assert_eq!(
+        policies.for_groups(&json!(rows[0].groups)),
+        Err(PolicyFailure::Invalid)
+    );
+    assert_eq!(
+        policies.for_groups(&json!(rows[1].groups)).unwrap().url,
+        None
+    );
+    assert_eq!(
+        policies
+            .for_groups(&json!(rows[2].groups))
+            .unwrap()
+            .url
+            .as_deref(),
+        Some("https://billing.invalid/check")
+    );
+    for row in &rows[3..] {
+        assert_eq!(
+            policies.for_groups(&json!(row.groups)),
+            Err(PolicyFailure::Ambiguous)
+        );
+    }
+}

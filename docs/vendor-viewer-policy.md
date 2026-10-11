@@ -86,3 +86,11 @@ eligibility remain separate requirements. Viewer authorization must precede
 private media requests, and daemon pulls must retain subtitle options.
 Live positive/negative vendor authentication, aliases/name decoding and HLS/TS
 private credential carriage remain unqualified. Vendor routing stays disabled.
+
+
+The [inventory library](vendor-source-inventory.md#local-origin-candidate-preflight)
+preserves validated explicit memberships separately from omission and offers a
+conservative local-origin candidate check. Neither library automatically invokes
+the other. A future revision-fenced adapter must require known memberships and
+qualify provenance/loops before publishing the resulting local policy. Remote
+policy fields remain ignored, and vendor routing remains disabled.

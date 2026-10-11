@@ -1264,3 +1264,18 @@ fixed by this increment.
 The [explicit local policy gate](vendor-viewer-policy.md) validates source and named group policy layers independently of inventory and private media credentials. Behavioral regressions cover source inheritance, atomic callback replacement, explicit public access versus unresolved authority, equivalent/conflicting groups, local backend resolution, malformed/unsupported/shadowed policies, limits and real native callback denial, token guards and session limits. No vendor component is a build, test or runtime dependency.
 
 The gate is library-only. Existing source selection, local precedence, revision fencing, provenance, leases, recovery and subtitle handling remain unchanged. It rejects template references and order-dependent group conflicts; live effective reference policy and complete group precedence are not claimed. Group-membership inventory, provenance/loop checks, live Cluster authentication and daemon/UI integration remain pending. Historical HEVC/socket/UDP observations are unchanged.
+
+
+### Vendor inventory memberships and local-origin candidates
+
+Independent owned HTTP fixtures distinguish unknown from explicitly empty groups,
+retain literal names, reject malformed/duplicate memberships on every row kind,
+and exercise exact per-row/name-byte/whole-chain membership boundaries. Candidate
+checks require explicit memberships and locally initialized config/user claims,
+classify static/on-demand streams and reject disabled, remote, external or unknown
+facts, including mutated public rows. A fixture-to-local-policy regression retains
+protected group policy and rejects conflicts in either group order. These checks
+introduce no vendor build/test/runtime dependency. Vendor routing remains disabled;
+metadata claims are not verified provenance or relay-loop proof. Live sender
+encoding/authentication, current configuration authority, leases and resolver
+integration remain separate qualification gates.

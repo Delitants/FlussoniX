@@ -360,3 +360,11 @@ gates; live vendor authentication and HLS/TS carriage need separate qualificatio
 
 
 The [local source/group viewer-policy gate](vendor-viewer-policy.md) is a separate library building block. It validates local callback/token settings, preserves independent token guards and rejects conflicting group overrides or unsupported rules. It does not grant inventory/media credentials viewer authority. Native routing and policy publication stay unchanged; vendor mode still requires explicit group metadata, configuration fences, provenance/loop eligibility and live authentication qualification.
+
+
+Vendor inventory now preserves explicit group membership and supplies a
+[local-origin candidate preflight](vendor-source-inventory.md#local-origin-candidate-preflight).
+Unknown groups/provenance and relayed/external initialization fail conservatively.
+This preflight does not establish topology or viewer authority; it is not wired
+to the LB/CDN resolver. Native load balancing, local precedence, source filters,
+activation leases and configuration fencing retain their existing behavior.

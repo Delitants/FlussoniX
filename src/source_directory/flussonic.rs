@@ -17,6 +17,8 @@ const MAX_BYTES: usize = 1024 * 1024;
 const MAX_ROWS: usize = 10000;
 const MAX_PAGES: usize = 100;
 const MAX_CURSOR_BYTES: usize = 4096;
+const MAX_GROUPS_PER_ROW: usize = 64;
+const MAX_MEMBERSHIPS: usize = 10000;
 const DEADLINE: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +28,7 @@ pub enum StreamProvenance {
     Remote,
     External,
 }
-/// Minimal inventory facts. Missing provenance remains unknown, never local.
+/// Minimal inventory facts. Missing provenance and groups remain unknown.
 /// Unknown fields, including remote inputs/authentication, are not route grants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InventoryStream {
@@ -34,6 +36,54 @@ pub struct InventoryStream {
     pub is_static: bool,
     pub disabled: bool,
     pub named_by: Option<StreamProvenance>,
+    /// Omission is unknown; `Some(vec![])` is explicitly ungrouped.
+    pub groups: Option<Vec<String>>,
+}
+
+/// Metadata-only candidate classification, not an activation or routing grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateKind {
+    Static,
+    OnDemand,
+}
+/// Generic diagnostics contain no name, group, URL, policy or credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EligibilityFailure {
+    Invalid,
+    Disabled,
+    UnknownProvenance,
+    Relayed,
+    External,
+    UnknownGroups,
+}
+impl InventoryStream {
+    /// Conservatively accept enabled config/user claims with explicit groups.
+    /// Revalidate public facts that callers may construct or mutate. A passing
+    /// result does not verify provenance, input topology, local configuration,
+    /// viewer authority, revisions or leases. The daemon does not use this gate.
+    pub fn local_origin_candidate(&self) -> Result<CandidateKind, EligibilityFailure> {
+        crate::config::valid_name(&self.name).map_err(|_| EligibilityFailure::Invalid)?;
+        if let Some(groups) = &self.groups {
+            validate_group_names(groups).map_err(|_| EligibilityFailure::Invalid)?;
+        }
+        if self.disabled {
+            return Err(EligibilityFailure::Disabled);
+        }
+        match self.named_by {
+            Some(StreamProvenance::Config | StreamProvenance::User) => {}
+            Some(StreamProvenance::Remote) => return Err(EligibilityFailure::Relayed),
+            Some(StreamProvenance::External) => return Err(EligibilityFailure::External),
+            None => return Err(EligibilityFailure::UnknownProvenance),
+        }
+        self.groups
+            .as_ref()
+            .ok_or(EligibilityFailure::UnknownGroups)?;
+        Ok(if self.is_static {
+            CandidateKind::Static
+        } else {
+            CandidateKind::OnDemand
+        })
+    }
 }
 
 /// Owns a verified, no-proxy, no-redirect HTTP client and a privileged key.
@@ -104,6 +154,7 @@ impl InventoryClient {
         let mut names = HashSet::new();
         let mut streams = Vec::new();
         let mut remaining = MAX_BYTES;
+        let mut remaining_memberships = MAX_MEMBERSHIPS;
         for _ in 0..MAX_PAGES {
             let mut url = self.endpoint.clone();
             if let Some(cursor) = &cursor {
@@ -170,11 +221,16 @@ impl InventoryClient {
                     }),
                     Some(_) => return Err(LookupFailure::Invalid),
                 };
+                let groups = row.get("groups").map(parse_groups).transpose()?;
+                remaining_memberships = remaining_memberships
+                    .checked_sub(groups.as_ref().map_or(0, Vec::len))
+                    .ok_or(LookupFailure::Invalid)?;
                 streams.push(InventoryStream {
                     name: name.to_owned(),
                     is_static: optional_bool(row, "static", true)?,
                     disabled: optional_bool(row, "disabled", false)?,
                     named_by,
+                    groups,
                 });
             }
             match value.get("next") {
@@ -191,6 +247,38 @@ impl InventoryClient {
         }
         Err(LookupFailure::Invalid)
     }
+}
+
+fn parse_groups(value: &Value) -> Result<Vec<String>, LookupFailure> {
+    let array = value.as_array().ok_or(LookupFailure::Invalid)?;
+    if array.len() > MAX_GROUPS_PER_ROW {
+        return Err(LookupFailure::Invalid);
+    }
+    let groups = array
+        .iter()
+        .map(|group| {
+            group
+                .as_str()
+                .map(str::to_owned)
+                .ok_or(LookupFailure::Invalid)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_group_names(&groups)?;
+    Ok(groups)
+}
+
+fn validate_group_names(groups: &[String]) -> Result<(), LookupFailure> {
+    if groups.len() > MAX_GROUPS_PER_ROW {
+        return Err(LookupFailure::Invalid);
+    }
+    let mut seen = HashSet::new();
+    for group in groups {
+        crate::config::valid_name(group).map_err(|_| LookupFailure::Invalid)?;
+        if !seen.insert(group) {
+            return Err(LookupFailure::Invalid);
+        }
+    }
+    Ok(())
 }
 
 fn optional_bool(row: &Value, field: &str, default: bool) -> Result<bool, LookupFailure> {

@@ -547,3 +547,16 @@ policy, provenance/loop gates and HLS/MPEG-TS carriage remain unqualified.
 ### Local source/group viewer-policy gate
 
 An independent [local policy library](vendor-viewer-policy.md) composes explicit source/group callback and token layers using native viewer authorization. Whole callback replacement, normalized field agreement between groups, explicit public decisions and strict unsupported/malformed-policy rejection are supported. It deliberately rejects conflicting group precedence and unresolved templates. Native source behavior is unchanged; inventory group metadata, resolver/activation wiring, live vendor authentication and full source/group parity remain unqualified.
+
+
+### Vendor inventory membership facts
+
+The [inventory client](vendor-source-inventory.md) distinguishes omitted group
+membership from an explicit empty list, rejects malformed/duplicate names and
+bounds memberships per row and across the complete cursor chain. Its independent
+local-origin preflight classifies enabled config/user claims as static or
+on-demand candidates; remote, external, missing provenance and missing groups
+remain ineligible. Passing this metadata check does not prove a loop-free origin
+or grant routing/viewer authority. No native configuration, resolver, activation
+or UI behavior changes. Live metadata/authentication and revision-fenced
+integration remain unqualified.

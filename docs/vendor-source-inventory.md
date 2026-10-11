@@ -64,13 +64,52 @@ page, duplicate or invalid name, invalid row/envelope or exceeded budget
 returns an error for the entire operation. No partial result or background
 pagination task is stored. Cancellation drops the in-flight request.
 
-Rows contain only name, static/disabled flags and optional provenance.
+Rows contain only name, static/disabled flags, optional provenance and optional
+group memberships.
 Omitted static defaults to true; omitted disabled defaults to false.
 Present flags must be booleans. Present `named_by` must be one of
 `config`, `user`, `remote` or `external`; omission remains unknown.
 Disabled and on-demand rows are retained as facts for later policy decisions.
 Remote inputs, viewer authentication and other fields are not imported as
 configuration or access grants.
+
+The strict membership profile accepts `groups` only as an array of unique literal
+names. Omission returns `None` (unknown); an explicit empty array returns
+`Some(vec![])` (known ungrouped). Null, strings, objects, nested values, invalid
+names and repeated names invalidate the whole inventory, even on disabled,
+on-demand or relayed rows. Names preserve case, spaces, Unicode and percent
+sequences; they are not decoded or normalized. Each name uses the existing
+1..256 UTF-8 byte stream-name validation. A row permits at most 64 memberships,
+matching the local policy gate. The complete cursor chain permits at most 10000
+memberships, counting every occurrence across rows/pages. The same group may
+appear on different streams. The existing byte/row/page/deadline bounds also
+apply. Exact complete membership limits are accepted; a bad later page never
+returns an earlier partial result. These are the supported independent wire
+profile and resource limits; live reference group encoding remains unqualified.
+
+### Local-origin candidate preflight
+
+`InventoryStream::local_origin_candidate()` checks these facts without fetching
+media, publishing policy or applying configuration. It revalidates the literal
+stream name and any explicit memberships, since library consumers can construct
+or mutate public facts. Disabled rows fail. Enabled rows require explicit groups
+and `named_by: config` or `named_by: user`; omitted provenance, `remote` and
+`external` fail with distinct generic diagnostics. A passing row is classified
+as `Static` or `OnDemand`; static status is not proof of local ownership.
+
+This conservative preflight accepts only locally initialized provenance claims.
+It does **not** verify those claims or prove the upstream input is loop-free.
+Even a configured stream may pull this CDN through its input URL, and the legacy
+sender's metadata has not been qualified live. `external` stays unsupported
+until its authority/provenance semantics are qualified. A passing result is not
+a route grant, viewer policy, activation decision or security capability, and
+is not used by the daemon. It intentionally does not implement prefix/exclusion
+selection, local precedence, topology checks, revision fences or inventory leases.
+
+A future adapter must carry explicit memberships into the local policy gate
+without replacing unknown membership with an empty list. Inventory `on_play`
+and input fields never substitute for local source/group configuration. Policy
+composition still rejects conflicting groups regardless of remote array order.
 
 ## Qualification and remaining integration
 
@@ -94,4 +133,4 @@ local precedence, revision fencing, inventory leases, capacity limits and
 relay-loop prevention during integration. Missing provenance must not be
 interpreted as proof that a stream is locally owned.
 
-The separate [local viewer-policy gate](vendor-viewer-policy.md) validates source/group callback and token layers, rejecting unsupported rules and order-dependent group conflicts. It does not consume inventory yet: explicit group-membership metadata, configuration fencing, provenance/loop eligibility and live reference qualification remain integration requirements.
+The separate [local viewer-policy gate](vendor-viewer-policy.md) validates source/group callback and token layers, rejecting unsupported rules and order-dependent group conflicts. It does not consume inventory yet: explicit inventory memberships can now be validated as facts, but configuration fencing, verified provenance/loop eligibility and live reference qualification remain integration requirements.
