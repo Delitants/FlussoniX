@@ -594,3 +594,77 @@ async fn url_keyed_m4ss_source_uses_verified_tls_for_discovery_and_media() {
 async fn url_keyed_m4fs_source_preserves_original_segments_over_verified_tls() {
     topology_with_source_identity("m4f", false, true).await;
 }
+
+// Break caught: source inventory accepts an untrusted TLS endpoint or ignores
+// configured management trust / per-source peer credentials.
+#[tokio::test]
+async fn explicit_source_activation_inventory_requires_trust_and_peer_authorization() {
+    async fn status(app: Arc<App>) -> Value {
+        let response = router(app)
+            .oneshot(
+                axum::http::Request::get("/flussonix/api/v1/node")
+                    .header("X-Flussonix-Peer", "owned-peer-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        serde_json::from_slice::<Value>(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap()["source_activation"]["sources"][0]
+            .clone()
+    }
+    let source = node("source").await;
+    let cdn = node("cdn").await;
+    source
+        .app
+        .config
+        .put(
+            "streams",
+            "owned",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    cdn.app
+        .config
+        .put(
+            "sources",
+            "origin",
+            json!({"api_url":source.url,"only":["owned"]}),
+        )
+        .unwrap();
+    cdn.app.reconcile().await;
+    let untrusted = status(cdn.app.clone()).await;
+    cdn.app
+        .config
+        .put(
+            "sources",
+            "origin",
+            json!({"flussonix_tls_ca":source.cert.ca}),
+        )
+        .unwrap();
+    cdn.app.reconcile().await;
+    let trusted = status(cdn.app.clone()).await;
+    cdn.app
+        .config
+        .put(
+            "sources",
+            "origin",
+            json!({"cluster_key":"wrong-owned-peer-key"}),
+        )
+        .unwrap();
+    cdn.app.reconcile().await;
+    let denied = status(cdn.app.clone()).await;
+    cdn.stop().await;
+    source.stop().await;
+    assert_eq!(untrusted["last_error"], "unavailable");
+    assert_eq!(untrusted["lease_valid"], false);
+    assert!(trusted["last_error"].is_null());
+    assert_eq!(trusted["lease_valid"], true);
+    assert_eq!(trusted["inventory_streams"], 0);
+    assert_eq!(denied["last_error"], "unavailable");
+    assert_eq!(denied["lease_valid"], false);
+}

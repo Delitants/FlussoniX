@@ -365,6 +365,16 @@ fn validate_root(root: &Value) -> Result<(), String> {
             ));
         }
     }
+    if root["sources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|s| s["only"].as_array().is_some_and(|a| !a.is_empty()))
+        .count()
+        > 64
+    {
+        return Err("at most 64 sources may request eager activation".into());
+    }
     let mut groups = std::collections::HashMap::new();
     for source in root["sources"].as_array().into_iter().flatten() {
         if let Some(group) = source["flussonix_source_group"].as_str() {
@@ -430,6 +440,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "flussonix_source_group",
                     "prefix",
                     "except",
+                    "only",
                     "flussonix_tls_ca",
                     "flussonix_media_tls_ca",
                 ],
@@ -481,21 +492,28 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     );
                 }
             }
-            if let Some(except) = item.get("except") {
-                if *kind != "sources" {
-                    return Err("except is source-only".into());
-                }
-                let patterns = except
-                    .as_array()
-                    .filter(|p| p.len() <= 1024)
-                    .ok_or("except must be an array of at most 1024 stream patterns")?;
-                for pattern in patterns {
-                    let pattern = pattern.as_str().ok_or("except patterns must be strings")?;
-                    let name = pattern.strip_suffix("/*").unwrap_or(pattern);
-                    if pattern.len() > 256 || name.contains('*') || valid_name(name).is_err() {
-                        return Err(
-                            "except requires exact stream names or prefix/* patterns".into()
-                        );
+            for field in ["except", "only"] {
+                if let Some(except) = item.get(field) {
+                    if *kind != "sources" {
+                        return Err(format!("{field} is source-only"));
+                    }
+                    let patterns =
+                        except
+                            .as_array()
+                            .filter(|p| p.len() <= 1024)
+                            .ok_or_else(|| {
+                                format!("{field} must be an array of at most 1024 stream patterns")
+                            })?;
+                    for pattern in patterns {
+                        let pattern = pattern
+                            .as_str()
+                            .ok_or_else(|| format!("{field} patterns must be strings"))?;
+                        let name = pattern.strip_suffix("/*").unwrap_or(pattern);
+                        if pattern.len() > 256 || name.contains('*') || valid_name(name).is_err() {
+                            return Err(format!(
+                                "{field} requires exact stream names or prefix/* patterns"
+                            ));
+                        }
                     }
                 }
             }

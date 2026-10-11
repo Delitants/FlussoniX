@@ -1655,6 +1655,81 @@ mod lifecycle_tests {
             assert!(app.media.workers().await.is_empty());
         }
     }
+    // Break caught: background only activation renews viewer demand or an idle
+    // static relay is retired before its source demand is removed.
+    #[tokio::test]
+    async fn source_static_demand_preserves_idle_worker_without_touching_playback_clock() {
+        let d = tempfile::tempdir().unwrap();
+        let source_dir = d.path().join("source");
+        let edge_dir = d.path().join("edge");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&edge_dir).unwrap();
+        let source = app(&source_dir);
+        let edge = app(&edge_dir);
+        source
+            .config
+            .put("streams", "news", json!({"inputs":[{"url":"testsrc://"}]}))
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let a = source.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, crate::server::router(a))
+                .await
+                .unwrap()
+        });
+        edge.config
+            .put(
+                "sources",
+                "owned",
+                json!({"api_url":url,"flussonix_transport":"m4s","only":["news"]}),
+            )
+            .unwrap();
+        source
+            .media
+            .ensure("news", &source.config.effective("news").unwrap())
+            .await
+            .unwrap();
+        edge.reconcile().await;
+        let worker = edge.media.workers.lock().await.get("news").cloned();
+        let observations = if let Some(worker) = worker {
+            *worker.last_access.lock().unwrap() = Instant::now() - Duration::from_secs(61);
+            edge.reconcile().await;
+            let retained = edge
+                .media
+                .workers
+                .lock()
+                .await
+                .get("news")
+                .is_some_and(|w| Arc::ptr_eq(w, &worker));
+            let idle = worker.idle_seconds();
+            edge.config
+                .put("sources", "owned", json!({"only":[]}))
+                .unwrap();
+            edge.reconcile().await;
+            (
+                retained,
+                idle,
+                edge.media.workers.lock().await.is_empty(),
+                worker.is_closed(),
+            )
+        } else {
+            (false, 0, false, false)
+        };
+        edge.media.stop_all().await;
+        source.media.stop_all().await;
+        server.abort();
+        let _ = server.await;
+        assert!(observations.0, "warm relay was retired or replaced as idle");
+        assert!(
+            observations.1 >= 61,
+            "background activation renewed playback demand"
+        );
+        assert!(
+            observations.2 && observations.3,
+            "removing static demand left an idle worker running"
+        );
+    }
 }
 #[cfg(test)]
 #[allow(dead_code)]

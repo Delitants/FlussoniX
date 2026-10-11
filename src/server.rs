@@ -110,6 +110,7 @@ pub struct App {
     pub started: Instant,
     mirrors: Mutex<HashMap<String, Mirror>>,
     source_queries: tokio::sync::Semaphore,
+    source_activation: Mutex<source_activation::State>,
     pub(crate) publishers: Arc<tokio::sync::Semaphore>,
     source_lookups: Mutex<HashMap<String, origin_resolution::Ticket>>,
 }
@@ -174,6 +175,7 @@ impl App {
             started: Instant::now(),
             mirrors: Mutex::new(HashMap::new()),
             source_queries: tokio::sync::Semaphore::new(64),
+            source_activation: Mutex::new(source_activation::State::default()),
             publishers: Arc::new(tokio::sync::Semaphore::new(64)),
             source_lookups: Mutex::new(HashMap::new()),
         });
@@ -312,13 +314,14 @@ impl App {
         }
     }
     pub async fn reconcile(&self) {
+        self.refresh_source_activation().await;
         // Retirement comes first: a background retry must not extend demand.
         for name in self.media.idle().await {
-            if self
-                .config
-                .effective(&name)
-                .is_none_or(|c| c["static"] == false)
-            {
+            let static_demand = match self.config.effective(&name) {
+                Some(config) => config["static"] != false,
+                None => self.source_is_warm(&name).await,
+            };
+            if !static_demand {
                 self.media.stop(&name).await;
             }
         }
@@ -447,6 +450,7 @@ impl App {
             .unwrap()
             .extend(node.as_object().unwrap().clone());
         metrics["stream_bitrates"] = stream_bitrates;
+        metrics["source_activation"] = self.source_activation_status().await;
         metrics
     }
     pub fn sample_metrics(&self) {
@@ -828,6 +832,33 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
     }
     if tail == "rtsp-routing" && request.method() == "GET" && peer {
         return json_response(app.rtsp_routing_node().await);
+    }
+    if tail == "source-streams" {
+        if request.method() != "GET" {
+            return error(StatusCode::METHOD_NOT_ALLOWED, "GET required");
+        }
+        let root = app.config.snapshot();
+        let configured = root["streams"].as_array().unwrap();
+        if configured.len() > 10000 {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "native source inventory exceeds 10000 streams",
+            );
+        }
+        let templates = root["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| Some((t["name"].as_str()?, t)))
+            .collect::<HashMap<_, _>>();
+        let mut streams = configured.iter().filter_map(|row| {
+            let name = row["name"].as_str()?;
+            let template = row["template"].as_str().and_then(|name| templates.get(name));
+            let field = |key, default| row.get(key).or_else(|| template.and_then(|t| t.get(key))).and_then(Value::as_bool).unwrap_or(default);
+            Some(json!({"name":name,"static":field("static",true),"disabled":field("disabled",false)}))
+        }).collect::<Vec<_>>();
+        streams.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        return json_response(json!({"streams":streams}));
     }
     if tail == "node" && request.method() == "GET" {
         return json_response(app.node().await);
@@ -1719,3 +1750,6 @@ pub(crate) mod publication;
 mod admission;
 mod http_balancer;
 pub(crate) mod rtsp_balancer;
+
+#[path = "source_activation.rs"]
+mod source_activation;
