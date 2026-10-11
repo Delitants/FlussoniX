@@ -382,10 +382,17 @@ impl App {
         let mut mirrors = self.mirrors.lock().await;
         self.config.read(|root| {
             // Cache eviction is not source removal: retain mirrors whose discovery endpoint is unchanged.
-            mirrors.retain(|_, m| {
-                root["sources"]
+            mirrors.retain(|name, m| {
+                let current = root["sources"]
                     .as_array()
-                    .is_some_and(|sources| sources.contains(&m.source))
+                    .is_some_and(|sources| sources.contains(&m.source));
+                // Release background ownership before eviction loses its record.
+                // Request snapshots claim the mirror first; entries also prevent
+                // forgetting, so ordinary policy invalidation remains authoritative.
+                if !current && m.activation_only {
+                    self.playback_auth.forget_unobserved_activation(name);
+                }
+                current
             });
             self.playback_auth.invalidate(|name| {
                 let cfg = crate::config::effective(root, name).or_else(|| {

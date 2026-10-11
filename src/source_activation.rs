@@ -460,4 +460,147 @@ mod tests {
             "cache reclamation revoked an admitted viewer"
         );
     }
+    // Break caught: source edits discard eager route ownership before releasing authority.
+    #[tokio::test]
+    async fn source_edit_and_removal_reclaim_unconsumed_activation_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-cache-peer".into(),
+                role: "cdn".into(),
+                ffmpeg: "/owned-cache-no-ffmpeg".into(),
+                uplink_interface: "process".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let selected = Arc::new(std::sync::Mutex::new("old/0/0".to_owned()));
+        let picked = selected.clone();
+        let routes=axum::Router::new()
+          .route("/flussonix/api/v1/source-streams",axum::routing::get(move || {let picked=picked.clone();async move {
+              axum::Json(json!({"streams":[{"name":picked.lock().unwrap().clone(),"static":true,"disabled":false}]}))
+          }}))
+          .route("/flussonix/api/v1/stream/{*name}",axum::routing::get(|axum::extract::Path(name):axum::extract::Path<String>|async move {
+              axum::Json(json!({"name":name,"static":true,"disabled":false,"flussonix_content_id":"owned-cache"}))
+          }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(l, routes).await.unwrap() });
+        app.config
+            .put(
+                "sources",
+                "owned",
+                json!({"api_url":url,"flussonix_transport":"m4s","only":["old/*","warm/*"]}),
+            )
+            .unwrap();
+        app.refresh_source_activation().await;
+        app.media.stop_all().await;
+        let seed = app.mirrors.lock().await["old/0/0"].clone();
+        app.config
+            .put("streams", "local-viewer", json!({"static":false}))
+            .unwrap();
+        let viewer = app.resolve("local-viewer").await.unwrap();
+        let AuthOutcome::Allowed(grant) = app
+            .playback_auth
+            .authorize(
+                viewer.policy,
+                ViewerRequest {
+                    name: "local-viewer".into(),
+                    proto: "hls".into(),
+                    ip: "owned".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("owned local viewer denied")
+        };
+        let denied = app.resolve("claimed-denied").await.unwrap();
+        let denied_policy = Policy::from_config(&denied.config, &app.config.snapshot()).unwrap();
+        app.playback_auth.publish("claimed-denied", None);
+        let mut observations = Vec::new();
+        for round in 0..3 {
+            let root = app.config.snapshot();
+            {
+                let mut mirrors = app.mirrors.lock().await;
+                mirrors.retain(|_, mirror| !mirror.activation_only);
+                for n in 0..9997 {
+                    let name = format!("old/{round}/{n}");
+                    let mut mirror = seed.clone();
+                    mirror.source = root["sources"][0].clone();
+                    mirror.config["name"] = json!(name);
+                    app.playback_auth.publish(
+                        &name,
+                        Some(Policy::from_config(&mirror.config, &root).unwrap()),
+                    );
+                    if n % 2 == 0 {
+                        mirror.denied = true;
+                        mirror.available = false;
+                        app.playback_auth.publish(&name, None);
+                    }
+                    mirrors.insert(name, mirror);
+                }
+            }
+            // Exercise the same invalidation called by source PUT and DELETE,
+            // including removal before recreation in the middle round.
+            if round == 1 {
+                app.config.delete("sources", "owned").unwrap();
+                app.invalidate_sessions().await;
+            }
+            app.config.put("sources", "owned", json!({"api_url":url,"flussonix_transport":"m4s","only":["old/*","warm/*",format!("marker{round}")]})).unwrap();
+            app.invalidate_sessions().await;
+            let retained_denial = app
+                .playback_auth
+                .publish("claimed-denied", Some(denied_policy.clone()))
+                .is_some();
+            let stale_denied = matches!(
+                app.playback_auth
+                    .authorize(
+                        denied.policy.clone(),
+                        ViewerRequest {
+                            name: "claimed-denied".into(),
+                            proto: "hls".into(),
+                            ip: "owned".into(),
+                            ..Default::default()
+                        }
+                    )
+                    .await,
+                AuthOutcome::Denied
+            );
+            app.playback_auth.publish("claimed-denied", None);
+            *selected.lock().unwrap() = format!("warm/{round}");
+            app.refresh_source_activation().await;
+            let warm = app
+                .resolve_for_activation(&format!("warm/{round}"))
+                .await
+                .is_some();
+            let ondemand = app.resolve(&format!("on-demand/{round}")).await.is_some();
+            app.config
+                .put(
+                    "streams",
+                    &format!("local-{round}"),
+                    json!({"static":false}),
+                )
+                .unwrap();
+            let local = app.resolve(&format!("local-{round}")).await.is_some();
+            observations.push((warm, ondemand, local, retained_denial, stale_denied));
+            app.media.stop_all().await;
+        }
+        server.abort();
+        let _ = server.await;
+        app.media.stop_all().await;
+        assert!(
+            observations
+                .iter()
+                .all(|row| *row == (true, true, true, true, true)),
+            "source invalidation leaked unused authority or reset claimed denial: {observations:?}"
+        );
+        assert!(
+            !grant.is_cancelled(),
+            "source churn revoked an unrelated local viewer"
+        );
+    }
 }
