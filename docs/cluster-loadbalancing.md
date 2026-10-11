@@ -368,3 +368,12 @@ Unknown groups/provenance and relayed/external initialization fail conservativel
 This preflight does not establish topology or viewer authority; it is not wired
 to the LB/CDN resolver. Native load balancing, local precedence, source filters,
 activation leases and configuration fencing retain their existing behavior.
+
+
+The independent [source configuration authority](vendor-source-authority.md)
+validates all supported local source/group options before projection, preserves
+native namespace/exclusion/static-selection semantics and rejects stale or
+cross-authority candidate publication. Source/backend replacement and removal
+invalidate outstanding snapshots. This is not wired to daemon routing or
+activation; global configuration fences, leases, actual topology and live vendor
+interoperability remain integration requirements.

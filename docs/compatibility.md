@@ -560,3 +560,12 @@ remain ineligible. Passing this metadata check does not prove a loop-free origin
 or grant routing/viewer authority. No native configuration, resolver, activation
 or UI behavior changes. Live metadata/authentication and revision-fenced
 integration remain unqualified.
+
+
+The independent [source configuration authority](vendor-source-authority.md)
+validates all supported local source/group options before projection, preserves
+native namespace/exclusion/static-selection semantics and rejects stale or
+cross-authority candidate publication. Source/backend replacement and removal
+invalidate outstanding snapshots. This is not wired to daemon routing or
+activation; global configuration fences, leases, actual topology and live vendor
+interoperability remain integration requirements.

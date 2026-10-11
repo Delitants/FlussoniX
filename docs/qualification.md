@@ -1279,3 +1279,18 @@ introduce no vendor build/test/runtime dependency. Vendor routing remains disabl
 metadata claims are not verified provenance or relay-loop proof. Live sender
 encoding/authentication, current configuration authority, leases and resolver
 integration remain separate qualification gates.
+
+
+### Complete local vendor source projection and candidate fencing
+
+Owned library regressions cover strict complete-profile projection, unmatched and
+shadowed rule rejection, explicit identities/keys, source namespace/exclusions,
+separate static selection, mandatory inventory preflight and local group policy.
+Configuration/backend edits, removal/re-addition, delayed snapshots and different
+authority instances cannot publish stale candidates. A barrier-controlled thread
+test checks that publication and replacement serialize, and panic handling fails
+closed. Exact configured-count, full-group/source-policy/backend byte and combined
+1 MiB profile boundaries are exercised. No vendor components are dependencies.
+The [independent authority](vendor-source-authority.md) does not govern the daemon's
+global configuration or verify actual origin topology. Vendor routing remains
+disabled pending live interoperability, leases, global fencing and integration.

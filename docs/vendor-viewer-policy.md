@@ -80,9 +80,9 @@ The gate is immutable after construction; it does not acquire configuration
 revision authority. A future resolver must bind it to the current local
 configuration revision, revalidate after asynchronous work, and preserve local
 stream precedence, leases, content identity and failover policy equality.
-Inventory currently does not return group membership facts, so it cannot yet
-be fed directly into this gate. Discovered-name provenance and relay-loop
-eligibility remain separate requirements. Viewer authorization must precede
+The inventory library returns explicit group membership facts separately from
+omission; live sender encoding and daemon integration remain unqualified.
+Discovered-name provenance and relay-loop eligibility remain separate requirements. Viewer authorization must precede
 private media requests, and daemon pulls must retain subtitle options.
 Live positive/negative vendor authentication, aliases/name decoding and HLS/TS
 private credential carriage remain unqualified. Vendor routing stays disabled.
@@ -90,7 +90,15 @@ private credential carriage remain unqualified. Vendor routing stays disabled.
 
 The [inventory library](vendor-source-inventory.md#local-origin-candidate-preflight)
 preserves validated explicit memberships separately from omission and offers a
-conservative local-origin candidate check. Neither library automatically invokes
-the other. A future revision-fenced adapter must require known memberships and
-qualify provenance/loops before publishing the resulting local policy. Remote
+conservative local-origin candidate check. The source authority described below
+connects these libraries under its own fence. A future daemon adapter must also
+require current global authority and qualify provenance/loops before publishing
+the resulting local policy. Remote
 policy fields remain ignored, and vendor routing remains disabled.
+
+
+The [source configuration authority](vendor-source-authority.md) now validates a
+complete supported local source/group profile before policy projection and binds
+inventory candidates to immutable configuration identity/revision. It remains
+independent of the daemon's global configuration and does not establish verified
+provenance, leases, topology or live interoperability.

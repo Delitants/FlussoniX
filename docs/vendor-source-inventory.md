@@ -133,4 +133,13 @@ local precedence, revision fencing, inventory leases, capacity limits and
 relay-loop prevention during integration. Missing provenance must not be
 interpreted as proof that a stream is locally owned.
 
-The separate [local viewer-policy gate](vendor-viewer-policy.md) validates source/group callback and token layers, rejecting unsupported rules and order-dependent group conflicts. It does not consume inventory yet: explicit inventory memberships can now be validated as facts, but configuration fencing, verified provenance/loop eligibility and live reference qualification remain integration requirements.
+The separate [local viewer-policy gate](vendor-viewer-policy.md) validates source/group callback and token layers, rejecting unsupported rules and order-dependent group conflicts. Explicit inventory memberships can be composed through the source authority below. Global configuration fencing, verified provenance/loop eligibility and live reference qualification remain daemon integration requirements.
+
+
+The independent [source configuration authority](vendor-source-authority.md)
+validates all supported local source/group options before projection, preserves
+native namespace/exclusion/static-selection semantics and rejects stale or
+cross-authority candidate publication. Source/backend replacement and removal
+invalidate outstanding snapshots. This is not wired to daemon routing or
+activation; global configuration fences, leases, actual topology and live vendor
+interoperability remain integration requirements.

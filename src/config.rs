@@ -281,7 +281,7 @@ fn valid_key(kind: &str, key: &str) -> Result<(), String> {
     }
 }
 /// A source identity is a server root, never a stream path or credential carrier.
-fn source_address(raw: &str) -> Result<(String, &'static str), String> {
+pub(crate) fn source_address(raw: &str) -> Result<(String, &'static str), String> {
     let invalid = || {
         "source URL requires m4f/m4fs/m4s/m4ss://HOST[:PORT], without credentials, path, query or fragment".to_string()
     };
