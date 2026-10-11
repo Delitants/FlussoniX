@@ -93,3 +93,5 @@ also needs its own evidence. Preserve native prefix/except/only semantics,
 local precedence, revision fencing, inventory leases, capacity limits and
 relay-loop prevention during integration. Missing provenance must not be
 interpreted as proof that a stream is locally owned.
+
+The separate [local viewer-policy gate](vendor-viewer-policy.md) validates source/group callback and token layers, rejecting unsupported rules and order-dependent group conflicts. It does not consume inventory yet: explicit group-membership metadata, configuration fencing, provenance/loop eligibility and live reference qualification remain integration requirements.

@@ -2,6 +2,7 @@
 use serde_json::Value;
 use std::time::Duration;
 pub mod flussonic;
+pub mod flussonic_policy;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LookupFailure {
     Unavailable,

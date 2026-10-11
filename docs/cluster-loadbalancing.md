@@ -357,3 +357,6 @@ decoding but is not selected by source activation or routing. No vendor source
 mode or automatic native/vendor fallback is introduced. Effective source/group
 viewer policy, discovered-name provenance and loop checks remain integration
 gates; live vendor authentication and HLS/TS carriage need separate qualification.
+
+
+The [local source/group viewer-policy gate](vendor-viewer-policy.md) is a separate library building block. It validates local callback/token settings, preserves independent token guards and rejects conflicting group overrides or unsupported rules. It does not grant inventory/media credentials viewer authority. Native routing and policy publication stay unchanged; vendor mode still requires explicit group metadata, configuration fences, provenance/loop eligibility and live authentication qualification.

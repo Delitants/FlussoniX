@@ -1257,3 +1257,10 @@ semantics, HLS/TS credential carriage, effective source/group viewer policy,
 provenance/loop rules, daemon/UI integration or production capacity. Historical
 HEVC loss, socket-observation and parallel UDP readiness issues are not claimed
 fixed by this increment.
+
+
+## Independent local vendor viewer-policy gate
+
+The [explicit local policy gate](vendor-viewer-policy.md) validates source and named group policy layers independently of inventory and private media credentials. Behavioral regressions cover source inheritance, atomic callback replacement, explicit public access versus unresolved authority, equivalent/conflicting groups, local backend resolution, malformed/unsupported/shadowed policies, limits and real native callback denial, token guards and session limits. No vendor component is a build, test or runtime dependency.
+
+The gate is library-only. Existing source selection, local precedence, revision fencing, provenance, leases, recovery and subtitle handling remain unchanged. It rejects template references and order-dependent group conflicts; live effective reference policy and complete group precedence are not claimed. Group-membership inventory, provenance/loop checks, live Cluster authentication and daemon/UI integration remain pending. Historical HEVC/socket/UDP observations are unchanged.
