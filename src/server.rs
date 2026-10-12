@@ -92,7 +92,9 @@ pub struct App {
     http_delivery: std::sync::Mutex<Value>,
     srt_playback: std::sync::Mutex<Value>,
     rtsp_publication: std::sync::Mutex<Value>,
-    pub config: ConfigStore,
+    pub config: Arc<ConfigStore>,
+    node_name: String,
+    modern_sources: Option<crate::source_directory::modern_coordinator::ModernSourceCoordinator>,
     pub media: Engine,
     credentials: Credentials,
     pub options: Options,
@@ -118,6 +120,17 @@ pub struct App {
     source_lookups: Mutex<HashMap<String, origin_resolution::Ticket>>,
 }
 impl App {
+    /// Optional modern coordinator; this accessor does not enable vendor routing.
+    pub fn modern_source_coordinator(
+        &self,
+    ) -> Result<
+        &crate::source_directory::modern_coordinator::ModernSourceCoordinator,
+        crate::source_directory::modern_coordinator::CoordinationFailure,
+    > {
+        self.modern_sources
+            .as_ref()
+            .ok_or(crate::source_directory::modern_coordinator::CoordinationFailure::Invalid)
+    }
     pub fn new(
         config: impl AsRef<Path>,
         media: impl AsRef<Path>,
@@ -143,6 +156,13 @@ impl App {
                 .zip(options.view_password.as_deref()),
             &options.peer_key,
         );
+        let config = Arc::new(ConfigStore::open(config)?);
+        let modern_sources =
+            crate::source_directory::modern_coordinator::ModernSourceCoordinator::new(
+                config.clone(),
+                &options.node_name,
+            )
+            .ok();
         let app = Arc::new(Self {
             http_delivery: std::sync::Mutex::new(
                 json!({"http":null,"https":null,"https_only":false}),
@@ -153,7 +173,9 @@ impl App {
             srt_playback: std::sync::Mutex::new(
                 json!({"enabled":false,"listen":null,"encrypted":false}),
             ),
-            config: ConfigStore::open(config)?,
+            config,
+            node_name: options.node_name.clone(),
+            modern_sources,
             media: Engine::new(media, &options.ffmpeg),
             credentials,
             options: options.clone(),
@@ -455,7 +477,7 @@ impl App {
         let reserved_mbps: f64 = reservations.values().map(|r| r.bitrate_mbps).sum();
         drop(reservations);
         let rtsp_publication = self.rtsp_publication.lock().unwrap().clone();
-        let node = json!({"rtsp_publication":rtsp_publication,"name":self.options.node_name,"role":self.options.role,"uptime":self.started.elapsed().as_secs(),"reserved_mbps":reserved_mbps,"uplink_mbps":self.options.uplink_mbps,"active":self.active().await,"reserved":reserved,"limit":self.options.client_limit,"drain":self.options.drain,"http_delivery":self.http_delivery.lock().unwrap().clone()});
+        let node = json!({"rtsp_publication":rtsp_publication,"name":self.node_name,"role":self.options.role,"uptime":self.started.elapsed().as_secs(),"reserved_mbps":reserved_mbps,"uplink_mbps":self.options.uplink_mbps,"active":self.active().await,"reserved":reserved,"limit":self.options.client_limit,"drain":self.options.drain,"http_delivery":self.http_delivery.lock().unwrap().clone()});
         metrics
             .as_object_mut()
             .unwrap()

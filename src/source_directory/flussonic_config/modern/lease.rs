@@ -75,6 +75,15 @@ impl SourceAuthority {
         local_id: &ObservedServerId,
         lifetime: Duration,
     ) -> Result<ModernLeasedInventory, LeaseFailure> {
+        self.leased_modern_inventory_with_ids(std::slice::from_ref(local_id), lifetime)
+            .await
+    }
+
+    pub(crate) async fn leased_modern_inventory_with_ids(
+        &self,
+        local_ids: &[ObservedServerId],
+        lifetime: Duration,
+    ) -> Result<ModernLeasedInventory, LeaseFailure> {
         if lifetime.is_zero() || lifetime > MAX_LIFETIME {
             return Err(LeaseFailure::InvalidLifetime);
         }
@@ -99,7 +108,7 @@ impl SourceAuthority {
             .profile
             .modern_inventory()
             .map_err(projection)?
-            .inventory(local_id)
+            .inventory_with_ids(local_ids)
             .await;
         // Same lock fences success AND error: exact profile, newest turn, expiry,
         // upstream result. No publication lock is held across network awaits.

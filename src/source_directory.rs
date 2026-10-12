@@ -199,3 +199,5 @@ pub(crate) async fn inventory(
     .await
     .unwrap_or(Err(LookupFailure::Unavailable))
 }
+
+pub mod modern_coordinator;

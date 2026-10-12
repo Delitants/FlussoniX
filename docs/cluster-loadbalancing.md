@@ -433,3 +433,11 @@ independent of the immutable modern wire budget; failed/cancelled attempts never
 restore older grants. Existing legacy and unleased APIs retain their behavior.
 This library stage enables no vendor daemon routing, relay eligibility, global
 configuration ordering or worker/session revocation.
+
+
+[Modern configuration coordination](vendor-coordination.md) binds opt-in
+preparation, installation, discovery and synchronous publication to the daemon's
+actual startup name, explicit aliases, shared ConfigStore revision and installed
+source generation. Local viewer policy remains explicit; missing policy stays
+unresolved. This does not select vendor sources in the daemon or qualify relay
+ownership, viewer admission, private endpoint identity, or worker/session reuse.

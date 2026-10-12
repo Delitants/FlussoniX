@@ -84,16 +84,27 @@ impl ModernInventoryClient {
         &self,
         local_id: &ObservedServerId,
     ) -> Result<ObservedInventory, LookupFailure> {
+        self.inventory_with_ids(std::slice::from_ref(local_id))
+            .await
+    }
+
+    pub(crate) async fn inventory_with_ids(
+        &self,
+        local_ids: &[ObservedServerId],
+    ) -> Result<ObservedInventory, LookupFailure> {
+        if local_ids.is_empty() {
+            return Err(LookupFailure::Invalid);
+        }
         let deadline = tokio::time::Instant::now() + self.budget;
         tokio::time::timeout_at(deadline, async {
             let mut remaining = MAX_BYTES;
             let before = self.server_id(&mut remaining).await?;
-            if &before == local_id {
+            if local_ids.contains(&before) {
                 return Err(LookupFailure::Invalid);
             }
             let rows = self.fetch(&before, &mut remaining).await?;
             let after = self.server_id(&mut remaining).await?;
-            if before != after || &after == local_id {
+            if before != after || local_ids.contains(&after) {
                 return Err(LookupFailure::Invalid);
             }
             // The timeout cannot preempt synchronous bounded JSON/row parsing.
