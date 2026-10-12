@@ -151,3 +151,10 @@ Opaque complete inventory results produce candidates for current-profile media
 construction; stale fetch success/errors and cross-authority publication fail.
 This remains library-only: actual topology, live interoperability, global daemon
 fences, leases and worker/session lifetime still gate vendor routing.
+
+
+The independent [management identity preflight](vendor-source-identity.md) now
+provides opt-in configuration identity probes around bound inventory, rejecting
+direct self claims and observed ID drift under shared limits. This is not an
+atomic remote snapshot, private-endpoint identity, provenance or multi-hop loop
+proof. Vendor daemon routing remains disabled.

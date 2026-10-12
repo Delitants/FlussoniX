@@ -98,3 +98,10 @@ actual relay-loop/topology checks, inventory leases, daemon global configuration
 coordination, worker/session revocation, complete template/group semantics,
 HLS/TS private credentials and subtitle options remain integration gates. Vendor
 routing stays disabled.
+
+
+The independent [management identity preflight](vendor-source-identity.md) now
+provides opt-in configuration identity probes around bound inventory, rejecting
+direct self claims and observed ID drift under shared limits. This is not an
+atomic remote snapshot, private-endpoint identity, provenance or multi-hop loop
+proof. Vendor daemon routing remains disabled.

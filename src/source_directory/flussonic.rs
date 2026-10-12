@@ -3,6 +3,7 @@
 //! This client returns discovery facts, not viewer policy or media routes. It is
 //! deliberately not selected by the native source resolver. Integrating a vendor
 //! source requires separate policy, provenance and private-media qualification.
+mod identity;
 use super::LookupFailure;
 use reqwest::header::HeaderValue;
 use serde_json::Value;
@@ -143,17 +144,17 @@ impl InventoryClient {
     /// share one deadline and byte/row/page budget. Dropping this future cancels
     /// its current fetch; no background pagination or partial result is retained.
     pub async fn inventory(&self) -> Result<Vec<InventoryStream>, LookupFailure> {
-        tokio::time::timeout(DEADLINE, self.fetch())
+        let mut remaining = MAX_BYTES;
+        tokio::time::timeout(DEADLINE, self.fetch(&mut remaining))
             .await
             .unwrap_or(Err(LookupFailure::Unavailable))
     }
 
-    async fn fetch(&self) -> Result<Vec<InventoryStream>, LookupFailure> {
+    async fn fetch(&self, remaining: &mut usize) -> Result<Vec<InventoryStream>, LookupFailure> {
         let mut cursor: Option<String> = None;
         let mut cursors = HashSet::new();
         let mut names = HashSet::new();
         let mut streams = Vec::new();
-        let mut remaining = MAX_BYTES;
         let mut remaining_memberships = MAX_MEMBERSHIPS;
         for _ in 0..MAX_PAGES {
             let mut url = self.endpoint.clone();
@@ -161,42 +162,7 @@ impl InventoryClient {
                 // An opaque cursor is a query value, never a navigation target.
                 url.query_pairs_mut().append_pair("cursor", cursor);
             }
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|_| LookupFailure::Unavailable)?
-                .as_secs();
-            let mut response = self
-                .client
-                .get(url)
-                .header(
-                    "Authorization",
-                    inventory_authorization(&self.key, timestamp),
-                )
-                .send()
-                .await
-                .map_err(|_| LookupFailure::Unavailable)?;
-            if response.status() != reqwest::StatusCode::OK {
-                return Err(LookupFailure::Unavailable);
-            }
-            if response
-                .content_length()
-                .is_some_and(|n| n > remaining as u64)
-            {
-                return Err(LookupFailure::Invalid);
-            }
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|_| LookupFailure::Unavailable)?
-            {
-                remaining = remaining
-                    .checked_sub(chunk.len())
-                    .ok_or(LookupFailure::Invalid)?;
-                bytes.extend_from_slice(&chunk);
-            }
-            let value: Value =
-                serde_json::from_slice(&bytes).map_err(|_| LookupFailure::Invalid)?;
+            let value = self.json(url, remaining).await?;
             let rows = value
                 .get("streams")
                 .and_then(Value::as_array)
@@ -246,6 +212,44 @@ impl InventoryClient {
             }
         }
         Err(LookupFailure::Invalid)
+    }
+    /// Fixed-origin authenticated JSON request sharing a whole-operation byte budget.
+    async fn json(&self, url: Url, remaining: &mut usize) -> Result<Value, LookupFailure> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| LookupFailure::Unavailable)?
+            .as_secs();
+        let mut response = self
+            .client
+            .get(url)
+            .header(
+                "Authorization",
+                inventory_authorization(&self.key, timestamp),
+            )
+            .send()
+            .await
+            .map_err(|_| LookupFailure::Unavailable)?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(LookupFailure::Unavailable);
+        }
+        if response
+            .content_length()
+            .is_some_and(|n| n > *remaining as u64)
+        {
+            return Err(LookupFailure::Invalid);
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| LookupFailure::Unavailable)?
+        {
+            *remaining = remaining
+                .checked_sub(chunk.len())
+                .ok_or(LookupFailure::Invalid)?;
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| LookupFailure::Invalid)
     }
 }
 

@@ -10,7 +10,9 @@ use crate::{
     m4_ingest::flussonic::{MediaOrigin, Transport},
     playback_auth::Policy,
 };
-pub use binding::{BindingFailure, BoundCandidate, BoundInventory};
+pub use binding::{
+    BindingFailure, BoundCandidate, BoundInventory, IdentityCandidate, IdentityInventory,
+};
 use serde_json::{Map, Value, json};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};

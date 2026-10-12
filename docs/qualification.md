@@ -1309,3 +1309,32 @@ old candidates. Redirect and rejected-auth paths do not probe alternate origins.
 The [binding library](vendor-source-binding.md) does not attest topology or grant
 viewer access, revoke exported inputs, acquire global daemon authority or enable
 vendor routing. Live interoperability and daemon integration remain pending.
+
+
+### Vendor management identity preflight
+
+An opt-in independent identity-observed inventory API probes the configured
+management `/streamer/api/v3/config` endpoint before and after the complete
+inventory chain. It rejects nil local IDs, missing/malformed/nil/self remote
+UUIDs and observed identity changes. All bodies and requests share one existing
+1 MiB/750 ms operation budget, with frozen verified TLS, fixed origins/proxy
+prefixes, hashed Cluster credentials and no redirects/fallback. Opaque candidates
+retain the current-profile publication fence and configured private-media origin.
+
+Twelve owned HTTP/TLS regressions failed against the API scaffold and now pass,
+covering identity normalization, direct self rejection, complete pagination, exact
+aggregate bytes and overflow (declared/chunked), total deadline, auth/status and
+redirect failures, frozen management trust, stale success/errors in all three
+request phases, cross-authority/removal fencing and direct probe cancellation.
+The proxy fixture also checks the effective `api_url` default for omitted
+`private_payload_url` through an actual encoded private-media request.
+One initial new fixture incorrectly expected Removed rather than the existing
+revision-first Stale diagnostic after removal; only that expectation changed.
+
+Read-only static reference inspection supplied the direct-self-check and config
+identity facts; no vendor modules were executed or production endpoints changed.
+The [identity preflight contract](vendor-source-identity.md) documents why this
+is not an atomic remote snapshot, signed response, private-endpoint identity,
+inventory lease or multi-hop loop proof. Live sender/authentication, actual
+topology eligibility and daemon integration remain gates; vendor routing stays
+disabled. Historical HEVC/socket/parallel-readiness observations are unchanged.

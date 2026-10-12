@@ -32,13 +32,26 @@ impl SourceAuthority {
     pub async fn inventory(&self) -> Result<BoundInventory, BindingFailure> {
         let snapshot = self.snapshot().map_err(BindingFailure::Projection)?;
         let result = snapshot.profile.inventory.inventory().await;
+        self.bind_inventory(snapshot, result.map(|rows| ((), rows)))
+            .map(|(_, inventory)| inventory)
+    }
+    fn bind_inventory<T>(
+        &self,
+        snapshot: SourceSnapshot,
+        result: Result<(T, Vec<InventoryStream>), LookupFailure>,
+    ) -> Result<(T, BoundInventory), BindingFailure> {
         let state = self
             .current(snapshot.revision, &snapshot.profile)
             .map_err(BindingFailure::Projection)?;
         let result = result
-            .map(|rows| BoundInventory {
-                snapshot,
-                rows: rows.into_iter().map(|r| (r.name.clone(), r)).collect(),
+            .map(|(extra, rows)| {
+                (
+                    extra,
+                    BoundInventory {
+                        snapshot,
+                        rows: rows.into_iter().map(|r| (r.name.clone(), r)).collect(),
+                    },
+                )
             })
             .map_err(BindingFailure::Inventory);
         drop(state);
@@ -80,5 +93,70 @@ impl BoundInventory {
             .candidate(row)
             .map(|candidate| BoundCandidate { candidate })
             .map_err(BindingFailure::Projection)
+    }
+}
+
+/// Opaque identity-observed discovery, not a verified topology proof.
+pub struct IdentityInventory {
+    inventory: BoundInventory,
+    server_id: uuid::Uuid,
+}
+/// Candidate from identity-observed discovery; not a viewer or topology grant.
+pub struct IdentityCandidate {
+    candidate: BoundCandidate,
+    server_id: uuid::Uuid,
+}
+impl IdentityInventory {
+    /// Observed management UUID; no cryptographic or private-endpoint attestation.
+    pub fn server_id(&self) -> uuid::Uuid {
+        self.server_id
+    }
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.inventory.names()
+    }
+    pub fn candidate(&self, name: &str) -> Result<IdentityCandidate, BindingFailure> {
+        self.inventory
+            .candidate(name)
+            .map(|candidate| IdentityCandidate {
+                candidate,
+                server_id: self.server_id,
+            })
+    }
+}
+impl IdentityCandidate {
+    /// Observed management UUID; no cryptographic or private-endpoint attestation.
+    pub fn server_id(&self) -> uuid::Uuid {
+        self.server_id
+    }
+}
+impl SourceAuthority {
+    /// Probe the configured management identity before and after complete inventory.
+    /// Reject direct self claims and observed identity drift; this does not attest
+    /// remote content, the split private-media endpoint or multi-hop topology.
+    pub async fn identity_inventory(
+        &self,
+        local_id: uuid::Uuid,
+    ) -> Result<IdentityInventory, BindingFailure> {
+        let snapshot = self.snapshot().map_err(BindingFailure::Projection)?;
+        let result = snapshot
+            .profile
+            .inventory
+            .identity_inventory(local_id)
+            .await;
+        self.bind_inventory(snapshot, result)
+            .map(|(server_id, inventory)| IdentityInventory {
+                inventory,
+                server_id,
+            })
+    }
+    /// Current-profile media construction for an identity-observed candidate.
+    /// The observation is neither a lease nor permission to open private media.
+    /// All at_bound_current viewer, async fence and revocation caveats apply.
+    pub fn at_identity_current<T>(
+        &self,
+        bound: &IdentityCandidate,
+        commit: impl FnOnce(CandidateView<'_>, MediaInput) -> T,
+    ) -> Result<T, ProjectionFailure> {
+        self.at_bound_current(&bound.candidate, commit)
     }
 }
