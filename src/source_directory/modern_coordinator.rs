@@ -1,5 +1,6 @@
 //! Opt-in modern source lifecycle. Native routing never selects these handles.
 //! Lock order: ConfigStore -> coordinator -> SourceAuthority; no lock across I/O.
+mod relay;
 use super::{
     flussonic::modern::ObservedServerId,
     flussonic_config::{
@@ -8,6 +9,8 @@ use super::{
     },
 };
 use crate::{config::ConfigStore, m4_ingest::flussonic::MediaInput};
+use relay::RelayRoutes;
+pub use relay::{RelayCandidate, RelayFailure, RelayHop, RelayRoute};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -42,6 +45,7 @@ struct LocalIdentity {
 }
 struct State {
     retired: bool,
+    routes: Arc<RelayRoutes>,
     identity: Arc<LocalIdentity>,
     revision: u64,
     preparations: HashMap<String, Arc<()>>,
@@ -99,6 +103,7 @@ impl ModernSourceCoordinator {
         Ok(Self {
             state: Mutex::new(State {
                 retired: false,
+                routes: Arc::new(RelayRoutes::default()),
                 identity: Arc::new(LocalIdentity {
                     ids: vec![primary.clone()],
                 }),

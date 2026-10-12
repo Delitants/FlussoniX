@@ -1412,3 +1412,13 @@ actual startup name, explicit aliases, shared ConfigStore revision and installed
 source generation. Local viewer policy remains explicit; missing policy stays
 unresolved. This does not select vendor sources in the daemon or qualify relay
 ownership, viewer admission, private endpoint identity, or worker/session reuse.
+
+## Explicit configured relay path regressions
+
+Owned HTTP regressions cover [relay paths](vendor-relay-topology.md): path bounds,
+local/repeated semantic IDs, literal names, per-hop roles/memberships/filters/local
+policy, every source generation and newest refresh, failure/cancellation, every
+deadline, route replacement/removal and synchronous publication blocking. The
+positive fixture opens only the entry server's independently encoded MP3 media.
+This does not qualify actual vendor ancestry, private endpoint identity or mixed
+vendor activation; automatic vendor routing stays disabled.

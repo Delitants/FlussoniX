@@ -441,3 +441,12 @@ actual startup name, explicit aliases, shared ConfigStore revision and installed
 source generation. Local viewer policy remains explicit; missing policy stays
 unresolved. This does not select vendor sources in the daemon or qualify relay
 ownership, viewer admission, private endpoint identity, or worker/session reuse.
+
+## Explicit relay path coordination
+
+[Configured relay paths](vendor-relay-topology.md) now provide a bounded opt-in
+library gate over every declared source's leased inventory and identity pin.
+Publication holds the global configuration, coordinator and every source fence,
+constructing private media only for the entry hop. It validates explicit local
+paths rather than attesting actual remote inputs, distributed ownership or
+content equivalence. Native routing is unchanged; vendor routing remains disabled.

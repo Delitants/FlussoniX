@@ -304,6 +304,38 @@ impl SourceSnapshot {
         let kind = row
             .local_origin_candidate()
             .map_err(ProjectionFailure::Ineligible)?;
+        self.selected_candidate(row, kind)
+    }
+    // Only the explicit all-hop coordinator can use remote rows. Preserve the
+    // existing public local-origin gate and revalidate all other row facts.
+    pub(super) fn relay_candidate(
+        &self,
+        row: &InventoryStream,
+    ) -> Result<Candidate, ProjectionFailure> {
+        match row.local_origin_candidate() {
+            Err(super::flussonic::EligibilityFailure::Relayed) => {}
+            Err(error) => return Err(ProjectionFailure::Ineligible(error)),
+            Ok(_) => return Err(ProjectionFailure::Invalid),
+        }
+        if row.groups.is_none() {
+            return Err(ProjectionFailure::Ineligible(
+                super::flussonic::EligibilityFailure::UnknownGroups,
+            ));
+        }
+        self.selected_candidate(
+            row,
+            if row.is_static {
+                CandidateKind::Static
+            } else {
+                CandidateKind::OnDemand
+            },
+        )
+    }
+    fn selected_candidate(
+        &self,
+        row: &InventoryStream,
+        kind: CandidateKind,
+    ) -> Result<Candidate, ProjectionFailure> {
         if !super::allows(&self.profile.source, &row.name) {
             return Err(ProjectionFailure::Excluded);
         }

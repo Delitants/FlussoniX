@@ -633,3 +633,12 @@ actual startup name, explicit aliases, shared ConfigStore revision and installed
 source generation. Local viewer policy remains explicit; missing policy stays
 unresolved. This does not select vendor sources in the daemon or qualify relay
 ownership, viewer admission, private endpoint identity, or worker/session reuse.
+
+## Explicit relay path coordination
+
+The opt-in [configured relay path coordinator](vendor-relay-topology.md) binds
+2..8 pinned source identities and literal names to every hop's current leased
+inventory, policy and configuration generation. Atomic path edits and an all-hop
+publication fence reject local/repeated IDs, stale or expired hops, unknown roles
+and unresolved policy. These are operator assertions, not remotely attested
+ancestry or private endpoint identity. Automatic vendor routing remains disabled.

@@ -5,14 +5,14 @@ use crate::{
     source_directory::{
         flussonic::modern::ObservedServerId,
         flussonic_config::{
-            BindingFailure, BoundInventory, CandidateView, LeaseFailure, ProjectionFailure,
-            SourceAuthority, SourceSnapshot,
+            BindingFailure, BoundCandidate, BoundInventory, CandidateView, LeaseFailure,
+            ProjectionFailure, SourceAuthority, SourceSnapshot,
             binding::{MAX_LIFETIME, Ticket},
         },
     },
 };
 use std::{
-    sync::Arc,
+    sync::{Arc, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -32,6 +32,38 @@ pub struct ModernLeasedCandidate {
     ticket: Ticket,
 }
 impl ModernLeasedInventory {
+    pub(crate) fn path_provenance(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::source_directory::flussonic::StreamProvenance>, LeaseFailure> {
+        self.inventory
+            .inventory
+            .rows
+            .get(name)
+            .map(|row| row.named_by)
+            .ok_or(LeaseFailure::Binding(BindingFailure::Missing))
+    }
+    pub(crate) fn relay_candidate(
+        &self,
+        name: &str,
+    ) -> Result<ModernLeasedCandidate, LeaseFailure> {
+        let inventory = &self.inventory.inventory;
+        let row = inventory
+            .rows
+            .get(name)
+            .ok_or(LeaseFailure::Binding(BindingFailure::Missing))?;
+        let candidate = inventory
+            .snapshot
+            .relay_candidate(row)
+            .map_err(projection)?;
+        Ok(ModernLeasedCandidate {
+            candidate: ModernBoundCandidate {
+                candidate: BoundCandidate { candidate },
+                server_id: self.server_id().clone(),
+            },
+            ticket: self.ticket.clone(),
+        })
+    }
     /// Untrusted management claim, not private-endpoint identity or topology proof.
     pub fn server_id(&self) -> &ObservedServerId {
         self.inventory.server_id()
@@ -65,6 +97,17 @@ impl ModernLeasedCandidate {
     }
 }
 impl SourceAuthority {
+    pub(crate) fn guard_modern_lease<'a>(
+        &'a self,
+        bound: &'a ModernLeasedCandidate,
+    ) -> Result<ModernLeaseGuard<'a>, LeaseFailure> {
+        let candidate = &bound.candidate.candidate.candidate;
+        let state = self
+            .current(candidate.revision, &candidate.profile)
+            .map_err(projection)?;
+        bound.ticket.check(&state)?;
+        Ok(ModernLeaseGuard { state, bound })
+    }
     /// Lifetime must be in (0,30s], measured from reservation before I/O, separately
     /// from the constructor's modern wire budget. Invalid lifetime, removed source
     /// or wrong mode never reserve a turn or send requests. Unpolled futures do
@@ -140,18 +183,32 @@ impl SourceAuthority {
         bound: &ModernLeasedCandidate,
         commit: impl FnOnce(CandidateView<'_>, MediaInput) -> T,
     ) -> Result<T, LeaseFailure> {
-        let candidate = &bound.candidate.candidate.candidate;
-        let state = self
-            .current(candidate.revision, &candidate.profile)
-            .map_err(projection)?;
-        bound.ticket.check(&state)?;
+        let guard = self.guard_modern_lease(bound)?;
+        let (view, input) = guard.publication()?;
+        let result = commit(view, input);
+        drop(guard);
+        Ok(result)
+    }
+}
+/// Crate-private guard: no standalone external relay candidate or lock export.
+pub(crate) struct ModernLeaseGuard<'a> {
+    state: MutexGuard<'a, super::super::State>,
+    bound: &'a ModernLeasedCandidate,
+}
+impl ModernLeaseGuard<'_> {
+    pub(crate) fn check(&self) -> Result<(), LeaseFailure> {
+        self.bound.ticket.check(&self.state)
+    }
+    pub(crate) fn publication(&self) -> Result<(CandidateView<'_>, MediaInput), LeaseFailure> {
+        self.check()?;
+        let candidate = &self.bound.candidate.candidate.candidate;
         let input = candidate
             .profile
             .media
             .input(&candidate.name)
             .map_err(|_| projection(ProjectionFailure::Invalid))?;
-        bound.ticket.check(&state)?;
-        let result = commit(
+        self.check()?;
+        Ok((
             CandidateView {
                 source: candidate.profile.source["url"]
                     .as_str()
@@ -162,8 +219,6 @@ impl SourceAuthority {
                 selected_static: candidate.selected_static,
             },
             input,
-        );
-        drop(state);
-        Ok(result)
+        ))
     }
 }
