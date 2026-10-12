@@ -1,7 +1,9 @@
 //! Complete local source projection and metadata-candidate publication fencing.
 //! Independent of daemon configuration/routing; no vendor runtime components.
 mod binding;
+mod modern;
 use super::flussonic::InventoryClient;
+use super::flussonic::modern::ModernInventoryClient;
 use super::{
     flussonic::{CandidateKind, EligibilityFailure, InventoryStream},
     flussonic_policy::{PolicyFailure, PolicySet},
@@ -14,9 +16,11 @@ pub use binding::{
     BindingFailure, BoundCandidate, BoundInventory, IdentityCandidate, IdentityInventory,
     LeaseFailure, LeasedIdentityCandidate, LeasedIdentityInventory,
 };
+pub use modern::{ModernBoundCandidate, ModernBoundInventory};
 use serde_json::{Map, Value, json};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 const MAX_PROFILE_BYTES: usize = 1024 * 1024;
 const MAX_GROUP_BYTES: usize = 16 * 1024;
@@ -37,14 +41,27 @@ pub enum ProjectionFailure {
     Policy(PolicyFailure),
 }
 
+#[derive(Clone, Copy)]
+enum DiscoveryMode {
+    Legacy,
+    Modern(Duration),
+}
+enum Inventory {
+    Legacy(InventoryClient),
+    Modern(Box<ModernInventoryClient>),
+}
 struct Profile {
     source: Value,
     policies: PolicySet,
-    inventory: InventoryClient,
+    inventory: Inventory,
     media: MediaOrigin,
 }
 impl Profile {
-    fn parse(source: &Value, backends: &Value) -> Result<Self, ProjectionFailure> {
+    fn parse(
+        source: &Value,
+        backends: &Value,
+        mode: DiscoveryMode,
+    ) -> Result<Self, ProjectionFailure> {
         let object = source.as_object().ok_or(ProjectionFailure::Invalid)?;
         bounded(
             &json!({"source":source,"auth_backends":backends}),
@@ -121,11 +138,12 @@ impl Profile {
         let key = source["cluster_key"]
             .as_str()
             .expect("validated privileged key");
-        let inventory = InventoryClient::new(
-            api,
-            key,
-            optional_text(source, "flussonix_tls_ca")?.map(Path::new),
-        )
+        let ca = optional_text(source, "flussonix_tls_ca")?.map(Path::new);
+        let inventory = match mode {
+            DiscoveryMode::Legacy => InventoryClient::new(api, key, ca).map(Inventory::Legacy),
+            DiscoveryMode::Modern(budget) => ModernInventoryClient::new(api, key, ca, budget)
+                .map(|client| Inventory::Modern(Box::new(client))),
+        }
         .map_err(|_| ProjectionFailure::Invalid)?;
         let media = MediaOrigin::new(
             private,
@@ -147,6 +165,18 @@ impl Profile {
             media,
         })
     }
+    fn legacy_inventory(&self) -> Result<&InventoryClient, ProjectionFailure> {
+        match &self.inventory {
+            Inventory::Legacy(client) => Ok(client),
+            Inventory::Modern(_) => Err(ProjectionFailure::Unsupported),
+        }
+    }
+    fn modern_inventory(&self) -> Result<&ModernInventoryClient, ProjectionFailure> {
+        match &self.inventory {
+            Inventory::Modern(client) => Ok(client),
+            Inventory::Legacy(_) => Err(ProjectionFailure::Unsupported),
+        }
+    }
 }
 
 struct State {
@@ -158,12 +188,21 @@ struct State {
 /// Owns one independent local source authority. Not the daemon's configuration
 /// store. No Debug/serialization: source settings contain privileged credentials.
 pub struct SourceAuthority {
+    mode: DiscoveryMode,
     state: Mutex<State>,
 }
 impl SourceAuthority {
     pub fn new(source: &Value, backends: &Value) -> Result<Self, ProjectionFailure> {
-        let profile = Arc::new(Profile::parse(source, backends)?);
+        Self::with_mode(source, backends, DiscoveryMode::Legacy)
+    }
+    fn with_mode(
+        source: &Value,
+        backends: &Value,
+        mode: DiscoveryMode,
+    ) -> Result<Self, ProjectionFailure> {
+        let profile = Arc::new(Profile::parse(source, backends, mode)?);
         Ok(Self {
+            mode,
             state: Mutex::new(State {
                 revision: 0,
                 profile: Some(profile),
@@ -203,7 +242,7 @@ impl SourceAuthority {
     /// Every successful unconditional replacement creates a new profile identity.
     /// Callers must order/fence asynchronous configuration loads themselves.
     pub fn replace(&self, source: &Value, backends: &Value) -> Result<(), ProjectionFailure> {
-        let profile = Arc::new(Profile::parse(source, backends)?);
+        let profile = Arc::new(Profile::parse(source, backends, self.mode)?);
         let mut state = self.state()?;
         let revision = state
             .revision

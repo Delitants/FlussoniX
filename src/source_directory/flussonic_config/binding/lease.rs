@@ -118,6 +118,8 @@ impl SourceAuthority {
                     .clone()
                     .ok_or_else(|| projection(ProjectionFailure::Removed))?,
             };
+            // Wrong discovery mode must not reserve a legacy refresh turn.
+            snapshot.profile.legacy_inventory().map_err(projection)?;
             let ticket = Ticket {
                 turn: Arc::new(()),
                 expires_at: Instant::now() + lifetime,
@@ -127,7 +129,8 @@ impl SourceAuthority {
         };
         let result = snapshot
             .profile
-            .inventory
+            .legacy_inventory()
+            .map_err(projection)?
             .identity_inventory(local_id)
             .await;
         // Apply local source/turn/expiry fences to success AND error, in that

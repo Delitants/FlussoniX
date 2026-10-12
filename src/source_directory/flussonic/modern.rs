@@ -21,6 +21,9 @@ pub struct ObservedInventory {
     rows: Vec<InventoryStream>,
 }
 impl ObservedInventory {
+    pub(crate) fn into_parts(self) -> (ObservedServerId, Vec<InventoryStream>) {
+        (self.server_id, self.rows)
+    }
     pub fn server_id(&self) -> &ObservedServerId {
         &self.server_id
     }

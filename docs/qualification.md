@@ -1382,3 +1382,14 @@ media endpoint, relay/loop eligibility, global configuration ordering and daemon
 activation/session integration remain separate gates. Live complete discovery
 and immutable-head CI/review evidence are recorded with the release. Historical
 HEVC loss, socket-observation attribution and parallel UDP readiness are unchanged.
+
+
+## Explicit modern configured-source binding
+
+The opt-in [modern source binding](vendor-modern-source-binding.md) prepares
+modern management and private media from the same validated local profile,
+retains explicit mode/budget across edits and returns opaque complete results.
+Current-profile checks reject stale success/error and cross-authority publication.
+Existing local-origin, membership, filter and policy gates remain mandatory;
+legacy constructors/APIs retain their contracts. This adds no modern lease or
+relay permission and does not enable vendor daemon routing, configuration or UI.

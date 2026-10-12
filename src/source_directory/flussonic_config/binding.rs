@@ -33,11 +33,16 @@ impl SourceAuthority {
     /// current lookup result. Cancellation drops the direct client future.
     pub async fn inventory(&self) -> Result<BoundInventory, BindingFailure> {
         let snapshot = self.snapshot().map_err(BindingFailure::Projection)?;
-        let result = snapshot.profile.inventory.inventory().await;
+        let result = snapshot
+            .profile
+            .legacy_inventory()
+            .map_err(BindingFailure::Projection)?
+            .inventory()
+            .await;
         self.bind_inventory(snapshot, result.map(|rows| ((), rows)))
             .map(|(_, inventory)| inventory)
     }
-    fn bind_inventory<T>(
+    pub(super) fn bind_inventory<T>(
         &self,
         snapshot: SourceSnapshot,
         result: Result<(T, Vec<InventoryStream>), LookupFailure>,
@@ -142,7 +147,8 @@ impl SourceAuthority {
         let snapshot = self.snapshot().map_err(BindingFailure::Projection)?;
         let result = snapshot
             .profile
-            .inventory
+            .legacy_inventory()
+            .map_err(BindingFailure::Projection)?
             .identity_inventory(local_id)
             .await;
         self.bind_inventory(snapshot, result)

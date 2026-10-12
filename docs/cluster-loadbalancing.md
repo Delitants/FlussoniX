@@ -411,3 +411,14 @@ the complete cursor chain and in every page. Missing memberships and relay claim
 remain facts, not route or viewer grants. The strict legacy client and existing
 source-authority/lease APIs keep their contracts; vendor daemon routing stays
 disabled pending authority, relay/topology, policy and global integration.
+
+
+## Explicit modern configured-source binding
+
+The opt-in [modern source binding](vendor-modern-source-binding.md) prepares
+modern management and private media from the same validated local profile,
+retains explicit mode/budget across edits and returns opaque complete results.
+Current-profile checks reject stale success/error and cross-authority publication.
+Existing local-origin, membership, filter and policy gates remain mandatory;
+legacy constructors/APIs retain their contracts. This adds no modern lease or
+relay permission and does not enable vendor daemon routing, configuration or UI.

@@ -99,3 +99,14 @@ shared time/byte/page/row/group budgets, cancellation, denial/redirect handling,
 frozen TLS trust and unchanged legacy behavior. Live qualification uses bounded
 read-only requests and records authentication, complete observations and remaining
 policy/topology limitations separately. No production configuration is rewritten.
+
+
+## Explicit modern configured-source binding
+
+The opt-in [modern source binding](vendor-modern-source-binding.md) prepares
+modern management and private media from the same validated local profile,
+retains explicit mode/budget across edits and returns opaque complete results.
+Current-profile checks reject stale success/error and cross-authority publication.
+Existing local-origin, membership, filter and policy gates remain mandatory;
+legacy constructors/APIs retain their contracts. This adds no modern lease or
+relay permission and does not enable vendor daemon routing, configuration or UI.

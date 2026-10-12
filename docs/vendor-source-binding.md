@@ -113,3 +113,14 @@ monotonic lifetime and latest-refresh ordering to identity-observed discovery.
 Failed/cancelled refreshes do not restore old grants. This is library-only local
 publication fencing, not a remote lease, topology proof or worker revocation;
 vendor daemon routing remains disabled.
+
+
+## Explicit modern configured-source binding
+
+The opt-in [modern source binding](vendor-modern-source-binding.md) prepares
+modern management and private media from the same validated local profile,
+retains explicit mode/budget across edits and returns opaque complete results.
+Current-profile checks reject stale success/error and cross-authority publication.
+Existing local-origin, membership, filter and policy gates remain mandatory;
+legacy constructors/APIs retain their contracts. This adds no modern lease or
+relay permission and does not enable vendor daemon routing, configuration or UI.
