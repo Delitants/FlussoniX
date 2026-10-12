@@ -312,18 +312,65 @@ async fn cancelling_refresh_keeps_old_lease_revoked_and_allows_a_fresh_attempt()
 
 #[tokio::test]
 async fn time_spent_fetching_counts_against_the_inventory_lease() {
+    for status in [StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE] {
+        let s = Server::start().await;
+        let a = Arc::new(s.authority());
+        let (entered, release) = s.hold_probe();
+        let b = a.clone();
+        let refresh = tokio::spawn(async move {
+            b.leased_identity_inventory(local(), Duration::from_millis(50))
+                .await
+        });
+        entered.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        release.send(status).unwrap();
+        assert!(matches!(refresh.await.unwrap(), Err(LeaseFailure::Expired)));
+    }
+}
+
+#[tokio::test]
+async fn leased_publication_serializes_source_replacement_until_the_closure_finishes() {
     let s = Server::start().await;
     let a = Arc::new(s.authority());
-    let (entered, release) = s.hold_probe();
-    let b = a.clone();
-    let refresh = tokio::spawn(async move {
-        b.leased_identity_inventory(local(), Duration::from_millis(50))
-            .await
+    let c = a
+        .leased_identity_inventory(local(), Duration::from_secs(30))
+        .await
+        .unwrap()
+        .candidate(NAME)
+        .unwrap();
+    let (entered, entered_rx) = oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let publisher = a.clone();
+    let publication = std::thread::spawn(move || {
+        publisher.at_leased_current(&c, |view, _| {
+            assert_eq!(view.name, NAME);
+            entered.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })
     });
-    entered.await.unwrap();
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    release.send(StatusCode::OK).unwrap();
-    assert!(matches!(refresh.await.unwrap(), Err(LeaseFailure::Expired)));
+    entered_rx.await.unwrap();
+    let (started, started_rx) = oneshot::channel();
+    let (done, mut done_rx) = oneshot::channel();
+    let editor = a.clone();
+    let source = s.source();
+    let replacement = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        let result = editor.replace(&source, &json!([]));
+        let _ = done.send(result);
+        result
+    });
+    started_rx.await.unwrap();
+    let blocked = tokio::time::timeout(Duration::from_millis(500), &mut done_rx)
+        .await
+        .is_err();
+    // Release and join both owned threads before asserting the observed ordering.
+    release.send(()).unwrap();
+    publication.join().unwrap().unwrap();
+    replacement.join().unwrap().unwrap();
+    assert!(
+        blocked,
+        "source replacement entered during leased publication"
+    );
 }
 
 #[tokio::test]

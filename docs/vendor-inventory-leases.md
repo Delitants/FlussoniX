@@ -92,5 +92,6 @@ Vendor daemon routing stays disabled.
 Owned loopback regressions cover publication before/after expiry, expiration
 during discovery, concurrent held success/error ordering, immediate supersession,
 failed/cancelled refreshes, invalid parameters, cross-authority/source-edit
-fencing, actual configured M4S media and unchanged unleased APIs. No live vendor
+fencing, publication serialization against source replacement, actual configured
+M4S media and unchanged unleased APIs. No live vendor
 endpoint or production configuration is used by these tests.

@@ -1341,7 +1341,7 @@ disabled. Historical HEVC/socket/parallel-readiness observations are unchanged.
 
 ## Local vendor inventory lease regressions
 
-The owned `vendor_inventory_lease` suite covers 12 cases: configured M4S media
+The owned `vendor_inventory_lease` suite covers 13 cases: configured M4S media
 publication with projected policy; expiry without closure entry/media I/O;
 equal-row refresh supersession; immediate revocation while a refresh is held;
 older held success/error completion after newer success; failed refresh; cancelled
@@ -1354,6 +1354,10 @@ The API-only scaffold produced a retained genuine RED result of 3 passed and
 for the missing API is separate from that behavioral result. No vendor runtime
 component, live endpoint or production setting participates in these regressions.
 The 30-second maximum is a local adapter validity cap, not a vendor wire lease.
-The focused GREEN run passed 36 tests across lease, identity and binding suites.
+The initial focused GREEN run passed 36 tests across lease, identity and binding
+suites. Review added a held publication/source-replacement check and extended
+expiry precedence to held upstream errors. Both additions caught retained
+deliberate fault mutations; the correct source was restored before the final
+GREEN run, which passed 37 tests.
 Global daemon fencing, live authentication/topology and worker/session revocation
 remain unqualified by this suite.
