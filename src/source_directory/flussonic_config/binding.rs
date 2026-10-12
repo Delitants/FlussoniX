@@ -1,10 +1,12 @@
 //! Opaque inventory results and media construction bound to a local profile.
-//! This is not daemon routing, viewer admission, a lease or verified topology.
+//! This is not daemon routing, viewer admission or verified topology.
+mod lease;
 use super::{Candidate, CandidateView, ProjectionFailure, SourceAuthority, SourceSnapshot};
 use crate::{
     m4_ingest::flussonic::MediaInput,
     source_directory::{LookupFailure, flussonic::InventoryStream},
 };
+pub use lease::{LeaseFailure, LeasedIdentityCandidate, LeasedIdentityInventory};
 use std::collections::BTreeMap;
 
 /// Generic diagnostics; no endpoint, name, credentials or upstream body.

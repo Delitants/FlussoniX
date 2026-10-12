@@ -12,6 +12,7 @@ use crate::{
 };
 pub use binding::{
     BindingFailure, BoundCandidate, BoundInventory, IdentityCandidate, IdentityInventory,
+    LeaseFailure, LeasedIdentityCandidate, LeasedIdentityInventory,
 };
 use serde_json::{Map, Value, json};
 use std::path::Path;
@@ -151,6 +152,7 @@ impl Profile {
 struct State {
     revision: u64,
     profile: Option<Arc<Profile>>,
+    lease_turn: Option<Arc<()>>,
 }
 
 /// Owns one independent local source authority. Not the daemon's configuration
@@ -165,6 +167,7 @@ impl SourceAuthority {
             state: Mutex::new(State {
                 revision: 0,
                 profile: Some(profile),
+                lease_turn: None,
             }),
         })
     }
@@ -208,6 +211,7 @@ impl SourceAuthority {
             .ok_or(ProjectionFailure::Limit)?;
         state.profile = Some(profile);
         state.revision = revision;
+        state.lease_turn = None;
         Ok(())
     }
     pub fn remove(&self) -> Result<(), ProjectionFailure> {
@@ -218,6 +222,7 @@ impl SourceAuthority {
             .ok_or(ProjectionFailure::Limit)?;
         state.profile = None;
         state.revision = revision;
+        state.lease_turn = None;
         Ok(())
     }
     /// Hold the authority lock while committing a current candidate. Never await

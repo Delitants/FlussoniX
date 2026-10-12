@@ -86,3 +86,11 @@ NAT/proxies, input failover and changing runtime configuration still need actual
 topology eligibility and live reference qualification. Viewer authorization,
 fresh fences after async work, worker/session revocation and global ConfigStore
 coordination remain required. Vendor daemon routing stays disabled.
+
+## Local inventory freshness
+
+The optional [local inventory lease](vendor-inventory-leases.md) adds a bounded
+monotonic lifetime and latest-refresh ordering to identity-observed discovery.
+Failed/cancelled refreshes do not restore old grants. This is library-only local
+publication fencing, not a remote lease, topology proof or worker revocation;
+vendor daemon routing remains disabled.

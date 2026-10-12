@@ -1338,3 +1338,22 @@ is not an atomic remote snapshot, signed response, private-endpoint identity,
 inventory lease or multi-hop loop proof. Live sender/authentication, actual
 topology eligibility and daemon integration remain gates; vendor routing stays
 disabled. Historical HEVC/socket/parallel-readiness observations are unchanged.
+
+## Local vendor inventory lease regressions
+
+The owned `vendor_inventory_lease` suite covers 12 cases: configured M4S media
+publication with projected policy; expiry without closure entry/media I/O;
+equal-row refresh supersession; immediate revocation while a refresh is held;
+older held success/error completion after newer success; failed refresh; cancelled
+refresh and recovery; time spent fetching consuming the lease; source replacement
+and removal fencing held success/error; cross-authority use; invalid lifetime/nil
+ID without I/O or revocation; and unchanged unleased API behavior without renewal.
+
+The API-only scaffold produced a retained genuine RED result of 3 passed and
+9 failed for absent freshness/refresh enforcement. Initial compilation evidence
+for the missing API is separate from that behavioral result. No vendor runtime
+component, live endpoint or production setting participates in these regressions.
+The 30-second maximum is a local adapter validity cap, not a vendor wire lease.
+The focused GREEN run passed 36 tests across lease, identity and binding suites.
+Global daemon fencing, live authentication/topology and worker/session revocation
+remain unqualified by this suite.
