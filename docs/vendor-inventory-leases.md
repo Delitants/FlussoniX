@@ -95,3 +95,14 @@ failed/cancelled refreshes, invalid parameters, cross-authority/source-edit
 fencing, publication serialization against source replacement, actual configured
 M4S media and unchanged unleased APIs. No live vendor
 endpoint or production configuration is used by these tests.
+
+
+## Explicit modern management observations
+
+The opt-in [modern inventory client](vendor-modern-inventory.md) supports bounded
+configured custom IDs and UUID aliases, modern selected stream metadata and one
+explicit whole-refresh budget up to 30 seconds. It checks config identity around
+the complete cursor chain and in every page. Missing memberships and relay claims
+remain facts, not route or viewer grants. The strict legacy client and existing
+source-authority/lease APIs keep their contracts; vendor daemon routing stays
+disabled pending authority, relay/topology, policy and global integration.

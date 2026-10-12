@@ -1361,3 +1361,24 @@ deliberate fault mutations; the correct source was restored before the final
 GREEN run, which passed 37 tests.
 Global daemon fencing, live authentication/topology and worker/session revocation
 remain unqualified by this suite.
+
+
+## Explicit modern vendor discovery regressions
+
+The [modern management profile](vendor-modern-inventory.md) is an independent
+library extension. Twenty-one owned HTTP/TLS regressions exercise custom IDs,
+UUID aliases/nil/self claims, per-page/final identity drift, selected fields and
+encoded fixed-origin pagination, missing groups/relay facts, invalid chains and
+shared limits, longer bounded refreshes, a separate request timeout, direct
+cancellation, denial/redirect confinement and captured TLS trust. The initial
+API scaffold produced behavioral RED: 2 passed and 19 failed. The missing-API
+compile attempt is recorded separately. Initial GREEN passes all 82 focused
+checks across modern, legacy inventory, binding, identity and lease suites.
+
+The modern profile does not alter the legacy750ms client/lease contract, import
+remote viewer policies or expose authority-bound candidates. Configured custom
+alias coordination, remote atomicity/authenticity, relation to a separate private
+media endpoint, relay/loop eligibility, global configuration ordering and daemon
+activation/session integration remain separate gates. Live complete discovery
+and immutable-head CI/review evidence are recorded with the release. Historical
+HEVC loss, socket-observation attribution and parallel UDP readiness are unchanged.

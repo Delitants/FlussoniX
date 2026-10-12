@@ -4,6 +4,7 @@
 //! deliberately not selected by the native source resolver. Integrating a vendor
 //! source requires separate policy, provenance and private-media qualification.
 mod identity;
+pub mod modern;
 use super::LookupFailure;
 use reqwest::header::HeaderValue;
 use serde_json::Value;
@@ -100,6 +101,15 @@ impl InventoryClient {
     /// A supplied CA replaces public roots and requires HTTPS. Keys are UTF-8,
     /// nonempty, and at most 4096 bytes; native key requirements are unchanged.
     pub fn new(base: &str, key: &str, ca: Option<&Path>) -> Result<Self, LookupFailure> {
+        Self::prepare(base, key, ca, DEADLINE)
+    }
+
+    fn prepare(
+        base: &str,
+        key: &str,
+        ca: Option<&Path>,
+        request_deadline: Duration,
+    ) -> Result<Self, LookupFailure> {
         if base.len() > 4096
             || base.chars().any(|c| c.is_control() || c.is_whitespace())
             || base.contains('\\')
@@ -127,7 +137,7 @@ impl InventoryClient {
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(DEADLINE)
+            .timeout(request_deadline)
             .use_preconfigured_tls(
                 (*crate::tls_input::client(ca).map_err(|_| LookupFailure::Invalid)?).clone(),
             )
@@ -171,33 +181,14 @@ impl InventoryClient {
                 return Err(LookupFailure::Invalid);
             }
             for row in rows {
-                let name = row["name"].as_str().ok_or(LookupFailure::Invalid)?;
-                crate::config::valid_name(name).map_err(|_| LookupFailure::Invalid)?;
-                if !names.insert(name.to_owned()) {
+                let row = parse_row(row)?;
+                if !names.insert(row.name.clone()) {
                     return Err(LookupFailure::Invalid);
                 }
-                let named_by = match row.get("named_by") {
-                    None => None,
-                    Some(Value::String(s)) => Some(match s.as_str() {
-                        "config" => StreamProvenance::Config,
-                        "user" => StreamProvenance::User,
-                        "remote" => StreamProvenance::Remote,
-                        "external" => StreamProvenance::External,
-                        _ => return Err(LookupFailure::Invalid),
-                    }),
-                    Some(_) => return Err(LookupFailure::Invalid),
-                };
-                let groups = row.get("groups").map(parse_groups).transpose()?;
                 remaining_memberships = remaining_memberships
-                    .checked_sub(groups.as_ref().map_or(0, Vec::len))
+                    .checked_sub(row.groups.as_ref().map_or(0, Vec::len))
                     .ok_or(LookupFailure::Invalid)?;
-                streams.push(InventoryStream {
-                    name: name.to_owned(),
-                    is_static: optional_bool(row, "static", true)?,
-                    disabled: optional_bool(row, "disabled", false)?,
-                    named_by,
-                    groups,
-                });
+                streams.push(row);
             }
             match value.get("next") {
                 None | Some(Value::Null) => return Ok(streams),
@@ -251,6 +242,32 @@ impl InventoryClient {
         }
         serde_json::from_slice(&bytes).map_err(|_| LookupFailure::Invalid)
     }
+}
+
+fn parse_row(row: &Value) -> Result<InventoryStream, LookupFailure> {
+    let name = row
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or(LookupFailure::Invalid)?;
+    crate::config::valid_name(name).map_err(|_| LookupFailure::Invalid)?;
+    let named_by = match row.get("named_by") {
+        None => None,
+        Some(Value::String(s)) => Some(match s.as_str() {
+            "config" => StreamProvenance::Config,
+            "user" => StreamProvenance::User,
+            "remote" => StreamProvenance::Remote,
+            "external" => StreamProvenance::External,
+            _ => return Err(LookupFailure::Invalid),
+        }),
+        Some(_) => return Err(LookupFailure::Invalid),
+    };
+    Ok(InventoryStream {
+        name: name.into(),
+        is_static: optional_bool(row, "static", true)?,
+        disabled: optional_bool(row, "disabled", false)?,
+        named_by,
+        groups: row.get("groups").map(parse_groups).transpose()?,
+    })
 }
 
 fn parse_groups(value: &Value) -> Result<Vec<String>, LookupFailure> {

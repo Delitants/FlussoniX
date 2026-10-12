@@ -166,3 +166,14 @@ monotonic lifetime and latest-refresh ordering to identity-observed discovery.
 Failed/cancelled refreshes do not restore old grants. This is library-only local
 publication fencing, not a remote lease, topology proof or worker revocation;
 vendor daemon routing remains disabled.
+
+
+## Explicit modern management observations
+
+The opt-in [modern inventory client](vendor-modern-inventory.md) supports bounded
+configured custom IDs and UUID aliases, modern selected stream metadata and one
+explicit whole-refresh budget up to 30 seconds. It checks config identity around
+the complete cursor chain and in every page. Missing memberships and relay claims
+remain facts, not route or viewer grants. The strict legacy client and existing
+source-authority/lease APIs keep their contracts; vendor daemon routing stays
+disabled pending authority, relay/topology, policy and global integration.
