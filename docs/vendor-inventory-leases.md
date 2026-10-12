@@ -117,3 +117,14 @@ Current-profile checks reject stale success/error and cross-authority publicatio
 Existing local-origin, membership, filter and policy gates remain mandatory;
 legacy constructors/APIs retain their contracts. This adds no modern lease or
 relay permission and does not enable vendor daemon routing, configuration or UI.
+
+
+## Opt-in modern bound freshness
+
+[Modern configured-source leases](vendor-modern-leases.md) add opaque leased
+results/candidates, monotonic expiry measured before I/O, latest-reserved-refresh
+ordering and current-profile media publication checks. The local lifetime is
+independent of the immutable modern wire budget; failed/cancelled attempts never
+restore older grants. Existing legacy and unleased APIs retain their behavior.
+This library stage enables no vendor daemon routing, relay eligibility, global
+configuration ordering or worker/session revocation.

@@ -73,10 +73,11 @@ frozen independent trust. Existing legacy binding, identity, lease and wire test
 run alongside them. Live read-only qualification records complete bound discovery
 and negative authentication/self checks separately from eligibility or routing.
 
-This provides configured-client binding, not a local freshness lease, signed
-identity, atomic remote snapshot, relation to a separate private endpoint,
-verified source ownership or relay-loop proof. Modern local freshness ordering,
-authoritative local-ID coordination, relay/membership policy, global ConfigStore
+This unleased API provides configured-client binding, not signed identity, an
+atomic remote snapshot, relation to a separate private endpoint, verified source
+ownership or relay-loop proof. Opt-in [modern leases](vendor-modern-leases.md)
+add local monotonic expiry and latest-refresh ordering without changing this API.
+Authoritative local-ID coordination, relay/membership policy, global ConfigStore
 ordering, viewer admission and worker/session lifetime remain integration gates.
 The supplied live CDN stream is relayed and lacks groups; it must not become a
 local-origin route merely because complete bound discovery succeeds.

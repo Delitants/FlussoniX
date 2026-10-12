@@ -16,7 +16,9 @@ pub use binding::{
     BindingFailure, BoundCandidate, BoundInventory, IdentityCandidate, IdentityInventory,
     LeaseFailure, LeasedIdentityCandidate, LeasedIdentityInventory,
 };
-pub use modern::{ModernBoundCandidate, ModernBoundInventory};
+pub use modern::{
+    ModernBoundCandidate, ModernBoundInventory, ModernLeasedCandidate, ModernLeasedInventory,
+};
 use serde_json::{Map, Value, json};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};

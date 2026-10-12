@@ -1,4 +1,5 @@
-//! Explicit modern configured-source binding. No relay, lease or daemon grant.
+//! Explicit modern configured-source binding. No relay or daemon grant.
+mod lease;
 use super::{
     BindingFailure, BoundCandidate, BoundInventory, CandidateView, DiscoveryMode,
     ProjectionFailure, SourceAuthority,
@@ -7,6 +8,7 @@ use crate::{
     m4_ingest::flussonic::MediaInput,
     source_directory::flussonic::modern::{ObservedInventory, ObservedServerId},
 };
+pub use lease::{ModernLeasedCandidate, ModernLeasedInventory};
 use serde_json::Value;
 use std::time::Duration;
 

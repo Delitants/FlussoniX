@@ -7,6 +7,7 @@ use crate::{
     source_directory::{LookupFailure, flussonic::InventoryStream},
 };
 pub use lease::{LeaseFailure, LeasedIdentityCandidate, LeasedIdentityInventory};
+pub(super) use lease::{MAX_LIFETIME, Ticket};
 use std::collections::BTreeMap;
 
 /// Generic diagnostics; no endpoint, name, credentials or upstream body.
@@ -19,13 +20,13 @@ pub enum BindingFailure {
 /// Only a complete fetch through the configured inventory client constructs this
 /// type. Facts cannot be imported or mutated; no Debug/serialization is provided.
 pub struct BoundInventory {
-    snapshot: SourceSnapshot,
-    rows: BTreeMap<String, InventoryStream>,
+    pub(super) snapshot: SourceSnapshot,
+    pub(super) rows: BTreeMap<String, InventoryStream>,
 }
 /// Constructed only from an opaque bound result. A plain/manual Candidate cannot
 /// be substituted at the bound media construction/publication entry point.
 pub struct BoundCandidate {
-    candidate: Candidate,
+    pub(super) candidate: Candidate,
 }
 impl SourceAuthority {
     /// Capture the profile before I/O, without holding the publication lock across

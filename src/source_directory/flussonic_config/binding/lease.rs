@@ -11,7 +11,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const MAX_LIFETIME: Duration = Duration::from_secs(30);
+pub(in super::super) const MAX_LIFETIME: Duration = Duration::from_secs(30);
 
 /// Generic diagnostics contain no endpoint, stream name, credential or body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,13 +25,13 @@ fn projection(error: ProjectionFailure) -> LeaseFailure {
     LeaseFailure::Binding(BindingFailure::Projection(error))
 }
 #[derive(Clone)]
-struct Ticket {
-    turn: Arc<()>,
-    expires_at: Instant,
+pub(in super::super) struct Ticket {
+    pub(in super::super) turn: Arc<()>,
+    pub(in super::super) expires_at: Instant,
 }
 impl Ticket {
     /// Called only while holding this authority's source publication lock.
-    fn check(&self, state: &State) -> Result<(), LeaseFailure> {
+    pub(in super::super) fn check(&self, state: &State) -> Result<(), LeaseFailure> {
         if !state
             .lease_turn
             .as_ref()
