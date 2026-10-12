@@ -295,10 +295,19 @@ impl Requests {
             }
         })
     }
-    fn accepts(&self, status: reqwest::StatusCode) -> bool {
+    fn accepts(&self, response: &reqwest::Response) -> bool {
         match self.auth {
-            RequestAuth::Flussonic { .. } => status == reqwest::StatusCode::OK,
-            RequestAuth::Native(_) => status.is_success(),
+            RequestAuth::Flussonic { .. } => {
+                // A public media200 is not acknowledgment of privileged auth.
+                // This marker confirms acceptance only, never server identity.
+                let mut markers = response.headers().get_all("cluster-auth").iter();
+                response.status() == reqwest::StatusCode::OK
+                    && markers
+                        .next()
+                        .is_some_and(|value| value.as_bytes() == b"yes")
+                    && markers.next().is_none()
+            }
+            RequestAuth::Native(_) => response.status().is_success(),
         }
     }
 }
@@ -330,7 +339,7 @@ async fn consume<W: AsyncWrite + Unpin>(
         .await
         .map_err(|_| "media setup timed out")?
         .map_err(|_| "media connection failed")?;
-    if !requests.accepts(response.status()) {
+    if !requests.accepts(&response) {
         return Err("source rejected input".into());
     }
     let mut stream = response.bytes_stream();
@@ -355,7 +364,7 @@ async fn consume<W: AsyncWrite + Unpin>(
                 url.set_path(&format!("{}/{}", requests.base.path(), n.name));
                 let request = requests.get(url)?.timeout(Duration::from_secs(10));
                 let response = request.send().await.map_err(|_| "M4F fetch failed")?;
-                if !requests.accepts(response.status()) {
+                if !requests.accepts(&response) {
                     return Err("M4F segment denied".into());
                 }
                 let mut body = BytesMut::new();

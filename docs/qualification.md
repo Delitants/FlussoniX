@@ -1422,3 +1422,13 @@ deadline, route replacement/removal and synchronous publication blocking. The
 positive fixture opens only the entry server's independently encoded MP3 media.
 This does not qualify actual vendor ancestry, private endpoint identity or mixed
 vendor activation; automatic vendor routing stays disabled.
+
+
+## Private media acknowledgment
+
+Explicit vendor M4F/M4S clients require a single affirmative Cluster response
+marker on each200 control or segment response, including reconnects. Owned
+regressions distinguish missing/ambiguous acknowledgment from accepted media and
+retain public/native-peer behavior. Read-only reference header checks support the
+wire contract; they do not qualify serving-server identity, consistent live M4F
+payloads or automatic mixed-vendor routing. See [endpoint checks](vendor-endpoint-checks.md).

@@ -1,5 +1,7 @@
 //! Breaks caught: modern refreshes retaining indefinite authority, reordering or
 //! restoring failed/cancelled leases, and bypassing expiry/profile/media fences.
+#[path = "support/vendor_media_ack.rs"]
+mod vendor_fixture;
 use axum::{
     Router,
     body::Body,
@@ -94,7 +96,11 @@ impl Server {
                 }
             }
         }));
-        let task = tokio::spawn(async move { axum::serve(tcp, router).await.unwrap() });
+        let task = tokio::spawn(async move {
+            axum::serve(tcp, vendor_fixture::acknowledge_media(router))
+                .await
+                .unwrap()
+        });
         Self {
             url,
             hold,

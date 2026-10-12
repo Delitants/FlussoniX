@@ -1,5 +1,7 @@
 //! Breaks caught: cross-source facts, stale fetches, wrong origins/principals,
 //! mutable CA trust and adapter paths that bypass the qualified wire clients.
+#[path = "support/vendor_media_ack.rs"]
+mod vendor_fixture;
 use axum::{
     Router,
     body::Body,
@@ -48,11 +50,16 @@ impl Server {
         let tls = cert.map(|c| c.server());
         let task = tokio::spawn(async move {
             if let Some(tls) = tls {
-                axum::serve(flussonix::http_tls::Listener::new(tcp, tls), router)
+                axum::serve(
+                    flussonix::http_tls::Listener::new(tcp, tls),
+                    vendor_fixture::acknowledge_media(router),
+                )
+                .await
+                .unwrap();
+            } else {
+                axum::serve(tcp, vendor_fixture::acknowledge_media(router))
                     .await
                     .unwrap();
-            } else {
-                axum::serve(tcp, router).await.unwrap();
             }
         });
         Self { url, task }

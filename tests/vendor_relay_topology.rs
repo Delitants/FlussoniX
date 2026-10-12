@@ -1,4 +1,6 @@
 //! Explicit local paths and all-hop freshness. No vendor service or vendor code.
+#[path = "support/vendor_media_ack.rs"]
+mod vendor_fixture;
 use axum::{
     Router,
     body::Body,
@@ -73,7 +75,11 @@ impl Server {
                 }
             }
         }));
-        let task = tokio::spawn(async move { axum::serve(tcp, router).await.unwrap() });
+        let task = tokio::spawn(async move {
+            axum::serve(tcp, vendor_fixture::acknowledge_media(router))
+                .await
+                .unwrap()
+        });
         Self {
             key,
             expected,

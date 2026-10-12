@@ -105,3 +105,8 @@ the complete cursor chain and in every page. Missing memberships and relay claim
 remain facts, not route or viewer grants. The strict legacy client and existing
 source-authority/lease APIs keep their contracts; vendor daemon routing stays
 disabled pending authority, relay/topology, policy and global integration.
+
+
+[Private endpoint checks](vendor-endpoint-checks.md) now qualify affirmative
+media credential acknowledgment. Playback IDs and the acknowledgment marker do
+not bind the private endpoint to the observed management server ID.

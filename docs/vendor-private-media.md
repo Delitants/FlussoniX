@@ -8,8 +8,8 @@ not used at build, test or runtime.
 
 This client is deliberately not selected by daemon source configuration or
 the resolver. It does not establish viewer access, import remote policy, or
-enable mixed-vendor cluster routing. Live positive/negative authentication
-against an authorized reference key remains unqualified.
+enable mixed-vendor cluster routing. Bounded read-only reference checks have observed positive/negative control
+authentication; live decoder delivery and endpoint identity remain separate gates.
 
 ## Construction and name binding
 
@@ -53,8 +53,16 @@ The HTTP client disables proxies and all redirects, including same-origin
 redirects and M4F segment redirects. No Basic/native fallback or credential
 probe is attempted. HTTPS verifies trust, identity and validity before HTTP
 headers are sent. A supplied CA replaces public roots and requires HTTPS.
-Control and segments require HTTP 200; partial/asynchronous success statuses
-are rejected before metadata or media publication.
+Control and every segment require HTTP 200 and exactly one `cluster-auth: yes`
+response header. Missing, negative, differently cased, combined or duplicate
+values fail before metadata, media writes or segment publication. Header names
+remain case-insensitive. Acknowledgment is checked again on reconnect and on
+each segment; a previous success grants no later response. Partial/asynchronous
+success statuses are rejected even when acknowledgment is affirmative. Public
+and native-peer inputs retain their existing response contracts.
+
+This marker confirms credential acceptance only. It is not a serving-server
+identity or content/route attestation; see [endpoint checks](vendor-endpoint-checks.md).
 
 ## Input lifetime and media behavior
 
@@ -87,8 +95,9 @@ custom trust, unknown roots, wrong identities and expired certificates.
 Four literal library vectors were independently derived with Python hashlib
 and OpenSSL. Test fixtures need no vendor executable, library or server.
 
-This qualifies the explicit client's fixture behavior. It does not qualify
-live vendor authentication, aliases, HLS/MPEG-TS credential carriage, source/
+This qualifies the explicit client's fixture behavior. Header-only live checks
+also observed accepted Cluster credentials and incorrect-key rejection for M4S
+and successful M4F controls; they do not qualify consistent live payload delivery, aliases, HLS/MPEG-TS credential carriage, source/
 group policy inheritance, discovered-name provenance, loop prevention,
 daemon/UI integration, or production scale.
 

@@ -1,4 +1,6 @@
 //! Owned HTTP/TLS fixtures for explicit vendor media input; no vendor runtime.
+#[path = "support/vendor_media_ack.rs"]
+mod vendor_fixture;
 use axum::{
     Router,
     body::Body,
@@ -40,7 +42,11 @@ impl Server {
     async fn start(router: Router) -> Self {
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", tcp.local_addr().unwrap());
-        let task = tokio::spawn(async move { axum::serve(tcp, router).await.unwrap() });
+        let task = tokio::spawn(async move {
+            axum::serve(tcp, vendor_fixture::acknowledge_media(router))
+                .await
+                .unwrap()
+        });
         Self {
             url,
             task: Some(task),
@@ -426,6 +432,7 @@ async fn errors_and_non_200_responses_never_publish_or_fallback() {
                             } else {
                                 Response::builder()
                                     .status(status)
+                                    .header("cluster-auth", "yes")
                                     .body(Body::from(if transport == Transport::M4s {
                                         stream
                                     } else {
@@ -760,9 +767,12 @@ async fn private_media_tls_verifies_trust_identity_and_expiry() {
             let url = format!("https://{}", tcp.local_addr().unwrap());
             let tls = cert.server();
             let task = tokio::spawn(async move {
-                axum::serve(flussonix::http_tls::Listener::new(tcp, tls), router)
-                    .await
-                    .unwrap()
+                axum::serve(
+                    flussonix::http_tls::Listener::new(tcp, tls),
+                    vendor_fixture::acknowledge_media(router),
+                )
+                .await
+                .unwrap()
             });
             let server = Server {
                 url,

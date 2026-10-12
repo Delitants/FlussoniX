@@ -1,5 +1,7 @@
 //! Breaks caught: indefinite inventory authority, refresh reordering, failure or
 //! cancellation retaining old facts, and expiry/source edits bypassing publication.
+#[path = "support/vendor_media_ack.rs"]
+mod vendor_fixture;
 use axum::{
     Router, body::Body, extract::OriginalUri, http::StatusCode, response::Response, routing::get,
 };
@@ -78,7 +80,11 @@ impl Server {
                 }
             }
         }));
-        let task = tokio::spawn(async move { axum::serve(tcp, router).await.unwrap() });
+        let task = tokio::spawn(async move {
+            axum::serve(tcp, vendor_fixture::acknowledge_media(router))
+                .await
+                .unwrap()
+        });
         Self {
             url,
             hold,
