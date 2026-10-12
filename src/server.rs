@@ -127,9 +127,12 @@ impl App {
         &crate::source_directory::modern_coordinator::ModernSourceCoordinator,
         crate::source_directory::modern_coordinator::CoordinationFailure,
     > {
-        self.modern_sources
+        let coordinator = self
+            .modern_sources
             .as_ref()
-            .ok_or(crate::source_directory::modern_coordinator::CoordinationFailure::Invalid)
+            .ok_or(crate::source_directory::modern_coordinator::CoordinationFailure::Invalid)?;
+        coordinator.require_config(&self.config)?;
+        Ok(coordinator)
     }
     pub fn new(
         config: impl AsRef<Path>,

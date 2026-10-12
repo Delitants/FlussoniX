@@ -778,3 +778,47 @@ async fn normalized_transport_must_match_source_and_source_capture_count_is_boun
     assert!(c.capture("m4s://owned-64.invalid").is_ok());
     assert!(s.paths.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn replacing_public_daemon_config_retires_coordinator_and_old_candidates() {
+    let s = Server::start().await;
+    let d = tempfile::tempdir().unwrap();
+    let options = flussonix::server::Options {
+        admin_password: "owned-password".into(),
+        peer_key: "owned-peer-key".into(),
+        node_name: "owned-daemon".into(),
+        ..Default::default()
+    };
+    let mut app = flussonix::server::App::new(
+        d.path().join("original.json"),
+        d.path().join("media"),
+        options,
+    )
+    .unwrap();
+    app.config
+        .put("sources", s.source()["url"].as_str().unwrap(), s.source())
+        .unwrap();
+    let coordinator = app.modern_source_coordinator().unwrap();
+    let candidate = coordinator
+        .inventory(&handle(coordinator, &s), Duration::from_secs(30))
+        .await
+        .unwrap()
+        .candidate(NAME)
+        .unwrap();
+    let original = app.config.clone();
+    let replacement = Arc::new(ConfigStore::open(d.path().join("replacement.json")).unwrap());
+    Arc::get_mut(&mut app).unwrap().config = replacement;
+    assert_eq!(
+        app.modern_source_coordinator()
+            .and_then(|c| publish(c, &candidate)),
+        Err(CoordinationFailure::Stale)
+    );
+    // Observing a mismatch permanently retires the old owner: restoring the old
+    // public Arc must not revive its handles or candidates.
+    Arc::get_mut(&mut app).unwrap().config = original;
+    assert!(matches!(
+        app.modern_source_coordinator(),
+        Err(CoordinationFailure::Stale)
+    ));
+    assert_eq!(s.paths.lock().unwrap().len(), 3);
+}

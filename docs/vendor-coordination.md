@@ -16,7 +16,14 @@ and cannot change the primary name (restart required).
 Capture source and backend settings with the global config revision. Prepare
 clients outside locks. Install only under the same config revision and identity
 epoch; installed handles are opaque, coordinator-specific, and replace prior
-handles for that source even at the same config revision. At most 64 installed
+handles for that source even at the same config revision. App retains its public
+configuration handle for Rust API compatibility; substituting that handle is not
+an ordered configuration edit. The App coordinator accessor verifies the exact
+store pointer and permanently retires the coordinator after observing a mismatch,
+including if the original handle is subsequently restored. Existing borrowed
+coordinator references prevent safe mutable access to App while in use. Use the
+ConfigStore edit methods for ordered runtime changes, or create a new App for a
+new store. At most 64 installed
 sources. Config revisions, including unrelated edits and remove/re-add, fence
 old preparations, handles, results, candidates, and both successful and failed
 in-flight refreshes. Failed preparation/install cannot reactivate an old handle.

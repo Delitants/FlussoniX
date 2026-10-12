@@ -41,6 +41,7 @@ struct LocalIdentity {
     ids: Vec<ObservedServerId>,
 }
 struct State {
+    retired: bool,
     identity: Arc<LocalIdentity>,
     revision: u64,
     preparations: HashMap<String, Arc<()>>,
@@ -97,6 +98,7 @@ impl ModernSourceCoordinator {
         let primary = ObservedServerId::parse(primary).map_err(|_| CoordinationFailure::Invalid)?;
         Ok(Self {
             state: Mutex::new(State {
+                retired: false,
                 identity: Arc::new(LocalIdentity {
                     ids: vec![primary.clone()],
                 }),
@@ -110,9 +112,35 @@ impl ModernSourceCoordinator {
         })
     }
     fn state(&self) -> Result<MutexGuard<'_, State>, CoordinationFailure> {
-        self.state
+        let state = self
+            .state
             .lock()
-            .map_err(|_| CoordinationFailure::Unavailable)
+            .map_err(|_| CoordinationFailure::Unavailable)?;
+        if state.retired {
+            return Err(CoordinationFailure::Stale);
+        }
+        Ok(state)
+    }
+    /// App's public config handle is retained for compatibility. Detect store
+    /// substitution at its accessor and permanently retire this coordinator.
+    /// No configuration lock is acquired here; this never reverses lock order.
+    pub(crate) fn require_config(
+        &self,
+        config: &Arc<ConfigStore>,
+    ) -> Result<(), CoordinationFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CoordinationFailure::Unavailable)?;
+        if !Arc::ptr_eq(&self.config, config) {
+            state.retired = true;
+            state.sources.clear();
+            state.preparations.clear();
+        }
+        if state.retired {
+            return Err(CoordinationFailure::Stale);
+        }
+        Ok(())
     }
     /// Validate atomically; duplicates (including primary/UUID equivalents) fail.
     /// Every accepted edit, even identical, invalidates all outstanding objects.
