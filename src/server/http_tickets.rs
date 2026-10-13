@@ -8,6 +8,38 @@ fn matches(reservation: &Reservation, name: &str) -> bool {
         && matches!(reservation.kind, rtsp_balancer::Kind::Http)
 }
 
+// Control commit kept synchronous so the source fence and ledger form one
+// transaction. The checker may reject after commit when a lease expires.
+fn consume_ticket(
+    reservations: &mut HashMap<String, Reservation>,
+    name: &str,
+    ticket: &str,
+    check: impl FnOnce(
+        &mut dyn FnMut() -> bool,
+    )
+        -> Result<bool, crate::source_directory::modern_coordinator::AdmissionFailure>,
+) -> bool {
+    let mut removed = None;
+    let outcome = check(&mut || {
+        if !reservations
+            .get(ticket)
+            .is_some_and(|reservation| matches(reservation, name))
+        {
+            return false;
+        }
+        removed = reservations.remove(ticket);
+        removed.is_some()
+    });
+    // The source fence includes a post-commit lease check. Roll back before
+    // releasing the ledger so a failed redemption cannot destroy its retry.
+    if outcome.is_err()
+        && let Some(reservation) = removed
+    {
+        reservations.insert(ticket.to_owned(), reservation);
+    }
+    outcome.unwrap_or(false)
+}
+
 impl App {
     pub(crate) fn http_viewer_query(query: &str) -> String {
         query
@@ -58,27 +90,25 @@ impl App {
         admitted: &AdmittedCandidate,
     ) -> bool {
         let mut reservations = self.reservations.lock().await;
-        owner
-            .with_admitted_current(admitted, || {
-                if !reservations
-                    .get(ticket)
-                    .is_some_and(|reservation| matches(reservation, name))
-                {
-                    return false;
-                }
-                reservations.remove(ticket);
-                true
-            })
-            .unwrap_or(false)
+        consume_ticket(&mut reservations, name, ticket, |commit| {
+            owner.with_admitted_current(admitted, commit)
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test]
-    async fn admitted_source_change_while_ledger_waits_leaves_ticket_unconsumed() {
-        use crate::source_directory::modern_coordinator::AdmissionOutcome;
+    use crate::source_directory::modern_coordinator::AdmissionOutcome;
+    async fn admitted_source(
+        lifetime: Duration,
+    ) -> (
+        tempfile::TempDir,
+        Arc<App>,
+        Box<AdmittedCandidate>,
+        tokio::task::JoinHandle<()>,
+        String,
+    ) {
         use axum::{extract::OriginalUri, routing::get};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let key = format!("m4s://{}", listener.local_addr().unwrap());
@@ -113,10 +143,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let rows = owner
-            .inventory(&handle, Duration::from_secs(30))
-            .await
-            .unwrap();
+        let rows = owner.inventory(&handle, lifetime).await.unwrap();
         let outcome = owner
             .admit(
                 rows.candidate("owned").unwrap(),
@@ -138,6 +165,49 @@ mod tests {
             panic!("owned explicit policy rejected")
         };
         assert!(owner.admitted_current(&admitted).is_ok());
+        (dir, app, admitted, server, key)
+    }
+    #[tokio::test]
+    async fn post_commit_lease_expiry_restores_still_valid_http_reservation() {
+        let (_dir, app, admitted, server, _key) = admitted_source(Duration::from_secs(2)).await;
+        let owner = app.modern_sources.as_ref().unwrap().clone();
+        let mut ledger = app.reservations.lock().await;
+        ledger.insert(
+            "owned-ticket".into(),
+            Reservation {
+                kind: rtsp_balancer::Kind::Http,
+                bitrate_mbps: 2.0,
+                stream: "owned".into(),
+                expires: Instant::now() + Duration::from_secs(5),
+            },
+        );
+        let mut removed = false;
+        let result = consume_ticket(&mut ledger, "owned", "owned-ticket", |commit| {
+            owner.with_admitted_current(&admitted, || {
+                let result = commit();
+                removed = result;
+                // Simulate preemption across the real leased-current postcheck.
+                std::thread::sleep(Duration::from_millis(2100));
+                result
+            })
+        });
+        assert!(removed, "test must enter the commit with a current source");
+        assert!(!result, "expired source fence accepted commit");
+        assert!(
+            ledger
+                .get("owned-ticket")
+                .is_some_and(|r| matches(r, "owned")),
+            "failed final fence consumed a still-valid ticket"
+        );
+        drop(admitted);
+        assert_eq!(app.playback_auth.active(), 0);
+        server.abort();
+        let _ = server.await;
+    }
+    #[tokio::test]
+    async fn admitted_source_change_while_ledger_waits_leaves_ticket_unconsumed() {
+        let (_dir, app, admitted, server, key) = admitted_source(Duration::from_secs(30)).await;
+        let owner = app.modern_sources.as_ref().unwrap().clone();
         let mut ledger = app.reservations.lock().await;
         ledger.insert(
             "owned-ticket".into(),
