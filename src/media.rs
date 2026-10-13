@@ -921,7 +921,8 @@ impl Engine {
                             _=c.cancelled()=>Ok(()),
                             result=async {
                                 if let Some(mut shared)=shared {
-                                    let result=shared.feed.copy(&mut writer,metadata_tx,original_wire,&input_worker.native_text_tracks).await;
+                                    let mut metadata=Some(metadata_tx);
+                                    let result=shared.feed.copy(&mut writer,&mut metadata,original_wire,&input_worker.native_text_tracks).await;
                                     // Record the specific failure before dropping the required
                                     // receiver can wake the source with a generic broken pipe.
                                     if let Err(reason)=&result {

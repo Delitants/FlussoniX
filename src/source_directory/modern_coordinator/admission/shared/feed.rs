@@ -85,7 +85,7 @@ impl SharedFeed {
     pub(crate) async fn copy<W: AsyncWrite + Unpin>(
         &mut self,
         output: &mut W,
-        metadata: oneshot::Sender<Vec<Track>>,
+        metadata: &mut Option<oneshot::Sender<Vec<Track>>>,
         full_copy: bool,
         detected: &AtomicU64,
     ) -> Result<(), String> {
@@ -125,6 +125,8 @@ impl SharedFeed {
             return Err("shared source closed".into());
         }
         metadata
+            .take()
+            .ok_or("native startup cancelled")?
             .send(tracks)
             .map_err(|_| "native startup cancelled")?;
         let unsupported = || {
