@@ -228,6 +228,113 @@ async fn bytes(response: Response) -> bytes::Bytes {
         .await
         .unwrap()
 }
+async fn reauth(f: &Fixture) -> Response {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    router(f.app.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/streamer/api/v3/sessions/reauth?name=owned")
+                .header(
+                    "authorization",
+                    format!("Basic {}", STANDARD.encode("admin:owned-admin-key")),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn active_vendor_session_reauth_rechecks_callback_and_closes_denied_body_without_repull() {
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let deny = Arc::new(AtomicBool::new(false));
+    let c = calls.clone();
+    let d = deny.clone();
+    let callback = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().fallback(get(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+                let status = if d.load(Ordering::SeqCst) {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::OK
+                };
+                async move { (status, [("x-authduration", "3600")]) }
+            })),
+        )
+        .await
+        .unwrap()
+    });
+    let f = Fixture::new(json!({"on_play":url})).await;
+    let live = f.get("/owned/m4s?token=reauth").await;
+    assert_eq!(live.status(), StatusCode::OK);
+    let mut body = live.into_body();
+    let before = f.app.media.stats("owned").await;
+    let allowed = reauth(&f).await;
+    if allowed.status() != StatusCode::OK {
+        let status = allowed.status();
+        drop(body);
+        f.stop().await;
+        callback.abort();
+        let _ = callback.await;
+        assert_eq!(status, StatusCode::OK);
+        return;
+    }
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes(allowed).await).unwrap()["estimated_count"],
+        1
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(f.app.media.stats("owned").await["pid"], before["pid"]);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    deny.store(true, Ordering::SeqCst);
+    assert_eq!(reauth(&f).await.status(), StatusCode::OK);
+    let ended = tokio::time::timeout(Duration::from_secs(2), async {
+        while body.frame().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    let count = calls.load(Ordering::SeqCst);
+    let pulls = f.media_calls();
+    drop(body);
+    f.stop().await;
+    callback.abort();
+    let _ = callback.await;
+    assert!(
+        ended,
+        "explicit callback denial must close the existing body"
+    );
+    assert_eq!(count, 3);
+    assert_eq!(pulls, 1);
+}
+#[tokio::test]
+async fn vendor_reauth_requires_current_active_route_without_discovery() {
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    assert_eq!(reauth(&f).await.status(), StatusCode::NOT_FOUND);
+    assert!(f.calls.lock().unwrap().is_empty());
+    let live = f.get("/owned/m4s").await;
+    assert_eq!(live.status(), StatusCode::OK);
+    let before = f.calls.lock().unwrap().len();
+    f.app
+        .config
+        .put("sources", &f.source, json!({"except":["owned"]}))
+        .unwrap();
+    assert_eq!(reauth(&f).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(f.calls.lock().unwrap().len(), before);
+    drop(live);
+    f.stop().await;
+}
 async fn playlist(f: &Fixture, path: &str) -> String {
     tokio::time::timeout(Duration::from_secs(12), async {
         loop {

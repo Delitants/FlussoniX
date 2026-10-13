@@ -642,7 +642,12 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
             let Some(stream) = query.get("name") else {
                 return error(StatusCode::BAD_REQUEST, "name required");
             };
-            if app.resolve(stream).await.is_none() {
+            if app.resolve(stream).await.is_none()
+                && !app
+                    .vendor_playback
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.publish_current_policy(&app, stream))
+            {
                 return error(StatusCode::NOT_FOUND, "stream not found");
             }
             let count = app.playback_auth.force_reauth(stream);

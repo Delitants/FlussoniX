@@ -134,6 +134,31 @@ impl Runtime {
     fn running(&self) -> bool {
         !self.closed.is_cancelled() && self.sessions.running()
     }
+    /// Publish only an already managed current policy for the admin reauth API.
+    /// This never discovers a source, attaches media, or creates a viewer grant.
+    pub(crate) fn publish_current_policy(&self, app: &App, name: &str) -> bool {
+        if !self.running() || app.modern_source_coordinator().is_err() {
+            return false;
+        }
+        let revision = app.config.revision();
+        let Selection::Vendor { key, revision } = select(&app.config.snapshot(), name, revision)
+        else {
+            return false;
+        };
+        let Ok(candidate) = self.inputs.current_candidate(name) else {
+            return false;
+        };
+        if candidate.source_key() != key || candidate.config_revision() != revision {
+            return false;
+        }
+        self.owner
+            .publish(&candidate, |view, _| {
+                app.playback_auth
+                    .publish(view.name, Some(view.policy.clone()))
+                    .is_some()
+            })
+            .unwrap_or(false)
+    }
     async fn candidate(
         &self,
         app: &App,

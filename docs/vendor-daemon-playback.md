@@ -28,6 +28,10 @@ requests. Native peer headers cannot bypass vendor viewer policy. Callback
 redirects are preserved and HTTPS rejects downgrade redirects. Query parameters
 are carried into HLS child URLs. Private Cluster credentials remain bound to
 the independent source clients and never enter FFmpeg inputs or output URLs.
+The admin session reauthorization action supports current active vendor routes
+through the same native callback renewal path. It performs no source discovery;
+missing, inactive, excluded or stale routes return 404. Callback denial closes
+existing guarded responses without reconnecting the private input.
 
 Cold discovery is serialized per source, with at most four concurrent source
 queries, a three-second wire budget, four-second request selection budget and

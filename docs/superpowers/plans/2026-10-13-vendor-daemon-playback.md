@@ -8,4 +8,5 @@
 - [x] Write behavioral HTTP routing tests; observe absent routing fail.
 - [x] Implement source selection/cache and lifetime owner; integrate HTTP shared responses, native supervisor fences and CLI task join.
 - [x] Verify HLS/continuous outputs, auth/redirect/local precedence, concurrency, stale edits and cancellation, including real FFmpeg packaging.
-- [ ] Run related regression suites, fmt/clippy, pin/build/smoke candidate, independent immutable review and publish full exact-head CI. Preview promotion waits for qualification.
+- [ ] Run related regression suites, fmt/clippy, pin/build/smoke candidate and independent immutable review, including active vendor session reauthorization.
+- [ ] Publish and qualify full exact-head CI. Preview promotion waits for qualification.
