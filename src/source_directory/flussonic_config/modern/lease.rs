@@ -89,6 +89,11 @@ impl ModernLeasedInventory {
     }
 }
 impl ModernLeasedCandidate {
+    pub(crate) fn shares_lease(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.ticket.turn, &other.ticket.turn)
+            && self.ticket.expires_at == other.ticket.expires_at
+    }
+
     pub fn server_id(&self) -> &ObservedServerId {
         self.candidate.server_id()
     }

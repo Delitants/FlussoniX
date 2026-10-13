@@ -61,7 +61,9 @@ a future daemon pull must preserve configured subtitle options explicitly.
 The [guarded private-pull primitive](vendor-private-pull.md) now retains admission
 through actual HTTP reads, metadata/stream writes and native fan-out, with idle
 authority checks and per-owner cancellation. It forwards native subtitle and HLS
-conversion options. Shared-worker ownership and daemon integration remain pending.
+conversion options. The [shared-input registry](vendor-shared-input.md) now owns
+one private pull per generation with independent viewer attachments. Automatic
+daemon routing and the FFmpeg/HLS adapter remain pending.
 
 ## Validation
 

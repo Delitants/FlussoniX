@@ -26,10 +26,10 @@ Dropping or aborting the pull drops its pending HTTP bodies. No detached monitor
 automatic retry, lease renewal, global worker stop or shared-hub close is created.
 Cancellation affects this pull only. An owning worker should pass its own
 generation's cancellation token and use pointer/generation checks when retiring
-it. A cancelled viewer must not stop another viewer's shared worker. The shared
-worker registry, viewer attachment, equivalent-source renewal/failover and daemon
-resolver activation remain separate integration work; this primitive does not
-claim those are implemented.
+it. A cancelled viewer must not stop another viewer's shared worker. The [shared-input registry](vendor-shared-input.md) adds actual shared worker
+ownership and independent viewer attachments on this guarded transport.
+Equivalent-source renewal/failover, the FFmpeg/HLS adapter and daemon resolver
+activation remain separate integration work.
 
 `PrivatePullOptions` forwards native subtitle preservation/filtering, the owning
 worker's detected-track counter and the existing HLS conversion state. Conversion
@@ -49,4 +49,4 @@ late headers, source/alias/configuration/refresh/lease changes, idle cancellatio
 pending output writes, partial M4F bodies, independent pull ownership and HTTP
 body cleanup. Native text tests verify preservation/filtering and HLS-conversion
 input for English and German UTF-8 text. They do not claim new CEA/DVB/teletext
-decoder qualification or a new shared-worker implementation.
+decoder qualification; shared-worker behavior has its own suite.

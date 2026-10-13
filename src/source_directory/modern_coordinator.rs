@@ -12,6 +12,8 @@ use super::{
 use crate::{config::ConfigStore, m4_ingest::flussonic::MediaInput};
 pub use admission::{
     AdmissionFailure, AdmissionOutcome, AdmittedCandidate, PrivatePullFailure, PrivatePullOptions,
+    SharedFailure, SharedInput, SharedInputAttachment, SharedInputOptions, SharedInputs,
+    SharedSubscription, SharedViewer,
 };
 use relay::RelayRoutes;
 pub use relay::{RelayCandidate, RelayFailure, RelayHop, RelayRoute};

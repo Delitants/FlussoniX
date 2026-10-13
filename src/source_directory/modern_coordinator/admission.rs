@@ -1,5 +1,6 @@
 //! Opt-in direct-source viewer admission. No automatic routing or worker owner.
 mod pull;
+mod shared;
 use super::{CoordinatedCandidate, CoordinationFailure, ModernSourceCoordinator};
 use crate::{
     m4_ingest::flussonic::MediaInput,
@@ -7,6 +8,10 @@ use crate::{
     source_directory::flussonic_config::CandidateView,
 };
 pub use pull::{PrivatePullFailure, PrivatePullOptions};
+pub use shared::{
+    SharedFailure, SharedInput, SharedInputAttachment, SharedInputOptions, SharedInputs,
+    SharedSubscription, SharedViewer,
+};
 
 /// Generic diagnostics contain no names, callback URLs or credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,18 +116,28 @@ impl ModernSourceCoordinator {
         // was created. The identical config revision preserves those facts.
         // Frequent frame/write checks need no media client/key allocation or
         // stream-list scan; retain every owner/profile/refresh/expiry fence.
-        self.at_handle(&admitted.candidate.handle, || {
-            let guard = admitted
-                .candidate
-                .handle
-                .authority
-                .guard_modern_lease(&admitted.candidate.candidate)
-                .map_err(CoordinationFailure::Lease)?;
-            let result = if admitted.grant.is_cancelled() {
+        self.at_current_candidate(&admitted.candidate, || {
+            if admitted.grant.is_cancelled() {
                 Err(AdmissionFailure::Revoked)
             } else {
                 Ok(())
-            };
+            }
+        })
+    }
+
+    // Shared inputs fence their source independently of any particular viewer.
+    fn at_current_candidate<T>(
+        &self,
+        candidate: &CoordinatedCandidate,
+        commit: impl FnOnce() -> Result<T, AdmissionFailure>,
+    ) -> Result<T, AdmissionFailure> {
+        self.at_handle(&candidate.handle, || {
+            let guard = candidate
+                .handle
+                .authority
+                .guard_modern_lease(&candidate.candidate)
+                .map_err(CoordinationFailure::Lease)?;
+            let result = commit();
             guard.check().map_err(CoordinationFailure::Lease)?;
             Ok(result)
         })
