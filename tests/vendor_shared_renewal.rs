@@ -571,3 +571,45 @@ async fn renewed_worker_still_fences_media_after_configuration_change() {
     assert!(v.tracks().is_err());
     joined(t).await;
 }
+
+#[tokio::test]
+async fn renewal_never_revives_a_stale_unstarted_worker_beside_a_fresh_route() {
+    for expired in [false, true] {
+        let f = Fixture::start().await;
+        let registry = SharedInputs::new(f.owner.clone());
+        let old = f
+            .inventory(if expired {
+                Duration::from_millis(30)
+            } else {
+                Duration::from_secs(3)
+            })
+            .await;
+        let a = registry
+            .attach(
+                f.admit(&old, "one", "old").await,
+                SharedInputOptions::default(),
+            )
+            .unwrap();
+        if expired {
+            after(old.expires_at()).await;
+        }
+        let fresh = f.inventory(Duration::from_secs(3)).await;
+        assert!(a.viewer.current().is_err());
+        let b = registry
+            .attach(
+                f.admit(&fresh, "two", "fresh").await,
+                SharedInputOptions::default(),
+            )
+            .unwrap();
+        let result = registry
+            .renew(&f.handle, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!((result.renewed, result.retired), (1, 1));
+        assert!(a.viewer.current().is_err(), "invalidated route was revived");
+        b.viewer.current().unwrap();
+        assert_eq!(f.media_calls(), 0);
+        registry.shutdown();
+        drop((a.input, b.input));
+    }
+}

@@ -33,18 +33,23 @@ pub(crate) struct ModernStateGuard<'a> {
 }
 impl ModernStateGuard<'_> {
     pub(crate) fn check(&self, bound: &ModernLeasedCandidate) -> Result<(), LeaseFailure> {
-        let candidate = &bound.candidate.candidate.candidate;
-        if self.state.revision != candidate.revision
-            || !self
-                .state
-                .profile
-                .as_ref()
-                .is_some_and(|p| Arc::ptr_eq(p, &candidate.profile))
-        {
-            return Err(projection(ProjectionFailure::Stale));
-        }
-        bound.ticket.check(&self.state)
+        current(&self.state, bound)
     }
+}
+fn current(
+    state: &super::super::super::State,
+    bound: &ModernLeasedCandidate,
+) -> Result<(), LeaseFailure> {
+    let candidate = &bound.candidate.candidate.candidate;
+    if state.revision != candidate.revision
+        || !state
+            .profile
+            .as_ref()
+            .is_some_and(|p| Arc::ptr_eq(p, &candidate.profile))
+    {
+        return Err(projection(ProjectionFailure::Stale));
+    }
+    bound.ticket.check(state)
 }
 impl SourceAuthority {
     pub(crate) fn guard_modern_state(&self) -> Result<ModernStateGuard<'_>, LeaseFailure> {
@@ -86,7 +91,7 @@ impl SourceAuthority {
         &self,
         pending: ModernRenewal,
         observed: Result<ObservedInventory, LeaseFailure>,
-        prepare: impl FnOnce(&ModernLeasedInventory) -> (T, F),
+        prepare: impl FnOnce(&ModernLeasedInventory, &dyn Fn(&ModernLeasedCandidate) -> bool) -> (T, F),
     ) -> Result<(ModernLeasedInventory, T), LeaseFailure> {
         let mut state = self
             .current(pending.snapshot.revision, &pending.snapshot.profile)
@@ -120,7 +125,8 @@ impl SourceAuthority {
             },
             ticket: pending.next.clone(),
         };
-        let (result, apply) = prepare(&inventory);
+        let valid = |bound: &ModernLeasedCandidate| current(&state, bound).is_ok();
+        let (result, apply) = prepare(&inventory, &valid);
         check(&state)?;
         state.lease_turn = Some(pending.next.turn.clone());
         state.renewal_turn = None;

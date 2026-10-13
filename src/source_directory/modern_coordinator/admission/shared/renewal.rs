@@ -52,7 +52,7 @@ impl SharedInputs {
             .at_handle(handle, || {
                 handle
                     .authority
-                    .commit_modern_renewal(pending, observed, |inventory| {
+                    .commit_modern_renewal(pending, observed, |inventory, current| {
                         let mut updates = Vec::new();
                         let (mut renewed, mut retired) = (0, 0);
                         for worker in registry
@@ -62,10 +62,9 @@ impl SharedInputs {
                             .filter(|w| same_source(&w.handle, handle) && !w.cancel.is_cancelled())
                         {
                             let old = worker.route.lock().unwrap();
-                            let next = inventory
-                                .candidate(&worker.name)
-                                .ok()
-                                .filter(|c| old.candidate.equivalent_route(c));
+                            let next = inventory.candidate(&worker.name).ok().filter(|c| {
+                                current(&old.candidate) && old.candidate.equivalent_route(c)
+                            });
                             drop(old);
                             if next.is_some() {
                                 renewed += 1

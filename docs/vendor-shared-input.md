@@ -46,14 +46,16 @@ generation-owned. Registry/attachment validation never invents remote policy or
 renews an inventory lease. Credential acknowledgments and private transport
 validation still apply to every input response.
 
-The lock order is registry, configuration, coordinator, source, attachment map.
+The lock order is registry, configuration, coordinator, source, mutable route,
+attachment map.
 No lock crosses an await. Viewer destruction never acquires registry/configuration
 locks. Output hubs are closed by their owning input generation only.
 
 The [packaging adapter](vendor-shared-packaging.md) now connects this input to the
-existing FFmpeg/HLS worker with a separate bounded mandatory pipe. Automatic
-discovery selection, policy-equivalent failover/lease renewal, persisted operator
-settings and load routing remain integration work. Native daemon workers keep
+existing FFmpeg/HLS worker with a separate bounded mandatory pipe. An explicit
+[renewal API](vendor-shared-renewal.md) preserves equivalent current managed
+routes. Automatic discovery selection, scheduled renewal, policy-equivalent
+failover, persisted operator settings and load routing remain integration work. Native daemon workers keep
 their current behavior.
 
 The owned `vendor_shared_input` suite exercises actual private HTTP, independent

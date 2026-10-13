@@ -29,7 +29,9 @@ A newer renewal attempt supersedes an older pending attempt even if the newer
 one fails. An ordinary `coordinator.inventory` refresh retains its original
 immediate-invalidation behavior and supersedes any pending renewal. Config,
 identity, source-installation changes and registry shutdown fence late results.
-Retired generations are never restored by a pending response.
+Each managed route must also pass its own published ticket and deadline check
+before renewal. A stale unstarted worker beside a fresh route is retired;
+retired generations are never restored by a pending response.
 
 Current checks acquire configuration, coordinator, source, route and member
 locks in that order. Publication holds the source lock across all route updates;

@@ -129,6 +129,9 @@ impl Worker {
         if self.cancel.is_cancelled() {
             return Err(SharedFailure::Closed);
         }
+        if self.active_viewer().is_none() {
+            return Err(SharedFailure::Closed);
+        }
         self.at_route(|| {
             if self.active_viewer().is_some() {
                 Ok(())

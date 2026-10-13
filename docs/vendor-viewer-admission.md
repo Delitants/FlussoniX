@@ -64,7 +64,9 @@ authority checks and per-owner cancellation. It forwards native subtitle and HLS
 conversion options. The [shared-input registry](vendor-shared-input.md) now owns
 one private pull per generation with independent viewer attachments. The
 [FFmpeg/HLS adapter](vendor-shared-packaging.md) packages those generations.
-Automatic daemon routing, lease renewal and failover remain pending.
+Standalone admissions retain their original tickets. Explicit
+[managed shared-input renewal](vendor-shared-renewal.md) can preserve equivalent
+workers; automatic daemon routing, scheduled renewal and failover remain pending.
 
 ## Validation
 
