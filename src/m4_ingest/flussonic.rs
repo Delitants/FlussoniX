@@ -22,6 +22,14 @@ pub struct MediaInput {
     requests: Requests,
 }
 impl MediaInput {
+    pub(crate) fn transport(&self) -> Transport {
+        if self.requests.is_m4f {
+            Transport::M4f
+        } else {
+            Transport::M4s
+        }
+    }
+
     pub(crate) async fn pull_guarded<W: AsyncWrite + Unpin>(
         &self,
         output: &mut W,

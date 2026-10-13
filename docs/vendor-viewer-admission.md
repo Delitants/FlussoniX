@@ -62,8 +62,9 @@ The [guarded private-pull primitive](vendor-private-pull.md) now retains admissi
 through actual HTTP reads, metadata/stream writes and native fan-out, with idle
 authority checks and per-owner cancellation. It forwards native subtitle and HLS
 conversion options. The [shared-input registry](vendor-shared-input.md) now owns
-one private pull per generation with independent viewer attachments. Automatic
-daemon routing and the FFmpeg/HLS adapter remain pending.
+one private pull per generation with independent viewer attachments. The
+[FFmpeg/HLS adapter](vendor-shared-packaging.md) packages those generations.
+Automatic daemon routing, lease renewal and failover remain pending.
 
 ## Validation
 

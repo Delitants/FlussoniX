@@ -1,9 +1,11 @@
 //! One private input per generation; viewer grants remain independently owned.
+mod feed;
 use super::{AdmissionFailure, AdmittedCandidate, ModernSourceCoordinator};
 use crate::{
     m4_ingest::flussonic::MediaInput, m4s::Track, media_queue, playback_auth::Policy, wire::Hub,
 };
 use bytes::Bytes;
+pub(crate) use feed::SharedFeed;
 use std::{
     collections::{HashMap, VecDeque},
     io,
@@ -60,9 +62,12 @@ struct Worker {
     members: Mutex<HashMap<Uuid, Weak<Viewer>>>,
     changed: Notify,
     cancel: CancellationToken,
-    hub: Hub,
+    hub: Arc<Hub>,
+    transport: crate::m4_ingest::flussonic::Transport,
     ts: media_queue::Channel,
+    required: Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>,
     tracks: Mutex<Option<Vec<Track>>>,
+    metadata_ready: Notify,
     detected: AtomicU64,
 }
 struct Viewer {
@@ -233,9 +238,12 @@ impl SharedInputs {
                         members: Mutex::new(HashMap::new()),
                         changed: Notify::new(),
                         cancel: CancellationToken::new(),
-                        hub: Hub::new(),
+                        hub: Arc::new(Hub::new()),
+                        transport: input.transport(),
                         ts: media_queue::Channel::new(128, 8 * 1024 * 1024),
+                        required: Mutex::new(None),
                         tracks: Mutex::new(None),
+                        metadata_ready: Notify::new(),
                         detected: AtomicU64::new(0),
                     });
                     let viewer = worker.attach(admission.clone());
@@ -342,20 +350,37 @@ impl SharedViewer {
         Ok(tracks)
     }
 }
-struct QueueWriter<'a>(&'a media_queue::Channel);
+struct QueueWriter<'a> {
+    channel: &'a media_queue::Channel,
+    required: Option<tokio_util::sync::PollSender<Bytes>>,
+}
 impl AsyncWrite for QueueWriter<'_> {
     fn poll_write(
         self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
         let n = bytes.len().min(64 * 1024);
         if n == 0 {
             return Poll::Ready(Ok(0));
         }
+        if let Some(required) = &mut this.required {
+            match required.poll_reserve(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(_)) => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+                Poll::Ready(Ok(())) => {}
+            }
+        }
+        let bytes = Bytes::copy_from_slice(&bytes[..n]);
+        if let Some(required) = &mut this.required {
+            if required.send_item(bytes.clone()).is_err() {
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
+        }
         Poll::Ready(
-            self.0
-                .send(Bytes::copy_from_slice(&bytes[..n]))
+            this.channel
+                .send(bytes)
                 .map(|_| n)
                 .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe)),
         )
@@ -373,7 +398,16 @@ impl SharedInput {
         let worker = &self.worker;
         worker.current()?;
         let authority = || worker.current().is_ok();
-        let mut output = QueueWriter(&worker.ts);
+        let required = worker
+            .required
+            .lock()
+            .unwrap()
+            .clone()
+            .map(tokio_util::sync::PollSender::new);
+        let mut output = QueueWriter {
+            channel: &worker.ts,
+            required,
+        };
         let (tx, mut metadata) = oneshot::channel();
         let pull = self.input.pull_guarded(
             &mut output,
@@ -401,6 +435,7 @@ impl SharedInput {
                     if let Ok(tracks) = tracks {
                         worker.current()?;
                         *worker.tracks.lock().unwrap() = Some(tracks);
+                        worker.metadata_ready.notify_waiters();
                     }
                 },
                 result = &mut pull => {

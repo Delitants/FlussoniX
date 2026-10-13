@@ -6,15 +6,15 @@ use std::{
 };
 use tokio::io::AsyncWrite;
 
-pub(super) type Authority<'a> = Option<&'a (dyn Fn() -> bool + Send + Sync)>;
-pub(super) fn check(authority: Authority<'_>) -> Result<(), String> {
+pub(crate) type Authority<'a> = Option<&'a (dyn Fn() -> bool + Send + Sync)>;
+pub(crate) fn check(authority: Authority<'_>) -> Result<(), String> {
     if authority.is_some_and(|current| !current()) {
         Err("media authority changed".into())
     } else {
         Ok(())
     }
 }
-pub(super) struct Writer<'a, W> {
+pub(crate) struct Writer<'a, W> {
     pub inner: &'a mut W,
     pub authority: Authority<'a>,
 }

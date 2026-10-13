@@ -50,9 +50,11 @@ The lock order is registry, configuration, coordinator, source, attachment map.
 No lock crosses an await. Viewer destruction never acquires registry/configuration
 locks. Output hubs are closed by their owning input generation only.
 
-Automatic discovery selection, policy-equivalent failover/lease renewal, persisted
-operator settings, load routing and the FFmpeg/HLS packaging adapter remain
-integration work. Native daemon workers keep their current behavior.
+The [packaging adapter](vendor-shared-packaging.md) now connects this input to the
+existing FFmpeg/HLS worker with a separate bounded mandatory pipe. Automatic
+discovery selection, policy-equivalent failover/lease renewal, persisted operator
+settings and load routing remain integration work. Native daemon workers keep
+their current behavior.
 
 The owned `vendor_shared_input` suite exercises actual private HTTP, independent
 native authorizations, shared MP3 TS/M4S fan-out, M4F control/segment reuse,

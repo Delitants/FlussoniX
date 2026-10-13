@@ -28,8 +28,9 @@ Cancellation affects this pull only. An owning worker should pass its own
 generation's cancellation token and use pointer/generation checks when retiring
 it. A cancelled viewer must not stop another viewer's shared worker. The [shared-input registry](vendor-shared-input.md) adds actual shared worker
 ownership and independent viewer attachments on this guarded transport.
-Equivalent-source renewal/failover, the FFmpeg/HLS adapter and daemon resolver
-activation remain separate integration work.
+The [FFmpeg/HLS adapter](vendor-shared-packaging.md) packages the shared input.
+Equivalent-source renewal/failover and daemon resolver activation remain separate
+integration work.
 
 `PrivatePullOptions` forwards native subtitle preservation/filtering, the owning
 worker's detected-track counter and the existing HLS conversion state. Conversion

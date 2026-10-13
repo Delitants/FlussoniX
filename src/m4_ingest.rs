@@ -1,5 +1,5 @@
 //! Independent M4 HTTP ingest. Privileged peer credentials never follow redirects.
-mod authority;
+pub(crate) mod authority;
 pub mod flussonic;
 use crate::{
     m4s::{Decoder, Event, PackedGop, Track},

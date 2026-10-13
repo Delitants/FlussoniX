@@ -1,7 +1,10 @@
+mod shared;
 use crate::wire::Hub;
 use bytes::Bytes;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use shared::StartMode;
+pub use shared::{PackagedPlayback, PackagedSubscription, SharedPackagingFailure};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -69,7 +72,9 @@ pub struct Worker {
     output_rate: std::sync::Mutex<crate::media_rate::OutputRate>,
     pub viewers: Arc<AtomicU64>,
     pub alive: std::sync::atomic::AtomicBool,
-    pub wire: Hub,
+    pub wire: Arc<Hub>,
+    shared_generation: Option<uuid::Uuid>,
+    shared_authority: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     last_access: Arc<std::sync::Mutex<Instant>>,
 }
 impl Worker {
@@ -238,7 +243,16 @@ impl Engine {
             return Err("stream does not accept publications".into());
         }
         let worker = self
-            .ensure_mode(name, cfg, true, current, Some(mode), None)
+            .ensure_mode(
+                name,
+                cfg,
+                true,
+                current,
+                StartMode {
+                    publishing: Some(mode),
+                    ..Default::default()
+                },
+            )
             .await?;
         let stdin = worker.publisher_stdin.lock().unwrap().take();
         Ok(Publication { worker, stdin })
@@ -262,7 +276,7 @@ impl Engine {
         touch_demand: bool,
         current: impl std::future::Future<Output = bool>,
     ) -> Result<Arc<Worker>, String> {
-        self.ensure_mode(name, cfg, touch_demand, current, None, None)
+        self.ensure_mode(name, cfg, touch_demand, current, StartMode::default())
             .await
     }
     pub(crate) async fn recover_demand_guarded(
@@ -272,8 +286,17 @@ impl Engine {
         last_playback: Instant,
         current: impl std::future::Future<Output = bool>,
     ) -> Result<Arc<Worker>, String> {
-        self.ensure_mode(name, cfg, false, current, None, Some(last_playback))
-            .await
+        self.ensure_mode(
+            name,
+            cfg,
+            false,
+            current,
+            StartMode {
+                last_playback: Some(last_playback),
+                ..Default::default()
+            },
+        )
+        .await
     }
     async fn ensure_mode(
         &self,
@@ -281,9 +304,14 @@ impl Engine {
         cfg: &Value,
         touch_demand: bool,
         current: impl std::future::Future<Output = bool>,
-        publishing: Option<PublicationInput>,
-        last_playback: Option<Instant>,
+        mode: StartMode,
     ) -> Result<Arc<Worker>, String> {
+        let StartMode {
+            publishing,
+            last_playback,
+            mut shared,
+        } = mode;
+        let shared_generation = shared.as_ref().map(|s| s.feed.generation());
         let subtitle_tracks = crate::config::subtitle_tracks(cfg)?;
         let destinations = crate::push::configuration(cfg)?;
         let direct_destinations = crate::direct_rtp::config::outputs(cfg)?;
@@ -320,6 +348,9 @@ impl Engine {
         if cfg["disabled"] == true {
             return Err("stream disabled".into());
         }
+        if shared.as_ref().is_some_and(|s| !s.feed.current()) {
+            return Err("media route changed".into());
+        }
         let signature = media_signature(cfg);
         let mut index = 0;
         let mut restart_count = 0;
@@ -335,14 +366,22 @@ impl Engine {
             // Body guards can outlive the generation that served them.
             last_access = w.last_access.clone();
             viewers = w.viewers.clone();
-            let running = w.alive.load(Ordering::Relaxed) && !w.is_closed();
-            if running && w.signature == signature {
+            let running = w.alive.load(Ordering::Relaxed)
+                && !w.is_closed()
+                && w.shared_authority.as_ref().is_none_or(|current| current());
+            if shared_generation.is_some()
+                && running
+                && (w.shared_generation != shared_generation || w.signature != signature)
+            {
+                return Err("shared packaging mismatch".into());
+            }
+            if running && w.signature == signature && w.shared_generation == shared_generation {
                 if publishing.is_some() {
                     return Err("publisher already connected".into());
                 }
                 return Ok(w.clone());
             }
-            if !running && w.signature == signature {
+            if !running && w.signature == signature && w.shared_generation == shared_generation {
                 let recovery = w.recovery.lock().unwrap();
                 if publishing.is_none() && recovery.retry_in().is_some_and(|delay| !delay.is_zero())
                 {
@@ -356,6 +395,9 @@ impl Engine {
             if let Some(done) = w.done.lock().await.take() {
                 let _ = done.await;
             }
+        }
+        if shared.as_ref().is_some_and(|s| s.input.is_none()) {
+            return Err("shared input startup owner required".into());
         }
         let inputs = cfg["inputs"]
             .as_array()
@@ -403,13 +445,18 @@ impl Engine {
         let caption_target = caption_listener
             .as_ref()
             .map(|l| format!("tcp://{}", l.local_addr().unwrap()));
-        let captions = (!caption_services.is_empty()).then(|| {
-            Arc::new(crate::caption_hls::State::new(
-                crate::captions::Decoder::new(caption_services),
-                generation.clone(),
-                sequence,
-            ))
-        });
+        let captions = shared
+            .as_ref()
+            .and_then(|s| s.feed.conversion())
+            .or_else(|| {
+                (!caption_services.is_empty()).then(|| {
+                    Arc::new(crate::caption_hls::State::new(
+                        crate::captions::Decoder::new(caption_services),
+                        generation.clone(),
+                        sequence,
+                    ))
+                })
+            });
         let mut cmd = Command::new(&self.ffmpeg);
         cmd.args([
             "-hide_banner",
@@ -780,7 +827,18 @@ impl Engine {
             output_rate: std::sync::Mutex::new(crate::media_rate::OutputRate::default()),
             viewers,
             alive: std::sync::atomic::AtomicBool::new(true),
-            wire: Hub::new(),
+            wire: if profile.full_copy() {
+                shared
+                    .as_ref()
+                    .map(|s| s.feed.hub())
+                    .unwrap_or_else(|| Arc::new(Hub::new()))
+            } else {
+                Arc::new(Hub::new())
+            },
+            shared_generation,
+            shared_authority: shared
+                .as_ref()
+                .map(|s| Arc::new(s.feed.authority()) as Arc<dyn Fn() -> bool + Send + Sync>),
             last_access,
         });
         let original_wire = (m4s_input || m4f_input) && profile.full_copy();
@@ -810,6 +868,18 @@ impl Engine {
             .collect();
         tokio::spawn(async move {
             let mut tasks = Vec::new();
+            if let Some(input) = shared.as_mut().and_then(|s| s.input.take()) {
+                let c = cancel.clone();
+                let source_worker = w.clone();
+                tasks.push(tokio::spawn(async move {
+                    let result =
+                        tokio::select! {biased;_=c.cancelled()=>return,result=input.run()=>result};
+                    if result.is_err() && !c.is_cancelled() {
+                        source_worker.failed("input_closed");
+                        c.cancel();
+                    }
+                }));
+            }
             if let Some(input) = direct_input {
                 if let Some(writer) = stdin.take() {
                     let c = cancel.clone();
@@ -849,7 +919,13 @@ impl Engine {
                     tasks.push(tokio::spawn(async move {
                         let result = tokio::select! { biased;
                             _=c.cancelled()=>Ok(()),
-                            result=crate::m4_ingest::pull_ready_with_options(&url,key.as_deref(),&mut writer,if original_wire {Some(&input_worker.wire)}else{None},metadata_tx,crate::m4_ingest::PullOptions { ca: native_ca.as_deref(), preserve: subtitle_tracks == "preserve", detected: Some(&input_worker.native_text_tracks), conversion: if native_captions {input_worker.captions.as_deref()} else {None} })=>result,
+                            result=async {
+                                if let Some(shared)=shared {
+                                    shared.feed.copy(&mut writer,metadata_tx,original_wire,&input_worker.native_text_tracks).await
+                                } else {
+                                    crate::m4_ingest::pull_ready_with_options(&url,key.as_deref(),&mut writer,if original_wire {Some(&input_worker.wire)}else{None},metadata_tx,crate::m4_ingest::PullOptions { ca: native_ca.as_deref(), preserve: subtitle_tracks == "preserve", detected: Some(&input_worker.native_text_tracks), conversion: if native_captions {input_worker.captions.as_deref()} else {None} }).await
+                                }
+                            }=>result,
                         };
                         if let Err(reason) = result {
                             input_worker.failed(if reason == "native_subtitle_transcode_unsupported" { "native_subtitle_transcode_unsupported" } else { "input_closed" });
