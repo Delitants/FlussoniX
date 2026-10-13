@@ -94,7 +94,9 @@ pub struct App {
     rtsp_publication: std::sync::Mutex<Value>,
     pub config: Arc<ConfigStore>,
     node_name: String,
-    modern_sources: Option<crate::source_directory::modern_coordinator::ModernSourceCoordinator>,
+    modern_sources:
+        Option<Arc<crate::source_directory::modern_coordinator::ModernSourceCoordinator>>,
+    vendor_playback: Option<crate::vendor_playback::Runtime>,
     pub media: Engine,
     credentials: Credentials,
     pub options: Options,
@@ -120,6 +122,19 @@ pub struct App {
     source_lookups: Mutex<HashMap<String, origin_resolution::Ticket>>,
 }
 impl App {
+    /// Caller owns/joins this one-shot driver; stopping it retires shared inputs.
+    pub async fn run_vendor_playback(
+        &self,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), String> {
+        match &self.vendor_playback {
+            Some(runtime) => runtime.run(cancel).await,
+            None => {
+                cancel.cancelled().await;
+                Ok(())
+            }
+        }
+    }
     /// Optional modern coordinator; this accessor does not enable vendor routing.
     pub fn modern_source_coordinator(
         &self,
@@ -165,7 +180,11 @@ impl App {
                 config.clone(),
                 &options.node_name,
             )
-            .ok();
+            .ok()
+            .map(Arc::new);
+        let vendor_playback = modern_sources
+            .as_ref()
+            .map(|owner| crate::vendor_playback::Runtime::new(owner.clone()));
         let app = Arc::new(Self {
             http_delivery: std::sync::Mutex::new(
                 json!({"http":null,"https":null,"https_only":false}),
@@ -179,6 +198,7 @@ impl App {
             config,
             node_name: options.node_name.clone(),
             modern_sources,
+            vendor_playback,
             media: Engine::new(media, &options.ffmpeg),
             credentials,
             options: options.clone(),
@@ -277,6 +297,9 @@ impl App {
         let mirrors = self.mirrors.lock().await;
         self.config.read(|root| {
             let config = crate::config::effective(root, name).or_else(|| {
+                if crate::vendor_playback::reserved(root, name) {
+                    return None;
+                }
                 mirrors
                     .get(name)
                     .filter(|m| {
@@ -356,6 +379,9 @@ impl App {
         }
         self.refresh_sources().await;
         for (name, _) in self.media.workers().await {
+            if self.media.maintain_shared(&name).await {
+                continue;
+            }
             if let Some((config, revision)) = self.media_config(&name).await {
                 if config["disabled"] == true {
                     self.media.stop(&name).await;
@@ -421,6 +447,9 @@ impl App {
             });
             self.playback_auth.invalidate(|name| {
                 let cfg = crate::config::effective(root, name).or_else(|| {
+                    if crate::vendor_playback::reserved(root, name) {
+                        return None;
+                    }
                     mirrors
                         .get(name)
                         .filter(|m| m.known && !m.denied)
@@ -439,7 +468,7 @@ impl App {
     async fn node(&self) -> Value {
         let cfg = self.config.snapshot();
         let mut streams = Vec::new();
-        let names = cfg["streams"]
+        let mut names = cfg["streams"]
             .as_array()
             .unwrap()
             .iter()
@@ -454,6 +483,7 @@ impl App {
                     .collect::<Vec<_>>(),
             )
             .collect::<std::collections::BTreeSet<_>>();
+        names.extend(self.media.workers().await.into_iter().map(|(name, _)| name));
         for name in names {
             streams.push(json!({"name":name,"ready":self.media.ready(&name).await,"stats":self.stream_stats(&name).await}));
         }
@@ -519,17 +549,17 @@ impl App {
         })?
     }
 }
-fn header<'a>(h: &'a HeaderMap, key: &str) -> Option<&'a str> {
+pub(crate) fn header<'a>(h: &'a HeaderMap, key: &str) -> Option<&'a str> {
     h.get(key).and_then(|v| v.to_str().ok())
 }
 
-fn error(code: StatusCode, message: &str) -> Response {
+pub(crate) fn error(code: StatusCode, message: &str) -> Response {
     (code, axum::Json(json!({"errors":[{"message":message}]}))).into_response()
 }
 fn json_response(value: Value) -> Response {
     axum::Json(value).into_response()
 }
-fn parse_query(q: Option<&str>) -> HashMap<String, String> {
+pub(crate) fn parse_query(q: Option<&str>) -> HashMap<String, String> {
     url::form_urlencoded::parse(q.unwrap_or("").as_bytes())
         .into_owned()
         .collect()
@@ -1320,6 +1350,39 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     if valid_name(name).is_err() {
         return error(StatusCode::BAD_REQUEST, "invalid stream name");
     }
+    let selection = app
+        .config
+        .read(|root| crate::vendor_playback::select(root, name, app.config.revision()));
+    match selection {
+        crate::vendor_playback::Selection::Native => {}
+        crate::vendor_playback::Selection::Excluded => {
+            return error(StatusCode::NOT_FOUND, "stream excluded");
+        }
+        crate::vendor_playback::Selection::Ambiguous => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overlapping vendor source namespaces",
+            );
+        }
+        crate::vendor_playback::Selection::Vendor { key, revision } => {
+            return match &app.vendor_playback {
+                Some(runtime) => {
+                    runtime
+                        .serve(
+                            &app,
+                            crate::vendor_playback::HttpRequest::new(
+                                &request, name, file, key, revision,
+                            ),
+                        )
+                        .await
+                }
+                None => error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "vendor playback owner unavailable",
+                ),
+            };
+        }
+    }
     let Some(resolved) = app.resolve(name).await else {
         return error(StatusCode::NOT_FOUND, "stream not found");
     };
@@ -1789,3 +1852,71 @@ pub(crate) mod rtsp_balancer;
 
 #[path = "source_activation.rs"]
 mod source_activation;
+
+#[cfg(test)]
+mod vendor_namespace_tests {
+    use super::*;
+    #[tokio::test]
+    async fn reserving_vendor_namespace_revokes_previous_native_mirror_grant_before_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-admin-key".into(),
+                peer_key: "owned-native-peer-key".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let source = app
+            .config
+            .put(
+                "sources",
+                "native",
+                json!({"api_url":"http://owned-native.invalid"}),
+            )
+            .unwrap();
+        let cfg = json!({"name":"owned","inputs":[{"url":"http://owned-native.invalid/owned/mpegts"}],"static":false});
+        app.mirrors.lock().await.insert(
+            "owned".into(),
+            Mirror {
+                when: Instant::now(),
+                config: cfg.clone(),
+                source,
+                available: true,
+                denied: false,
+                known: true,
+                activation_only: false,
+                serial: 1,
+                switches: 0,
+            },
+        );
+        let snapshot = app
+            .resolved("owned", cfg, app.config.revision())
+            .unwrap()
+            .policy;
+        let AuthOutcome::Allowed(grant) = app
+            .playback_auth
+            .authorize(
+                snapshot,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "mpegts".into(),
+                    ip: "127.0.0.1".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("native fixture denied");
+        };
+        app.config.put("sources","m4s://owned-vendor.invalid",json!({"flussonix_source_kind":"flussonic","cluster_key":"owned-private-cluster-key","flussonix_token_sha256":"a".repeat(64)})).unwrap();
+        app.invalidate_sessions().await;
+        assert!(
+            grant.is_cancelled(),
+            "previous native authority survived vendor namespace reservation"
+        );
+        app.media.stop_all().await;
+    }
+}

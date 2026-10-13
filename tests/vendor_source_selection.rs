@@ -290,7 +290,7 @@ async fn configured_vendor_does_not_enter_native_static_activation_or_playback_l
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE); // embedding owner not running
     assert!(
         calls.lock().unwrap().is_empty(),
         "native discovery sent credentials to vendor endpoint"

@@ -51,6 +51,30 @@ enum Receiver {
     Native(crate::media_queue::Receiver),
 }
 impl Engine {
+    /// Native supervision may retire shared generations but never restart them
+    /// through privileged native input configuration.
+    pub(crate) async fn maintain_shared(&self, name: &str) -> bool {
+        let worker = self
+            .workers
+            .lock()
+            .await
+            .get(name)
+            .filter(|w| w.shared_generation.is_some())
+            .cloned();
+        let Some(worker) = worker else {
+            return false;
+        };
+        if worker.is_closed()
+            || !worker.alive.load(Ordering::Relaxed)
+            || worker
+                .shared_authority
+                .as_ref()
+                .is_none_or(|current| !current())
+        {
+            self.stop_if_current(name, &worker).await;
+        }
+        true
+    }
     /// Package one already admitted shared generation. Settings describe local
     /// outputs only; no source URL, credentials or input override is accepted.
     /// The Engine owns and joins the unique source run future with this worker.

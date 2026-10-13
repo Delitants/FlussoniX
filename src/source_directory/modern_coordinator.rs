@@ -321,6 +321,9 @@ impl ModernSourceCoordinator {
     }
 }
 impl SourcePreparation {
+    pub(crate) fn config_revision(&self) -> u64 {
+        self.stamp.revision
+    }
     /// Explicit local policy-only templates, validated with captured backends.
     /// Materialize inheritance before strict complete-source projection. These
     /// inputs are frozen into this preparation, not imported from discovery or
@@ -409,6 +412,12 @@ impl CoordinatedInventory {
     }
 }
 impl CoordinatedCandidate {
+    pub(crate) fn config_revision(&self) -> u64 {
+        self.handle.stamp.revision
+    }
+    pub(crate) fn source_key(&self) -> &str {
+        &self.handle.stamp.key
+    }
     pub fn server_id(&self) -> &ObservedServerId {
         self.candidate.server_id()
     }

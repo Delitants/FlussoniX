@@ -279,6 +279,32 @@ impl SharedInputs {
             .map(str::to_owned)
             .ok_or(SharedFailure::Authority(AdmissionFailure::Invalid))
     }
+    pub(crate) fn source_in_use(&self, handle: &super::super::SourceHandle) -> bool {
+        self.workers
+            .lock()
+            .unwrap()
+            .workers
+            .values()
+            .filter_map(Weak::upgrade)
+            .any(|w| same_source(&w.handle, handle) && w.current().is_ok())
+    }
+    pub(crate) fn install_idle(
+        &self,
+        prepared: super::super::PreparedSource,
+    ) -> Result<super::super::SourceHandle, SharedFailure> {
+        let registry = self.workers.lock().unwrap();
+        if registry
+            .workers
+            .values()
+            .filter_map(Weak::upgrade)
+            .any(|w| w.handle.stamp.key == prepared.stamp.key && w.current().is_ok())
+        {
+            return Err(SharedFailure::Unavailable);
+        }
+        self.owner
+            .install(prepared)
+            .map_err(|e| SharedFailure::Authority(AdmissionFailure::Coordination(e)))
+    }
     pub fn new(owner: Arc<ModernSourceCoordinator>) -> Self {
         Self {
             owner,

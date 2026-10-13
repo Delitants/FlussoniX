@@ -1,0 +1,11 @@
+# Vendor daemon HTTP playback
+
+Connect explicit saved Flussonic profiles to real daemon HTTP/HTTPS HLS, TS, M4S and M4F playback. Keep native behavior for unmarked/native profiles and local configured streams (including disabled streams) first. Vendor prefix namespaces are reserved before discovery: exclusions return 404; multiple matching vendor namespaces return 503, without native fallback or origin probing. A single prefixless vendor profile reserves all nonlocal names. Vendor LB/placement tickets and RTSP/SRT routes remain explicitly unavailable in this increment.
+
+One App-owned runtime shares its existing coordinator, one SharedInputs registry, Engine and native PlaybackAuth. CLI owns and joins a single maintenance future; abort/completion cancels requests, sessions and registry generations. Every request must have a current owner and consume fresh native admission, including cached HLS segments; peer headers do not bypass it. Callback redirects cannot downgrade HTTPS.
+
+Cold discovery is serialized per source, bounded globally and by timeout, coalesces complete inventory, and never replaces an active source through ordinary refresh. Use managed current candidates after scheduled renewal; if metadata needs refresh while the source has demand, use safe shared renewal. Failures back off; source/config/identity changes fence all awaits. No remote policies or credentials reach FFmpeg.
+
+Existing shared packaging supplies copy outputs with default subtitle filtering; configurable vendor output/transcoding/subtitle profiles and friendly vendor editor are later work. HLS session retention and aggregate lease renewal cover response gaps and long bodies. Native supervisor must preserve only currently authorized shared workers, retire obsolete ones and avoid native recovery for them. File/subscription delivery uses guarded shared APIs and counts egress.
+
+Owned tests prove actual routing, header isolation, source and packager reuse, HLS segment authorization, denial/redirect behavior, local precedence, native supervisor survival, owner cancellation, stale source edits and cleanup. All FFmpeg/probe children must be reaped. No production mutation or live vendor/hardware qualification is implied.

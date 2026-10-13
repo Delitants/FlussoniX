@@ -76,3 +76,5 @@ pub mod worker_output;
 
 mod gpu;
 mod transcoder;
+
+mod vendor_playback;

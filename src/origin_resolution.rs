@@ -336,6 +336,9 @@ impl App {
             return self.resolved(name, c, revision);
         }
         let root = self.config.snapshot();
+        if crate::vendor_playback::reserved(&root, name) {
+            return None;
+        }
         let sources = root["sources"].as_array()?;
         let old = self
             .mirrors

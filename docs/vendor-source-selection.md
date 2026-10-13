@@ -1,9 +1,8 @@
 # Saved vendor source profiles
 
-This increment adds configuration and native-routing isolation for the opt-in
-modern source coordinator. **The daemon does not yet serve playback automatically
-from these vendor rows.** Its native discovery path skips them. Automatic vendor
-playback and the source-policy editor remain separate integration work.
+Explicit vendor profiles now select [guarded daemon HTTP playback](vendor-daemon-playback.md).
+The native discovery path skips them. The friendly source-policy editor remains
+separate integration work.
 
 Source rows may set `flussonix_source_kind` to `native` or `flussonic`. Omitting it
 keeps existing native FlussoniX discovery, including URL-keyed sources. A URL alone

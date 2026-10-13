@@ -1,8 +1,9 @@
 //! Explicit stream-scoped Flussonic HTTP media authentication.
 //!
-//! This library client is not selected by the daemon's source resolver. No
-//! official Flussonic components are required. Live reference authentication,
-//! viewer-policy inheritance and vendor source integration remain separate gates.
+//! Explicit vendor daemon profiles reach this client through current admitted
+//! source authority; ordinary native discovery stays separate. No official
+//! Flussonic components are required. Live reference qualification remains a
+//! separate gate.
 use super::{PullOptions, RequestAuth, Requests};
 use crate::{m4s::Track, wire::Hub};
 use reqwest::header::{HeaderMap, HeaderValue};

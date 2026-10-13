@@ -164,6 +164,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.reconcile().await;
     let background = app.clone();
     let cancel = tokio_util::sync::CancellationToken::new();
+    let vendor_app = app.clone();
+    let vendor_cancel = cancel.clone();
+    let vendor_playback =
+        tokio::spawn(async move { vendor_app.run_vendor_playback(vendor_cancel).await });
+    tokio::task::yield_now().await;
     let mut srt_task = srt_listener.map(|listener| {
         tokio::spawn(flussonix::srt_playback::serve(
             listener,
@@ -245,6 +250,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = supervisor.await;
     let _ = authorization.await;
     let _ = telemetry.await;
+    let vendor_result = vendor_playback.await;
     if srt_result.is_none() {
         if let Some(task) = srt_task {
             srt_result = Some(task.await);
@@ -285,6 +291,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(result) = srt_result {
         result??;
     }
+    vendor_result??;
     Ok(())
 }
 async fn shutdown() {
