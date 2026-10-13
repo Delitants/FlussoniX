@@ -18,9 +18,10 @@ source's prefix reserves that literal namespace, without renaming upstream
 streams. Exclusions return 404. One prefixless vendor source reserves every
 nonlocal name; overlapping vendor namespaces return 503 before discovery. There
 is no native fallback on vendor absence, denial or error. Native RTSP/SRT
-resolution also cannot cross a reserved vendor namespace. Vendor LB roles and
-placement tickets return 503 before discovery; native cluster/LB behavior stays
-separate. Vendor failover, static demand and RTSP/SRT delivery need further work.
+resolution also cannot cross a reserved vendor namespace. A native FlussoniX LB can redirect to a vendor-backed FlussoniX CDN using
+[HTTP placement tickets](vendor-cdn-placement.md). Direct vendor-source profiles
+on the LB still return 503 before discovery. Vendor failover, static demand and
+RTSP/SRT delivery need further work.
 
 Every HTTP request passes current source/local policy and the App's actual native
 viewer authorizer. Shared input, HLS retention and cached files never authorize

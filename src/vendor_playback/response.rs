@@ -14,6 +14,7 @@ use axum::{
 use bytes::Bytes;
 use std::net::SocketAddr;
 pub(crate) struct HttpRequest {
+    raw_path: String,
     name: String,
     file: String,
     key: String,
@@ -50,12 +51,13 @@ impl HttpRequest {
                 .map(|c| c.0.ip().to_string())
                 .unwrap_or_else(|| "127.0.0.1".into()),
             token: query.get("token").cloned().unwrap_or_default(),
-            qs: request.uri().query().unwrap_or("").into(),
+            qs: App::http_viewer_query(request.uri().query().unwrap_or("")),
             user_agent: header(request.headers(), "user-agent").unwrap_or("").into(),
             referer: header(request.headers(), "referer").unwrap_or("").into(),
             host: header(request.headers(), "host").unwrap_or("").into(),
         };
         Self {
+            raw_path: request.uri().path().to_owned(),
             name: name.into(),
             file: file.into(),
             key,
@@ -72,6 +74,7 @@ impl HttpRequest {
 impl Runtime {
     pub(crate) async fn serve(&self, app: &App, request: HttpRequest) -> Response {
         let HttpRequest {
+            raw_path,
             name,
             file,
             key,
@@ -93,10 +96,12 @@ impl Runtime {
                 "vendor playback owner unavailable",
             );
         }
-        if query.contains_key("flussonix_ticket") {
+        if let Some(ticket) = query.get("flussonix_ticket")
+            && !app.vendor_http_ticket_current(name, ticket).await
+        {
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "vendor placement tickets are not supported",
+                "admission ticket invalid or expired",
             );
         }
         if !matches!(file, "mpegts" | "m4s" | "m4f")
@@ -136,6 +141,18 @@ impl Runtime {
             }
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "vendor authority changed"),
         };
+        if let Some(ticket) = query.get("flussonix_ticket") {
+            if !app
+                .redeem_vendor_http_ticket(name, ticket, &self.owner, &admission)
+                .await
+            {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "admission ticket invalid or expired",
+                );
+            }
+            return App::http_ticket_redirect(&raw_path, &query);
+        }
         let package = async {
             if hls {
                 self.sessions

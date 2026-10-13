@@ -40,5 +40,6 @@ Source kind changes require explicitly clearing vendor processing selection.
 Owned tests verify CPU AAC decoding, native text preservation/filtering,
 English/German WebVTT, source/profile isolation, edits, authorization and child
 cleanup. Encoder syntax/selector acceptance is not new GPU hardware or broadcast
-interoperability qualification. Vendor LB, failover, static activation and
-RTSP/SRT delivery remain pending.
+interoperability qualification. Native LB placement into vendor-backed FlussoniX CDNs is described
+[here](vendor-cdn-placement.md). Direct vendor LB discovery, failover, static
+activation and RTSP/SRT delivery remain pending.

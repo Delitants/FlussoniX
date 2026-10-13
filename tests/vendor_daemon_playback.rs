@@ -117,6 +117,7 @@ impl Fixture {
             dir.path().join("media"),
             Options {
                 role: role.into(),
+                uplink_interface: "process".into(),
                 admin_password: "owned-admin-key".into(),
                 peer_key: "owned-native-peer-key".into(),
                 ..Default::default()
@@ -1495,3 +1496,6 @@ async fn fmp4_hls_child_segments_are_guarded_and_decode_with_init() {
     assert_eq!(statuses, (StatusCode::OK, StatusCode::OK));
     assert!(result.unwrap().status.success());
 }
+
+#[path = "vendor_daemon_playback/placement.rs"]
+mod placement;

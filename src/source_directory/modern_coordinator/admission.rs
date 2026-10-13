@@ -116,6 +116,16 @@ impl ModernSourceCoordinator {
     /// Recheck the exact owner/config/source/refresh/lease and native revocation.
     /// This is an instant check, not a background revocation or lease renewal.
     pub fn admitted_current(&self, admitted: &AdmittedCandidate) -> Result<(), AdmissionFailure> {
+        self.with_admitted_current(admitted, || ())
+    }
+
+    /// Synchronous control-only commit under the same source/config/grant fence.
+    /// Unlike a media handoff, this never promotes playback demand.
+    pub(crate) fn with_admitted_current<T>(
+        &self,
+        admitted: &AdmittedCandidate,
+        commit: impl FnOnce() -> T,
+    ) -> Result<T, AdmissionFailure> {
         // Name and local precedence were established when this opaque admission
         // was created. The identical config revision preserves those facts.
         // Frequent frame/write checks need no media client/key allocation or
@@ -124,7 +134,7 @@ impl ModernSourceCoordinator {
             if admitted.grant.is_cancelled() {
                 Err(AdmissionFailure::Revoked)
             } else {
-                Ok(())
+                Ok(commit())
             }
         })
     }

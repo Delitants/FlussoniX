@@ -1407,18 +1407,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     {
         Grant::peer()
     } else {
-        let qs = request
-            .uri()
-            .query()
-            .unwrap_or("")
-            .split('&')
-            .filter(|pair| {
-                url::form_urlencoded::parse(pair.as_bytes())
-                    .next()
-                    .is_none_or(|(key, _)| key != "flussonix_ticket")
-            })
-            .collect::<Vec<_>>()
-            .join("&");
+        let qs = App::http_viewer_query(request.uri().query().unwrap_or(""));
         let viewer = ViewerRequest {
             name: name.into(),
             proto: if file == "mpegts" {
@@ -1490,19 +1479,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         match valid {
             true => {
                 reservations.remove(ticket);
-                let clean = url::form_urlencoded::Serializer::new(String::new())
-                    .extend_pairs(
-                        query
-                            .iter()
-                            .filter(|(k, _)| k.as_str() != "flussonix_ticket"),
-                    )
-                    .finish();
-                let location = if clean.is_empty() {
-                    raw_path.to_owned()
-                } else {
-                    format!("{raw_path}?{clean}")
-                };
-                return (StatusCode::FOUND, [("location", location)]).into_response();
+                return App::http_ticket_redirect(raw_path, &query);
             }
             _ => {
                 return error(
@@ -1853,6 +1830,7 @@ pub(crate) mod publication;
 
 mod admission;
 mod http_balancer;
+mod http_tickets;
 pub(crate) mod rtsp_balancer;
 
 #[path = "source_activation.rs"]
