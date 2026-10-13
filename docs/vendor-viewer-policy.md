@@ -80,8 +80,8 @@ may additionally name one template with a literal `template` string. Template
 defaults apply first, then direct fields replace those defaults. The resulting
 group fields override source fields under the existing conflict rules.
 Callbacks remain atomic; replacing a callback never clears a separate token
-guard. An empty template supplies no authority. A public decision still needs
-the explicit `"true"` callback value or a protected token-only policy.
+guard. An empty template supplies no authority. Public access still requires
+the explicit `"true"` callback value; a token-only policy remains protected.
 
 All template definitions validate, including unused ones. Missing references,
 invalid names, null values and malformed direct settings fail even when a later
