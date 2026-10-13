@@ -920,8 +920,15 @@ impl Engine {
                         let result = tokio::select! { biased;
                             _=c.cancelled()=>Ok(()),
                             result=async {
-                                if let Some(shared)=shared {
-                                    shared.feed.copy(&mut writer,metadata_tx,original_wire,&input_worker.native_text_tracks).await
+                                if let Some(mut shared)=shared {
+                                    let result=shared.feed.copy(&mut writer,metadata_tx,original_wire,&input_worker.native_text_tracks).await;
+                                    // Record the specific failure before dropping the required
+                                    // receiver can wake the source with a generic broken pipe.
+                                    if let Err(reason)=&result {
+                                        input_worker.failed(if reason == "native_subtitle_transcode_unsupported" { "native_subtitle_transcode_unsupported" } else { "input_closed" });
+                                        c.cancel();
+                                    }
+                                    result
                                 } else {
                                     crate::m4_ingest::pull_ready_with_options(&url,key.as_deref(),&mut writer,if original_wire {Some(&input_worker.wire)}else{None},metadata_tx,crate::m4_ingest::PullOptions { ca: native_ca.as_deref(), preserve: subtitle_tracks == "preserve", detected: Some(&input_worker.native_text_tracks), conversion: if native_captions {input_worker.captions.as_deref()} else {None} }).await
                                 }
@@ -956,6 +963,10 @@ impl Engine {
                         let c = cancel.clone();
                         let pipe_worker = w.clone();
                         tasks.push(tokio::spawn(async move {
+                            let mut stdin = crate::m4_ingest::authority::Writer {
+                                inner: &mut stdin,
+                                authority: pipe_worker.shared_authority.as_deref(),
+                            };
                             let result = tokio::select! { biased;
                                 _=c.cancelled()=>return,
                                 result=tokio::io::copy(&mut reader,&mut stdin)=>result,

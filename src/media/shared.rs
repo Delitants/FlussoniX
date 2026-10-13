@@ -72,6 +72,12 @@ impl Engine {
         }) {
             return Err(SharedPackagingFailure::Invalid);
         }
+        if object
+            .get("flussonix_input_timeout")
+            .is_some_and(|v| !v.as_u64().is_some_and(|n| (1..=300).contains(&n)))
+        {
+            return Err(SharedPackagingFailure::Invalid);
+        }
         let feed = attachment
             .viewer
             .feed(attachment.input.is_some())

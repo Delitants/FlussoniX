@@ -16,7 +16,8 @@ input generation; retire/reselect explicitly before changing them.
 Settings accept only `transcoder`, `flussonix_input_timeout`,
 `flussonix_subtitle_tracks`, `flussonix_hls_subtitles` and
 `flussonix_hls_captions`. Existing profile/capability validation applies. Input
-URLs, keys and source overrides are rejected. FFmpeg receives local MPEG-TS on
+URLs, keys and source overrides are rejected. When present, the input timeout
+must be an integer from 1 through 300 seconds; invalid values fail before startup. FFmpeg receives local MPEG-TS on
 stdin; only the independently implemented source client contacts the origin.
 Configured push/direct-output integration is deferred until their output fences
 are connected to source authority. Existing native daemon outputs are unchanged.
@@ -37,7 +38,8 @@ so a complete M4F GOP cannot overflow a live-viewer ring during process startup.
 The existing bounded viewer ring remains independent; slow viewers may report
 lag without stalling others. A stalled required consumer is terminated by the
 worker watchdog. Both private input and downstream pipe writes recheck source
-and aggregate demand at every writer poll, including after pending I/O.
+and aggregate demand at every writer poll, including the final child-stdin copy after pending I/O. Specific unsupported
+subtitle diagnostics are recorded before closing the required pipe.
 
 `PackagedPlayback` exposes guarded TS/M4S/M4F subscriptions. `Engine::read_shared`
 checks the viewer, source and exact installed output worker before/after HLS or

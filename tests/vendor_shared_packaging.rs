@@ -940,3 +940,138 @@ async fn late_native_text_rejects_preserve_with_cpu_transcoding() {
         "native_subtitle_transcode_unsupported"
     );
 }
+
+#[tokio::test]
+async fn invalid_timeout_values_are_rejected_before_startup() {
+    for value in [
+        json!(null),
+        json!(0),
+        json!(301),
+        json!(-1),
+        json!(1.5),
+        json!("15"),
+    ] {
+        let f = Fixture::start(false).await;
+        let registry = SharedInputs::new(f.owner.clone());
+        let rows = f.inventory(Duration::from_secs(30)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "ffmpeg");
+        let mut cfg = options();
+        cfg["flussonix_input_timeout"] = value;
+        let result = engine
+            .package_shared(attach(&f, f.admitted(&rows, "one").await, &registry), &cfg)
+            .await;
+        engine.stop_all().await;
+        assert!(matches!(result, Err(Failure::Invalid)));
+        assert_eq!(f.media_calls(), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blocked_required_sender_keeps_specific_unsupported_text_failure() {
+    for _ in 0..32 {
+        let mut f = Fixture::start(false).await;
+        let registry = SharedInputs::new(f.owner.clone());
+        let rows = f.inventory(Duration::from_secs(30)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "ffmpeg");
+        let cfg = json!({"transcoder":{"ab":96},"flussonix_subtitle_tracks":"preserve","flussonix_hls_subtitles":"drop"});
+        let attachment = registry
+            .attach(
+                f.admitted(&rows, "one").await,
+                SharedInputOptions {
+                    preserve_subtitles: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let playback = engine.package_shared(attachment, &cfg).await.unwrap();
+        let conn = f.connection().await;
+        let tracks = vec![
+            audio(),
+            Track {
+                id: 7,
+                codec: "subtitle".into(),
+                config: vec![],
+            },
+        ];
+        let mut burst = wire::encode_info(&tracks).unwrap();
+        for _ in 0..300 {
+            burst.extend_from_slice(&sample());
+        }
+        conn.feed.send(Ok(Bytes::from(burst))).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), conn.feed.closed())
+            .await
+            .unwrap();
+        engine.stop_all().await;
+        assert_eq!(
+            playback.stats()["last_error"],
+            "native_subtitle_transcode_unsupported"
+        );
+    }
+}
+
+// Bytes already in the kernel pipe may drain; a pending write may not add more.
+#[tokio::test]
+async fn final_child_stdin_does_not_resume_queued_bytes_after_source_edit() {
+    let mut f = Fixture::start(false).await;
+    let registry = SharedInputs::new(f.owner.clone());
+    let rows = f.inventory(Duration::from_secs(30)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("owned-pipe-reader");
+    let marker = dir.path().join("full");
+    let gate = dir.path().join("gate");
+    let captured = dir.path().join("captured");
+    let source = format!(
+        "#!/usr/bin/python3\nimport os,fcntl,termios,array,time\nfrom pathlib import Path\nmarker=Path({:?});gate=Path({:?});captured=Path({:?})\ncapacity=fcntl.fcntl(0,fcntl.F_GETPIPE_SZ)\nwhile True:\n n=array.array('i',[0]);fcntl.ioctl(0,termios.FIONREAD,n,True)\n if n[0]>capacity//2:\n  time.sleep(.02)\n  previous=n[0];fcntl.ioctl(0,termios.FIONREAD,n,True)\n  if n[0]==previous:break\n time.sleep(.001)\nmarker.write_text(str(n[0]))\nwhile not gate.exists():time.sleep(.001)\nwith captured.open('wb',buffering=0) as out:\n while True:\n  data=os.read(0,65536)\n  if not data:break\n  out.write(data)\n",
+        marker.to_str().unwrap(),
+        gate.to_str().unwrap(),
+        captured.to_str().unwrap()
+    );
+    std::fs::write(&script, source).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = Engine::new(dir.path(), script.to_str().unwrap());
+    let playback = engine
+        .package_shared(
+            attach(&f, f.admitted(&rows, "one").await, &registry),
+            &options(),
+        )
+        .await
+        .unwrap();
+    let conn = f.connection().await;
+    let mut burst = info().to_vec();
+    for _ in 0..2000 {
+        burst.extend_from_slice(&sample());
+    }
+    conn.feed.send(Ok(Bytes::from(burst))).unwrap();
+    let filled = tokio::time::timeout(Duration::from_secs(2), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    if filled.is_err() {
+        engine.stop_all().await;
+        panic!("owned child pipe did not fill");
+    }
+    let committed = std::fs::read_to_string(&marker)
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    f.config
+        .put("templates", "edit", json!({"static":false}))
+        .unwrap();
+    std::fs::write(&gate, b"go").unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(2), conn.feed.closed()).await;
+    engine.stop_all().await;
+    closed.unwrap();
+    let received = std::fs::metadata(&captured)
+        .map(|m| m.len() as usize)
+        .unwrap_or(0);
+    assert!(
+        received <= committed,
+        "pending stdin write resumed stale media: {received} > {committed}"
+    );
+    assert!(!std::path::Path::new(&format!("/proc/{}", playback.pid())).exists());
+}

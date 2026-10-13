@@ -83,20 +83,21 @@ impl SharedFeed {
         }
     }
     pub(crate) async fn copy<W: AsyncWrite + Unpin>(
-        mut self,
+        &mut self,
         output: &mut W,
         metadata: oneshot::Sender<Vec<Track>>,
         full_copy: bool,
         detected: &AtomicU64,
     ) -> Result<(), String> {
-        let mut receiver = self
+        let worker = self.worker.clone();
+        let receiver = self
             .receiver
-            .take()
+            .as_mut()
             .ok_or("shared input startup owner required")?;
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let tracks = loop {
-            if !self.current() {
+            if worker.current().is_err() {
                 return Err("shared source closed".into());
             }
             let notified = self.worker.metadata_ready.notified();
@@ -120,13 +121,12 @@ impl SharedFeed {
         {
             return Err("native_subtitle_transcode_unsupported".into());
         }
-        if !self.current() {
+        if worker.current().is_err() {
             return Err("shared source closed".into());
         }
         metadata
             .send(tracks)
             .map_err(|_| "native startup cancelled")?;
-        let worker = self.worker.clone();
         let unsupported = || {
             !full_copy
                 && worker.options.preserve_subtitles
