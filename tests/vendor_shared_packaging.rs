@@ -1075,3 +1075,56 @@ async fn final_child_stdin_does_not_resume_queued_bytes_after_source_edit() {
     );
     assert!(!std::path::Path::new(&format!("/proc/{}", playback.pid())).exists());
 }
+
+// An explicit lease refresh must not restart the private connection or FFmpeg.
+#[tokio::test]
+async fn equivalent_lease_renewal_keeps_live_packager_and_hls_after_old_deadline() {
+    let mut f = Fixture::start(false).await;
+    let registry = SharedInputs::new(f.owner.clone());
+    let rows = f.inventory(Duration::from_secs(2)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "ffmpeg");
+    let playback = engine
+        .package_shared(
+            attach(&f, f.admitted(&rows, "one").await, &registry),
+            &options(),
+        )
+        .await
+        .unwrap();
+    let conn = f.connection().await;
+    let feeder = tokio::spawn(feed_audio(conn.feed.clone()));
+    ready(&engine, &playback).await;
+    let pid = playback.pid();
+    let generation = playback.generation();
+    let fresh = registry
+        .renew(&f.handle, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!((fresh.renewed, fresh.retired), (1, 0));
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        rows.expires_at() + Duration::from_millis(50),
+    ))
+    .await;
+    playback.current().unwrap();
+    assert!(
+        !engine
+            .read_shared(&playback, "index.m3u8")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let second = engine
+        .package_shared(
+            attach(&f, f.admitted(&fresh.inventory, "two").await, &registry),
+            &options(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.pid(), pid);
+    assert_eq!(second.generation(), generation);
+    assert_eq!(f.media_calls(), 1);
+    engine.stop_all().await;
+    feeder.abort();
+    let _ = feeder.await;
+    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+}

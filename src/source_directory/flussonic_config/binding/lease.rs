@@ -125,6 +125,7 @@ impl SourceAuthority {
                 expires_at: Instant::now() + lifetime,
             };
             state.lease_turn = Some(ticket.turn.clone());
+            state.renewal_turn = None;
             (snapshot, ticket)
         };
         let result = snapshot

@@ -11,7 +11,7 @@ pub use pull::{PrivatePullFailure, PrivatePullOptions};
 pub(crate) use shared::SharedFeed;
 pub use shared::{
     SharedFailure, SharedInput, SharedInputAttachment, SharedInputOptions, SharedInputs,
-    SharedSubscription, SharedViewer,
+    SharedRenewal, SharedSubscription, SharedViewer,
 };
 
 /// Generic diagnostics contain no names, callback URLs or credentials.

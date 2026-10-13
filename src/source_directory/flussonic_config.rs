@@ -185,6 +185,7 @@ struct State {
     revision: u64,
     profile: Option<Arc<Profile>>,
     lease_turn: Option<Arc<()>>,
+    renewal_turn: Option<Arc<()>>,
 }
 
 /// Owns one independent local source authority. Not the daemon's configuration
@@ -209,6 +210,7 @@ impl SourceAuthority {
                 revision: 0,
                 profile: Some(profile),
                 lease_turn: None,
+                renewal_turn: None,
             }),
         })
     }
@@ -253,6 +255,7 @@ impl SourceAuthority {
         state.profile = Some(profile);
         state.revision = revision;
         state.lease_turn = None;
+        state.renewal_turn = None;
         Ok(())
     }
     pub fn remove(&self) -> Result<(), ProjectionFailure> {
@@ -264,6 +267,7 @@ impl SourceAuthority {
         state.profile = None;
         state.revision = revision;
         state.lease_turn = None;
+        state.renewal_turn = None;
         Ok(())
     }
     /// Hold the authority lock while committing a current candidate. Never await

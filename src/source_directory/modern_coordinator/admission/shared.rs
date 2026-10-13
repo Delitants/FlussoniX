@@ -1,11 +1,13 @@
 //! One private input per generation; viewer grants remain independently owned.
 mod feed;
+mod renewal;
 use super::{AdmissionFailure, AdmittedCandidate, ModernSourceCoordinator};
 use crate::{
     m4_ingest::flussonic::MediaInput, m4s::Track, media_queue, playback_auth::Policy, wire::Hub,
 };
 use bytes::Bytes;
 pub(crate) use feed::SharedFeed;
+pub use renewal::SharedRenewal;
 use std::{
     collections::{HashMap, VecDeque},
     io,
@@ -50,12 +52,18 @@ pub enum SharedFailure {
 pub struct SharedInputs {
     owner: Arc<ModernSourceCoordinator>,
     id: Arc<()>,
-    workers: Mutex<HashMap<String, Weak<Worker>>>,
+    workers: Mutex<Registry>,
+}
+struct Registry {
+    workers: HashMap<String, Weak<Worker>>,
+    epoch: Arc<()>,
 }
 struct Worker {
     id: Uuid,
     registry: Arc<()>,
     owner: Arc<ModernSourceCoordinator>,
+    handle: super::super::SourceHandle,
+    route: Mutex<super::super::CoordinatedCandidate>,
     name: String,
     policy: Policy,
     options: SharedInputOptions,
@@ -121,16 +129,13 @@ impl Worker {
         if self.cancel.is_cancelled() {
             return Err(SharedFailure::Closed);
         }
-        let first = self.active_viewer().ok_or(SharedFailure::Closed)?;
-        self.owner
-            .at_current_candidate(&first.admission.candidate, || {
-                if self.active_viewer().is_some() {
-                    Ok(())
-                } else {
-                    Err(AdmissionFailure::Revoked)
-                }
-            })
-            .map_err(SharedFailure::Authority)?;
+        self.at_route(|| {
+            if self.active_viewer().is_some() {
+                Ok(())
+            } else {
+                Err(AdmissionFailure::Revoked)
+            }
+        })?;
         if self.cancel.is_cancelled() {
             return Err(SharedFailure::Closed);
         }
@@ -145,16 +150,37 @@ impl Worker {
         if &self.policy != policy || !self.options.matches(options) {
             return false;
         }
-        self.active_viewer().is_some_and(|v| {
-            let a = &v.admission.candidate;
-            let b = &admitted.candidate;
-            Arc::ptr_eq(&a.handle.authority, &b.handle.authority)
-                && a.handle.stamp.revision == b.handle.stamp.revision
-                && Arc::ptr_eq(&a.handle.stamp.identity, &b.handle.stamp.identity)
-                && a.candidate.shares_lease(&b.candidate)
-                && v.admission.name == admitted.name
-        })
+        let a = self.route.lock().unwrap();
+        let b = &admitted.candidate;
+        same_source(&a.handle, &b.handle)
+            && a.candidate.shares_lease(&b.candidate)
+            && self.name == admitted.name
     }
+    fn at_route<T>(
+        &self,
+        check: impl FnOnce() -> Result<T, AdmissionFailure>,
+    ) -> Result<T, SharedFailure> {
+        self.owner
+            .at_handle(&self.handle, || {
+                let guard = self
+                    .handle
+                    .authority
+                    .guard_modern_state()
+                    .map_err(super::super::CoordinationFailure::Lease)?;
+                let route = self.route.lock().unwrap();
+                guard
+                    .check(&route.candidate)
+                    .map_err(super::super::CoordinationFailure::Lease)?;
+                let result = check();
+                guard
+                    .check(&route.candidate)
+                    .map_err(super::super::CoordinationFailure::Lease)?;
+                Ok(result)
+            })
+            .map_err(|e| SharedFailure::Authority(AdmissionFailure::Coordination(e)))?
+            .map_err(SharedFailure::Authority)
+    }
+
     fn attach(
         self: &Arc<Self>,
         admission: Arc<AdmittedCandidate>,
@@ -187,7 +213,10 @@ impl SharedInputs {
         Self {
             owner,
             id: Arc::new(()),
-            workers: Mutex::new(HashMap::new()),
+            workers: Mutex::new(Registry {
+                workers: HashMap::new(),
+                epoch: Arc::new(()),
+            }),
         }
     }
     /// Consume an independently authorized viewer. The first attachment owns
@@ -198,10 +227,11 @@ impl SharedInputs {
         options: SharedInputOptions,
     ) -> Result<SharedInputAttachment, SharedFailure> {
         let admission: Arc<AdmittedCandidate> = admission.into();
-        let mut workers = self
+        let mut registry = self
             .workers
             .lock()
             .map_err(|_| SharedFailure::Unavailable)?;
+        let workers = &mut registry.workers;
         workers.retain(|_, w| w.upgrade().is_some_and(|w| !w.cancel.is_cancelled()));
         let old = workers.get(&admission.name).and_then(Weak::upgrade);
         // Check outside the incoming publication fence to avoid lock reentry.
@@ -232,6 +262,8 @@ impl SharedInputs {
                         id: Uuid::new_v4(),
                         registry: self.id.clone(),
                         owner: self.owner.clone(),
+                        handle: admission.candidate.handle.clone(),
+                        route: Mutex::new(copy_route(&admission.candidate)),
                         name: view.name.into(),
                         policy: view.policy.clone(),
                         options,
@@ -263,7 +295,8 @@ impl SharedInputs {
         if !Arc::ptr_eq(&self.id, &worker.registry) {
             return false;
         }
-        let mut workers = self.workers.lock().unwrap();
+        let mut registry = self.workers.lock().unwrap();
+        let workers = &mut registry.workers;
         if !workers
             .get(&worker.name)
             .and_then(Weak::upgrade)
@@ -278,11 +311,13 @@ impl SharedInputs {
     /// Cancel registered generations. The caller still owns and joins run futures.
     /// Subsequent explicit attachment may start a new generation.
     pub fn shutdown(&self) {
-        let mut workers = self.workers.lock().unwrap();
+        let mut registry = self.workers.lock().unwrap();
+        let workers = &mut registry.workers;
         for worker in workers.values().filter_map(Weak::upgrade) {
             worker.close();
         }
         workers.clear();
+        registry.epoch = Arc::new(());
     }
 }
 impl Drop for SharedInputs {
@@ -299,10 +334,13 @@ impl SharedViewer {
         if worker.cancel.is_cancelled() {
             return Err(SharedFailure::Closed);
         }
-        worker
-            .owner
-            .admitted_current(&self.inner.admission)
-            .map_err(SharedFailure::Authority)?;
+        worker.at_route(|| {
+            if self.inner.admission.grant.is_cancelled() {
+                Err(AdmissionFailure::Revoked)
+            } else {
+                Ok(())
+            }
+        })?;
         if worker.cancel.is_cancelled() {
             return Err(SharedFailure::Closed);
         }
@@ -469,5 +507,20 @@ impl SharedSubscription {
         self.viewer.current()?;
         self.viewer.inner.admission.grant.add_bytes(bytes.len());
         Ok(bytes)
+    }
+}
+
+fn same_source(a: &super::super::SourceHandle, b: &super::super::SourceHandle) -> bool {
+    Arc::ptr_eq(&a.authority, &b.authority)
+        && a.stamp.revision == b.stamp.revision
+        && Arc::ptr_eq(&a.stamp.identity, &b.stamp.identity)
+        && Arc::ptr_eq(&a.stamp.owner, &b.stamp.owner)
+        && Arc::ptr_eq(&a.stamp.turn, &b.stamp.turn)
+        && a.stamp.key == b.stamp.key
+}
+fn copy_route(a: &super::super::CoordinatedCandidate) -> super::super::CoordinatedCandidate {
+    super::super::CoordinatedCandidate {
+        handle: a.handle.clone(),
+        candidate: a.candidate.copy_for_worker(),
     }
 }

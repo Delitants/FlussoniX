@@ -66,6 +66,7 @@ preserved or filtered, and HLS conversion produces WebVTT. Existing native
 codec/TLS/transcode suites retain their separate coverage; no new GPU hardware
 or live vendor qualification is claimed.
 
-Automatic route activation, HLS session retention, lease renewal and equivalent
-source failover remain required integration steps. Workers still stop at the
-existing lease deadline; this adapter alone is not a continuous production route.
+An explicit [shared-input renewal API](vendor-shared-renewal.md) can preserve
+equivalent workers beyond a discovery deadline. Automatic route activation, HLS
+session retention, scheduled renewal and source failover remain integration
+steps. Without successful explicit renewal, workers stop at the lease deadline.

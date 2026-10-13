@@ -1,4 +1,5 @@
 //! Opt-in modern freshness; wire timing and local lease lifetime are independent.
+mod renewal;
 use super::{ModernBoundCandidate, ModernBoundInventory};
 use crate::{
     m4_ingest::flussonic::MediaInput,
@@ -150,6 +151,7 @@ impl SourceAuthority {
                 expires_at: Instant::now() + lifetime,
             };
             state.lease_turn = Some(ticket.turn.clone());
+            state.renewal_turn = None;
             (snapshot, ticket)
         };
         let result = snapshot
