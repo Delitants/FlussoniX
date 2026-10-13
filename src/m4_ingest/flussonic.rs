@@ -22,6 +22,24 @@ pub struct MediaInput {
     requests: Requests,
 }
 impl MediaInput {
+    pub(crate) async fn pull_guarded<W: AsyncWrite + Unpin>(
+        &self,
+        output: &mut W,
+        hub: Option<&Hub>,
+        metadata: oneshot::Sender<Vec<Track>>,
+        options: PullOptions<'_>,
+        authority: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<(), String> {
+        super::consume_guarded(
+            &self.requests,
+            output,
+            hub,
+            Some(metadata),
+            options,
+            Some(authority),
+        )
+        .await
+    }
     /// The HTTP(S) root may include a trusted proxy prefix. `name` is the literal
     /// decoded stream name, never an escaped URL or protocol-suffixed path.
     /// Each path component is encoded once; the digest binds the original UTF-8.

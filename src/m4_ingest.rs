@@ -1,10 +1,12 @@
 //! Independent M4 HTTP ingest. Privileged peer credentials never follow redirects.
+mod authority;
 pub mod flussonic;
 use crate::{
     m4s::{Decoder, Event, PackedGop, Track},
     wire::{Hub, Segment},
     worker_ts::Muxer,
 };
+use authority::{Authority, check as check_authority};
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use std::{
@@ -84,6 +86,7 @@ struct SubtitlePolicy<'a> {
     sparse: bool,
     detected: Option<&'a AtomicU64>,
     conversion: Option<&'a crate::caption_hls::State>,
+    authority: Authority<'a>,
 }
 async fn configs<W: AsyncWrite + Unpin>(
     stdin: &mut W,
@@ -94,6 +97,7 @@ async fn configs<W: AsyncWrite + Unpin>(
     metadata: &mut Option<oneshot::Sender<Vec<Track>>>,
     policy: SubtitlePolicy<'_>,
 ) -> Result<(), String> {
+    check_authority(policy.authority)?;
     if let Some(state) = policy.conversion {
         state.native_tracks(&new);
     }
@@ -123,6 +127,7 @@ async fn configs<W: AsyncWrite + Unpin>(
     }
     let mut next = Muxer::new(&new)?;
     if let Some(sender) = metadata.take() {
+        check_authority(policy.authority)?;
         sender
             .send(new.clone())
             .map_err(|_| "native startup cancelled")?;
@@ -315,9 +320,25 @@ async fn consume<W: AsyncWrite + Unpin>(
     requests: &Requests,
     stdin: &mut W,
     hub: Option<&Hub>,
-    mut metadata: Option<oneshot::Sender<Vec<Track>>>,
+    metadata: Option<oneshot::Sender<Vec<Track>>>,
     subtitles: PullOptions<'_>,
 ) -> Result<(), String> {
+    consume_guarded(requests, stdin, hub, metadata, subtitles, None).await
+}
+async fn consume_guarded<W: AsyncWrite + Unpin>(
+    requests: &Requests,
+    output: &mut W,
+    hub: Option<&Hub>,
+    mut metadata: Option<oneshot::Sender<Vec<Track>>>,
+    subtitles: PullOptions<'_>,
+    authority: Authority<'_>,
+) -> Result<(), String> {
+    check_authority(authority)?;
+    let mut guarded = authority::Writer {
+        inner: output,
+        authority,
+    };
+    let stdin = &mut guarded;
     let PullOptions {
         preserve,
         detected,
@@ -331,14 +352,17 @@ async fn consume<W: AsyncWrite + Unpin>(
         sparse: is_m4f,
         detected,
         conversion,
+        authority,
     };
     let request = requests
         .get(requests.control.clone())?
         .header("X-Supported", "prepush,drop_status");
+    check_authority(authority)?;
     let response = tokio::time::timeout(Duration::from_secs(10), request.send())
         .await
         .map_err(|_| "media setup timed out")?
         .map_err(|_| "media connection failed")?;
+    check_authority(authority)?;
     if !requests.accepts(&response) {
         return Err("source rejected input".into());
     }
@@ -355,21 +379,26 @@ async fn consume<W: AsyncWrite + Unpin>(
             .map_err(|_| "source timed out")?
             .ok_or("source closed")?
             .map_err(|_| "transport failed")?;
+        check_authority(authority)?;
         if is_m4f {
             for n in signals.push(&bytes)? {
+                check_authority(authority)?;
                 if seen.contains(&n.name) {
                     continue;
                 }
                 let mut url = requests.base.clone();
                 url.set_path(&format!("{}/{}", requests.base.path(), n.name));
                 let request = requests.get(url)?.timeout(Duration::from_secs(10));
+                check_authority(authority)?;
                 let response = request.send().await.map_err(|_| "M4F fetch failed")?;
+                check_authority(authority)?;
                 if !requests.accepts(&response) {
                     return Err("M4F segment denied".into());
                 }
                 let mut body = BytesMut::new();
                 let mut chunks = response.bytes_stream();
                 while let Some(chunk) = chunks.next().await {
+                    check_authority(authority)?;
                     let chunk = chunk.map_err(|_| "M4F fetch failed")?;
                     if body.len() + chunk.len() > 16 * 1024 * 1024 {
                         return Err("M4F segment too large".into());
@@ -378,9 +407,11 @@ async fn consume<W: AsyncWrite + Unpin>(
                 }
                 let body = body.freeze();
                 let (new, frames) = crate::m4f::unpack(&body)?;
+                check_authority(authority)?;
                 if let Some(state) = conversion {
                     state.native_tracks(&new);
                     for f in &frames {
+                        check_authority(authority)?;
                         state.native_frame(&new, f);
                     }
                 }
@@ -411,6 +442,7 @@ async fn consume<W: AsyncWrite + Unpin>(
                     write_frame(stdin, &mut muxer, f).await?;
                 }
                 if let Some(hub) = hub {
+                    check_authority(authority)?;
                     let gop = PackedGop {
                         utc: n.utc,
                         dts_ms: source_start.unwrap() as f64 / 90.0,
@@ -435,6 +467,7 @@ async fn consume<W: AsyncWrite + Unpin>(
             }
         } else {
             for event in decoder.push(&bytes)? {
+                check_authority(authority)?;
                 match event {
                     Event::Info { tracks: new, wire } => {
                         configs(
@@ -448,6 +481,7 @@ async fn consume<W: AsyncWrite + Unpin>(
                         )
                         .await?;
                         if let Some(h) = hub {
+                            check_authority(authority)?;
                             let text = new.iter().any(|t| t.codec == "subtitle");
                             let output = if !preserve && text {
                                 crate::native_subtitles::info(&wire)?
@@ -483,6 +517,7 @@ async fn consume<W: AsyncWrite + Unpin>(
                         }
                         write_frame(stdin, &mut muxer, &f).await?;
                         if let Some(h) = hub {
+                            check_authority(authority)?;
                             if preserve
                                 || tracks
                                     .iter()
@@ -512,12 +547,14 @@ async fn consume<W: AsyncWrite + Unpin>(
                         )
                         .await?;
                         for f in &frames {
+                            check_authority(authority)?;
                             if let Some(state) = conversion {
                                 state.native_frame(&new, f);
                             }
                             write_frame(stdin, &mut muxer, f).await?;
                         }
                         if let Some(h) = hub {
+                            check_authority(authority)?;
                             if !preserve && new.iter().any(|t| t.codec == "subtitle") {
                                 let body = crate::native_subtitles::segment(&gop.body)?;
                                 let filtered = PackedGop { body, ..gop };
@@ -537,6 +574,7 @@ async fn consume<W: AsyncWrite + Unpin>(
                     }
                     Event::Other { wire } => {
                         if let Some(h) = hub {
+                            check_authority(authority)?;
                             h.m4s.send(wire)?;
                         }
                     }

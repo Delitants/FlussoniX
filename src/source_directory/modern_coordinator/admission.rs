@@ -1,10 +1,12 @@
 //! Opt-in direct-source viewer admission. No automatic routing or worker owner.
+mod pull;
 use super::{CoordinatedCandidate, CoordinationFailure, ModernSourceCoordinator};
 use crate::{
     m4_ingest::flussonic::MediaInput,
     playback_auth::{AuthOutcome, Grant, PlaybackAuth, ViewerRequest},
     source_directory::flussonic_config::CandidateView,
 };
+pub use pull::{PrivatePullFailure, PrivatePullOptions};
 
 /// Generic diagnostics contain no names, callback URLs or credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,13 +107,26 @@ impl ModernSourceCoordinator {
     /// Recheck the exact owner/config/source/refresh/lease and native revocation.
     /// This is an instant check, not a background revocation or lease renewal.
     pub fn admitted_current(&self, admitted: &AdmittedCandidate) -> Result<(), AdmissionFailure> {
-        self.at_admission_candidate(&admitted.candidate, &admitted.name, |_, _| {
-            if admitted.grant.is_cancelled() {
+        // Name and local precedence were established when this opaque admission
+        // was created. The identical config revision preserves those facts.
+        // Frequent frame/write checks need no media client/key allocation or
+        // stream-list scan; retain every owner/profile/refresh/expiry fence.
+        self.at_handle(&admitted.candidate.handle, || {
+            let guard = admitted
+                .candidate
+                .handle
+                .authority
+                .guard_modern_lease(&admitted.candidate.candidate)
+                .map_err(CoordinationFailure::Lease)?;
+            let result = if admitted.grant.is_cancelled() {
                 Err(AdmissionFailure::Revoked)
             } else {
                 Ok(())
-            }
+            };
+            guard.check().map_err(CoordinationFailure::Lease)?;
+            Ok(result)
         })
+        .map_err(AdmissionFailure::Coordination)?
     }
 
     /// Re-fence immediately before synchronous media handoff and promote the
