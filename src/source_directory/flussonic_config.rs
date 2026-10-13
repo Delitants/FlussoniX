@@ -1,5 +1,5 @@
 //! Complete local source projection and metadata-candidate publication fencing.
-//! Independent of daemon configuration/routing; no vendor runtime components.
+//! Shared with daemon source validation; no automatic routes or vendor components.
 mod binding;
 mod modern;
 use super::flussonic::InventoryClient;
@@ -28,6 +28,33 @@ const MAX_PROFILE_BYTES: usize = 1024 * 1024;
 const MAX_GROUP_BYTES: usize = 16 * 1024;
 const MAX_GROUPS: usize = 128;
 const MAX_PATTERNS: usize = 1024;
+
+/// Remove only daemon selection metadata and a validated derived transport.
+/// Complete-profile validation still rejects every unsupported native field.
+/// Unmarked rows remain available to explicit library callers; a marked native
+/// row must never be projected as a vendor source by mistake.
+pub(crate) fn normalized_modern_source(source: &Value) -> Result<Value, ProjectionFailure> {
+    let mut profile = source.clone();
+    let object = profile.as_object_mut().ok_or(ProjectionFailure::Invalid)?;
+    if let Some(kind) = object.remove("flussonix_source_kind")
+        && kind.as_str() != Some("flussonic")
+    {
+        return Err(ProjectionFailure::Unsupported);
+    }
+    if let Some(transport) = object.remove("flussonix_transport") {
+        let (_, expected) = crate::config::source_address(
+            object
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or(ProjectionFailure::Unsupported)?,
+        )
+        .map_err(|_| ProjectionFailure::Invalid)?;
+        if transport.as_str() != Some(expected) {
+            return Err(ProjectionFailure::Unsupported);
+        }
+    }
+    Ok(profile)
+}
 
 /// Diagnostics deliberately contain no endpoint, name, policy or credential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

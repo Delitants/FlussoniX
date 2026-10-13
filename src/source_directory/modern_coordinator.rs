@@ -374,26 +374,13 @@ impl SourcePreparation {
     }
 
     /// Prepare complete immutable clients with independent per-leg TLS trust.
-    /// Only the validated URL-derived transport is removed from normalized config;
-    /// unsupported native options fail instead of being silently discarded.
-    pub fn prepare(mut self, budget: Duration) -> Result<PreparedSource, CoordinationFailure> {
-        if let Some(transport) = self.source.get("flussonix_transport") {
-            let (_, expected) = crate::config::source_address(
-                self.source["url"]
-                    .as_str()
-                    .ok_or(CoordinationFailure::Unsupported)?,
-            )
-            .map_err(|_| CoordinationFailure::Invalid)?;
-            if transport.as_str() != Some(expected) {
-                return Err(CoordinationFailure::Unsupported);
-            }
-            self.source
-                .as_object_mut()
-                .ok_or(CoordinationFailure::Invalid)?
-                .remove("flussonix_transport");
-        }
-        let authority = SourceAuthority::new_modern(&self.source, &self.backends, budget)
-            .map_err(projection)?;
+    /// Daemon selection metadata and validated derived transport are the only
+    /// removed fields; complete-profile validation rejects unsupported options.
+    pub fn prepare(self, budget: Duration) -> Result<PreparedSource, CoordinationFailure> {
+        let source =
+            super::flussonic_config::normalized_modern_source(&self.source).map_err(projection)?;
+        let authority =
+            SourceAuthority::new_modern(&source, &self.backends, budget).map_err(projection)?;
         Ok(PreparedSource {
             stamp: self.stamp,
             authority: Arc::new(authority),

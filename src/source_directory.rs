@@ -10,6 +10,12 @@ pub enum LookupFailure {
     Absent,
     Invalid,
 }
+/// Unknown or malformed type claims also fail closed before native credential I/O.
+pub(crate) fn native_source(source: &Value) -> bool {
+    source
+        .get("flussonix_source_kind")
+        .is_none_or(|kind| kind.as_str() == Some("native"))
+}
 /// Select a source namespace without renaming the upstream stream. Exclusions
 /// are relative to that namespace; without a prefix they use full stream names.
 /// A subtree pattern does not exclude its parent name or a similar sibling prefix.
@@ -45,6 +51,9 @@ pub async fn query(
     default_key: &str,
 ) -> Result<Value, LookupFailure> {
     tokio::time::timeout(Duration::from_millis(750), async {
+        if !native_source(source) {
+            return Err(LookupFailure::Invalid);
+        }
         crate::config::valid_name(name).map_err(|_| LookupFailure::Invalid)?;
         if !allows(source, name) {
             return Err(LookupFailure::Absent);
@@ -139,6 +148,9 @@ pub(crate) async fn inventory(
     default_key: &str,
 ) -> Result<Vec<String>, LookupFailure> {
     tokio::time::timeout(Duration::from_millis(750), async {
+        if !native_source(source) {
+            return Err(LookupFailure::Invalid);
+        }
         let mut url = url::Url::parse(source["api_url"].as_str().ok_or(LookupFailure::Invalid)?)
             .map_err(|_| LookupFailure::Invalid)?;
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
@@ -201,3 +213,31 @@ pub(crate) async fn inventory(
 }
 
 pub mod modern_coordinator;
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    #[tokio::test]
+    async fn native_inventory_rejects_vendor_and_unknown_kind_without_dialing() {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for kind in [
+            serde_json::json!("flussonic"),
+            serde_json::json!("unknown"),
+            serde_json::json!(null),
+        ] {
+            let row = serde_json::json!({"api_url":format!("http://{}",tcp.local_addr().unwrap()),"flussonix_source_kind":kind});
+            assert_eq!(
+                inventory(&client, &row, "owned-unused-peer-key")
+                    .await
+                    .err(),
+                Some(LookupFailure::Invalid)
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), tcp.accept())
+                .await
+                .is_err()
+        );
+    }
+}

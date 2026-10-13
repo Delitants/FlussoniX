@@ -103,8 +103,10 @@ impl App {
             .unwrap()
             .iter()
             .filter(|s| {
-                !s.get("only")
-                    .is_some_and(|v| v.as_array().is_some_and(Vec::is_empty))
+                crate::source_directory::native_source(s)
+                    && !s
+                        .get("only")
+                        .is_some_and(|v| v.as_array().is_some_and(Vec::is_empty))
             })
             .cloned()
             .collect::<Vec<_>>();

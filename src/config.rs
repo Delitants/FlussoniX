@@ -1,3 +1,4 @@
+mod vendor_sources;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -380,6 +381,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
             "at most 64 sources may keep streams active; set other sources to On demand".into(),
         );
     }
+    vendor_sources::validate_count(root)?;
     let mut groups = std::collections::HashMap::new();
     for source in root["sources"].as_array().into_iter().flatten() {
         if let Some(group) = source["flussonix_source_group"].as_str() {
@@ -453,9 +455,14 @@ fn validate_root(root: &Value) -> Result<(), String> {
                 _ => &[],
             };
             for key in item.as_object().ok_or("item must be an object")?.keys() {
-                if !allowed.contains(&key.as_str()) {
+                if !allowed.contains(&key.as_str())
+                    && !(*kind == "sources" && vendor_sources::FIELDS.contains(&key.as_str()))
+                {
                     return Err(format!("{kind} option {key} is not implemented"));
                 }
+            }
+            if *kind == "sources" {
+                vendor_sources::validate(item, root)?;
             }
             for (field, scheme) in [
                 ("flussonix_rtsp_url", "rtsp"),

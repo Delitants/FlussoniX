@@ -469,6 +469,7 @@ impl App {
                     .take(sources.len())
                     .filter(|s| {
                         *s != &m.source
+                            && crate::source_directory::native_source(s)
                             && s["drain"] != true
                             && allows(s, name)
                             && s["flussonix_source_group"].as_str() == group
@@ -481,7 +482,11 @@ impl App {
         } else {
             sources
                 .iter()
-                .filter(|s| s["drain"] != true && allows(s, name))
+                .filter(|s| {
+                    crate::source_directory::native_source(s)
+                        && s["drain"] != true
+                        && allows(s, name)
+                })
                 .cloned()
                 .collect()
         };
