@@ -1,5 +1,6 @@
 //! Opt-in modern source lifecycle. Native routing never selects these handles.
 //! Lock order: ConfigStore -> coordinator -> SourceAuthority; no lock across I/O.
+mod admission;
 mod relay;
 use super::{
     flussonic::modern::ObservedServerId,
@@ -9,6 +10,7 @@ use super::{
     },
 };
 use crate::{config::ConfigStore, m4_ingest::flussonic::MediaInput};
+pub use admission::{AdmissionFailure, AdmissionOutcome, AdmittedCandidate};
 use relay::RelayRoutes;
 pub use relay::{RelayCandidate, RelayFailure, RelayHop, RelayRoute};
 use serde_json::Value;
@@ -53,7 +55,8 @@ struct State {
 }
 /// Owns the exact configuration store and startup local identity. No Debug or
 /// serialization: internal preparations retain privileged source credentials.
-/// This does not enable vendor routing, relay, viewer admission or worker reuse.
+/// This does not enable automatic vendor routing or worker reuse. Explicit
+/// direct-source viewer admission is opt-in through admit/publish_admitted.
 pub struct ModernSourceCoordinator {
     config: Arc<ConfigStore>,
     owner: Arc<()>,
@@ -246,8 +249,15 @@ impl ModernSourceCoordinator {
         handle: &SourceHandle,
         read: impl FnOnce() -> Result<T, CoordinationFailure>,
     ) -> Result<T, CoordinationFailure> {
+        self.at_handle_root(handle, |_| read())
+    }
+    fn at_handle_root<T>(
+        &self,
+        handle: &SourceHandle,
+        read: impl FnOnce(&Value) -> Result<T, CoordinationFailure>,
+    ) -> Result<T, CoordinationFailure> {
         self.config
-            .at_revision(handle.stamp.revision, |_| {
+            .at_revision(handle.stamp.revision, |root| {
                 let state = self.state()?;
                 self.check(&handle.stamp, &state)?;
                 if !state
@@ -257,7 +267,7 @@ impl ModernSourceCoordinator {
                 {
                     return Err(CoordinationFailure::Stale);
                 }
-                let result = read();
+                let result = read(root);
                 drop(state);
                 result
             })

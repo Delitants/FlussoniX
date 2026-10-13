@@ -149,14 +149,17 @@ objects before projection; never treat unknown membership or missing policy as
 public. Preserve local stream precedence and source selection/exclusion rules.
 The current explicit adapter is available without changing the native schema.
 
-Viewer admission must use the existing authorizer before opening private media.
+The [explicit direct-source admission adapter](vendor-viewer-admission.md) now
+uses the existing authorizer before private-media handoff and rechecks candidate
+fences after callbacks. Automatic daemon admission must use that same authorizer
+before opening private media.
 Because callbacks await, recheck configuration, source generation, lease,
 content identity and equivalent failover policy after admission and immediately
 before activation. Do not hold publication locks across an await. Configuration
 replacement must retire affected workers and sessions; copying a policy out of
-a synchronous publication closure does not authorize later reuse. These runtime
-steps, friendly persisted controls and automatic vendor source activation remain
-pending.
+a synchronous publication closure does not authorize later reuse. Worker lifetime
+integration, relay admission, friendly persisted controls and automatic vendor
+source activation remain pending.
 
 
 The [source configuration authority](vendor-source-authority.md) now validates a

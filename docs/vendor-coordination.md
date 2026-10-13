@@ -37,7 +37,8 @@ has unresolved policy by default. The explicit with_policy step accepts only
 local source/group policy objects and validates them against captured backends;
 those settings are frozen into the same ordered prepared source generation.
 Changing policy requires a new capture/prepare/install, with the same replacement
-fences. This library API is not an operator UI or viewer admission implementation.
+fences. This policy preparation step alone grants no viewer permission and is
+not an operator UI.
 
 The optional `with_policy_templates(source, groups, templates)` step supports
 explicit local policy-only template defaults before direct source/group fields.
@@ -47,6 +48,14 @@ unsupported templates fail; neither remote inventory nor general-purpose native
 stream templates are implicitly imported. Frozen inputs and the same global
 revision/generation fences apply. See [viewer policy](vendor-viewer-policy.md#explicit-local-templates)
 for precedence, bounds and the pending daemon integration.
+
+Explicit direct-source viewer admission is now available through `admit`,
+`admitted_current` and `publish_admitted`, using the embedding owner's existing
+native authorizer. It checks local stream precedence before policy publication
+and rechecks all candidate fences after callbacks and before media handoff.
+See [viewer admission](vendor-viewer-admission.md) for lifetime requirements and
+the distinction between native grant revocation and source/configuration changes.
+Automatic resolver activation, relay admission and worker ownership are pending.
 
 Refresh uses the existing latest-turn, start-based (0,30s] lease; all local aliases
 are checked at the first config probe before page requests. Publication holds
