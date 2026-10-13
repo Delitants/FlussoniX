@@ -225,7 +225,7 @@ async fn vendor_http_placement_pending_policy_edit_cannot_redeem_or_pull() {
     f.stop().await;
 }
 
-async fn check_native_lb_vendor_cdn(file: &str) {
+pub(super) async fn check_native_lb_vendor_cdn(file: &str, discovery: bool) {
     use sha2::{Digest, Sha256};
     let guard = format!("{:x}", Sha256::digest(b"viewer"));
     let f = Fixture::variant(json!({"flussonix_token_sha256":guard}), "m4s", "cdn").await;
@@ -247,13 +247,33 @@ async fn check_native_lb_vendor_cdn(file: &str) {
         },
     )
     .unwrap();
-    lb.config
-        .put(
-            "streams",
-            "owned",
-            json!({"static":false,"flussonix_token_sha256":guard}),
-        )
-        .unwrap();
+    if discovery {
+        let source = f.app.config.snapshot()["sources"][0].clone();
+        lb.config.put("sources", &f.source, source).unwrap();
+        assert!(
+            lb.config.snapshot()["streams"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    } else {
+        lb.config
+            .put(
+                "streams",
+                "owned",
+                json!({"static":false,"flussonix_token_sha256":guard}),
+            )
+            .unwrap();
+    }
+    let lb_cancel = CancellationToken::new();
+    let lb_owner = if discovery {
+        let a = lb.clone();
+        let c = lb_cancel.clone();
+        Some(tokio::spawn(async move { a.run_vendor_playback(c).await }))
+    } else {
+        None
+    };
+    tokio::task::yield_now().await;
     lb.config
         .put(
             "peers",
@@ -300,8 +320,24 @@ async fn check_native_lb_vendor_cdn(file: &str) {
         )
         .await
         .unwrap();
-    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
-    assert!(f.calls.lock().unwrap().is_empty());
+    let denied_status = denied.status();
+    if denied_status != StatusCode::FORBIDDEN {
+        lb_cancel.cancel();
+        if let Some(task) = lb_owner {
+            assert!(task.await.unwrap().is_ok());
+        }
+        cdn_server.abort();
+        let _ = cdn_server.await;
+        lb.media.stop_all().await;
+        f.stop().await;
+        assert_eq!(denied_status, StatusCode::FORBIDDEN);
+        return;
+    }
+    assert_eq!(f.media_calls(), 0);
+    if !discovery {
+        assert!(f.calls.lock().unwrap().is_empty());
+    }
+    let discovery_calls = f.calls.lock().unwrap().len();
     let response = service
         .oneshot(
             Request::builder()
@@ -317,10 +353,15 @@ async fn check_native_lb_vendor_cdn(file: &str) {
     assert!(destination.contains("flussonix_ticket="));
     assert!(!destination.contains("owned-private-cluster-key"));
     assert!(!destination.contains("owned-native-peer-key"));
-    assert!(
-        f.calls.lock().unwrap().is_empty(),
-        "LB contacted vendor management or media"
+    assert_eq!(f.media_calls(), 0, "LB pulled vendor media");
+    assert_eq!(
+        f.calls.lock().unwrap().len(),
+        discovery_calls,
+        "LB repeated cached source discovery"
     );
+    if discovery {
+        assert!(discovery_calls > 0);
+    }
     let redeemed = client.get(&destination).send().await.unwrap();
     assert_eq!(redeemed.status(), StatusCode::FOUND);
     let clean = redeemed.headers()["location"].to_str().unwrap().to_owned();
@@ -380,7 +421,14 @@ async fn check_native_lb_vendor_cdn(file: &str) {
         drop(body);
     }
     assert_eq!(f.media_calls(), 1);
+    if discovery {
+        lb.reconcile().await;
+    }
     assert_eq!(lb.media.count().await, 0);
+    lb_cancel.cancel();
+    if let Some(task) = lb_owner {
+        assert!(task.await.unwrap().is_ok());
+    }
     cdn_server.abort();
     let _ = cdn_server.await;
     lb.media.stop_all().await;
@@ -411,11 +459,11 @@ async fn check_native_lb_vendor_cdn(file: &str) {
 
 #[tokio::test]
 async fn native_lb_delivers_vendor_backed_cdn_without_origin_credentials_or_lb_worker() {
-    check_native_lb_vendor_cdn("m4s").await;
+    check_native_lb_vendor_cdn("m4s", false).await;
 }
 #[tokio::test]
 async fn native_lb_delivers_vendor_backed_hls_with_guarded_decodable_segments() {
-    check_native_lb_vendor_cdn("index.m3u8").await;
+    check_native_lb_vendor_cdn("index.m3u8", false).await;
 }
 
 #[tokio::test]

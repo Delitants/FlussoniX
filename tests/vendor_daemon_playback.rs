@@ -1,4 +1,6 @@
 //! Real daemon HTTP playback uses owned vendor management/private endpoints.
+#[path = "support/tls.rs"]
+mod tls_fixture;
 #[path = "support/vendor_media_ack.rs"]
 mod vendor_fixture;
 use axum::{
@@ -907,8 +909,6 @@ async fn held_callback_cannot_authorize_private_media_after_source_change() {
 }
 #[tokio::test]
 async fn https_vendor_playback_works_and_callback_redirect_cannot_downgrade() {
-    #[path = "support/tls.rs"]
-    mod tls_fixture;
     let f = Fixture::new(json!({"on_play":"true"})).await;
     let cert = tls_fixture::Certificates::new();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1357,8 +1357,14 @@ async fn m4f_source_serves_original_multitrack_segment_and_hls_through_daemon() 
 async fn vendor_lb_tickets_and_invalid_files_fail_before_source_io() {
     let f = Fixture::variant(json!({"on_play":"true"}), "m4s", "lb").await;
     assert_eq!(
-        f.get("/owned/index.m3u8").await.status(),
+        f.get("/owned/index.m3u8?flussonix_ticket=unsupported")
+            .await
+            .status(),
         StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        f.get("/owned/config.json").await.status(),
+        StatusCode::NOT_FOUND
     );
     assert!(f.calls.lock().unwrap().is_empty());
     f.stop().await;
@@ -1499,3 +1505,6 @@ async fn fmp4_hls_child_segments_are_guarded_and_decode_with_init() {
 
 #[path = "vendor_daemon_playback/placement.rs"]
 mod placement;
+
+#[path = "vendor_daemon_playback/balancer.rs"]
+mod balancer;

@@ -72,7 +72,7 @@ impl HttpRequest {
     }
 }
 impl Runtime {
-    pub(crate) async fn serve(&self, app: &App, request: HttpRequest) -> Response {
+    pub(crate) async fn serve(&self, app: &Arc<App>, request: HttpRequest) -> Response {
         let HttpRequest {
             raw_path,
             name,
@@ -84,12 +84,6 @@ impl Runtime {
             secure,
         } = request;
         let (name, file, key) = (name.as_str(), file.as_str(), key.as_str());
-        if app.options.role == "lb" {
-            return error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "vendor load balancing is not configured",
-            );
-        }
         if app.modern_source_coordinator().is_err() || !self.running() {
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -97,7 +91,7 @@ impl Runtime {
             );
         }
         if let Some(ticket) = query.get("flussonix_ticket")
-            && !app.vendor_http_ticket_current(name, ticket).await
+            && (app.options.role == "lb" || !app.vendor_http_ticket_current(name, ticket).await)
         {
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -116,16 +110,7 @@ impl Runtime {
             Err(Failure::Absent) => return error(StatusCode::NOT_FOUND, "stream not found"),
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "vendor source unavailable"),
         };
-        let hls = !matches!(file, "mpegts" | "m4s" | "m4f") && !file.ends_with(".m4f");
-        let settings = match self.output_settings(app, key, candidate.config_revision()) {
-            Ok(settings) => settings,
-            Err(_) => {
-                return error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "vendor processing unavailable",
-                );
-            }
-        };
+        let output_revision = candidate.config_revision();
         let outcome = tokio::select! {biased;_=self.closed.cancelled()=>return error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),outcome=self.owner.admit(candidate,&app.playback_auth,viewer)=>outcome};
         let admission = match outcome {
             Ok(AdmissionOutcome::Allowed(a)) => a,
@@ -140,6 +125,22 @@ impl Runtime {
                 return (StatusCode::FOUND, [("location", url)]).into_response();
             }
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "vendor authority changed"),
+        };
+        if app.options.role == "lb" {
+            return tokio::select! {biased;
+                _=self.closed.cancelled()=>error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),
+                response=app.balance_vendor(&self.owner,&admission,&raw_path,&query,secure)=>response,
+            };
+        }
+        let hls = !matches!(file, "mpegts" | "m4s" | "m4f") && !file.ends_with(".m4f");
+        let settings = match self.output_settings(app, key, output_revision) {
+            Ok(settings) => settings,
+            Err(_) => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "vendor processing unavailable",
+                );
+            }
         };
         if let Some(ticket) = query.get("flussonix_ticket") {
             if !app

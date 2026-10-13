@@ -1832,6 +1832,7 @@ mod admission;
 mod http_balancer;
 mod http_tickets;
 pub(crate) mod rtsp_balancer;
+mod vendor_balancer;
 
 #[path = "source_activation.rs"]
 mod source_activation;
@@ -1903,3 +1904,6 @@ mod vendor_namespace_tests {
         app.media.stop_all().await;
     }
 }
+
+#[cfg(test)]
+mod test_vendor_admission;

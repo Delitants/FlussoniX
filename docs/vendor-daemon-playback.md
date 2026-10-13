@@ -19,8 +19,9 @@ streams. Exclusions return 404. One prefixless vendor source reserves every
 nonlocal name; overlapping vendor namespaces return 503 before discovery. There
 is no native fallback on vendor absence, denial or error. Native RTSP/SRT
 resolution also cannot cross a reserved vendor namespace. A native FlussoniX LB can redirect to a vendor-backed FlussoniX CDN using
-[HTTP placement tickets](vendor-cdn-placement.md). Direct vendor-source profiles
-on the LB still return 503 before discovery. Vendor failover, static demand and
+[HTTP placement tickets](vendor-cdn-placement.md). Configured vendor sources on
+the LB discover and authorize names through the same bounded catalog, without
+local stream rows or any LB media pull. Vendor failover, static demand and
 RTSP/SRT delivery need further work.
 
 Every HTTP request passes current source/local policy and the App's actual native

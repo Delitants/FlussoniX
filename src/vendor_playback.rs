@@ -165,7 +165,7 @@ impl Runtime {
             })
             .ok_or(Failure::Unavailable)?
     }
-    /// Publish only an already managed current policy for the admin reauth API.
+    /// Publish an already current managed/CDN or active LB catalog policy.
     /// This never discovers a source, attaches media, or creates a viewer grant.
     pub(crate) fn publish_current_policy(&self, app: &App, name: &str) -> bool {
         if !self.running() || app.modern_source_coordinator().is_err() {
@@ -176,7 +176,20 @@ impl Runtime {
         else {
             return false;
         };
-        let Ok(candidate) = self.inputs.current_candidate(name) else {
+        let candidate = if app.options.role == "lb" {
+            if !app
+                .playback_auth
+                .snapshots()
+                .iter()
+                .any(|row| row["name"] == name)
+            {
+                return false;
+            }
+            self.catalog_candidate(&key, revision, name)
+        } else {
+            self.inputs.current_candidate(name).ok()
+        };
+        let Some(candidate) = candidate else {
             return false;
         };
         if candidate.source_key() != key || candidate.config_revision() != revision {
@@ -189,6 +202,24 @@ impl Runtime {
                     .is_some()
             })
             .unwrap_or(false)
+    }
+    fn catalog_candidate(
+        &self,
+        key: &str,
+        revision: u64,
+        name: &str,
+    ) -> Option<CoordinatedCandidate> {
+        // Admin reauth is read-only: never wait for or start a catalog refresh.
+        // Release cache locks before the coordinator's publication fence.
+        let slot = {
+            let caches = self.caches.try_lock().ok()?;
+            if caches.revision != revision {
+                return None;
+            }
+            caches.sources.get(key)?.clone()
+        };
+        let cache = slot.try_lock().ok()?;
+        cache.inventory.as_ref()?.candidate(name).ok()
     }
     async fn candidate(
         &self,

@@ -99,77 +99,11 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source_directory::modern_coordinator::AdmissionOutcome;
-    async fn admitted_source(
-        lifetime: Duration,
-    ) -> (
-        tempfile::TempDir,
-        Arc<App>,
-        Box<AdmittedCandidate>,
-        tokio::task::JoinHandle<()>,
-        String,
-    ) {
-        use axum::{extract::OriginalUri, routing::get};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let key = format!("m4s://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            axum::serve(listener,Router::new().fallback(get(|OriginalUri(uri):OriginalUri,headers:HeaderMap| async move {
-                assert!(headers.contains_key("authorization"));
-                assert!(!headers.contains_key("x-flussonix-peer"));
-                let value=if uri.path().ends_with("/config") {json!({"stats":{"id":"owned-origin"}})}
-                    else {assert_eq!(uri.path(),"/streamer/api/v3/streams");json!({"server_id":"owned-origin","streams":[{"name":"owned","groups":[],"static":true,"named_by":"config"}]})};
-                json_response(value)
-            }))).await.unwrap()
-        });
-        let dir = tempfile::tempdir().unwrap();
-        let app = App::new(
-            dir.path().join("config.json"),
-            dir.path().join("media"),
-            Options {
-                admin_password: "owned-admin-key".into(),
-                peer_key: "owned-peer-key".into(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        app.config.put("sources",&key,json!({"flussonix_source_kind":"flussonic","cluster_key":"owned-vendor-key","on_play":"true"})).unwrap();
-        let owner = app.modern_sources.as_ref().unwrap().clone();
-        let handle = owner
-            .install(
-                owner
-                    .capture(&key)
-                    .unwrap()
-                    .prepare(Duration::from_secs(3))
-                    .unwrap(),
-            )
-            .unwrap();
-        let rows = owner.inventory(&handle, lifetime).await.unwrap();
-        let outcome = owner
-            .admit(
-                rows.candidate("owned").unwrap(),
-                &app.playback_auth,
-                ViewerRequest {
-                    name: "owned".into(),
-                    proto: "m4s".into(),
-                    ip: "127.0.0.1".into(),
-                    token: String::new(),
-                    qs: String::new(),
-                    user_agent: String::new(),
-                    referer: String::new(),
-                    host: String::new(),
-                },
-            )
-            .await
-            .unwrap();
-        let AdmissionOutcome::Allowed(admitted) = outcome else {
-            panic!("owned explicit policy rejected")
-        };
-        assert!(owner.admitted_current(&admitted).is_ok());
-        (dir, app, admitted, server, key)
-    }
+    use crate::server::test_vendor_admission::admitted_source;
     #[tokio::test]
     async fn post_commit_lease_expiry_restores_still_valid_http_reservation() {
-        let (_dir, app, admitted, server, _key) = admitted_source(Duration::from_secs(2)).await;
+        let (_dir, app, admitted, server, _key) =
+            admitted_source(Duration::from_secs(2), "standalone", None).await;
         let owner = app.modern_sources.as_ref().unwrap().clone();
         let mut ledger = app.reservations.lock().await;
         ledger.insert(
@@ -206,7 +140,8 @@ mod tests {
     }
     #[tokio::test]
     async fn admitted_source_change_while_ledger_waits_leaves_ticket_unconsumed() {
-        let (_dir, app, admitted, server, key) = admitted_source(Duration::from_secs(30)).await;
+        let (_dir, app, admitted, server, key) =
+            admitted_source(Duration::from_secs(30), "standalone", None).await;
         let owner = app.modern_sources.as_ref().unwrap().clone();
         let mut ledger = app.reservations.lock().await;
         ledger.insert(

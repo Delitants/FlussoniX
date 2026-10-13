@@ -38,6 +38,10 @@ pub struct AdmittedCandidate {
     grant: Grant,
 }
 impl AdmittedCandidate {
+    /// Native placement borrows authority; no input ownership is transferred.
+    pub(crate) fn control_route(&self) -> (&str, &Grant, u64) {
+        (&self.name, &self.grant, self.candidate.config_revision())
+    }
     /// Grant revocation only; use admitted_current for source/config/lease checks.
     pub fn is_cancelled(&self) -> bool {
         self.grant.is_cancelled()
