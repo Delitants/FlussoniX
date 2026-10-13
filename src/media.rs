@@ -4,7 +4,10 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use shared::StartMode;
-pub use shared::{PackagedPlayback, PackagedSubscription, SharedPackagingFailure};
+pub use shared::{
+    HlsSessionFailure, PackagedPlayback, PackagedSubscription, SharedHlsOptions, SharedHlsSessions,
+    SharedPackagingFailure,
+};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},

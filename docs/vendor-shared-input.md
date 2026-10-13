@@ -54,8 +54,9 @@ locks. Output hubs are closed by their owning input generation only.
 The [packaging adapter](vendor-shared-packaging.md) now connects this input to the
 existing FFmpeg/HLS worker with a separate bounded mandatory pipe. An explicit
 [renewal API](vendor-shared-renewal.md) preserves equivalent current managed
-routes. Automatic discovery selection, scheduled renewal, policy-equivalent
-failover, persisted operator settings and load routing remain integration work. Native daemon workers keep
+routes. The [session owner](vendor-hls-sessions.md) supplies bounded retention
+and scheduled renewal. Automatic discovery selection, policy-equivalent failover,
+persisted operator settings and load routing remain integration work. Native daemon workers keep
 their current behavior.
 
 The owned `vendor_shared_input` suite exercises actual private HTTP, independent

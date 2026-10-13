@@ -1,8 +1,10 @@
 //! Opt-in packaging of an already admitted shared private input.
+mod sessions;
 use super::*;
 use crate::source_directory::modern_coordinator::{
     SharedFailure, SharedFeed, SharedInput, SharedInputAttachment, SharedViewer,
 };
+pub use sessions::{HlsSessionFailure, SharedHlsOptions, SharedHlsSessions};
 use std::collections::VecDeque;
 
 #[derive(Default)]

@@ -34,6 +34,7 @@ pub enum AdmissionOutcome {
 pub struct AdmittedCandidate {
     candidate: CoordinatedCandidate,
     name: String,
+    proto: String,
     grant: Grant,
 }
 impl AdmittedCandidate {
@@ -86,6 +87,7 @@ impl ModernSourceCoordinator {
         request: ViewerRequest,
     ) -> Result<AdmissionOutcome, AdmissionFailure> {
         let name = request.name.clone();
+        let proto = request.proto.clone();
         let snapshot = self.at_admission_candidate(&candidate, &name, |view, _| {
             auth.publish(view.name, Some(view.policy.clone()))
                 .ok_or(AdmissionFailure::Unavailable)
@@ -103,6 +105,7 @@ impl ModernSourceCoordinator {
             AuthOutcome::Allowed(grant) => AdmissionOutcome::Allowed(Box::new(AdmittedCandidate {
                 candidate,
                 name,
+                proto,
                 grant,
             })),
             AuthOutcome::Denied => AdmissionOutcome::Denied,

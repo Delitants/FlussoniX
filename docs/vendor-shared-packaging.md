@@ -67,6 +67,6 @@ codec/TLS/transcode suites retain their separate coverage; no new GPU hardware
 or live vendor qualification is claimed.
 
 An explicit [shared-input renewal API](vendor-shared-renewal.md) can preserve
-equivalent workers beyond a discovery deadline. Automatic route activation, HLS
-session retention, scheduled renewal and source failover remain integration
-steps. Without successful explicit renewal, workers stop at the lease deadline.
+equivalent workers beyond a discovery deadline. The opt-in
+[session owner](vendor-hls-sessions.md) supplies HLS retention and scheduled
+renewal. Automatic route activation and source failover remain integration steps. Without successful explicit renewal, workers stop at the lease deadline.

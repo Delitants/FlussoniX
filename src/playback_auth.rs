@@ -255,6 +255,9 @@ pub struct Grant {
     cancel: CancellationToken,
 }
 impl Grant {
+    pub(crate) fn session_identity(&self) -> Option<&str> {
+        self.entry.as_ref().map(|entry| entry.id.as_str())
+    }
     /// Promote a control admission only once it will acquire playback media.
     pub(crate) fn playback(&self) {
         if let Some(e) = &self.entry {

@@ -103,6 +103,12 @@ pub struct CoordinatedCandidate {
     handle: SourceHandle,
     candidate: ModernLeasedCandidate,
 }
+impl SourceHandle {
+    // Process-local grouping only; retained handles prevent pointer reuse.
+    pub(crate) fn generation_key(&self) -> usize {
+        Arc::as_ptr(&self.authority) as usize
+    }
+}
 impl ModernSourceCoordinator {
     /// The owner supplies its actual startup identity, not a per-request claim.
     /// Primary identity changes require a new owner; aliases are explicit only.

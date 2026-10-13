@@ -2,7 +2,12 @@
 #[path = "support/vendor_media_ack.rs"]
 mod vendor_fixture;
 use axum::{
-    Router, body::Body, extract::OriginalUri, http::HeaderMap, response::Response, routing::get,
+    Router,
+    body::Body,
+    extract::OriginalUri,
+    http::{HeaderMap, StatusCode},
+    response::Response,
+    routing::get,
 };
 use bytes::Bytes;
 use flussonix::{
@@ -30,6 +35,11 @@ struct Connection {
     path: String,
     feed: Feed,
 }
+struct InventoryControl {
+    status: StatusCode,
+    streams: serde_json::Value,
+    hold: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+}
 struct Fixture {
     _dir: tempfile::TempDir,
     config: Arc<ConfigStore>,
@@ -39,6 +49,7 @@ struct Fixture {
     headers: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     connections: mpsc::UnboundedReceiver<Connection>,
     calls: Arc<Mutex<Vec<String>>>,
+    remote: Arc<Mutex<InventoryControl>>,
     server: tokio::task::JoinHandle<()>,
 }
 impl Drop for Fixture {
@@ -53,25 +64,61 @@ impl Fixture {
         let key = root.replacen("http", if m4f { "m4f" } else { "m4s" }, 1);
         let calls = Arc::new(Mutex::new(vec![]));
         let headers: Arc<Mutex<Option<oneshot::Receiver<()>>>> = Arc::new(Mutex::new(None));
+        let remote = Arc::new(Mutex::new(InventoryControl {
+            status: StatusCode::OK,
+            streams: json!([{"name":NAME,"groups":[],"named_by":"config","static":true}]),
+            hold: None,
+        }));
+        let control = remote.clone();
         let (tx, connections) = mpsc::unbounded_channel();
         let (paths, held) = (calls.clone(), headers.clone());
-        let router=Router::new().fallback(get(move |OriginalUri(uri):OriginalUri,header:HeaderMap| {
-            let(paths,held,tx)=(paths.clone(),held.clone(),tx.clone());
-            async move {
-                paths.lock().unwrap().push(uri.path().to_owned());
-                if uri.path().starts_with("/owned/") {
-                    assert!(header.contains_key("cluster-auth-key"));assert!(!header.contains_key("authorization"));
-                    let(feed,rx)=mpsc::unbounded_channel();tx.send(Connection{path:uri.path().into(),feed}).unwrap();
-                    let pause=held.lock().unwrap().take();if let Some(pause)=pause {let _=pause.await;}
-                    return Response::new(Body::from_stream(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)));
+        let router = Router::new().fallback(get(
+            move |OriginalUri(uri): OriginalUri, header: HeaderMap| {
+                let (paths, held, tx, control) =
+                    (paths.clone(), held.clone(), tx.clone(), control.clone());
+                async move {
+                    paths.lock().unwrap().push(uri.path().to_owned());
+                    if uri.path().starts_with("/owned/") || uri.path().starts_with("/owned-alt/") {
+                        assert!(header.contains_key("cluster-auth-key"));
+                        assert!(!header.contains_key("authorization"));
+                        let (feed, rx) = mpsc::unbounded_channel();
+                        tx.send(Connection {
+                            path: uri.path().into(),
+                            feed,
+                        })
+                        .unwrap();
+                        let pause = held.lock().unwrap().take();
+                        if let Some(pause) = pause {
+                            let _ = pause.await;
+                        }
+                        return Response::new(Body::from_stream(
+                            tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+                        ));
+                    }
+                    assert!(header.contains_key("authorization"));
+                    assert!(!header.contains_key("cluster-auth-key"));
+                    let (value, status, pause) = if uri.path().ends_with("/config") {
+                        (json!({"stats":{"id":"owned-origin"}}), StatusCode::OK, None)
+                    } else {
+                        assert_eq!(uri.path(), "/streamer/api/v3/streams");
+                        let mut control = control.lock().unwrap();
+                        (
+                            json!({"server_id":"owned-origin","streams":control.streams}),
+                            control.status,
+                            control.hold.take(),
+                        )
+                    };
+                    if let Some((started, release)) = pause {
+                        let _ = started.send(());
+                        let _ = release.await;
+                    }
+                    Response::builder()
+                        .status(status)
+                        .body(Body::from(value.to_string()))
+                        .unwrap()
                 }
-                assert!(header.contains_key("authorization"));assert!(!header.contains_key("cluster-auth-key"));
-                let value=if uri.path().ends_with("/config") {json!({"stats":{"id":"owned-origin"}})} else {
-                    assert_eq!(uri.path(),"/streamer/api/v3/streams");json!({"server_id":"owned-origin","streams":[{"name":NAME,"groups":[],"named_by":"config","static":true}]})
-                };
-                Response::new(Body::from(value.to_string()))
-            }
-        }));
+            },
+        ));
         let server = tokio::spawn(async move {
             axum::serve(listener, vendor_fixture::acknowledge_media(router))
                 .await
@@ -97,6 +144,7 @@ impl Fixture {
             headers,
             connections,
             calls,
+            remote,
             server,
         }
     }
@@ -132,7 +180,7 @@ impl Fixture {
             .lock()
             .unwrap()
             .iter()
-            .filter(|p| p.starts_with("/owned/"))
+            .filter(|p| p.starts_with("/owned/") || p.starts_with("/owned-alt/"))
             .count()
     }
 }
@@ -1127,4 +1175,771 @@ async fn equivalent_lease_renewal_keeps_live_packager_and_hls_after_old_deadline
     feeder.abort();
     let _ = feeder.await;
     assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+}
+
+async fn session_owner(
+    registry: Arc<SharedInputs>,
+    options: flussonix::media::SharedHlsOptions,
+) -> (
+    Arc<flussonix::media::SharedHlsSessions>,
+    tokio_util::sync::CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
+    let sessions = Arc::new(flussonix::media::SharedHlsSessions::new(registry, options).unwrap());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (s, c) = (sessions.clone(), cancel.clone());
+    let task = tokio::spawn(async move {
+        s.run(c).await.unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !sessions.running() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    (sessions, cancel, task)
+}
+
+#[tokio::test]
+async fn hls_session_retention_groups_actual_admissions_and_keeps_one_pull_between_requests() {
+    use flussonix::media::SharedHlsOptions;
+    let mut f = Fixture::start(false).await;
+    let registry = Arc::new(SharedInputs::new(f.owner.clone()));
+    let rows = f.inventory(Duration::from_secs(30)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "ffmpeg");
+    let (sessions, cancel, task) = session_owner(registry, SharedHlsOptions::default()).await;
+    let first = sessions
+        .package(
+            &engine,
+            f.admitted(&rows, "one").await,
+            SharedInputOptions::default(),
+            &options(),
+        )
+        .await
+        .unwrap();
+    let conn = f.connection().await;
+    let feeder = tokio::spawn(feed_audio(conn.feed.clone()));
+    ready(&engine, &first).await;
+    let (pid, generation) = (first.pid(), first.generation());
+    drop(first);
+    assert_eq!(sessions.retained_sessions(), 1);
+    assert_eq!(f.auth.live_grants(), 1);
+    let second = sessions
+        .package(
+            &engine,
+            f.admitted(&rows, "one").await,
+            SharedInputOptions::default(),
+            &options(),
+        )
+        .await
+        .unwrap();
+    assert_eq!((second.pid(), second.generation()), (pid, generation));
+    assert_eq!(sessions.retained_sessions(), 1);
+    assert_eq!(f.auth.live_grants(), 1);
+    assert!(
+        !engine
+            .read_shared(&second, "index.m3u8")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(second);
+    assert_eq!(f.media_calls(), 1);
+    cancel.cancel();
+    task.await.unwrap();
+    assert_eq!(sessions.retained_sessions(), 0);
+    assert_eq!(f.auth.live_grants(), 0);
+    engine.stop_all().await;
+    feeder.abort();
+    let _ = feeder.await;
+    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+}
+
+#[tokio::test]
+async fn hls_idle_expiry_closes_unobserved_input_without_a_followup_request() {
+    use flussonix::media::SharedHlsOptions;
+    let mut f = Fixture::start(false).await;
+    let registry = Arc::new(SharedInputs::new(f.owner.clone()));
+    let rows = f.inventory(Duration::from_secs(30)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "ffmpeg");
+    let (sessions, cancel, task) = session_owner(
+        registry,
+        SharedHlsOptions {
+            idle_timeout: Duration::from_millis(500),
+            maintenance_interval: Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
+    .await;
+    let playback = sessions
+        .package(
+            &engine,
+            f.admitted(&rows, "one").await,
+            SharedInputOptions::default(),
+            &options(),
+        )
+        .await
+        .unwrap();
+    let conn = f.connection().await;
+    let feeder = tokio::spawn(feed_audio(conn.feed.clone()));
+    assert_eq!(sessions.retained_sessions(), 1);
+    drop(playback);
+    tokio::time::timeout(Duration::from_secs(2), conn.feed.closed())
+        .await
+        .unwrap();
+    assert_eq!(sessions.retained_sessions(), 0);
+    assert_eq!(f.auth.live_grants(), 0);
+    cancel.cancel();
+    task.await.unwrap();
+    engine.stop_all().await;
+    feeder.abort();
+    let _ = feeder.await;
+}
+
+#[tokio::test]
+async fn hls_capacity_mismatch_and_revocation_preserve_the_other_session() {
+    use flussonix::media::{HlsSessionFailure, SharedHlsOptions};
+    let mut f = Fixture::start(false).await;
+    let registry = Arc::new(SharedInputs::new(f.owner.clone()));
+    let rows = f.inventory(Duration::from_secs(30)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "ffmpeg");
+    let (sessions, cancel, task) = session_owner(
+        registry,
+        SharedHlsOptions {
+            capacity: 1,
+            maintenance_interval: Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
+    .await;
+    let first = sessions
+        .package(
+            &engine,
+            f.admitted(&rows, "one").await,
+            SharedInputOptions::default(),
+            &options(),
+        )
+        .await
+        .unwrap();
+    let id = f.auth.snapshots()[0]["id"].as_str().unwrap().to_owned();
+    let conn = f.connection().await;
+    let feeder = tokio::spawn(feed_audio(conn.feed.clone()));
+    ready(&engine, &first).await;
+    let denied = sessions
+        .package(
+            &engine,
+            f.admitted(&rows, "two").await,
+            SharedInputOptions::default(),
+            &options(),
+        )
+        .await;
+    assert!(matches!(denied, Err(HlsSessionFailure::Limit)));
+    first.current().unwrap();
+    let mismatch = sessions
+        .package(
+            &engine,
+            f.admitted(&rows, "one").await,
+            SharedInputOptions::default(),
+            &json!({"transcoder":{"ab":96},"flussonix_hls_subtitles":"drop"}),
+        )
+        .await;
+    assert!(matches!(
+        mismatch,
+        Err(HlsSessionFailure::Packaging(Failure::Mismatch))
+    ));
+    assert_eq!(sessions.retained_sessions(), 1);
+    assert!(f.auth.revoke(&id));
+    drop(first);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while sessions.retained_sessions() != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    cancel.cancel();
+    task.await.unwrap();
+    engine.stop_all().await;
+    feeder.abort();
+    let _ = feeder.await;
+}
+
+#[tokio::test]
+async fn hls_rejects_stopped_foreign_stale_and_non_hls_admissions_before_private_io() {
+    use flussonix::media::{HlsSessionFailure, SharedHlsOptions, SharedHlsSessions};
+    let f = Fixture::start(false).await;
+    let registry = Arc::new(SharedInputs::new(f.owner.clone()));
+    let rows = f.inventory(Duration::from_secs(30)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "ffmpeg");
+    let stopped = SharedHlsSessions::new(registry.clone(), SharedHlsOptions::default()).unwrap();
+    assert!(matches!(
+        stopped
+            .package(
+                &engine,
+                f.admitted(&rows, "one").await,
+                SharedInputOptions::default(),
+                &options()
+            )
+            .await,
+        Err(HlsSessionFailure::Closed)
+    ));
+    let (sessions, cancel, task) = session_owner(registry, SharedHlsOptions::default()).await;
+    let AdmissionOutcome::Allowed(non_hls) = f
+        .owner
+        .admit(
+            rows.candidate(NAME).unwrap(),
+            &f.auth,
+            ViewerRequest {
+                name: NAME.into(),
+                proto: "m4s".into(),
+                ip: "127.0.0.1".into(),
+                token: "other".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("denied")
+    };
+    assert!(matches!(
+        sessions
+            .package(&engine, non_hls, SharedInputOptions::default(), &options())
+            .await,
+        Err(HlsSessionFailure::Invalid)
+    ));
+    let other = Fixture::start(false).await;
+    let other_rows = other.inventory(Duration::from_secs(30)).await;
+    assert!(
+        sessions
+            .package(
+                &engine,
+                other.admitted(&other_rows, "foreign").await,
+                SharedInputOptions::default(),
+                &options()
+            )
+            .await
+            .is_err()
+    );
+    let stale = f.admitted(&rows, "old").await;
+    f.config
+        .put("templates", "edit", json!({"static":false}))
+        .unwrap();
+    assert!(
+        sessions
+            .package(&engine, stale, SharedInputOptions::default(), &options())
+            .await
+            .is_err()
+    );
+    assert_eq!(f.media_calls(), 0);
+    assert_eq!(other.media_calls(), 0);
+    cancel.cancel();
+    task.await.unwrap();
+    engine.stop_all().await;
+}
+
+#[tokio::test]
+async fn hls_blocked_startup_reserves_capacity_and_shutdown_cancels_it_before_private_io() {
+    use flussonix::media::{HlsSessionFailure, SharedHlsOptions};
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::start(false).await;
+    let registry = Arc::new(SharedInputs::new(f.owner.clone()));
+    let rows = f.inventory(Duration::from_secs(30)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("owned-probe");
+    let marker = dir.path().join("probe");
+    std::fs::write(&script,format!("#!/usr/bin/python3\nimport os,sys,time\nfrom pathlib import Path\nif any('nvenc' in a for a in sys.argv):\n Path({:?}).write_text(str(os.getpid()))\n time.sleep(30)\nelse:os.execv('/usr/bin/ffmpeg',['ffmpeg']+sys.argv[1:])\n",marker.to_str().unwrap())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = Engine::new(dir.path(), script.to_str().unwrap());
+    let (sessions, cancel, task) = session_owner(
+        registry,
+        SharedHlsOptions {
+            capacity: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let first = f.admitted(&rows, "one").await;
+    let cfg =
+        json!({"transcoder":{"encoder":"h264_nvenc","vb":300},"flussonix_hls_subtitles":"drop"});
+    let package = sessions.package(&engine, first, SharedInputOptions::default(), &cfg);
+    tokio::pin!(package);
+    tokio::select! {result=&mut package=>panic!("startup should await owned probe: {}",result.is_ok()),_=async{while !marker.exists(){tokio::time::sleep(Duration::from_millis(5)).await;}}=>{}}
+    let pid = std::fs::read_to_string(&marker)
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    assert!(matches!(
+        sessions
+            .package(
+                &engine,
+                f.admitted(&rows, "two").await,
+                SharedInputOptions::default(),
+                &options()
+            )
+            .await,
+        Err(HlsSessionFailure::Limit)
+    ));
+    sessions.shutdown();
+    assert!(matches!(package.await, Err(HlsSessionFailure::Closed)));
+    cancel.cancel();
+    task.await.unwrap();
+    engine.stop_all().await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(sessions.retained_sessions(), 0);
+    assert_eq!(f.media_calls(), 0);
+}
+
+#[tokio::test]
+async fn hls_scheduled_renewal_keeps_two_sessions_and_accepts_fresh_requests_past_old_deadline() {
+    use flussonix::media::SharedHlsOptions;
+    let mut f = Fixture::start(false).await;
+    let registry = Arc::new(SharedInputs::new(f.owner.clone()));
+    let rows = f.inventory(Duration::from_secs(1)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "ffmpeg");
+    let (sessions, cancel, task) = session_owner(
+        registry.clone(),
+        SharedHlsOptions {
+            idle_timeout: Duration::from_secs(5),
+            lease_lifetime: Duration::from_secs(3),
+            renew_margin: Duration::from_millis(400),
+            maintenance_interval: Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
+    .await;
+    let a = sessions
+        .package(
+            &engine,
+            f.admitted(&rows, "one").await,
+            SharedInputOptions::default(),
+            &options(),
+        )
+        .await
+        .unwrap();
+    let first_id = f.auth.snapshots()[0]["id"].as_str().unwrap().to_owned();
+    let b = sessions
+        .package(
+            &engine,
+            f.admitted(&rows, "two").await,
+            SharedInputOptions::default(),
+            &options(),
+        )
+        .await
+        .unwrap();
+    let conn = f.connection().await;
+    let feeder = tokio::spawn(feed_audio(conn.feed.clone()));
+    ready(&engine, &a).await;
+    let (pid, generation) = (a.pid(), a.generation());
+    drop((a, b));
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        rows.expires_at() + Duration::from_millis(50),
+    ))
+    .await;
+    let candidate = registry.current_candidate(NAME).unwrap();
+    let AdmissionOutcome::Allowed(next) = f
+        .owner
+        .admit(
+            candidate,
+            &f.auth,
+            ViewerRequest {
+                name: NAME.into(),
+                proto: "hls".into(),
+                ip: "127.0.0.1".into(),
+                token: "two".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("denied")
+    };
+    let c = sessions
+        .package(&engine, next, SharedInputOptions::default(), &options())
+        .await
+        .unwrap();
+    assert_eq!((c.pid(), c.generation()), (pid, generation));
+    assert!(
+        !engine
+            .read_shared(&c, "index.m3u8")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(sessions.retained_sessions(), 2);
+    assert_eq!(f.media_calls(), 1);
+    let polls = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|p| p.as_str() == "/streamer/api/v3/streams")
+        .count();
+    assert_eq!(polls, 2, "one scheduled refresh per source, not per viewer");
+    assert!(f.auth.revoke(&first_id));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while sessions.retained_sessions() != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    c.current().unwrap();
+    drop(c);
+    cancel.cancel();
+    task.await.unwrap();
+    engine.stop_all().await;
+    feeder.abort();
+    let _ = feeder.await;
+    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+}
+
+#[tokio::test]
+async fn hls_failed_scheduled_refresh_never_extends_expired_authority() {
+    use flussonix::media::SharedHlsOptions;
+    let mut f = Fixture::start(false).await;
+    let registry = Arc::new(SharedInputs::new(f.owner.clone()));
+    let rows = f.inventory(Duration::from_millis(600)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "ffmpeg");
+    let (sessions, cancel, task) = session_owner(
+        registry.clone(),
+        SharedHlsOptions {
+            lease_lifetime: Duration::from_secs(3),
+            renew_margin: Duration::from_millis(300),
+            retry_delay: Duration::from_millis(50),
+            maintenance_interval: Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
+    .await;
+    let playback = sessions
+        .package(
+            &engine,
+            f.admitted(&rows, "one").await,
+            SharedInputOptions::default(),
+            &options(),
+        )
+        .await
+        .unwrap();
+    let conn = f.connection().await;
+    let feeder = tokio::spawn(feed_audio(conn.feed.clone()));
+    f.remote.lock().unwrap().status = StatusCode::FORBIDDEN;
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        rows.expires_at() + Duration::from_millis(50),
+    ))
+    .await;
+    assert!(playback.current().is_err());
+    assert!(registry.current_candidate(NAME).is_err());
+    assert!(engine.read_shared(&playback, "index.m3u8").await.is_err());
+    drop(playback);
+    cancel.cancel();
+    task.await.unwrap();
+    engine.stop_all().await;
+    feeder.abort();
+    let _ = feeder.await;
+}
+
+#[tokio::test]
+async fn hls_idle_expiry_and_abort_cancel_held_renewal_without_a_late_request() {
+    use flussonix::media::SharedHlsOptions;
+    for abort in [false, true] {
+        let mut f = Fixture::start(false).await;
+        let registry = Arc::new(SharedInputs::new(f.owner.clone()));
+        let rows = f.inventory(Duration::from_secs(3)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "ffmpeg");
+        let (sessions, cancel, task) = session_owner(
+            registry,
+            SharedHlsOptions {
+                idle_timeout: Duration::from_millis(500),
+                lease_lifetime: Duration::from_secs(3),
+                renew_margin: Duration::from_millis(2800),
+                maintenance_interval: Duration::from_millis(10),
+                ..Default::default()
+            },
+        )
+        .await;
+        let (started_tx, started) = oneshot::channel();
+        let (release, held) = oneshot::channel();
+        f.remote.lock().unwrap().hold = Some((started_tx, held));
+        let playback = sessions
+            .package(
+                &engine,
+                f.admitted(&rows, "one").await,
+                SharedInputOptions::default(),
+                &options(),
+            )
+            .await
+            .unwrap();
+        let conn = f.connection().await;
+        let feeder = tokio::spawn(feed_audio(conn.feed.clone()));
+        drop(playback);
+        tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .unwrap()
+            .unwrap();
+        if abort {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while sessions.retained_sessions() != 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            cancel.cancel();
+            task.await.unwrap();
+        }
+        assert_eq!(sessions.retained_sessions(), 0);
+        assert!(!sessions.running());
+        tokio::time::timeout(Duration::from_secs(2), conn.feed.closed())
+            .await
+            .unwrap();
+        let before = f.calls.lock().unwrap().len();
+        let _ = release.send(());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            f.calls.lock().unwrap().len(),
+            before,
+            "cancelled refresh resumed after owner left"
+        );
+        engine.stop_all().await;
+        feeder.abort();
+        let _ = feeder.await;
+    }
+}
+
+#[tokio::test]
+async fn hls_owner_options_and_unique_run_are_bounded() {
+    use flussonix::media::{HlsSessionFailure, SharedHlsOptions, SharedHlsSessions};
+    let f = Fixture::start(false).await;
+    let registry = Arc::new(SharedInputs::new(f.owner.clone()));
+    for which in 0..9 {
+        let mut options = SharedHlsOptions::default();
+        match which {
+            0 => options.capacity = 0,
+            1 => options.capacity = 20001,
+            2 => options.idle_timeout = Duration::ZERO,
+            3 => options.idle_timeout = Duration::from_secs(31),
+            4 => options.lease_lifetime = Duration::ZERO,
+            5 => options.lease_lifetime = Duration::from_secs(31),
+            6 => options.renew_margin = options.lease_lifetime,
+            7 => options.retry_delay = Duration::ZERO,
+            _ => options.maintenance_interval = Duration::ZERO,
+        };
+        assert!(matches!(
+            SharedHlsSessions::new(registry.clone(), options),
+            Err(HlsSessionFailure::Invalid)
+        ));
+    }
+    let (sessions, cancel, task) = session_owner(registry, SharedHlsOptions::default()).await;
+    assert_eq!(
+        sessions
+            .clone()
+            .run(tokio_util::sync::CancellationToken::new())
+            .await,
+        Err(HlsSessionFailure::AlreadyRunning)
+    );
+    assert!(sessions.running());
+    sessions.shutdown();
+    use futures_util::FutureExt;
+    assert_eq!(
+        sessions
+            .clone()
+            .run(tokio_util::sync::CancellationToken::new())
+            .now_or_never(),
+        Some(Err(HlsSessionFailure::AlreadyRunning)),
+        "cancelled owner must be joined before replacement"
+    );
+    cancel.cancel();
+    task.await.unwrap();
+    assert!(!sessions.running());
+    let next = tokio_util::sync::CancellationToken::new();
+    let (s, c) = (sessions.clone(), next.clone());
+    let task = tokio::spawn(async move {
+        s.run(c).await.unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !sessions.running() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    next.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn hls_cache_expiry_does_not_stop_renewal_for_an_active_response_handle() {
+    use flussonix::media::SharedHlsOptions;
+    let mut f = Fixture::start(false).await;
+    let registry = Arc::new(SharedInputs::new(f.owner.clone()));
+    let rows = f.inventory(Duration::from_secs(1)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "ffmpeg");
+    let (sessions, cancel, task) = session_owner(
+        registry,
+        SharedHlsOptions {
+            idle_timeout: Duration::from_millis(200),
+            lease_lifetime: Duration::from_secs(3),
+            renew_margin: Duration::from_millis(400),
+            maintenance_interval: Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
+    .await;
+    let playback = sessions
+        .package(
+            &engine,
+            f.admitted(&rows, "one").await,
+            SharedInputOptions::default(),
+            &options(),
+        )
+        .await
+        .unwrap();
+    let conn = f.connection().await;
+    let feeder = tokio::spawn(feed_audio(conn.feed.clone()));
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        rows.expires_at() + Duration::from_millis(50),
+    ))
+    .await;
+    assert_eq!(sessions.retained_sessions(), 0);
+    playback
+        .current()
+        .expect("an active response still owns authorized demand");
+    assert!(
+        !engine
+            .read_shared(&playback, "index.m3u8")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(f.media_calls(), 1);
+    drop(playback);
+    cancel.cancel();
+    task.await.unwrap();
+    engine.stop_all().await;
+    feeder.abort();
+    let _ = feeder.await;
+}
+
+#[tokio::test]
+async fn hls_old_pending_reservation_cannot_remove_a_new_epoch_session() {
+    use flussonix::media::{HlsSessionFailure, SharedHlsOptions};
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = Fixture::start(false).await;
+    f.remote.lock().unwrap().streams = json!([{"name":NAME,"groups":[],"named_by":"config","static":true},{"name":"owned-alt","groups":[],"named_by":"config","static":true}]);
+    let registry = Arc::new(SharedInputs::new(f.owner.clone()));
+    let rows = f.inventory(Duration::from_secs(30)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("owned-probe");
+    let marker = dir.path().join("probe");
+    std::fs::write(&script,format!("#!/usr/bin/python3\nimport os,sys,time\nfrom pathlib import Path\nif any('nvenc' in a for a in sys.argv):\n Path({:?}).write_text(str(os.getpid()))\n time.sleep(30)\nelse:os.execv('/usr/bin/ffmpeg',['ffmpeg']+sys.argv[1:])\n",marker.to_str().unwrap())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = Engine::new(dir.path(), script.to_str().unwrap());
+    let (sessions, cancel, task) = session_owner(
+        registry,
+        SharedHlsOptions {
+            capacity: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let first = f.admitted(&rows, "old").await;
+    let cfg =
+        json!({"transcoder":{"encoder":"h264_nvenc","vb":300},"flussonix_hls_subtitles":"drop"});
+    let old = sessions.package(&engine, first, SharedInputOptions::default(), &cfg);
+    tokio::pin!(old);
+    tokio::select! {r=&mut old=>panic!("probe should block: {}",r.is_ok()),_=async{while !marker.exists(){tokio::time::sleep(Duration::from_millis(5)).await;}}=>{}}
+    let probe = std::fs::read_to_string(&marker)
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    sessions.shutdown();
+    cancel.cancel();
+    task.await.unwrap();
+    let next_cancel = tokio_util::sync::CancellationToken::new();
+    let (s, c) = (sessions.clone(), next_cancel.clone());
+    let next_task = tokio::spawn(async move {
+        s.run(c).await.unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !sessions.running() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let AdmissionOutcome::Allowed(next) = f
+        .owner
+        .admit(
+            rows.candidate("owned-alt").unwrap(),
+            &f.auth,
+            ViewerRequest {
+                name: "owned-alt".into(),
+                proto: "hls".into(),
+                ip: "127.0.0.1".into(),
+                token: "fresh".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("denied")
+    };
+    let fresh = sessions
+        .package(&engine, next, SharedInputOptions::default(), &options())
+        .await
+        .unwrap();
+    let conn = f.connection().await;
+    assert!(conn.path.starts_with("/owned-alt/"));
+    let feeder = tokio::spawn(feed_audio(conn.feed.clone()));
+    ready(&engine, &fresh).await;
+    assert!(matches!(old.await, Err(HlsSessionFailure::Closed)));
+    fresh.current().unwrap();
+    assert_eq!(sessions.retained_sessions(), 1);
+    assert_eq!(f.auth.live_grants(), 1);
+    assert_eq!(f.media_calls(), 1);
+    assert!(matches!(
+        sessions
+            .package(
+                &engine,
+                f.admitted(&rows, "third").await,
+                SharedInputOptions::default(),
+                &options()
+            )
+            .await,
+        Err(HlsSessionFailure::Limit)
+    ));
+    drop(fresh);
+    next_cancel.cancel();
+    next_task.await.unwrap();
+    engine.stop_all().await;
+    feeder.abort();
+    let _ = feeder.await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while std::path::Path::new(&format!("/proc/{probe}")).exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
 }

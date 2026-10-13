@@ -43,6 +43,7 @@ Owned HTTP tests cover preserved and retired routes, revocation, expiry, failed
 and cancelled refreshes, competing attempts, global edits, ordinary refresh,
 shutdown and media fencing after renewal. Owned FFmpeg tests verify HLS remains
 available beyond the old deadline with the same PID and one upstream connection.
-Automatic daemon vendor routing, HLS session retention, scheduled renewal and
-source failover remain separate integration work. No new live vendor, GPU,
+The opt-in [HLS session owner](vendor-hls-sessions.md) now supplies retention
+and scheduled renewal. Automatic daemon vendor routing and source failover remain
+separate integration work. No new live vendor, GPU,
 capacity or production continuity qualification is claimed.

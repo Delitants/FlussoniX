@@ -132,7 +132,7 @@ impl Worker {
         if self.active_viewer().is_none() {
             return Err(SharedFailure::Closed);
         }
-        self.at_route(|| {
+        self.at_route(|_| {
             if self.active_viewer().is_some() {
                 Ok(())
             } else {
@@ -161,7 +161,7 @@ impl Worker {
     }
     fn at_route<T>(
         &self,
-        check: impl FnOnce() -> Result<T, AdmissionFailure>,
+        check: impl FnOnce(&super::super::CoordinatedCandidate) -> Result<T, AdmissionFailure>,
     ) -> Result<T, SharedFailure> {
         self.owner
             .at_handle(&self.handle, || {
@@ -174,7 +174,7 @@ impl Worker {
                 guard
                     .check(&route.candidate)
                     .map_err(super::super::CoordinationFailure::Lease)?;
-                let result = check();
+                let result = check(&route);
                 guard
                     .check(&route.candidate)
                     .map_err(super::super::CoordinationFailure::Lease)?;
@@ -212,6 +212,73 @@ impl Drop for Viewer {
     }
 }
 impl SharedInputs {
+    /// Aggregate authorized registry demand, without retaining viewer grants.
+    pub(crate) fn renewal_sources(
+        &self,
+    ) -> Result<Vec<(usize, super::super::SourceHandle, std::time::Instant)>, SharedFailure> {
+        let registry = self
+            .workers
+            .lock()
+            .map_err(|_| SharedFailure::Unavailable)?;
+        Ok(registry
+            .workers
+            .values()
+            .filter_map(Weak::upgrade)
+            .filter_map(|worker| {
+                worker.current().ok()?;
+                worker
+                    .at_route(|route| {
+                        if worker.cancel.is_cancelled() || worker.active_viewer().is_none() {
+                            return Err(AdmissionFailure::Revoked);
+                        }
+                        Ok((
+                            route.handle.generation_key(),
+                            route.handle.clone(),
+                            route.expires_at(),
+                        ))
+                    })
+                    .ok()
+            })
+            .collect())
+    }
+    /// Current managed metadata for fresh native admission; no media permission.
+    pub fn current_candidate(
+        &self,
+        name: &str,
+    ) -> Result<super::super::CoordinatedCandidate, SharedFailure> {
+        let registry = self
+            .workers
+            .lock()
+            .map_err(|_| SharedFailure::Unavailable)?;
+        let worker = registry
+            .workers
+            .get(name)
+            .and_then(Weak::upgrade)
+            .ok_or(SharedFailure::Unavailable)?;
+        worker.current()?;
+        worker.at_route(|route| {
+            if worker.cancel.is_cancelled() || worker.active_viewer().is_none() {
+                return Err(AdmissionFailure::Revoked);
+            }
+            Ok(copy_route(route))
+        })
+    }
+    pub(crate) fn hls_session_identity(
+        &self,
+        admission: &AdmittedCandidate,
+    ) -> Result<String, SharedFailure> {
+        if admission.proto != "hls" {
+            return Err(SharedFailure::Authority(AdmissionFailure::Invalid));
+        }
+        self.owner
+            .admitted_current(admission)
+            .map_err(SharedFailure::Authority)?;
+        admission
+            .grant
+            .session_identity()
+            .map(str::to_owned)
+            .ok_or(SharedFailure::Authority(AdmissionFailure::Invalid))
+    }
     pub fn new(owner: Arc<ModernSourceCoordinator>) -> Self {
         Self {
             owner,
@@ -329,6 +396,9 @@ impl Drop for SharedInputs {
     }
 }
 impl SharedViewer {
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner.worker.cancel.is_cancelled() || self.inner.admission.grant.is_cancelled()
+    }
     pub fn generation(&self) -> Uuid {
         self.inner.worker.id
     }
@@ -337,7 +407,7 @@ impl SharedViewer {
         if worker.cancel.is_cancelled() {
             return Err(SharedFailure::Closed);
         }
-        worker.at_route(|| {
+        worker.at_route(|_| {
             if self.inner.admission.grant.is_cancelled() {
                 Err(AdmissionFailure::Revoked)
             } else {
