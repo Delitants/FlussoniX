@@ -26,6 +26,45 @@ struct Layer {
     token_hash: Option<String>,
 }
 impl Layer {
+    fn resolve(
+        value: &Value,
+        root: &Value,
+        templates: &HashMap<String, Self>,
+    ) -> Result<Self, PolicyFailure> {
+        bounded(value)?;
+        let mut object = value.as_object().ok_or(PolicyFailure::Invalid)?.clone();
+        let base = object
+            .remove("template")
+            .map(|reference| {
+                let name = reference.as_str().ok_or(PolicyFailure::Invalid)?;
+                crate::config::valid_name(name).map_err(|_| PolicyFailure::Invalid)?;
+                templates
+                    .get(name)
+                    .cloned()
+                    .ok_or(PolicyFailure::Unresolved)
+            })
+            .transpose()?
+            .unwrap_or_default();
+        // Parse the direct layer before merging: an inherited value never hides
+        // invalid or unsupported local fields. Callback replacement is atomic.
+        let direct = Self::parse(&Value::Object(object), root)?;
+        Ok(Self {
+            callback: direct.callback.or(base.callback),
+            token_hash: direct.token_hash.or(base.token_hash),
+        })
+    }
+
+    fn config(&self) -> Value {
+        let mut value = json!({});
+        if let Some((callback, _)) = &self.callback {
+            value["on_play"] = callback.clone();
+        }
+        if let Some(hash) = &self.token_hash {
+            value["flussonix_token_sha256"] = json!(hash);
+        }
+        value
+    }
+
     fn parse(value: &Value, root: &Value) -> Result<Self, PolicyFailure> {
         bounded(value)?;
         let object = value.as_object().ok_or(PolicyFailure::Invalid)?;
@@ -74,13 +113,39 @@ pub struct PolicySet {
     root: Value,
 }
 impl PolicySet {
+    /// Opt into explicit local policy-only templates. A source/group may name
+    /// one template; its direct fields replace that template's defaults.
+    /// All templates validate, even unused. Nested templates are unsupported.
+    pub fn with_templates(
+        source: &Value,
+        groups: &Value,
+        templates: &Value,
+        backends: &Value,
+    ) -> Result<Self, PolicyFailure> {
+        Self::build(source, groups, Some(templates), backends)
+    }
     /// Inputs are policy-only source/group objects and local backend entries.
     /// Unknown fields (including template inheritance) fail even when shadowed.
     /// This is not an importer for complete source or remote inventory objects.
     pub fn new(source: &Value, groups: &Value, backends: &Value) -> Result<Self, PolicyFailure> {
+        Self::build(source, groups, None, backends)
+    }
+
+    fn build(
+        source: &Value,
+        groups: &Value,
+        templates: Option<&Value>,
+        backends: &Value,
+    ) -> Result<Self, PolicyFailure> {
         let backends_array = backends.as_array().ok_or(PolicyFailure::Invalid)?;
         let groups_map = groups.as_object().ok_or(PolicyFailure::Invalid)?;
+        let templates_map = templates
+            .map(|value| value.as_object().ok_or(PolicyFailure::Invalid))
+            .transpose()?;
         if backends_array.len() > MAX_CONFIGURED || groups_map.len() > MAX_CONFIGURED {
+            return Err(PolicyFailure::Limit);
+        }
+        if templates_map.is_some_and(|map| map.len() > MAX_CONFIGURED) {
             return Err(PolicyFailure::Limit);
         }
         let mut names = HashSet::new();
@@ -104,12 +169,26 @@ impl PolicySet {
                 .map_err(|_| PolicyFailure::Invalid)?;
         }
         let root = json!({"auth_backends":backends});
-        let source = Layer::parse(source, &root)?;
+        let mut resolved_templates = HashMap::new();
+        if let Some(map) = templates_map {
+            for (name, value) in map {
+                crate::config::valid_name(name).map_err(|_| PolicyFailure::Invalid)?;
+                resolved_templates.insert(name.clone(), Layer::parse(value, &root)?);
+            }
+        }
+        let parse = |value: &Value| {
+            if templates.is_some() {
+                Layer::resolve(value, &root, &resolved_templates)
+            } else {
+                Layer::parse(value, &root)
+            }
+        };
+        let source = parse(source)?;
         let groups = groups_map
             .iter()
             .map(|(name, value)| {
                 crate::config::valid_name(name).map_err(|_| PolicyFailure::Invalid)?;
-                Ok((name.clone(), Layer::parse(value, &root)?))
+                Ok((name.clone(), parse(value)?))
             })
             .collect::<Result<_, _>>()?;
         Ok(Self {
@@ -117,6 +196,20 @@ impl PolicySet {
             groups,
             root,
         })
+    }
+
+    /// Internal projection only after complete validation. Preserve explicit
+    /// public decisions and independent guards; never project remote objects.
+    pub(super) fn materialized_inputs(&self) -> (Value, Value) {
+        (
+            self.source.config(),
+            Value::Object(
+                self.groups
+                    .iter()
+                    .map(|(name, layer)| (name.clone(), layer.config()))
+                    .collect(),
+            ),
+        )
     }
 
     /// Memberships must be explicit, unique literal names. Unconfigured groups

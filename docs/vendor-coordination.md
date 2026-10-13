@@ -39,6 +39,15 @@ those settings are frozen into the same ordered prepared source generation.
 Changing policy requires a new capture/prepare/install, with the same replacement
 fences. This library API is not an operator UI or viewer admission implementation.
 
+The optional `with_policy_templates(source, groups, templates)` step supports
+explicit local policy-only template defaults before direct source/group fields.
+It validates every template and reference against captured backends, then
+materializes the inherited layers through the same strict adapter. Nested or
+unsupported templates fail; neither remote inventory nor general-purpose native
+stream templates are implicitly imported. Frozen inputs and the same global
+revision/generation fences apply. See [viewer policy](vendor-viewer-policy.md#explicit-local-templates)
+for precedence, bounds and the pending daemon integration.
+
 Refresh uses the existing latest-turn, start-based (0,30s] lease; all local aliases
 are checked at the first config probe before page requests. Publication holds
 locks in config -> coordinator -> source order through a synchronous closure.

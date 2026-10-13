@@ -711,6 +711,114 @@ async fn policy_is_explicit_and_prepared_policy_change_supersedes_old_candidate(
 }
 
 #[tokio::test]
+async fn explicit_template_preparation_preserves_protection_and_reinstall_fences_old_candidate() {
+    let s = Server::start().await;
+    let (_d, _config, c) = setup(&s);
+    let key = s.source()["url"].as_str().unwrap().to_owned();
+    let mut templates =
+        json!({"paid":{"on_play":"https://first.invalid","flussonix_token_sha256":"a".repeat(64)}});
+    let prepare = |templates: &Value| {
+        c.capture(&key)
+            .unwrap()
+            .with_policy_templates(&json!({"template":"paid"}), &json!({}), templates)
+            .unwrap()
+            .prepare(Duration::from_secs(3))
+            .unwrap()
+    };
+    let prepared = prepare(&templates);
+    // Mutating the caller's template input must not mutate an existing preparation.
+    templates["paid"]["on_play"] = json!("https://second.invalid");
+    let h = c.install(prepared).unwrap();
+    let old = c
+        .inventory(&h, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .candidate(NAME)
+        .unwrap();
+    c.publish(&old, |view, _| {
+        let expected = flussonix::playback_auth::Policy::from_config(
+            &json!({"on_play":"https://first.invalid","flussonix_token_sha256":"a".repeat(64)}),
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(view.policy, &expected);
+    })
+    .unwrap();
+    let h = c.install(prepare(&templates)).unwrap();
+    assert_eq!(c.publish(&old, |_, _| ()), Err(CoordinationFailure::Stale));
+    let new = c
+        .inventory(&h, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .candidate(NAME)
+        .unwrap();
+    c.publish(&new, |view, _| {
+        assert_eq!(view.policy.url.as_deref(), Some("https://second.invalid"))
+    })
+    .unwrap();
+}
+
+#[tokio::test]
+async fn global_template_edit_fences_pending_template_preparation() {
+    let s = Server::start().await;
+    let (_d, config, c) = setup(&s);
+    config
+        .put(
+            "templates",
+            "paid",
+            json!({"name":"paid","on_play":"https://first.invalid"}),
+        )
+        .unwrap();
+    let prepared = c
+        .capture(s.source()["url"].as_str().unwrap())
+        .unwrap()
+        .with_policy_templates(
+            &json!({"template":"paid"}),
+            &json!({}),
+            &json!({"paid":{"on_play":"https://first.invalid"}}),
+        )
+        .unwrap()
+        .prepare(Duration::from_secs(3))
+        .unwrap();
+    config
+        .put(
+            "templates",
+            "paid",
+            json!({"on_play":"https://second.invalid"}),
+        )
+        .unwrap();
+    assert!(matches!(
+        c.install(prepared),
+        Err(CoordinationFailure::Stale)
+    ));
+    assert!(s.paths.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn invalid_unused_policy_template_cannot_replace_current_source() {
+    let s = Server::start().await;
+    let (_d, _config, c) = setup(&s);
+    let h = handle(&c, &s);
+    let old = c
+        .inventory(&h, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .candidate(NAME)
+        .unwrap();
+    assert!(matches!(
+        c.capture(s.source()["url"].as_str().unwrap())
+            .unwrap()
+            .with_policy_templates(
+                &json!({"on_play":"true"}),
+                &json!({}),
+                &json!({"unused":{"protocols":["hls"]}})
+            ),
+        Err(CoordinationFailure::Unsupported)
+    ));
+    assert_eq!(publish(&c, &old), Ok(()));
+}
+
+#[tokio::test]
 async fn daemon_coordinator_shares_the_management_config_and_actual_startup_identity() {
     let s = Server::start().await;
     let d = tempfile::tempdir().unwrap();

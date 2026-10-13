@@ -300,6 +300,29 @@ impl ModernSourceCoordinator {
     }
 }
 impl SourcePreparation {
+    /// Explicit local policy-only templates, validated with captured backends.
+    /// Materialize inheritance before strict complete-source projection. These
+    /// inputs are frozen into this preparation, not imported from discovery or
+    /// implicitly projected from the daemon's general-purpose stream templates.
+    pub fn with_policy_templates(
+        self,
+        source: &Value,
+        groups: &Value,
+        templates: &Value,
+    ) -> Result<Self, CoordinationFailure> {
+        let policies = super::flussonic_policy::PolicySet::with_templates(
+            source,
+            groups,
+            templates,
+            &self.backends,
+        )
+        .map_err(|error| match error {
+            super::flussonic_policy::PolicyFailure::Unsupported => CoordinationFailure::Unsupported,
+            _ => CoordinationFailure::Invalid,
+        })?;
+        let (source, groups) = policies.materialized_inputs();
+        self.with_policy(&source, &groups)
+    }
     /// Explicit local policy only, frozen with captured backend definitions.
     /// Missing policy stays unresolved; remote discovery never supplies it.
     pub fn with_policy(
