@@ -6,7 +6,8 @@ is a private upstream credential; it does not grant viewer access.
 
 Management and private media endpoints can use separate HTTP or HTTPS addresses.
 For private certificate authorities, enter absolute PEM file paths on the
-receiving FlussoniX node. Management and media trust remain independently editable.
+receiving FlussoniX node. Vendor media trust does not inherit the management CA;
+leaving its field empty uses public roots. Configure each private CA separately.
 
 Choose a viewer policy: no callback with a token guard, explicit allow without a
 callback, a named backend or a callback URL. New profiles start unresolved and cannot serve viewers until
