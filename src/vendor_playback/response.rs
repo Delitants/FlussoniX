@@ -3,7 +3,7 @@ use crate::{
     media::PackagedSubscription,
     playback_auth::ViewerRequest,
     server::{error, header, parse_query, rewrite_playlist},
-    source_directory::modern_coordinator::{AdmissionOutcome, SharedInputOptions},
+    source_directory::modern_coordinator::AdmissionOutcome,
 };
 use axum::{
     body::Body,
@@ -112,6 +112,15 @@ impl Runtime {
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "vendor source unavailable"),
         };
         let hls = !matches!(file, "mpegts" | "m4s" | "m4f") && !file.ends_with(".m4f");
+        let settings = match self.output_settings(app, key, candidate.config_revision()) {
+            Ok(settings) => settings,
+            Err(_) => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "vendor processing unavailable",
+                );
+            }
+        };
         let outcome = tokio::select! {biased;_=self.closed.cancelled()=>return error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),outcome=self.owner.admit(candidate,&app.playback_auth,viewer)=>outcome};
         let admission = match outcome {
             Ok(AdmissionOutcome::Allowed(a)) => a,
@@ -127,22 +136,16 @@ impl Runtime {
             }
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "vendor authority changed"),
         };
-        let settings = serde_json::json!({});
         let package = async {
             if hls {
                 self.sessions
-                    .package(
-                        &app.media,
-                        admission,
-                        SharedInputOptions::default(),
-                        &settings,
-                    )
+                    .package_configured(&app.media, admission, &settings)
                     .await
                     .map_err(|_| ())
             } else {
                 let attachment = self
                     .inputs
-                    .attach(admission, SharedInputOptions::default())
+                    .attach_configured(admission, &settings)
                     .map_err(|_| ())?;
                 app.media
                     .package_shared(attachment, &settings)

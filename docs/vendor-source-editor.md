@@ -27,7 +27,10 @@ with a vendor profile must be explicitly removed. Switching back to native also
 requires explicitly clearing vendor viewer policies; the editor never silently
 drops them.
 
-Vendor profiles currently serve on-demand HTTP/HTTPS HLS, MPEG-TS, M4S and M4F with
-copy output and default subtitle filtering. Vendor output processing, static
-activation, failover, load balancing and RTSP/SRT delivery remain pending. The
-native source editor retains its existing controls.
+Choose a [Processing template](vendor-processing-templates.md) to apply existing
+Media template transcoding/subtitle settings. Template inputs and viewer policies
+are not inherited. Clear this selection explicitly before switching source kind.
+
+Vendor profiles currently serve on-demand HTTP/HTTPS HLS, MPEG-TS, M4S and M4F.
+Static activation, failover, load balancing and RTSP/SRT delivery remain pending.
+The native source editor retains its existing controls.

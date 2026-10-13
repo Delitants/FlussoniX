@@ -48,8 +48,9 @@ retains only current shared workers and can retire them, without attempting a
 privileged native restart. These are bounded schedules, not availability or
 real-time guarantees.
 
-This first daemon integration uses copy output and existing default subtitle
-filtering. Per-vendor output/transcoding/subtitle settings are still pending.
+Sources use copy output and existing default subtitle filtering unless a local
+[processing template](vendor-processing-templates.md) is selected. Existing
+transcoding/subtitle controls then apply through the guarded shared packager.
 The [source policy editor](vendor-source-editor.md) configures local viewer policy
 without JSON. Existing configured-stream controls are
 unchanged. No new GPU, production-performance or live vendor qualification is

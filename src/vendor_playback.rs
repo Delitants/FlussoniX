@@ -92,6 +92,7 @@ pub(crate) struct Runtime {
     inputs: Arc<SharedInputs>,
     sessions: Arc<SharedHlsSessions>,
     caches: Mutex<Caches>,
+    outputs: std::sync::Mutex<(u64, HashMap<String, Value>)>,
     queries: Semaphore,
     closed: CancellationToken,
     claimed: AtomicBool,
@@ -115,6 +116,7 @@ impl Runtime {
             ),
             inputs,
             caches: Mutex::new(Caches::default()),
+            outputs: std::sync::Mutex::new((0, HashMap::new())),
             queries: Semaphore::new(4),
             closed: CancellationToken::new(),
             claimed: AtomicBool::new(false),
@@ -133,6 +135,35 @@ impl Runtime {
     }
     fn running(&self) -> bool {
         !self.closed.is_cancelled() && self.sessions.running()
+    }
+    fn output_settings(&self, app: &App, key: &str, revision: u64) -> Result<Value, Failure> {
+        // Config -> immutable profile cache; never hold either lock across I/O.
+        app.config
+            .at_revision(revision, |root| {
+                let mut cache = self.outputs.lock().map_err(|_| Failure::Unavailable)?;
+                if cache.0 != revision {
+                    cache.0 = revision;
+                    cache.1.clear();
+                }
+                if let Some(settings) = cache.1.get(key) {
+                    return Ok(settings.clone());
+                }
+                if cache.1.len() >= 64 {
+                    return Err(Failure::Unavailable);
+                }
+                let source = root["sources"]
+                    .as_array()
+                    .and_then(|rows| {
+                        rows.iter()
+                            .find(|row| crate::config::item_key("sources", row) == Some(key))
+                    })
+                    .ok_or(Failure::Unavailable)?;
+                let settings = crate::vendor_output::resolve(root, source)
+                    .map_err(|_| Failure::Unavailable)?;
+                cache.1.insert(key.to_owned(), settings.clone());
+                Ok(settings)
+            })
+            .ok_or(Failure::Unavailable)?
     }
     /// Publish only an already managed current policy for the admin reauth API.
     /// This never discovers a source, attaches media, or creates a viewer grant.

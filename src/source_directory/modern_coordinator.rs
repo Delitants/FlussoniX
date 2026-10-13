@@ -377,8 +377,8 @@ impl SourcePreparation {
     }
 
     /// Prepare complete immutable clients with independent per-leg TLS trust.
-    /// Daemon selection metadata and validated derived transport are the only
-    /// removed fields; complete-profile validation rejects unsupported options.
+    /// Validated daemon selection, processing reference and derived transport
+    /// metadata are removed; complete-profile validation rejects unsupported options.
     pub fn prepare(self, budget: Duration) -> Result<PreparedSource, CoordinationFailure> {
         let source =
             super::flussonic_config::normalized_modern_source(&self.source).map_err(projection)?;

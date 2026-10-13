@@ -37,6 +37,9 @@ struct Fixture {
     hold: Hold,
     calls: Arc<Mutex<Vec<(String, HeaderMap)>>>,
     remote: Arc<Mutex<Value>>,
+    segment: Arc<Mutex<Vec<u8>>>,
+    duration: Arc<std::sync::atomic::AtomicU64>,
+    control_epoch: Arc<Mutex<CancellationToken>>,
     server: tokio::task::JoinHandle<()>,
     owner: tokio::task::JoinHandle<Result<(), String>>,
     cancel: CancellationToken,
@@ -57,23 +60,32 @@ impl Fixture {
         let rows = remote.clone();
         let hold: Hold = Arc::new(Mutex::new(None));
         let held = hold.clone();
+        let segment = Arc::new(Mutex::new(multitrack_segment()));
+        let payload = segment.clone();
+        let duration = Arc::new(std::sync::atomic::AtomicU64::new(4000));
+        let control_duration = duration.clone();
+        let control_epoch = Arc::new(Mutex::new(CancellationToken::new()));
+        let epoch = control_epoch.clone();
         let service=Router::new().fallback(get(move |OriginalUri(uri):OriginalUri,h:HeaderMap|{
-            record.lock().unwrap().push((uri.path().to_owned(),h.clone()));let rows=rows.clone();let held=held.clone();
+            record.lock().unwrap().push((uri.path().to_owned(),h.clone()));let rows=rows.clone();let held=held.clone();let payload=payload.clone();let control_duration=control_duration.clone();let epoch=epoch.clone();
             async move {
                 assert!(!h.contains_key("x-flussonix-peer"),"native credentials reached vendor");
                 if uri.path()=="/owned/m4f" {
                     assert!(h.contains_key("cluster-auth-key"));assert!(!h.contains_key("authorization"));
-                    let body=futures_util::stream::unfold(false,|sent|async move{
-                        if sent {std::future::pending::<()>().await;}
-                        Some((Ok::<_,std::io::Error>(bytes::Bytes::from_static(b"1 2026/10/13/00/00/00-4000\n")),true))
+                    let millis=control_duration.load(std::sync::atomic::Ordering::SeqCst);
+                    let closed=epoch.lock().unwrap().clone();
+                    let body=futures_util::stream::unfold(false,move |sent|{let closed=closed.clone();async move{
+                        if sent {closed.cancelled().await;return None;}
+                        Some((Ok::<_,std::io::Error>(bytes::Bytes::from(format!("1 2026/10/13/00/00/00-{millis}\n"))),true))
+                    }
                     });
                     return Response::new(Body::from_stream(body));
                 }
                 if uri.path()=="/owned/2026/10/13/00/00/00.m4f" {
                     assert!(h.contains_key("cluster-auth-key"));assert!(!h.contains_key("authorization"));
-                    return Response::new(Body::from(multitrack_segment()));
+                    return Response::new(Body::from(payload.lock().unwrap().clone()));
                 }
-                if uri.path()=="/owned/m4s" {
+                if uri.path().ends_with("/owned/m4s") {
                     assert!(h.contains_key("cluster-auth-key"));assert!(!h.contains_key("authorization"));
                     let track=Track{id:1,codec:"mp3".into(),config:vec![]};
                     let body=futures_util::stream::unfold((0u64,track),|(i,track)|async move {
@@ -131,6 +143,9 @@ impl Fixture {
             hold,
             calls,
             remote,
+            segment,
+            duration,
+            control_epoch,
             server,
             owner,
             cancel,
@@ -151,7 +166,7 @@ impl Fixture {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(p, _)| p == "/owned/m4s")
+            .filter(|(p, _)| p.ends_with("/owned/m4s"))
             .count()
     }
     async fn stop(self) {
@@ -227,6 +242,28 @@ async fn bytes(response: Response) -> bytes::Bytes {
     axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
         .await
         .unwrap()
+}
+async fn native_info(body: &mut Body) -> Vec<Track> {
+    use http_body_util::BodyExt;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut decoder = flussonix::m4s::Decoder::default();
+        loop {
+            let data = body
+                .frame()
+                .await
+                .expect("native body closed before metadata")
+                .unwrap()
+                .into_data()
+                .unwrap();
+            for event in decoder.push(&data).unwrap() {
+                if let flussonix::m4s::Event::Info { tracks, .. } = event {
+                    return tracks;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap()
 }
 async fn reauth(f: &Fixture) -> Response {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -349,6 +386,197 @@ async fn playlist(f: &Fixture, path: &str) -> String {
     })
     .await
     .unwrap()
+}
+#[tokio::test]
+async fn processing_template_delivers_cpu_aac_and_authorized_hls_with_one_private_pull() {
+    use sha2::{Digest, Sha256};
+    let hash = format!("{:x}", Sha256::digest(b"cpu"));
+    let f = Fixture::new(json!({"on_play":"true","flussonix_token_sha256":hash})).await;
+    f.app.config.put("templates","processing",json!({"transcoder":{"encoder":"copy","acodec":"aac","ab":96},"flussonix_hls_subtitles":"drop","inputs":[{"url":"http://owned-user:owned-template-secret@unused.invalid"}],"on_play":"https://unused-auth.invalid/check","static":true})).unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"processing"}),
+        )
+        .unwrap();
+    let r = f.get("/owned/m4s?token=cpu").await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let mut body = r.into_body();
+    let tracks = native_info(&mut body).await;
+    let aac = tracks.iter().any(|t| t.codec == "aac");
+    let pid = f.app.media.stats("owned").await["pid"].as_u64().unwrap();
+    let manifest = playlist(&f, "/owned/index.m3u8?token=cpu").await;
+    let segment = manifest
+        .lines()
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .unwrap();
+    let media = bytes(f.get(&format!("/owned/{segment}")).await).await;
+    assert_eq!(
+        f.get(&format!(
+            "/owned/{}",
+            segment.replace("token=cpu", "token=wrong")
+        ))
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let same_pid = f.app.media.stats("owned").await["pid"].as_u64().unwrap();
+    let pulls = f.media_calls();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cpu.ts");
+    std::fs::write(&path, media).unwrap();
+    drop(body);
+    f.stop().await;
+    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    let mut child = tokio::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(&path)
+        .args(["-t", "0.1", "-f", "null", "-"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let status = match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+        Ok(s) => s.unwrap(),
+        Err(_) => {
+            child.kill().await.unwrap();
+            let _ = child.wait().await;
+            panic!("owned decoder timed out")
+        }
+    };
+    assert!(status.success());
+    assert_eq!(pid, same_pid);
+    assert_eq!(pulls, 1);
+    assert!(
+        aac,
+        "saved processing template was ignored: output is not AAC"
+    );
+}
+#[tokio::test]
+async fn processing_template_edit_revokes_old_body_and_replaces_profile_and_cached_files() {
+    use http_body_util::BodyExt;
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    f.app
+        .config
+        .put(
+            "templates",
+            "processing",
+            json!({"flussonix_hls_subtitles":"drop"}),
+        )
+        .unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"processing"}),
+        )
+        .unwrap();
+    let live = f.get("/owned/m4s").await;
+    assert_eq!(live.status(), StatusCode::OK);
+    let mut old = live.into_body();
+    let before = f.app.media.stats("owned").await["pid"].as_u64().unwrap();
+    let manifest = playlist(&f, "/owned/index.m3u8").await;
+    let old_file = manifest
+        .lines()
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .unwrap()
+        .to_owned();
+    f.app
+        .config
+        .put(
+            "templates",
+            "processing",
+            json!({"transcoder":{"encoder":"copy","acodec":"aac","ab":96}}),
+        )
+        .unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(2), async {
+        while old.frame().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    let fresh = f.get("/owned/m4s").await;
+    assert_eq!(fresh.status(), StatusCode::OK);
+    let mut new = fresh.into_body();
+    let tracks = native_info(&mut new).await;
+    let aac = tracks.iter().any(|t| t.codec == "aac");
+    let after = f.app.media.stats("owned").await["pid"].as_u64().unwrap();
+    let stale = f.get(&format!("/owned/{old_file}")).await.status();
+    let pulls = f.media_calls();
+    drop(old);
+    drop(new);
+    f.stop().await;
+    assert!(closed);
+    assert!(aac);
+    assert_ne!(before, after);
+    assert_ne!(stale, StatusCode::OK);
+    assert_eq!(pulls, 2);
+    for pid in [before, after] {
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+}
+#[tokio::test]
+async fn processing_templates_are_isolated_between_distinct_vendor_sources() {
+    let a = Fixture::new(json!({"on_play":"true"})).await;
+    let b = Fixture::new(json!({"on_play":"true"})).await;
+    *a.remote.lock().unwrap() =
+        json!([{"name":"a/owned","groups":[],"named_by":"config","static":true}]);
+    *b.remote.lock().unwrap() =
+        json!([{"name":"b/owned","groups":[],"named_by":"config","static":true}]);
+    a.app
+        .config
+        .put(
+            "templates",
+            "processing",
+            json!({"transcoder":{"acodec":"aac","ab":96}}),
+        )
+        .unwrap();
+    a.app
+        .config
+        .put(
+            "sources",
+            &a.source,
+            json!({"prefix":"a","flussonix_output_template":"processing"}),
+        )
+        .unwrap();
+    a.app.config.put("sources",&b.source,json!({"flussonix_source_kind":"flussonic","prefix":"b","cluster_key":"owned-private-cluster-key","on_play":"true"})).unwrap();
+    let mut bodies = vec![];
+    let mut codecs = vec![];
+    for name in ["a/owned", "b/owned"] {
+        let live = a.get(&format!("/{name}/m4s")).await;
+        assert_eq!(live.status(), StatusCode::OK);
+        let mut body = live.into_body();
+        let tracks = native_info(&mut body).await;
+        codecs.push(tracks[0].codec.clone());
+        bodies.push(body);
+    }
+    let pulls = (a.media_calls(), b.media_calls());
+    drop(bodies);
+    a.stop().await;
+    b.stop().await;
+    assert_eq!(codecs, ["aac", "mp3"]);
+    assert_eq!(pulls, (1, 1));
+}
+#[tokio::test]
+async fn processing_template_never_supplies_missing_source_viewer_authority() {
+    let f = Fixture::new(json!({})).await;
+    f.app.config.put("templates","processing",json!({"transcoder":{"acodec":"aac","ab":96},"inputs":[{"url":"http://owned-template-input.invalid"}],"static":true})).unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"processing"}),
+        )
+        .unwrap();
+    let status = f.get("/owned/m4s").await.status();
+    let pulls = f.media_calls();
+    f.stop().await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(pulls, 0);
 }
 #[tokio::test]
 async fn hls_requests_retain_one_source_and_authorize_every_cached_segment() {
@@ -779,6 +1007,319 @@ fn multitrack_segment() -> Vec<u8> {
     }
     frames.sort_by_key(|f| f.dts);
     flussonix::m4f::pack(&tracks, &frames, 360000).unwrap()
+}
+fn text_segment() -> Vec<u8> {
+    let (mut tracks, mut frames) = flussonix::m4f::unpack(&multitrack_segment()).unwrap();
+    for i in 150..380 {
+        frames.push(Frame {
+            track_id: 1,
+            dts: 90000 + i * 2351,
+            pts_offset: 0,
+            key: true,
+            body: include_bytes!("fixtures/codecs/mp3.bin").to_vec(),
+        });
+        frames.push(Frame {
+            track_id: 2,
+            dts: 90000 + i * 2160,
+            pts_offset: 0,
+            key: true,
+            body: include_bytes!("fixtures/codecs/mp2.bin").to_vec(),
+        });
+    }
+    for (id, text) in [(7, "AMERICA HELLO"), (8, "EUROPE GRÜSSE")] {
+        tracks.push(Track {
+            id,
+            codec: "subtitle".into(),
+            config: vec![],
+        });
+        frames.push(Frame {
+            track_id: id,
+            dts: 100000,
+            pts_offset: 50000,
+            key: true,
+            body: text.as_bytes().to_vec(),
+        });
+    }
+    frames.sort_by_key(|f| f.dts);
+    flussonix::m4f::pack(&tracks, &frames, 900000).unwrap()
+}
+#[tokio::test]
+async fn processing_template_preserves_or_filters_original_native_subtitle_tracks() {
+    for preserve in [false, true] {
+        let f = Fixture::variant(json!({"on_play":"true"}), "m4f", "standalone").await;
+        *f.segment.lock().unwrap() = text_segment();
+        f.duration.store(10000, std::sync::atomic::Ordering::SeqCst);
+        f.app.config.put("templates","processing",json!({"flussonix_subtitle_tracks":if preserve {"preserve"} else {"drop"},"flussonix_hls_subtitles":"drop"})).unwrap();
+        f.app
+            .config
+            .put(
+                "sources",
+                &f.source,
+                json!({"flussonix_output_template":"processing"}),
+            )
+            .unwrap();
+        let live = f.get("/owned/m4s").await;
+        assert_eq!(live.status(), StatusCode::OK);
+        let mut body = live.into_body();
+        let tracks = native_info(&mut body).await;
+        let count = tracks.iter().filter(|t| t.codec == "subtitle").count();
+        let response = f.get("/owned/2026/10/13/00/00/00.m4f").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let segment = bytes(response).await;
+        let (tracks, _) = flussonix::m4f::unpack(&segment).unwrap();
+        let segment_count = tracks.iter().filter(|t| t.codec == "subtitle").count();
+        drop(body);
+        f.stop().await;
+        assert_eq!(count, if preserve { 2 } else { 0 });
+        assert_eq!(segment_count, count);
+        if preserve {
+            assert_eq!(segment, text_segment());
+        }
+    }
+}
+#[tokio::test]
+async fn processing_template_converts_english_and_german_native_text_with_shared_authorized_state()
+{
+    use http_body_util::BodyExt;
+    use sha2::{Digest, Sha256};
+    let f=Fixture::variant(json!({"on_play":"true","flussonix_token_sha256":format!("{:x}",Sha256::digest(b"caption"))}),"m4f","standalone").await;
+    *f.segment.lock().unwrap() = text_segment();
+    f.duration.store(10000, std::sync::atomic::Ordering::SeqCst);
+    f.app.config.put("templates","processing",json!({"flussonix_hls_subtitles":"convert","flussonix_hls_captions":[{"native_track":7,"language":"en","name":"English"},{"native_track":8,"language":"de","name":"Deutsch"}]})).unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"processing"}),
+        )
+        .unwrap();
+    let master = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let r = f.get("/owned/index.m3u8?token=caption").await;
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "{}",
+                f.app.media.stats("owned").await
+            );
+            let text = String::from_utf8(bytes(r).await.to_vec()).unwrap();
+            if text.contains("TYPE=SUBTITLES") {
+                break text;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(master.contains("English") && master.contains("Deutsch"));
+    let first_pid = f.app.media.stats("owned").await["pid"].clone();
+    let live = f.get("/owned/m4s?token=caption").await;
+    assert_eq!(live.status(), StatusCode::OK);
+    let mut body = live.into_body();
+    let tracks = native_info(&mut body).await;
+    assert!(tracks.iter().all(|t| t.codec != "subtitle"));
+    let mut texts = vec![];
+    for id in [7, 8] {
+        let list = String::from_utf8(
+            bytes(f.get(&format!("/owned/nt{id}.m3u8?token=caption")).await)
+                .await
+                .to_vec(),
+        )
+        .unwrap();
+        let mut text = String::new();
+        for file in list
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            let r = f.get(&format!("/owned/{file}")).await;
+            assert_eq!(r.status(), StatusCode::OK);
+            text += &String::from_utf8_lossy(&bytes(r).await);
+            assert_eq!(
+                f.get(&format!(
+                    "/owned/{}",
+                    file.replace("token=caption", "token=wrong")
+                ))
+                .await
+                .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        texts.push(text);
+    }
+    let last_pid = f.app.media.stats("owned").await["pid"].clone();
+    let pulls = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(p, _)| p == "/owned/m4f")
+        .count();
+    let old_list = String::from_utf8(
+        bytes(f.get("/owned/nt7.m3u8?token=caption").await)
+            .await
+            .to_vec(),
+    )
+    .unwrap();
+    let old_files: Vec<_> = old_list
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_owned)
+        .collect();
+    let (tracks, mut frames) = flussonix::m4f::unpack(&text_segment()).unwrap();
+    for frame in &mut frames {
+        if frame.track_id == 7 {
+            frame.body = b"REPLACEMENT ENGLISH".to_vec();
+        }
+        if frame.track_id == 8 {
+            frame.body = "NEUE GRÜSSE".as_bytes().to_vec();
+        }
+    }
+    *f.segment.lock().unwrap() = flussonix::m4f::pack(&tracks, &frames, 900000).unwrap();
+    f.app
+        .config
+        .put(
+            "templates",
+            "processing",
+            json!({"flussonix_input_timeout":20}),
+        )
+        .unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(2), async {
+        while body.frame().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    let fresh = f.get("/owned/index.m3u8?token=caption").await;
+    assert_eq!(fresh.status(), StatusCode::OK);
+    let new_list = String::from_utf8(
+        bytes(f.get("/owned/nt7.m3u8?token=caption").await)
+            .await
+            .to_vec(),
+    )
+    .unwrap();
+    let mut replacement = String::new();
+    for file in new_list
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        assert!(!old_files.iter().any(|old| old == file));
+        replacement +=
+            &String::from_utf8_lossy(&bytes(f.get(&format!("/owned/{file}")).await).await);
+    }
+    let stale = f.get(&format!("/owned/{}", old_files[0])).await.status();
+    drop(body);
+    f.stop().await;
+    assert!(texts[0].contains("AMERICA HELLO"), "{}", texts[0]);
+    assert!(texts[1].contains("EUROPE GRÜSSE"), "{}", texts[1]);
+    assert_eq!(first_pid, last_pid);
+    assert_eq!(pulls, 1);
+    assert!(closed);
+    assert!(replacement.contains("REPLACEMENT ENGLISH"), "{replacement}");
+    assert!(!replacement.contains("AMERICA HELLO"));
+    assert_ne!(stale, StatusCode::OK);
+}
+#[tokio::test]
+async fn processing_template_preserve_with_transcoding_fails_explicitly_for_native_text() {
+    let f = Fixture::variant(json!({"on_play":"true"}), "m4f", "standalone").await;
+    *f.segment.lock().unwrap() = text_segment();
+    f.duration.store(10000, std::sync::atomic::Ordering::SeqCst);
+    f.app.config.put("templates","processing",json!({"transcoder":{"acodec":"aac","ab":96},"flussonix_subtitle_tracks":"preserve","flussonix_hls_subtitles":"drop"})).unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"processing"}),
+        )
+        .unwrap();
+    let status = f.get("/owned/m4s").await.status();
+    let stats = f.app.media.stats("owned").await;
+    f.stop().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(stats["last_error"], "native_subtitle_transcode_unsupported");
+}
+#[tokio::test]
+async fn processing_template_conversion_restarts_with_fresh_state_in_the_same_config_revision() {
+    use http_body_util::BodyExt;
+    let f = Fixture::variant(json!({"on_play":"true"}), "m4f", "standalone").await;
+    *f.segment.lock().unwrap() = text_segment();
+    f.duration.store(10000, std::sync::atomic::Ordering::SeqCst);
+    f.app.config.put("templates","processing",json!({"flussonix_hls_subtitles":"convert","flussonix_hls_captions":[{"native_track":7,"language":"en","name":"English"}]})).unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"processing"}),
+        )
+        .unwrap();
+    let master = f.get("/owned/index.m3u8").await;
+    assert_eq!(master.status(), StatusCode::OK);
+    let list = String::from_utf8(bytes(f.get("/owned/nt7.m3u8").await).await.to_vec()).unwrap();
+    let old_file = list
+        .lines()
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .unwrap()
+        .to_owned();
+    let old_text = bytes(f.get(&format!("/owned/{old_file}")).await).await;
+    let live = f.get("/owned/m4s").await;
+    assert_eq!(live.status(), StatusCode::OK);
+    let mut body = live.into_body();
+    let _ = native_info(&mut body).await;
+    let old_pid = f.app.media.stats("owned").await["pid"].clone();
+    let revision = f.app.config.revision();
+    let management = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(p, _)| p.contains("/streamer/api/"))
+        .count();
+    let (tracks, mut frames) = flussonix::m4f::unpack(&text_segment()).unwrap();
+    for frame in &mut frames {
+        if frame.track_id == 7 {
+            frame.body = b"NEW INPUT GENERATION".to_vec();
+        }
+    }
+    *f.segment.lock().unwrap() = flussonix::m4f::pack(&tracks, &frames, 900000).unwrap();
+    let closed = std::mem::replace(
+        &mut *f.control_epoch.lock().unwrap(),
+        CancellationToken::new(),
+    );
+    closed.cancel();
+    let ended = tokio::time::timeout(Duration::from_secs(3), async {
+        while body.frame().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    let fresh = f.get("/owned/index.m3u8").await;
+    assert_eq!(fresh.status(), StatusCode::OK);
+    let list = String::from_utf8(bytes(f.get("/owned/nt7.m3u8").await).await.to_vec()).unwrap();
+    let new_file = list
+        .lines()
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .unwrap()
+        .to_owned();
+    let text = bytes(f.get(&format!("/owned/{new_file}")).await).await;
+    let new_pid = f.app.media.stats("owned").await["pid"].clone();
+    let same_revision = f.app.config.revision() == revision;
+    let new_management = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(p, _)| p.contains("/streamer/api/"))
+        .count();
+    drop(body);
+    f.stop().await;
+    assert!(ended);
+    assert!(same_revision);
+    assert_eq!(management, new_management);
+    assert_ne!(old_pid, new_pid);
+    assert_ne!(old_file, new_file);
+    assert!(String::from_utf8_lossy(&old_text).contains("AMERICA HELLO"));
+    assert!(String::from_utf8_lossy(&text).contains("NEW INPUT GENERATION"));
+    assert!(!String::from_utf8_lossy(&text).contains("AMERICA HELLO"));
 }
 #[tokio::test]
 async fn m4f_source_serves_original_multitrack_segment_and_hls_through_daemon() {

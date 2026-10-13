@@ -4,6 +4,8 @@ Explicit vendor profiles now select [guarded daemon HTTP playback](vendor-daemon
 The native discovery path skips them. The [source editor](vendor-source-editor.md)
 provides ordinary fields for source type, endpoints, TLS trust and local viewer
 policies, including group overrides.
+An optional local [processing template](vendor-processing-templates.md) selects
+the shared output profile without importing template input or viewer policy.
 
 Source rows may set `flussonix_source_kind` to `native` or `flussonic`. Omitting it
 keeps existing native FlussoniX discovery, including URL-keyed sources. A URL alone

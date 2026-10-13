@@ -202,6 +202,24 @@ impl SharedHlsSessions {
         options: SharedInputOptions,
         settings: &Value,
     ) -> Result<PackagedPlayback, HlsSessionFailure> {
+        self.package_inner(engine, admission, Some(options), settings)
+            .await
+    }
+    pub(crate) async fn package_configured(
+        &self,
+        engine: &Engine,
+        admission: Box<AdmittedCandidate>,
+        settings: &Value,
+    ) -> Result<PackagedPlayback, HlsSessionFailure> {
+        self.package_inner(engine, admission, None, settings).await
+    }
+    async fn package_inner(
+        &self,
+        engine: &Engine,
+        admission: Box<AdmittedCandidate>,
+        options: Option<SharedInputOptions>,
+        settings: &Value,
+    ) -> Result<PackagedPlayback, HlsSessionFailure> {
         if !self.running() {
             return Err(HlsSessionFailure::Closed);
         }
@@ -216,10 +234,11 @@ impl SharedHlsSessions {
                 }
             })?;
         let reservation = self.reserve(key)?;
-        let attachment = self
-            .registry
-            .attach(admission, options)
-            .map_err(HlsSessionFailure::Authority)?;
+        let attachment = match options {
+            Some(options) => self.registry.attach(admission, options),
+            None => self.registry.attach_configured(admission, settings),
+        }
+        .map_err(HlsSessionFailure::Authority)?;
         let playback = tokio::select! {biased;_=reservation.cancel.cancelled()=>return Err(HlsSessionFailure::Closed),r=engine.package_shared(attachment,settings)=>r.map_err(HlsSessionFailure::Packaging)?};
         playback.current().map_err(HlsSessionFailure::Packaging)?;
         {

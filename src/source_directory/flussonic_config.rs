@@ -29,7 +29,7 @@ const MAX_GROUP_BYTES: usize = 16 * 1024;
 const MAX_GROUPS: usize = 128;
 const MAX_PATTERNS: usize = 1024;
 
-/// Remove only daemon selection metadata and a validated derived transport.
+/// Remove validated local selection/processing metadata and derived transport.
 /// Complete-profile validation still rejects every unsupported native field.
 /// Unmarked rows remain available to explicit library callers; a marked native
 /// row must never be projected as a vendor source by mistake.
@@ -40,6 +40,10 @@ pub(crate) fn normalized_modern_source(source: &Value) -> Result<Value, Projecti
         && kind.as_str() != Some("flussonic")
     {
         return Err(ProjectionFailure::Unsupported);
+    }
+    if let Some(reference) = object.remove("flussonix_output_template") {
+        crate::config::valid_name(reference.as_str().ok_or(ProjectionFailure::Invalid)?)
+            .map_err(|_| ProjectionFailure::Invalid)?;
     }
     if let Some(transport) = object.remove("flussonix_transport") {
         let (_, expected) = crate::config::source_address(

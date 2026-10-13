@@ -322,6 +322,62 @@ impl SharedInputs {
         admission: Box<AdmittedCandidate>,
         options: SharedInputOptions,
     ) -> Result<SharedInputAttachment, SharedFailure> {
+        self.attach_with(admission, |_| Ok(options))
+    }
+    /// Resolve local processing options inside the registry's attachment fence.
+    /// Mutable conversion state belongs to exactly one shared input generation.
+    pub(crate) fn attach_configured(
+        &self,
+        admission: Box<AdmittedCandidate>,
+        settings: &serde_json::Value,
+    ) -> Result<SharedInputAttachment, SharedFailure> {
+        self.attach_with(admission, |reuse| {
+            crate::vendor_output::validate(settings).map_err(|_| SharedFailure::Input)?;
+            let preserve = crate::config::subtitle_tracks(settings)
+                .map_err(|_| SharedFailure::Input)?
+                == "preserve";
+            let services =
+                crate::captions::configuration(settings).map_err(|_| SharedFailure::Input)?;
+            let native = services.iter().any(|s| s.native_track().is_some());
+            if let Some(worker) = reuse {
+                if worker.options.preserve_subtitles != preserve {
+                    return Err(SharedFailure::Mismatch);
+                }
+                let matches = match (&worker.options.conversion, native) {
+                    (None, false) => true,
+                    (Some(state), true) => {
+                        let decoder = state
+                            .decoder
+                            .lock()
+                            .map_err(|_| SharedFailure::Unavailable)?;
+                        serde_json::to_value(&decoder.services).map_err(|_| SharedFailure::Input)?
+                            == serde_json::to_value(&services).map_err(|_| SharedFailure::Input)?
+                    }
+                    _ => false,
+                };
+                return if matches {
+                    Ok(worker.options.clone())
+                } else {
+                    Err(SharedFailure::Mismatch)
+                };
+            }
+            Ok(SharedInputOptions {
+                preserve_subtitles: preserve,
+                conversion: native.then(|| {
+                    Arc::new(crate::caption_hls::State::new(
+                        crate::captions::Decoder::new(services),
+                        format!("vendor-{}", Uuid::new_v4()),
+                        0,
+                    ))
+                }),
+            })
+        })
+    }
+    fn attach_with(
+        &self,
+        admission: Box<AdmittedCandidate>,
+        options: impl FnOnce(Option<&Worker>) -> Result<SharedInputOptions, SharedFailure>,
+    ) -> Result<SharedInputAttachment, SharedFailure> {
         let admission: Arc<AdmittedCandidate> = admission.into();
         let mut registry = self
             .workers
@@ -337,6 +393,10 @@ impl SharedInputs {
                 if admission.grant.is_cancelled() {
                     return Err(AdmissionFailure::Revoked);
                 }
+                let options = match options(reuse.map(Arc::as_ref)) {
+                    Ok(options) => options,
+                    Err(error) => return Ok(Err(error)),
+                };
                 let result = if let Some(worker) = reuse {
                     if !worker.compatible(&admission, view.policy, &options) {
                         Err(SharedFailure::Mismatch)

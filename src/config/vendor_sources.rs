@@ -7,6 +7,7 @@ pub(super) const FIELDS: &[&str] = &[
     "on_play",
     "flussonix_token_sha256",
     "group_config",
+    "flussonix_output_template",
 ];
 pub(super) fn validate_count(root: &Value) -> Result<(), String> {
     if root["sources"]
@@ -29,14 +30,20 @@ pub(super) fn validate(source: &Value, root: &Value) -> Result<(), String> {
         _ => return Err("source kind must be native or flussonic".into()),
     };
     if !vendor {
-        if ["on_play", "flussonix_token_sha256", "group_config"]
-            .iter()
-            .any(|key| source.get(*key).is_some())
+        if [
+            "on_play",
+            "flussonix_token_sha256",
+            "group_config",
+            "flussonix_output_template",
+        ]
+        .iter()
+        .any(|key| source.get(*key).is_some())
         {
-            return Err("source viewer policies require explicit Flussonic source kind".into());
+            return Err("source viewer policies and processing templates require explicit Flussonic source kind".into());
         }
         return Ok(());
     }
+    crate::vendor_output::resolve(root, source)?;
     let profile = crate::source_directory::flussonic_config::normalized_modern_source(source)
         .map_err(|_| {
             "Flussonic source requires a supported URL profile and matching transport".to_string()
