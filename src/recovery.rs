@@ -4,6 +4,10 @@ use std::time::{Duration, Instant};
 pub fn retry_delay(streak: u32) -> Duration {
     Duration::from_secs((1u64 << streak.min(5)).min(30))
 }
+// Retry telemetry must not announce zero while recovery still rejects the request.
+pub(crate) fn retry_millis(delay: Duration) -> u128 {
+    delay.as_nanos().div_ceil(1_000_000)
+}
 struct Failure {
     reason: &'static str,
     when: Instant,
@@ -69,6 +73,23 @@ impl Recovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retry_telemetry_is_zero_only_when_backoff_is_due() {
+        for (nanos, millis) in [
+            (0, 0),
+            (1, 1),
+            (999_999, 1),
+            (1_000_000, 1),
+            (1_000_001, 2),
+            (29_999_999_999, 30_000),
+        ] {
+            assert_eq!(
+                retry_millis(Duration::from_nanos(nanos)),
+                millis,
+                "remaining {nanos} ns"
+            );
+        }
+    }
     #[test]
     fn a_long_final_stall_is_not_a_healthy_media_window() {
         let mut state = Recovery::new(4);
