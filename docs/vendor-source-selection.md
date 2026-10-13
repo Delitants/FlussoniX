@@ -1,8 +1,9 @@
 # Saved vendor source profiles
 
 Explicit vendor profiles now select [guarded daemon HTTP playback](vendor-daemon-playback.md).
-The native discovery path skips them. The friendly source-policy editor remains
-separate integration work.
+The native discovery path skips them. The [source editor](vendor-source-editor.md)
+provides ordinary fields for source type, endpoints, TLS trust and local viewer
+policies, including group overrides.
 
 Source rows may set `flussonix_source_kind` to `native` or `flussonic`. Omitting it
 keeps existing native FlussoniX discovery, including URL-keyed sources. A URL alone
@@ -19,9 +20,10 @@ A minimal vendor profile for an explicit coordinator caller is:
 }
 ```
 
-`on_play: "true"` explicitly permits viewers without a callback. Omit it to leave
-viewer authority unresolved, or configure a supported callback / `auth://` backend
-and optionally `flussonix_token_sha256`. Privileged Cluster credentials never
+`on_play: "true"` explicitly permits viewers without a callback. Without an
+applicable callback, explicit allow policy or `flussonix_token_sha256` guard, viewer
+authority stays unresolved. Configure a token guard alone, or a supported callback
+/ `auth://` backend with an optional token guard. Privileged Cluster credentials never
 substitute for a viewer policy. Only the explicit vendor kind permits these local
 source policy fields and `group_config`, for example:
 

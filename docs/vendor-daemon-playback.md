@@ -49,8 +49,9 @@ privileged native restart. These are bounded schedules, not availability or
 real-time guarantees.
 
 This first daemon integration uses copy output and existing default subtitle
-filtering. Per-vendor output/transcoding/subtitle settings and the friendly source
-policy editor are still pending. Existing configured-stream controls are
+filtering. Per-vendor output/transcoding/subtitle settings are still pending.
+The [source policy editor](vendor-source-editor.md) configures local viewer policy
+without JSON. Existing configured-stream controls are
 unchanged. No new GPU, production-performance or live vendor qualification is
 claimed.
 

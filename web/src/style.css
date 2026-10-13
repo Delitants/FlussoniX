@@ -17,3 +17,5 @@ fieldset{border:1px solid #e2e8f0;border-radius:6px;padding:16px;margin:0 0 20px
 
 @media(max-width:900px){.filterbar{flex-wrap:wrap}}
 .gpu-readiness{margin-bottom:18px}.gpu-readiness ul{padding-left:20px;line-height:1.8}.gpu-readiness li p{margin:4px 0 12px;font-size:12px}
+
+.vendor-policies,.vendor-policies fieldset{min-width:0}.vendor-policies{overflow-wrap:anywhere}.vendor-policies legend{max-width:100%}
