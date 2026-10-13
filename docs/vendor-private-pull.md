@@ -39,9 +39,10 @@ defaults are unchanged. Trust and privileged credentials remain frozen in the
 source profile; these options cannot replace the origin or its TLS settings.
 
 Failures distinguish owner cancellation, current-authority failure and generic
-input failure without including URLs, credentials or media. A stopped pull
-requires a fresh current candidate/admission before a later startup. The caller
-continues to own native authorizer renewal and downstream delivery fences.
+input failure without including URLs, credentials or media. Every later startup
+rechecks admission. A still-current admission may be reused after an input
+failure; an obsolete or revoked admission cannot be revived. The caller continues
+to own native authorizer renewal and downstream delivery fences.
 
 The owned `vendor_private_pull` suite covers both protocols, stale startup,
 late headers, source/alias/configuration/refresh/lease changes, idle cancellation,
