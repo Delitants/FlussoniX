@@ -517,6 +517,9 @@ impl App {
             .extend(node.as_object().unwrap().clone());
         metrics["stream_bitrates"] = stream_bitrates;
         metrics["source_activation"] = self.source_activation_status().await;
+        if let Some(runtime) = &self.vendor_playback {
+            metrics["vendor_source_activation"] = runtime.activation_status(self);
+        }
         metrics
     }
     pub fn sample_metrics(&self) {

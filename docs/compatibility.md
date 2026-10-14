@@ -645,15 +645,14 @@ ancestry or private endpoint identity. Automatic vendor routing remains disabled
 
 ## Explicit vendor HTTP source recovery
 
-Configured Flussonic HTTP sources now support [equivalent-origin failover](vendor-daemon-failover.md) with explicit local group/content identity, equal policies and processing, guarded native viewer admission, private rejection barriers and background shared-worker replacement. HLS discontinuities and continuous-response reconnects apply. Always-on vendor activation, vendor RTSP/SRT delivery, vendor CDN destinations and production mixed-cluster qualification remain pending.
+Configured Flussonic HTTP sources now support [equivalent-origin failover](vendor-daemon-failover.md) with explicit local group/content identity, equal policies and processing, guarded native viewer admission, private rejection barriers and background shared-worker replacement. HLS discontinuities and continuous-response reconnects apply. Vendor RTSP/SRT delivery, vendor CDN destinations and production mixed-cluster qualification remain pending.
 
-### Vendor static input ownership foundation
+### Automatic vendor static activation
 
-The [static input ownership library](vendor-static-activation.md) can keep a
-current selected vendor static candidate in the shared input/packager without
-creating a viewer session, calling viewer authentication, consuming viewer
-limits or renewing playback activity. Real viewers retain independent native
-authorization and share that generation. Cancellation, source/configuration
-changes, lease expiry, demotion and replica switches fence stale owners.
-Automatic vendor inventory polling and daemon startup scheduling remain pending;
-existing vendor playback stays demand-driven.
+[Configured static activation](vendor-static-activation.md) now polls complete
+authenticated vendor inventories and starts selected eligible streams on CDN
+and standalone nodes without viewer sessions or callbacks. Normal viewer
+authorization remains mandatory. Static owners share media with viewers and
+use bounded renewal, recovery and cancellation; load balancers do no eager
+media work. Cluster and staged Config expose All static / Selected / On demand
+controls and the Cluster page reports activity, discovery errors and capacity.

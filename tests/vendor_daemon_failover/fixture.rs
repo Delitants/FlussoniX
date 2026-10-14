@@ -81,9 +81,9 @@ impl Origin {
    let held=held.clone();let stalled=stalled.clone();
    let (a,m,r,e,p,c,k)=(a.clone(),m.clone(),r.clone(),e.clone(),p.clone(),c.clone(),k.clone());async move{
     assert!(!headers.contains_key("x-flussonix-peer"));
-    if uri.path()=="/owned/m4s" {
+    if let Some(name)=uri.path().strip_prefix('/').and_then(|p|p.strip_suffix("/m4s")) {
      p.fetch_add(1,Ordering::SeqCst);assert!(uri.query().is_none());assert!(!headers.contains_key("authorization"));
-     let time=headers["cluster-auth-time"].to_str().unwrap();assert_eq!(headers["cluster-auth-key"],digest(&format!("{time}:{k}:owned")));
+     let time=headers["cluster-auth-time"].to_str().unwrap();assert_eq!(headers["cluster-auth-key"],digest(&format!("{time}:{k}:{name}")));
      let status=*m.lock().unwrap();if status!=StatusCode::OK {let mut out=Response::new(Body::empty());*out.status_mut()=status;return out;}
      if stalled.load(Ordering::SeqCst) {
          let mut out=Response::new(Body::from_stream(futures_util::stream::pending::<Result<bytes::Bytes,std::io::Error>>()));
@@ -149,6 +149,9 @@ impl Fixture {
         Self::with_role("standalone").await
     }
     pub async fn with_role(role: &str) -> Self {
+        Self::configured(role, json!({"only":[]}), None, true).await
+    }
+    pub async fn configured(role: &str, patch: Value, rows: Option<Value>, grouped: bool) -> Self {
         let origins = vec![
             Origin::start("owned-origin-a").await,
             Origin::start("owned-origin-b").await,
@@ -166,8 +169,22 @@ impl Fixture {
             },
         )
         .unwrap();
-        for origin in &origins {
-            app.config.put("sources",&origin.key,json!({"flussonix_source_kind":"flussonic","cluster_key":origin.secret,"on_play":"true","flussonix_source_group":"music-origins","flussonix_content_id":"explicit-music-v1"})).unwrap();
+        if patch["flussonix_output_template"] == "owned-aac" {
+            app.config.put("templates","owned-aac",json!({"transcoder":{"encoder":"copy","acodec":"aac","ab":96},"flussonix_hls_subtitles":"drop"})).unwrap();
+        }
+        for origin in origins.iter().take(if grouped { 2 } else { 1 }) {
+            if let Some(rows) = &rows {
+                *origin.rows.lock().unwrap() = rows.clone();
+            }
+            let mut source = json!({"flussonix_source_kind":"flussonic","cluster_key":origin.secret,"on_play":"true"});
+            if grouped {
+                source["flussonix_source_group"] = json!("music-origins");
+                source["flussonix_content_id"] = json!("explicit-music-v1");
+            }
+            for (key, value) in patch.as_object().unwrap() {
+                source[key] = value.clone();
+            }
+            app.config.put("sources", &origin.key, source).unwrap();
         }
         let cancel = CancellationToken::new();
         let (a, c) = (app.clone(), cancel.clone());

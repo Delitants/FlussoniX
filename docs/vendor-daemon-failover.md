@@ -25,11 +25,12 @@ private metadata from the same origin can clear it. Unrelated settings saves
 preserve these barriers and the selected-origin history. Changing the source
 relationship, its processing or policy starts a new selection plan.
 
-Recovery uses original native viewer permission and recent playback demand.
-Background work does not renew viewer activity or bypass callbacks, revocation,
-limits or authorization expiry. With no recent authorized demand, media and
-retries stop. No streams are started solely because they exist in a vendor
-catalog. Every origin retains its own private credentials and TLS trust.
+On-demand recovery uses original native viewer permission and recent playback
+demand. [Selected static streams](vendor-static-activation.md) recover through
+separate daemon ownership without viewer sessions. Background work does not
+renew viewer activity or bypass callbacks, revocation, limits or authorization
+expiry. Media and retries stop when neither owner remains. Every origin retains
+its own private credentials and TLS trust.
 
 HTTP/HTTPS HLS, MPEG-TS, M4S and M4F outputs use the replacement worker. Continuous
 responses close at replacement and clients reconnect. HLS gets a new generation
@@ -39,8 +40,7 @@ same origin instead of being interpreted as an origin's transport failure.
 
 The existing active-pulls table reports selected source, group, availability and
 switch count. FlussoniX load balancers use group catalog authority for placement
-on FlussoniX CDNs and never start media workers. Vendor CDN destinations,
-always-on vendor activation and vendor RTSP/SRT delivery remain separate work.
+on FlussoniX CDNs and never start media workers. Vendor CDN destinations and vendor RTSP/SRT delivery remain separate work.
 
 Discovery is coalesced per source, with four concurrent queries, a four-second
 group lookup budget and a 750 ms wire budget per origin. Recovery owns at most

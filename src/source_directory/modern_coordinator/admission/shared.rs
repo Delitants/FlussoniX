@@ -409,7 +409,21 @@ impl SharedInputs {
         admission: Box<AdmittedCandidate>,
         settings: &serde_json::Value,
     ) -> Result<SharedInputAttachment, SharedFailure> {
-        self.attach_with(admission, |reuse| {
+        self.attach_processing(Permission::Viewer(Arc::from(admission)), settings)
+    }
+    pub(crate) fn attach_activation_configured(
+        &self,
+        activation: super::ActivatedCandidate,
+        settings: &serde_json::Value,
+    ) -> Result<SharedInputAttachment, SharedFailure> {
+        self.attach_processing(Permission::Activation(Arc::new(activation)), settings)
+    }
+    fn attach_processing(
+        &self,
+        permission: Permission,
+        settings: &serde_json::Value,
+    ) -> Result<SharedInputAttachment, SharedFailure> {
+        self.attach_permission(permission, |reuse| {
             crate::vendor_output::validate(settings).map_err(|_| SharedFailure::Input)?;
             let preserve = crate::config::subtitle_tracks(settings)
                 .map_err(|_| SharedFailure::Input)?

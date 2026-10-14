@@ -186,7 +186,7 @@ impl Runtime {
             ),
         }
     }
-    async fn replica_inventory(
+    pub(super) async fn replica_inventory(
         &self,
         app: &App,
         key: &str,

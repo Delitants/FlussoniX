@@ -126,8 +126,7 @@ impl Fixture {
             },
         )
         .unwrap();
-        let mut row =
-            json!({"flussonix_source_kind":"flussonic","cluster_key":"owned-private-cluster-key"});
+        let mut row = json!({"flussonix_source_kind":"flussonic","cluster_key":"owned-private-cluster-key","only":[]});
         if let Some(policy) = policy.as_object() {
             for (k, v) in policy {
                 row[k] = v.clone();
@@ -1508,3 +1507,63 @@ mod placement;
 
 #[path = "vendor_daemon_playback/balancer.rs"]
 mod balancer;
+
+#[tokio::test]
+async fn automatic_m4f_static_startup_requires_no_viewer_and_decodes_hls() {
+    use http_body_util::BodyExt;
+    let f = Fixture::variant(
+        json!({"only":["owned"],"on_play":"true"}),
+        "m4f",
+        "standalone",
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while f.app.media.stats("owned").await["bytes_in"]
+            .as_u64()
+            .unwrap_or(0)
+            == 0
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("automatic M4F input never started");
+    assert!(f.app.playback_auth.snapshots().is_empty());
+    assert_eq!(f.app.playback_auth.live_grants(), 0);
+    let playlist = f.get("/owned/index.m3u8").await;
+    assert_eq!(playlist.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        playlist
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    let segment = text
+        .lines()
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .unwrap();
+    let reply = f.get(&format!("/owned/{segment}")).await;
+    assert_eq!(reply.status(), StatusCode::OK);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("static-m4f.ts");
+    tokio::fs::write(&path, reply.into_body().collect().await.unwrap().to_bytes())
+        .await
+        .unwrap();
+    let status = tokio::process::Command::new("/usr/bin/ffmpeg")
+        .kill_on_drop(true)
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(path)
+        .args(["-t", "0.1", "-f", "null", "-"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success());
+    f.stop().await;
+}

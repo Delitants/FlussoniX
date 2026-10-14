@@ -17,7 +17,7 @@ test('vendor source form defaults to unresolved viewer policy and masks private 
  await page.getByLabel('Source type',{exact:true}).selectOption('flussonic');
  await page.getByLabel('Source address',{exact:true}).fill(source);
  await expect(page.getByLabel('Viewer policy',{exact:true})).toHaveValue('inherit');
- await expect(page.getByLabel('Stream activation',{exact:true})).toHaveCount(0);
+ await expect(page.getByLabel('Stream activation',{exact:true})).toHaveValue('all');
  await expect(page.getByLabel('Public delivery URL',{exact:true})).toHaveCount(0);
  await expect(page.getByLabel('Failover group',{exact:true})).toHaveValue('');
  await expect(page.getByLabel('Content identity',{exact:true})).toHaveValue('');
@@ -121,4 +121,11 @@ test('vendor replica controls save explicit equivalence and retain it until clea
  await page.getByLabel('Source type',{exact:true}).selectOption('native');await page.getByRole('button',{name:'Clear vendor viewer policies',exact:true}).click();await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Clear vendor content identity');
  await page.getByRole('button',{name:'Clear vendor content identity',exact:true}).click();await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
  saved=await(await request.get(uri,{headers:headers()})).json();expect(saved.flussonix_content_id).toBeUndefined();expect(saved.flussonix_source_group).toBe('music-origins');
+});
+
+test('vendor static activation selections persist through Cluster and staged Config',async({page,request})=>{
+ await page.getByRole('button',{name:'Add source',exact:true}).click();await page.getByLabel('Source type',{exact:true}).selectOption('flussonic');await page.getByLabel('Source address',{exact:true}).fill(source);await page.getByLabel('Cluster key',{exact:true}).fill('owned-vendor-private-key');await page.getByLabel('Viewer policy',{exact:true}).selectOption('allow');
+ await page.getByLabel('Stream activation',{exact:true}).selectOption('selected');await page.getByLabel('Active stream or prefix 1',{exact:true}).fill('news/*');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(row(page)).toBeVisible();expect((await(await request.get(uri,{headers:headers()})).json()).only).toEqual(['news/*']);
+ await edit(page);await expect(page.getByLabel('Stream activation',{exact:true})).toHaveValue('selected');await expect(page.getByLabel('Active stream or prefix 1',{exact:true})).toHaveValue('news/*');await page.getByRole('button',{name:'Cancel',exact:true}).click();
+ await page.getByRole('button',{name:'Config',exact:true}).click();await page.getByRole('button',{name:'Source servers',exact:true}).first().click();await edit(page);await page.getByLabel('Stream activation',{exact:true}).selectOption('ondemand');await page.getByRole('button',{name:'Stage changes',exact:true}).click();await page.getByRole('button',{name:'Save & apply',exact:true}).click();await expect(page.locator('.notice[role=status]')).toContainText('saved and applied');expect((await(await request.get(uri,{headers:headers()})).json()).only).toEqual([]);
 });

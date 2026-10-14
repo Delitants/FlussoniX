@@ -1,4 +1,5 @@
 //! App-owned direct vendor playback. No implicit native/vendor failover.
+mod activation;
 mod recovery;
 mod replicas;
 mod response;
@@ -104,6 +105,7 @@ pub(crate) struct Runtime {
     outputs: std::sync::Mutex<(u64, HashMap<String, Value>)>,
     groups: std::sync::Mutex<replicas::Groups>,
     recovery: std::sync::Mutex<recovery::State>,
+    activation: std::sync::Mutex<activation::State>,
     queries: Semaphore,
     closed: CancellationToken,
     claimed: AtomicBool,
@@ -117,6 +119,7 @@ impl Drop for RunGuard<'_> {
             group.selector.shutdown();
         }
         self.0.recovery.lock().unwrap().entries.clear();
+        self.0.activation.lock().unwrap().demands.clear();
         self.0.inputs.shutdown();
     }
 }
@@ -134,6 +137,7 @@ impl Runtime {
             outputs: std::sync::Mutex::new((0, HashMap::new())),
             groups: std::sync::Mutex::new(replicas::Groups::default()),
             recovery: std::sync::Mutex::new(recovery::State::default()),
+            activation: std::sync::Mutex::new(activation::State::default()),
             queries: Semaphore::new(4),
             closed: CancellationToken::new(),
             claimed: AtomicBool::new(false),
@@ -147,10 +151,12 @@ impl Runtime {
         let cancel = cancel.child_token();
         let sessions = self.sessions.clone().run(cancel.clone());
         let recovery = self.maintain_replicas(app, cancel.clone());
-        tokio::pin!(sessions, recovery);
+        let activation = self.poll_static_catalogs(app, cancel.clone());
+        tokio::pin!(sessions, recovery, activation);
         tokio::select! {
-            result=&mut sessions=>{cancel.cancel();recovery.await;result.map_err(|_|"vendor playback owner unavailable".into())},
-            _=&mut recovery=>{cancel.cancel();sessions.await.map_err(|_|"vendor playback owner unavailable".into())},
+            result=&mut sessions=>{cancel.cancel();tokio::join!(recovery,activation);result.map_err(|_|"vendor playback owner unavailable".into())},
+            _=&mut recovery=>{cancel.cancel();let(result,_)=tokio::join!(sessions,activation);result.map_err(|_|"vendor playback owner unavailable".into())},
+            _=&mut activation=>{cancel.cancel();let(result,_)=tokio::join!(sessions,recovery);result.map_err(|_|"vendor playback owner unavailable".into())},
         }
     }
     fn running(&self) -> bool {

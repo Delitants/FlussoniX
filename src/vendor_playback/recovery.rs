@@ -74,8 +74,7 @@ impl Runtime {
         state
             .entries
             .retain(|_, e| e.group.revision == group.revision);
-        self.inputs
-            .retain_failures(|name| state.entries.contains_key(name));
+        self.retain_failure_slots(&state);
         let count: usize = state.entries.values().map(|e| e.anchors.len()).sum();
         if state.entries.len() >= 256 && !state.entries.contains_key(name) {
             return Err(Failure::Unavailable);
@@ -137,9 +136,12 @@ impl Runtime {
             .entries
             .get(name)
             .filter(|e| Arc::ptr_eq(&e.group, group))
-            .map_or(Mode::Normal, |e| e.mode)
+            .map(|e| e.mode)
+            .or_else(|| self.static_mode(name, group))
+            .unwrap_or(Mode::Normal)
     }
     pub(super) fn selected_recovery(&self, name: &str, group: &Arc<Group>) {
+        self.reset_static_mode(name, group);
         if let Some(entry) = self.recovery.lock().unwrap().entries.get_mut(name)
             && Arc::ptr_eq(&entry.group, group)
         {
@@ -158,7 +160,8 @@ impl Runtime {
             .unwrap()
             .entries
             .get(name)
-            .and_then(|e| e.playback.clone());
+            .and_then(|e| e.playback.clone())
+            .or_else(|| self.static_playback(name));
         if playback.is_some_and(|p| p.generation() != observation.generation && p.current().is_ok())
         {
             return;
@@ -166,14 +169,16 @@ impl Runtime {
         if !group.selector.failure_current(&observation.notice) {
             return;
         }
+        let mode = if observation.notice.kind == InputFailure::Transient {
+            Mode::Rotate
+        } else {
+            Mode::Selected
+        };
+        self.process_static_failure(name, group, mode);
         if let Some(entry) = self.recovery.lock().unwrap().entries.get_mut(name)
             && Arc::ptr_eq(&entry.group, group)
         {
-            entry.mode = if observation.notice.kind == InputFailure::Transient {
-                Mode::Rotate
-            } else {
-                Mode::Selected
-            };
+            entry.mode = mode;
             entry.next_attempt = Instant::now() + crate::recovery::retry_delay(entry.streak);
         }
     }
@@ -241,6 +246,7 @@ impl Runtime {
         type Job<'a> = Pin<Box<dyn Future<Output = String> + Send + 'a>>;
         let mut jobs = FuturesUnordered::<Job<'_>>::new();
         let mut active = HashMap::<String, CancellationToken>::new();
+        let mut static_first = true;
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -248,6 +254,16 @@ impl Runtime {
             if cancel.is_cancelled() {
                 break;
             }
+            self.sync_static(app);
+            let static_due = self.static_jobs(&active);
+            let static_names = self
+                .activation
+                .lock()
+                .unwrap()
+                .demands
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
             let due = {
                 let mut state = self.recovery.lock().unwrap();
                 state.entries.retain(|_, e| {
@@ -258,10 +274,9 @@ impl Runtime {
                         .retain(|_, a| a.recovery_activity().is_some() || e.pending > 0);
                     !e.anchors.is_empty() || e.pending > 0
                 });
-                self.inputs
-                    .retain_failures(|name| state.entries.contains_key(name));
+                self.retain_failure_slots(&state);
                 for (name, token) in &active {
-                    if !state.entries.contains_key(name) {
+                    if !state.entries.contains_key(name) && !static_names.contains(name) {
                         token.cancel();
                     }
                 }
@@ -270,6 +285,7 @@ impl Runtime {
                     .iter()
                     .filter(|(name, e)| {
                         !active.contains_key(*name)
+                            && !static_names.contains(*name)
                             && e.pending == 0
                             && e.next_attempt <= Instant::now()
                     })
@@ -280,10 +296,30 @@ impl Runtime {
             if app.options.role == "lb" {
                 continue;
             }
-            for (name, group) in due {
+            let static_due = static_due.into_iter().map(|n| (n, None));
+            let viewer_due = due.into_iter().map(|(n, g)| (n, Some(g)));
+            let due = if static_first {
+                static_due.chain(viewer_due).collect::<Vec<_>>()
+            } else {
+                viewer_due.chain(static_due).collect::<Vec<_>>()
+            };
+            static_first = !static_first;
+            for (name, group) in due.into_iter().take(8usize.saturating_sub(active.len())) {
                 let token = cancel.child_token();
                 active.insert(name.clone(), token.clone());
-                jobs.push(Box::pin(async move{tokio::select!{biased;_=token.cancelled()=>{},_=tokio::time::timeout(Duration::from_secs(8),self.recover_one(app,&name,group))=>{}}name}));
+                jobs.push(Box::pin(async move{
+                    let work=async{match group{
+                        Some(g)=>self.recover_one(app,&name,g).await,
+                        None=>if !self.start_static(app,&name).await {
+                            // Static intent may belong only to another member.
+                            // It cannot suppress independently authorized viewer
+                            // recovery when the selected candidate is on demand.
+                            let group=self.recovery.lock().unwrap().entries.get(&name).map(|e|e.group.clone());
+                            if let Some(group)=group {self.recover_one(app,&name,group).await;}
+                        }
+                    }};
+                    tokio::select!{biased;_=token.cancelled()=>{},_=tokio::time::timeout(Duration::from_secs(8),work)=>{}}name
+                }));
             }
         }
         drop(jobs);
