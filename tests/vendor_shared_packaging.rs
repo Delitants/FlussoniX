@@ -1071,7 +1071,7 @@ async fn final_child_stdin_does_not_resume_queued_bytes_after_source_edit() {
     let gate = dir.path().join("gate");
     let captured = dir.path().join("captured");
     let source = format!(
-        "#!/usr/bin/python3\nimport os,fcntl,termios,array,time\nfrom pathlib import Path\nmarker=Path({:?});gate=Path({:?});captured=Path({:?})\ncapacity=fcntl.fcntl(0,fcntl.F_GETPIPE_SZ)\nwhile True:\n n=array.array('i',[0]);fcntl.ioctl(0,termios.FIONREAD,n,True)\n if n[0]>capacity//2:\n  time.sleep(.02)\n  previous=n[0];fcntl.ioctl(0,termios.FIONREAD,n,True)\n  if n[0]==previous:break\n time.sleep(.001)\nmarker.write_text(str(n[0]))\nwhile not gate.exists():time.sleep(.001)\nwith captured.open('wb',buffering=0) as out:\n while True:\n  data=os.read(0,65536)\n  if not data:break\n  out.write(data)\n",
+        "#!/usr/bin/python3\nimport os,fcntl,termios,array,time\nfrom pathlib import Path\nmarker=Path({:?});gate=Path({:?});captured=Path({:?})\ncapacity=fcntl.fcntl(0,fcntl.F_GETPIPE_SZ)\nwhile True:\n n=array.array('i',[0]);fcntl.ioctl(0,termios.FIONREAD,n,True)\n if n[0]>capacity//2:\n  time.sleep(.02)\n  previous=n[0];fcntl.ioctl(0,termios.FIONREAD,n,True)\n  if n[0]==previous:break\n time.sleep(.001)\nready=marker.with_suffix('.tmp')\nready.write_text(str(n[0]))\nos.replace(ready,marker)\nwhile not gate.exists():time.sleep(.001)\nwith captured.open('wb',buffering=0) as out:\n while True:\n  data=os.read(0,65536)\n  if not data:break\n  out.write(data)\n",
         marker.to_str().unwrap(),
         gate.to_str().unwrap(),
         captured.to_str().unwrap()
@@ -1103,10 +1103,13 @@ async fn final_child_stdin_does_not_resume_queued_bytes_after_source_edit() {
         engine.stop_all().await;
         panic!("owned child pipe did not fill");
     }
-    let committed = std::fs::read_to_string(&marker)
-        .unwrap()
-        .parse::<usize>()
-        .unwrap();
+    let committed = match std::fs::read_to_string(&marker).unwrap().parse::<usize>() {
+        Ok(committed) => committed,
+        Err(error) => {
+            engine.stop_all().await;
+            panic!("incomplete owned pipe readiness: {error}");
+        }
+    };
     f.config
         .put("templates", "edit", json!({"static":false}))
         .unwrap();
