@@ -43,4 +43,6 @@ cleanup. Encoder syntax/selector acceptance is not new GPU hardware or broadcast
 interoperability qualification. Native LB placement into vendor-backed FlussoniX CDNs is described
 [here](vendor-cdn-placement.md), including vendor discovery on the LB. Processing
 runs on the CDN; it is never applied on the LB. [Vendor failover](vendor-daemon-failover.md) preserves equal processing settings
-across members. Static activation and RTSP/SRT delivery remain pending.
+across members. [Static activation](vendor-static-activation.md) and CDN/standalone
+[RTSP/RTSPS playback](vendor-daemon-playback.md) are supported; vendor RTSP LB
+placement and SRT delivery remain pending.

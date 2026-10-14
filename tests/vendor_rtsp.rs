@@ -71,7 +71,14 @@ async fn request<S: AsyncRead + AsyncWrite + Unpin>(
     .unwrap()
 }
 async fn play<S: AsyncRead + AsyncWrite + Unpin>(s: &mut BufReader<S>, url: &str) {
-    let (code, _, body) = request(s, "DESCRIBE", &format!("{url}?token=owned-viewer"), "").await;
+    play_token(s, url, "owned-viewer").await;
+}
+async fn play_token<S: AsyncRead + AsyncWrite + Unpin>(
+    s: &mut BufReader<S>,
+    url: &str,
+    token: &str,
+) {
+    let (code, _, body) = request(s, "DESCRIBE", &format!("{url}?token={token}"), "").await;
     assert_eq!(code, 200, "vendor RTSP admission unavailable");
     let sdp = String::from_utf8(body).unwrap();
     assert!(sdp.contains("MPA/90000"), "{sdp}");
@@ -79,6 +86,9 @@ async fn play<S: AsyncRead + AsyncWrite + Unpin>(s: &mut BufReader<S>, url: &str
         .lines()
         .find_map(|l| l.strip_prefix("a=control:trackID="))
         .unwrap();
+    setup_play(s, url, id).await;
+}
+async fn setup_play<S: AsyncRead + AsyncWrite + Unpin>(s: &mut BufReader<S>, url: &str, id: &str) {
     let (code, h, _) = request(
         s,
         "SETUP",
@@ -100,6 +110,29 @@ async fn play<S: AsyncRead + AsyncWrite + Unpin>(s: &mut BufReader<S>, url: &str
             .0,
         200
     );
+}
+
+async fn closed<S: AsyncRead + Unpin>(s: &mut BufReader<S>) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut bytes = vec![0; 8192];
+        loop {
+            match s.read(&mut bytes).await {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    break;
+                }
+                Err(e) => panic!("unexpected read error: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("retired RTSP viewer stayed connected");
 }
 async fn packet<S: AsyncRead + Unpin>(s: &mut BufReader<S>) -> Vec<u8> {
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -175,3 +208,8 @@ async fn vendor_rtsp_shares_http_packager_and_individual_viewer_revocation() {
     task.await.unwrap().unwrap();
     f.stop().await;
 }
+
+#[path = "vendor_rtsp/boundaries.rs"]
+mod boundaries;
+#[path = "vendor_rtsp/transports.rs"]
+mod transports;

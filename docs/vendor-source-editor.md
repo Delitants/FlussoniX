@@ -34,5 +34,7 @@ are not inherited. Clear this selection explicitly before switching source kind.
 Vendor profiles currently serve on-demand HTTP/HTTPS HLS, MPEG-TS, M4S and M4F.
 The labeled Failover group and Content identity fields configure
 [equivalent source recovery](vendor-daemon-failover.md). FlussoniX LB placement
-is also supported. Static activation and RTSP/SRT delivery remain pending.
+is also supported. [Static activation](vendor-static-activation.md) and CDN/standalone
+[RTSP/RTSPS playback](vendor-daemon-playback.md) are supported; vendor RTSP LB
+placement and SRT delivery remain pending.
 The native source editor retains its existing controls.

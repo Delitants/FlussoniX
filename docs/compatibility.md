@@ -645,7 +645,7 @@ ancestry or private endpoint identity. Automatic vendor routing remains disabled
 
 ## Explicit vendor HTTP source recovery
 
-Configured Flussonic HTTP sources now support [equivalent-origin failover](vendor-daemon-failover.md) with explicit local group/content identity, equal policies and processing, guarded native viewer admission, private rejection barriers and background shared-worker replacement. HLS discontinuities and continuous-response reconnects apply. Vendor RTSP/SRT delivery, vendor CDN destinations and production mixed-cluster qualification remain pending.
+Configured Flussonic HTTP sources now support [equivalent-origin failover](vendor-daemon-failover.md) with explicit local group/content identity, equal policies and processing, guarded native viewer admission, private rejection barriers and background shared-worker replacement. HLS discontinuities and continuous-response reconnects apply. Vendor-backed RTSP TCP/UDP and RTSPS playback on CDN/standalone nodes use the same guarded shared input, viewer admission and processing template. Owned tests independently decode HEVC/MP3/MP2 from M4F and cover TLS, UDP, revocation, static sharing and replica recovery. Vendor RTSP LB placement, SRT delivery, vendor CDN destinations and production mixed-cluster qualification remain pending.
 
 ### Automatic vendor static activation
 

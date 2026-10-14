@@ -1,6 +1,6 @@
 # Saved vendor source profiles
 
-Explicit vendor profiles now select [guarded daemon HTTP playback](vendor-daemon-playback.md).
+Explicit vendor profiles now select [guarded daemon playback](vendor-daemon-playback.md).
 The native discovery path skips them. The [source editor](vendor-source-editor.md)
 provides ordinary fields for source type, endpoints, TLS trust and local viewer
 policies, including group overrides.

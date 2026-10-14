@@ -44,7 +44,7 @@ capacity; authoritative blocks are not evicted to make room. It owns no retry
 tasks, media workers, background I/O or lease renewal. Shutdown is permanent.
 The daemon supplies typed private-input failure classification and shared-worker
 recovery through guarded managed routes. Automatic static activation uses separate grantless ownership; see
-[vendor static activation](vendor-static-activation.md). Vendor RTSP/SRT delivery remains separate
-work. The standalone selector API itself still owns no daemon maintenance.
+[vendor static activation](vendor-static-activation.md). Vendor RTSP/RTSPS delivery is described in [vendor playback](vendor-daemon-playback.md).
+Vendor RTSP LB placement and SRT delivery remain separate work. The standalone selector API itself still owns no daemon maintenance.
 The owned fixtures and independent audio decode do not establish production
 vendor interoperability or throughput.

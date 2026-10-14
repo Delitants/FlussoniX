@@ -1567,3 +1567,89 @@ async fn automatic_m4f_static_startup_requires_no_viewer_and_decodes_hls() {
     assert!(status.success());
     f.stop().await;
 }
+
+#[tokio::test]
+async fn m4f_vendor_rtsp_decodes_hevc_mp3_and_mp2_with_independent_ffmpeg() {
+    let f = Fixture::variant(json!({"on_play":"true","only":[]}), "m4f", "standalone").await;
+    let (mut tracks, mut frames) = flussonix::m4f::unpack(&multitrack_segment()).unwrap();
+    tracks.push(Track {
+        id: 205,
+        codec: "hevc".into(),
+        config: include_bytes!("fixtures/codecs/hevc.hvcc").to_vec(),
+    });
+    let timing: Vec<Value> =
+        serde_json::from_str(include_str!("fixtures/codecs/hevc-timing.json")).unwrap();
+    for cycle in 0..8u64 {
+        for (i, t) in timing.iter().enumerate() {
+            let d = t["dts"].as_i64().unwrap();
+            let p = t["pts"].as_i64().unwrap();
+            frames.push(Frame {
+                track_id: 205,
+                dts: 90000 + cycle * 43200 + ((d + 1024) * 90000 / 12800) as u64,
+                pts_offset: (p - d) * 90000 / 12800,
+                key: t["flags"].as_str().unwrap().contains('K'),
+                body: std::fs::read(format!("tests/fixtures/codecs/hevc-{i:02}.bin")).unwrap(),
+            });
+        }
+    }
+    frames.sort_by_key(|f| f.dts);
+    *f.segment.lock().unwrap() = flussonix::m4f::pack(&tracks, &frames, 360000).unwrap();
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "rtsp://{}/owned?token=owned-rtsp",
+        tcp.local_addr().unwrap()
+    );
+    let cancel = CancellationToken::new();
+    let listener = tokio::spawn(flussonix::rtsp::serve(tcp, f.app.clone(), cancel.clone()));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("decoder.log");
+    let mut child = tokio::process::Command::new("/usr/bin/ffmpeg")
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-threads",
+            "1",
+            "-rtsp_transport",
+            "tcp",
+            "-i",
+        ])
+        .arg(&url)
+        .args([
+            "-map", "0:v:0", "-map", "0:a:0", "-map", "0:a:1", "-t", "0.2", "-f", "null", "-",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&path).unwrap())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let status = match tokio::time::timeout(Duration::from_secs(20), child.wait()).await {
+        Ok(status) => Some(status.unwrap()),
+        Err(_) => {
+            child.kill().await.unwrap();
+            let _ = child.wait().await;
+            None
+        }
+    };
+    let pulls = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(p, _)| p == "/owned/m4f")
+        .count();
+    let pid = f.app.media.stats("owned").await["pid"]
+        .as_u64()
+        .unwrap_or(0);
+    cancel.cancel();
+    listener.await.unwrap().unwrap();
+    f.stop().await;
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "independent RTSP decoder failed: {}",
+        std::fs::read_to_string(path).unwrap()
+    );
+    assert_eq!(pulls, 1);
+    assert!(pid > 0);
+    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+}

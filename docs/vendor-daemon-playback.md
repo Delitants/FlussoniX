@@ -1,4 +1,4 @@
-# Vendor HTTP playback
+# Vendor stream playback
 
 The daemon can now play streams from explicitly configured Flussonic source
 profiles through HTTP or HTTPS. Supported delivery paths are `index.m3u8`,
@@ -17,15 +17,22 @@ Local configured streams, including disabled streams, take precedence. A vendor
 source's prefix reserves that literal namespace, without renaming upstream
 streams. Exclusions return 404. One prefixless vendor source reserves every
 nonlocal name; overlaps outside one explicit equivalent group return 503 before discovery. There
-is no native fallback on vendor absence, denial or error. Native RTSP/SRT
-resolution also cannot cross a reserved vendor namespace. A native FlussoniX LB can redirect to a vendor-backed FlussoniX CDN using
+is no native fallback on vendor absence, denial or error. SRT
+resolution cannot cross a reserved vendor namespace. A native FlussoniX LB can redirect to a vendor-backed FlussoniX CDN using
 [HTTP placement tickets](vendor-cdn-placement.md). Configured vendor sources on
 the LB discover and authorize names through the same bounded catalog, without
 local stream rows or any LB media pull. Explicit groups support
-[automatic vendor failover](vendor-daemon-failover.md). Static demand and
-RTSP/SRT delivery remain separate work.
+[automatic vendor failover](vendor-daemon-failover.md) and
+[static startup](vendor-static-activation.md).
 
-Every HTTP request passes current source/local policy and the App's actual native
+CDN and standalone nodes also serve vendor streams over the existing opt-in RTSP
+TCP, unicast UDP and RTSPS TLS listeners. RTSP viewers authorize independently
+and share the private input, processing template and RTP packager with HTTP.
+Revocation and source/replica changes close the affected connection; reconnect
+to obtain current authority. Vendor RTSP LB placement and SRT delivery remain
+pending; LB RTSP requests and foreign admission tickets fail without media pulls.
+
+Every HTTP request and RTSP DESCRIBE passes current source/local policy and the App's actual native
 viewer authorizer. Shared input, HLS retention and cached files never authorize
 requests. Native peer headers cannot bypass vendor viewer policy. Callback
 redirects are preserved and HTTPS rejects downgrade redirects. Query parameters
@@ -63,3 +70,7 @@ Owned tests cover M4S and M4F input, original MP3/MPEG Layer II M4F segments, HL
 segment authorization, shared continuous outputs, HTTPS and redirect downgrade
 protection, lease renewal past the original deadline, native supervision, local
 precedence, namespace isolation, held discovery/callback cancellation and cleanup.
+
+Owned RTSP tests cover M4S/M4F inputs, independently decoded HEVC/MP3/MP2, CPU AAC,
+TCP, UDP, verified TLS, shared HTTP media, per-viewer revocation, static ownership,
+source edits during startup and automatic replica recovery.

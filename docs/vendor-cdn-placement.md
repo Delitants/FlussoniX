@@ -50,7 +50,8 @@ addresses, and callback redirects cannot downgrade them.
 
 Owned tests exercise discovered and locally configured LB routes, independently
 decoded HLS segments, M4S delivery, source/policy edits, lease expiry, callback and
-group guards, shutdown and HTTPS redirect boundaries. This does not enable
-Flussonic CDN destinations, automatic vendor failover, seamless recovery, static
-vendor activation or vendor RTSP/SRT delivery. Configure equivalent intended viewer
+group guards, shutdown and HTTPS redirect boundaries. Flussonic CDN destinations, seamless recovery, vendor RTSP LB placement and SRT
+delivery remain pending. [Equivalent-origin failover](vendor-daemon-failover.md),
+[static activation](vendor-static-activation.md) and CDN/standalone
+[RTSP/RTSPS playback](vendor-daemon-playback.md) are supported separately. Configure equivalent intended viewer
 policies on LB and CDN; this increment does not infer equivalence between them.
