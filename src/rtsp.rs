@@ -203,7 +203,7 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
                 };
             let grant = async {
                 if let Some(p) = playback {
-                    p.grant.cancelled().await
+                    p.cancelled().await
                 } else {
                     std::future::pending::<()>().await
                 }
@@ -339,7 +339,7 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
                 if let Some(pacer) = &mut s.pacer {
                     pacer.sent(body.len(), Instant::now());
                 }
-                s.playback.grant.add_bytes(bytes);
+                s.playback.add_bytes(bytes);
                 app.rtsp_egress.fetch_add(bytes as u64, Ordering::Relaxed);
                 if is_udp {
                     app.rtsp_udp_egress
@@ -360,7 +360,7 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
                                 let bytes =
                                     deliver(sender, &mut write, &body, true, &cancel, s).await?;
                                 app.rtsp_egress.fetch_add(bytes as u64, Ordering::Relaxed);
-                                s.playback.grant.add_bytes(bytes);
+                                s.playback.add_bytes(bytes);
                                 if matches!(sender.delivery, Delivery::Udp { .. }) {
                                     app.rtsp_udp_egress
                                         .fetch_add(bytes as u64, Ordering::Relaxed);
@@ -418,6 +418,9 @@ async fn deliver<W: tokio::io::AsyncWrite + Unpin>(
     cancel: &CancellationToken,
     session: &Session,
 ) -> std::io::Result<usize> {
+    if !session.playback.current() {
+        return Err(std::io::ErrorKind::Interrupted.into());
+    }
     match &sender.delivery {
         Delivery::Tcp(transport) => {
             let mut data = vec![b'$', if rtcp { transport.rtcp } else { transport.rtp }];
@@ -434,8 +437,11 @@ async fn deliver<W: tokio::io::AsyncWrite + Unpin>(
                     lease.send_rtp(body).await
                 }
             };
-            let result = tokio::select! {biased;_=cancel.cancelled()=>return Err(std::io::ErrorKind::Interrupted.into()),_=session.playback.grant.cancelled()=>return Err(std::io::ErrorKind::Interrupted.into()),_=session.playback.worker.closed()=>return Err(std::io::ErrorKind::Interrupted.into()),result=tokio::time::timeout(Duration::from_secs(2),send)=>result.unwrap_or_else(|_|Err(std::io::ErrorKind::TimedOut.into()))};
+            let result = tokio::select! {biased;_=cancel.cancelled()=>return Err(std::io::ErrorKind::Interrupted.into()),_=session.playback.cancelled()=>return Err(std::io::ErrorKind::Interrupted.into()),_=session.playback.worker.closed()=>return Err(std::io::ErrorKind::Interrupted.into()),result=tokio::time::timeout(Duration::from_secs(2),send)=>result.unwrap_or_else(|_|Err(std::io::ErrorKind::TimedOut.into()))};
             let n = result?;
+            if !session.playback.current() {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
             if n != body.len() {
                 return Err(std::io::ErrorKind::WriteZero.into());
             }
@@ -449,9 +455,12 @@ async fn bounded_write<W: tokio::io::AsyncWrite + Unpin>(
     cancel: &CancellationToken,
     session: Option<&Session>,
 ) -> std::io::Result<()> {
+    if session.is_some_and(|s| !s.playback.current()) {
+        return Err(std::io::ErrorKind::Interrupted.into());
+    }
     let revoked = async {
         if let Some(s) = session {
-            s.playback.grant.cancelled().await
+            s.playback.cancelled().await
         } else {
             std::future::pending::<()>().await
         }
@@ -463,7 +472,11 @@ async fn bounded_write<W: tokio::io::AsyncWrite + Unpin>(
             std::future::pending::<()>().await
         }
     };
-    tokio::select! {biased;_=cancel.cancelled()=>Err(std::io::ErrorKind::Interrupted.into()),_=revoked=>Err(std::io::ErrorKind::Interrupted.into()),_=closed=>Err(std::io::ErrorKind::Interrupted.into()),result=tokio::time::timeout(Duration::from_secs(2),writer.write_all(bytes))=>result.unwrap_or_else(|_|Err(std::io::ErrorKind::TimedOut.into()))}
+    let result = tokio::select! {biased;_=cancel.cancelled()=>Err(std::io::ErrorKind::Interrupted.into()),_=revoked=>Err(std::io::ErrorKind::Interrupted.into()),_=closed=>Err(std::io::ErrorKind::Interrupted.into()),result=tokio::time::timeout(Duration::from_secs(2),writer.write_all(bytes))=>result.unwrap_or_else(|_|Err(std::io::ErrorKind::TimedOut.into()))};
+    if session.is_some_and(|s| !s.playback.current()) {
+        return Err(std::io::ErrorKind::Interrupted.into());
+    }
+    result
 }
 fn location(uri: &str) -> Result<(url::Url, String), u16> {
     let url = url::Url::parse(uri).map_err(|_| 400u16)?;

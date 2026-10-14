@@ -194,6 +194,23 @@ impl Engine {
     }
 }
 impl PackagedPlayback {
+    /// Internal protocol adapters retain this playback permission for every
+    /// read/write; a worker reference alone never authorizes shared output.
+    pub(crate) fn worker(&self) -> Arc<Worker> {
+        self.inner.worker.clone()
+    }
+    pub(crate) async fn closed(&self) {
+        tokio::select! {
+            _=self.inner.source.closed()=>{},
+            _=self.inner.worker.closed()=>{},
+        }
+    }
+    pub(crate) fn account_bytes(&self, bytes: usize) {
+        if self.current().is_ok() {
+            self.inner.source.add_bytes(bytes);
+            self.inner.worker.touch();
+        }
+    }
     pub(crate) fn with_current_source<T>(
         &self,
         commit: impl FnOnce() -> T,

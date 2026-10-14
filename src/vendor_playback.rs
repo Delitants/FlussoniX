@@ -3,6 +3,7 @@ mod activation;
 mod recovery;
 mod replicas;
 mod response;
+mod rtsp;
 use crate::{
     media::{SharedHlsOptions, SharedHlsSessions},
     server::App,
