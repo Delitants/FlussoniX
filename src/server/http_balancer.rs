@@ -161,7 +161,8 @@ impl App {
         value.as_object_mut()?.retain(|key, _| {
             matches!(
                 key.as_str(),
-                "role"
+                "srt_playback"
+                    | "role"
                     | "uplink"
                     | "uplink_mbps"
                     | "cpu"

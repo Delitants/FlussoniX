@@ -114,9 +114,9 @@ survive unrelated configuration saves and are shared by destinations reporting
 the same server identity. Identity continuity covers all mappings under a
 management profile; a changed identity excludes that profile. Final placement
 rechecks the latest accepted load observation. Native
-FlussoniX destinations retain CDN-owned atomic admission. Native SRT
-destination admission, missing dynamic routes, and production throughput qualification
-remain separate work. The HTTP adapter is based on the
+FlussoniX destinations retain CDN-owned atomic admission, including SRT through
+the lookup described below. Missing dynamic routes and production throughput
+qualification remain separate work. The HTTP adapter is based on the
 [Flussonic management API](https://flussonic.com/doc/api/reference/) and its
 [HTTP load-balancing model](https://flussonic.com/doc/fms/cluster/loadbalancer/).
 
@@ -159,11 +159,46 @@ HTTP, RTSP and SRT share fresh vendor load observations and five-second per-LB
 advisory holds; no media crosses the LB. Configuration changes and expired
 source authority prevent a pending lookup from returning a destination.
 
-This extension initially targets explicitly mapped Flussonic peers. It does not
-provide a native SRT admission protocol, a single-address SRT relay, coordinated
-capacity across multiple LBs, or production throughput qualification. Owned
+This extension supports native FlussoniX CDNs and explicitly mapped Flussonic
+peers. It does not provide a single-address SRT relay or production throughput
+qualification. Flussonic capacity holds remain local to each LB. Owned
 independent SRT tests cover encrypted audio/video decoding, destination token
 denial and mismatched passphrases; they do not establish live Flussonic SRT
 interoperability.
-`expires_in` describes the advisory placement estimate, not a redeemable
-admission ticket. Request a fresh lookup before connecting after that interval.
+For Flussonic destinations, `expires_in` describes the advisory placement
+estimate, not a redeemable admission ticket. Request a fresh lookup before
+connecting after that interval.
+
+
+### Native FlussoniX SRT destinations
+
+Choose **FlussoniX** as the peer type, enter its management address and **Public
+SRT URL**, and match the **SRT encryption** setting to its enabled global playback
+listener. Configure a trusted management CA when needed. The client still calls
+the HTTPS lookup and then connects directly; the LB carries no media.
+
+The LB checks the CDN's enabled listener and encryption metadata. The CDN then
+reserves capacity for five seconds through its authenticated native admission
+API. Concurrent LBs share this CDN-owned reservation ledger with HTTP and RTSP;
+SRT also respects the listener's connection limit. Actual connections and other
+traffic still compete for resources: a reservation does not guarantee delivery.
+If admission fails, lookup tries another eligible CDN within its time budget.
+
+A native response appends `flussonix_ticket=<opaque UUID>` to the returned stream
+ID. Pass the **entire returned stream ID unchanged** to the SRT client. The ticket
+is single-use and binds the stream, viewer token, encryption, listener generation
+and source configuration. Its lifetime starts when the CDN issues it, so connect
+promptly; an expired ticket requires a new lookup. The full ID,
+including this field, must fit 512 UTF-8 bytes; lookup checks that before asking
+for a reservation. Supplying a ticket to the lookup endpoint is rejected.
+
+The CDN independently authorizes playback before redeeming the ticket and
+starting media. The internal ticket is removed from its authorization callback
+and session query, while opaque viewer fields remain unchanged. A wrong token,
+stream, transport or listener cannot redeem it. Configuration changes, revoked
+viewer grants and expired source or replica authority prevent playback. Source
+reservations never pull upstream media by themselves.
+
+Existing ticketless SRT clients keep their normal viewer policy. Native tickets
+are never sent to Flussonic destinations. Listener support and owned decoder tests
+do not establish live Flussonic interoperability or production capacity.

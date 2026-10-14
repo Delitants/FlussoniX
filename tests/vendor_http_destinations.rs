@@ -14,6 +14,11 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use tower::ServiceExt;
+#[path = "support/native_srt_admission.rs"]
+mod native_srt_admission;
+#[path = "vendor_daemon_failover/fixture.rs"]
+#[allow(dead_code)]
+mod vendor_origin_fixture;
 #[path = "support/vendor_rtsp_destinations.rs"]
 mod vendor_rtsp_destinations;
 #[path = "support/vendor_srt_lookup.rs"]

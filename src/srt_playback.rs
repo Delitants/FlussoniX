@@ -37,6 +37,7 @@ pub async fn serve(
     cancel: CancellationToken,
 ) -> std::io::Result<()> {
     app.set_srt_playback(Some(&listener));
+    let listener_id = app.srt_listener_id();
     let stop = cancel.child_token();
     let slots = Arc::new(Semaphore::new(listener.settings().client_limit()));
     let mut tasks = JoinSet::new();
@@ -52,8 +53,8 @@ pub async fn serve(
                     let accepted=match listener.accept(){Ok(v)=>v,Err(e)=>break 'serving Err(e)};
                     let Some((socket,peer))=accepted else {break};
                     let Ok(permit)=slots.clone().try_acquire_owned() else {drop(socket);continue;};
-                    app.srt_connections.fetch_add(1,Ordering::Relaxed);let slot=Slot{_permit:permit,app:app.clone()};let a=app.clone();let c=stop.clone();let address=listener.address();
-                    tasks.spawn(async move {let _slot=slot;connection(socket,peer,address,a,c).await;});
+                    app.srt_connections.fetch_add(1,Ordering::Relaxed);let slot=Slot{_permit:permit,app:app.clone()};let a=app.clone();let c=stop.clone();let address=listener.address();let context=(address,listener.settings().encrypted(),listener_id.clone());
+                    tasks.spawn(async move {let _slot=slot;connection(socket,peer,context,a,c).await;});
                 }
             }
         }
@@ -66,16 +67,17 @@ pub async fn serve(
 async fn connection(
     socket: Socket,
     peer: SocketAddr,
-    address: SocketAddr,
+    context: (SocketAddr, bool, String),
     app: Arc<App>,
     cancel: CancellationToken,
 ) {
     let Ok(id) = socket.stream_id() else { return };
-    let Ok(selection) = Selection::parse(&id) else {
+    let (address, encrypted, listener_id) = context;
+    let Ok((selection, ticket, clean)) = selection::playback(&id) else {
         return;
     };
     let query = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("streamid", &id)
+        .append_pair("streamid", &clean)
         .finish();
     let viewer = ViewerRequest {
         name: selection.name,
@@ -86,7 +88,22 @@ async fn connection(
         host: address.to_string(),
         ..Default::default()
     };
-    let admitted = tokio::select! {biased;_=cancel.cancelled()=>return,result=tokio::time::timeout(Duration::from_secs(10),app.ts_admit(viewer))=>result};
+    let admitting = async {
+        if let Some(id) = ticket.as_deref() {
+            app.ts_admit_ticket(
+                viewer,
+                Some(crate::server::srt_tickets::Ticket {
+                    id,
+                    encrypted,
+                    listener_id: &listener_id,
+                }),
+            )
+            .await
+        } else {
+            app.ts_admit(viewer).await
+        }
+    };
+    let admitted = tokio::select! {biased;_=cancel.cancelled()=>return,result=tokio::time::timeout(Duration::from_secs(10),admitting)=>result};
     let Ok(Ok(mut playback)) = admitted else {
         return;
     };

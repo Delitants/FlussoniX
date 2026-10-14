@@ -11,29 +11,60 @@ impl Runtime {
         viewer: ViewerRequest,
         key: &str,
         revision: u64,
+        ticket: Option<crate::server::srt_tickets::Ticket<'_>>,
     ) -> Result<Playback, u16> {
         if !self.running() || app.modern_source_coordinator().is_err() {
             return Err(503);
         }
         let name = viewer.name.clone();
         let prepare = async {
-            let candidate =
-                self.candidate(app, key, revision, &name)
-                    .await
-                    .map_err(|e| match e {
-                        Failure::Absent => 404u16,
-                        _ => 503,
-                    })?;
-            let output_key = candidate.source_key().to_owned();
-            let output_revision = candidate.config_revision();
-            let admission = match self
-                .admit_selection(candidate, &app.playback_auth, viewer)
-                .await
-            {
+            let route_viewer = viewer.clone();
+            let reserved = if let Some(ticket) = ticket {
+                Some(app.vendor_srt_ticket(ticket, &viewer).await.ok_or(503u16)?)
+            } else {
+                None
+            };
+            let (output_key, output_revision, outcome) = if let Some(reserved) = &reserved {
+                (
+                    reserved.source_key().to_owned(),
+                    reserved.config_revision(),
+                    self.owner
+                        .admit_reserved(reserved, &app.playback_auth, viewer)
+                        .await,
+                )
+            } else {
+                let candidate =
+                    self.candidate(app, key, revision, &name)
+                        .await
+                        .map_err(|e| match e {
+                            Failure::Absent => 404u16,
+                            _ => 503,
+                        })?;
+                (
+                    candidate.source_key().to_owned(),
+                    candidate.config_revision(),
+                    self.admit_selection(candidate, &app.playback_auth, viewer)
+                        .await,
+                )
+            };
+            let admission = match outcome {
                 Ok(AdmissionOutcome::Allowed(a)) => a,
                 Ok(AdmissionOutcome::Denied | AdmissionOutcome::Redirect(_)) => return Err(403),
                 Err(_) => return Err(503),
             };
+            if let Some(ticket) = ticket
+                && !app
+                    .redeem_vendor_srt_ticket(
+                        ticket,
+                        &route_viewer,
+                        &self.owner,
+                        &admission,
+                        reserved.as_ref().unwrap(),
+                    )
+                    .await
+            {
+                return Err(503);
+            }
             let settings = self
                 .output_settings(app, &output_key, output_revision)
                 .map_err(|_| 503u16)?;

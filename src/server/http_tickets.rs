@@ -109,6 +109,7 @@ mod tests {
         ledger.insert(
             "owned-ticket".into(),
             Reservation {
+                srt: None,
                 vendor: None,
                 kind: rtsp_balancer::Kind::Http,
                 bitrate_mbps: 2.0,
@@ -148,6 +149,7 @@ mod tests {
         ledger.insert(
             "owned-ticket".into(),
             Reservation {
+                srt: None,
                 vendor: None,
                 kind: rtsp_balancer::Kind::Http,
                 bitrate_mbps: 2.0,
@@ -191,6 +193,7 @@ mod tests {
         app.reservations.lock().await.insert(
             "owned-ticket".into(),
             Reservation {
+                srt: None,
                 vendor: None,
                 kind: rtsp_balancer::Kind::Http,
                 bitrate_mbps: 2.0,
@@ -228,6 +231,7 @@ mod tests {
             app.reservations.lock().await.insert(
                 "owned-ticket".into(),
                 Reservation {
+                    srt: None,
                     vendor: None,
                     kind: rtsp_balancer::Kind::Rtsp {
                         secure,

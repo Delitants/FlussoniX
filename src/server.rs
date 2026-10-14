@@ -65,6 +65,7 @@ impl Default for Options {
     }
 }
 struct Reservation {
+    srt: Option<srt_tickets::Binding>,
     vendor: Option<Arc<crate::source_directory::modern_coordinator::ReservedCandidate>>,
     kind: rtsp_balancer::Kind,
     bitrate_mbps: f64,
@@ -251,7 +252,7 @@ impl App {
     pub fn set_srt_playback(&self, listener: Option<&crate::srt_playback::Listener>) {
         *self.srt_playback.lock().unwrap() = match listener {
             Some(l) => {
-                json!({"enabled":true,"listen":l.address().to_string(),"encrypted":l.settings().encrypted(),"latency_ms":l.settings().latency_millis(),"client_limit":l.settings().client_limit()})
+                json!({"enabled":true,"listener_id":uuid::Uuid::new_v4().to_string(),"listen":l.address().to_string(),"encrypted":l.settings().encrypted(),"latency_ms":l.settings().latency_millis(),"client_limit":l.settings().client_limit()})
             }
             None => json!({"enabled":false,"listen":null,"encrypted":false}),
         };
@@ -507,6 +508,15 @@ impl App {
         metrics["srt_playback"] = srt;
         let mut reservations = self.reservations.lock().await;
         reservations.retain(|_, v| v.expires > Instant::now());
+        metrics["srt_playback"]["reserved"] = json!(
+            reservations
+                .values()
+                .filter(|r| r
+                    .srt
+                    .as_ref()
+                    .is_some_and(|b| metrics["srt_playback"]["listener_id"] == b.listener_id))
+                .count()
+        );
         let reserved = reservations.len() as u64;
         let reserved_mbps: f64 = reservations.values().map(|r| r.bitrate_mbps).sum();
         drop(reservations);
@@ -1023,26 +1033,60 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
             Err(message) => return error(StatusCode::BAD_REQUEST, &message),
         };
         let mut vendor = None;
-        if let rtsp_balancer::Kind::Rtsp { secure, .. } = &kind {
-            let enabled = app.rtsp_publication.lock().unwrap()
-                [if *secure { "rtsps" } else { "rtsp" }]
-            .is_string();
-            if !enabled || !matches!(app.options.role.as_str(), "cdn" | "standalone") {
+        let mut srt = None;
+        if let rtsp_balancer::Kind::Srt { encrypted, .. } = &kind {
+            let listener = app.srt_playback.lock().unwrap().clone();
+            if listener["enabled"] != true
+                || listener["encrypted"] != *encrypted
+                || !matches!(app.options.role.as_str(), "cdn" | "standalone")
+            {
                 return error(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "RTSP delivery not enabled on CDN",
+                    "SRT delivery not enabled with requested encryption",
                 );
+            }
+            srt = Some(srt_tickets::Binding {
+                listener_id: listener["listener_id"].as_str().unwrap_or("").into(),
+                revision: app.config.revision(),
+                signature: None,
+            });
+        }
+        if matches!(
+            &kind,
+            rtsp_balancer::Kind::Rtsp { .. } | rtsp_balancer::Kind::Srt { .. }
+        ) {
+            if let rtsp_balancer::Kind::Rtsp { secure, .. } = &kind {
+                let enabled = app.rtsp_publication.lock().unwrap()
+                    [if *secure { "rtsps" } else { "rtsp" }]
+                .is_string();
+                if !enabled || !matches!(app.options.role.as_str(), "cdn" | "standalone") {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "RTSP delivery not enabled on CDN",
+                    );
+                }
             }
             match app
                 .config
                 .read(|root| crate::vendor_playback::select(root, name, app.config.revision()))
             {
                 crate::vendor_playback::Selection::Native => {
-                    if app.resolve(name).await.is_none() {
+                    let Some(resolved) = app
+                        .resolve(name)
+                        .await
+                        .filter(|r| r.config["disabled"] != true)
+                    else {
                         return error(StatusCode::NOT_FOUND, "stream route unavailable");
+                    };
+                    if let Some(binding) = &mut srt {
+                        binding.revision = resolved.revision;
+                        binding.signature = Some(crate::media::media_signature(&resolved.config));
                     }
                 }
                 crate::vendor_playback::Selection::Vendor { key, revision } => {
+                    if let Some(binding) = &mut srt {
+                        binding.revision = revision;
+                    }
                     vendor = match &app.vendor_playback {
                         Some(runtime) => {
                             match runtime.rtsp_reserve(&app, name, &key, revision).await {
@@ -1101,7 +1145,24 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
         let n = app.telemetry.snapshot(app.options.uplink_mbps);
         let active = app.playback_auth.active();
         let reserved_mbps: f64 = reservations.values().map(|r| r.bitrate_mbps).sum();
-        if app.options.drain
+        let srt_full = srt.as_ref().is_some_and(|binding| {
+            let listener = app.srt_playback.lock().unwrap();
+            let limit = listener["client_limit"].as_u64().unwrap_or(0);
+            let pending = reservations
+                .values()
+                .filter(|r| {
+                    r.srt
+                        .as_ref()
+                        .is_some_and(|b| b.listener_id == binding.listener_id)
+                })
+                .count() as u64;
+            app.srt_connections
+                .load(Ordering::Relaxed)
+                .saturating_add(pending)
+                >= limit
+        });
+        if srt_full
+            || app.options.drain
             || reservations.len() >= 20000
             || active + reservations.len() as u64 >= app.options.client_limit
             || n["uplink"].as_f64().unwrap_or(1.0)
@@ -1115,26 +1176,46 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
         }
         let ticket = uuid::Uuid::new_v4().to_string();
         let route = vendor.clone();
+        let binding = srt.clone();
         let commit = || {
+            // Keep the actual listener generation stable through reservation commit.
+            let listener = app.srt_playback.lock().unwrap();
+            if let Some(b) = &srt
+                && (listener["enabled"] != true
+                    || listener["listener_id"] != b.listener_id
+                    || !matches!(&kind,rtsp_balancer::Kind::Srt{encrypted,..} if listener["encrypted"]==*encrypted))
+            {
+                return false;
+            }
+
             reservations.insert(
                 ticket.clone(),
                 Reservation {
+                    srt,
                     vendor,
                     kind,
                     bitrate_mbps,
                     stream: name.into(),
                     expires: Instant::now() + Duration::from_secs(5),
                 },
-            )
+            );
+            true
         };
         if let Some(route) = &route {
             let owner = app
                 .modern_sources
                 .as_ref()
                 .expect("vendor reservation owner");
-            if owner.with_reserved_current(route, commit).is_err() {
+            if owner.with_reserved_current(route, commit).ok() != Some(true) {
                 reservations.remove(&ticket); // post-commit lease expiry rollback
                 return error(StatusCode::SERVICE_UNAVAILABLE, "vendor authority changed");
+            }
+        } else if let Some(binding) = binding {
+            if app.config.at_revision(binding.revision, |_| commit()) != Some(true) {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "SRT route or listener changed",
+                );
             }
         } else {
             commit();
@@ -1905,6 +1986,7 @@ mod http_balancer;
 mod http_tickets;
 pub(crate) mod rtsp_balancer;
 mod srt_lookup;
+pub(crate) mod srt_tickets;
 mod vendor_balancer;
 mod vendor_http_state;
 mod vendor_rtsp_tickets;

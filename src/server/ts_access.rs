@@ -76,6 +76,13 @@ impl Drop for Playback {
 }
 impl App {
     pub(crate) async fn ts_admit(&self, viewer: ViewerRequest) -> Result<Playback, u16> {
+        self.ts_admit_ticket(viewer, None).await
+    }
+    pub(crate) async fn ts_admit_ticket(
+        &self,
+        viewer: ViewerRequest,
+        ticket: Option<super::srt_tickets::Ticket<'_>>,
+    ) -> Result<Playback, u16> {
         if self.options.role == "lb" || self.options.drain {
             return Err(503);
         }
@@ -88,14 +95,23 @@ impl App {
             crate::vendor_playback::Selection::Ambiguous => return Err(503),
             crate::vendor_playback::Selection::Vendor { key, revision } => {
                 return match &self.vendor_playback {
-                    Some(runtime) => runtime.ts_admit(self, viewer, &key, revision).await,
+                    Some(runtime) => runtime.ts_admit(self, viewer, &key, revision, ticket).await,
                     None => Err(503),
                 };
             }
         }
         let name = viewer.name.clone();
         let resolved = self.resolve(&name).await.ok_or(404u16)?;
-        let grant = match self.playback_auth.authorize(resolved.policy, viewer).await {
+        let result = if ticket.is_some() {
+            self.playback_auth
+                .authorize_control(resolved.policy, viewer.clone())
+                .await
+        } else {
+            self.playback_auth
+                .authorize(resolved.policy, viewer.clone())
+                .await
+        };
+        let grant = match result {
             AuthOutcome::Allowed(g) => g,
             _ => return Err(403),
         };
@@ -104,6 +120,10 @@ impl App {
         }
         let (cfg, _) = self.media_config(&name).await.ok_or(404u16)?;
         let signature = crate::media::media_signature(&cfg);
+        if let Some(ticket) = ticket {
+            self.srt_consume(ticket, &viewer, &grant, &signature)
+                .await?;
+        }
         let check = async {
             let current = self.media_config(&name).await.is_some_and(|(c, _)| {
                 c["disabled"] != true && crate::media::media_signature(&c) == signature

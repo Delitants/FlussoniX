@@ -7,12 +7,25 @@ use tokio::sync::Semaphore;
 #[derive(Clone)]
 pub(super) enum Kind {
     Http,
+    Srt { encrypted: bool, token_hash: String },
     Rtsp { secure: bool, token_hash: String },
 }
 pub(super) fn kind(body: &Value) -> Result<Kind, String> {
     match body.get("protocol") {
         None => Ok(Kind::Http),
         Some(Value::String(p)) if p == "http" => Ok(Kind::Http),
+        Some(Value::String(p)) if p == "srt" => {
+            let hash = body["token_hash"]
+                .as_str()
+                .filter(|h| h.len() == 64 && h.bytes().all(|c| c.is_ascii_hexdigit()))
+                .ok_or("SRT admission requires token_hash SHA256 hex")?;
+            Ok(Kind::Srt {
+                encrypted: body["encrypted"]
+                    .as_bool()
+                    .ok_or("SRT admission requires encrypted boolean")?,
+                token_hash: hash.to_ascii_lowercase(),
+            })
+        }
         Some(Value::String(p)) if matches!(p.as_str(), "rtsp" | "rtsps") => {
             let hash = body["token_hash"]
                 .as_str()

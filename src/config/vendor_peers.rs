@@ -16,15 +16,6 @@ pub(super) fn validate(peer: &Value) -> Result<(), String> {
         Some("native" | "flussonic") => {}
         _ => return Err("peer type must be native or flussonic".into()),
     }
-    if !is_vendor(peer) {
-        if peer.get("flussonix_stream_map").is_some()
-            || peer.get("flussonix_srt_url").is_some()
-            || peer.get("flussonix_srt_encrypted").is_some()
-        {
-            return Err("stream mappings require a Flussonic peer".into());
-        }
-        return Ok(());
-    }
     if peer.get("flussonix_srt_url").is_some() || peer.get("flussonix_srt_encrypted").is_some() {
         peer["flussonix_srt_url"]
             .as_str()
@@ -33,6 +24,12 @@ pub(super) fn validate(peer: &Value) -> Result<(), String> {
         peer["flussonix_srt_encrypted"]
             .as_bool()
             .ok_or("SRT requires an explicit encryption declaration")?;
+    }
+    if !is_vendor(peer) {
+        if peer.get("flussonix_stream_map").is_some() {
+            return Err("stream mappings require a Flussonic peer".into());
+        }
+        return Ok(());
     }
     let key = peer["cluster_key"]
         .as_str()

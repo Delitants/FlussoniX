@@ -1,5 +1,5 @@
 import React from 'react';
-import {PeerTypeField,VendorPeerMappings,VendorSRTFields,vendorPeerError} from './vendorPeerFields';
+import {PeerTypeField,VendorPeerMappings,PeerSRTFields,vendorPeerError} from './vendorPeerFields';
 import {SourceTypeField,VendorSourcePolicies,VendorPolicyReset,vendorSourceError} from './vendorSourceFields';
 import {GPUReadiness} from './gpuReadiness';
 import {RTPInputFields,DirectOutputFields,directRTP,rtpError,rtpSummary} from './rtpFields';
@@ -144,7 +144,7 @@ export function ConfigurationFields({kind,value,onChange,templates,backends,lock
   {vendor&&<Field label="Content identity" help="Explicit identity for the content namespace shared by this group. Configure the same group, identity, viewer policies, filters and processing on 2 to 8 equivalent origins. A single member can be saved while setting up the group; playback requires two."><input maxLength={128} value={value.flussonix_content_id||''} placeholder="e.g. music-v1" onChange={e=>set('flussonix_content_id',e.target.value)}/></Field>}
   {kind==='peers'&&<Field label="New viewer admission"><select value={value.drain?'drain':'accept'} onChange={e=>set('drain',e.target.value==='drain')}><option value="accept">Accept new viewers</option><option value="drain">Drain (stop new viewers)</option></select></Field>}
  </div></fieldset>{vendor&&<VendorSourcePolicies value={value} onChange={onChange} backends={backends} templates={templates} capabilities={capabilities}/>}
- {vendorPeer&&<><VendorPeerMappings value={value} onChange={onChange}/><VendorSRTFields value={value} onChange={onChange}/></>}
+ {vendorPeer&&<VendorPeerMappings value={value} onChange={onChange}/>}{kind==='peers'&&<PeerSRTFields value={value} onChange={onChange}/>}
  {kind==='sources'&&<VendorPolicyReset value={value} onChange={onChange}/>}</>}
  </>;
 }

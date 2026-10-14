@@ -7,7 +7,7 @@ use std::{
 };
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 const PATH: &str = "/flussonix/api/v1/srt-lookup";
-struct Https {
+pub(super) struct Https {
     url: String,
     client: reqwest::Client,
     stop: CancellationToken,
@@ -15,7 +15,7 @@ struct Https {
     _cert: tls_fixture::Certificates,
 }
 impl Https {
-    async fn new(app: Arc<App>) -> Self {
+    pub(super) async fn new(app: Arc<App>) -> Self {
         let cert = tls_fixture::Certificates::new();
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("https://{}", tcp.local_addr().unwrap());
@@ -39,7 +39,7 @@ impl Https {
             _cert: cert,
         }
     }
-    async fn lookup(&self, id: &str, encryption: Option<&str>) -> reqwest::Response {
+    pub(super) async fn lookup(&self, id: &str, encryption: Option<&str>) -> reqwest::Response {
         let mut req = self
             .client
             .get(format!("{}{PATH}", self.url))
@@ -49,7 +49,7 @@ impl Https {
         }
         req.send().await.unwrap()
     }
-    async fn close(self) {
+    pub(super) async fn close(self) {
         self.stop.cancel();
         tokio::time::timeout(Duration::from_secs(6), self.task)
             .await
@@ -211,7 +211,7 @@ async fn lookup_defaults_to_encryption_and_filters_unsupported_peers_before_io()
     https.close().await;
 }
 #[tokio::test]
-async fn srt_peer_requires_paired_vendor_fields_safe_explicit_port_and_representable_mapping() {
+async fn srt_peer_requires_paired_fields_safe_explicit_port_and_representable_vendor_mapping() {
     let v = Vendor::new().await;
     let (_d, a) = app();
     for raw in [
@@ -236,7 +236,7 @@ async fn srt_peer_requires_paired_vendor_fields_safe_explicit_port_and_represent
     let mut p = peer(&v);
     p["flussonix_peer_kind"] = json!("native");
     p.as_object_mut().unwrap().remove("flussonix_stream_map");
-    assert!(a.config.put("peers", "edge", p).is_err());
+    assert!(a.config.put("peers", "edge", p).is_ok());
     let mut p = peer(&v);
     p["flussonix_stream_map"][0]["remote_name"] = json!("remote,news");
     assert!(a.config.put("peers", "edge", p).is_err());

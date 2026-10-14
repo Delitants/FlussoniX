@@ -196,9 +196,7 @@ impl App {
             return Err(503);
         }
         let calls = peers.into_iter().map(|peer| async move {
-            if !crate::config::vendor_peers::is_vendor(&peer) {
-                return None;
-            }
+            let vendor = crate::config::vendor_peers::is_vendor(&peer);
             let root = crate::config::vendor_peers::srt_root(peer["flussonix_srt_url"].as_str()?)?;
             let required = peer["flussonix_srt_encrypted"].as_bool()?;
             if encrypted && !required {
@@ -206,9 +204,37 @@ impl App {
             }
             let id = mapped(
                 streamid,
-                crate::config::vendor_peers::remote_name(&peer, &viewer.name)?,
+                if vendor {
+                    crate::config::vendor_peers::remote_name(&peer, &viewer.name)?
+                } else {
+                    &viewer.name
+                },
             )?;
+            if !vendor && append_ticket(&id, "00000000-0000-0000-0000-000000000000").is_none() {
+                return None;
+            }
             let snapshot = self.http_snapshot(&peer, &viewer.name, revision).await?;
+            if !vendor {
+                let node = &snapshot.value;
+                let profile = &node["srt_playback"];
+                if !matches!(node["role"].as_str(), Some("cdn" | "standalone"))
+                    || profile["enabled"] != true
+                    || profile["encrypted"] != required
+                    || profile["listener_id"]
+                        .as_str()
+                        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                        .is_none()
+                    || profile["client_limit"].as_u64().is_none_or(|limit| {
+                        limit == 0
+                            || profile["clients"]
+                                .as_u64()
+                                .and_then(|n| n.checked_add(profile["reserved"].as_u64()?))
+                                .is_none_or(|n| n >= limit)
+                    })
+                {
+                    return None;
+                }
+            }
             Some((snapshot, peer, root.to_string(), id, required))
         });
         let mut calls = futures_util::stream::iter(calls).buffer_unordered(64);
@@ -293,10 +319,40 @@ impl App {
                 .iter()
                 .find(|(_, peer, _, _, _)| peer["hostname"] == id)
                 .unwrap();
-            // Shared HTTP/RTSP/SRT holds are advisory on this LB, never a vendor RPC.
-            if !self.hold_vendor_http(peer, snapshot, bitrate, revision) {
-                continue;
-            }
+            let output = if crate::config::vendor_peers::is_vendor(peer) {
+                // Vendor HTTP/RTSP/SRT holds remain advisory on this LB.
+                if !self.hold_vendor_http(peer, snapshot, bitrate, revision) {
+                    continue;
+                }
+                streamid.clone()
+            } else {
+                let Some(client) = self.cluster_client(peer).ok() else {
+                    continue;
+                };
+                let Some(api) = peer["api_url"].as_str() else {
+                    continue;
+                };
+                let response=client.post(format!("{}/flussonix/api/v1/admit",api.trim_end_matches('/')))
+                    .header("X-Flussonix-Peer",peer["cluster_key"].as_str().unwrap_or(&self.options.peer_key))
+                    .json(&json!({"name":viewer.name,"protocol":"srt","encrypted":required,"token_hash":super::rtsp_balancer::token_hash(viewer),"bitrate_mbps":bitrate}))
+                    .timeout(Duration::from_secs(4)).send().await;
+                let Ok(response) = response else {
+                    continue;
+                };
+                if !response.status().is_success() {
+                    continue;
+                }
+                let Some(body) = super::admission::read_json(response).await else {
+                    continue;
+                };
+                let Some(id) = body["ticket"]
+                    .as_str()
+                    .and_then(|id| append_ticket(streamid, id))
+                else {
+                    continue;
+                };
+                id
+            };
             if grant.is_cancelled() {
                 return Err(403);
             }
@@ -304,8 +360,17 @@ impl App {
                 return Err(503);
             }
             return Ok(
-                json!({"address":address.trim_end_matches('/'),"streamid":streamid,"encryption_required":required,"expires_in":5}),
+                json!({"address":address.trim_end_matches('/'),"streamid":output,"encryption_required":required,"expires_in":5}),
             );
         }
     }
+}
+
+fn append_ticket(streamid: &str, ticket: &str) -> Option<String> {
+    let id = uuid::Uuid::parse_str(ticket).ok()?;
+    if id.to_string() != ticket {
+        return None;
+    }
+    let output = format!("{streamid},flussonix_ticket={ticket}");
+    (output.len() <= 512).then_some(output)
 }
