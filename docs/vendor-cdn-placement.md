@@ -61,7 +61,9 @@ addresses, and callback redirects cannot downgrade them.
 Owned tests exercise discovered and locally configured LB routes, independently
 decoded HLS segments, M4S delivery, source/policy edits, lease expiry, callback and
 group guards, shutdown, concurrent RTSP redemption and verified RTSPS redirects.
-Flussonic HTTP/HTTPS and RTSP/RTSPS destinations are described below. Seamless recovery and SRT LB placement remain pending. CDN/standalone SRT playback uses the existing guarded listener. [Equivalent-origin failover](vendor-daemon-failover.md),
+Flussonic HTTP/HTTPS, RTSP/RTSPS and HTTPS-based SRT destination lookup are
+described below. Existing connections do not migrate between CDNs.
+CDN/standalone SRT playback uses the guarded listener. [Equivalent-origin failover](vendor-daemon-failover.md),
 [static activation](vendor-static-activation.md) and CDN/standalone
 [RTSP/RTSPS playback](vendor-daemon-playback.md) are supported separately. Configure equivalent intended viewer
 policies on LB and CDN; this increment does not infer equivalence between them.
@@ -202,3 +204,15 @@ reservations never pull upstream media by themselves.
 Existing ticketless SRT clients keep their normal viewer policy. Native tickets
 are never sent to Flussonic destinations. Listener support and owned decoder tests
 do not establish live Flussonic interoperability or production capacity.
+
+When a native CDN switches to an equivalent origin, an existing SRT connection
+can close. Request a **fresh HTTPS lookup** and connect using the new stream ID;
+an old ticket cannot be reused. The CDN can recover its upstream automatically
+while authorized playback demand remains recent. A complete origin outage
+rejects lookup and stops stale source media; restored availability permits a new
+lookup and connection.
+
+Owned daemon tests cover this reconnect flow with HEVC and MP2/MP3 audio over
+both M4F and M4S private inputs, including origin failure and total outage with
+restoration. These tests do not qualify uninterrupted SRT connections or gapless
+timestamps. See [native recovery qualification](cluster-loadbalancing.md#encrypted-srt-reconnection-after-native-origin-recovery).

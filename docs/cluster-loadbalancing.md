@@ -32,6 +32,32 @@ It excludes subsequent offline decoding. This loopback synthetic-source profile
 is a functional qualification, not a first-frame SLA, seamless playback,
 hardware decoding, HEVC GPU encoding, WAN/soak or capacity benchmark.
 
+## Encrypted SRT reconnection after native origin recovery
+
+For clients using the native HTTPS SRT lookup, request a new lookup whenever an
+SRT connection must reconnect after an origin switch. Connect directly to the
+returned CDN with the entire new stream ID and the configured SRT passphrase.
+Single-use tickets from earlier connections cannot be reused.
+
+The real-daemon profile uses two equivalent origins, one CDN and one LB on
+unused loopback ports, with independently trusted HTTPS certificates. It checks
+HEVC with MP2 and MP3 audio over both M4F and M4S private pulls. An active SRT
+receiver must close after its origin fails, before its normal capture deadline.
+The CDN supervisor
+must replace a failed origin without another viewer request; a fresh lookup then
+delivers independently decoded encrypted SRT using that recovered worker. A
+complete origin outage must stop stale CDN media and reject lookup, and restoring
+an equivalent origin must permit new playback. Wrong viewer tokens and spent
+tickets receive no media, and the LB starts no encoder.
+
+```bash
+cargo test --locked --test cluster_srt_recovery -- --test-threads=1
+```
+
+This covers reconnection and codec preservation, not uninterrupted SRT sessions,
+gapless timestamps, live Flussonic interoperability or production throughput.
+Recovery still requires recent authorized demand and equivalent source policies.
+
 ## Repeated native TLS origin failover
 
 The repeated-failure scenario adds an A → B → A sequence to the same owned

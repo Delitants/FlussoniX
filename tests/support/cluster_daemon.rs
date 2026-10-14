@@ -8,6 +8,8 @@ pub struct Daemon {
     pub cert: tls_fixture::Certificates,
     pub url: String,
     pub key: String,
+    #[allow(dead_code)] // Only SRT cluster qualification uses this listener.
+    pub srt_url: Option<String>,
     child: Option<Child>,
     config: Vec<u8>,
 }
@@ -18,6 +20,7 @@ impl Daemon {
             cert: tls_fixture::Certificates::new(),
             url: String::new(),
             key: format!("owned-{name}-peer"),
+            srt_url: None,
             child: None,
             config: vec![],
         }
@@ -26,6 +29,13 @@ impl Daemon {
         flussonix::config::ConfigStore::open(self.directory.path().join("config.json")).unwrap()
     }
     pub async fn start(&mut self, name: &str, role: &str) {
+        self.start_configured(name, role, None).await;
+    }
+    #[allow(dead_code)] // Other transport qualifications keep SRT disabled.
+    pub async fn start_srt(&mut self, name: &str, role: &str, passphrase: &str) {
+        self.start_configured(name, role, Some(passphrase)).await;
+    }
+    async fn start_configured(&mut self, name: &str, role: &str, srt: Option<&str>) {
         self.config = std::fs::read(self.directory.path().join("config.json")).unwrap();
         let listener = if self.url.is_empty() {
             "127.0.0.1:0".to_owned()
@@ -36,8 +46,21 @@ impl Daemon {
                 .unwrap()[0]
                 .to_string()
         };
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_flussonix"));
+        if let Some(passphrase) = srt {
+            command
+                .args([
+                    "--srt-play-listen",
+                    "127.0.0.1:0",
+                    "--srt-play-client-limit",
+                    "8",
+                ])
+                .env("FLUSSONIX_SRT_PLAY_PASSPHRASE", passphrase);
+        } else {
+            command.env_remove("FLUSSONIX_SRT_PLAY_PASSPHRASE");
+        }
         self.child = Some(
-            tokio::process::Command::new(env!("CARGO_BIN_EXE_flussonix"))
+            command
                 .args(["--https-only", "--https-listen", &listener])
                 .arg("--https-cert")
                 .arg(&self.cert.cert)
@@ -60,8 +83,7 @@ impl Daemon {
                 .env("FLUSSONIX_ADMIN_USER", "owned-cluster")
                 .env("FLUSSONIX_ADMIN_PASSWORD", "owned-management")
                 .env("FLUSSONIX_PEER_KEY", &self.key)
-                // This owned fixture has no SRT listener, regardless of the shell.
-                .env_remove("FLUSSONIX_SRT_PLAY_PASSPHRASE")
+                // Only an explicit start_srt call enables SRT, never the shell.
                 .env("RUST_LOG", "error")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -80,6 +102,10 @@ impl Daemon {
         let info: Value = serde_json::from_str(&line).unwrap();
         assert!(info["listen"].is_null(), "fixture must bind HTTPS only");
         self.url = format!("https://{}", info["https_listen"].as_str().unwrap());
+        self.srt_url = info["srt_play_listen"]
+            .as_str()
+            .map(|a| format!("srt://{a}"));
+        assert_eq!(self.srt_url.is_some(), srt.is_some());
     }
     pub async fn node(&self, client: &reqwest::Client) -> Value {
         client
