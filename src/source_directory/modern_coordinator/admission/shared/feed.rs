@@ -33,6 +33,14 @@ impl SharedViewer {
     }
 }
 impl SharedFeed {
+    pub(crate) fn static_demand(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let worker = self.worker.clone();
+        move || {
+            worker
+                .at_route(|_| Ok(!worker.cancel.is_cancelled() && worker.has_active_activation()))
+                .unwrap_or(false)
+        }
+    }
     /// Commit the source startup stall before packaging cancellation drops input.run.
     /// Does nothing after metadata acceptance or authority/demand retirement.
     pub(crate) fn startup_timeout(&self) -> impl Fn() + Send + Sync + 'static {

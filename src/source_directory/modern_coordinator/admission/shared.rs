@@ -138,6 +138,20 @@ impl Worker {
         self.ts.close();
         self.hub.finish();
     }
+    fn has_active_activation(&self) -> bool {
+        // Drop upgraded members only after releasing the members mutex.
+        let members = {
+            self.members
+                .lock()
+                .unwrap()
+                .values()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>()
+        };
+        members
+            .iter()
+            .any(|member| !member.admission.counts_as_viewer() && !member.admission.is_cancelled())
+    }
     fn active_viewer(&self) -> Option<Arc<Viewer>> {
         // Common case is O(1): stop at the first authorized attachment. Defer
         // dropping upgraded handles until after members is unlocked, since a
@@ -181,7 +195,12 @@ impl Worker {
         policy: &Policy,
         options: &SharedInputOptions,
     ) -> bool {
-        if &self.policy != policy || !self.options.matches(options) {
+        let same_scope = match (&self.scope, admitted.selection()) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same_route(b),
+            _ => false,
+        };
+        if !same_scope || &self.policy != policy || !self.options.matches(options) {
             return false;
         }
         let a = self.route.lock().unwrap();
@@ -488,7 +507,7 @@ impl SharedInputs {
                             owner: self.owner.clone(),
                             handle: admission.candidate().handle.clone(),
                             route: Mutex::new(copy_route(admission.candidate())),
-                            scope: admission.selection(),
+                            scope: admission.selection().cloned(),
                             failure: self.failures.lock().unwrap().get(view.name).cloned(),
                             name: view.name.into(),
                             policy: view.policy.clone(),

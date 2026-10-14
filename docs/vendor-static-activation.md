@@ -13,8 +13,10 @@ viewer still needs its own normal authorization.
 
 `SharedInputs::attach_activation` and `Engine::package_shared` let an embedding
 owner keep one shared input and packager active. Independently authorized
-viewers join the same generation. Static ownership counts as zero viewers and
-its reads do not renew playback activity. Cancelling its `ActivationControl`
+viewers join the same generation when source, processing and replica selection
+match. Direct and replica-group attachments cannot mix. Static ownership counts
+as zero viewers and its reads do not renew playback activity. Current static
+demand protects the worker from idle retirement. Cancelling its `ActivationControl`
 stops that owner's demand; an authorized viewer can keep the shared worker
 alive. Revoking a viewer does not cancel static ownership.
 

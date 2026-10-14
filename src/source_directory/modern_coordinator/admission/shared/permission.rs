@@ -19,10 +19,10 @@ impl Permission {
             Self::Activation(a) => &a.name,
         }
     }
-    pub fn selection(&self) -> Option<super::super::super::ReplicaRoute> {
+    pub fn selection(&self) -> Option<&super::super::super::ReplicaRoute> {
         match self {
-            Self::Viewer(a) => a.selection.clone(),
-            Self::Activation(a) => a.selection.clone(),
+            Self::Viewer(a) => a.selection.as_ref(),
+            Self::Activation(a) => a.selection.as_ref(),
         }
     }
     pub fn counts_as_viewer(&self) -> bool {

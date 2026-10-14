@@ -426,3 +426,60 @@ async fn static_activation_is_fenced_by_replica_renewal_switch_and_owner_identit
             .all(|o| o.private_calls.load(Ordering::SeqCst) == 0)
     );
 }
+
+#[tokio::test]
+async fn direct_and_replica_static_owners_cannot_share_or_weaken_each_others_scope() {
+    use flussonix::source_directory::modern_coordinator::{
+        SharedFailure, SharedInputOptions, SharedInputs,
+    };
+    for scoped_first in [false, true] {
+        let f = Fixture::new().await;
+        let s = f.selector();
+        let a = f.handle(0);
+        let rows = f
+            .owner
+            .inventory(&a, Duration::from_secs(30))
+            .await
+            .unwrap();
+        let direct = f.owner.activate(rows.candidate(NAME).unwrap()).unwrap();
+        let mut lookup = s.begin(NAME).unwrap();
+        let choice = lookup.observe(&a, Ok(rows)).unwrap().unwrap();
+        let scoped = s.activate(choice).unwrap();
+        let inputs = SharedInputs::new(f.owner.clone());
+        let (mut first, second) = if scoped_first {
+            (
+                inputs
+                    .attach_activation(scoped, SharedInputOptions::default())
+                    .unwrap(),
+                inputs.attach_activation(direct, SharedInputOptions::default()),
+            )
+        } else {
+            (
+                inputs
+                    .attach_activation(direct, SharedInputOptions::default())
+                    .unwrap(),
+                inputs.attach_activation(scoped, SharedInputOptions::default()),
+            )
+        };
+        let rejected = matches!(second, Err(SharedFailure::Mismatch));
+        drop(second);
+        let correct_scope = if scoped_first {
+            *f.origins[0].private_status.lock().unwrap() = StatusCode::FORBIDDEN;
+            assert!(first.input.take().unwrap().run().await.is_err());
+            s.status(NAME).unwrap().blocked
+        } else {
+            s.shutdown();
+            first.viewer.current().is_ok()
+        };
+        drop(first);
+        inputs.shutdown();
+        assert!(
+            rejected,
+            "direct and replica-scoped ownership shared one worker"
+        );
+        assert!(
+            correct_scope,
+            "worker inherited another owner's shutdown or lost private rejection authority"
+        );
+    }
+}

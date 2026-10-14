@@ -322,3 +322,7 @@ mod activation_tests {
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
     }
 }
+
+#[cfg(test)]
+#[path = "activation_idle_tests.rs"]
+mod activation_idle_tests;

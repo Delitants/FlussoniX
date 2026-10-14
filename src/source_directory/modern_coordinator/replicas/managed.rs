@@ -164,3 +164,13 @@ impl super::ReplicaRoute {
             .map_err(ReplicaFailure::Admission)
     }
 }
+
+impl super::ReplicaRoute {
+    /// Pure identity comparison: attachment already holds the current scope fence.
+    pub(crate) fn same_route(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.stamp.selector, &other.stamp.selector)
+            && self.stamp.name == other.stamp.name
+            && self.stamp.selected == other.stamp.selected
+            && Arc::ptr_eq(&self.stamp.route, &other.stamp.route)
+    }
+}

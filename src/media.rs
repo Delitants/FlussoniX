@@ -78,6 +78,7 @@ pub struct Worker {
     pub wire: Arc<Hub>,
     shared_generation: Option<uuid::Uuid>,
     shared_authority: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    shared_static_demand: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     last_access: Arc<std::sync::Mutex<Instant>>,
 }
 impl Worker {
@@ -839,6 +840,9 @@ impl Engine {
                 Arc::new(Hub::new())
             },
             shared_generation,
+            shared_static_demand: shared
+                .as_ref()
+                .map(|s| Arc::new(s.feed.static_demand()) as Arc<dyn Fn() -> bool + Send + Sync>),
             shared_authority: shared
                 .as_ref()
                 .map(|s| Arc::new(s.feed.authority()) as Arc<dyn Fn() -> bool + Send + Sync>),
@@ -1372,6 +1376,10 @@ impl Engine {
                     && !w.active_pushes
                     && w.idle_seconds() >= 60
                     && w.viewers.load(Ordering::Relaxed) == 0
+                    && !w
+                        .shared_static_demand
+                        .as_ref()
+                        .is_some_and(|demand| demand())
             })
             .map(|(n, _)| n.clone())
             .collect()

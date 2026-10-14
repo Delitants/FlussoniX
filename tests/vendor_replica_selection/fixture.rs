@@ -3,6 +3,7 @@ use super::*;
 pub(super) struct Origin {
     pub(super) key: String,
     pub(super) status: Arc<Mutex<StatusCode>>,
+    pub(super) private_status: Arc<Mutex<StatusCode>>,
     pub(super) rows: Arc<Mutex<Value>>,
     pub(super) calls: Arc<AtomicUsize>,
     pub(super) private_calls: Arc<AtomicUsize>,
@@ -20,6 +21,8 @@ impl Origin {
         let key = format!("m4s://{}", tcp.local_addr().unwrap());
         let secret = format!("owned-{id}-key");
         let status = Arc::new(Mutex::new(StatusCode::OK));
+        let private_status = Arc::new(Mutex::new(StatusCode::OK));
+        let media_status = private_status.clone();
         let rows = Arc::new(Mutex::new(
             json!([{"name":NAME,"named_by":"config","static":true,"groups":[]}]),
         ));
@@ -34,6 +37,7 @@ impl Origin {
         );
         let router = Router::new().fallback(get(
             move |OriginalUri(uri): OriginalUri, headers: HeaderMap| {
+                let media_status = media_status.clone();
                 let (s, r, c, p, secret) = (
                     s.clone(),
                     r.clone(),
@@ -59,6 +63,13 @@ impl Origin {
                             .map(|b| format!("{b:02x}"))
                             .collect();
                         assert_eq!(headers["cluster-auth-key"].to_str().unwrap(), expected);
+                        let status = *media_status.lock().unwrap();
+                        if status != StatusCode::OK {
+                            return Response::builder()
+                                .status(status)
+                                .body(Body::empty())
+                                .unwrap();
+                        }
                         let track = flussonix::m4s::Track {
                             id: 1,
                             codec: "mp3".into(),
@@ -137,6 +148,7 @@ impl Origin {
         Self {
             key,
             status,
+            private_status,
             rows,
             task,
             calls,
