@@ -2,7 +2,7 @@
 //! Lock order: ConfigStore -> coordinator -> SourceAuthority; no lock across I/O.
 mod admission;
 mod replicas;
-pub(crate) use admission::SharedFeed;
+pub(crate) use admission::{ReservedCandidate, SharedFeed};
 pub use replicas::{
     ReplicaAdmission, ReplicaAdmissionOutcome, ReplicaChoice, ReplicaFailure, ReplicaLookup,
     ReplicaMember, ReplicaPullFailure, ReplicaSelector, ReplicaStatus,

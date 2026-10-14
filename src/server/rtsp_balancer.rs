@@ -26,7 +26,7 @@ pub(super) fn kind(body: &Value) -> Result<Kind, String> {
         _ => Err("unknown admission protocol".into()),
     }
 }
-fn token_hash(viewer: &ViewerRequest) -> String {
+pub(super) fn token_hash(viewer: &ViewerRequest) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(viewer.token.as_bytes()))
 }
@@ -156,7 +156,7 @@ impl App {
     ) -> Result<(), u16> {
         let mut ledger = self.reservations.lock().await;
         ledger.retain(|_, r| r.expires > Instant::now());
-        let valid = ledger.get(ticket).is_some_and(|r| r.stream == viewer.name && matches!(&r.kind,Kind::Rtsp{secure:s,token_hash:h} if *s==secure && *h==token_hash(viewer)));
+        let valid = ledger.get(ticket).is_some_and(|r| r.vendor.is_none() && r.stream == viewer.name && matches!(&r.kind,Kind::Rtsp{secure:s,token_hash:h} if *s==secure && *h==token_hash(viewer)));
         if !valid {
             return Err(503);
         }

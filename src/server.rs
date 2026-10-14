@@ -65,6 +65,7 @@ impl Default for Options {
     }
 }
 struct Reservation {
+    vendor: Option<Arc<crate::source_directory::modern_coordinator::ReservedCandidate>>,
     kind: rtsp_balancer::Kind,
     bitrate_mbps: f64,
     stream: String,
@@ -1020,6 +1021,7 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
             Ok(kind) => kind,
             Err(message) => return error(StatusCode::BAD_REQUEST, &message),
         };
+        let mut vendor = None;
         if let rtsp_balancer::Kind::Rtsp { secure, .. } = &kind {
             let enabled = app.rtsp_publication.lock().unwrap()
                 [if *secure { "rtsps" } else { "rtsp" }]
@@ -1030,8 +1032,42 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
                     "RTSP delivery not enabled on CDN",
                 );
             }
-            if app.resolve(name).await.is_none() {
-                return error(StatusCode::NOT_FOUND, "stream route unavailable");
+            match app
+                .config
+                .read(|root| crate::vendor_playback::select(root, name, app.config.revision()))
+            {
+                crate::vendor_playback::Selection::Native => {
+                    if app.resolve(name).await.is_none() {
+                        return error(StatusCode::NOT_FOUND, "stream route unavailable");
+                    }
+                }
+                crate::vendor_playback::Selection::Vendor { key, revision } => {
+                    vendor = match &app.vendor_playback {
+                        Some(runtime) => {
+                            match runtime.rtsp_reserve(&app, name, &key, revision).await {
+                                Ok(reserved) => Some(Arc::new(reserved)),
+                                Err(code) => {
+                                    return error(
+                                        StatusCode::from_u16(code).unwrap(),
+                                        "vendor route unavailable",
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            return error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "vendor owner unavailable",
+                            );
+                        }
+                    };
+                }
+                crate::vendor_playback::Selection::Excluded => {
+                    return error(StatusCode::NOT_FOUND, "stream excluded");
+                }
+                crate::vendor_playback::Selection::Ambiguous => {
+                    return error(StatusCode::SERVICE_UNAVAILABLE, "ambiguous vendor route");
+                }
             }
         }
         // Never acquire the worker mutex under the admission ledger. Any wait
@@ -1077,15 +1113,31 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
             return error(StatusCode::SERVICE_UNAVAILABLE, "node has no capacity");
         }
         let ticket = uuid::Uuid::new_v4().to_string();
-        reservations.insert(
-            ticket.clone(),
-            Reservation {
-                kind,
-                bitrate_mbps,
-                stream: name.into(),
-                expires: Instant::now() + Duration::from_secs(5),
-            },
-        );
+        let route = vendor.clone();
+        let commit = || {
+            reservations.insert(
+                ticket.clone(),
+                Reservation {
+                    vendor,
+                    kind,
+                    bitrate_mbps,
+                    stream: name.into(),
+                    expires: Instant::now() + Duration::from_secs(5),
+                },
+            )
+        };
+        if let Some(route) = &route {
+            let owner = app
+                .modern_sources
+                .as_ref()
+                .expect("vendor reservation owner");
+            if owner.with_reserved_current(route, commit).is_err() {
+                reservations.remove(&ticket); // post-commit lease expiry rollback
+                return error(StatusCode::SERVICE_UNAVAILABLE, "vendor authority changed");
+            }
+        } else {
+            commit();
+        }
         return json_response(json!({"ticket":ticket,"expires_in":5}));
     }
     error(StatusCode::NOT_FOUND, "operation not implemented")
@@ -1836,6 +1888,7 @@ mod http_balancer;
 mod http_tickets;
 pub(crate) mod rtsp_balancer;
 mod vendor_balancer;
+mod vendor_rtsp_tickets;
 
 #[path = "source_activation.rs"]
 mod source_activation;

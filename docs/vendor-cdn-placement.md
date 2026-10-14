@@ -1,6 +1,6 @@
 # Load balancing vendor-backed CDNs
 
-A native FlussoniX load balancer can now send HTTP viewers to a FlussoniX CDN
+A native FlussoniX load balancer can send HTTP, RTSP and RTSPS viewers to a FlussoniX CDN
 that pulls from a configured Flussonic source. The existing uplink/CPU/RAM
 selection, CDN capacity reservation and public delivery endpoints are reused.
 
@@ -30,7 +30,17 @@ are removed from authorization callback query strings; unrelated raw query bytes
 and repeated parameters are preserved there.
 Relative redirects keep the current HTTP/HTTPS authority and transport.
 
-Wrong-stream, expired, replayed and RTSP tickets fail. A denied viewer or a source
+For RTSP, configure each peer's public RTSP/RTSPS address and enable the
+corresponding CDN listener. The LB uses the same load measurements and never
+pulls media. The CDN reserves its exact current vendor source or equivalent
+origin selection for five seconds, without creating viewer permission. DESCRIBE
+independently authorizes the viewer, validates the token and transport binding,
+then consumes the ticket once before starting or joining media. A source,
+configuration, lease or replica change invalidates that reservation. RTSPS
+requests select only RTSPS peers. HTTP and native RTSP tickets cannot substitute
+for a vendor RTSP reservation.
+
+Wrong-stream, expired, replayed and wrong-protocol tickets fail. A denied viewer or a source
 change during authorization cannot consume a valid ticket or start media.
 Concurrent redemption has one winner. CDN ticket redemption alone leaves no
 playback occupancy. Origin Cluster credentials remain in the independent source
@@ -50,8 +60,8 @@ addresses, and callback redirects cannot downgrade them.
 
 Owned tests exercise discovered and locally configured LB routes, independently
 decoded HLS segments, M4S delivery, source/policy edits, lease expiry, callback and
-group guards, shutdown and HTTPS redirect boundaries. Flussonic CDN destinations, seamless recovery, vendor RTSP LB placement and SRT
-delivery remain pending. [Equivalent-origin failover](vendor-daemon-failover.md),
+group guards, shutdown, concurrent RTSP redemption and verified RTSPS redirects.
+Flussonic CDN destinations, seamless recovery and SRT delivery remain pending. [Equivalent-origin failover](vendor-daemon-failover.md),
 [static activation](vendor-static-activation.md) and CDN/standalone
 [RTSP/RTSPS playback](vendor-daemon-playback.md) are supported separately. Configure equivalent intended viewer
 policies on LB and CDN; this increment does not infer equivalence between them.

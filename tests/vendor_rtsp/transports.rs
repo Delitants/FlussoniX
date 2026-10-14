@@ -1,6 +1,4 @@
 use super::*;
-#[path = "../support/tls.rs"]
-mod tls_fixture;
 #[path = "../support/udp.rs"]
 mod udp_fixture;
 

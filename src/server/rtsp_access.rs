@@ -110,7 +110,17 @@ impl App {
                 return match &self.vendor_playback {
                     Some(runtime) => {
                         runtime
-                            .rtsp_admit(self, viewer, &key, revision, ticket.is_some())
+                            .rtsp_admit(
+                                self,
+                                crate::vendor_playback::RtspRequest {
+                                    viewer,
+                                    key: &key,
+                                    revision,
+                                    ticket: ticket.as_deref(),
+                                    source,
+                                    secure,
+                                },
+                            )
                             .await
                     }
                     None => Err(503),

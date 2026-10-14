@@ -29,8 +29,9 @@ CDN and standalone nodes also serve vendor streams over the existing opt-in RTSP
 TCP, unicast UDP and RTSPS TLS listeners. RTSP viewers authorize independently
 and share the private input, processing template and RTP packager with HTTP.
 Revocation and source/replica changes close the affected connection; reconnect
-to obtain current authority. Vendor RTSP LB placement and SRT delivery remain
-pending; LB RTSP requests and foreign admission tickets fail without media pulls.
+to obtain current authority. [RTSP/RTSPS load balancing](vendor-cdn-placement.md)
+uses source-fenced CDN reservations and independent viewer admission. Foreign
+admission tickets fail without media pulls. Vendor SRT delivery remains pending.
 
 Every HTTP request and RTSP DESCRIBE passes current source/local policy and the App's actual native
 viewer authorizer. Shared input, HLS retention and cached files never authorize

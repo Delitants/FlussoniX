@@ -2,6 +2,8 @@
 #[path = "vendor_daemon_failover/fixture.rs"]
 #[allow(dead_code)]
 mod fixture;
+#[path = "support/tls.rs"]
+mod tls_fixture;
 use fixture::Fixture;
 use flussonix::rtsp;
 use serde_json::json;
@@ -211,5 +213,7 @@ async fn vendor_rtsp_shares_http_packager_and_individual_viewer_revocation() {
 
 #[path = "vendor_rtsp/boundaries.rs"]
 mod boundaries;
+#[path = "vendor_rtsp/placement.rs"]
+mod placement;
 #[path = "vendor_rtsp/transports.rs"]
 mod transports;

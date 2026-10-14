@@ -16,6 +16,7 @@ use crate::{
     },
 };
 pub(crate) use response::HttpRequest;
+pub(crate) use rtsp::RtspRequest;
 use serde_json::Value;
 use std::{
     collections::HashMap,

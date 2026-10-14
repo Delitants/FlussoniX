@@ -40,7 +40,7 @@ same origin instead of being interpreted as an origin's transport failure.
 
 The existing active-pulls table reports selected source, group, availability and
 switch count. FlussoniX load balancers use group catalog authority for placement
-on FlussoniX CDNs and never start media workers. Vendor CDN destinations and vendor RTSP LB placement and SRT delivery remain separate work.
+on FlussoniX CDNs and never start media workers. Vendor CDN destinations and SRT delivery remain separate work.
 
 Discovery is coalesced per source, with four concurrent queries, a four-second
 group lookup budget and a 750 ms wire budget per origin. Recovery owns at most
