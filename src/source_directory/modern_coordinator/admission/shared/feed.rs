@@ -35,6 +35,15 @@ impl SharedViewer {
     }
 }
 impl SharedFeed {
+    /// Commit the source startup stall before packaging cancellation drops input.run.
+    /// Does nothing after metadata acceptance or authority/demand retirement.
+    pub(crate) fn startup_timeout(&self) -> impl Fn() + Send + Sync + 'static {
+        let worker = self.worker.clone();
+        move || {
+            let _ = worker.input_failed(crate::m4_ingest::flussonic::InputFailure::Transient, true);
+        }
+    }
+
     pub(crate) fn name(&self) -> &str {
         &self.worker.name
     }

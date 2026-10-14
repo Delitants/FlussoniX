@@ -43,50 +43,74 @@ impl Candidate {
         }
     }
 }
+struct GroupPlan {
+    name: String,
+    members: Vec<ReplicaMember>,
+    spec: Value,
+    names: std::collections::HashSet<String>,
+    revision: u64,
+}
 impl Runtime {
+    fn capture_group(app: &App, key: &str, revision: u64) -> Result<Option<GroupPlan>, Failure> {
+        app.config.at_revision(revision, |root| {
+            let Some(sources) = root["sources"].as_array() else { return Ok(None) };
+            let Some(source) = sources.iter().find(|s| crate::config::item_key("sources",s) == Some(key)) else { return Ok(None) };
+            let Some(name) = source["flussonix_source_group"].as_str() else { return Ok(None) };
+            let rows = sources.iter().filter(|s| s["flussonix_source_kind"] == "flussonic" && s["flussonix_source_group"] == name).collect::<Vec<_>>();
+            let members = rows.iter().map(|s| ReplicaMember {
+                source_key: crate::config::item_key("sources",s).expect("validated source").into(),
+                content_id: s["flussonix_content_id"].as_str().expect("validated identity").into(),
+            }).collect();
+            let spec = serde_json::json!({"sources":rows,"processing":crate::vendor_output::resolve(root,source).map_err(|_| Failure::Unavailable)?});
+            let names = sources.iter().filter_map(|s| s["flussonix_source_group"].as_str().map(str::to_owned)).collect();
+            Ok(Some(GroupPlan { name:name.into(), members, spec, names, revision }))
+        }).ok_or(Failure::Unavailable)?
+    }
     pub(super) fn group_for(
         &self,
         app: &App,
         key: &str,
         revision: u64,
     ) -> Result<Option<Arc<Group>>, Failure> {
-        let members=app.config.at_revision(revision,|root| {
-   let sources=root["sources"].as_array()?;
-   let source=sources.iter().find(|s|crate::config::item_key("sources",s)==Some(key))?;
-   let group=source["flussonix_source_group"].as_str()?;
-   let rows=sources.iter().filter(|s|s["flussonix_source_kind"]=="flussonic"&&s["flussonix_source_group"]==group).collect::<Vec<_>>();
-   let members=rows.iter().map(|s|ReplicaMember{source_key:crate::config::item_key("sources",s).expect("validated source").into(),content_id:s["flussonix_content_id"].as_str().expect("validated identity").into()}).collect::<Vec<_>>();
-   let spec=serde_json::json!({"sources":rows,"processing":crate::vendor_output::resolve(root,source).ok()?});
-   let names=sources.iter().filter_map(|s|s["flussonix_source_group"].as_str().map(str::to_owned)).collect::<std::collections::HashSet<_>>();
-   Some((group.to_owned(),members,spec,names))
-  }).ok_or(Failure::Unavailable)?;
-        let Some((name, members, spec, names)) = members else {
+        let Some(plan) = Self::capture_group(app, key, revision)? else {
             return Ok(None);
         };
-        let previous = {
-            let mut groups = self.groups.lock().map_err(|_| Failure::Unavailable)?;
-            if groups.revision != revision {
-                for group in groups.groups.values() {
-                    group.selector.shutdown();
+        self.resolve_group(app, plan).map(Some)
+    }
+    fn resolve_group(&self, app: &App, plan: GroupPlan) -> Result<Arc<Group>, Failure> {
+        let GroupPlan {
+            name,
+            members,
+            spec,
+            names,
+            revision,
+        } = plan;
+        let (ready, previous) = app
+            .config
+            .at_revision(revision, |_| {
+                let mut groups = self.groups.lock().map_err(|_| Failure::Unavailable)?;
+                if groups.revision != revision {
+                    for group in groups.groups.values() {
+                        group.selector.shutdown();
+                    }
+                    groups.groups.retain(|name, _| names.contains(name));
+                    groups.revision = revision;
                 }
-                groups.groups.retain(|name, _| names.contains(name));
-                groups.revision = revision;
-            }
-            if let Some(group) = groups.groups.get(&name)
-                && group.revision == revision
-            {
-                return Ok(Some(group.clone()));
-            }
-            groups.groups.get(&name).cloned()
-        };
+                let previous = groups.groups.get(&name).cloned();
+                Ok((
+                    previous.as_ref().is_some_and(|g| g.revision == revision),
+                    previous,
+                ))
+            })
+            .ok_or(Failure::Unavailable)??;
+        if ready {
+            return Ok(previous.expect("current cached group"));
+        }
         let keys = members.iter().map(|m| m.source_key.clone()).collect();
         let selector = Arc::new(
             ReplicaSelector::new(self.owner.clone(), &name, members)
                 .map_err(|_| Failure::Unavailable)?,
         );
-        if app.config.revision() != revision {
-            return Err(Failure::Unavailable);
-        }
         if let Some(old) = previous
             && old.spec == spec
         {
@@ -99,17 +123,21 @@ impl Runtime {
             gate: Mutex::new(()),
             spec,
         });
-        let mut groups = self.groups.lock().map_err(|_| Failure::Unavailable)?;
-        if groups.revision != revision {
-            return Err(Failure::Unavailable);
-        }
-        if let Some(existing) = groups.groups.get(&name)
-            && existing.revision == revision
-        {
-            return Ok(Some(existing.clone()));
-        }
-        groups.groups.insert(name, group.clone());
-        Ok(Some(group))
+        app.config
+            .at_revision(revision, |_| {
+                let mut groups = self.groups.lock().map_err(|_| Failure::Unavailable)?;
+                if groups.revision != revision {
+                    return Err(Failure::Unavailable);
+                }
+                if let Some(existing) = groups.groups.get(&name)
+                    && existing.revision == revision
+                {
+                    return Ok(existing.clone());
+                }
+                groups.groups.insert(name, group.clone());
+                Ok(group)
+            })
+            .ok_or(Failure::Unavailable)?
     }
     pub(super) async fn candidate(
         &self,
@@ -384,6 +412,48 @@ impl Runtime {
         stats["source_switches"] = serde_json::json!(status.switches);
         stats["source_available"] = serde_json::json!(
             status.available && !group.selector.private_rejected(name).unwrap_or(true)
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn stale_captured_group_cannot_retire_current_playback_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            crate::server::Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-native-peer".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for key in ["m4s://one.invalid", "m4s://two.invalid"] {
+            app.config.put("sources",key,serde_json::json!({"flussonix_source_kind":"flussonic","cluster_key":"owned-group-key","on_play":"true","flussonix_source_group":"replicas","flussonix_content_id":"music"})).unwrap();
+        }
+        let owner =
+            Arc::new(ModernSourceCoordinator::new(app.config.clone(), "owned-runtime").unwrap());
+        let runtime = Runtime::new(owner);
+        let key = "m4s://one.invalid";
+        let old_revision = app.config.revision();
+        let stale = Runtime::capture_group(&app, key, old_revision)
+            .unwrap()
+            .unwrap();
+        app.config
+            .put("templates", "unrelated", serde_json::json!({}))
+            .unwrap();
+        let revision = app.config.revision();
+        let current = runtime.group_for(&app, key, revision).unwrap().unwrap();
+        assert!(current.selector.begin("owned").is_ok());
+        assert!(runtime.resolve_group(&app, stale).is_err());
+        let next = runtime.group_for(&app, key, revision).unwrap().unwrap();
+        assert!(
+            next.selector.begin("owned").is_ok(),
+            "stale captured request permanently closed the current selector"
         );
     }
 }

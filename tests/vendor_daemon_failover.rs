@@ -578,3 +578,38 @@ async fn scheduled_catalog_removal_latches_before_api_outage_and_prevents_backgr
     drop(body);
     f.stop().await;
 }
+
+#[tokio::test]
+async fn authenticated_private_startup_stall_rotates_with_short_and_default_deadlines() {
+    for seconds in [1, 15] {
+        let f = fixture::Fixture::new().await;
+        f.app
+            .config
+            .put(
+                "templates",
+                "startup",
+                json!({"flussonix_input_timeout":seconds}),
+            )
+            .unwrap();
+        let mut root = f.app.config.snapshot();
+        for source in root["sources"].as_array_mut().unwrap() {
+            source["flussonix_output_template"] = json!("startup");
+        }
+        f.app.config.replace(root).unwrap();
+        f.origins[0].stall_metadata.store(true, Ordering::SeqCst);
+        // This viewer creates real demand but never gets metadata from A.
+        let request = f.get("/owned/index.m3u8").await;
+        assert_eq!(request.status(), StatusCode::SERVICE_UNAVAILABLE);
+        tokio::time::timeout(Duration::from_secs(seconds + 8), async {
+            while f.origins[1].private_calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("authenticated startup stall never selected the healthy backup");
+        assert_eq!(f.origins[0].private_calls.load(Ordering::SeqCst), 1);
+        let playlist = f.playlist().await;
+        assert!(playlist.contains("#EXTINF:"));
+        f.stop().await;
+    }
+}

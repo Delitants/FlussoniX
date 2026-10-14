@@ -871,6 +871,7 @@ impl Engine {
             .collect();
         tokio::spawn(async move {
             let mut tasks = Vec::new();
+            let shared_startup_timeout = shared.as_ref().map(|s| s.feed.startup_timeout());
             if let Some(input) = shared.as_mut().and_then(|s| s.input.take()) {
                 let c = cancel.clone();
                 let source_worker = w.clone();
@@ -949,7 +950,7 @@ impl Engine {
                         result=tokio::time::timeout(timeout,metadata_rx)=>match result {
                             Ok(Ok(tracks))=>tracks,
                             Ok(Err(_))=>{ w.failed("input_closed"); return; },
-                            Err(_)=>{ w.failed("startup_timeout"); return; },
+                            Err(_)=>{ if let Some(expired)=&shared_startup_timeout {expired();} w.failed("startup_timeout"); return; },
                         },
                     };
                     let output = if native_audio_copy {

@@ -1,4 +1,7 @@
 //! Bounded owner-scheduled replacement using original admitted viewer permission.
+#[cfg(test)]
+#[path = "failure_retirement_tests.rs"]
+mod failure_retirement_tests;
 use super::replicas::{Group, Mode};
 use super::*;
 use crate::{
@@ -24,6 +27,7 @@ pub(super) struct Entry {
 pub(super) struct Attempt<'a> {
     runtime: &'a Runtime,
     name: String,
+    group: Arc<Group>,
 }
 impl Drop for Attempt<'_> {
     fn drop(&mut self) {
@@ -34,6 +38,7 @@ impl Drop for Attempt<'_> {
             .unwrap()
             .entries
             .get_mut(&self.name)
+            .filter(|entry| Arc::ptr_eq(&entry.group, &self.group))
         {
             entry.pending = entry.pending.saturating_sub(1);
         }
@@ -41,6 +46,20 @@ impl Drop for Attempt<'_> {
 }
 impl Runtime {
     pub(super) fn register_anchor<'a>(
+        &'a self,
+        name: &str,
+        group: Arc<Group>,
+        admission: &AdmittedCandidate,
+        settings: &Value,
+    ) -> Result<Attempt<'a>, Failure> {
+        // An old foreground request must not retire a newer recovery generation.
+        self.owner
+            .with_admitted_current(admission, || {
+                self.register_anchor_current(name, group, admission, settings)
+            })
+            .map_err(|_| Failure::Unavailable)?
+    }
+    fn register_anchor_current<'a>(
         &'a self,
         name: &str,
         group: Arc<Group>,
@@ -55,6 +74,8 @@ impl Runtime {
         state
             .entries
             .retain(|_, e| e.group.revision == group.revision);
+        self.inputs
+            .retain_failures(|name| state.entries.contains_key(name));
         let count: usize = state.entries.values().map(|e| e.anchors.len()).sum();
         if state.entries.len() >= 256 && !state.entries.contains_key(name) {
             return Err(Failure::Unavailable);
@@ -67,6 +88,9 @@ impl Runtime {
         {
             return Err(Failure::Unavailable);
         }
+        self.inputs
+            .reserve_failure(name)
+            .map_err(|_| Failure::Unavailable)?;
         let entry = state.entries.entry(name.into()).or_insert_with(|| Entry {
             group: group.clone(),
             settings: settings.clone(),
@@ -85,6 +109,7 @@ impl Runtime {
         Ok(Attempt {
             runtime: self,
             name: name.into(),
+            group,
         })
     }
     pub(super) fn remember_recovery(&self, name: &str, playback: &PackagedPlayback) {
@@ -233,6 +258,8 @@ impl Runtime {
                         .retain(|_, a| a.recovery_activity().is_some() || e.pending > 0);
                     !e.anchors.is_empty() || e.pending > 0
                 });
+                self.inputs
+                    .retain_failures(|name| state.entries.contains_key(name));
                 for (name, token) in &active {
                     if !state.entries.contains_key(name) {
                         token.cancel();

@@ -52,7 +52,7 @@ pub enum SharedFailure {
 pub struct SharedInputs {
     owner: Arc<ModernSourceCoordinator>,
     id: Arc<()>,
-    failures: Arc<Mutex<HashMap<String, FailureObservation>>>,
+    failures: Mutex<HashMap<String, FailureSlot>>,
     workers: Mutex<Registry>,
 }
 struct Registry {
@@ -66,7 +66,7 @@ struct Worker {
     handle: super::super::SourceHandle,
     route: Mutex<super::super::CoordinatedCandidate>,
     scope: Option<super::super::ReplicaRoute>,
-    failures: Arc<Mutex<HashMap<String, FailureObservation>>>,
+    failure: Option<FailureSlot>,
     name: String,
     policy: Policy,
     options: SharedInputOptions,
@@ -105,6 +105,32 @@ pub struct SharedInputAttachment {
     pub input: Option<SharedInput>,
 }
 impl Worker {
+    fn input_failed(
+        &self,
+        kind: crate::m4_ingest::flussonic::InputFailure,
+        before_metadata: bool,
+    ) -> Result<(), SharedFailure> {
+        self.at_source_route(|_| {
+            if self.cancel.is_cancelled() || self.active_viewer().is_none() {
+                return Err(AdmissionFailure::Revoked);
+            }
+            // Packaging supervision can expire before the private client's timer.
+            // Once metadata exists, a blocked local feed/packager is not a remote stall.
+            if before_metadata && self.tracks.lock().unwrap().is_some() {
+                return Ok(());
+            }
+            if let Some(scope) = &self.scope {
+                let notice = scope.input_failed(&self.handle, kind)?;
+                if let Some(slot) = &self.failure {
+                    *slot.lock().unwrap() = Some(FailureObservation {
+                        generation: self.id,
+                        notice,
+                    });
+                }
+            }
+            Ok(())
+        })
+    }
     fn close(&self) {
         self.cancel.cancel();
         self.ts.close();
@@ -325,7 +351,7 @@ impl SharedInputs {
         Self {
             owner,
             id: Arc::new(()),
-            failures: Arc::new(Mutex::new(HashMap::new())),
+            failures: Mutex::new(HashMap::new()),
             workers: Mutex::new(Registry {
                 workers: HashMap::new(),
                 epoch: Arc::new(()),
@@ -447,7 +473,7 @@ impl SharedInputs {
                             handle: admission.candidate.handle.clone(),
                             route: Mutex::new(copy_route(&admission.candidate)),
                             scope: admission.selection.clone(),
-                            failures: self.failures.clone(),
+                            failure: self.failures.lock().unwrap().get(view.name).cloned(),
                             name: view.name.into(),
                             policy: view.policy.clone(),
                             options,
@@ -683,16 +709,7 @@ impl SharedInput {
                 result = &mut pull => {
                     worker.current()?;
                     if let Err(kind)=result {
-                        worker.at_source_route(|_| {
-                            if let Some(scope) = &worker.scope {
-                                let notice=scope.input_failed(&worker.handle,kind)?;
-                                let mut failures=worker.failures.lock().unwrap();
-                                if failures.len()<256 || failures.contains_key(&worker.name) {
-                                    failures.insert(worker.name.clone(),FailureObservation {generation:worker.id,notice});
-                                }
-                            }
-                            Ok(())
-                        })?;
+                        worker.input_failed(kind,false)?;
                         return Err(SharedFailure::Input);
                     }
                     return Ok(());
@@ -746,8 +763,29 @@ pub(crate) struct FailureObservation {
     pub generation: Uuid,
     pub notice: super::super::ReplicaInputFailure,
 }
+// Reserve one mailbox with each recovery entry, rather than allocating on
+// failure. A retired worker can write only its orphaned slot, never consume a
+// new entry's capacity or replace its failure signal.
+type FailureSlot = Arc<Mutex<Option<FailureObservation>>>;
 impl SharedInputs {
+    pub(crate) fn reserve_failure(&self, name: &str) -> Result<(), SharedFailure> {
+        let mut slots = self
+            .failures
+            .lock()
+            .map_err(|_| SharedFailure::Unavailable)?;
+        if slots.len() >= 256 && !slots.contains_key(name) {
+            return Err(SharedFailure::Limit);
+        }
+        slots
+            .entry(name.into())
+            .or_insert_with(|| Arc::new(Mutex::new(None)));
+        Ok(())
+    }
+    pub(crate) fn retain_failures(&self, active: impl Fn(&str) -> bool) {
+        self.failures.lock().unwrap().retain(|name, _| active(name));
+    }
     pub(crate) fn take_failure(&self, name: &str) -> Option<FailureObservation> {
-        self.failures.lock().ok()?.remove(name)
+        let slot = self.failures.lock().ok()?.get(name)?.clone();
+        slot.lock().ok()?.take()
     }
 }

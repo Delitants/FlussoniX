@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -33,6 +33,7 @@ type Hold = Arc<
 >;
 pub(super) struct Origin {
     pub hold: Hold,
+    pub stall_metadata: Arc<AtomicBool>,
     pub key: String,
     pub api: Arc<Mutex<StatusCode>>,
     pub media: Arc<Mutex<StatusCode>>,
@@ -65,6 +66,8 @@ impl Origin {
         let management_calls = Arc::new(AtomicUsize::new(0));
         let hold: Hold = Arc::new(Mutex::new(None));
         let held = hold.clone();
+        let stall_metadata = Arc::new(AtomicBool::new(false));
+        let stalled = stall_metadata.clone();
         let (a, m, r, e, p, c, k) = (
             api.clone(),
             media.clone(),
@@ -75,13 +78,17 @@ impl Origin {
             secret.clone(),
         );
         let service=Router::new().fallback(get(move|OriginalUri(uri):OriginalUri,headers:HeaderMap|{
-   let held=held.clone();
+   let held=held.clone();let stalled=stalled.clone();
    let (a,m,r,e,p,c,k)=(a.clone(),m.clone(),r.clone(),e.clone(),p.clone(),c.clone(),k.clone());async move{
     assert!(!headers.contains_key("x-flussonix-peer"));
     if uri.path()=="/owned/m4s" {
      p.fetch_add(1,Ordering::SeqCst);assert!(uri.query().is_none());assert!(!headers.contains_key("authorization"));
      let time=headers["cluster-auth-time"].to_str().unwrap();assert_eq!(headers["cluster-auth-key"],digest(&format!("{time}:{k}:owned")));
      let status=*m.lock().unwrap();if status!=StatusCode::OK {let mut out=Response::new(Body::empty());*out.status_mut()=status;return out;}
+     if stalled.load(Ordering::SeqCst) {
+         let mut out=Response::new(Body::from_stream(futures_util::stream::pending::<Result<bytes::Bytes,std::io::Error>>()));
+         out.headers_mut().insert("cluster-auth","yes".parse().unwrap());return out;
+     }
      let stop=e.lock().unwrap().clone();let track=Track{id:1,codec:"mp3".into(),config:vec![]};
      let stream=futures_util::stream::unfold((0u64,track,stop),|(i,track,stop)|async move{
       if stop.is_cancelled(){return None;}
@@ -104,6 +111,7 @@ impl Origin {
         let task = tokio::spawn(async move { axum::serve(tcp, service).await.unwrap() });
         Self {
             hold,
+            stall_metadata,
             key,
             api,
             media,
