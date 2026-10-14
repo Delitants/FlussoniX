@@ -27,8 +27,7 @@ impl Playback {
                 .worker
                 .wire
                 .rtp
-                .description()
-                .is_some_and(|d| d.is_ok_and(|d| d == self.description))
+                .generation_is(self.description.generation)
     }
     pub(crate) async fn cancelled(&self) {
         match &self.authority {
@@ -198,3 +197,6 @@ impl App {
                     }))
     }
 }
+
+#[cfg(test)]
+mod tests;

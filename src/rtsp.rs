@@ -901,4 +901,7 @@ mod tests {
 #[cfg(test)]
 mod playback_feedback_tests;
 
+#[cfg(test)]
+mod blocked_write_tests;
+
 pub(crate) mod redirect;
