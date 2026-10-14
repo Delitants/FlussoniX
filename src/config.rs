@@ -1,3 +1,4 @@
+pub(crate) mod vendor_peers;
 mod vendor_sources;
 use serde_json::{Value, json};
 use std::{
@@ -440,6 +441,8 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "public_payload_url",
                     "flussonix_rtsp_url",
                     "flussonix_rtsps_url",
+                    "flussonix_peer_kind",
+                    "flussonix_stream_map",
                     "private_payload_url",
                     "cluster_key",
                     "drain",
@@ -463,6 +466,14 @@ fn validate_root(root: &Value) -> Result<(), String> {
             }
             if *kind == "sources" {
                 vendor_sources::validate(item, root)?;
+                if item.get("flussonix_peer_kind").is_some()
+                    || item.get("flussonix_stream_map").is_some()
+                {
+                    return Err("destination type and mappings are peer-only".into());
+                }
+            }
+            if *kind == "peers" {
+                vendor_peers::validate(item)?;
             }
             for (field, scheme) in [
                 ("flussonix_rtsp_url", "rtsp"),

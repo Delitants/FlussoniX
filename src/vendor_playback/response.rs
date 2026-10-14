@@ -110,6 +110,7 @@ impl Runtime {
             Err(Failure::Absent) => return error(StatusCode::NOT_FOUND, "stream not found"),
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "vendor source unavailable"),
         };
+        let raw_viewer_query = viewer.qs.clone();
         let output_revision = candidate.config_revision();
         let output_key = candidate.source_key().to_owned();
         let outcome = tokio::select! {biased;_=self.closed.cancelled()=>return error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),outcome=self.admit_selection(candidate,&app.playback_auth,viewer)=>outcome};
@@ -130,7 +131,7 @@ impl Runtime {
         if app.options.role == "lb" {
             return tokio::select! {biased;
                 _=self.closed.cancelled()=>error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),
-                response=app.balance_vendor(&self.owner,&admission,&raw_path,&query,secure)=>response,
+                response=app.balance_vendor(&self.owner,&admission,&raw_path,&raw_viewer_query,secure)=>response,
             };
         }
         let hls = !matches!(file, "mpegts" | "m4s" | "m4f") && !file.ends_with(".m4f");

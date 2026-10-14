@@ -5,6 +5,7 @@
 //! source requires separate policy, provenance and private-media qualification.
 mod identity;
 pub mod modern;
+pub(crate) mod routing;
 use super::LookupFailure;
 use reqwest::header::HeaderValue;
 use serde_json::Value;

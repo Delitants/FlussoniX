@@ -32,7 +32,7 @@ impl App {
         owner: &ModernSourceCoordinator,
         admitted: &AdmittedCandidate,
         path: &str,
-        query: &HashMap<String, String>,
+        query: &str,
         secure: bool,
     ) -> Response {
         if self.options.role != "lb" || owner.admitted_current(admitted).is_err() {
@@ -140,7 +140,7 @@ mod tests {
             admitted_source(Duration::from_secs(2), "lb", Some(peer)).await;
         let owner = app.modern_sources.as_ref().unwrap().clone();
         let response = app
-            .balance_vendor(&owner, &viewer, "/owned/m4s", &HashMap::new(), false)
+            .balance_vendor(&owner, &viewer, "/owned/m4s", "", false)
             .await;
         let status = response.status();
         let location = response.headers().contains_key("location");
@@ -158,5 +158,47 @@ mod tests {
         );
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(!location, "expired vendor lease exposed a CDN ticket");
+    }
+}
+
+#[cfg(test)]
+mod vendor_destination_tests {
+    use super::*;
+    #[tokio::test]
+    async fn vendor_source_lease_expiring_during_flussonic_telemetry_prevents_redirect() {
+        use axum::{extract::OriginalUri, routing::get};
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", tcp.local_addr().unwrap());
+        let calls = Arc::new(AtomicU64::new(0));
+        let observed = calls.clone();
+        let service=Router::new().route("/streamer/api/v3/{*rest}",get(move |OriginalUri(uri):OriginalUri,headers:HeaderMap|{let calls=observed.clone();async move {
+   assert!(headers["authorization"].to_str().unwrap().starts_with("Cluster "));assert!(!headers.contains_key("x-flussonix-peer"));calls.fetch_add(1,Ordering::SeqCst);
+   if uri.path().ends_with("/config") {tokio::time::sleep(Duration::from_millis(450)).await;json_response(json!({"stats":{"id":"owned-vendor-cdn","now":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()as u64,"cpu_usage":10,"memory_usage":20,"output_kbit":10000,"total_bandwidth":100000000,"total_clients":0,"streamer_status":"running"}}))}
+   else{tokio::time::sleep(Duration::from_millis(300)).await;json_response(json!({"name":"owned","disabled":false,"named_by":"remote","stats":{"running":true}}))}
+  }}));
+        let cdn = tokio::spawn(async move { axum::serve(tcp, service).await.unwrap() });
+        let peer = json!({"hostname":"edge","api_url":api,"public_payload_url":"https://edge.invalid","cluster_key":"owned-vendor-cluster-key","flussonix_peer_kind":"flussonic","flussonix_stream_map":[{"name":"owned","remote_name":"owned"}]});
+        let (_dir, app, admitted, origin, _key) =
+            crate::server::test_vendor_admission::admitted_source(
+                Duration::from_secs(2),
+                "lb",
+                Some(peer),
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let owner = app.modern_sources.as_ref().unwrap();
+        let response = app
+            .balance_vendor(owner, &admitted, "/owned/m4s", "", false)
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!response.headers().contains_key("location"));
+        assert_eq!(app.media.count().await, 0);
+        drop(admitted);
+        assert_eq!(app.playback_auth.active(), 0);
+        cdn.abort();
+        let _ = cdn.await;
+        origin.abort();
+        let _ = origin.await;
     }
 }

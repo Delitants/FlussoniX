@@ -1146,7 +1146,7 @@ async fn balance(
     app: &Arc<App>,
     name: &str,
     path: &str,
-    query: &HashMap<String, String>,
+    query: &str,
     secure: bool,
     grant: &Grant,
     revision: u64,
@@ -1161,7 +1161,7 @@ async fn balance_inner(
     app: &Arc<App>,
     name: &str,
     path: &str,
-    query: &HashMap<String, String>,
+    query: &str,
     secure: bool,
     grant: &Grant,
     revision: u64,
@@ -1192,7 +1192,7 @@ async fn balance_inner(
             {
                 return None;
             }
-            let snapshot = app.http_snapshot(&p, revision).await?;
+            let snapshot = app.http_snapshot(&p, &name, revision).await?;
             let ready = snapshot.ready.contains(&name);
             Some((snapshot, p, ready))
         }
@@ -1240,14 +1240,14 @@ async fn balance_inner(
             .filter(|(snapshot, p, ready)| {
                 p["hostname"]
                     .as_str()
-                    .and_then(|id| {
-                        NodeLoad::from_telemetry(
-                            id,
-                            &snapshot.value,
+                    .and_then(|_| {
+                        app.http_load(
+                            p,
+                            snapshot,
                             *ready,
-                            p["drain"] == true,
                             elapsed(snapshot),
                             crate::cluster::FALLBACK_MBPS,
+                            revision,
                         )
                     })
                     .is_some_and(|load| load.age_ms <= 10000)
@@ -1273,14 +1273,14 @@ async fn balance_inner(
             {
                 continue;
             }
-            let Some(load) = p["hostname"].as_str().and_then(|name| {
-                NodeLoad::from_telemetry(
-                    name,
-                    &snapshot.value,
+            let Some(load) = p["hostname"].as_str().and_then(|_| {
+                app.http_load(
+                    p,
+                    snapshot,
                     *ready,
-                    p["drain"] == true,
                     elapsed(snapshot),
                     bitrate_mbps,
+                    revision,
                 )
             }) else {
                 continue;
@@ -1291,11 +1291,18 @@ async fn balance_inner(
             break;
         };
         attempted.insert(id.clone());
-        let p = &observations
+        let (selected, p, _) = observations
             .iter()
             .find(|(_, p, _)| p["hostname"] == id)
-            .unwrap()
-            .1;
+            .unwrap();
+        if crate::config::vendor_peers::is_vendor(p) {
+            if let Some(location) = http_balancer::vendor_location(p, name, path, query)
+                && app.hold_vendor_http(p, selected, bitrate_mbps, revision)
+            {
+                return (StatusCode::FOUND, [("location", location)]).into_response();
+            }
+            continue;
+        }
         let api = p["api_url"].as_str().unwrap_or("");
         let key = p["cluster_key"].as_str().unwrap_or(&app.options.peer_key);
         let Ok(client) = app.cluster_client(p) else {
@@ -1325,7 +1332,7 @@ async fn balance_inner(
                     if let (Some(public), Some(ticket)) =
                         (p["public_payload_url"].as_str(), body["ticket"].as_str())
                     {
-                        let mut q = query.clone();
+                        let mut q = parse_query(Some(query));
                         q.insert("flussonix_ticket".into(), ticket.into());
                         let query = url::form_urlencoded::Serializer::new(String::new())
                             .extend_pairs(q.iter())
@@ -1522,7 +1529,16 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         return error(StatusCode::FORBIDDEN, "playback policy changed");
     }
     if app.options.role == "lb" {
-        return balance(&app, name, raw_path, &query, secure, &grant, revision).await;
+        return balance(
+            &app,
+            name,
+            raw_path,
+            &App::http_viewer_query(request.uri().query().unwrap_or("")),
+            secure,
+            &grant,
+            revision,
+        )
+        .await;
     }
     if let Some(ticket) = query.get("flussonix_ticket") {
         let mut reservations = app.reservations.lock().await;
