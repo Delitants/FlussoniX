@@ -441,6 +441,8 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "public_payload_url",
                     "flussonix_rtsp_url",
                     "flussonix_rtsps_url",
+                    "flussonix_srt_url",
+                    "flussonix_srt_encrypted",
                     "flussonix_peer_kind",
                     "flussonix_stream_map",
                     "private_payload_url",
@@ -468,6 +470,8 @@ fn validate_root(root: &Value) -> Result<(), String> {
                 vendor_sources::validate(item, root)?;
                 if item.get("flussonix_peer_kind").is_some()
                     || item.get("flussonix_stream_map").is_some()
+                    || item.get("flussonix_srt_url").is_some()
+                    || item.get("flussonix_srt_encrypted").is_some()
                 {
                     return Err("destination type and mappings are peer-only".into());
                 }

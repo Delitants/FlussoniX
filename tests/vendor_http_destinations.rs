@@ -16,6 +16,8 @@ use std::sync::{
 use tower::ServiceExt;
 #[path = "support/vendor_rtsp_destinations.rs"]
 mod vendor_rtsp_destinations;
+#[path = "support/vendor_srt_lookup.rs"]
+mod vendor_srt_lookup;
 
 type Hold = Arc<
     Mutex<

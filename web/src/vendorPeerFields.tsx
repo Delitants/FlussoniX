@@ -1,7 +1,7 @@
 import React from 'react';
 import {Field,type Item} from './forms';
 export function PeerTypeField({value,onChange}:{value:Item,onChange:(v:Item)=>void}) {
- return <Field label="Peer type" help="Flussonic destinations use HTTP/HTTPS and optional RTSP/RTSPS viewer redirects with their own viewer policy."><select value={value.flussonix_peer_kind||'native'} onChange={e=>{const next:Item={...value,flussonix_peer_kind:e.target.value};for(const key of ['cluster_key','flussonix_stream_map','flussonix_rtsp_url','flussonix_rtsps_url','private_payload_url'])delete next[key];if(e.target.value==='flussonic')next.flussonix_stream_map=[];onChange(next)}}><option value="native">FlussoniX</option><option value="flussonic">Flussonic</option></select></Field>;
+ return <Field label="Peer type" help="Flussonic destinations use HTTP/HTTPS and optional RTSP/RTSPS viewer redirects with their own viewer policy."><select value={value.flussonix_peer_kind||'native'} onChange={e=>{const next:Item={...value,flussonix_peer_kind:e.target.value};for(const key of ['cluster_key','flussonix_stream_map','flussonix_rtsp_url','flussonix_rtsps_url','flussonix_srt_url','flussonix_srt_encrypted','private_payload_url'])delete next[key];if(e.target.value==='flussonic')next.flussonix_stream_map=[];onChange(next)}}><option value="native">FlussoniX</option><option value="flussonic">Flussonic</option></select></Field>;
 }
 export function VendorPeerMappings({value,onChange}:{value:Item,onChange:(v:Item)=>void}) {
  const rows=value.flussonix_stream_map||[];
@@ -11,10 +11,20 @@ export function VendorPeerMappings({value,onChange}:{value:Item,onChange:(v:Item
 const validName=(s:unknown)=>typeof s==='string'&&s.length>0&&new TextEncoder().encode(s).length<=256&&!/[\\?#\x00-\x1f\x7f-\x9f]/.test(s)&&s.split('/').every(p=>p&&p!=='.'&&p!=='..');
 export function vendorPeerError(value:Item):string|undefined {
  if(value.flussonix_peer_kind!==undefined&&!['native','flussonic'].includes(value.flussonix_peer_kind))return 'Choose FlussoniX or Flussonic as the peer type.';
- if(value.flussonix_peer_kind!=='flussonic')return value.flussonix_stream_map!==undefined?'Stream mappings require a Flussonic peer.':undefined;
+ if(value.flussonix_peer_kind!=='flussonic')return [value.flussonix_stream_map,value.flussonix_srt_url,value.flussonix_srt_encrypted].some(v=>v!==undefined)?'Stream mappings require a Flussonic peer.':undefined;
+ if(value.flussonix_srt_url!==undefined||value.flussonix_srt_encrypted!==undefined){
+  try{const raw=value.flussonix_srt_url,u=new URL(raw);if(typeof raw!=='string'||raw.length>2048||/[\\\\\s\x00-\x1f\x7f-\x9f]/.test(raw)||!raw.startsWith('srt://')||raw.split('://')[1].split(/[/?#]/)[0].includes('@')||u.protocol!=='srt:'||!u.hostname||!u.port||u.port==='0'||u.username||u.password||u.search||u.hash||!['','/'].includes(u.pathname))return 'Public SRT URL needs a listener root with an explicit port, without credentials, path or query.';}catch{return 'Public SRT URL needs a listener root with an explicit port.';}
+  if(typeof value.flussonix_srt_encrypted!=='boolean')return 'Choose the CDN SRT encryption setting.';
+  if(value.flussonix_stream_map?.some((r:Item)=>typeof r.remote_name==='string'&&r.remote_name.includes(',')))return 'SRT CDN stream names cannot contain commas.';
+ }
  if(!value.cluster_key)return 'Cluster key is required for a Flussonic peer. It does not authorize viewers.';
  for(const [key,label] of [['api_url','Management'],['public_payload_url','Public delivery']]){try{const u=new URL(value[key]);if(!['http:','https:'].includes(u.protocol)||!u.hostname||u.username||u.password||u.search||u.hash||u.port==='0')return `${label} URL must use HTTP or HTTPS without credentials, query or fragment.`;}catch{return `${label} URL is required.`;}}
  if(!Array.isArray(value.flussonix_stream_map)||!value.flussonix_stream_map.length||value.flussonix_stream_map.length>128)return 'Add 1 to 128 stream mappings.';
  if(value.flussonix_stream_map.some((r:Item)=>!validName(r.name)||!validName(r.remote_name)))return 'Each mapping needs valid LB and CDN stream names.';
  if(new Set(value.flussonix_stream_map.map((r:Item)=>r.name)).size!==value.flussonix_stream_map.length)return 'Each LB stream name may appear only once.';
+}
+
+export function VendorSRTFields({value,onChange}:{value:Item,onChange:(v:Item)=>void}) {
+ const changeURL=(url:string)=>{const next={...value};if(url){next.flussonix_srt_url=url;if(next.flussonix_srt_encrypted===undefined)next.flussonix_srt_encrypted=true;}else{delete next.flussonix_srt_url;delete next.flussonix_srt_encrypted;}onChange(next);};
+ return <fieldset><legend>SRT discovery</legend><p className="muted">Clients first request a destination over HTTPS, then connect directly to the CDN. SRT itself does not redirect. Encryption is your declaration of the CDN configuration; each client must require matching encryption.</p><div className="form-grid"><Field label="Public SRT URL" help="Optional listener root with an explicit port, such as srt://cdn.example:9998."><input value={value.flussonix_srt_url||''} placeholder="srt://cdn.example:9998" onChange={e=>changeURL(e.target.value)}/></Field>{value.flussonix_srt_url&&<Field label="SRT encryption" help="Configure the passphrase on the CDN and client. It is never included in a lookup response."><select value={value.flussonix_srt_encrypted===false?'plain':'required'} onChange={e=>onChange({...value,flussonix_srt_encrypted:e.target.value==='required'})}><option value="required">Required (passphrase)</option><option value="plain">Unencrypted</option></select></Field>}</div></fieldset>;
 }

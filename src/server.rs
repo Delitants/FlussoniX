@@ -571,6 +571,7 @@ pub(crate) fn parse_query(q: Option<&str>) -> HashMap<String, String> {
 pub fn router(app: Arc<App>) -> Router {
     Router::new().route("/health",axum::routing::get(||async{axum::Json(json!({"status":"ok","service":"FlussoniX","version":env!("CARGO_PKG_VERSION")}))}))
  .route("/streamer/api/v3/{*tail}",axum::routing::any(management))
+ .route("/flussonix/api/v1/srt-lookup",axum::routing::any(srt_lookup::lookup))
  .route("/flussonix/api/v1/{*tail}",axum::routing::any(native))
  .nest_service("/admin",tower_http::services::ServeDir::new(&app.options.web_dir).append_index_html_on_directories(true))
  .fallback(media_request).with_state(app).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024))
@@ -1903,6 +1904,7 @@ mod admission;
 mod http_balancer;
 mod http_tickets;
 pub(crate) mod rtsp_balancer;
+mod srt_lookup;
 mod vendor_balancer;
 mod vendor_http_state;
 mod vendor_rtsp_tickets;

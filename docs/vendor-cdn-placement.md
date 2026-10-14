@@ -103,7 +103,7 @@ viewer query bytes are preserved in the RTSP 302 redirect. Viewers must support
 redirects and verify the destination certificate. RTSPS viewers require an
 RTSPS destination; plain RTSP may use RTSPS when no plain endpoint is configured.
 The existing RTSP parser rejects duplicate query keys and incoming LB tickets.
-HTTP and RTSP share identity continuity, fresh load checks and pending egress
+HTTP, RTSP and SRT share identity continuity, fresh load checks and pending egress
 holds for each observed server. No native admission RPC or ticket is sent to a
 Flussonic destination, and the LB starts no media worker.
 
@@ -114,8 +114,56 @@ survive unrelated configuration saves and are shared by destinations reporting
 the same server identity. Identity continuity covers all mappings under a
 management profile; a changed identity excludes that profile. Final placement
 rechecks the latest accepted load observation. Native
-FlussoniX destinations retain CDN-owned atomic admission. Vendor SRT
-destinations, missing dynamic routes, and production throughput qualification
+FlussoniX destinations retain CDN-owned atomic admission. Native SRT
+destination admission, missing dynamic routes, and production throughput qualification
 remain separate work. The HTTP adapter is based on the
 [Flussonic management API](https://flussonic.com/doc/api/reference/) and its
 [HTTP load-balancing model](https://flussonic.com/doc/fms/cluster/loadbalancer/).
+
+### SRT lookup for compatible clients
+
+SRT has no redirect response. A client with lookup support can call
+`GET /flussonix/api/v1/srt-lookup` over **HTTPS on the LB**, with one URL-form-encoded
+`streamid` parameter, then connect directly to the returned CDN. Existing SRT
+URLs need client integration to use this extension.
+
+For each Flussonic peer, enter **Public SRT URL** with an explicit port and choose
+**SRT encryption** to match its configured listener. Configure the passphrase on
+the CDN and client; neither Cluster keys nor passphrases are returned. This
+setting is an operator declaration, not a remote encryption check. The client
+must enforce encrypted SRT and verify the LB's HTTPS certificate.
+
+The default lookup only selects destinations declared encrypted. An explicit
+`encryption=any` also permits declared unencrypted listeners. A successful
+response has `Cache-Control: no-store` and these fields:
+
+```json
+{
+  "address": "srt://cdn.example:9998",
+  "streamid": "#!::r=news,u=viewer-token,m=request",
+  "encryption_required": true,
+  "expires_in": 5
+}
+```
+
+Pass the returned stream ID as a separate SRT client option. Its values are
+opaque: do not decode percent sequences or interpret plus signs again. The LB
+maps only the resource name and supplies `m=request` if missing. IDs must fit
+512 UTF-8 bytes after mapping; mapped names cannot contain commas. Duplicate or
+unknown lookup parameters and stream ID fields are rejected.
+
+The lookup uses SRT viewer policy, with the original stream ID in the callback
+query. Admin, Basic and Cluster credentials do not grant viewer access. Callback
+redirects are rejected. The CDN independently checks the token and encryption.
+HTTP, RTSP and SRT share fresh vendor load observations and five-second per-LB
+advisory holds; no media crosses the LB. Configuration changes and expired
+source authority prevent a pending lookup from returning a destination.
+
+This extension initially targets explicitly mapped Flussonic peers. It does not
+provide a native SRT admission protocol, a single-address SRT relay, coordinated
+capacity across multiple LBs, or production throughput qualification. Owned
+independent SRT tests cover encrypted audio/video decoding, destination token
+denial and mismatched passphrases; they do not establish live Flussonic SRT
+interoperability.
+`expires_in` describes the advisory placement estimate, not a redeemable
+admission ticket. Request a fresh lookup before connecting after that interval.

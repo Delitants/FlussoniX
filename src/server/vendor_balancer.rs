@@ -3,6 +3,31 @@ use super::*;
 use crate::source_directory::modern_coordinator::{AdmittedCandidate, ModernSourceCoordinator};
 
 impl App {
+    pub(crate) async fn balance_vendor_srt(
+        &self,
+        owner: &ModernSourceCoordinator,
+        admitted: &AdmittedCandidate,
+        viewer: &ViewerRequest,
+        streamid: &str,
+        encrypted: bool,
+    ) -> Result<Value, u16> {
+        if self.options.role != "lb" || owner.admitted_current(admitted).is_err() {
+            return Err(503);
+        }
+        let (_, grant, revision) = admitted.control_route();
+        let result = self
+            .srt_place(viewer, streamid, encrypted, grant, revision)
+            .await;
+        owner
+            .with_admitted_current(admitted, || {
+                if result.is_ok() {
+                    grant.playback();
+                }
+                result
+            })
+            .map_err(|_| 503u16)?
+    }
+
     pub(crate) async fn balance_vendor_rtsp(
         &self,
         owner: &ModernSourceCoordinator,
@@ -242,6 +267,52 @@ mod vendor_destination_tests {
                 &url::Url::parse("rtsps://owned-lb.invalid/owned").unwrap(),
                 true,
             )
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(response, Err(503));
+        assert_eq!(app.media.count().await, 0);
+        drop(admitted);
+        assert_eq!(app.playback_auth.active(), 0);
+        cdn.abort();
+        let _ = cdn.await;
+        origin.abort();
+        let _ = origin.await;
+    }
+    #[tokio::test]
+    async fn vendor_source_lease_expiring_during_flussonic_srt_telemetry_prevents_lookup() {
+        use axum::{extract::OriginalUri, routing::get};
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", tcp.local_addr().unwrap());
+        let calls = Arc::new(AtomicU64::new(0));
+        let observed = calls.clone();
+        let service=Router::new().route("/streamer/api/v3/{*rest}",get(move |OriginalUri(uri):OriginalUri,headers:HeaderMap|{let calls=observed.clone();async move {
+   assert!(headers["authorization"].to_str().unwrap().starts_with("Cluster "));assert!(!headers.contains_key("x-flussonix-peer"));calls.fetch_add(1,Ordering::SeqCst);
+   if uri.path().ends_with("/config") {tokio::time::sleep(Duration::from_millis(450)).await;json_response(json!({"stats":{"id":"owned-vendor-cdn","now":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()as u64,"cpu_usage":10,"memory_usage":20,"output_kbit":10000,"total_bandwidth":100000000,"total_clients":0,"streamer_status":"running"}}))}
+   else{tokio::time::sleep(Duration::from_millis(300)).await;json_response(json!({"name":"owned","disabled":false,"named_by":"remote","stats":{"running":true}}))}
+  }}));
+        let cdn = tokio::spawn(async move { axum::serve(tcp, service).await.unwrap() });
+        let peer = json!({"hostname":"edge","api_url":api,"public_payload_url":"https://edge.invalid","flussonix_srt_url":"srt://edge.invalid:9998","flussonix_srt_encrypted":true,"cluster_key":"owned-vendor-cluster-key","flussonix_peer_kind":"flussonic","flussonix_stream_map":[{"name":"owned","remote_name":"owned"}]});
+        let (_dir, app, admitted, origin, _key) =
+            crate::server::test_vendor_admission::admitted_source(
+                Duration::from_secs(2),
+                "lb",
+                Some(peer),
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let owner = app.modern_sources.as_ref().unwrap();
+        let viewer = ViewerRequest {
+            name: "owned".into(),
+            proto: "srt".into(),
+            ip: "127.0.0.1".into(),
+            token: String::new(),
+            qs: String::new(),
+            user_agent: String::new(),
+            referer: String::new(),
+            host: String::new(),
+        };
+        let response = app
+            .balance_vendor_srt(owner, &admitted, &viewer, "#!::r=owned,m=request", true)
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(response, Err(503));
