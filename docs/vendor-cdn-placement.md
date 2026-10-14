@@ -61,7 +61,7 @@ addresses, and callback redirects cannot downgrade them.
 Owned tests exercise discovered and locally configured LB routes, independently
 decoded HLS segments, M4S delivery, source/policy edits, lease expiry, callback and
 group guards, shutdown, concurrent RTSP redemption and verified RTSPS redirects.
-Flussonic CDN destinations, seamless recovery and SRT delivery remain pending. [Equivalent-origin failover](vendor-daemon-failover.md),
+Flussonic CDN destinations, seamless recovery and SRT LB placement remain pending. CDN/standalone SRT playback uses the existing guarded listener. [Equivalent-origin failover](vendor-daemon-failover.md),
 [static activation](vendor-static-activation.md) and CDN/standalone
 [RTSP/RTSPS playback](vendor-daemon-playback.md) are supported separately. Configure equivalent intended viewer
 policies on LB and CDN; this increment does not infer equivalence between them.

@@ -18,7 +18,7 @@ source's prefix reserves that literal namespace, without renaming upstream
 streams. Exclusions return 404. One prefixless vendor source reserves every
 nonlocal name; overlaps outside one explicit equivalent group return 503 before discovery. There
 is no native fallback on vendor absence, denial or error. SRT
-resolution cannot cross a reserved vendor namespace. A native FlussoniX LB can redirect to a vendor-backed FlussoniX CDN using
+uses the same reserved namespace and independent viewer admission. A native FlussoniX LB can redirect to a vendor-backed FlussoniX CDN using
 [HTTP placement tickets](vendor-cdn-placement.md). Configured vendor sources on
 the LB discover and authorize names through the same bounded catalog, without
 local stream rows or any LB media pull. Explicit groups support
@@ -31,12 +31,23 @@ and share the private input, processing template and RTP packager with HTTP.
 Revocation and source/replica changes close the affected connection; reconnect
 to obtain current authority. [RTSP/RTSPS load balancing](vendor-cdn-placement.md)
 uses source-fenced CDN reservations and independent viewer admission. Foreign
-admission tickets fail without media pulls. Vendor SRT delivery remains pending.
+admission tickets fail without media pulls.
 
-Every HTTP request and RTSP DESCRIBE passes current source/local policy and the App's actual native
+The existing opt-in SRT playback listener also serves vendor streams on CDN and
+standalone nodes. Callers select `#!::r=STREAM,m=request,u=VIEWER_TOKEN` and use
+the listener passphrase when encryption is configured. Every caller authorizes
+independently and shares the HTTP/RTSP processing worker and private input.
+Revocation, source edits and replica changes close affected callers; reconnect
+for current authority. LB and draining nodes refuse SRT playback before source
+discovery. SRT has no redirect mechanism, so LB placement remains separate.
+Native UTF-8 subtitles stay in M4S/M4F or convert to HLS WebVTT; they have no
+implemented MPEG-TS mapping and are absent from SRT audio/video output.
+
+Every HTTP request, RTSP DESCRIBE and SRT caller passes current source/local policy and the App's actual native
 viewer authorizer. Shared input, HLS retention and cached files never authorize
 requests. Native peer headers cannot bypass vendor viewer policy. Callback
-redirects are preserved and HTTPS rejects downgrade redirects. Query parameters
+redirects are preserved for HTTP/RTSP and HTTPS rejects downgrade redirects.
+SRT rejects callback redirects without starting private media. Query parameters
 are carried into HLS child URLs. Private Cluster credentials remain bound to
 the independent source clients and never enter FFmpeg inputs or output URLs.
 The admin session reauthorization action supports current active vendor routes
@@ -75,3 +86,8 @@ precedence, namespace isolation, held discovery/callback cancellation and cleanu
 Owned RTSP tests cover M4S/M4F inputs, independently decoded HEVC/MP3/MP2, CPU AAC,
 TCP, UDP, verified TLS, shared HTTP media, per-viewer revocation, static ownership,
 source edits during startup and automatic replica recovery.
+
+Owned SRT tests cover clear/encrypted listeners, independently decoded
+AVC/HEVC/MP3/MP2 from M4F, CPU AAC, wrong transport keys, denied viewers,
+independent revocation, static/HTTP sharing, held callback/metadata edits,
+namespace precedence, replica recovery, pending writes and accepted-byte accounting.

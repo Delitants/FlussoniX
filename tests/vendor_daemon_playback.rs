@@ -1653,3 +1653,6 @@ async fn m4f_vendor_rtsp_decodes_hevc_mp3_and_mp2_with_independent_ffmpeg() {
     assert!(pid > 0);
     assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
 }
+
+#[path = "vendor_daemon_playback/srt.rs"]
+mod srt;
