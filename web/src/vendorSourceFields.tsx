@@ -3,7 +3,7 @@ import {Field,SettingsSummary,sourceEndpoint,type Item} from './forms';
 import {GPUReadiness} from './gpuReadiness';
 
 const policyFields=['on_play','flussonix_token_sha256','group_config'];
-const supported=new Set(['url','api_url','private_payload_url','cluster_key','prefix','only','except','flussonix_tls_ca','flussonix_media_tls_ca','flussonix_source_kind','flussonix_transport','flussonix_output_template',...policyFields]);
+const supported=new Set(['url','api_url','private_payload_url','cluster_key','prefix','only','except','flussonix_tls_ca','flussonix_media_tls_ca','flussonix_source_kind','flussonix_transport','flussonix_output_template','flussonix_source_group','flussonix_content_id',...policyFields]);
 const owns=(v:Item,k:string)=>Object.hasOwn(v,k);
 const validName=(name:string)=>!!name&&new TextEncoder().encode(name).length<=256&&!name.split('/').some(p=>!p||p==='.'||p==='..')&&!/[\\?#\x00-\x1f\x7f-\x9f]/.test(name);
 const httpURL=(raw:string)=>{try{const u=new URL(raw);return ['http:','https:'].includes(u.protocol)&&!!u.hostname;}catch{return false}};
@@ -13,10 +13,12 @@ export function unsupportedVendorFields(value:Item):string[]{
 }
 export function vendorSourceError(value:Item):string|undefined {
  if(value.flussonix_source_kind!==undefined&&!['native','flussonic'].includes(value.flussonix_source_kind))return 'Choose Native FlussoniX or Flussonic as the source type.';
- if(value.flussonix_source_kind!=='flussonic')return policyFields.some(k=>owns(value,k))?'Clear vendor viewer policies before switching to a native source.':owns(value,'flussonix_output_template')?'Clear vendor processing template before switching to a native source.':undefined;
+ if(value.flussonix_source_kind!=='flussonic')return policyFields.some(k=>owns(value,k))?'Clear vendor viewer policies before switching to a native source.':owns(value,'flussonix_output_template')?'Clear vendor processing template before switching to a native source.':owns(value,'flussonix_content_id')?'Clear vendor content identity before switching to a native source.':undefined;
  if(owns(value,'flussonix_output_template')&&(typeof value.flussonix_output_template!=='string'||!validName(value.flussonix_output_template)))return 'Choose a valid processing template.';
  if(!owns(value,'url')||!sourceEndpoint(value.url))return 'Flussonic sources require an M4F or M4S source address.';
  if(unsupportedVendorFields(value).length)return 'Remove unsupported native settings before saving a Flussonic source.';
+ if(owns(value,'flussonix_source_group')!==owns(value,'flussonix_content_id'))return 'Vendor failover requires both a group and content identity.';
+ for(const field of ['flussonix_source_group','flussonix_content_id'])if(owns(value,field)&&!(/^[A-Za-z0-9._-]{1,128}$/).test(value[field]))return 'Replica identifiers require 1 to 128 letters, digits, dots, underscores or hyphens.';
  if(typeof value.cluster_key!=='string'||!value.cluster_key)return 'Cluster key is required for a Flussonic source. It does not authorize viewers.';
  const policyError=(policy:Item,label:string):string|undefined=>{
   if(owns(policy,'flussonix_token_sha256')&&!/^[a-f\d]{64}$/i.test(policy.flussonix_token_sha256))return `${label} token SHA256 must contain exactly 64 hexadecimal characters.`;
@@ -47,6 +49,7 @@ export function SourceTypeField({value,onChange,locked}:{value:Item,onChange:(v:
 export function VendorPolicyReset({value,onChange}:{value:Item,onChange:(v:Item)=>void}) {
  if(value.flussonix_source_kind==='flussonic')return null;
  return <>{policyFields.some(k=>owns(value,k))&&<section className="panel padded"><p>Vendor viewer policies are still present. Clear them explicitly to finish switching this source to native discovery.</p><button type="button" onClick={()=>{const next={...value};for(const k of policyFields)delete next[k];onChange(next)}}>Clear vendor viewer policies</button></section>}
+ {owns(value,'flussonix_content_id')&&<section className="panel padded"><p>A vendor content identity is still present. Clear it explicitly before using native discovery. The failover group remains editable below.</p><button type="button" onClick={()=>{const next={...value};delete next.flussonix_content_id;onChange(next)}}>Clear vendor content identity</button></section>}
  {owns(value,'flussonix_output_template')&&<section className="panel padded"><p>A vendor processing template is still selected. Clear it explicitly before using native discovery.</p><button type="button" onClick={()=>{const next={...value};delete next.flussonix_output_template;onChange(next)}}>Clear vendor processing template</button></section>}</>;
 }
 function PolicyFields({value,onChange,backends,label,group=false}:{value:Item,onChange:(v:Item)=>void,backends:Item[],label:string,group?:boolean}) {
@@ -70,14 +73,14 @@ export function VendorSourcePolicies({value,onChange,backends,templates,capabili
  const selected=templates.find(t=>t.name===value.flussonix_output_template);
  const processing=Object.fromEntries(['transcoder','flussonix_input_timeout','flussonix_subtitle_tracks','flussonix_hls_subtitles','flussonix_hls_captions'].filter(k=>selected&&owns(selected,k)).map(k=>[k,selected![k]]));
  return <>
-  <p className="muted">HTTP/HTTPS delivery: HLS, MPEG-TS, M4S and M4F. FlussoniX load balancers can discover these sources and route viewers to FlussoniX CDNs. Automatic source failover, always-on activation and RTSP/SRT delivery are not available yet.</p>
+  <p className="muted">HTTP/HTTPS delivery: HLS, MPEG-TS, M4S and M4F. FlussoniX load balancers can discover these sources and route viewers to FlussoniX CDNs. Equivalent source groups recover automatically while recent authorized viewer demand remains. Always-on activation and RTSP/SRT delivery are not available yet.</p>
   <section role="region" aria-label="Vendor output processing"><fieldset><legend>Output processing</legend><Field label="Processing template" help="Configure CPU/GPU encoding and HLS passthrough, conversion or filtering in Media → Templates. Only processing settings are selected; source credentials and viewer authorization stay separate."><select value={value.flussonix_output_template||''} onChange={e=>{const next={...value};if(e.target.value)next.flussonix_output_template=e.target.value;else delete next.flussonix_output_template;onChange(next)}}><option value="">Copy / default subtitles</option>{templates.map(t=><option key={t.name} value={t.name}>{t.name}</option>)}{value.flussonix_output_template&&!selected&&<option value={value.flussonix_output_template}>{value.flussonix_output_template} (unavailable)</option>}</select></Field>
   {selected?<SettingsSummary value={processing} empty="Copy output and default subtitle filtering apply."/>:<p className="muted">{value.flussonix_output_template?'The selected template is unavailable. Select an existing template before saving.':'Copy output and default subtitle filtering apply.'}</p>}
   {selected&&/_(nvenc|vaapi)$/.test(selected.transcoder?.encoder||'')&&<GPUReadiness transcoding={capabilities.transcoding} error={capabilities.error} encoder={selected.transcoder.encoder}/>}
   <p className="muted">USA captions, European DVB/teletext and native text selectors use the existing template controls. Preserving native text with transcoding is unsupported; choose filtering or HLS conversion. GPU caption conversion is not qualified.</p>
   </fieldset></section>
   {owns(value,'only')&&<p className="muted">Saved activation selections are retained, but vendor streams currently start only on viewer demand.</p>}
-  {!!unsupported.length&&<section className="panel padded"><p>Unsupported native settings: {unsupported.map(k=>({public_payload_url:'Public delivery URL',flussonix_source_group:'Failover group',flussonix_transport:'Mismatched source transport'} as Item)[k]||k.replaceAll('_',' ')).join(', ')}.</p><button type="button" onClick={()=>{const next={...value};for(const k of unsupported)delete next[k];onChange(next)}}>Remove unsupported native settings</button></section>}
+  {!!unsupported.length&&<section className="panel padded"><p>Unsupported native settings: {unsupported.map(k=>({public_payload_url:'Public delivery URL',flussonix_transport:'Mismatched source transport'} as Item)[k]||k.replaceAll('_',' ')).join(', ')}.</p><button type="button" onClick={()=>{const next={...value};for(const k of unsupported)delete next[k];onChange(next)}}>Remove unsupported native settings</button></section>}
   <fieldset><legend>Viewer authorization</legend><PolicyFields value={value} onChange={onChange} backends={backends} label="Viewer"/></fieldset>
   <fieldset className="vendor-policies"><legend>Group policy overrides</legend><p className="muted">Match upstream group names without renaming streams. Unset fields inherit source policy; conflicting policies from matching groups deny playback.</p>
    {Object.entries(groups).map(([group,policy])=><fieldset key={group}><legend>Group {group}</legend><PolicyFields value={policy} onChange={next=>setGroups({...groups,[group]:next})} backends={backends} label={`Group ${group}`} group/><button type="button" aria-label={`Remove group ${group}`} onClick={()=>{const next={...groups};delete next[group];setGroups(next)}}>Remove group</button></fieldset>)}

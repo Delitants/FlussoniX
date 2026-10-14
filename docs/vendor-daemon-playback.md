@@ -16,15 +16,14 @@ permanently cancels its source requests, HLS retention and shared generations.
 Local configured streams, including disabled streams, take precedence. A vendor
 source's prefix reserves that literal namespace, without renaming upstream
 streams. Exclusions return 404. One prefixless vendor source reserves every
-nonlocal name; overlapping vendor namespaces return 503 before discovery. There
+nonlocal name; overlaps outside one explicit equivalent group return 503 before discovery. There
 is no native fallback on vendor absence, denial or error. Native RTSP/SRT
 resolution also cannot cross a reserved vendor namespace. A native FlussoniX LB can redirect to a vendor-backed FlussoniX CDN using
 [HTTP placement tickets](vendor-cdn-placement.md). Configured vendor sources on
 the LB discover and authorize names through the same bounded catalog, without
-local stream rows or any LB media pull. Vendor failover, static demand and
-RTSP/SRT delivery need further work.
-The [replica selection library](vendor-replica-selection.md) supplies the guarded
-selection foundation; it does not yet enable automatic failover in the daemon.
+local stream rows or any LB media pull. Explicit groups support
+[automatic vendor failover](vendor-daemon-failover.md). Static demand and
+RTSP/SRT delivery remain separate work.
 
 Every HTTP request passes current source/local policy and the App's actual native
 viewer authorizer. Shared input, HLS retention and cached files never authorize

@@ -7,6 +7,7 @@ pub use replicas::{
     ReplicaAdmission, ReplicaAdmissionOutcome, ReplicaChoice, ReplicaFailure, ReplicaLookup,
     ReplicaMember, ReplicaPullFailure, ReplicaSelector, ReplicaStatus,
 };
+pub(crate) use replicas::{ReplicaInputFailure, ReplicaRoute};
 mod relay;
 use super::{
     flussonic::modern::ObservedServerId,
@@ -260,6 +261,9 @@ impl ModernSourceCoordinator {
             })
             .ok_or(CoordinationFailure::Stale)?
     }
+    pub(crate) fn handle_current(&self, handle: &SourceHandle) -> bool {
+        self.at_handle(handle, || Ok(())).is_ok()
+    }
     fn at_handle<T>(
         &self,
         handle: &SourceHandle,
@@ -310,7 +314,7 @@ impl ModernSourceCoordinator {
     }
     /// Inventory facts, including absence and disabled metadata, must remain
     /// current through any synchronous selection mutation. Never reenter owners.
-    fn at_inventory_current<T>(
+    pub(crate) fn at_inventory_current<T>(
         &self,
         inventory: &CoordinatedInventory,
         commit: impl FnOnce() -> T,

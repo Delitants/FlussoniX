@@ -69,4 +69,4 @@ or live vendor qualification is claimed.
 An explicit [shared-input renewal API](vendor-shared-renewal.md) can preserve
 equivalent workers beyond a discovery deadline. The opt-in
 [session owner](vendor-hls-sessions.md) supplies HLS retention and scheduled
-renewal. Automatic route activation and source failover remain integration steps. Without successful explicit renewal, workers stop at the lease deadline.
+renewal. The daemon integrates [explicit source-group recovery](vendor-daemon-failover.md). Without successful renewal, workers stop at the lease deadline.

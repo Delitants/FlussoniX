@@ -44,8 +44,10 @@ Groups are policy-only objects: `on_play`, `flussonix_token_sha256` and an optio
 matching fields fail. Unmatched groups retain the explicit source policy. Missing
 applicable policy stays unresolved. Remote discovery does not supply viewer policy.
 Templates in group objects and native-only settings are rejected, including
-`drain`, `public_payload_url` and `flussonix_source_group`. They are not silently
-discarded or interpreted as vendor failover/placement controls.
+`drain` and `public_payload_url`. They are not silently discarded.
+Source-level `flussonix_source_group` with `flussonix_content_id` separately
+configures [equivalent vendor failover](vendor-daemon-failover.md); these fields
+are not group viewer-policy options.
 
 The strict profile accepts M4F/M4FS/M4S/M4SS URL identities, optional separate
 management/private HTTP(S) roots and independent TLS CA files. The derived

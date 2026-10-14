@@ -1,8 +1,9 @@
 # Equivalent vendor-origin selection
 
 The Rust library now provides an opt-in selection engine for equivalent vendor
-origins. Daemon recovery and saved replica controls still need integration;
-the existing Source servers UI and direct playback behavior are unchanged.
+origins. The daemon now uses it for explicitly configured groups; see
+[vendor source failover](vendor-daemon-failover.md) for setup and behavior.
+Ungrouped direct playback retains its existing behavior.
 
 An embedding owner registers `ReplicaSelector` with two to eight distinct
 configured Flussonic sources. Each member must have the same explicit local
@@ -41,7 +42,8 @@ equivalent guards; selection status is diagnostic data, not authorization.
 The selector retains at most 20,000 stream entries. New names fail closed at
 capacity; authoritative blocks are not evicted to make room. It owns no retry
 tasks, media workers, background I/O or lease renewal. Shutdown is permanent.
-Private-input failure classification, shared-worker recovery, automatic daemon
-activation and HLS replacement/discontinuity behavior remain subsequent work.
+The daemon supplies typed private-input failure classification and shared-worker
+recovery through guarded managed routes. Always-on activation remains separate
+work. The standalone selector API itself still owns no daemon maintenance.
 The owned fixtures and independent audio decode do not establish production
 vendor interoperability or throughput.

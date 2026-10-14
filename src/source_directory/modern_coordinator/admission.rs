@@ -35,9 +35,40 @@ pub struct AdmittedCandidate {
     candidate: CoordinatedCandidate,
     name: String,
     proto: String,
-    grant: Grant,
+    grant: std::sync::Arc<Grant>,
+    policy: crate::playback_auth::Policy,
+    pub(super) selection: Option<super::ReplicaRoute>,
+    background: bool,
 }
 impl AdmittedCandidate {
+    fn at_scope<T>(&self, commit: impl FnOnce() -> T) -> Result<T, AdmissionFailure> {
+        match &self.selection {
+            Some(scope) => scope
+                .at_current(commit)
+                .map_err(|_| AdmissionFailure::Revoked),
+            None => Ok(commit()),
+        }
+    }
+    pub(crate) fn recovery_activity(&self) -> Option<std::time::Instant> {
+        self.grant.recovery_activity()
+    }
+    pub(crate) fn anchor_copy(&self) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            candidate: super::CoordinatedCandidate {
+                handle: self.candidate.handle.clone(),
+                candidate: self.candidate.candidate.copy_for_worker(),
+            },
+            name: self.name.clone(),
+            proto: self.proto.clone(),
+            grant: self.grant.clone(),
+            policy: self.policy.clone(),
+            selection: self.selection.clone(),
+            background: self.background,
+        })
+    }
+    pub(crate) fn session_identity(&self) -> Option<&str> {
+        self.grant.session_identity()
+    }
     /// Native placement borrows authority; no input ownership is transferred.
     pub(crate) fn control_route(&self) -> (&str, &Grant, u64) {
         (&self.name, &self.grant, self.candidate.config_revision())
@@ -45,9 +76,14 @@ impl AdmittedCandidate {
     /// Grant revocation only; use admitted_current for source/config/lease checks.
     pub fn is_cancelled(&self) -> bool {
         self.grant.is_cancelled()
+            || self.selection.as_ref().is_some_and(|s| s.is_cancelled())
+            || (self.background && self.grant.recovery_activity().is_none())
     }
     pub async fn cancelled(&self) {
-        self.grant.cancelled().await
+        match &self.selection {
+            Some(scope) => tokio::select! {_=self.grant.cancelled()=>{},_=scope.cancelled()=>{}},
+            None => self.grant.cancelled().await,
+        }
     }
 }
 impl ModernSourceCoordinator {
@@ -92,8 +128,9 @@ impl ModernSourceCoordinator {
     ) -> Result<AdmissionOutcome, AdmissionFailure> {
         let name = request.name.clone();
         let proto = request.proto.clone();
-        let snapshot = self.at_admission_candidate(&candidate, &name, |view, _| {
+        let (snapshot, policy) = self.at_admission_candidate(&candidate, &name, |view, _| {
             auth.publish(view.name, Some(view.policy.clone()))
+                .map(|snapshot| (snapshot, view.policy.clone()))
                 .ok_or(AdmissionFailure::Unavailable)
         })?;
         // Control admission holds native capacity without marking playback demand
@@ -110,13 +147,44 @@ impl ModernSourceCoordinator {
                 candidate,
                 name,
                 proto,
-                grant,
+                grant: std::sync::Arc::new(grant),
+                policy,
+                selection: None,
+                background: false,
             })),
             AuthOutcome::Denied => AdmissionOutcome::Denied,
             AuthOutcome::Redirect(target) => AdmissionOutcome::Redirect(target),
         })
     }
 
+    /// Rebind the original native permission to an equal-policy recovered route.
+    /// This does not publish new policy, manufacture a grant or mark activity.
+    pub(crate) fn recover_replica(
+        &self,
+        choice: super::ReplicaChoice,
+        anchor: &AdmittedCandidate,
+    ) -> Result<Box<AdmittedCandidate>, AdmissionFailure> {
+        let (candidate, selection) = choice.into_managed();
+        self.at_admission_candidate(&candidate, &anchor.name, |view, _| {
+            selection
+                .at_current(|| {
+                    if view.policy != &anchor.policy || anchor.grant.recovery_activity().is_none() {
+                        return Err(AdmissionFailure::Revoked);
+                    }
+                    Ok(())
+                })
+                .map_err(|_| AdmissionFailure::Revoked)?
+        })?;
+        Ok(Box::new(AdmittedCandidate {
+            candidate,
+            name: anchor.name.clone(),
+            proto: anchor.proto.clone(),
+            grant: anchor.grant.clone(),
+            policy: anchor.policy.clone(),
+            selection: Some(selection),
+            background: true,
+        }))
+    }
     /// Recheck the exact owner/config/source/refresh/lease and native revocation.
     /// This is an instant check, not a background revocation or lease renewal.
     pub fn admitted_current(&self, admitted: &AdmittedCandidate) -> Result<(), AdmissionFailure> {
@@ -135,10 +203,10 @@ impl ModernSourceCoordinator {
         // Frequent frame/write checks need no media client/key allocation or
         // stream-list scan; retain every owner/profile/refresh/expiry fence.
         self.at_current_candidate(&admitted.candidate, || {
-            if admitted.grant.is_cancelled() {
+            if admitted.is_cancelled() {
                 Err(AdmissionFailure::Revoked)
             } else {
-                Ok(commit())
+                admitted.at_scope(commit)
             }
         })
     }
@@ -183,10 +251,10 @@ impl ModernSourceCoordinator {
         commit: impl FnOnce(CandidateView<'_>, MediaInput, &Grant) -> Result<T, AdmissionFailure>,
     ) -> Result<T, AdmissionFailure> {
         self.at_admission_candidate(&admitted.candidate, &admitted.name, |view, input| {
-            if admitted.grant.is_cancelled() {
+            if admitted.is_cancelled() {
                 return Err(AdmissionFailure::Revoked);
             }
-            commit(view, input, &admitted.grant)
+            admitted.at_scope(|| commit(view, input, &admitted.grant))?
         })
     }
 }

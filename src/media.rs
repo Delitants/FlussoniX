@@ -934,7 +934,7 @@ impl Engine {
                                     }
                                     result
                                 } else {
-                                    crate::m4_ingest::pull_ready_with_options(&url,key.as_deref(),&mut writer,if original_wire {Some(&input_worker.wire)}else{None},metadata_tx,crate::m4_ingest::PullOptions { ca: native_ca.as_deref(), preserve: subtitle_tracks == "preserve", detected: Some(&input_worker.native_text_tracks), conversion: if native_captions {input_worker.captions.as_deref()} else {None} }).await
+                                    crate::m4_ingest::pull_ready_with_options(&url,key.as_deref(),&mut writer,if original_wire {Some(&input_worker.wire)}else{None},metadata_tx,crate::m4_ingest::PullOptions { ca: native_ca.as_deref(), preserve: subtitle_tracks == "preserve", detected: Some(&input_worker.native_text_tracks), conversion: if native_captions {input_worker.captions.as_deref()} else {None}, ..Default::default() }).await
                                 }
                             }=>result,
                         };

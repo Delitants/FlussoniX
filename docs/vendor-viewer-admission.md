@@ -66,7 +66,7 @@ one private pull per generation with independent viewer attachments. The
 [FFmpeg/HLS adapter](vendor-shared-packaging.md) packages those generations.
 Standalone admissions retain their original tickets. Explicit
 [managed shared-input renewal](vendor-shared-renewal.md) can preserve equivalent
-workers; automatic daemon routing, scheduled renewal and failover remain pending.
+workers. The daemon supplies [configured routing and failover](vendor-daemon-failover.md) with scheduled shared-input renewal.
 
 ## Validation
 

@@ -137,6 +137,9 @@ impl App {
             stats["source_switches"] = json!(m.switches);
             stats["source_available"] = json!(m.available);
         }
+        if let Some(runtime) = &self.vendor_playback {
+            runtime.annotate_stats(self, name, &mut stats);
+        }
         stats
     }
     pub(super) async fn refresh_sources(&self) {

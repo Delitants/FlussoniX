@@ -519,3 +519,175 @@ async fn choices_cannot_cross_equal_selectors_or_different_content_assertions() 
             .all(|o| o.private_calls.load(Ordering::SeqCst) == 0)
     );
 }
+
+#[tokio::test]
+async fn shared_replica_route_survives_lease_renewal_and_closes_on_selection_switch() {
+    use flussonix::source_directory::modern_coordinator::{SharedInputOptions, SharedInputs};
+    let f = Fixture::new().await;
+    let s = f.selector();
+    let a = f.handle(0);
+    let b = f.handle(1);
+    let auth = PlaybackAuth::new(16);
+    let mut lookup = s.begin(NAME).unwrap();
+    let choice = lookup
+        .observe(&a, f.owner.inventory(&a, Duration::from_secs(30)).await)
+        .unwrap()
+        .unwrap();
+    let ReplicaAdmissionOutcome::Allowed(admission) = s
+        .admit(
+            choice,
+            &auth,
+            ViewerRequest {
+                name: NAME.into(),
+                proto: "hls".into(),
+                ip: "127.0.0.1".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("owned viewer denied")
+    };
+    let inputs = SharedInputs::new(f.owner.clone());
+    let attachment = inputs
+        .attach_replica(*admission, SharedInputOptions::default())
+        .unwrap();
+    attachment.viewer.current().unwrap();
+    assert_eq!(
+        inputs
+            .renew(&a, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .renewed,
+        1
+    );
+    attachment.viewer.current().unwrap();
+    let mut replacement = s.begin(NAME).unwrap();
+    assert!(
+        replacement
+            .observe(
+                &a,
+                Err(CoordinationFailure::Lease(LeaseFailure::Binding(
+                    BindingFailure::Inventory(
+                        flussonix::source_directory::LookupFailure::Unavailable
+                    )
+                )))
+            )
+            .unwrap()
+            .is_none()
+    );
+    let next = replacement
+        .observe(&b, f.owner.inventory(&b, Duration::from_secs(30)).await)
+        .unwrap()
+        .unwrap();
+    s.current(&next).unwrap();
+    assert!(attachment.viewer.current().is_err());
+    drop(attachment);
+    assert!(
+        f.origins
+            .iter()
+            .all(|o| o.private_calls.load(Ordering::SeqCst) == 0)
+    );
+}
+
+#[tokio::test]
+async fn stale_replica_admission_cannot_attach_or_promote_native_playback() {
+    use flussonix::source_directory::modern_coordinator::{SharedInputOptions, SharedInputs};
+    let f = Fixture::new().await;
+    let s = f.selector();
+    let a = f.handle(0);
+    let auth = PlaybackAuth::new(16);
+    let mut lookup = s.begin(NAME).unwrap();
+    let choice = lookup
+        .observe(&a, f.owner.inventory(&a, Duration::from_secs(30)).await)
+        .unwrap()
+        .unwrap();
+    let ReplicaAdmissionOutcome::Allowed(admission) = s
+        .admit(
+            choice,
+            &auth,
+            ViewerRequest {
+                name: NAME.into(),
+                proto: "hls".into(),
+                ip: "127.0.0.1".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("owned viewer denied")
+    };
+    s.shutdown();
+    let inputs = SharedInputs::new(f.owner.clone());
+    assert!(
+        inputs
+            .attach_replica(*admission, SharedInputOptions::default())
+            .is_err()
+    );
+    assert_eq!(auth.live_grants(), 0);
+    assert!(auth.snapshots().is_empty());
+    assert!(
+        f.origins
+            .iter()
+            .all(|o| o.private_calls.load(Ordering::SeqCst) == 0)
+    );
+}
+
+#[tokio::test]
+async fn managed_renewal_latches_selected_authoritative_rejection_before_later_outage() {
+    use flussonix::source_directory::modern_coordinator::{SharedInputOptions, SharedInputs};
+    for status in [StatusCode::OK, StatusCode::FORBIDDEN] {
+        let f = Fixture::new().await;
+        let s = f.selector();
+        let a = f.handle(0);
+        let auth = PlaybackAuth::new(16);
+        let mut lookup = s.begin(NAME).unwrap();
+        let choice = lookup
+            .observe(&a, f.owner.inventory(&a, Duration::from_secs(30)).await)
+            .unwrap()
+            .unwrap();
+        let ReplicaAdmissionOutcome::Allowed(admission) = s
+            .admit(
+                choice,
+                &auth,
+                ViewerRequest {
+                    name: NAME.into(),
+                    proto: "hls".into(),
+                    ip: "127.0.0.1".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("owned viewer denied")
+        };
+        let inputs = SharedInputs::new(f.owner.clone());
+        let attachment = inputs
+            .attach_replica(*admission, SharedInputOptions::default())
+            .unwrap();
+        *f.origins[0].rows.lock().unwrap() = json!([]);
+        *f.origins[0].status.lock().unwrap() = status;
+        let _ = inputs.renew(&a, Duration::from_secs(30)).await;
+        assert!(
+            attachment.viewer.current().is_err(),
+            "authoritative maintenance must retire group media immediately"
+        );
+        let mut later = s.begin(NAME).unwrap();
+        assert!(matches!(
+            later.observe(
+                &a,
+                Err(CoordinationFailure::Lease(LeaseFailure::Binding(
+                    BindingFailure::Inventory(
+                        flussonix::source_directory::LookupFailure::Unavailable
+                    )
+                )))
+            ),
+            Err(flussonix::source_directory::modern_coordinator::ReplicaFailure::Blocked)
+        ));
+        assert_eq!(later.next_source().unwrap(), None);
+        drop(attachment);
+    }
+}

@@ -1,4 +1,6 @@
 //! App-owned direct vendor playback. No implicit native/vendor failover.
+mod recovery;
+mod replicas;
 mod response;
 use crate::{
     media::{SharedHlsOptions, SharedHlsSessions},
@@ -86,7 +88,7 @@ enum Failure {
 #[derive(Default)]
 struct Cache {
     handle: Option<SourceHandle>,
-    inventory: Option<CoordinatedInventory>,
+    inventory: Option<Arc<CoordinatedInventory>>,
     next_probe: Option<Instant>,
 }
 #[derive(Default)]
@@ -100,6 +102,8 @@ pub(crate) struct Runtime {
     sessions: Arc<SharedHlsSessions>,
     caches: Mutex<Caches>,
     outputs: std::sync::Mutex<(u64, HashMap<String, Value>)>,
+    groups: std::sync::Mutex<replicas::Groups>,
+    recovery: std::sync::Mutex<recovery::State>,
     queries: Semaphore,
     closed: CancellationToken,
     claimed: AtomicBool,
@@ -109,6 +113,10 @@ impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         self.0.closed.cancel();
         self.0.sessions.shutdown();
+        for group in self.0.groups.lock().unwrap().groups.values() {
+            group.selector.shutdown();
+        }
+        self.0.recovery.lock().unwrap().entries.clear();
         self.0.inputs.shutdown();
     }
 }
@@ -124,21 +132,26 @@ impl Runtime {
             inputs,
             caches: Mutex::new(Caches::default()),
             outputs: std::sync::Mutex::new((0, HashMap::new())),
+            groups: std::sync::Mutex::new(replicas::Groups::default()),
+            recovery: std::sync::Mutex::new(recovery::State::default()),
             queries: Semaphore::new(4),
             closed: CancellationToken::new(),
             claimed: AtomicBool::new(false),
         }
     }
-    pub(crate) async fn run(&self, cancel: CancellationToken) -> Result<(), String> {
+    pub(crate) async fn run(&self, app: &App, cancel: CancellationToken) -> Result<(), String> {
         if self.claimed.swap(true, Ordering::AcqRel) {
             return Err("vendor playback owner already started".into());
         }
         let _guard = RunGuard(self);
-        self.sessions
-            .clone()
-            .run(cancel)
-            .await
-            .map_err(|_| "vendor playback owner unavailable".into())
+        let cancel = cancel.child_token();
+        let sessions = self.sessions.clone().run(cancel.clone());
+        let recovery = self.maintain_replicas(app, cancel.clone());
+        tokio::pin!(sessions, recovery);
+        tokio::select! {
+            result=&mut sessions=>{cancel.cancel();recovery.await;result.map_err(|_|"vendor playback owner unavailable".into())},
+            _=&mut recovery=>{cancel.cancel();sessions.await.map_err(|_|"vendor playback owner unavailable".into())},
+        }
     }
     fn running(&self) -> bool {
         !self.closed.is_cancelled() && self.sessions.running()
@@ -183,6 +196,16 @@ impl Runtime {
         else {
             return false;
         };
+        let group = self.cached_group(app, &key, revision);
+        let actual_key = match &group {
+            Some(group) => match group.selector.status(name) {
+                Ok(status) if group.keys.contains(&status.selected_source) => {
+                    status.selected_source
+                }
+                _ => return false,
+            },
+            None => key.clone(),
+        };
         let candidate = if app.options.role == "lb" {
             if !app
                 .playback_auth
@@ -192,15 +215,21 @@ impl Runtime {
             {
                 return false;
             }
-            self.catalog_candidate(&key, revision, name)
+            self.catalog_candidate(&actual_key, revision, name)
         } else {
             self.inputs.current_candidate(name).ok()
         };
         let Some(candidate) = candidate else {
             return false;
         };
-        if candidate.source_key() != key || candidate.config_revision() != revision {
+        if candidate.source_key() != actual_key || candidate.config_revision() != revision {
             return false;
+        }
+        if let Some(group) = group {
+            return group
+                .selector
+                .choice_for(candidate, name)
+                .is_ok_and(|choice| choice.publish_policy(&app.playback_auth));
         }
         self.owner
             .publish(&candidate, |view, _| {
@@ -228,7 +257,7 @@ impl Runtime {
         let cache = slot.try_lock().ok()?;
         cache.inventory.as_ref()?.candidate(name).ok()
     }
-    async fn candidate(
+    async fn direct_candidate(
         &self,
         app: &App,
         key: &str,
@@ -325,7 +354,7 @@ impl Runtime {
                     Failure::Absent
                 }
             });
-            cache.inventory = Some(rows);
+            cache.inventory = Some(Arc::new(rows));
             candidate
         };
         tokio::select! {biased;_=self.closed.cancelled()=>Err(Failure::Closed),result=tokio::time::timeout(Duration::from_secs(4),work)=>result.unwrap_or(Err(Failure::Unavailable))}

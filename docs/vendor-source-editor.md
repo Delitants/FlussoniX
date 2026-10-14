@@ -32,5 +32,7 @@ Media template transcoding/subtitle settings. Template inputs and viewer policie
 are not inherited. Clear this selection explicitly before switching source kind.
 
 Vendor profiles currently serve on-demand HTTP/HTTPS HLS, MPEG-TS, M4S and M4F.
-Static activation, failover, load balancing and RTSP/SRT delivery remain pending.
+The labeled Failover group and Content identity fields configure
+[equivalent source recovery](vendor-daemon-failover.md). FlussoniX LB placement
+is also supported. Static activation and RTSP/SRT delivery remain pending.
 The native source editor retains its existing controls.

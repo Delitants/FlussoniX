@@ -52,6 +52,7 @@ pub enum SharedFailure {
 pub struct SharedInputs {
     owner: Arc<ModernSourceCoordinator>,
     id: Arc<()>,
+    failures: Arc<Mutex<HashMap<String, FailureObservation>>>,
     workers: Mutex<Registry>,
 }
 struct Registry {
@@ -64,6 +65,8 @@ struct Worker {
     owner: Arc<ModernSourceCoordinator>,
     handle: super::super::SourceHandle,
     route: Mutex<super::super::CoordinatedCandidate>,
+    scope: Option<super::super::ReplicaRoute>,
+    failures: Arc<Mutex<HashMap<String, FailureObservation>>>,
     name: String,
     policy: Policy,
     options: SharedInputOptions,
@@ -115,7 +118,7 @@ impl Worker {
         let mut retired = Vec::new();
         let mut active = None;
         for viewer in members.values().filter_map(Weak::upgrade) {
-            if !viewer.admission.grant.is_cancelled() {
+            if !viewer.admission.is_cancelled() {
                 active = Some(viewer);
                 break;
             }
@@ -163,6 +166,17 @@ impl Worker {
         &self,
         check: impl FnOnce(&super::super::CoordinatedCandidate) -> Result<T, AdmissionFailure>,
     ) -> Result<T, SharedFailure> {
+        self.at_source_route(|route| match &self.scope {
+            Some(scope) => scope
+                .at_current(|| check(route))
+                .unwrap_or(Err(AdmissionFailure::Revoked)),
+            None => check(route),
+        })
+    }
+    fn at_source_route<T>(
+        &self,
+        check: impl FnOnce(&super::super::CoordinatedCandidate) -> Result<T, AdmissionFailure>,
+    ) -> Result<T, SharedFailure> {
         self.owner
             .at_handle(&self.handle, || {
                 let guard = self
@@ -200,7 +214,9 @@ impl Worker {
         });
         members.insert(inner.id, Arc::downgrade(&inner));
         drop(members);
-        inner.admission.grant.playback();
+        if !inner.admission.background {
+            inner.admission.grant.playback();
+        }
         self.changed.notify_one();
         Ok(SharedViewer { inner })
     }
@@ -309,11 +325,20 @@ impl SharedInputs {
         Self {
             owner,
             id: Arc::new(()),
+            failures: Arc::new(Mutex::new(HashMap::new())),
             workers: Mutex::new(Registry {
                 workers: HashMap::new(),
                 epoch: Arc::new(()),
             }),
         }
+    }
+    /// Consume opaque replica admission with its selected-route fence intact.
+    pub fn attach_replica(
+        &self,
+        admission: super::super::ReplicaAdmission,
+        options: SharedInputOptions,
+    ) -> Result<SharedInputAttachment, SharedFailure> {
+        self.attach(admission.into_native(), options)
     }
     /// Consume an independently authorized viewer. The first attachment owns
     /// startup; later attachments share only a current compatible generation.
@@ -390,58 +415,62 @@ impl SharedInputs {
         let reuse = old.as_ref().filter(|w| w.current().is_ok());
         self.owner
             .at_admission_candidate(&admission.candidate, &admission.name, |view, input| {
-                if admission.grant.is_cancelled() {
-                    return Err(AdmissionFailure::Revoked);
-                }
-                let options = match options(reuse.map(Arc::as_ref)) {
-                    Ok(options) => options,
-                    Err(error) => return Ok(Err(error)),
-                };
-                let result = if let Some(worker) = reuse {
-                    if !worker.compatible(&admission, view.policy, &options) {
-                        Err(SharedFailure::Mismatch)
+                admission.at_scope(|| {
+                    if admission.is_cancelled() {
+                        return Err(AdmissionFailure::Revoked);
+                    }
+                    let options = match options(reuse.map(Arc::as_ref)) {
+                        Ok(options) => options,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    let result = if let Some(worker) = reuse {
+                        if !worker.compatible(&admission, view.policy, &options) {
+                            Err(SharedFailure::Mismatch)
+                        } else {
+                            worker
+                                .attach(admission.clone())
+                                .map(|viewer| SharedInputAttachment {
+                                    viewer,
+                                    input: None,
+                                })
+                        }
+                    } else if old.is_none() && workers.len() >= 256 {
+                        Err(SharedFailure::Limit)
                     } else {
-                        worker
-                            .attach(admission.clone())
-                            .map(|viewer| SharedInputAttachment {
-                                viewer,
-                                input: None,
-                            })
-                    }
-                } else if old.is_none() && workers.len() >= 256 {
-                    Err(SharedFailure::Limit)
-                } else {
-                    if let Some(old) = &old {
-                        old.close();
-                    }
-                    let worker = Arc::new(Worker {
-                        id: Uuid::new_v4(),
-                        registry: self.id.clone(),
-                        owner: self.owner.clone(),
-                        handle: admission.candidate.handle.clone(),
-                        route: Mutex::new(copy_route(&admission.candidate)),
-                        name: view.name.into(),
-                        policy: view.policy.clone(),
-                        options,
-                        members: Mutex::new(HashMap::new()),
-                        changed: Notify::new(),
-                        cancel: CancellationToken::new(),
-                        hub: Arc::new(Hub::new()),
-                        transport: input.transport(),
-                        ts: media_queue::Channel::new(128, 8 * 1024 * 1024),
-                        required: Mutex::new(None),
-                        tracks: Mutex::new(None),
-                        metadata_ready: Notify::new(),
-                        detected: AtomicU64::new(0),
-                    });
-                    let viewer = worker.attach(admission.clone());
-                    workers.insert(worker.name.clone(), Arc::downgrade(&worker));
-                    viewer.map(|viewer| SharedInputAttachment {
-                        viewer,
-                        input: Some(SharedInput { worker, input }),
-                    })
-                };
-                Ok(result)
+                        if let Some(old) = &old {
+                            old.close();
+                        }
+                        let worker = Arc::new(Worker {
+                            id: Uuid::new_v4(),
+                            registry: self.id.clone(),
+                            owner: self.owner.clone(),
+                            handle: admission.candidate.handle.clone(),
+                            route: Mutex::new(copy_route(&admission.candidate)),
+                            scope: admission.selection.clone(),
+                            failures: self.failures.clone(),
+                            name: view.name.into(),
+                            policy: view.policy.clone(),
+                            options,
+                            members: Mutex::new(HashMap::new()),
+                            changed: Notify::new(),
+                            cancel: CancellationToken::new(),
+                            hub: Arc::new(Hub::new()),
+                            transport: input.transport(),
+                            ts: media_queue::Channel::new(128, 8 * 1024 * 1024),
+                            required: Mutex::new(None),
+                            tracks: Mutex::new(None),
+                            metadata_ready: Notify::new(),
+                            detected: AtomicU64::new(0),
+                        });
+                        let viewer = worker.attach(admission.clone());
+                        workers.insert(worker.name.clone(), Arc::downgrade(&worker));
+                        viewer.map(|viewer| SharedInputAttachment {
+                            viewer,
+                            input: Some(SharedInput { worker, input }),
+                        })
+                    };
+                    Ok(result)
+                })?
             })
             .map_err(SharedFailure::Authority)?
     }
@@ -474,6 +503,7 @@ impl SharedInputs {
         }
         workers.clear();
         registry.epoch = Arc::new(());
+        self.failures.lock().unwrap().clear();
     }
 }
 impl Drop for SharedInputs {
@@ -483,7 +513,16 @@ impl Drop for SharedInputs {
 }
 impl SharedViewer {
     pub(crate) fn is_closed(&self) -> bool {
-        self.inner.worker.cancel.is_cancelled() || self.inner.admission.grant.is_cancelled()
+        self.inner.worker.cancel.is_cancelled() || self.inner.admission.is_cancelled()
+    }
+    pub(crate) fn with_current<T>(&self, commit: impl FnOnce() -> T) -> Result<T, SharedFailure> {
+        let worker = &self.inner.worker;
+        worker.at_route(|_| {
+            if worker.cancel.is_cancelled() || self.inner.admission.is_cancelled() {
+                return Err(AdmissionFailure::Revoked);
+            }
+            Ok(commit())
+        })
     }
     pub fn generation(&self) -> Uuid {
         self.inner.worker.id
@@ -494,7 +533,7 @@ impl SharedViewer {
             return Err(SharedFailure::Closed);
         }
         worker.at_route(|_| {
-            if self.inner.admission.grant.is_cancelled() {
+            if self.inner.admission.is_cancelled() {
                 Err(AdmissionFailure::Revoked)
             } else {
                 Ok(())
@@ -536,7 +575,7 @@ impl SharedViewer {
         let bytes = self.inner.worker.hub.segment(name);
         self.current()?;
         if let Some(bytes) = &bytes {
-            self.inner.admission.grant.add_bytes(bytes.len());
+            self.add_bytes(bytes.len());
         }
         Ok(bytes)
     }
@@ -606,7 +645,7 @@ impl SharedInput {
             required,
         };
         let (tx, mut metadata) = oneshot::channel();
-        let pull = self.input.pull_guarded(
+        let pull = self.input.pull_guarded_classified(
             &mut output,
             Some(&worker.hub),
             tx,
@@ -631,13 +670,32 @@ impl SharedInput {
                     metadata_pending = false;
                     if let Ok(tracks) = tracks {
                         worker.current()?;
-                        *worker.tracks.lock().unwrap() = Some(tracks);
-                        worker.metadata_ready.notify_waiters();
+                        worker.at_source_route(|_| {
+                            let commit=|| {
+                                if worker.active_viewer().is_none(){return Err(AdmissionFailure::Revoked);}
+                                *worker.tracks.lock().unwrap()=Some(tracks);
+                                worker.metadata_ready.notify_waiters();Ok(())
+                            };
+                            match &worker.scope {Some(scope)=>scope.accept_private(commit),None=>commit()}
+                        })?;
                     }
                 },
                 result = &mut pull => {
                     worker.current()?;
-                    return result.map_err(|_| SharedFailure::Input);
+                    if let Err(kind)=result {
+                        worker.at_source_route(|_| {
+                            if let Some(scope) = &worker.scope {
+                                let notice=scope.input_failed(&worker.handle,kind)?;
+                                let mut failures=worker.failures.lock().unwrap();
+                                if failures.len()<256 || failures.contains_key(&worker.name) {
+                                    failures.insert(worker.name.clone(),FailureObservation {generation:worker.id,notice});
+                                }
+                            }
+                            Ok(())
+                        })?;
+                        return Err(SharedFailure::Input);
+                    }
+                    return Ok(());
                 }
             }
         }
@@ -664,7 +722,7 @@ impl SharedSubscription {
             }
         };
         self.viewer.current()?;
-        self.viewer.inner.admission.grant.add_bytes(bytes.len());
+        self.viewer.add_bytes(bytes.len());
         Ok(bytes)
     }
 }
@@ -681,5 +739,15 @@ fn copy_route(a: &super::super::CoordinatedCandidate) -> super::super::Coordinat
     super::super::CoordinatedCandidate {
         handle: a.handle.clone(),
         candidate: a.candidate.copy_for_worker(),
+    }
+}
+
+pub(crate) struct FailureObservation {
+    pub generation: Uuid,
+    pub notice: super::super::ReplicaInputFailure,
+}
+impl SharedInputs {
+    pub(crate) fn take_failure(&self, name: &str) -> Option<FailureObservation> {
+        self.failures.lock().ok()?.remove(name)
     }
 }

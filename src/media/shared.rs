@@ -186,6 +186,21 @@ impl Engine {
     }
 }
 impl PackagedPlayback {
+    pub(crate) fn with_current_source<T>(
+        &self,
+        commit: impl FnOnce() -> T,
+    ) -> Result<T, SharedPackagingFailure> {
+        self.inner
+            .source
+            .with_current(|| {
+                if self.inner.worker.is_closed() || !self.inner.worker.alive.load(Ordering::Relaxed)
+                {
+                    return Err(SharedPackagingFailure::Closed);
+                }
+                Ok(commit())
+            })
+            .map_err(SharedPackagingFailure::Authority)?
+    }
     pub fn generation(&self) -> uuid::Uuid {
         self.inner.source.generation()
     }

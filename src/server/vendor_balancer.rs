@@ -19,16 +19,15 @@ impl App {
         // Placement awaits advisory telemetry and a CDN-owned capacity ticket.
         // Recheck source identity/lease as well as config and viewer authority
         // before exposing a redirect. Unused remote tickets expire normally.
-        let response = match owner.with_admitted_current(admitted, || response) {
+        match owner.with_admitted_current(admitted, || {
+            if response.status() == StatusCode::FOUND {
+                grant.playback();
+            }
+            response
+        }) {
             Ok(response) => response,
-            Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "vendor authority changed"),
-        };
-        if response.status() == StatusCode::FOUND {
-            // Match native LB session accounting only after successful, current
-            // placement. This does not attach an input or acquire a worker.
-            grant.playback();
+            Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "vendor authority changed"),
         }
-        response
     }
 }
 

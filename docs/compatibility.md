@@ -642,3 +642,7 @@ inventory, policy and configuration generation. Atomic path edits and an all-hop
 publication fence reject local/repeated IDs, stale or expired hops, unknown roles
 and unresolved policy. These are operator assertions, not remotely attested
 ancestry or private endpoint identity. Automatic vendor routing remains disabled.
+
+## Explicit vendor HTTP source recovery
+
+Configured Flussonic HTTP sources now support [equivalent-origin failover](vendor-daemon-failover.md) with explicit local group/content identity, equal policies and processing, guarded native viewer admission, private rejection barriers and background shared-worker replacement. HLS discontinuities and continuous-response reconnects apply. Always-on vendor activation, vendor RTSP/SRT delivery, vendor CDN destinations and production mixed-cluster qualification remain pending.

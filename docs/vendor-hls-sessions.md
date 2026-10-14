@@ -45,6 +45,7 @@ cannot affect the replacement owner's cache or capacity.
 
 The embedding owner still maintains `PlaybackAuth::renew_due`, selects cold
 sources explicitly, handles native deny/redirect outcomes, and calls
-`Engine::stop_all` on shutdown. Automatic daemon route activation, persisted
-source policy settings and equivalent-source failover remain separate work.
+`Engine::stop_all` on shutdown. The daemon now integrates persisted source
+policies and [equivalent-source recovery](vendor-daemon-failover.md); always-on
+vendor activation remains separate work.
 No production capacity, new GPU or live vendor qualification is implied.

@@ -19,7 +19,8 @@ test('vendor source form defaults to unresolved viewer policy and masks private 
  await expect(page.getByLabel('Viewer policy',{exact:true})).toHaveValue('inherit');
  await expect(page.getByLabel('Stream activation',{exact:true})).toHaveCount(0);
  await expect(page.getByLabel('Public delivery URL',{exact:true})).toHaveCount(0);
- await expect(page.getByLabel('Failover group',{exact:true})).toHaveCount(0);
+ await expect(page.getByLabel('Failover group',{exact:true})).toHaveValue('');
+ await expect(page.getByLabel('Content identity',{exact:true})).toHaveValue('');
  await expect(page.getByLabel('Source transport',{exact:true})).toHaveCount(0);
  await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Cluster key is required');
  await page.getByLabel('Cluster key',{exact:true}).fill('owned-vendor-private-key');await expect(page.getByLabel('Cluster key',{exact:true})).toHaveAttribute('type','password');
@@ -57,7 +58,7 @@ test('native settings are retained until explicitly removed for vendor conversio
  expect((await request.put(uri,{headers:headers(),data:{cluster_key:'owned-vendor-private-key',public_payload_url:'https://delivery.example',flussonix_source_group:'owned-replicas'}})).ok()).toBeTruthy();
  await expect(row(page)).toBeVisible();await edit(page);await page.getByLabel('Source type',{exact:true}).selectOption('flussonic');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('unsupported native settings');
  expect((await(await request.get(uri,{headers:headers()})).json()).public_payload_url).toBe('https://delivery.example');
- await page.getByRole('button',{name:'Remove unsupported native settings',exact:true}).click();await page.getByLabel('Viewer policy',{exact:true}).selectOption('allow');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);const saved=await(await request.get(uri,{headers:headers()})).json();expect(saved.on_play).toBe('true');expect(saved.public_payload_url).toBeUndefined();expect(saved.flussonix_source_group).toBeUndefined();
+ await page.getByRole('button',{name:'Remove unsupported native settings',exact:true}).click();await expect(page.getByLabel('Failover group',{exact:true})).toHaveValue('owned-replicas');await page.getByLabel('Failover group',{exact:true}).fill('');await page.getByLabel('Viewer policy',{exact:true}).selectOption('allow');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);const saved=await(await request.get(uri,{headers:headers()})).json();expect(saved.on_play).toBe('true');expect(saved.public_payload_url).toBeUndefined();expect(saved.flussonix_source_group).toBeUndefined();
 });
 
 test('invalid group guards and callback policies cannot be saved',async({page,request})=>{
@@ -107,4 +108,17 @@ test('vendor processing selection shows the existing GPU dependency readiness',a
  await expect(row(page)).toBeVisible();await edit(page);const readiness=page.getByRole('region',{name:'GPU transcoding readiness'});await expect(readiness).toBeVisible();
  const caps=await(await request.get('/flussonix/api/v1/capabilities',{headers:headers()})).json();const profile=caps.transcoding.gpu_profiles.find((p:{encoder:string})=>p.encoder==='h264_nvenc');expect(profile).toBeTruthy();
  await expect(readiness.getByTestId('gpu-h264_nvenc')).toContainText(profile.status==='available'?'Ready for GPU encoding':'GPU encoding unavailable');await expect(readiness).toContainText('Initialization does not measure streaming capacity.');await expect(page.locator('textarea')).toHaveCount(0);
+});
+
+test('vendor replica controls save explicit equivalence and retain it until cleared',async({page,request})=>{
+ await page.getByRole('button',{name:'Add source',exact:true}).click();await page.getByLabel('Source type',{exact:true}).selectOption('flussonic');
+ await page.getByLabel('Source address',{exact:true}).fill(source);await page.getByLabel('Cluster key',{exact:true}).fill('owned-vendor-private-key');await page.getByLabel('Viewer policy',{exact:true}).selectOption('allow');
+ await page.getByLabel('Failover group',{exact:true}).fill('music-origins');
+ await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('both a group and content identity');
+ await page.getByLabel('Content identity',{exact:true}).fill('music-v1');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+ let saved=await(await request.get(uri,{headers:headers()})).json();expect(saved.flussonix_source_group).toBe('music-origins');expect(saved.flussonix_content_id).toBe('music-v1');
+ await edit(page);await expect(page.getByLabel('Content identity',{exact:true})).toHaveValue('music-v1');await expect(page.locator('textarea')).toHaveCount(0);
+ await page.getByLabel('Source type',{exact:true}).selectOption('native');await page.getByRole('button',{name:'Clear vendor viewer policies',exact:true}).click();await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Clear vendor content identity');
+ await page.getByRole('button',{name:'Clear vendor content identity',exact:true}).click();await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+ saved=await(await request.get(uri,{headers:headers()})).json();expect(saved.flussonix_content_id).toBeUndefined();expect(saved.flussonix_source_group).toBe('music-origins');
 });

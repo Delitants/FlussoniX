@@ -14,7 +14,7 @@ FlussoniX does not require any official Flussonic components.
 - Preserve, convert or remove subtitles; supported conversion profiles produce HLS WebVTT.
 - Build a FlussoniX source/CDN cluster with LAN stream pulls and load balancing based on uplink, CPU and RAM.
 
-Protocol, codec and API coverage is still incomplete. Mixed Flussonic clusters are under development; automatic vendor routing remains disabled. See [compatibility](docs/compatibility.md) before planning a migration.
+Protocol, codec and API coverage is still incomplete. Mixed Flussonic clusters are under development. Explicit Flussonic HTTP source profiles support playback and [equivalent-origin failover](docs/vendor-daemon-failover.md). See [compatibility](docs/compatibility.md) before planning a migration.
 
 ## Try it
 

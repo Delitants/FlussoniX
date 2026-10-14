@@ -87,6 +87,7 @@ struct SubtitlePolicy<'a> {
     detected: Option<&'a AtomicU64>,
     conversion: Option<&'a crate::caption_hls::State>,
     authority: Authority<'a>,
+    failure: Option<&'a std::sync::atomic::AtomicU8>,
 }
 async fn configs<W: AsyncWrite + Unpin>(
     stdin: &mut W,
@@ -128,9 +129,13 @@ async fn configs<W: AsyncWrite + Unpin>(
     let mut next = Muxer::new(&new)?;
     if let Some(sender) = metadata.take() {
         check_authority(policy.authority)?;
-        sender
-            .send(new.clone())
-            .map_err(|_| "native startup cancelled")?;
+        sender.send(new.clone()).map_err(|_| {
+            flussonic::failure::record(
+                policy.failure,
+                flussonic::InputFailure::Local,
+                "native startup cancelled",
+            )
+        })?;
     }
     stdin
         .write_all(&next.tables())
@@ -182,6 +187,7 @@ pub(crate) struct PullOptions<'a> {
     pub preserve: bool,
     pub detected: Option<&'a AtomicU64>,
     pub conversion: Option<&'a crate::caption_hls::State>,
+    pub failure: Option<&'a std::sync::atomic::AtomicU8>,
 }
 pub(crate) async fn pull_ready_with_options<W: AsyncWrite + Unpin>(
     input: &str,
@@ -334,8 +340,12 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
     authority: Authority<'_>,
 ) -> Result<(), String> {
     check_authority(authority)?;
+    let mut writer = flussonic::failure::Writer {
+        output,
+        slot: subtitles.failure,
+    };
     let mut guarded = authority::Writer {
-        inner: output,
+        inner: &mut writer,
         authority,
     };
     let stdin = &mut guarded;
@@ -345,6 +355,24 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
         conversion,
         ..
     } = subtitles;
+    let transient = |message| {
+        flussonic::failure::record(
+            subtitles.failure,
+            flussonic::InputFailure::Transient,
+            message,
+        )
+    };
+    let rejection = |response: &reqwest::Response, message| {
+        flussonic::failure::record(
+            subtitles.failure,
+            if response.status().is_server_error() {
+                flussonic::InputFailure::Transient
+            } else {
+                flussonic::InputFailure::Rejected
+            },
+            message,
+        )
+    };
     let is_m4f = requests.is_m4f;
     let policy = SubtitlePolicy {
         preserve,
@@ -353,6 +381,7 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
         detected,
         conversion,
         authority,
+        failure: subtitles.failure,
     };
     let request = requests
         .get(requests.control.clone())?
@@ -360,11 +389,11 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
     check_authority(authority)?;
     let response = tokio::time::timeout(Duration::from_secs(10), request.send())
         .await
-        .map_err(|_| "media setup timed out")?
-        .map_err(|_| "media connection failed")?;
+        .map_err(|_| transient("media setup timed out"))?
+        .map_err(|_| transient("media connection failed"))?;
     check_authority(authority)?;
     if !requests.accepts(&response) {
-        return Err("source rejected input".into());
+        return Err(rejection(&response, "source rejected input").into());
     }
     let mut stream = response.bytes_stream();
     let mut decoder = Decoder::default();
@@ -376,9 +405,9 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
     loop {
         let bytes = tokio::time::timeout(Duration::from_secs(15), stream.next())
             .await
-            .map_err(|_| "source timed out")?
-            .ok_or("source closed")?
-            .map_err(|_| "transport failed")?;
+            .map_err(|_| transient("source timed out"))?
+            .ok_or_else(|| transient("source closed"))?
+            .map_err(|_| transient("transport failed"))?;
         check_authority(authority)?;
         if is_m4f {
             for n in signals.push(&bytes)? {
@@ -390,16 +419,19 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                 url.set_path(&format!("{}/{}", requests.base.path(), n.name));
                 let request = requests.get(url)?.timeout(Duration::from_secs(10));
                 check_authority(authority)?;
-                let response = request.send().await.map_err(|_| "M4F fetch failed")?;
+                let response = request
+                    .send()
+                    .await
+                    .map_err(|_| transient("M4F fetch failed"))?;
                 check_authority(authority)?;
                 if !requests.accepts(&response) {
-                    return Err("M4F segment denied".into());
+                    return Err(rejection(&response, "M4F segment denied").into());
                 }
                 let mut body = BytesMut::new();
                 let mut chunks = response.bytes_stream();
                 while let Some(chunk) = chunks.next().await {
                     check_authority(authority)?;
-                    let chunk = chunk.map_err(|_| "M4F fetch failed")?;
+                    let chunk = chunk.map_err(|_| transient("M4F fetch failed"))?;
                     if body.len() + chunk.len() > 16 * 1024 * 1024 {
                         return Err("M4F segment too large".into());
                     }

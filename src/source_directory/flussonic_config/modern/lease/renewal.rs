@@ -91,6 +91,7 @@ impl SourceAuthority {
         &self,
         pending: ModernRenewal,
         observed: Result<ObservedInventory, LeaseFailure>,
+        reject: impl FnOnce(LeaseFailure),
         prepare: impl FnOnce(&ModernLeasedInventory, &dyn Fn(&ModernLeasedCandidate) -> bool) -> (T, F),
     ) -> Result<(ModernLeasedInventory, T), LeaseFailure> {
         let mut state = self
@@ -111,7 +112,14 @@ impl SourceAuthority {
             Ok(())
         };
         check(&state)?;
-        let (server_id, rows) = observed?.into_parts();
+        let observed = match observed {
+            Ok(observed) => observed,
+            Err(error) => {
+                reject(error);
+                return Err(error);
+            }
+        };
+        let (server_id, rows) = observed.into_parts();
         let inventory = ModernLeasedInventory {
             inventory: ModernBoundInventory {
                 inventory: BoundInventory {

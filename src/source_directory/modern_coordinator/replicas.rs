@@ -1,5 +1,7 @@
 //! Explicit equivalent-origin selection. No daemon activation or background I/O.
+mod failure;
 mod lookup;
+mod managed;
 mod pull;
 mod registration;
 use super::{
@@ -14,6 +16,7 @@ use crate::{
         flussonic_config::{BindingFailure, CandidateView, LeaseFailure, SourceAuthority},
     },
 };
+pub(crate) use failure::ReplicaInputFailure;
 pub use pull::ReplicaPullFailure;
 use serde_json::{Value, json};
 use std::{
@@ -65,6 +68,8 @@ struct Entry {
     selected: usize,
     available: bool,
     blocked: bool,
+    private_rejected: bool,
+    pending_failure: Option<Arc<()>>,
     switches: u64,
     turn: Arc<()>,
     route: Arc<Epoch>,
@@ -79,6 +84,7 @@ impl Epoch {
         })
     }
 }
+#[derive(Clone)]
 struct RouteStamp {
     selector: Arc<ReplicaSelector>,
     name: String,
@@ -149,6 +155,8 @@ impl ReplicaSelector {
                     selected: 0,
                     available: false,
                     blocked: false,
+                    private_rejected: false,
+                    pending_failure: None,
                     switches: 0,
                     turn: Arc::new(()),
                     route: Epoch::new(),
@@ -288,5 +296,26 @@ impl ReplicaAdmission {
     }
     pub async fn cancelled(&self) {
         tokio::select! {_=self.stamp.route.cancel.cancelled()=>{},_=self.inner.cancelled()=>{}}
+    }
+}
+
+/// Managed workers retain group generation independently of renewed source tickets.
+#[derive(Clone)]
+pub(crate) struct ReplicaRoute {
+    stamp: RouteStamp,
+}
+impl ReplicaRoute {
+    pub(crate) fn at_current<T>(&self, commit: impl FnOnce() -> T) -> Result<T, ReplicaFailure> {
+        self.stamp.selector.at_stamp(&self.stamp, commit)
+    }
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.stamp.route.cancel.is_cancelled()
+    }
+}
+impl ReplicaAdmission {
+    pub(crate) fn into_native(self) -> Box<super::AdmittedCandidate> {
+        let Self { mut inner, stamp } = self;
+        inner.selection = Some(ReplicaRoute { stamp });
+        inner
     }
 }

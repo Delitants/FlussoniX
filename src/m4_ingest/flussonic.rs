@@ -4,8 +4,10 @@
 //! source authority; ordinary native discovery stays separate. No official
 //! Flussonic components are required. Live reference qualification remains a
 //! separate gate.
+pub(super) mod failure;
 use super::{PullOptions, RequestAuth, Requests};
 use crate::{m4s::Track, wire::Hub};
+pub use failure::InputFailure;
 use reqwest::header::{HeaderMap, HeaderValue};
 use std::{path::Path, time::Duration};
 use tokio::{io::AsyncWrite, sync::oneshot};
@@ -48,6 +50,36 @@ impl MediaInput {
             Some(authority),
         )
         .await
+    }
+    /// Typed retry provenance; no endpoint, credential or diagnostic string.
+    pub async fn pull_ready_classified<W: AsyncWrite + Unpin>(
+        &self,
+        output: &mut W,
+        hub: Option<&Hub>,
+        metadata: oneshot::Sender<Vec<Track>>,
+    ) -> Result<(), InputFailure> {
+        self.pull_guarded_classified(output, hub, metadata, PullOptions::default(), &|| true)
+            .await
+    }
+    pub(crate) async fn pull_guarded_classified<W: AsyncWrite + Unpin>(
+        &self,
+        output: &mut W,
+        hub: Option<&Hub>,
+        metadata: oneshot::Sender<Vec<Track>>,
+        mut options: PullOptions<'_>,
+        authority: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<(), InputFailure> {
+        let slot = std::sync::atomic::AtomicU8::new(InputFailure::Invalid as u8);
+        options.failure = Some(&slot);
+        self.pull_guarded(output, hub, metadata, options, authority)
+            .await
+            .map_err(|_| {
+                if !authority() {
+                    InputFailure::Revoked
+                } else {
+                    failure::read(&slot)
+                }
+            })
     }
     /// The HTTP(S) root may include a trusted proxy prefix. `name` is the literal
     /// decoded stream name, never an escaped URL or protocol-suffixed path.

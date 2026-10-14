@@ -255,6 +255,15 @@ pub struct Grant {
     cancel: CancellationToken,
 }
 impl Grant {
+    /// Read-only recovery permission from this original native viewer grant.
+    pub(crate) fn recovery_activity(&self) -> Option<Instant> {
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        let entry = self.entry.as_ref()?;
+        let state = entry.state.lock().ok()?;
+        state.recovery_activity(Some(&state.policy), Instant::now())
+    }
     pub(crate) fn session_identity(&self) -> Option<&str> {
         self.entry.as_ref().map(|entry| entry.id.as_str())
     }

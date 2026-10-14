@@ -128,7 +128,7 @@ impl App {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(), String> {
         match &self.vendor_playback {
-            Some(runtime) => runtime.run(cancel).await,
+            Some(runtime) => runtime.run(self, cancel).await,
             None => {
                 cancel.cancelled().await;
                 Ok(())

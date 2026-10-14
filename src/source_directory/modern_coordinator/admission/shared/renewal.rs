@@ -52,41 +52,77 @@ impl SharedInputs {
             .at_handle(handle, || {
                 handle
                     .authority
-                    .commit_modern_renewal(pending, observed, |inventory, current| {
-                        let mut updates = Vec::new();
-                        let (mut renewed, mut retired) = (0, 0);
-                        for worker in registry
-                            .workers
-                            .values()
-                            .filter_map(Weak::upgrade)
-                            .filter(|w| same_source(&w.handle, handle) && !w.cancel.is_cancelled())
-                        {
-                            let old = worker.route.lock().unwrap();
-                            let next = inventory.candidate(&worker.name).ok().filter(|c| {
-                                current(&old.candidate) && old.candidate.equivalent_route(c)
-                            });
-                            drop(old);
-                            if next.is_some() {
-                                renewed += 1
-                            } else {
-                                retired += 1
-                            }
-                            updates.push((worker, next));
-                        }
-                        ((renewed, retired), move || {
-                            for (worker, next) in updates {
-                                if let Some(candidate) = next {
-                                    *worker.route.lock().unwrap() =
-                                        super::super::super::CoordinatedCandidate {
-                                            handle: worker.handle.clone(),
-                                            candidate,
-                                        };
-                                } else {
+                    .commit_modern_renewal(
+                        pending,
+                        observed,
+                        |error| {
+                            for worker in registry
+                                .workers
+                                .values()
+                                .filter_map(Weak::upgrade)
+                                .filter(|w| {
+                                    same_source(&w.handle, handle) && !w.cancel.is_cancelled()
+                                })
+                            {
+                                if worker
+                                    .scope
+                                    .as_ref()
+                                    .is_some_and(|scope| scope.reject_inventory(error))
+                                {
                                     worker.close();
                                 }
                             }
-                        })
-                    })
+                        },
+                        |inventory, current| {
+                            let mut updates = Vec::new();
+                            let (mut renewed, mut retired) = (0, 0);
+                            for worker in registry
+                                .workers
+                                .values()
+                                .filter_map(Weak::upgrade)
+                                .filter(|w| {
+                                    same_source(&w.handle, handle) && !w.cancel.is_cancelled()
+                                })
+                            {
+                                let old = worker.route.lock().unwrap();
+                                let valid = current(&old.candidate);
+                                let projected = inventory.candidate(&worker.name);
+                                let rejected = if valid {
+                                    projected.as_ref().err().copied()
+                                } else {
+                                    None
+                                };
+                                let next = projected
+                                    .ok()
+                                    .filter(|c| valid && old.candidate.equivalent_route(c));
+                                drop(old);
+                                if next.is_some() {
+                                    renewed += 1
+                                } else {
+                                    retired += 1
+                                }
+                                updates.push((worker, next, rejected));
+                            }
+                            ((renewed, retired), move || {
+                                for (worker, next, rejected) in updates {
+                                    if let Some(candidate) = next {
+                                        *worker.route.lock().unwrap() =
+                                            super::super::super::CoordinatedCandidate {
+                                                handle: worker.handle.clone(),
+                                                candidate,
+                                            };
+                                    } else {
+                                        if let (Some(scope), Some(error)) =
+                                            (&worker.scope, rejected)
+                                        {
+                                            scope.reject_inventory(error);
+                                        }
+                                        worker.close();
+                                    }
+                                }
+                            })
+                        },
+                    )
                     .map_err(CoordinationFailure::Lease)
             })
             .map_err(|e| SharedFailure::Authority(AdmissionFailure::Coordination(e)))?;

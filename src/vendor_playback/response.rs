@@ -111,7 +111,8 @@ impl Runtime {
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "vendor source unavailable"),
         };
         let output_revision = candidate.config_revision();
-        let outcome = tokio::select! {biased;_=self.closed.cancelled()=>return error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),outcome=self.owner.admit(candidate,&app.playback_auth,viewer)=>outcome};
+        let output_key = candidate.source_key().to_owned();
+        let outcome = tokio::select! {biased;_=self.closed.cancelled()=>return error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),outcome=self.admit_selection(candidate,&app.playback_auth,viewer)=>outcome};
         let admission = match outcome {
             Ok(AdmissionOutcome::Allowed(a)) => a,
             Ok(AdmissionOutcome::Denied) => return error(StatusCode::FORBIDDEN, "playback denied"),
@@ -133,7 +134,7 @@ impl Runtime {
             };
         }
         let hls = !matches!(file, "mpegts" | "m4s" | "m4f") && !file.ends_with(".m4f");
-        let settings = match self.output_settings(app, key, output_revision) {
+        let settings = match self.output_settings(app, &output_key, output_revision) {
             Ok(settings) => settings,
             Err(_) => {
                 return error(
@@ -154,6 +155,16 @@ impl Runtime {
             }
             return App::http_ticket_redirect(&raw_path, &query);
         }
+        let _attempt = match self.register_recovery(app, name, key, revision, &admission, &settings)
+        {
+            Ok(attempt) => attempt,
+            Err(_) => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "vendor recovery capacity unavailable",
+                );
+            }
+        };
         let package = async {
             if hls {
                 self.sessions
@@ -176,6 +187,7 @@ impl Runtime {
             Ok(p) => p,
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "vendor media unavailable"),
         };
+        self.remember_recovery(name, &playback);
         if matches!(file, "mpegts" | "m4s" | "m4f") {
             if file != "mpegts" {
                 let deadline = Instant::now() + Duration::from_secs(8);

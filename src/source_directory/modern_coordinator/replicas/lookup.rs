@@ -9,7 +9,7 @@ fn transient(error: CoordinationFailure) -> bool {
         )))
     )
 }
-fn authoritative(error: CoordinationFailure) -> bool {
+pub(super) fn authoritative(error: CoordinationFailure) -> bool {
     matches!(
         error,
         CoordinationFailure::Lease(LeaseFailure::Binding(
@@ -93,7 +93,7 @@ impl ReplicaLookup {
             }
             if self.finished
                 || self.offset >= self.selector.members.len()
-                || (entry.blocked && self.offset > 0)
+                || ((entry.blocked || entry.private_rejected) && self.offset > 0)
             {
                 return Ok(None);
             }
@@ -111,6 +111,13 @@ impl ReplicaLookup {
         &mut self,
         handle: &SourceHandle,
         result: Result<CoordinatedInventory, CoordinationFailure>,
+    ) -> Result<Option<ReplicaChoice>, ReplicaFailure> {
+        self.observe_cached(handle, result.as_ref().map_err(|error| *error))
+    }
+    pub(crate) fn observe_cached(
+        &mut self,
+        handle: &SourceHandle,
+        result: Result<&CoordinatedInventory, CoordinationFailure>,
     ) -> Result<Option<ReplicaChoice>, ReplicaFailure> {
         let expected = self.next_source()?.ok_or(ReplicaFailure::Invalid)?;
         if handle.stamp.key != expected
@@ -139,7 +146,7 @@ impl ReplicaLookup {
                 let observation = self
                     .selector
                     .owner
-                    .at_inventory_current(&inventory, || match inventory.candidate(&self.name) {
+                    .at_inventory_current(inventory, || match inventory.candidate(&self.name) {
                         Ok(candidate) => Observation::Candidate(candidate),
                         Err(error) if transient(error) || authoritative(error) => {
                             Observation::Rejected(
@@ -184,6 +191,7 @@ impl ReplicaLookup {
                         entry.selected = selected;
                         entry.available = true;
                         entry.blocked = false;
+                        entry.pending_failure = None;
                         Ok(RouteStamp {
                             selector: self.selector.clone(),
                             name: self.name.clone(),

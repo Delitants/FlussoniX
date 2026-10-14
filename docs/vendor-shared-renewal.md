@@ -44,6 +44,7 @@ and cancelled refreshes, competing attempts, global edits, ordinary refresh,
 shutdown and media fencing after renewal. Owned FFmpeg tests verify HLS remains
 available beyond the old deadline with the same PID and one upstream connection.
 The opt-in [HLS session owner](vendor-hls-sessions.md) now supplies retention
-and scheduled renewal. Automatic daemon vendor routing and source failover remain
-separate integration work. No new live vendor, GPU,
+and scheduled renewal. The daemon uses this with
+[explicit vendor failover groups](vendor-daemon-failover.md), retaining a group
+route scope independently of renewable source tickets. No new live vendor, GPU,
 capacity or production continuity qualification is claimed.
