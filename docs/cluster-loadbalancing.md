@@ -42,7 +42,9 @@ Single-use tickets from earlier connections cannot be reused.
 The real-daemon profile uses two equivalent origins, one CDN and one LB on
 unused loopback ports, with independently trusted HTTPS certificates. It checks
 HEVC with MP2 and MP3 audio over both M4F and M4S private pulls. An active SRT
-receiver must close after its origin fails, before its normal capture deadline.
+receiver has no recording deadline and must close after its origin fails,
+before its longer read timeout. One case holds a healthy caller for 40 seconds
+before injecting failure.
 The CDN supervisor
 must replace a failed origin without another viewer request; a fresh lookup then
 delivers independently decoded encrypted SRT using that recovered worker. A

@@ -55,9 +55,17 @@ async fn fresh(client: &reqwest::Client, lb: &Daemon, cdn: &Daemon) -> Value {
     }
     value
 }
-fn receiver(value: &Value, path: &Path, seconds: &str) -> tokio::process::Child {
+fn receiver(value: &Value, path: &Path, seconds: Option<&str>) -> tokio::process::Child {
     let log = std::fs::File::create(path.with_extension("log")).unwrap();
-    tokio::process::Command::new("/usr/bin/ffmpeg")
+    let mut command = tokio::process::Command::new("/usr/bin/ffmpeg");
+    // The active caller must not stop because of a recording limit or a read
+    // timeout inside the eight-second server-closure observation window.
+    let read_timeout = if seconds.is_some() {
+        5_000_000
+    } else {
+        30_000_000
+    };
+    command
         .args([
             "-hide_banner",
             "-loglevel",
@@ -78,10 +86,14 @@ fn receiver(value: &Value, path: &Path, seconds: &str) -> tokio::process::Child 
             "-i",
         ])
         .arg(format!(
-            "{}?mode=caller&latency=120000&connect_timeout=1000&timeout=5000000",
+            "{}?mode=caller&latency=120000&connect_timeout=1000&timeout={read_timeout}",
             value["address"].as_str().unwrap()
-        ))
-        .args(["-t", seconds, "-map", "0", "-c", "copy", "-f", "mpegts"])
+        ));
+    if let Some(seconds) = seconds {
+        command.args(["-t", seconds]);
+    }
+    command
+        .args(["-map", "0", "-c", "copy", "-f", "mpegts"])
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -91,7 +103,7 @@ fn receiver(value: &Value, path: &Path, seconds: &str) -> tokio::process::Child 
         .unwrap()
 }
 async fn receive(value: &Value, path: &Path) -> bool {
-    let mut child = receiver(value, path, "3");
+    let mut child = receiver(value, path, Some("3"));
     match tokio::time::timeout(Duration::from_secs(20), child.wait()).await {
         Ok(result) => result.unwrap().success(),
         Err(_) => {
@@ -259,7 +271,7 @@ async fn run(
     decode(&capture, audio).await;
     let live = nodes[2].directory.path().join("active-at-failure.ts");
     let active_ticket = fresh(&client, &nodes[3], &nodes[2]).await;
-    *active = Some(receiver(&active_ticket, &live, "30"));
+    *active = Some(receiver(&active_ticket, &live, None));
     tokio::time::timeout(Duration::from_secs(12), async {
         loop {
             assert!(
@@ -274,10 +286,28 @@ async fn run(
     })
     .await
     .expect("independent caller must receive media before origin shutdown");
+    if transport == "m4f" && audio == "mp2" {
+        let before = std::fs::metadata(&live).unwrap().len();
+        // No failure is injected during this interval. A finite 30-second
+        // capture must not masquerade as a failure-driven SRT disconnect.
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        assert!(
+            active.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "healthy active SRT caller must outlive the former 30-second capture deadline"
+        );
+        assert!(
+            std::fs::metadata(&live).unwrap().len() > before,
+            "healthy caller keeps receiving media before fault injection"
+        );
+    }
     let before = stats(&nodes[2].node(&client).await);
     assert_eq!(before["upstream_source"], "a");
     assert!(nodes[3].owned_encoders().is_empty());
     let before_pid = before["pid"].as_u64().unwrap();
+    assert!(
+        active.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "active caller must still be alive immediately before fault injection"
+    );
     assert!(
         nodes[0].stop().await,
         "stop/reap only the owned failed origin"
@@ -291,7 +321,7 @@ async fn run(
         }
         assert!(
             closed.is_ok_and(|r| r.is_ok()),
-            "old SRT caller must close before its normal capture deadline, without waiting for recovery"
+            "old SRT caller must close before its 30-second read timeout, without waiting for recovery"
         );
     };
     let (after, ()) = tokio::join!(recovered(&client, &nodes[2], &before), closing);
