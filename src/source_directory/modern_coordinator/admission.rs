@@ -1,4 +1,6 @@
 //! Opt-in direct-source viewer admission. No automatic routing or worker owner.
+mod activation;
+pub use activation::{ActivatedCandidate, ActivationControl};
 mod pull;
 mod shared;
 use super::{CoordinatedCandidate, CoordinationFailure, ModernSourceCoordinator};

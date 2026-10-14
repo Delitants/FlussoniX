@@ -1943,3 +1943,6 @@ async fn hls_old_pending_reservation_cannot_remove_a_new_epoch_session() {
     .await
     .unwrap();
 }
+
+#[path = "vendor_shared_packaging/activation.rs"]
+mod activation;
