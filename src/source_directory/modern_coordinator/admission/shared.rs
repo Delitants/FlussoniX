@@ -1,5 +1,6 @@
 //! One private input per generation; viewer grants remain independently owned.
 mod feed;
+mod permission;
 mod renewal;
 use super::{AdmissionFailure, AdmittedCandidate, ModernSourceCoordinator};
 use crate::{
@@ -7,6 +8,7 @@ use crate::{
 };
 use bytes::Bytes;
 pub(crate) use feed::SharedFeed;
+use permission::Permission;
 pub use renewal::SharedRenewal;
 use std::{
     collections::{HashMap, VecDeque},
@@ -84,7 +86,7 @@ struct Worker {
 struct Viewer {
     id: Uuid,
     worker: Arc<Worker>,
-    admission: Arc<AdmittedCandidate>,
+    admission: Permission,
 }
 #[derive(Clone)]
 pub struct SharedViewer {
@@ -175,7 +177,7 @@ impl Worker {
     }
     fn compatible(
         &self,
-        admitted: &AdmittedCandidate,
+        admitted: &Permission,
         policy: &Policy,
         options: &SharedInputOptions,
     ) -> bool {
@@ -183,10 +185,10 @@ impl Worker {
             return false;
         }
         let a = self.route.lock().unwrap();
-        let b = &admitted.candidate;
+        let b = admitted.candidate();
         same_source(&a.handle, &b.handle)
             && a.candidate.shares_lease(&b.candidate)
-            && self.name == admitted.name
+            && self.name == admitted.name()
     }
     fn at_route<T>(
         &self,
@@ -224,10 +226,7 @@ impl Worker {
             .map_err(SharedFailure::Authority)
     }
 
-    fn attach(
-        self: &Arc<Self>,
-        admission: Arc<AdmittedCandidate>,
-    ) -> Result<SharedViewer, SharedFailure> {
+    fn attach(self: &Arc<Self>, admission: Permission) -> Result<SharedViewer, SharedFailure> {
         let mut members = self.members.lock().unwrap();
         members.retain(|_, v| v.strong_count() > 0);
         if members.len() >= 20_000 {
@@ -240,9 +239,7 @@ impl Worker {
         });
         members.insert(inner.id, Arc::downgrade(&inner));
         drop(members);
-        if !inner.admission.background {
-            inner.admission.grant.playback();
-        }
+        inner.admission.playback();
         self.changed.notify_one();
         Ok(SharedViewer { inner })
     }
@@ -366,6 +363,17 @@ impl SharedInputs {
     ) -> Result<SharedInputAttachment, SharedFailure> {
         self.attach(admission.into_native(), options)
     }
+    /// Attach locally selected static input ownership without a viewer session.
+    /// Every network viewer must still enter through independent native admission.
+    pub fn attach_activation(
+        &self,
+        activation: super::ActivatedCandidate,
+        options: SharedInputOptions,
+    ) -> Result<SharedInputAttachment, SharedFailure> {
+        self.attach_permission(Permission::Activation(Arc::new(activation)), |_| {
+            Ok(options)
+        })
+    }
     /// Consume an independently authorized viewer. The first attachment owns
     /// startup; later attachments share only a current compatible generation.
     pub fn attach(
@@ -429,20 +437,28 @@ impl SharedInputs {
         admission: Box<AdmittedCandidate>,
         options: impl FnOnce(Option<&Worker>) -> Result<SharedInputOptions, SharedFailure>,
     ) -> Result<SharedInputAttachment, SharedFailure> {
-        let admission: Arc<AdmittedCandidate> = admission.into();
+        self.attach_permission(Permission::Viewer(admission.into()), options)
+    }
+    fn attach_permission(
+        &self,
+        admission: Permission,
+        options: impl FnOnce(Option<&Worker>) -> Result<SharedInputOptions, SharedFailure>,
+    ) -> Result<SharedInputAttachment, SharedFailure> {
         let mut registry = self
             .workers
             .lock()
             .map_err(|_| SharedFailure::Unavailable)?;
         let workers = &mut registry.workers;
         workers.retain(|_, w| w.upgrade().is_some_and(|w| !w.cancel.is_cancelled()));
-        let old = workers.get(&admission.name).and_then(Weak::upgrade);
+        let old = workers.get(admission.name()).and_then(Weak::upgrade);
         // Check outside the incoming publication fence to avoid lock reentry.
         let reuse = old.as_ref().filter(|w| w.current().is_ok());
         self.owner
-            .at_admission_candidate(&admission.candidate, &admission.name, |view, input| {
+            .at_admission_candidate(admission.candidate(), admission.name(), |view, input| {
                 admission.at_scope(|| {
-                    if admission.is_cancelled() {
+                    if admission.is_cancelled()
+                        || (!admission.counts_as_viewer() && !view.selected_static)
+                    {
                         return Err(AdmissionFailure::Revoked);
                     }
                     let options = match options(reuse.map(Arc::as_ref)) {
@@ -470,9 +486,9 @@ impl SharedInputs {
                             id: Uuid::new_v4(),
                             registry: self.id.clone(),
                             owner: self.owner.clone(),
-                            handle: admission.candidate.handle.clone(),
-                            route: Mutex::new(copy_route(&admission.candidate)),
-                            scope: admission.selection.clone(),
+                            handle: admission.candidate().handle.clone(),
+                            route: Mutex::new(copy_route(admission.candidate())),
+                            scope: admission.selection(),
                             failure: self.failures.lock().unwrap().get(view.name).cloned(),
                             name: view.name.into(),
                             policy: view.policy.clone(),
@@ -538,6 +554,9 @@ impl Drop for SharedInputs {
     }
 }
 impl SharedViewer {
+    pub(crate) fn counts_as_viewer(&self) -> bool {
+        self.inner.admission.counts_as_viewer()
+    }
     pub(crate) fn is_closed(&self) -> bool {
         self.inner.worker.cancel.is_cancelled() || self.inner.admission.is_cancelled()
     }

@@ -153,3 +153,14 @@ impl ReplicaChoice {
             .is_ok_and(|result| result.unwrap_or(false))
     }
 }
+impl super::ReplicaRoute {
+    pub(crate) fn activate(
+        self,
+        candidate: CoordinatedCandidate,
+    ) -> Result<super::super::ActivatedCandidate, ReplicaFailure> {
+        let owner = self.stamp.selector.owner.clone();
+        owner
+            .activate_scoped(candidate, Some(self))
+            .map_err(ReplicaFailure::Admission)
+    }
+}

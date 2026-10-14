@@ -29,9 +29,7 @@ impl SharedViewer {
         }
     }
     pub(crate) fn add_bytes(&self, n: usize) {
-        if !self.inner.admission.background {
-            self.inner.admission.grant.add_bytes(n);
-        }
+        self.inner.admission.add_bytes(n);
     }
 }
 impl SharedFeed {

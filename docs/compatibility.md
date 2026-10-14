@@ -646,3 +646,14 @@ ancestry or private endpoint identity. Automatic vendor routing remains disabled
 ## Explicit vendor HTTP source recovery
 
 Configured Flussonic HTTP sources now support [equivalent-origin failover](vendor-daemon-failover.md) with explicit local group/content identity, equal policies and processing, guarded native viewer admission, private rejection barriers and background shared-worker replacement. HLS discontinuities and continuous-response reconnects apply. Always-on vendor activation, vendor RTSP/SRT delivery, vendor CDN destinations and production mixed-cluster qualification remain pending.
+
+### Vendor static input ownership foundation
+
+The [static input ownership library](vendor-static-activation.md) can keep a
+current selected vendor static candidate in the shared input/packager without
+creating a viewer session, calling viewer authentication, consuming viewer
+limits or renewing playback activity. Real viewers retain independent native
+authorization and share that generation. Cancellation, source/configuration
+changes, lease expiry, demotion and replica switches fence stale owners.
+Automatic vendor inventory polling and daemon startup scheduling remain pending;
+existing vendor playback stays demand-driven.

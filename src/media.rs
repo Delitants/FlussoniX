@@ -1128,6 +1128,9 @@ impl Engine {
         Ok(worker)
     }
     pub async fn read(&self, name: &str, file: &str) -> Result<Bytes, String> {
+        self.read_mode(name, file, true).await
+    }
+    async fn read_mode(&self, name: &str, file: &str, touch_demand: bool) -> Result<Bytes, String> {
         if self
             .workers
             .lock()
@@ -1173,7 +1176,9 @@ impl Engine {
             return Err("invalid media path".into());
         }
         if let Some(w) = self.workers.lock().await.get(name) {
-            w.touch();
+            if touch_demand {
+                w.touch();
+            }
         } else {
             return Err("media worker unavailable".into());
         }

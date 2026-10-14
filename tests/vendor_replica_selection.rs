@@ -368,3 +368,61 @@ async fn late_lookup_success_cannot_replace_the_newer_selection() {
         f.origins[1].key
     );
 }
+
+#[tokio::test]
+async fn static_activation_is_fenced_by_replica_renewal_switch_and_owner_identity() {
+    use flussonix::source_directory::modern_coordinator::{SharedInputOptions, SharedInputs};
+    let f = Fixture::new().await;
+    let s = f.selector();
+    let a = f.handle(0);
+    let b = f.handle(1);
+    let mut lookup = s.begin(NAME).unwrap();
+    let choice = lookup
+        .observe(&a, f.owner.inventory(&a, Duration::from_secs(30)).await)
+        .unwrap()
+        .unwrap();
+    let activated = s.activate(choice).unwrap();
+    let control = activated.control();
+    let inputs = SharedInputs::new(f.owner.clone());
+    let attachment = inputs
+        .attach_activation(activated, SharedInputOptions::default())
+        .unwrap();
+    assert_eq!(
+        inputs
+            .renew(&a, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .renewed,
+        1
+    );
+    attachment.viewer.current().unwrap();
+    let mut replacement = s.begin(NAME).unwrap();
+    assert!(
+        replacement
+            .observe(
+                &a,
+                Err(CoordinationFailure::Lease(LeaseFailure::Binding(
+                    BindingFailure::Inventory(
+                        flussonix::source_directory::LookupFailure::Unavailable
+                    )
+                )))
+            )
+            .unwrap()
+            .is_none()
+    );
+    let next = replacement
+        .observe(&b, f.owner.inventory(&b, Duration::from_secs(30)).await)
+        .unwrap()
+        .unwrap();
+    s.current(&next).unwrap();
+    assert!(attachment.viewer.current().is_err());
+    let foreign = f.selector();
+    assert!(foreign.activate(next).is_err());
+    control.cancel();
+    drop(attachment);
+    assert!(
+        f.origins
+            .iter()
+            .all(|o| o.private_calls.load(Ordering::SeqCst) == 0)
+    );
+}

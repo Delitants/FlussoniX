@@ -33,8 +33,10 @@ struct Viewer {
 }
 impl Drop for Viewer {
     fn drop(&mut self) {
-        self.worker.viewers.fetch_sub(1, Ordering::Relaxed);
-        self.worker.touch();
+        if self.source.counts_as_viewer() {
+            self.worker.viewers.fetch_sub(1, Ordering::Relaxed);
+            self.worker.touch();
+        }
     }
 }
 #[derive(Clone)]
@@ -118,7 +120,7 @@ impl Engine {
             .ensure_mode(
                 &name,
                 &cfg,
-                true,
+                attachment.viewer.counts_as_viewer(),
                 async { current() },
                 StartMode {
                     shared: Some(SharedStart {
@@ -145,7 +147,9 @@ impl Engine {
         if worker.is_closed() {
             return Err(SharedPackagingFailure::Closed);
         }
-        worker.viewers.fetch_add(1, Ordering::Relaxed);
+        if attachment.viewer.counts_as_viewer() {
+            worker.viewers.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(PackagedPlayback {
             inner: Arc::new(Viewer {
                 name,
@@ -166,7 +170,11 @@ impl Engine {
             return Err(SharedPackagingFailure::Closed);
         }
         let bytes = self
-            .read(&playback.inner.name, file)
+            .read_mode(
+                &playback.inner.name,
+                file,
+                playback.inner.source.counts_as_viewer(),
+            )
             .await
             .map_err(|_| SharedPackagingFailure::Unavailable)?;
         playback.current()?;
@@ -226,7 +234,9 @@ impl PackagedPlayback {
         receiver: Receiver,
     ) -> Result<PackagedSubscription, SharedPackagingFailure> {
         self.current()?;
-        self.inner.worker.touch();
+        if self.inner.source.counts_as_viewer() {
+            self.inner.worker.touch();
+        }
         Ok(PackagedSubscription {
             playback: self.clone(),
             bootstrap: bootstrap.into(),
@@ -235,7 +245,12 @@ impl PackagedPlayback {
     }
     pub fn subscribe_ts(&self) -> Result<PackagedSubscription, SharedPackagingFailure> {
         self.current()?;
-        self.subscription(vec![], Receiver::Ts(self.inner.worker.subscribe()))
+        let receiver = if self.inner.source.counts_as_viewer() {
+            self.inner.worker.subscribe()
+        } else {
+            self.inner.worker.tx.subscribe()
+        };
+        self.subscription(vec![], Receiver::Ts(receiver))
     }
     pub fn subscribe_m4s(&self) -> Result<PackagedSubscription, SharedPackagingFailure> {
         self.current()?;
@@ -271,7 +286,39 @@ impl PackagedSubscription {
         };
         self.playback.current()?;
         self.playback.inner.source.add_bytes(bytes.len());
-        self.playback.inner.worker.touch();
+        if self.playback.inner.source.counts_as_viewer() {
+            self.playback.inner.worker.touch();
+        }
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod activation_tests {
+    use super::*;
+    #[tokio::test]
+    async fn owner_file_polling_does_not_renew_playback_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "ffmpeg");
+        let worker = engine
+            .ensure("owned", &json!({"inputs":[{"url":"testsrc://"}]}))
+            .await
+            .unwrap();
+        *worker.last_access.lock().unwrap() = Instant::now() - Duration::from_secs(20);
+        let _ = engine.read_mode("owned", "index.m3u8", false).await;
+        let owner_idle = worker.idle_seconds();
+        let _ = engine.read("owned", "index.m3u8").await;
+        let viewer_idle = worker.idle_seconds();
+        let pid = worker.pid();
+        engine.stop_all().await;
+        assert!(
+            owner_idle >= 20,
+            "owner file polling renewed the actual viewer clock"
+        );
+        assert!(
+            viewer_idle < 2,
+            "real viewer file requests stopped marking playback"
+        );
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
     }
 }

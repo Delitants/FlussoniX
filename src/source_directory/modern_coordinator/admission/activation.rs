@@ -98,3 +98,14 @@ impl ModernSourceCoordinator {
         })
     }
 }
+impl super::super::ReplicaSelector {
+    /// Preserve the exact selected-origin generation for static input ownership.
+    pub fn activate(
+        &self,
+        choice: super::super::ReplicaChoice,
+    ) -> Result<ActivatedCandidate, super::super::ReplicaFailure> {
+        self.current(&choice)?;
+        let (candidate, scope) = choice.into_managed();
+        scope.activate(candidate)
+    }
+}
