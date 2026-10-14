@@ -270,6 +270,69 @@ async fn expired_foreign_and_replaced_source_observations_cannot_publish_selecti
     );
 }
 
+// An old negative fact must not cancel a recovered route or create a tombstone.
+#[tokio::test]
+async fn superseded_negative_inventory_preserves_the_current_healthy_choice() {
+    for rows in [
+        json!([]),
+        json!([{"name":NAME,"named_by":"config","static":true,"groups":[],"disabled":true}]),
+    ] {
+        let f = Fixture::new().await;
+        let s = f.selector();
+        let a = f.handle(0);
+        let healthy = f.origins[0].rows.lock().unwrap().clone();
+        *f.origins[0].rows.lock().unwrap() = rows;
+        let old = f
+            .owner
+            .inventory(&a, Duration::from_secs(30))
+            .await
+            .unwrap();
+        *f.origins[0].rows.lock().unwrap() = healthy;
+        let mut recovered = s.begin(NAME).unwrap();
+        let choice = recovered
+            .observe(&a, f.owner.inventory(&a, Duration::from_secs(30)).await)
+            .unwrap()
+            .unwrap();
+        s.current(&choice).unwrap();
+        let mut later = s.begin(NAME).unwrap();
+        assert!(matches!(
+            later.observe(&a, Ok(old)),
+            Err(
+                flussonix::source_directory::modern_coordinator::ReplicaFailure::Coordination(
+                    CoordinationFailure::Lease(LeaseFailure::Superseded)
+                )
+            )
+        ));
+        let status = s.status(NAME).unwrap();
+        assert!(status.available);
+        assert!(!status.blocked);
+        assert_eq!(status.switches, 0);
+        s.current(&choice).unwrap();
+        assert_eq!(later.next_source().unwrap(), Some(f.origins[0].key.clone()));
+    }
+}
+
+#[tokio::test]
+async fn expired_negative_inventory_cannot_create_an_authoritative_block() {
+    let f = Fixture::new().await;
+    let s = f.selector();
+    let a = f.handle(0);
+    *f.origins[0].rows.lock().unwrap() = json!([]);
+    let old = f.owner.inventory(&a, Duration::from_secs(1)).await.unwrap();
+    tokio::time::sleep_until(tokio::time::Instant::from_std(old.expires_at())).await;
+    let mut later = s.begin(NAME).unwrap();
+    assert!(matches!(
+        later.observe(&a, Ok(old)),
+        Err(
+            flussonix::source_directory::modern_coordinator::ReplicaFailure::Coordination(
+                CoordinationFailure::Lease(LeaseFailure::Expired)
+            )
+        )
+    ));
+    assert!(!s.status(NAME).unwrap().blocked);
+    assert_eq!(later.next_source().unwrap(), Some(f.origins[0].key.clone()));
+}
+
 #[tokio::test]
 async fn configuration_identity_and_shutdown_fence_outstanding_choices() {
     for mode in 0..3 {

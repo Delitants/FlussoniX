@@ -308,6 +308,21 @@ impl ModernSourceCoordinator {
             })
         })
     }
+    /// Inventory facts, including absence and disabled metadata, must remain
+    /// current through any synchronous selection mutation. Never reenter owners.
+    fn at_inventory_current<T>(
+        &self,
+        inventory: &CoordinatedInventory,
+        commit: impl FnOnce() -> T,
+    ) -> Result<T, CoordinationFailure> {
+        self.at_handle(&inventory.handle, || {
+            inventory
+                .handle
+                .authority
+                .with_modern_inventory_current(&inventory.inventory, commit)
+                .map_err(CoordinationFailure::Lease)
+        })
+    }
     /// Hold config -> coordinator -> source through synchronous closure entry and
     /// return. Never await/reenter any owner in the closure. Async work must return
     /// through a fresh fence; exported inputs/workers/sessions are not revoked.

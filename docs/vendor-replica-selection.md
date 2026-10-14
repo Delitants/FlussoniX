@@ -25,7 +25,9 @@ selected origin blocks fallback through later outages. That same origin must
 return valid metadata and matching policy, or the owner must replace the selector
 or configuration. Ineligible backups can be skipped. Modern management redirects
 and non-server HTTP errors are authoritative; legacy inventory classification
-is unchanged.
+is unchanged. Absence and disabled metadata are checked under the inventory
+lease fence before changing route state; expired or superseded facts cannot block
+a recovered route.
 
 Choices and admissions remain opaque. Config, owner identity, source generation,
 inventory lease, lookup ordering and selected-route generation are checked before

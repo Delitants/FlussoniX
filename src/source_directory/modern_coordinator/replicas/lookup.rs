@@ -27,7 +27,50 @@ fn authoritative(error: CoordinationFailure) -> bool {
     )
 }
 
+enum Observation {
+    Candidate(CoordinatedCandidate),
+    Rejected(Result<Option<ReplicaChoice>, ReplicaFailure>),
+    Failed(CoordinationFailure),
+}
+
 impl ReplicaLookup {
+    // Caller holds either the current source handle fence (trusted error input)
+    // or the full inventory lease fence (opaque positive/negative facts).
+    fn reject_current(
+        &self,
+        selected: usize,
+        authoritative: bool,
+    ) -> Result<Option<ReplicaChoice>, ReplicaFailure> {
+        let mut state = self.selector.state()?;
+        let entry = state
+            .entries
+            .get_mut(&self.name)
+            .ok_or(ReplicaFailure::Stale)?;
+        if !Arc::ptr_eq(&entry.turn, &self.turn) {
+            return Err(ReplicaFailure::Stale);
+        }
+        if selected == self.first {
+            entry.available = false;
+            entry.route.cancel.cancel();
+            if authoritative {
+                entry.blocked = true;
+            }
+            if entry.blocked {
+                return Err(ReplicaFailure::Blocked);
+            }
+        }
+        Ok(None)
+    }
+    fn finish_rejection(
+        &mut self,
+        outcome: Result<Option<ReplicaChoice>, ReplicaFailure>,
+    ) -> Result<Option<ReplicaChoice>, ReplicaFailure> {
+        self.offset += 1;
+        if matches!(outcome, Err(ReplicaFailure::Blocked)) {
+            self.finished = true;
+        }
+        outcome
+    }
     fn reject(
         &mut self,
         handle: &SourceHandle,
@@ -37,35 +80,9 @@ impl ReplicaLookup {
         let outcome = self
             .selector
             .owner
-            .at_handle(handle, || {
-                Ok((|| {
-                    let mut state = self.selector.state()?;
-                    let entry = state
-                        .entries
-                        .get_mut(&self.name)
-                        .ok_or(ReplicaFailure::Stale)?;
-                    if !Arc::ptr_eq(&entry.turn, &self.turn) {
-                        return Err(ReplicaFailure::Stale);
-                    }
-                    if selected == self.first {
-                        entry.available = false;
-                        entry.route.cancel.cancel();
-                        if authoritative {
-                            entry.blocked = true;
-                        }
-                        if entry.blocked {
-                            return Err(ReplicaFailure::Blocked);
-                        }
-                    }
-                    Ok(None)
-                })())
-            })
+            .at_handle(handle, || Ok(self.reject_current(selected, authoritative)))
             .map_err(ReplicaFailure::Coordination)?;
-        self.offset += 1;
-        if matches!(outcome, Err(ReplicaFailure::Blocked)) {
-            self.finished = true;
-        }
-        outcome
+        self.finish_rejection(outcome)
     }
     pub fn next_source(&self) -> Result<Option<String>, ReplicaFailure> {
         self.selector.at_plan(|| {
@@ -119,7 +136,24 @@ impl ReplicaLookup {
                 if !Arc::ptr_eq(&handle.authority, &inventory.handle.authority) {
                     return Err(ReplicaFailure::Stale);
                 }
-                inventory.candidate(&self.name)
+                let observation = self
+                    .selector
+                    .owner
+                    .at_inventory_current(&inventory, || match inventory.candidate(&self.name) {
+                        Ok(candidate) => Observation::Candidate(candidate),
+                        Err(error) if transient(error) || authoritative(error) => {
+                            Observation::Rejected(
+                                self.reject_current(selected, authoritative(error)),
+                            )
+                        }
+                        Err(error) => Observation::Failed(error),
+                    })
+                    .map_err(ReplicaFailure::Coordination)?;
+                match observation {
+                    Observation::Candidate(candidate) => Ok(candidate),
+                    Observation::Rejected(outcome) => return self.finish_rejection(outcome),
+                    Observation::Failed(error) => return Err(ReplicaFailure::Coordination(error)),
+                }
             }
             Err(error) => Err(error),
         };

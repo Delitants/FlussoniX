@@ -103,6 +103,22 @@ impl ModernLeasedCandidate {
     }
 }
 impl SourceAuthority {
+    /// Fence negative facts as well as candidates. Keep this source lock through
+    /// the synchronous mutation; a pre-check alone races a newer refresh.
+    pub(crate) fn with_modern_inventory_current<T>(
+        &self,
+        inventory: &ModernLeasedInventory,
+        commit: impl FnOnce() -> T,
+    ) -> Result<T, LeaseFailure> {
+        let snapshot = &inventory.inventory.inventory.snapshot;
+        let state = self
+            .current(snapshot.revision, &snapshot.profile)
+            .map_err(projection)?;
+        inventory.ticket.check(&state)?;
+        let result = commit();
+        inventory.ticket.check(&state)?;
+        Ok(result)
+    }
     pub(crate) fn guard_modern_lease<'a>(
         &'a self,
         bound: &'a ModernLeasedCandidate,
