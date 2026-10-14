@@ -13,13 +13,15 @@ type Slot = Arc<Mutex<Option<Arc<Snapshot>>>>;
 pub(super) struct Registry {
     slots: Mutex<(u64, HashMap<String, Slot>)>,
     network: Semaphore,
+    vendor_network: Semaphore,
     pub(super) vendor: std::sync::Mutex<super::vendor_http_state::Book>,
 }
 impl Default for Registry {
     fn default() -> Self {
         Self {
             slots: Mutex::new((0, HashMap::new())),
-            network: Semaphore::new(64),
+            network: Semaphore::new(8),
+            vendor_network: Semaphore::new(64),
             vendor: std::sync::Mutex::new(Default::default()),
         }
     }
@@ -69,7 +71,12 @@ impl App {
             return Some(snapshot.clone());
         }
 
-        let _network = self.http_routes.network.acquire().await.ok()?;
+        let network = if vendor {
+            &self.http_routes.vendor_network
+        } else {
+            &self.http_routes.network
+        };
+        let _network = network.acquire().await.ok()?;
         if self.config.revision() != revision {
             return None;
         }
