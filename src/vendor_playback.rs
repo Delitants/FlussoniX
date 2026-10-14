@@ -38,7 +38,7 @@ pub(crate) fn select(root: &Value, name: &str, revision: u64) -> Selection {
     {
         return Selection::Native;
     }
-    let mut selected = None;
+    let mut selected: Option<&Value> = None;
     for source in root["sources"]
         .as_array()
         .into_iter()
@@ -52,8 +52,15 @@ pub(crate) fn select(root: &Value, name: &str, revision: u64) -> Selection {
         if !namespace {
             continue;
         }
-        if selected.replace(source).is_some() {
-            return Selection::Ambiguous;
+        if let Some(first) = selected {
+            if first["flussonix_source_group"].as_str().is_none()
+                || first["flussonix_source_group"] != source["flussonix_source_group"]
+                || first["flussonix_content_id"] != source["flussonix_content_id"]
+            {
+                return Selection::Ambiguous;
+            }
+        } else {
+            selected = Some(source);
         }
     }
     match selected {

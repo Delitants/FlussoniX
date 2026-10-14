@@ -742,5 +742,6 @@ fn validate_root(root: &Value) -> Result<(), String> {
             }
         }
     }
+    vendor_sources::validate_groups(root)?;
     Ok(())
 }

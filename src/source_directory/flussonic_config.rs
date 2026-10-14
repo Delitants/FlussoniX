@@ -41,6 +41,14 @@ pub(crate) fn normalized_modern_source(source: &Value) -> Result<Value, Projecti
     {
         return Err(ProjectionFailure::Unsupported);
     }
+    let group = object.remove("flussonix_source_group");
+    let content = object.remove("flussonix_content_id");
+    if group.is_some() != content.is_some() {
+        return Err(ProjectionFailure::Invalid);
+    }
+    for identity in [group, content].into_iter().flatten() {
+        crate::config::valid_identity(&identity).map_err(|_| ProjectionFailure::Invalid)?;
+    }
     if let Some(reference) = object.remove("flussonix_output_template") {
         crate::config::valid_name(reference.as_str().ok_or(ProjectionFailure::Invalid)?)
             .map_err(|_| ProjectionFailure::Invalid)?;
