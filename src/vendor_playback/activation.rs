@@ -161,7 +161,7 @@ impl Runtime {
             .playback
             .clone()
     }
-    pub(super) fn static_jobs(&self, active: &HashMap<String, CancellationToken>) -> Vec<String> {
+    pub(super) fn static_jobs(&self, active: &HashMap<String, recovery::ActiveJob>) -> Vec<String> {
         let mut state = self.activation.lock().unwrap();
         let due = state
             .demands
@@ -183,10 +183,27 @@ impl Runtime {
         state.cursor = rotated.get(3).or(rotated.last()).cloned();
         rotated
     }
-    pub(super) async fn start_static(&self, app: &App, name: &str) -> bool {
+    pub(super) fn static_job_epoch(&self, name: &str) -> Option<(u64, Arc<()>)> {
+        let state = self.activation.lock().unwrap();
+        let demand = state.demands.get(name)?;
+        Some((demand.revision, demand.epoch.clone()))
+    }
+    pub(super) fn static_job_current(&self, name: &str, revision: u64, epoch: &Arc<()>) -> bool {
+        self.activation
+            .lock()
+            .unwrap()
+            .demands
+            .get(name)
+            .is_some_and(|d| d.revision == revision && Arc::ptr_eq(&d.epoch, epoch))
+    }
+    pub(super) async fn start_static(&self, app: &App, name: &str, expected: &Arc<()>) -> bool {
         let (revision, epoch, key, group, settings, playback) = {
             let mut state = self.activation.lock().unwrap();
-            let Some(d) = state.demands.get_mut(name) else {
+            let Some(d) = state
+                .demands
+                .get_mut(name)
+                .filter(|d| Arc::ptr_eq(&d.epoch, expected))
+            else {
                 return false;
             };
             if d.next_attempt > Instant::now() {
@@ -336,3 +353,6 @@ impl Runtime {
         status
     }
 }
+
+#[cfg(test)]
+mod scheduling_tests;

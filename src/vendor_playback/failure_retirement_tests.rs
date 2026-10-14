@@ -6,17 +6,17 @@ use axum::{
 };
 use serde_json::json;
 use std::sync::atomic::AtomicUsize;
-struct Origin {
-    key: String,
+pub(in crate::vendor_playback) struct Origin {
+    pub(in crate::vendor_playback) key: String,
     task: tokio::task::JoinHandle<()>,
-    calls: Arc<AtomicUsize>,
+    pub(in crate::vendor_playback) calls: Arc<AtomicUsize>,
 }
 impl Drop for Origin {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
-async fn origin(id: &'static str) -> Origin {
+pub(in crate::vendor_playback) async fn origin(id: &'static str) -> Origin {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let key = format!("m4s://{}", listener.local_addr().unwrap());
     let calls = Arc::new(AtomicUsize::new(0));

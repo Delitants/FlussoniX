@@ -383,3 +383,27 @@ async fn viewer_recovery_continues_when_only_backup_selects_static_activation() 
     assert_eq!(f.origins[1].private_calls.load(Ordering::SeqCst), 1);
     f.stop().await;
 }
+
+#[tokio::test]
+async fn viewer_recovery_deadline_wins_over_ineligible_static_backoff() {
+    let mut f = Fixture::new().await;
+    let third = fixture::Origin::start("owned-origin-c").await;
+    f.app.config.put("sources",&third.key,json!({"flussonix_source_kind":"flussonic","cluster_key":third.secret,"on_play":"true","flussonix_source_group":"music-origins","flussonix_content_id":"explicit-music-v1"})).unwrap();
+    f.origins.push(third);
+    let _ = f.playlist().await;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while node(&f).await["vendor_source_activation"]["wanted_streams"] != 1 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("static intent not published");
+    // Healthy retries occur near 0, 1, 3, 7 and 15 seconds. The next static
+    // attempt is around31s; viewer recovery must follow its own earlier deadline.
+    tokio::time::sleep(Duration::from_secs(19)).await;
+    f.origins[0].close_media();
+    f.wait_private(1, 1).await;
+    let _ = f.playlist().await;
+    assert_eq!(f.origins[1].private_calls.load(Ordering::SeqCst), 1);
+    f.stop().await;
+}

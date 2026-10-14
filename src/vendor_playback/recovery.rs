@@ -1,7 +1,7 @@
 //! Bounded owner-scheduled replacement using original admitted viewer permission.
 #[cfg(test)]
 #[path = "failure_retirement_tests.rs"]
-mod failure_retirement_tests;
+pub(in crate::vendor_playback) mod failure_retirement_tests;
 use super::replicas::{Group, Mode};
 use super::*;
 use crate::{
@@ -23,6 +23,16 @@ pub(super) struct Entry {
     next_attempt: Instant,
     streak: u32,
     pending: usize,
+}
+#[derive(Clone)]
+enum JobOwner {
+    Static(Arc<()>),
+    Viewer(Arc<Group>),
+}
+pub(super) struct ActiveJob {
+    revision: u64,
+    owner: JobOwner,
+    cancel: CancellationToken,
 }
 pub(super) struct Attempt<'a> {
     runtime: &'a Runtime,
@@ -245,7 +255,7 @@ impl Runtime {
     pub(super) async fn maintain_replicas(&self, app: &App, cancel: CancellationToken) {
         type Job<'a> = Pin<Box<dyn Future<Output = String> + Send + 'a>>;
         let mut jobs = FuturesUnordered::<Job<'_>>::new();
-        let mut active = HashMap::<String, CancellationToken>::new();
+        let mut active = HashMap::<String, ActiveJob>::new();
         let mut static_first = true;
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -256,14 +266,6 @@ impl Runtime {
             }
             self.sync_static(app);
             let static_due = self.static_jobs(&active);
-            let static_names = self
-                .activation
-                .lock()
-                .unwrap()
-                .demands
-                .keys()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>();
             let due = {
                 let mut state = self.recovery.lock().unwrap();
                 state.entries.retain(|_, e| {
@@ -275,9 +277,19 @@ impl Runtime {
                     !e.anchors.is_empty() || e.pending > 0
                 });
                 self.retain_failure_slots(&state);
-                for (name, token) in &active {
-                    if !state.entries.contains_key(name) && !static_names.contains(name) {
-                        token.cancel();
+                for (name, job) in &active {
+                    let current = job.revision == app.config.revision()
+                        && match &job.owner {
+                            JobOwner::Static(epoch) => {
+                                self.static_job_current(name, job.revision, epoch)
+                            }
+                            JobOwner::Viewer(group) => state
+                                .entries
+                                .get(name)
+                                .is_some_and(|e| Arc::ptr_eq(&e.group, group)),
+                        };
+                    if !current {
+                        job.cancel.cancel();
                     }
                 }
                 state
@@ -285,7 +297,6 @@ impl Runtime {
                     .iter()
                     .filter(|(name, e)| {
                         !active.contains_key(*name)
-                            && !static_names.contains(*name)
                             && e.pending == 0
                             && e.next_attempt <= Instant::now()
                     })
@@ -304,16 +315,41 @@ impl Runtime {
                 viewer_due.chain(static_due).collect::<Vec<_>>()
             };
             static_first = !static_first;
-            for (name, group) in due.into_iter().take(8usize.saturating_sub(active.len())) {
+            let mut seen = std::collections::HashSet::new();
+            let due = due
+                .into_iter()
+                .filter(|(name, _)| seen.insert(name.clone()))
+                .take(8usize.saturating_sub(active.len()));
+            for (name, group) in due {
+                let (revision, owner) = match group {
+                    Some(group) => (group.revision, JobOwner::Viewer(group)),
+                    None => {
+                        let Some((revision, epoch)) = self.static_job_epoch(&name) else {
+                            continue;
+                        };
+                        (revision, JobOwner::Static(epoch))
+                    }
+                };
+                if revision != app.config.revision() {
+                    continue;
+                }
                 let token = cancel.child_token();
-                active.insert(name.clone(), token.clone());
+                active.insert(
+                    name.clone(),
+                    ActiveJob {
+                        revision,
+                        owner: owner.clone(),
+                        cancel: token.clone(),
+                    },
+                );
                 jobs.push(Box::pin(async move{
-                    let work=async{match group{
-                        Some(g)=>self.recover_one(app,&name,g).await,
-                        None=>if !self.start_static(app,&name).await {
-                            // Static intent may belong only to another member.
-                            // It cannot suppress independently authorized viewer
-                            // recovery when the selected candidate is on demand.
+                    let work=async{match owner{
+                        JobOwner::Viewer(g)=>self.recover_one(app,&name,g).await,
+                        JobOwner::Static(epoch)=>if !self.start_static(app,&name,&epoch).await
+                            && app.config.revision()==revision
+                            && self.static_job_current(&name,revision,&epoch) {
+                            // An ineligible static owner cannot defer original-
+                            // grant viewer recovery to its own later retry time.
                             let group=self.recovery.lock().unwrap().entries.get(&name).map(|e|e.group.clone());
                             if let Some(group)=group {self.recover_one(app,&name,group).await;}
                         }
