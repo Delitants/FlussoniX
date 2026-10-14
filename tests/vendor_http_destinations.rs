@@ -30,6 +30,9 @@ struct StateData {
     delay_ms: Arc<AtomicU64>,
     flip: Arc<std::sync::atomic::AtomicBool>,
     calls: Arc<AtomicU64>,
+    stream_status: Arc<std::sync::atomic::AtomicU16>,
+    inventory_calls: Arc<AtomicU64>,
+    source_calls: Arc<AtomicU64>,
     config: Arc<Mutex<Value>>,
     stream: Arc<Mutex<Value>>,
 }
@@ -46,6 +49,9 @@ impl Vendor {
             delay_ms: Arc::new(AtomicU64::new(0)),
             flip: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             calls: Arc::new(AtomicU64::new(0)),
+            stream_status: Arc::new(std::sync::atomic::AtomicU16::new(200)),
+            inventory_calls: Arc::new(AtomicU64::new(0)),
+            source_calls: Arc::new(AtomicU64::new(0)),
             config: Arc::new(Mutex::new(
                 json!({"stats":{"id":"owned-vendor-server","cpu_usage":10,"memory_usage":20,"output_kbit":10000,"total_bandwidth":100000000,"total_clients":1,"streamer_status":"running"}}),
             )),
@@ -106,7 +112,25 @@ impl Vendor {
                 "/streamer/api/v3/streams/{name}",
                 get(|State(s): State<StateData>, h: HeaderMap| async move {
                     check(&s, &h).await;
-                    axum::Json(s.stream.lock().unwrap().clone())
+                    (
+                        StatusCode::from_u16(s.stream_status.load(Ordering::SeqCst)).unwrap(),
+                        axum::Json(s.stream.lock().unwrap().clone()),
+                    )
+                }),
+            )
+            .route(
+                "/streamer/api/v3/streams",
+                get(|State(s): State<StateData>| async move {
+                    s.inventory_calls.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({"streams":[],"next":null,"server_id":"owned-vendor-server"}))
+                }),
+            )
+            .route(
+                "/streamer/api/v3/cluster/sources",
+                get(|State(s): State<StateData>| async move {
+                    s.source_calls.fetch_add(1, Ordering::SeqCst);
+                    // A configured source can exist without advertising a stream.
+                    axum::Json(json!({"sources":[{"url":"owned-origin.invalid","only":[],"except":[]}],"next":null}))
                 }),
             )
             .route(
@@ -414,6 +438,95 @@ async fn draining_and_cold_vendor_routes_do_not_bypass_capacity_policy() {
     a.config.put("peers", "edge", p).unwrap();
     let r = request(&a, "/local/news/m4f").await;
     assert_eq!(r.status(), 302);
+    assert_eq!(a.media.count().await, 0);
+}
+#[tokio::test]
+async fn directly_advertised_idle_remote_route_does_not_require_list_inventory() {
+    let v = Vendor::new().await;
+    *v.state.stream.lock().unwrap() = json!({
+        "name":"remote/news", "named_by":"remote", "static":false,
+        "stats":{"running":false,"alive":false,"status":"waiting"}
+    });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let inventory: Value = client
+        .get(format!("{}/streamer/api/v3/streams", v.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(inventory["streams"], json!([]));
+    let (_d, a) = app();
+    a.config.put("peers", "edge", v.peer()).unwrap();
+    for suffix in ["index.m3u8", "mpegts", "m4f", "m4s"] {
+        let r = request(&a, &format!("/local/news/{suffix}?token=owned-cold-viewer")).await;
+        assert_eq!(r.status(), StatusCode::FOUND);
+        assert_eq!(
+            r.headers()["location"],
+            format!("https://edge.example/base/remote/news/{suffix}?token=owned-cold-viewer")
+        );
+    }
+    assert_eq!(v.state.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        v.state.inventory_calls.load(Ordering::SeqCst),
+        1,
+        "LB must resolve the mapped name directly"
+    );
+    assert_eq!(v.state.source_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(a.media.count().await, 0);
+}
+#[tokio::test]
+async fn absent_or_failed_direct_lookup_cannot_use_source_config_as_availability() {
+    for status in [404, 401, 403, 500] {
+        let v = Vendor::new().await;
+        v.state.stream_status.store(status, Ordering::SeqCst);
+        // Even a stream-shaped error body is not an advertisement.
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let sources: Value = client
+            .get(format!("{}/streamer/api/v3/cluster/sources", v.url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(sources["sources"].as_array().unwrap().len(), 1);
+        let (_d, a) = app();
+        a.config.put("peers", "edge", v.peer()).unwrap();
+        let r = request(&a, "/local/news/m4s?token=owned-viewer").await;
+        assert_eq!(
+            r.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "vendor status {status}"
+        );
+        assert!(!r.headers().contains_key("location"));
+        assert_eq!(v.state.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            v.state.source_calls.load(Ordering::SeqCst),
+            1,
+            "source configuration cannot grant an absent route"
+        );
+        // A cached authorization decision can remain; placement owns no grant.
+        assert_eq!(a.playback_auth.live_grants(), 0);
+        assert_eq!(a.media.count().await, 0);
+    }
+}
+#[tokio::test]
+async fn vanished_remote_route_is_rejected_after_observation_cache_expires() {
+    let v = Vendor::new().await;
+    let (_d, a) = app();
+    a.config.put("peers", "edge", v.peer()).unwrap();
+    assert_eq!(
+        request(&a, "/local/news/m4s").await.status(),
+        StatusCode::FOUND
+    );
+    v.state.stream_status.store(404, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let r = request(&a, "/local/news/m4s").await;
+    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!r.headers().contains_key("location"));
+    assert_eq!(v.state.calls.load(Ordering::SeqCst), 5);
     assert_eq!(a.media.count().await, 0);
 }
 #[tokio::test]

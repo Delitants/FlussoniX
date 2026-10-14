@@ -74,10 +74,18 @@ mapping links an LB stream name to the corresponding name on that CDN. The LB
 stream still needs its intended viewer policy, either locally or through its
 configured source. Configure the CDN's intended viewer policy independently.
 
-Only mapped, enabled streams already visible on that CDN are eligible, including
-configured streams waiting for a viewer and existing remote-source streams.
-This increment does not create missing CDN streams or infer equivalent content
-from matching names. Mapping is the operator's declaration of the destination.
+Only mapped, enabled streams advertised by that CDN's direct stream API are
+eligible, including configured streams waiting for a viewer and idle streams
+discovered from its sources. A running stream or an entry in a list response is
+not required; the LB looks up the mapped name directly. The viewer's subsequent
+request lets the CDN start its own pull after authorization.
+
+A missing direct route (404), a failed lookup or an invalid response excludes
+that destination. Configured sources, prefixes and exclusions alone do not prove
+that a stream is available. The LB does not create missing CDN streams or infer
+equivalent content from matching names. Mapping is the operator's declaration
+of the destination. Cached observations expire after one second; a failed
+refresh never reuses the expired route.
 
 The LB checks coherent server identity and current CPU, RAM and outgoing
 bandwidth through the Flussonic management API. Keep clocks synchronized within
