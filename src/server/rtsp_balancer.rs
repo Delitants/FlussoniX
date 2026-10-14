@@ -1,4 +1,4 @@
-//! Native RTSP placement. Cached telemetry is advisory; the CDN owns admission.
+//! RTSP placement. Native CDNs own admission; vendor redirects use local advisory holds.
 use super::*;
 use futures_util::StreamExt;
 use std::collections::HashSet;
@@ -47,11 +47,7 @@ pub(super) fn strip_ticket(qs: &str) -> (Option<String>, String) {
         .join("&");
     (ticket, clean)
 }
-struct Snapshot {
-    when: Instant,
-    value: Value,
-    ready: HashSet<String>,
-}
+type Snapshot = super::http_balancer::Snapshot;
 type Slot = Arc<Mutex<Option<Arc<Snapshot>>>>;
 pub(super) struct Registry {
     slots: Mutex<(u64, HashMap<String, Slot>)>,
@@ -144,7 +140,12 @@ impl App {
         if self.config.revision() != revision {
             return None;
         }
-        let snapshot = Arc::new(Snapshot { when, value, ready });
+        let snapshot = Arc::new(Snapshot {
+            when,
+            value,
+            ready,
+            vendor: None,
+        });
         *cache = Some(snapshot.clone());
         Some(snapshot)
     }
@@ -188,6 +189,7 @@ impl App {
             return Err(503);
         }
         let calls = peers.into_iter().map(|peer| async move {
+            let vendor = crate::config::vendor_peers::is_vendor(&peer);
             let public = if secure {
                 peer["flussonix_rtsps_url"].as_str()
             } else {
@@ -208,33 +210,42 @@ impl App {
             {
                 return None;
             }
-            let name = viewer
-                .name
-                .split('/')
-                .map(|s| {
-                    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC)
-                        .to_string()
-                })
-                .collect::<Vec<_>>()
-                .join("/");
+            let name = if vendor {
+                crate::config::vendor_peers::remote_name(&peer, &viewer.name)?
+            } else {
+                &viewer.name
+            }
+            .split('/')
+            .map(|s| {
+                percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC)
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("/");
             target.set_path(&format!("/{name}"));
             target.set_query((!viewer.qs.is_empty()).then_some(viewer.qs.as_str()));
-            let probe = append_ticket(target.as_str(), "00000000-0000-0000-0000-000000000000");
-            crate::rtsp::redirect::destination(&probe)?;
-            let snapshot = self.rtsp_snapshot(&peer, revision).await?;
+            let snapshot = if vendor {
+                crate::rtsp::redirect::destination(target.as_str())?;
+                self.http_snapshot(&peer, &viewer.name, revision).await?
+            } else {
+                let probe = append_ticket(target.as_str(), "00000000-0000-0000-0000-000000000000");
+                crate::rtsp::redirect::destination(&probe)?;
+                self.rtsp_snapshot(&peer, revision).await?
+            };
             let n = &snapshot.value;
             if !matches!(n["role"].as_str(), Some("cdn" | "standalone"))
-                || !n["rtsp_publication"][if encrypted { "rtsps" } else { "rtsp" }].is_string()
+                || (!vendor
+                    && !n["rtsp_publication"][if encrypted { "rtsps" } else { "rtsp" }].is_string())
             {
                 return None;
             }
-            let load = NodeLoad::from_telemetry(
-                peer["hostname"].as_str()?,
-                n,
+            let load = self.http_load(
+                &peer,
+                &snapshot,
                 snapshot.ready.contains(&viewer.name),
-                peer["drain"] == true,
                 snapshot.when.elapsed().as_millis().try_into().ok()?,
                 2.0,
+                revision,
             )?;
             (load.age_ms <= 10000).then_some((snapshot, peer, target, encrypted))
         });
@@ -268,14 +279,14 @@ impl App {
                 .filter(|(snapshot, peer, _, _)| {
                     peer["hostname"]
                         .as_str()
-                        .and_then(|id| {
-                            NodeLoad::from_telemetry(
-                                id,
-                                &snapshot.value,
+                        .and_then(|_| {
+                            self.http_load(
+                                peer,
+                                snapshot,
                                 snapshot.ready.contains(&viewer.name),
-                                peer["drain"] == true,
                                 elapsed(snapshot),
                                 crate::cluster::FALLBACK_MBPS,
+                                revision,
                             )
                         })
                         .is_some_and(|load| load.age_ms <= 10000)
@@ -302,13 +313,13 @@ impl App {
                 {
                     continue;
                 }
-                if let Some(load) = NodeLoad::from_telemetry(
-                    peer["hostname"].as_str().unwrap(),
-                    &snapshot.value,
+                if let Some(load) = self.http_load(
+                    peer,
+                    snapshot,
                     snapshot.ready.contains(&viewer.name),
-                    peer["drain"] == true,
                     elapsed(snapshot),
                     bitrate_mbps,
+                    revision,
                 ) {
                     nodes.push(load);
                 }
@@ -323,10 +334,24 @@ impl App {
             if self.config.revision() != revision {
                 return Err(503);
             }
-            let (_, peer, target, encrypted) = observations
+            let (snapshot, peer, target, encrypted) = observations
                 .iter()
                 .find(|(_, peer, _, _)| peer["hostname"] == id)
                 .unwrap();
+            if crate::config::vendor_peers::is_vendor(peer) {
+                // HTTP and RTSP share one server's pending egress, even through aliases.
+                // Flussonic destinations do not implement the native admission RPC.
+                if !self.hold_vendor_http(peer, snapshot, bitrate_mbps, revision) {
+                    continue;
+                }
+                if grant.is_cancelled() {
+                    return Err(403);
+                }
+                if self.config.revision() != revision {
+                    return Err(503);
+                }
+                return Ok(target.to_string());
+            }
             let api = peer["api_url"].as_str().unwrap();
             let key = peer["cluster_key"]
                 .as_str()

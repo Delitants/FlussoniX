@@ -61,7 +61,7 @@ addresses, and callback redirects cannot downgrade them.
 Owned tests exercise discovered and locally configured LB routes, independently
 decoded HLS segments, M4S delivery, source/policy edits, lease expiry, callback and
 group guards, shutdown, concurrent RTSP redemption and verified RTSPS redirects.
-Flussonic HTTP/HTTPS destinations are described below. Seamless recovery and SRT LB placement remain pending. CDN/standalone SRT playback uses the existing guarded listener. [Equivalent-origin failover](vendor-daemon-failover.md),
+Flussonic HTTP/HTTPS and RTSP/RTSPS destinations are described below. Seamless recovery and SRT LB placement remain pending. CDN/standalone SRT playback uses the existing guarded listener. [Equivalent-origin failover](vendor-daemon-failover.md),
 [static activation](vendor-static-activation.md) and CDN/standalone
 [RTSP/RTSPS playback](vendor-daemon-playback.md) are supported separately. Configure equivalent intended viewer
 policies on LB and CDN; this increment does not infer equivalence between them.
@@ -95,6 +95,18 @@ The redirect preserves the media suffix and raw viewer query, including repeated
 parameters. Cluster credentials and native admission tickets never enter it.
 The destination independently authorizes the viewer.
 
+For RTSP viewers, optionally enter **Public RTSP URL** and **Public RTSPS URL**
+listener roots, such as `rtsp://cdn.example:554` and `rtsps://cdn.example:555`.
+Configure and test the corresponding listeners on the CDN; management metadata
+alone does not attest playback availability. The mapped CDN name and accepted
+viewer query bytes are preserved in the RTSP 302 redirect. Viewers must support
+redirects and verify the destination certificate. RTSPS viewers require an
+RTSPS destination; plain RTSP may use RTSPS when no plain endpoint is configured.
+The existing RTSP parser rejects duplicate query keys and incoming LB tickets.
+HTTP and RTSP share identity continuity, fresh load checks and pending egress
+holds for each observed server. No native admission RPC or ticket is sent to a
+Flussonic destination, and the LB starts no media worker.
+
 Capacity holds last five seconds and apply **only to this LB**. They prevent its
 concurrent redirects from reusing the same reported headroom; they are advisory,
 not reservations on Flussonic and not coordination between multiple LBs. Holds
@@ -102,8 +114,8 @@ survive unrelated configuration saves and are shared by destinations reporting
 the same server identity. Identity continuity covers all mappings under a
 management profile; a changed identity excludes that profile. Final placement
 rechecks the latest accepted load observation. Native
-FlussoniX destinations retain CDN-owned atomic admission. Vendor RTSP/RTSPS and
-SRT destinations, missing dynamic routes, and production throughput qualification
+FlussoniX destinations retain CDN-owned atomic admission. Vendor SRT
+destinations, missing dynamic routes, and production throughput qualification
 remain separate work. The HTTP adapter is based on the
 [Flussonic management API](https://flussonic.com/doc/api/reference/) and its
 [HTTP load-balancing model](https://flussonic.com/doc/fms/cluster/loadbalancer/).

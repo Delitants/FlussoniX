@@ -1,7 +1,7 @@
 import React from 'react';
 import {Field,type Item} from './forms';
 export function PeerTypeField({value,onChange}:{value:Item,onChange:(v:Item)=>void}) {
- return <Field label="Peer type" help="Flussonic destinations use HTTP/HTTPS viewer redirects and their own viewer policy."><select value={value.flussonix_peer_kind||'native'} onChange={e=>{const next:Item={...value,flussonix_peer_kind:e.target.value};for(const key of ['cluster_key','flussonix_stream_map','flussonix_rtsp_url','flussonix_rtsps_url','private_payload_url'])delete next[key];if(e.target.value==='flussonic')next.flussonix_stream_map=[];onChange(next)}}><option value="native">FlussoniX</option><option value="flussonic">Flussonic</option></select></Field>;
+ return <Field label="Peer type" help="Flussonic destinations use HTTP/HTTPS and optional RTSP/RTSPS viewer redirects with their own viewer policy."><select value={value.flussonix_peer_kind||'native'} onChange={e=>{const next:Item={...value,flussonix_peer_kind:e.target.value};for(const key of ['cluster_key','flussonix_stream_map','flussonix_rtsp_url','flussonix_rtsps_url','private_payload_url'])delete next[key];if(e.target.value==='flussonic')next.flussonix_stream_map=[];onChange(next)}}><option value="native">FlussoniX</option><option value="flussonic">Flussonic</option></select></Field>;
 }
 export function VendorPeerMappings({value,onChange}:{value:Item,onChange:(v:Item)=>void}) {
  const rows=value.flussonix_stream_map||[];

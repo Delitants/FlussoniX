@@ -14,6 +14,8 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use tower::ServiceExt;
+#[path = "support/vendor_rtsp_destinations.rs"]
+mod vendor_rtsp_destinations;
 
 type Hold = Arc<
     Mutex<
@@ -402,7 +404,16 @@ fn vendor_destination_profiles_require_explicit_keys_safe_urls_and_unique_maps()
             "flussonix_stream_map",
             json!([{"name":"a","remote_name":"../b"}]),
         ),
-        ("flussonix_rtsp_url", json!("rtsp://edge.example")),
+        ("flussonix_rtsp_url", json!("rtsp://edge.example/channel")),
+        (
+            "flussonix_rtsp_url",
+            json!("rtsp://user:password@edge.example"),
+        ),
+        ("flussonix_rtsps_url", json!("rtsp://edge.example:554")),
+        (
+            "flussonix_rtsps_url",
+            json!("rtsps://edge.example?token=secret"),
+        ),
     ] {
         let mut peer = base.clone();
         peer[field] = bad;

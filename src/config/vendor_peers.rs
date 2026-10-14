@@ -22,9 +22,6 @@ pub(super) fn validate(peer: &Value) -> Result<(), String> {
         }
         return Ok(());
     }
-    if peer.get("flussonix_rtsp_url").is_some() || peer.get("flussonix_rtsps_url").is_some() {
-        return Err("Flussonic CDN destinations support HTTP(S) only".into());
-    }
     let key = peer["cluster_key"]
         .as_str()
         .filter(|s| s.len() >= 12 && s.len() <= 4096)
