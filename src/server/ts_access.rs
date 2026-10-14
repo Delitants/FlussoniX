@@ -2,14 +2,65 @@
 use super::*;
 pub(crate) struct Playback {
     pub worker: Arc<Worker>,
-    pub grant: Grant,
+    authority: Authority,
     pub name: String,
     attached: bool,
 }
+enum Authority {
+    Native(Grant),
+    Vendor(crate::media::PackagedPlayback),
+}
 impl Playback {
+    pub(crate) fn vendor(
+        name: String,
+        playback: crate::media::PackagedPlayback,
+    ) -> Result<Self, u16> {
+        playback.current().map_err(|_| 503u16)?;
+        Ok(Self {
+            worker: playback.worker(),
+            authority: Authority::Vendor(playback),
+            name,
+            attached: false,
+        })
+    }
+    pub(crate) fn current(&self) -> bool {
+        !self.worker.is_closed()
+            && match &self.authority {
+                Authority::Native(grant) => !grant.is_cancelled(),
+                Authority::Vendor(playback) => playback.current().is_ok(),
+            }
+    }
+    pub(crate) async fn cancelled(&self) {
+        match &self.authority {
+            Authority::Native(grant) => grant.cancelled().await,
+            Authority::Vendor(playback) => playback.closed().await,
+        }
+    }
+    /// The caller supplies a nonblocking, non-reentrant transport operation.
+    pub(crate) fn write_current(
+        &self,
+        bytes: usize,
+        write: impl FnOnce() -> std::io::Result<bool>,
+    ) -> Result<std::io::Result<bool>, ()> {
+        match &self.authority {
+            Authority::Native(grant) => {
+                if !self.current() {
+                    return Err(());
+                }
+                let result = write();
+                if matches!(result, Ok(true)) {
+                    grant.add_bytes(bytes);
+                }
+                Ok(result)
+            }
+            Authority::Vendor(playback) => playback.write_current(bytes, write).map_err(|_| ()),
+        }
+    }
     pub fn attach(&mut self) {
         if !self.attached {
-            self.worker.viewers.fetch_add(1, Ordering::Relaxed);
+            if matches!(self.authority, Authority::Native(_)) {
+                self.worker.viewers.fetch_add(1, Ordering::Relaxed);
+            }
             self.worker.touch();
             self.attached = true;
         }
@@ -17,7 +68,7 @@ impl Playback {
 }
 impl Drop for Playback {
     fn drop(&mut self) {
-        if self.attached {
+        if self.attached && matches!(self.authority, Authority::Native(_)) {
             self.worker.viewers.fetch_sub(1, Ordering::Relaxed);
             self.worker.touch();
         }
@@ -27,6 +78,20 @@ impl App {
     pub(crate) async fn ts_admit(&self, viewer: ViewerRequest) -> Result<Playback, u16> {
         if self.options.role == "lb" || self.options.drain {
             return Err(503);
+        }
+        match self
+            .config
+            .read(|root| crate::vendor_playback::select(root, &viewer.name, self.config.revision()))
+        {
+            crate::vendor_playback::Selection::Native => {}
+            crate::vendor_playback::Selection::Excluded => return Err(404),
+            crate::vendor_playback::Selection::Ambiguous => return Err(503),
+            crate::vendor_playback::Selection::Vendor { key, revision } => {
+                return match &self.vendor_playback {
+                    Some(runtime) => runtime.ts_admit(self, viewer, &key, revision).await,
+                    None => Err(503),
+                };
+            }
         }
         let name = viewer.name.clone();
         let resolved = self.resolve(&name).await.ok_or(404u16)?;
@@ -67,12 +132,18 @@ impl App {
         }
         Ok(Playback {
             worker,
-            grant,
+            authority: Authority::Native(grant),
             name,
             attached: false,
         })
     }
     pub(crate) async fn ts_current(&self, playback: &Playback) -> bool {
+        if !playback.current() {
+            return false;
+        }
+        if matches!(playback.authority, Authority::Vendor(_)) {
+            return true;
+        }
         let current = self
             .media_config(&playback.name)
             .await
@@ -80,7 +151,7 @@ impl App {
                 c["disabled"] != true
                     && crate::media::media_signature(&c) == playback.worker.signature()
             });
-        current && !playback.grant.is_cancelled() && !playback.worker.is_closed()
+        current && playback.current()
     }
 }
 
@@ -200,7 +271,7 @@ mod tests {
         let worker = app.media.ensure("owned", &cfg).await.unwrap();
         let playback = Playback {
             worker,
-            grant,
+            authority: Authority::Native(grant),
             name: "owned".into(),
             attached: false,
         };
@@ -224,7 +295,7 @@ mod tests {
         app.mirrors.lock().await.get_mut("owned").unwrap().config["transcoder"] =
             json!({"encoder":"libx264","vb":900});
         assert_eq!(app.config.revision(), original);
-        assert!(!playback.grant.is_cancelled());
+        assert!(playback.current());
         let denied = sending.await.is_err();
         app.media.stop_all().await;
         assert!(denied, "old source retried after equivalent-policy switch");
@@ -273,3 +344,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ts_vendor_tests.rs"]
+mod vendor_tests;

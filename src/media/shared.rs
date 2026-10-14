@@ -211,6 +211,22 @@ impl PackagedPlayback {
             self.inner.worker.touch();
         }
     }
+    /// Synchronous nonblocking transport write under the exact current source
+    /// fence. Account accepted bytes before its post-commit expiry check.
+    pub(crate) fn write_current(
+        &self,
+        bytes: usize,
+        write: impl FnOnce() -> std::io::Result<bool>,
+    ) -> Result<std::io::Result<bool>, SharedPackagingFailure> {
+        self.with_current_source(|| {
+            let result = write();
+            if matches!(result, Ok(true)) {
+                self.inner.source.add_bytes(bytes);
+                self.inner.worker.touch();
+            }
+            result
+        })
+    }
     pub(crate) fn with_current_source<T>(
         &self,
         commit: impl FnOnce() -> T,

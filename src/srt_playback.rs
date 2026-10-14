@@ -101,7 +101,7 @@ async fn connection(
     loop {
         tokio::select! {biased;
             _=cancel.cancelled()=>break,
-            _=playback.grant.cancelled()=>break,
+            _=playback.cancelled()=>break,
             _=playback.worker.closed()=>break,
             _=tokio::time::sleep_until(deadline)=>break,
             _=check.tick()=>{if !socket.is_connected()||!app.ts_current(&playback).await {break;}},
@@ -142,13 +142,13 @@ pub(crate) async fn send_with(
 ) -> Result<(), ()> {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        if cancel.is_cancelled() || playback.grant.is_cancelled() || playback.worker.is_closed() {
+        if cancel.is_cancelled() || !playback.current() || playback.worker.is_closed() {
             return Err(());
         }
         // Validate after every pending wait and immediately before each write.
         // A mirror can change while the root configuration revision stays equal.
         let checked_revision = app.config.revision();
-        let current = tokio::select! {biased;_=cancel.cancelled()=>return Err(()),_=playback.grant.cancelled()=>return Err(()),_=playback.worker.closed()=>return Err(()),_=tokio::time::sleep_until(deadline)=>return Err(()),value=app.ts_current(playback)=>value};
+        let current = tokio::select! {biased;_=cancel.cancelled()=>return Err(()),_=playback.cancelled()=>return Err(()),_=playback.worker.closed()=>return Err(()),_=tokio::time::sleep_until(deadline)=>return Err(()),value=app.ts_current(playback)=>value};
         if !current {
             return Err(());
         }
@@ -156,20 +156,22 @@ pub(crate) async fn send_with(
             continue;
         }
         *revision = checked_revision;
-        if cancel.is_cancelled() || playback.grant.is_cancelled() || playback.worker.is_closed() {
+        if cancel.is_cancelled() || !playback.current() || playback.worker.is_closed() {
             return Err(());
         }
-        match write(data) {
-            Ok(true) => {
-                playback.grant.add_bytes(data.len());
+        match playback.write_current(data.len(), || {
+            let result = write(data);
+            if matches!(result, Ok(true)) {
                 app.srt_egress
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
-                return Ok(());
             }
+            result
+        })? {
+            Ok(true) => return Ok(()),
             Ok(false) => {}
             Err(_) => return Err(()),
         }
-        tokio::select! {biased;_=cancel.cancelled()=>return Err(()),_=playback.grant.cancelled()=>return Err(()),_=playback.worker.closed()=>return Err(()),_=tokio::time::sleep_until(deadline)=>return Err(()),_=tokio::time::sleep(Duration::from_millis(2))=>{}}
+        tokio::select! {biased;_=cancel.cancelled()=>return Err(()),_=playback.cancelled()=>return Err(()),_=playback.worker.closed()=>return Err(()),_=tokio::time::sleep_until(deadline)=>return Err(()),_=tokio::time::sleep(Duration::from_millis(2))=>{}}
     }
 }
 #[derive(Clone)]

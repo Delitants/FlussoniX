@@ -1,8 +1,5 @@
 use super::*;
-#[path = "../../tests/vendor_daemon_failover/fixture.rs"]
-#[allow(dead_code)]
-mod fixture;
-use fixture::Fixture;
+use crate::vendor_test_fixture::Fixture;
 use serde_json::json;
 use tokio::io::AsyncReadExt;
 

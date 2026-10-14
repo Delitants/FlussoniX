@@ -4,6 +4,7 @@ mod recovery;
 mod replicas;
 mod response;
 mod rtsp;
+mod srt;
 use crate::{
     media::{SharedHlsOptions, SharedHlsSessions},
     server::App,

@@ -79,3 +79,8 @@ mod transcoder;
 mod vendor_output;
 
 mod vendor_playback;
+
+#[cfg(test)]
+#[path = "../tests/vendor_daemon_failover/fixture.rs"]
+#[allow(dead_code)]
+pub(crate) mod vendor_test_fixture;
