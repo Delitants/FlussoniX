@@ -61,7 +61,37 @@ addresses, and callback redirects cannot downgrade them.
 Owned tests exercise discovered and locally configured LB routes, independently
 decoded HLS segments, M4S delivery, source/policy edits, lease expiry, callback and
 group guards, shutdown, concurrent RTSP redemption and verified RTSPS redirects.
-Flussonic CDN destinations, seamless recovery and SRT LB placement remain pending. CDN/standalone SRT playback uses the existing guarded listener. [Equivalent-origin failover](vendor-daemon-failover.md),
+Flussonic HTTP/HTTPS destinations are described below. Seamless recovery and SRT LB placement remain pending. CDN/standalone SRT playback uses the existing guarded listener. [Equivalent-origin failover](vendor-daemon-failover.md),
 [static activation](vendor-static-activation.md) and CDN/standalone
 [RTSP/RTSPS playback](vendor-daemon-playback.md) are supported separately. Configure equivalent intended viewer
 policies on LB and CDN; this increment does not infer equivalence between them.
+
+## Flussonic CDN destinations
+
+In **Cluster → CDN peers**, choose **Flussonic**, enter its management URL,
+public delivery URL and explicit Cluster key, then add stream mappings. Each
+mapping links an LB stream name to the corresponding name on that CDN. The LB
+stream still needs its intended viewer policy, either locally or through its
+configured source. Configure the CDN's intended viewer policy independently.
+
+Only mapped, enabled streams already visible on that CDN are eligible, including
+configured streams waiting for a viewer and existing remote-source streams.
+This increment does not create missing CDN streams or infer equivalent content
+from matching names. Mapping is the operator's declaration of the destination.
+
+The LB checks coherent server identity and current CPU, RAM and outgoing
+bandwidth through the Flussonic management API. Keep clocks synchronized within
+five seconds. HTTPS management verifies certificates; an optional local CA file
+supports private certificates. HTTPS viewers require HTTPS public delivery.
+The redirect preserves the media suffix and raw viewer query, including repeated
+parameters. Cluster credentials and native admission tickets never enter it.
+The destination independently authorizes the viewer.
+
+Capacity holds last five seconds and apply **only to this LB**. They prevent its
+concurrent redirects from reusing the same reported headroom; they are advisory,
+not reservations on Flussonic and not coordination between multiple LBs. Native
+FlussoniX destinations retain CDN-owned atomic admission. Vendor RTSP/RTSPS and
+SRT destinations, missing dynamic routes, and production throughput qualification
+remain separate work. The HTTP adapter is based on the
+[Flussonic management API](https://flussonic.com/doc/api/reference/) and its
+[HTTP load-balancing model](https://flussonic.com/doc/fms/cluster/loadbalancer/).
