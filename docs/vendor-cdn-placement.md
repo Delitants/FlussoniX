@@ -89,7 +89,11 @@ The destination independently authorizes the viewer.
 
 Capacity holds last five seconds and apply **only to this LB**. They prevent its
 concurrent redirects from reusing the same reported headroom; they are advisory,
-not reservations on Flussonic and not coordination between multiple LBs. Native
+not reservations on Flussonic and not coordination between multiple LBs. Holds
+survive unrelated configuration saves and are shared by destinations reporting
+the same server identity. Identity continuity covers all mappings under a
+management profile; a changed identity excludes that profile. Final placement
+rechecks the latest accepted load observation. Native
 FlussoniX destinations retain CDN-owned atomic admission. Vendor RTSP/RTSPS and
 SRT destinations, missing dynamic routes, and production throughput qualification
 remain separate work. The HTTP adapter is based on the

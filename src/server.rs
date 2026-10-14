@@ -1904,6 +1904,7 @@ mod http_balancer;
 mod http_tickets;
 pub(crate) mod rtsp_balancer;
 mod vendor_balancer;
+mod vendor_http_state;
 mod vendor_rtsp_tickets;
 
 #[path = "source_activation.rs"]

@@ -27,6 +27,7 @@ type Hold = Arc<
 struct StateData {
     hold: Hold,
     config_calls: Arc<AtomicU64>,
+    delay_ms: Arc<AtomicU64>,
     flip: Arc<std::sync::atomic::AtomicBool>,
     calls: Arc<AtomicU64>,
     config: Arc<Mutex<Value>>,
@@ -42,6 +43,7 @@ impl Vendor {
         let state = StateData {
             hold: Arc::new(Mutex::new(None)),
             config_calls: Arc::new(AtomicU64::new(0)),
+            delay_ms: Arc::new(AtomicU64::new(0)),
             flip: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             calls: Arc::new(AtomicU64::new(0)),
             config: Arc::new(Mutex::new(
@@ -82,6 +84,10 @@ impl Vendor {
                         let _ = entered.send(());
                         let _ = release.await;
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        s.delay_ms.load(Ordering::SeqCst),
+                    ))
+                    .await;
                     let turn = s.config_calls.fetch_add(1, Ordering::SeqCst);
                     let mut v = s.config.lock().unwrap().clone();
                     v["stats"]["now"] = json!(
@@ -479,4 +485,77 @@ async fn mixed_native_and_vendor_peers_retry_the_other_admission_protocol() {
     assert_eq!(a.media.count().await, 0);
     native.abort();
     let _ = native.await;
+}
+// Every regression below failed against the immutable reviewed head.
+#[tokio::test]
+async fn unrelated_config_save_does_not_erase_vendor_capacity_holds() {
+    let v = Vendor::new().await;
+    v.state.config.lock().unwrap()["stats"]["output_kbit"] = json!(82000);
+    let (_d, a) = app();
+    a.config.put("peers", "edge", v.peer()).unwrap();
+    assert_eq!(request(&a, "/local/news/m4s").await.status(), 302);
+    a.config
+        .put(
+            "streams",
+            "local/news",
+            json!({"title":"unrelated metadata"}),
+        )
+        .unwrap();
+    assert_eq!(
+        request(&a, "/local/news/m4s").await.status(),
+        503,
+        "config save erased already-issued capacity hold"
+    );
+}
+#[tokio::test]
+async fn new_mapping_cannot_accept_a_changed_destination_identity() {
+    let v = Vendor::new().await;
+    let (_d, a) = app();
+    a.config
+        .put(
+            "streams",
+            "local/other",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    let mut p = v.peer();
+    p["flussonix_stream_map"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name":"local/other","remote_name":"remote/other"}));
+    a.config.put("peers", "edge", p).unwrap();
+    assert_eq!(request(&a, "/local/news/m4s").await.status(), 302);
+    v.state.config.lock().unwrap()["stats"]["id"] = json!("replacement-cdn");
+    v.state.stream.lock().unwrap()["name"] = json!("remote/other");
+    assert_eq!(
+        request(&a, "/local/other/m4s").await.status(),
+        503,
+        "new stream slot forgot established peer identity"
+    );
+}
+#[tokio::test]
+async fn aliases_of_one_vendor_server_share_pending_egress() {
+    let v = Vendor::new().await;
+    v.state.config.lock().unwrap()["stats"]["output_kbit"] = json!(82000);
+    let (_d, a) = app();
+    a.config.put("peers", "edge", v.peer()).unwrap();
+    a.config.put("peers", "alias", v.peer()).unwrap();
+    assert_eq!(request(&a, "/local/news/m4s").await.status(), 302);
+    assert_eq!(
+        request(&a, "/local/news/m4s").await.status(),
+        503,
+        "peer alias reused the same server headroom"
+    );
+}
+#[tokio::test]
+async fn bounded_vendor_metadata_budget_allows_realistic_network_latency() {
+    let v = Vendor::new().await;
+    v.state.delay_ms.store(800, Ordering::SeqCst);
+    let (_d, a) = app();
+    a.config.put("peers", "edge", v.peer()).unwrap();
+    assert_eq!(
+        request(&a, "/local/news/m4s").await.status(),
+        302,
+        "650ms individual deadline excludes working remote CDN"
+    );
 }

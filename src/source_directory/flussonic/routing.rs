@@ -20,8 +20,8 @@ pub(crate) async fn observe(
     local_ids: &[ObservedServerId],
 ) -> Result<Observation, LookupFailure> {
     crate::config::valid_name(name).map_err(|_| LookupFailure::Invalid)?;
-    let transport = InventoryClient::prepare(base, key, ca, Duration::from_millis(650))?;
-    tokio::time::timeout(Duration::from_millis(1800), async {
+    let transport = InventoryClient::prepare(base, key, ca, Duration::from_secs(3))?;
+    tokio::time::timeout(Duration::from_secs(4), async {
         let mut config = Url::parse(base).map_err(|_| LookupFailure::Invalid)?;
         config.set_path(&format!(
             "{}/streamer/api/v3/config",

@@ -7,21 +7,20 @@ pub(super) struct Snapshot {
     pub when: Instant,
     pub value: Value,
     pub ready: HashSet<String>,
-    pub vendor_id: Option<crate::source_directory::flussonic::modern::ObservedServerId>,
+    pub vendor: Option<super::vendor_http_state::Stamp>,
 }
 type Slot = Arc<Mutex<Option<Arc<Snapshot>>>>;
-type Holds = (u64, HashMap<String, Vec<(Instant, f64)>>);
 pub(super) struct Registry {
     slots: Mutex<(u64, HashMap<String, Slot>)>,
     network: Semaphore,
-    holds: std::sync::Mutex<Holds>,
+    pub(super) vendor: std::sync::Mutex<super::vendor_http_state::Book>,
 }
 impl Default for Registry {
     fn default() -> Self {
         Self {
             slots: Mutex::new((0, HashMap::new())),
-            network: Semaphore::new(8),
-            holds: std::sync::Mutex::new((0, HashMap::new())),
+            network: Semaphore::new(64),
+            vendor: std::sync::Mutex::new(Default::default()),
         }
     }
 }
@@ -83,24 +82,18 @@ impl App {
             {
                 local_ids.push(ObservedServerId::parse(&id).ok()?);
             }
+            let stamp = self.begin_vendor_http(peer, remote, revision)?;
             let when = Instant::now();
-            let mut observation = routing::observe(
+            let observation = routing::observe(
                 peer["api_url"].as_str()?,
                 peer["cluster_key"].as_str()?,
                 peer["flussonix_tls_ca"].as_str().map(Path::new),
                 remote,
                 &local_ids,
             )
-            .await
-            .ok()?;
-            if cache
-                .as_ref()
-                .and_then(|s| s.vendor_id.as_ref())
-                .is_some_and(|id| *id != observation.id)
-                || self.config.revision() != revision
-            {
-                return None;
-            }
+            .await;
+            let (stamp, mut observation) =
+                self.record_vendor_http(stamp, when, observation, revision)?;
             if let Some(rate) = observation.value["stream_bitrates"].get(remote).cloned() {
                 observation.value["stream_bitrates"] = json!({name:rate});
             }
@@ -113,7 +106,7 @@ impl App {
                 when,
                 value: observation.value,
                 ready,
-                vendor_id: Some(observation.id),
+                vendor: Some(stamp),
             });
             *cache = Some(snapshot.clone());
             return Some(snapshot);
@@ -182,7 +175,7 @@ impl App {
             when,
             value,
             ready,
-            vendor_id: None,
+            vendor: None,
         });
         *cache = Some(snapshot.clone());
         Some(snapshot)
@@ -221,83 +214,43 @@ pub(super) fn vendor_location(peer: &Value, name: &str, path: &str, query: &str)
     ))
 }
 
-impl App {
-    pub(super) fn http_load(
-        &self,
-        peer: &Value,
-        snapshot: &Snapshot,
-        ready: bool,
-        elapsed: u64,
-        cost: f64,
-        revision: u64,
-    ) -> Option<NodeLoad> {
-        let id = peer["hostname"].as_str()?;
-        if !crate::config::vendor_peers::is_vendor(peer) {
-            return NodeLoad::from_telemetry(
-                id,
-                &snapshot.value,
-                ready,
-                peer["drain"] == true,
-                elapsed,
-                cost,
-            );
-        }
-        let mut holds = self.http_routes.holds.lock().ok()?;
-        if self.config.revision() != revision {
-            return None;
-        }
-        if holds.0 != revision {
-            *holds = (revision, HashMap::new());
-        }
-        let pending = holds.1.entry(id.into()).or_default();
-        pending.retain(|(until, _)| *until > Instant::now());
-        let mut value = snapshot.value.clone();
-        value["reserved_mbps"] = json!(pending.iter().map(|(_, rate)| rate).sum::<f64>());
-        value["reserved"] = json!(pending.len());
-        NodeLoad::from_telemetry(id, &value, ready, peer["drain"] == true, elapsed, cost)
-    }
-    pub(super) fn hold_vendor_http(
-        &self,
-        peer: &Value,
-        snapshot: &Snapshot,
-        cost: f64,
-        revision: u64,
-    ) -> bool {
-        let Some(id) = peer["hostname"].as_str() else {
-            return false;
-        };
-        let Ok(mut holds) = self.http_routes.holds.lock() else {
-            return false;
-        };
-        if self.config.revision() != revision {
-            return false;
-        }
-        if holds.0 != revision {
-            *holds = (revision, HashMap::new());
-        }
-        let now = Instant::now();
-        let pending = holds.1.entry(id.into()).or_default();
-        pending.retain(|(until, _)| *until > now);
-        if pending.len() >= 10000 {
-            return false;
-        }
-        let mut value = snapshot.value.clone();
-        value["reserved_mbps"] = json!(pending.iter().map(|(_, rate)| rate).sum::<f64>());
-        value["reserved"] = json!(pending.len());
-        let elapsed = now
-            .duration_since(snapshot.when)
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX);
-        let Some(load) =
-            NodeLoad::from_telemetry(id, &value, false, peer["drain"] == true, elapsed, cost)
-        else {
-            return false;
-        };
-        if crate::cluster::select(&[load], 0.0).is_none() {
-            return false;
-        }
-        pending.push((now + Duration::from_secs(5), cost));
-        true
+#[cfg(test)]
+mod current_sample_tests {
+    use super::*;
+    #[tokio::test]
+    async fn final_vendor_hold_rechecks_newer_telemetry_before_using_held_snapshot() {
+        use axum::routing::get;
+        let cpu = Arc::new(AtomicU64::new(10));
+        let current = cpu.clone();
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", tcp.local_addr().unwrap());
+        let service=Router::new().route("/streamer/api/v3/config",get(move||{let cpu=current.clone();async move{json_response(json!({"stats":{"id":"owned-vendor-cdn","now":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()as u64,"cpu_usage":cpu.load(Ordering::SeqCst),"memory_usage":20,"output_kbit":10000,"total_bandwidth":100000000,"total_clients":0,"streamer_status":"running"}}))}})).route("/streamer/api/v3/streams/{name}",get(||async{json_response(json!({"name":"owned","named_by":"remote","stats":{"running":true}}))}));
+        let cdn = tokio::spawn(async move { axum::serve(tcp, service).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("c.json"),
+            dir.path().join("media"),
+            Options {
+                role: "lb".into(),
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-native-peer-key".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let peer = json!({"hostname":"edge","api_url":api,"public_payload_url":"https://edge.invalid","cluster_key":"owned-vendor-cluster-key","flussonix_peer_kind":"flussonic","flussonix_stream_map":[{"name":"owned","remote_name":"owned"}]});
+        app.config.put("peers", "edge", peer.clone()).unwrap();
+        let rev = app.config.revision();
+        let held = app.http_snapshot(&peer, "owned", rev).await.unwrap();
+        assert!(app.http_load(&peer, &held, true, 0, 2.0, rev).is_some());
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        cpu.store(95, Ordering::SeqCst);
+        let _new = app.http_snapshot(&peer, "owned", rev).await.unwrap();
+        assert!(
+            !app.hold_vendor_http(&peer, &held, 2.0, rev),
+            "pending placement used superseded healthy CPU sample"
+        );
+        cdn.abort();
+        let _ = cdn.await;
     }
 }
