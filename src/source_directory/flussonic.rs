@@ -206,6 +206,17 @@ impl InventoryClient {
     }
     /// Fixed-origin authenticated JSON request sharing a whole-operation byte budget.
     async fn json(&self, url: Url, remaining: &mut usize) -> Result<Value, LookupFailure> {
+        self.json_status(url, remaining, false).await
+    }
+    async fn modern_json(&self, url: Url, remaining: &mut usize) -> Result<Value, LookupFailure> {
+        self.json_status(url, remaining, true).await
+    }
+    async fn json_status(
+        &self,
+        url: Url,
+        remaining: &mut usize,
+        modern: bool,
+    ) -> Result<Value, LookupFailure> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| LookupFailure::Unavailable)?
@@ -221,7 +232,11 @@ impl InventoryClient {
             .await
             .map_err(|_| LookupFailure::Unavailable)?;
         if response.status() != reqwest::StatusCode::OK {
-            return Err(LookupFailure::Unavailable);
+            return Err(if modern && !response.status().is_server_error() {
+                LookupFailure::Invalid
+            } else {
+                LookupFailure::Unavailable
+            });
         }
         if response
             .content_length()

@@ -1,7 +1,12 @@
 //! Opt-in modern source lifecycle. Native routing never selects these handles.
 //! Lock order: ConfigStore -> coordinator -> SourceAuthority; no lock across I/O.
 mod admission;
+mod replicas;
 pub(crate) use admission::SharedFeed;
+pub use replicas::{
+    ReplicaAdmission, ReplicaAdmissionOutcome, ReplicaChoice, ReplicaFailure, ReplicaLookup,
+    ReplicaMember, ReplicaPullFailure, ReplicaSelector, ReplicaStatus,
+};
 mod relay;
 use super::{
     flussonic::modern::ObservedServerId,

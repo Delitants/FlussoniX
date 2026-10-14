@@ -727,7 +727,9 @@ async fn management_denials_and_redirects_never_fallback_or_forward_credentials(
                 client(&s.url, Duration::from_secs(2))
                     .inventory(&local())
                     .await,
-                Err(LookupFailure::Unavailable)
+                // A modern authoritative denial/redirect must never be treated
+                // as a transient outage by a replica-selection consumer.
+                Err(LookupFailure::Invalid)
             ));
             s.stop().await;
             assert_eq!(got.lock().unwrap().len(), failing + 1);

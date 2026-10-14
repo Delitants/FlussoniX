@@ -172,12 +172,21 @@ impl ModernSourceCoordinator {
         admitted: &AdmittedCandidate,
         commit: impl FnOnce(CandidateView<'_>, MediaInput, &Grant) -> T,
     ) -> Result<T, AdmissionFailure> {
+        self.at_admitted(admitted, |view, input, grant| {
+            grant.playback();
+            Ok(commit(view, input, grant))
+        })
+    }
+    pub(super) fn at_admitted<T>(
+        &self,
+        admitted: &AdmittedCandidate,
+        commit: impl FnOnce(CandidateView<'_>, MediaInput, &Grant) -> Result<T, AdmissionFailure>,
+    ) -> Result<T, AdmissionFailure> {
         self.at_admission_candidate(&admitted.candidate, &admitted.name, |view, input| {
             if admitted.grant.is_cancelled() {
                 return Err(AdmissionFailure::Revoked);
             }
-            admitted.grant.playback();
-            Ok(commit(view, input, &admitted.grant))
+            commit(view, input, &admitted.grant)
         })
     }
 }

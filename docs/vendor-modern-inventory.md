@@ -33,6 +33,11 @@ fallback to `/-/streams`, a different host, another credential, or another API
 profile after a denial, timeout, redirect or malformed response. Unknown response
 fields, including upstream inputs and remote viewer policy, are discarded.
 
+Modern HTTP rejections and redirects return `Invalid`; server failures and
+network/timeouts return `Unavailable`. This distinction lets the opt-in replica
+selector keep authoritative rejection separate from transient outage. The raw
+inventory client itself never switches origins, credentials or API profiles.
+
 ## Observed identity
 
 `ObservedServerId::parse` accepts nonempty UTF-8 up to 256 bytes. Whitespace-only

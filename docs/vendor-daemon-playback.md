@@ -23,6 +23,8 @@ resolution also cannot cross a reserved vendor namespace. A native FlussoniX LB 
 the LB discover and authorize names through the same bounded catalog, without
 local stream rows or any LB media pull. Vendor failover, static demand and
 RTSP/SRT delivery need further work.
+The [replica selection library](vendor-replica-selection.md) supplies the guarded
+selection foundation; it does not yet enable automatic failover in the daemon.
 
 Every HTTP request passes current source/local policy and the App's actual native
 viewer authorizer. Shared input, HLS retention and cached files never authorize

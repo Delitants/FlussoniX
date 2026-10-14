@@ -86,6 +86,7 @@ enum Inventory {
 struct Profile {
     source: Value,
     policies: PolicySet,
+    uniform: std::sync::OnceLock<Result<Option<Policy>, PolicyFailure>>,
     inventory: Inventory,
     media: MediaOrigin,
 }
@@ -194,6 +195,7 @@ impl Profile {
         Ok(Self {
             source: source.clone(),
             policies,
+            uniform: std::sync::OnceLock::new(),
             inventory,
             media,
         })
@@ -226,6 +228,15 @@ pub struct SourceAuthority {
     state: Mutex<State>,
 }
 impl SourceAuthority {
+    pub(crate) fn uniform_policy(&self) -> Result<Option<Policy>, ProjectionFailure> {
+        let state = self.state()?;
+        let profile = state.profile.as_ref().ok_or(ProjectionFailure::Removed)?;
+        profile
+            .uniform
+            .get_or_init(|| profile.policies.uniform())
+            .clone()
+            .map_err(ProjectionFailure::Policy)
+    }
     pub fn new(source: &Value, backends: &Value) -> Result<Self, ProjectionFailure> {
         Self::with_mode(source, backends, DiscoveryMode::Legacy)
     }

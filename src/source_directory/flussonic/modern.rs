@@ -122,7 +122,10 @@ impl ModernInventoryClient {
     }
 
     async fn server_id(&self, remaining: &mut usize) -> Result<ObservedServerId, LookupFailure> {
-        let value = self.transport.json(self.config.clone(), remaining).await?;
+        let value = self
+            .transport
+            .modern_json(self.config.clone(), remaining)
+            .await?;
         let id = value
             .get("stats")
             .and_then(|s| s.get("id"))
@@ -152,7 +155,7 @@ impl ModernInventoryClient {
                     query.append_pair("cursor", cursor);
                 }
             }
-            let value = self.transport.json(url, remaining).await?;
+            let value = self.transport.modern_json(url, remaining).await?;
             let page_id = value
                 .get("server_id")
                 .and_then(Value::as_str)

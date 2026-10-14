@@ -212,6 +212,16 @@ impl PolicySet {
         )
     }
 
+    pub(crate) fn uniform(&self) -> Result<Option<Policy>, PolicyFailure> {
+        let base = self.for_groups(&json!([]))?;
+        for name in self.groups.keys() {
+            if self.for_groups(&json!([name]))? != base {
+                return Ok(None);
+            }
+        }
+        Ok(Some(base))
+    }
+
     /// Memberships must be explicit, unique literal names. Unconfigured groups
     /// contribute nothing. Matching group fields override source fields, but
     /// conflicting groups fail rather than depend on remote inventory order.
