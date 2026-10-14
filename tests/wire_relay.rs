@@ -261,3 +261,79 @@ fn overflow_recovered_m4f_excludes_samples_before_the_keyframe() {
     assert!(frames[0].key);
     assert_eq!(frames[0].dts, 90000);
 }
+#[tokio::test]
+async fn early_m4f_subscriber_receives_metadata_before_first_and_changed_gops() {
+    let hub = Hub::new();
+    let (bootstrap, mut early) = hub.m4s_subscribe();
+    assert!(bootstrap.is_empty());
+    let mut tracks = vec![Track {
+        id: 1,
+        codec: "mp3".into(),
+        config: vec![],
+    }];
+    for sequence in 1..=3u64 {
+        if sequence == 2 {
+            tracks.push(Track {
+                id: 7,
+                codec: "subtitle".into(),
+                config: vec![],
+            });
+        }
+        let frame = Frame {
+            track_id: 1,
+            dts: sequence * 90000,
+            pts_offset: 0,
+            key: true,
+            body: include_bytes!("fixtures/codecs/mp3.bin").to_vec(),
+        };
+        let body = Bytes::from(pack(&tracks, &[frame], 3600).unwrap());
+        let gop = PackedGop {
+            utc: 1700000000,
+            dts_ms: sequence as f64 * 1000.0,
+            sequence: sequence as u32,
+            duration_ms: 40.0,
+            body: body.clone(),
+        };
+        let wire = flussonix::m4s::encode_gop(&gop).unwrap();
+        hub.relay_segment(
+            Segment {
+                name: format!("2026/10/01/08/09/{sequence:02}.m4f"),
+                signal: Bytes::from(format!("{sequence} 2026/10/01/08/09/{sequence:02}-40\n")),
+                bytes: body,
+            },
+            tracks.clone(),
+            gop,
+        )
+        .unwrap();
+        let first = tokio::time::timeout(Duration::from_millis(100), early.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let info = Bytes::from(encode_info(&tracks).unwrap());
+        if sequence <= 2 {
+            assert_eq!(
+                first, info,
+                "an already-waiting subscriber must receive new metadata before its GOP"
+            );
+            let next = tokio::time::timeout(Duration::from_millis(100), early.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                next, wire,
+                "the original GOP must remain byte-for-byte unchanged"
+            );
+        } else {
+            assert_eq!(
+                first, wire,
+                "unchanged metadata must not introduce a duplicate announcement"
+            );
+        }
+        assert_eq!(hub.m4s_subscribe().0, vec![info, wire]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), early.recv())
+                .await
+                .is_err()
+        );
+    }
+}

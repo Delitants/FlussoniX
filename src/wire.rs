@@ -274,7 +274,8 @@ impl Hub {
             self.rtp.configure(&decoded_tracks);
             self.rtp.frames(&frames);
         }
-        if s.tracks != tracks {
+        let metadata_changed = s.tracks != tracks;
+        if metadata_changed {
             s.tracks = tracks;
             s.info = Some(Bytes::from(encode_info(&s.tracks)?));
             s.frames.clear();
@@ -286,6 +287,11 @@ impl Hub {
         s.bootstrap_ready = false;
         let signal = segment.signal.clone();
         Self::cache(&mut s, segment);
+        // Subscribers may already be waiting before the first segment arrives.
+        // Publish a new track inventory before its GOP, just as relay_info does.
+        if metadata_changed {
+            self.m4s.send(s.info.clone().unwrap())?;
+        }
         self.m4s.send(wire)?;
         self.signals.send(signal)?;
         Ok(())
