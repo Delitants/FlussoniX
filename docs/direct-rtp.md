@@ -25,3 +25,24 @@ On the qualification host, an independently extracted Intel iHD driver produced 
 A unicast input's interface setting must match its local bind address, or may restrict `0.0.0.0` to a concrete local IPv4 address. Multicast interface values cannot be wildcard, multicast or broadcast addresses. Multicast sender RTCP stays directed to the group; unicast receiver feedback is accepted on its source RTCP port and pins one valid participant (authenticated for SRTP). Multiple multicast receivers can consume media, while feedback counters summarize only that pinned participant.
 
 Multicast inputs bind their configured group address, so distinct groups may share RTP/RTCP ports and unrelated unicast cannot claim a multicast source. The parser checks TS adaptation occupancy and every flag-directed field length before source ownership or decoder writes. SDES feedback requires terminated, bounded, correctly aligned item lists.
+
+## Control-channel recovery qualification
+
+On Linux with libsrtp2 available, run the owned loopback qualification explicitly:
+
+```sh
+cargo test --locked --test direct_rtcp_recovery -- --ignored --test-threads=1 --nocapture
+```
+
+These two bounded tests keep RTP receiving while closing only the RTCP receiver,
+confirm a real pending ICMP error on the sender's own socket, and require a counted
+RTCP send refusal followed by media and control recovery. They also check retained
+SRTP/SRTCP authentication and replay state, cancellation, and socket release.
+They use synthetic null TS packets, so they do not qualify decoded media or throughput.
+
+The sender's report and error-receive branches race to consume the ICMP error.
+The tests fail if no send refusal is observed within eight attempts or the
+90-second case deadline. They are excluded from default CI because this finite
+probe cannot guarantee which branch wins. An observed SRTCP index gap does not
+identify the exact index of a refused packet. Fresh-receiver rollover setup
+remains subject to the limits in [the SRTP profile](direct-srtp.md).
