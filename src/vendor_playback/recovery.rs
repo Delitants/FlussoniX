@@ -193,6 +193,7 @@ impl Runtime {
         }
     }
     async fn recover_one(&self, app: &App, name: &str, group: Arc<Group>) {
+        let _activity = app.media.idle_memory.activity().await;
         let _gate = group.gate.lock().await;
         if app.config.revision() != group.revision || !self.running() {
             return;

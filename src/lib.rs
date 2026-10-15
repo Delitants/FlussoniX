@@ -5,6 +5,7 @@ mod api_sort;
 pub mod auth;
 pub mod cluster;
 pub mod config;
+mod idle_memory;
 pub mod m4f;
 pub mod m4s;
 pub mod media;

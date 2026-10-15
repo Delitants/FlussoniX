@@ -197,6 +197,7 @@ impl Runtime {
             .is_some_and(|d| d.revision == revision && Arc::ptr_eq(&d.epoch, epoch))
     }
     pub(super) async fn start_static(&self, app: &App, name: &str, expected: &Arc<()>) -> bool {
+        let _activity = app.media.idle_memory.activity().await;
         let (revision, epoch, key, group, settings, playback) = {
             let mut state = self.activation.lock().unwrap();
             let Some(d) = state

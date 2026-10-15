@@ -83,6 +83,7 @@ impl App {
         viewer: ViewerRequest,
         ticket: Option<super::srt_tickets::Ticket<'_>>,
     ) -> Result<Playback, u16> {
+        let _activity = self.media.idle_memory.activity().await;
         if self.options.role == "lb" || self.options.drain {
             return Err(503);
         }

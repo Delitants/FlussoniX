@@ -233,6 +233,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::select! { _=telemetry_cancel.cancelled()=>break, _=interval.tick()=>telemetry_app.sample_metrics() }
         }
     });
+    let memory_app = app.clone();
+    let memory_cancel = cancel.clone();
+    let memory_maintenance = tokio::spawn(async move {
+        memory_app.media.maintain_idle_memory(memory_cancel).await;
+    });
     type Server = std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
     let mut serving = FuturesUnordered::<Server>::new();
     if let Some(listener) = listener {
@@ -267,6 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = supervisor.await;
     let _ = authorization.await;
     let _ = telemetry.await;
+    let _ = memory_maintenance.await;
     let vendor_result = vendor_playback.await;
     if srt_result.is_none() {
         if let Some(task) = srt_task {

@@ -97,6 +97,7 @@ impl App {
         source: &url::Url,
         secure: bool,
     ) -> Result<Admission, u16> {
+        let _activity = self.media.idle_memory.activity().await;
         let (ticket, clean) = super::rtsp_balancer::strip_ticket(&viewer.qs);
         viewer.qs = clean;
         let selection = self.config.read(|root| {

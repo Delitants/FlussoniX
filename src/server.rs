@@ -338,6 +338,7 @@ impl App {
         _revision: u64,
         demand: Option<&RecoveryDemand>,
     ) {
+        let _activity = self.media.idle_memory.activity().await;
         let signature = crate::media::media_signature(config);
         if !self.recovery_current(name, &signature, demand).await {
             return;
@@ -491,6 +492,7 @@ impl App {
         }
         let mut node = self.load_node().await;
         node["streams"] = json!(streams);
+        node["idle_memory_cleanup"] = self.media.idle_memory.snapshot();
         node
     }
     async fn load_node(&self) -> Value {
@@ -1434,6 +1436,7 @@ async fn balance_inner(
     error(StatusCode::SERVICE_UNAVAILABLE, "no available CDN node")
 }
 async fn media_request(State(app): State<Arc<App>>, request: Request) -> Response {
+    let activity = app.media.idle_memory.activity().await;
     let mut response = if request.method() == "OPTIONS" {
         StatusCode::NO_CONTENT.into_response()
     } else if request.method() == "POST" {
@@ -1454,7 +1457,7 @@ async fn media_request(State(app): State<Arc<App>>, request: Request) -> Respons
         "access-control-allow-headers",
         axum::http::HeaderValue::from_static("Authorization, Range"),
     );
-    response
+    idle_body::retain(response, activity)
 }
 async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     let secure = request
@@ -1976,6 +1979,7 @@ mod continuous_session_tests {
 #[path = "origin_resolution.rs"]
 mod origin_resolution;
 
+mod idle_body;
 pub(crate) mod rtsp_access;
 pub(crate) mod ts_access;
 

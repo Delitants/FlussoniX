@@ -319,6 +319,7 @@ pub enum AuthOutcome {
     Redirect(String),
 }
 pub struct PlaybackAuth {
+    idle_memory: crate::idle_memory::Controller,
     authority: Mutex<HashMap<String, Authority>>,
     entries: Mutex<Entries>,
     client: reqwest::Client,
@@ -328,6 +329,7 @@ pub struct PlaybackAuth {
 impl PlaybackAuth {
     pub fn new(limit: usize) -> Self {
         Self {
+            idle_memory: crate::idle_memory::Controller::default(),
             authority: Mutex::new(HashMap::new()),
             entries: Mutex::new(Entries::default()),
             client: reqwest::Client::builder()
@@ -552,6 +554,13 @@ impl PlaybackAuth {
                 s.generation,
                 s.created.elapsed().as_secs(),
             )
+        };
+        // Background renewal can outlive a media worker. Only real callback
+        // work holds this fence; an empty periodic sweep stays passive.
+        let _activity = if policy.url.is_some() {
+            Some(self.idle_memory.activity().await)
+        } else {
+            None
         };
         let mut decision = Decision::Allow;
         let mut seconds = 180;
@@ -903,6 +912,9 @@ impl PlaybackAuth {
         }
     }
 }
+
+#[cfg(test)]
+mod idle_memory_tests;
 
 #[cfg(test)]
 mod tests {

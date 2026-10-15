@@ -71,6 +71,7 @@ fn mapped(id: &str, name: &str) -> Option<String> {
     Some(output)
 }
 pub(super) async fn lookup(State(app): State<Arc<App>>, request: Request) -> Response {
+    let _activity = app.media.idle_memory.activity().await;
     let result = async move {
         if request.method() != axum::http::Method::GET {
             return Err(405);

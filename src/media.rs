@@ -31,6 +31,7 @@ pub struct Engine {
     hls_epoch: crate::hls_generation::Epoch,
     workers: Mutex<HashMap<String, Arc<Worker>>>,
     gpu: crate::gpu::Checks,
+    pub(crate) idle_memory: crate::idle_memory::Controller,
     pub direct_egress: Arc<AtomicU64>,
     pub rtsp_push_egress: Arc<AtomicU64>,
     pub http_push_egress: Arc<AtomicU64>,
@@ -80,6 +81,8 @@ pub struct Worker {
     shared_authority: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     shared_static_demand: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     last_access: Arc<std::sync::Mutex<Instant>>,
+    // Drop last: old viewers and retirement may outlive the worker-map entry.
+    _idle_activity: crate::idle_memory::Activity,
 }
 impl Worker {
     pub fn subscribe(&self) -> broadcast::Receiver<Bytes> {
@@ -202,16 +205,23 @@ impl Engine {
             hls_epoch: crate::hls_generation::Epoch::new(),
             workers: Mutex::new(HashMap::new()),
             gpu: crate::gpu::Checks::default(),
+            idle_memory: crate::idle_memory::Controller::default(),
             direct_egress: Arc::new(AtomicU64::new(0)),
             rtsp_push_egress: Arc::new(AtomicU64::new(0)),
             http_push_egress: Arc::new(AtomicU64::new(0)),
         }
     }
     pub async fn gpu_capabilities(&self) -> Value {
+        let _activity = self.idle_memory.activity().await;
         json!(self.gpu.report(&self.ffmpeg).await)
     }
     pub async fn vaapi_capabilities(&self) -> Value {
+        let _activity = self.idle_memory.activity().await;
         json!(self.gpu.vaapi_report(&self.ffmpeg).await)
+    }
+    /// The daemon owns and joins this optional process-wide maintenance task.
+    pub async fn maintain_idle_memory(&self, cancel: CancellationToken) {
+        self.idle_memory.run(cancel).await;
     }
     fn directory(&self, name: &str) -> PathBuf {
         self.root
@@ -310,6 +320,7 @@ impl Engine {
         current: impl std::future::Future<Output = bool>,
         mode: StartMode,
     ) -> Result<Arc<Worker>, String> {
+        let activity = self.idle_memory.activity().await;
         let StartMode {
             publishing,
             last_playback,
@@ -847,6 +858,7 @@ impl Engine {
                 .as_ref()
                 .map(|s| Arc::new(s.feed.authority()) as Arc<dyn Fn() -> bool + Send + Sync>),
             last_access,
+            _idle_activity: activity,
         });
         let original_wire = (m4s_input || m4f_input) && profile.full_copy();
         let native_ca = inputs[index]["flussonix_tls_ca"]

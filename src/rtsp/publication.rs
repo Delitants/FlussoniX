@@ -41,6 +41,7 @@ struct Session {
     secure: bool,
     progress: Instant,
     _permit: OwnedSemaphorePermit,
+    _idle_activity: crate::idle_memory::Activity,
 }
 async fn admit(
     r: &Request,
@@ -50,6 +51,7 @@ async fn admit(
     pool: Option<Arc<udp::Pool>>,
     auth: &auth::Auth,
 ) -> Result<Session, u16> {
+    let idle_activity = app.media.idle_memory.activity().await;
     if app.options.role == "lb" {
         return Err(403);
     }
@@ -132,6 +134,7 @@ async fn admit(
         secure,
         progress: Instant::now(),
         _permit: permit,
+        _idle_activity: idle_activity,
     })
 }
 async fn revoked(app: &App, name: &str, expected: &Snapshot) {

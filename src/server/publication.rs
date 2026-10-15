@@ -126,6 +126,7 @@ impl Packets {
     }
 }
 pub async fn receive(app: Arc<App>, request: Request<Body>) -> Response {
+    let _activity = app.media.idle_memory.activity().await;
     let raw = request.uri().path().trim_start_matches('/');
     let Some(raw) = raw.strip_suffix("/mpegts") else {
         return error(StatusCode::NOT_FOUND, "publication path required");
