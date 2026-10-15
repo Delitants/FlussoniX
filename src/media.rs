@@ -20,7 +20,7 @@ use std::{
 use tokio::{
     io::AsyncReadExt,
     process::Command,
-    sync::{Mutex, broadcast, oneshot},
+    sync::{Mutex, oneshot},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -53,7 +53,7 @@ impl Drop for Publication {
 pub struct Worker {
     publisher_stdin: std::sync::Mutex<Option<tokio::process::ChildStdin>>,
     publication: bool,
-    tx: broadcast::Sender<Bytes>,
+    tx: crate::media_queue::Channel,
     cancel: CancellationToken,
     done: Mutex<Option<oneshot::Receiver<()>>>,
     pid: AtomicU32,
@@ -85,7 +85,7 @@ pub struct Worker {
     _idle_activity: crate::idle_memory::Activity,
 }
 impl Worker {
-    pub fn subscribe(&self) -> broadcast::Receiver<Bytes> {
+    pub fn subscribe(&self) -> crate::media_queue::Receiver {
         self.touch();
         self.tx.subscribe()
     }
@@ -785,7 +785,7 @@ impl Engine {
             )
         };
         let pid = child.as_ref().and_then(|c| c.id()).unwrap_or(0);
-        let (tx, _) = broadcast::channel(64);
+        let tx = ts_channel();
         let mut stdin = child.as_mut().and_then(|c| c.stdin.take());
         let (done_tx, done) = oneshot::channel();
         let cancel = CancellationToken::new();
@@ -1475,6 +1475,54 @@ mod lifecycle_tests {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
     #[tokio::test]
+    async fn rtsp_push_releases_ts_probe_before_waiting_for_receiver_setup() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (ready, setup) = tokio::sync::oneshot::channel();
+        let stop = CancellationToken::new();
+        let server_stop = stop.clone();
+        let server = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut byte = [0];
+            socket.read_exact(&mut byte).await.unwrap();
+            ready.send(()).unwrap();
+            server_stop.cancelled().await;
+        });
+        let cfg = json!({"inputs":[{"url":"testsrc://"}],
+            "pushes":[{"url":format!("rtsp://{address}/owned"),"connect_timeout":20}]});
+        let worker = app.media.ensure("owned", &cfg).await.unwrap();
+        let setup_ok = matches!(
+            tokio::time::timeout(Duration::from_secs(8), setup).await,
+            Ok(Ok(()))
+        );
+        let before = worker.bytes.load(Ordering::Relaxed);
+        let flowing = tokio::time::timeout(Duration::from_secs(3), async {
+            while worker.bytes.load(Ordering::Relaxed) < before + 64000 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let retained = worker.tx.retained();
+        app.media.stop_all().await;
+        stop.cancel();
+        server.abort();
+        let _ = server.await;
+        assert!(
+            setup_ok && flowing,
+            "real RTSP setup must be stalled after TS probing while worker flows"
+        );
+        assert_eq!(
+            retained,
+            (0, 0),
+            "RTSP probe must not pin TS after metadata is known"
+        );
+    }
+
+    #[tokio::test]
     async fn caption_queue_retains_a_transient_burst_in_order() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         sender.send(Bytes::from_static(b"first")).await.unwrap();
@@ -1885,5 +1933,42 @@ mod caption_sink_tests {
             status.is_none(),
             "optional caption connection failure must retain AV: {status:?}"
         );
+    }
+}
+
+// One shared backlog per worker, never one copy per viewer. This byte budget
+// tolerates GOP bursts across arbitrary stdout read boundaries. The record
+// ceiling also bounds metadata for tiny reads. Fully consumed data is released.
+fn ts_channel() -> crate::media_queue::Channel {
+    crate::media_queue::Channel::live(32 * 1024, 4 * 1024 * 1024)
+}
+
+#[cfg(test)]
+mod ts_backlog_tests {
+    use super::*;
+
+    // A GOP arrives in many small reads; chunk count must not truncate a
+    // healthy viewer while its byte backlog is still small.
+    #[tokio::test]
+    async fn ts_gop_burst_preserves_every_byte_for_all_viewers() {
+        let queue = ts_channel();
+        let mut first = queue.subscribe();
+        let mut second = queue.subscribe();
+        for sequence in 0..256u32 {
+            let mut packet = vec![0x47; 1316];
+            packet[4..8].copy_from_slice(&sequence.to_be_bytes());
+            queue.send(Bytes::from(packet)).unwrap();
+        }
+        for sequence in 0..256u32 {
+            let a = first.recv().await.expect("ordinary GOP must not overflow");
+            let b = second
+                .recv()
+                .await
+                .expect("second viewer must receive the same GOP");
+            assert_eq!(a.len(), 1316);
+            assert_eq!(&a[4..8], &sequence.to_be_bytes());
+            assert!(a[..4].iter().chain(a[8..].iter()).all(|b| *b == 0x47));
+            assert_eq!(a, b);
+        }
     }
 }

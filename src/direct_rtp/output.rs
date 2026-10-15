@@ -68,7 +68,7 @@ impl State {
     }
     pub async fn run(
         self: Arc<Self>,
-        mut receiver: broadcast::Receiver<Bytes>,
+        mut receiver: crate::media_queue::Receiver,
         cancel: CancellationToken,
     ) {
         if self.definition.settings.elementary {
@@ -89,7 +89,7 @@ impl State {
     }
     async fn send(
         &self,
-        receiver: &mut broadcast::Receiver<Bytes>,
+        receiver: &mut crate::media_queue::Receiver,
         cancel: &CancellationToken,
     ) -> Result<(), &'static str> {
         let pair = Pair::send(&self.definition.settings)

@@ -1,5 +1,4 @@
 //! Bounded SRT caller destinations. No vendor transport code is loaded.
-use bytes::Bytes;
 use serde_json::Value;
 use std::{
     sync::{Arc, Mutex},
@@ -239,7 +238,7 @@ impl State {
     pub async fn run(
         self: Arc<Self>,
         ffmpeg: String,
-        mut receiver: broadcast::Receiver<Bytes>,
+        mut receiver: crate::media_queue::Receiver,
         cancel: CancellationToken,
     ) {
         if self.destination.disabled {
@@ -270,7 +269,7 @@ impl State {
     async fn attempt(
         &self,
         ffmpeg: &str,
-        receiver: &mut broadcast::Receiver<Bytes>,
+        receiver: &mut crate::media_queue::Receiver,
         cancel: &CancellationToken,
     ) -> &'static str {
         let mut cmd = Command::new(ffmpeg);

@@ -6,6 +6,7 @@ use crate::source_directory::modern_coordinator::{
 };
 pub use sessions::{HlsSessionFailure, SharedHlsOptions, SharedHlsSessions};
 use std::collections::VecDeque;
+use tokio::sync::broadcast;
 
 #[derive(Default)]
 pub(super) struct StartMode {
@@ -49,7 +50,7 @@ pub struct PackagedSubscription {
     receiver: Receiver,
 }
 enum Receiver {
-    Ts(broadcast::Receiver<Bytes>),
+    Ts(crate::media_queue::Receiver),
     Native(crate::media_queue::Receiver),
 }
 impl Engine {

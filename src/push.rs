@@ -74,11 +74,7 @@ impl State {
         match self.as_ref() {
             Self::Http(s) => s.clone().run(worker.subscribe(), cancel).await,
             Self::Srt(s) => s.clone().run(ffmpeg, worker.subscribe(), cancel).await,
-            Self::Rtsp(s) => {
-                s.clone()
-                    .run(worker.clone(), worker.subscribe(), cancel)
-                    .await
-            }
+            Self::Rtsp(s) => s.clone().run(worker.clone(), cancel).await,
         }
     }
 }
