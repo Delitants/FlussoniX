@@ -1797,7 +1797,18 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             .into_response();
     }
     if file == "mpegts" {
-        let body = native_ts_body::body(worker, grant, app.egress.clone());
+        let connection = matches!(
+            request.version(),
+            axum::http::Version::HTTP_10 | axum::http::Version::HTTP_11
+        )
+        .then(|| {
+            request
+                .extensions()
+                .get::<crate::http_transport::Control>()
+                .cloned()
+        })
+        .flatten();
+        let body = native_ts_body::body(worker, grant, app.egress.clone(), connection);
         return (
             [
                 ("Content-Type".to_owned(), "video/mp2t".to_owned()),

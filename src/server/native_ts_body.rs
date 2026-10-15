@@ -26,6 +26,7 @@ impl End {
     }
 }
 struct Delivery {
+    connection_watch: Option<crate::http_transport::Watch>,
     rx: Receiver,
     viewer: ViewerGuard,
     egress: Arc<AtomicU64>,
@@ -37,11 +38,24 @@ struct Delivery {
 }
 impl Drop for Delivery {
     fn drop(&mut self) {
+        // Fence the watcher before observing its reason. Otherwise a concurrent
+        // cancellation could reset a reused connection after this event logs.
+        if let Some(watch) = &mut self.connection_watch {
+            watch.unregister();
+        }
         // Avoid queue/counter snapshots when this diagnostic target is disabled.
         if !tracing::enabled!(target: "flussonix::native_ts", tracing::Level::INFO) {
             return;
         }
-        let end = self.end.unwrap_or(End::BodyDropped);
+        let transport_reason = self
+            .connection_watch
+            .as_ref()
+            .and_then(|watch| watch.reason());
+        let end = match transport_reason {
+            Some(crate::http_transport::Reason::Authorization) => End::AuthorizationRevoked,
+            Some(crate::http_transport::Reason::Worker) => End::WorkerStopped,
+            None => self.end.unwrap_or(End::BodyDropped),
+        };
         let worker = &self.viewer.0;
         let (records, bytes) = worker.ts_backlog();
         tracing::info!(target: "flussonix::native_ts",
@@ -49,6 +63,7 @@ impl Drop for Delivery {
             delivery_id = self.id,
             worker_pid = worker.pid(),
             reason = end.reason(),
+            transport_abort_requested = transport_reason.is_some(),
             missed_records = match end { End::QueueLagged(missed) => missed, _ => 0 },
             bytes_yielded = self.bytes_yielded,
             worker_bytes_since_start = worker.bytes.load(Ordering::Relaxed).saturating_sub(self.worker_bytes_at_start),
@@ -63,11 +78,28 @@ impl Drop for Delivery {
     }
 }
 
-pub(super) fn body(worker: Arc<Worker>, grant: Grant, egress: Arc<AtomicU64>) -> Body {
+pub(super) fn body(
+    worker: Arc<Worker>,
+    grant: Grant,
+    egress: Arc<AtomicU64>,
+    connection: Option<crate::http_transport::Control>,
+) -> Body {
     let worker_bytes_at_start = worker.bytes.load(Ordering::Relaxed);
     let rx = worker.subscribe();
     worker.viewers.fetch_add(1, Ordering::Relaxed);
+    let connection_watch = connection.map(|control| {
+        let worker = worker.cancellation_token();
+        let authorization = grant.cancellation_token();
+        control.watch(async move {
+            tokio::select! {
+                biased;
+                _ = authorization.cancelled() => crate::http_transport::Reason::Authorization,
+                _ = worker.cancelled() => crate::http_transport::Reason::Worker,
+            }
+        })
+    });
     let delivery = Delivery {
+        connection_watch,
         rx,
         viewer: ViewerGuard(worker, grant),
         egress,
@@ -100,6 +132,17 @@ pub(super) fn body(worker: Arc<Worker>, grant: Grant, egress: Arc<AtomicU64>) ->
                     Some((Ok::<Bytes, std::io::Error>(bytes), delivery))
                 }
                 Err(end) => {
+                    if let Some(watch) = &delivery.connection_watch {
+                        match end {
+                            End::AuthorizationRevoked => {
+                                watch.abort(crate::http_transport::Reason::Authorization)
+                            }
+                            End::WorkerStopped => {
+                                watch.abort(crate::http_transport::Reason::Worker)
+                            }
+                            _ => {}
+                        }
+                    }
                     delivery.end = Some(end);
                     drop(delivery);
                     None

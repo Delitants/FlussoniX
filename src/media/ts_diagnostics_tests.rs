@@ -278,3 +278,233 @@ async fn producer_queue_close_is_distinct_and_drains_remaining_ts() {
     })
     .await;
 }
+
+use crate::transport_tls_fixture;
+trait ClientIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ClientIo for T {}
+
+async fn cancelled_blocked_socket(tls: bool, revoke: bool) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (rows, _capture) = capture();
+    let (_dir, app) = setup();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let certificates = tls.then(transport_tls_fixture::Certificates::new);
+    let server = if let Some(cert) = &certificates {
+        tokio::spawn(crate::http_tls::serve(
+            listener,
+            cert.server(),
+            app.clone(),
+            CancellationToken::new(),
+        ))
+    } else {
+        tokio::spawn(crate::http_transport::serve(
+            listener,
+            app.clone(),
+            CancellationToken::new(),
+        ))
+    };
+    let result = std::panic::AssertUnwindSafe(async {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        socket.bind("127.81.0.1:0".parse().unwrap()).unwrap();
+        let tcp = socket.connect(address).await.unwrap();
+        let mut client: Box<dyn ClientIo> = if let Some(cert) = &certificates {
+            Box::new(
+                tokio_rustls::TlsConnector::from(cert.client())
+                    .connect("localhost".try_into().unwrap(), tcp)
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            Box::new(tcp)
+        };
+        client
+            .write_all(
+                b"GET /owned/mpegts?token=private-viewer-token HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let worker = worker(&app).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while worker.viewers.load(Ordering::Relaxed) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let session = app
+            .playback_auth
+            .snapshots()
+            .into_iter()
+            .find(|s| s["ip"] == "127.81.0.1")
+            .expect("listener must retain real peer identity");
+        let mut healthy = if revoke {
+            Some(body(&app, "another-private-viewer-token").await)
+        } else {
+            None
+        };
+        send(&worker, Bytes::from_static(b"first-packet"));
+        if let Some(healthy) = &mut healthy {
+            assert_eq!(next(healthy).await.unwrap(), "first-packet");
+        }
+        let mut header = vec![0; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut header))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&header[..n]).starts_with("HTTP/1.1 200"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while app.egress.load(Ordering::Relaxed) < if revoke { 24 } else { 12 } {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // One legal queue record exceeds socket capacity. Pause only this
+        // receiver; host network policy remains unchanged.
+        send(&worker, Bytes::from(vec![0x47; 4 * 1024 * 1024]));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while app.egress.load(Ordering::Relaxed) < 4 * 1024 * 1024 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if revoke {
+            assert!(app.playback_auth.revoke(session["id"].as_str().unwrap()));
+        } else {
+            app.media.stop("owned").await;
+            assert!(worker.is_closed());
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while worker.viewers.load(Ordering::Relaxed) != if revoke { 1 } else { 0 } {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled delivery retained viewer while transport blocked");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut bytes = [0; 4096];
+            loop {
+                match client.read(&mut bytes).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("old media socket still drains after cancellation");
+        let row = one(
+            &rows,
+            if revoke {
+                "authorization_revoked"
+            } else {
+                "worker_stopped"
+            },
+        );
+        assert_eq!(row["transport_abort_requested"], true);
+        if let Some(healthy) = &mut healthy {
+            assert!(!worker.is_closed());
+            assert_eq!(next(healthy).await.unwrap().len(), 4 * 1024 * 1024);
+            send(&worker, Bytes::from_static(b"healthy-tail"));
+            assert_eq!(next(healthy).await.unwrap(), "healthy-tail");
+        }
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(3));
+        if let Some(cert) = &certificates {
+            builder = builder.add_root_certificate(
+                reqwest::Certificate::from_pem(&std::fs::read(&cert.ca).unwrap()).unwrap(),
+            );
+        }
+        let scheme = if tls { "https" } else { "http" };
+        let response = builder
+            .build()
+            .unwrap()
+            .get(format!(
+                "{scheme}://localhost:{}/flussonix/api/v1/node",
+                address.port()
+            ))
+            .header("X-Flussonix-Peer", "private-peer-password")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "unaffected connection must keep serving"
+        );
+    })
+    .catch_unwind()
+    .await;
+    server.abort();
+    let _ = server.await;
+    app.media.stop_all().await;
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+#[tokio::test]
+async fn stopped_worker_releases_viewer_while_http_socket_write_is_blocked() {
+    cancelled_blocked_socket(false, false).await;
+}
+#[tokio::test]
+async fn stopped_worker_releases_viewer_while_https_socket_write_is_blocked() {
+    cancelled_blocked_socket(true, false).await;
+}
+#[tokio::test]
+async fn revoked_http_viewer_releases_blocked_transport_and_preserves_another_viewer() {
+    cancelled_blocked_socket(false, true).await;
+}
+#[tokio::test]
+async fn revoked_https_viewer_releases_blocked_transport_and_preserves_another_viewer() {
+    cancelled_blocked_socket(true, true).await;
+}
+
+#[tokio::test]
+async fn unpolled_transport_cancellation_prioritizes_authorization_and_excludes_http2() {
+    for version in [axum::http::Version::HTTP_11, axum::http::Version::HTTP_2] {
+        let (rows, _capture) = capture();
+        let (_dir, app) = setup();
+        checked(&app, async {
+            let control = crate::http_transport::Control::default();
+            let mut request = Request::builder()
+                .uri("/owned/mpegts?token=private-viewer-token")
+                .version(version)
+                .body(Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(control.clone());
+            let response = router(app.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), 200);
+            let worker = worker(&app).await;
+            let id = app.playback_auth.snapshots()[0]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(app.playback_auth.revoke(&id));
+            worker.cancellation_token().cancel();
+            if version == axum::http::Version::HTTP_11 {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while !control.is_aborted() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            let mut body = response.into_body();
+            assert!(next(&mut body).await.is_none());
+            drop(body);
+            assert_eq!(
+                control.is_aborted(),
+                version == axum::http::Version::HTTP_11
+            );
+            let row = one(&rows, "authorization_revoked");
+            assert_eq!(
+                row["transport_abort_requested"],
+                version == axum::http::Version::HTTP_11
+            );
+            assert_eq!(worker.viewers.load(Ordering::Relaxed), 0);
+        })
+        .await;
+    }
+}

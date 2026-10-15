@@ -1,7 +1,7 @@
 use clap::Parser;
-use flussonix::server::{App, Options, router};
+use flussonix::server::{App, Options};
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use std::{future::IntoFuture, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 #[derive(Parser)]
 #[command(name = "flussonix", version, about = "Independent live media server")]
 struct Args {
@@ -241,14 +241,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     type Server = std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
     let mut serving = FuturesUnordered::<Server>::new();
     if let Some(listener) = listener {
-        serving.push(Box::pin(
-            axum::serve(
-                listener,
-                router(app.clone()).into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(cancel.clone().cancelled_owned())
-            .into_future(),
-        ));
+        serving.push(Box::pin(flussonix::http_transport::serve(
+            listener,
+            app.clone(),
+            cancel.clone(),
+        )));
     }
     if let Some(listener) = https_listener {
         serving.push(Box::pin(flussonix::http_tls::serve(

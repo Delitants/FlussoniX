@@ -43,6 +43,7 @@ pub mod hevc;
 mod http_basic;
 mod http_push;
 pub mod http_tls;
+pub mod http_transport;
 pub mod mpeg_audio;
 pub mod publish;
 
@@ -86,3 +87,7 @@ mod vendor_playback;
 #[path = "../tests/vendor_daemon_failover/fixture.rs"]
 #[allow(dead_code)]
 pub(crate) mod vendor_test_fixture;
+
+#[cfg(test)]
+#[path = "../tests/support/tls.rs"]
+pub(crate) mod transport_tls_fixture;

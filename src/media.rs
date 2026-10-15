@@ -104,6 +104,9 @@ impl Worker {
     pub fn is_closed(&self) -> bool {
         self.cancel.is_cancelled()
     }
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
     pub async fn closed(&self) {
         self.cancel.cancelled().await
     }
