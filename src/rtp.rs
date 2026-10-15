@@ -127,7 +127,7 @@ impl Hub {
     fn with_limit(max_tracks: usize) -> Self {
         Self {
             max_tracks,
-            q: Channel::new(4096, 64 * 1024 * 1024),
+            q: Channel::for_subscribers(4096, 64 * 1024 * 1024),
             state: Mutex::new(State {
                 input: vec![],
                 tracks: vec![],
@@ -380,6 +380,7 @@ fn describe(s: &State) -> Result<Description, String> {
         generation: s.generation,
     })
 }
+
 fn parse_tracks(tracks: &[Track], max_tracks: usize) -> Result<Vec<PacketTrack>, String> {
     let tracks: Vec<_> = tracks.iter().filter(|t| t.codec != "subtitle").collect();
     if tracks.is_empty() || tracks.len() > max_tracks {
@@ -678,4 +679,78 @@ fn hevc_payloads(width: usize, body: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod queue_lifecycle_tests {
+    use super::*;
+
+    fn audio_hub() -> Hub {
+        let hub = Hub::new();
+        hub.configure(&[Track {
+            id: 9,
+            codec: "aac".into(),
+            config: vec![0x12, 0x10],
+        }]);
+        hub
+    }
+    fn audio(value: u8, dts: u64) -> Frame {
+        Frame {
+            track_id: 9,
+            body: vec![value; 100],
+            key: true,
+            dts,
+            pts_offset: 0,
+        }
+    }
+
+    #[test]
+    fn unused_rtp_output_keeps_bootstrap_without_a_delivery_backlog() {
+        let hub = audio_hub();
+        hub.frames(&[audio(11, 90000), audio(22, 91920)]);
+        assert_eq!(hub.q.retained(), (0, 0), "no RTP viewer needs queued GOPs");
+        let snapshot = hub.play_snapshot().unwrap();
+        assert_eq!(snapshot.packets.len(), 2);
+        assert_eq!(&snapshot.packets[0][20..], &[11; 100]);
+        assert_eq!(&snapshot.packets[1][20..], &[22; 100]);
+    }
+
+    #[tokio::test]
+    async fn last_rtp_viewer_releases_backlog_without_interrupting_other_viewers() {
+        let hub = audio_hub();
+        let (_, _, first) = hub.subscribe().unwrap();
+        let (_, _, mut second) = hub.subscribe().unwrap();
+        hub.frame(&audio(33, 90000));
+        drop(first);
+        let packet = tokio::time::timeout(std::time::Duration::from_millis(100), second.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&packet[20..], &[33; 100]);
+        assert!(hub.q.retained().1 > 0);
+        drop(second);
+        assert_eq!(hub.q.retained(), (0, 0));
+        hub.frame(&audio(44, 91920));
+        assert_eq!(hub.q.retained(), (0, 0));
+        let snapshot = hub.play_snapshot().unwrap();
+        assert_eq!(&snapshot.packets.last().unwrap()[20..], &[44; 100]);
+    }
+
+    #[tokio::test]
+    async fn active_rtp_reader_still_drains_queued_packets_after_clean_eof() {
+        let hub = audio_hub();
+        let (_, _, mut reader) = hub.subscribe().unwrap();
+        hub.frames(&[audio(55, 90000), audio(66, 91920)]);
+        hub.finish();
+        for expected in [55, 66] {
+            let packet = reader.recv().await.unwrap();
+            assert_eq!(&packet[20..], &[expected; 100]);
+        }
+        assert!(matches!(
+            reader.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Closed)
+        ));
+        drop(reader);
+        assert_eq!(hub.q.retained(), (0, 0));
+    }
 }
