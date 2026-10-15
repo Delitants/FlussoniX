@@ -492,7 +492,6 @@ impl App {
         }
         let mut node = self.load_node().await;
         node["streams"] = json!(streams);
-        node["idle_memory_cleanup"] = self.media.idle_memory.snapshot();
         node
     }
     async fn load_node(&self) -> Value {
@@ -949,7 +948,9 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
         return json_response(json!({"streams":streams}));
     }
     if tail == "node" && request.method() == "GET" {
-        return json_response(app.node().await);
+        let mut node = app.node().await;
+        node["idle_memory_cleanup"] = app.media.idle_memory.snapshot();
+        return json_response(node);
     }
     if tail == "capabilities" && request.method() == "GET" {
         let (gpu_profiles, vaapi_profiles) =

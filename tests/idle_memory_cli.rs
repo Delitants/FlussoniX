@@ -85,7 +85,22 @@ async fn daemon_reports_supported_idle_cleanup_without_releasing_at_empty_boot()
     let dir = tempfile::tempdir().unwrap();
     let (child, base) = daemon(dir.path()).await;
     let value = node(&client(), &base).await;
+    let compatibility: Value = client()
+        .get(format!("{base}/streamer/api/v3/config/stats"))
+        .basic_auth("admin", Some("owned-memory-admin"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     stop(child).await;
+    assert!(
+        compatibility.get("idle_memory_cleanup").is_none(),
+        "native diagnostics must not change the compatibility stats response"
+    );
     let cleanup = &value["idle_memory_cleanup"];
     assert_eq!(
         cleanup["supported"], true,
