@@ -135,7 +135,17 @@ impl State {
                     let time=stamp.wrapping_add((origin.elapsed().as_micros()*90/1000) as u32);
                     let mut body=report(ssrc,time,self.stats.packets.load(Ordering::Relaxed) as u32,self.stats.bytes.load(Ordering::Relaxed) as u32);
                     if let Some(crypto)=&mut crypto {crypto.protect(&mut body,true)?;}
-                    tokio::select!{biased;_=cancel.cancelled()=>return Ok(()),result=tokio::time::timeout(Duration::from_secs(2),pair.rtcp.send_to(&body,std::net::SocketAddr::new(self.definition.settings.address.ip(),self.definition.settings.address.port()+1)))=>{result.map_err(|_| "RTCP send stalled")?.map_err(|_| "RTCP send failed")?;}}self.egress.fetch_add((body.len()+if self.definition.settings.address.is_ipv4(){28}else{48}) as u64,Ordering::Relaxed);continue;
+                    let sent=tokio::select!{biased;_=cancel.cancelled()=>return Ok(()),result=tokio::time::timeout(Duration::from_secs(2),pair.rtcp.send_to(&body,std::net::SocketAddr::new(self.definition.settings.address.ip(),self.definition.settings.address.port()+1)))=>{
+                        match result.map_err(|_| "RTCP send stalled")? {
+                            Ok(n) if n==body.len()=>true,
+                            Ok(_)=>return Err("RTCP datagram truncated"),
+                            Err(e) if e.kind()==std::io::ErrorKind::ConnectionRefused=>false,
+                            Err(_)=>return Err("RTCP send failed"),
+                        }
+                    }};
+                    if sent {self.egress.fetch_add((body.len()+if self.definition.settings.address.is_ipv4(){28}else{48}) as u64,Ordering::Relaxed);}
+                    else {self.stats.unreachable.fetch_add(1,Ordering::Relaxed);*self.stats.status.lock().unwrap()="receiver_unavailable";}
+                    continue;
                 },
                 _=flush.tick()=>{drain=true;Bytes::new()},
                 result=pair.rtcp.recv_from(&mut control)=>{if let Ok((n,addr))=result {
@@ -176,26 +186,42 @@ impl State {
                     let timestamp =
                         stamp.wrapping_add((origin.elapsed().as_micros() * 90 / 1000) as u32);
                     let mut body = packet::packet(sequence, timestamp, ssrc, payload);
+                    // A protected index is consumed even if the UDP destination
+                    // refuses this packet. Never protect it again under SRTP.
+                    sequence = sequence.wrapping_add(1);
                     if let Some(crypto) = &mut crypto {
                         crypto.protect(&mut body, false)?;
                     }
-                    tokio::select! {biased;_=cancel.cancelled()=>return Ok(()),result=tokio::time::timeout(Duration::from_secs(2),pair.rtp.send(&body))=>{let n=result.map_err(|_| "RTP send stalled")?.map_err(|_| "RTP send failed")?;if n!=body.len(){return Err("RTP datagram truncated");}}}
-                    self.egress.fetch_add(
-                        (body.len()
-                            + if self.definition.settings.address.is_ipv4() {
-                                28
-                            } else {
-                                48
-                            }) as u64,
-                        Ordering::Relaxed,
-                    );
+                    let sent = tokio::select! {biased;_=cancel.cancelled()=>return Ok(()),result=tokio::time::timeout(Duration::from_secs(2),pair.rtp.send(&body))=>{
+                        match result.map_err(|_| "RTP send stalled")? {
+                            Ok(n) if n==body.len()=>true,
+                            Ok(_)=>return Err("RTP datagram truncated"),
+                            Err(e) if e.kind()==std::io::ErrorKind::ConnectionRefused=>false,
+                            Err(_)=>return Err("RTP send failed"),
+                        }
+                    }};
+                    // Bound attempts, including unavailable destinations; never
+                    // retain or retry stale media or spin on an ICMP error.
                     pacer.sent(body.len(), tokio::time::Instant::now());
-                    self.stats.packets.fetch_add(1, Ordering::Relaxed);
-                    self.stats
-                        .bytes
-                        .fetch_add(payload.len() as u64, Ordering::Relaxed);
-                    *self.stats.status.lock().unwrap() = "sending";
-                    sequence = sequence.wrapping_add(1);
+                    if sent {
+                        self.egress.fetch_add(
+                            (body.len()
+                                + if self.definition.settings.address.is_ipv4() {
+                                    28
+                                } else {
+                                    48
+                                }) as u64,
+                            Ordering::Relaxed,
+                        );
+                        self.stats.packets.fetch_add(1, Ordering::Relaxed);
+                        self.stats
+                            .bytes
+                            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                        *self.stats.status.lock().unwrap() = "sending";
+                    } else {
+                        self.stats.unreachable.fetch_add(1, Ordering::Relaxed);
+                        *self.stats.status.lock().unwrap() = "receiver_unavailable";
+                    }
                     pending.drain(..count);
                 }
                 if offset == bytes.len() {
