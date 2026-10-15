@@ -21,6 +21,7 @@ struct History {
     measured: Option<Measurement>,
 }
 struct Measurement {
+    window: Option<(Instant, Instant)>,
     at: Instant,
     interface: Option<String>,
     mbps: Option<f64>,
@@ -63,6 +64,14 @@ impl Sampler {
                 measured: None,
             }),
         })
+    }
+    pub(crate) fn last_sample_at(&self) -> Option<Instant> {
+        self.history
+            .lock()
+            .unwrap()
+            .previous
+            .as_ref()
+            .map(|sample| sample.at)
     }
     pub fn sample(&self, bytes: u64) {
         self.sample_at(Instant::now(), bytes)
@@ -134,9 +143,11 @@ impl Sampler {
         let mut srt_mbps = None;
         let mut direct_rtp_mbps = None;
         let mut fraction = None;
+        let mut window = None;
         if let Some(prev) = &h.previous {
             let elapsed = at.saturating_duration_since(prev.at).as_secs_f64();
             if elapsed > 0.0 && elapsed <= 3.0 {
+                window = Some((prev.at, at));
                 http_mbps = rate(Some(process), Some(prev.process), elapsed);
                 rtsp_mbps = rate(Some(rtsp), Some(prev.rtsp), elapsed);
                 srt_mbps = rate(Some(srt), Some(prev.srt), elapsed);
@@ -172,6 +183,7 @@ impl Sampler {
             cpu,
         });
         h.measured = Some(Measurement {
+            window,
             at,
             interface,
             mbps,
@@ -191,14 +203,37 @@ impl Sampler {
         self.snapshot_at(Instant::now(), capacity)
     }
     pub fn snapshot_at(&self, at: Instant, capacity: f64) -> Value {
+        self.snapshot_window_at(at, capacity).0
+    }
+    pub(crate) fn snapshot_with_window(
+        &self,
+        capacity: f64,
+    ) -> (Value, Option<(Instant, Instant)>) {
+        self.snapshot_window_at(Instant::now(), capacity)
+    }
+    fn snapshot_window_at(
+        &self,
+        at: Instant,
+        capacity: f64,
+    ) -> (Value, Option<(Instant, Instant)>) {
         let h = self.history.lock().unwrap();
         let Some(m) = &h.measured else {
-            return json!({"cpu":null,"ram":null,"uplink":null,"egress_mbps":null,"http_egress_mbps":null,"rtsp_egress_mbps":null,"srt_egress_mbps":null,"direct_rtp_egress_mbps":null,"media_egress_mbps":null,"uplink_source":if self.selection=="process" {"process"}else{"interface"},"uplink_interface":null,"age_ms":null,"bytes_out":0});
+            return (
+                json!({"cpu":null,"ram":null,"uplink":null,"egress_mbps":null,"http_egress_mbps":null,"rtsp_egress_mbps":null,"srt_egress_mbps":null,"direct_rtp_egress_mbps":null,"media_egress_mbps":null,"uplink_source":if self.selection=="process" {"process"}else{"interface"},"uplink_interface":null,"age_ms":null,"bytes_out":0}),
+                None,
+            );
         };
         let age = at.saturating_duration_since(m.at);
         let fresh = age <= STALE;
         let mbps = if fresh { m.mbps } else { None };
-        json!({"cpu":if fresh {m.cpu}else{None},"ram":if fresh {m.ram}else{None},"uplink":mbps.map(|v|v/capacity),"egress_mbps":mbps,"http_egress_mbps":if fresh {m.http_mbps}else{None},"rtsp_egress_mbps":if fresh {m.rtsp_mbps}else{None},"srt_egress_mbps":if fresh {m.srt_mbps}else{None},"direct_rtp_egress_mbps":if fresh {m.direct_rtp_mbps}else{None},"media_egress_mbps":if fresh {m.http_mbps.zip(m.rtsp_mbps).zip(m.srt_mbps).zip(m.direct_rtp_mbps).map(|(((h,r),s),rtp)|h+r+s+rtp)}else{None},"uplink_source":if self.selection=="process" {"process"}else{"interface"},"uplink_interface":m.interface,"age_ms":age.as_millis() as u64,"bytes_out":m.bytes})
+        (
+            json!({"cpu":if fresh {m.cpu}else{None},"ram":if fresh {m.ram}else{None},"uplink":mbps.map(|v|v/capacity),"egress_mbps":mbps,"http_egress_mbps":if fresh {m.http_mbps}else{None},"rtsp_egress_mbps":if fresh {m.rtsp_mbps}else{None},"srt_egress_mbps":if fresh {m.srt_mbps}else{None},"direct_rtp_egress_mbps":if fresh {m.direct_rtp_mbps}else{None},"media_egress_mbps":if fresh {m.http_mbps.zip(m.rtsp_mbps).zip(m.srt_mbps).zip(m.direct_rtp_mbps).map(|(((h,r),s),rtp)|h+r+s+rtp)}else{None},"uplink_source":if self.selection=="process" {"process"}else{"interface"},"uplink_interface":m.interface,"age_ms":age.as_millis() as u64,"bytes_out":m.bytes}),
+            if fresh && m.mbps.is_some() {
+                m.window
+            } else {
+                None
+            },
+        )
     }
 }
 fn rate(current: Option<u64>, previous: Option<u64>, elapsed: f64) -> Option<f64> {

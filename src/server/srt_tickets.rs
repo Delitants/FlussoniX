@@ -162,6 +162,7 @@ mod tests {
         app.reservations.lock().await.insert(
             "owned-ticket".into(),
             Reservation {
+                http_slot: None,
                 srt: Some(Binding {
                     listener_id: "owned-listener".into(),
                     revision: app.config.revision(),
@@ -342,6 +343,7 @@ mod tests {
         app.reservations.lock().await.insert(
             "owned-ticket".into(),
             Reservation {
+                http_slot: None,
                 srt: Some(Binding {
                     listener_id: "owned-listener".into(),
                     revision: app.config.revision(),

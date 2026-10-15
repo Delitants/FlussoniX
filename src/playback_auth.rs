@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -208,7 +208,20 @@ pub(crate) struct RecoveryDemand {
 /// The primary session cache: grouping avoids an additional index or recovery ledger.
 #[derive(Default)]
 struct Entries {
+    reserved: HashMap<String, ReservedSlot>,
     by_stream: HashMap<String, HashMap<String, Arc<Entry>>>,
+}
+struct ReservedSlot {
+    expires: Instant,
+    entry: Option<Weak<Entry>>,
+}
+impl ReservedSlot {
+    fn pending(&self) -> bool {
+        self.entry
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_none_or(|e| !e.occupied())
+    }
 }
 impl Entries {
     fn values(&self) -> impl Iterator<Item = &Arc<Entry>> {
@@ -250,11 +263,37 @@ impl Drop for PendingAuthorization {
         self.0.admissions.fetch_sub(1, Ordering::Relaxed);
     }
 }
+/// A short-lived global slot promised to one native HTTP admission ticket.
+pub(crate) struct CapacityReservation {
+    entries: Arc<Mutex<Entries>>,
+    id: String,
+}
+impl Drop for CapacityReservation {
+    fn drop(&mut self) {
+        self.entries.lock().unwrap().reserved.remove(&self.id);
+    }
+}
 pub struct Grant {
+    capacity_reservation: Option<Arc<CapacityReservation>>,
+    output_credit: Option<Arc<crate::admission_credit::OutputCredit>>,
     entry: Option<Arc<Entry>>,
     cancel: CancellationToken,
 }
 impl Grant {
+    pub(crate) fn release_capacity_reservation(&mut self) {
+        self.capacity_reservation = None;
+    }
+    pub(crate) fn set_output_credit(
+        &mut self,
+        credit: Option<Arc<crate::admission_credit::OutputCredit>>,
+    ) {
+        self.output_credit = credit;
+    }
+    pub(crate) fn take_output_credit(
+        &mut self,
+    ) -> Option<Arc<crate::admission_credit::OutputCredit>> {
+        self.output_credit.take()
+    }
     /// Read-only recovery permission from this original native viewer grant.
     pub(crate) fn recovery_activity(&self) -> Option<Instant> {
         if self.cancel.is_cancelled() {
@@ -282,16 +321,27 @@ impl Grant {
     pub fn peer() -> Self {
         Self {
             entry: None,
+            output_credit: None,
+            capacity_reservation: None,
             cancel: CancellationToken::new(),
         }
     }
     pub async fn cancelled(&self) {
         self.cancel.cancelled().await
     }
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
     }
     pub fn add_bytes(&self, bytes: usize) {
+        if bytes > 0
+            && !self.cancel.is_cancelled()
+            && let Some(credit) = &self.output_credit
+        {
+            credit.record(bytes);
+        }
         if let Some(e) = &self.entry {
             let mut s = e.state.lock().unwrap();
             if self.cancel.is_cancelled() {
@@ -309,6 +359,12 @@ impl Grant {
 impl Drop for Grant {
     fn drop(&mut self) {
         if let Some(e) = &self.entry {
+            // A reservation represented by this live grant must return to the
+            // pending count atomically with releasing its live occupancy.
+            let _ledger = self
+                .capacity_reservation
+                .as_ref()
+                .map(|r| r.entries.lock().unwrap());
             e.live.fetch_sub(1, Ordering::Relaxed);
         }
     }
@@ -321,7 +377,7 @@ pub enum AuthOutcome {
 pub struct PlaybackAuth {
     idle_memory: crate::idle_memory::Controller,
     authority: Mutex<HashMap<String, Authority>>,
-    entries: Mutex<Entries>,
+    entries: Arc<Mutex<Entries>>,
     client: reqwest::Client,
     callbacks: Semaphore,
     limit: usize,
@@ -331,7 +387,7 @@ impl PlaybackAuth {
         Self {
             idle_memory: crate::idle_memory::Controller::default(),
             authority: Mutex::new(HashMap::new()),
-            entries: Mutex::new(Entries::default()),
+            entries: Arc::new(Mutex::new(Entries::default())),
             client: reqwest::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(3))
@@ -385,20 +441,64 @@ impl PlaybackAuth {
         })
     }
     pub async fn authorize(&self, snapshot: PolicySnapshot, request: ViewerRequest) -> AuthOutcome {
-        self.authorize_inner(snapshot, request, true).await
+        self.authorize_inner(snapshot, request, true, None).await
     }
     pub(crate) async fn authorize_control(
         &self,
         snapshot: PolicySnapshot,
         request: ViewerRequest,
     ) -> AuthOutcome {
-        self.authorize_inner(snapshot, request, false).await
+        self.authorize_inner(snapshot, request, false, None).await
+    }
+    pub(crate) fn reserve_capacity(&self, additional: usize) -> Option<Arc<CapacityReservation>> {
+        let mut entries = self.entries.lock().unwrap();
+        entries
+            .reserved
+            .retain(|_, slot| slot.expires > Instant::now());
+        if entries
+            .values()
+            .filter(|e| e.occupied())
+            .count()
+            .saturating_add(
+                entries
+                    .reserved
+                    .values()
+                    .filter(|slot| slot.pending())
+                    .count(),
+            )
+            .saturating_add(additional)
+            >= self.limit
+        {
+            return None;
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        entries.reserved.insert(
+            id.clone(),
+            ReservedSlot {
+                expires: Instant::now() + Duration::from_secs(5),
+                entry: None,
+            },
+        );
+        Some(Arc::new(CapacityReservation {
+            entries: self.entries.clone(),
+            id,
+        }))
+    }
+    pub(crate) async fn authorize_reserved(
+        &self,
+        snapshot: PolicySnapshot,
+        request: ViewerRequest,
+        reservation: Arc<CapacityReservation>,
+    ) -> AuthOutcome {
+        self.authorize_inner(snapshot, request, false, Some(reservation))
+            .await
     }
     async fn authorize_inner(
         &self,
         snapshot: PolicySnapshot,
         request: ViewerRequest,
         playback: bool,
+        reservation: Option<Arc<CapacityReservation>>,
     ) -> AuthOutcome {
         if snapshot.name != request.name {
             return AuthOutcome::Denied;
@@ -484,7 +584,22 @@ impl PlaybackAuth {
             }
             // Cached policy allows still need current capacity admission. Create
             // the live grant under the same lock as the global/user limit checks.
-            let all = self.entries.lock().unwrap();
+            let mut all = self.entries.lock().unwrap();
+            all.reserved.retain(|_, slot| slot.expires > Instant::now());
+            if reservation.as_ref().is_some_and(|r| {
+                !Arc::ptr_eq(&r.entries, &self.entries) || !all.reserved.contains_key(&r.id)
+            }) {
+                return AuthOutcome::Denied;
+            }
+            let own_pending = reservation
+                .as_ref()
+                .is_some_and(|r| all.reserved[&r.id].pending());
+            let pending = all
+                .reserved
+                .values()
+                .filter(|slot| slot.pending())
+                .count()
+                .saturating_sub(usize::from(own_pending));
             let mut s = entry.state.lock().unwrap();
             match &s.decision {
                 Decision::Allow => {
@@ -500,7 +615,7 @@ impl PlaybackAuth {
                         .iter()
                         .filter(|e| e.occupied() && e.state.lock().unwrap().user_id == s.user_id)
                         .count();
-                    if !already && slots >= self.limit
+                    if !already && slots.saturating_add(pending) >= self.limit
                         || !s.unique && s.effective_max.is_some_and(|n| user_slots as u64 >= n)
                     {
                         // Capacity is transient; do not poison the cached policy.
@@ -521,7 +636,13 @@ impl PlaybackAuth {
                             s.playback_seen = Some(Instant::now());
                         }
                         entry.live.fetch_add(1, Ordering::Relaxed);
+                        if let Some(r) = &reservation {
+                            all.reserved.get_mut(&r.id).unwrap().entry =
+                                Some(Arc::downgrade(&entry));
+                        }
                         AuthOutcome::Allowed(Grant {
+                            capacity_reservation: reservation.clone(),
+                            output_credit: None,
                             entry: Some(entry.clone()),
                             cancel: s.cancel.clone(),
                         })
@@ -1810,5 +1931,45 @@ mod tests {
         drop(grant);
         auth.renew_due().await;
         assert_eq!(auth.active(), 0);
+    }
+    #[tokio::test]
+    async fn promised_slots_transfer_to_control_grants_without_double_counting() {
+        let auth = PlaybackAuth::new(2);
+        let policy = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let a = auth.reserve_capacity(0).unwrap();
+        let b = auth.reserve_capacity(0).unwrap();
+        let viewer = ViewerRequest {
+            name: "owned".into(),
+            proto: "mpegts".into(),
+            token: "a".into(),
+            ..Default::default()
+        };
+        // authorize yields with its constructed grant still alive, modelling the
+        // ticket handler's media/config checks before it removes the reservation.
+        let (left, right) = tokio::join!(
+            auth.authorize_reserved(policy.clone(), viewer.clone(), a),
+            auth.authorize_reserved(
+                policy,
+                ViewerRequest {
+                    token: "b".into(),
+                    ..viewer
+                },
+                b
+            )
+        );
+        assert!(
+            matches!(left, AuthOutcome::Allowed(_)),
+            "first promise lost capacity"
+        );
+        assert!(
+            matches!(right, AuthOutcome::Allowed(_)),
+            "second promise double-counted the first transfer"
+        );
+        assert_eq!(auth.active(), 2);
     }
 }

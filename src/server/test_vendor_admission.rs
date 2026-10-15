@@ -13,6 +13,20 @@ pub(super) async fn admitted_source(
     tokio::task::JoinHandle<()>,
     String,
 ) {
+    admitted_source_with_limit(lifetime, role, peer, 1000).await
+}
+pub(super) async fn admitted_source_with_limit(
+    lifetime: Duration,
+    role: &str,
+    peer: Option<Value>,
+    limit: u64,
+) -> (
+    tempfile::TempDir,
+    Arc<App>,
+    Box<AdmittedCandidate>,
+    tokio::task::JoinHandle<()>,
+    String,
+) {
     use axum::{extract::OriginalUri, routing::get};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let key = format!("m4s://{}", listener.local_addr().unwrap());
@@ -31,6 +45,7 @@ pub(super) async fn admitted_source(
         dir.path().join("media"),
         Options {
             role: role.into(),
+            client_limit: limit,
             admin_password: "owned-admin-key".into(),
             peer_key: "owned-peer-key".into(),
             ..Default::default()

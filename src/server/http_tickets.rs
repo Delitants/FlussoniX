@@ -109,6 +109,7 @@ mod tests {
         ledger.insert(
             "owned-ticket".into(),
             Reservation {
+                http_slot: None,
                 srt: None,
                 vendor: None,
                 kind: rtsp_balancer::Kind::Http,
@@ -149,6 +150,7 @@ mod tests {
         ledger.insert(
             "owned-ticket".into(),
             Reservation {
+                http_slot: None,
                 srt: None,
                 vendor: None,
                 kind: rtsp_balancer::Kind::Http,
@@ -193,6 +195,7 @@ mod tests {
         app.reservations.lock().await.insert(
             "owned-ticket".into(),
             Reservation {
+                http_slot: None,
                 srt: None,
                 vendor: None,
                 kind: rtsp_balancer::Kind::Http,
@@ -231,6 +234,7 @@ mod tests {
             app.reservations.lock().await.insert(
                 "owned-ticket".into(),
                 Reservation {
+                    http_slot: None,
                     srt: None,
                     vendor: None,
                     kind: rtsp_balancer::Kind::Rtsp {
@@ -248,5 +252,81 @@ mod tests {
             );
             assert!(app.reservations.lock().await.contains_key("owned-ticket"));
         }
+    }
+    #[tokio::test]
+    async fn vendor_http_ticket_does_not_block_its_own_viewer_admission() {
+        use crate::source_directory::modern_coordinator::AdmissionOutcome;
+        use tower::ServiceExt;
+        let (_dir, app, admitted, server, key) =
+            super::super::test_vendor_admission::admitted_source_with_limit(
+                Duration::from_secs(30),
+                "cdn",
+                None,
+                1,
+            )
+            .await;
+        drop(admitted);
+        let owner = app.modern_sources.as_ref().unwrap();
+        let handle = owner
+            .install(
+                owner
+                    .capture(&key)
+                    .unwrap()
+                    .prepare(Duration::from_secs(3))
+                    .unwrap(),
+            )
+            .unwrap();
+        let inventory = owner
+            .inventory(&handle, Duration::from_secs(30))
+            .await
+            .unwrap();
+        app.sample_metrics();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        app.sample_metrics();
+        let response = router(app.clone())
+            .oneshot(
+                axum::http::Request::post("/flussonix/api/v1/admit")
+                    .header("X-Flussonix-Peer", "owned-peer-key")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"name":"owned"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 16384)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let outcome = owner
+            .admit(
+                inventory.candidate("owned").unwrap(),
+                &app.playback_auth,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "hls".into(),
+                    ip: "127.0.0.1".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let AdmissionOutcome::Allowed(admitted) = outcome else {
+            panic!("vendor HTTP ticket blocked its own independent authorization");
+        };
+        assert!(
+            app.redeem_vendor_http_ticket(
+                "owned",
+                value["ticket"].as_str().unwrap(),
+                owner,
+                &admitted
+            )
+            .await
+        );
+        assert_eq!(app.media.count().await, 0);
+        server.abort();
+        let _ = server.await;
     }
 }

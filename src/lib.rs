@@ -1,3 +1,4 @@
+mod admission_credit;
 mod api_cursor;
 mod api_filter;
 mod api_select;

@@ -65,6 +65,7 @@ impl Default for Options {
     }
 }
 struct Reservation {
+    http_slot: Option<Arc<crate::playback_auth::CapacityReservation>>,
     srt: Option<srt_tickets::Binding>,
     vendor: Option<Arc<crate::source_directory::modern_coordinator::ReservedCandidate>>,
     kind: rtsp_balancer::Kind,
@@ -106,6 +107,7 @@ pub struct App {
     cluster_clients: std::sync::Mutex<(u64, HashMap<String, reqwest::Client>)>,
     pub playback_auth: PlaybackAuth,
     reservations: Mutex<HashMap<String, Reservation>>,
+    http_handoffs: http_handoff::Registry,
     rtsp_routes: rtsp_balancer::Registry,
     http_routes: http_balancer::Registry,
     routing_rotation: TieRotation,
@@ -213,6 +215,7 @@ impl App {
             cluster_clients: std::sync::Mutex::new((0, HashMap::new())),
             playback_auth: PlaybackAuth::new(options.client_limit as usize),
             reservations: Mutex::new(HashMap::new()),
+            http_handoffs: http_handoff::Registry::default(),
             rtsp_routes: rtsp_balancer::Registry::default(),
             http_routes: http_balancer::Registry::default(),
             routing_rotation: TieRotation::default(),
@@ -498,7 +501,9 @@ impl App {
         // Worker setup can hold this mutex across network awaits. Obtain the
         // optional stream observation before capturing resource/session load.
         let stream_bitrates = self.media.output_bitrates().await;
-        let mut metrics = self.telemetry.snapshot(self.options.uplink_mbps);
+        let (mut metrics, window) = self
+            .telemetry
+            .snapshot_with_window(self.options.uplink_mbps);
         metrics["http_push_bytes_out"] = json!(self.media.http_push_egress.load(Ordering::Relaxed));
         metrics["rtsp_push_bytes_out"] = json!(self.media.rtsp_push_egress.load(Ordering::Relaxed));
         metrics["rtsp_udp_bytes_out"] = json!(self.rtsp_udp_egress.load(Ordering::Relaxed));
@@ -519,7 +524,10 @@ impl App {
                 .count()
         );
         let reserved = reservations.len() as u64;
-        let reserved_mbps: f64 = reservations.values().map(|r| r.bitrate_mbps).sum();
+        let reserved_mbps: f64 = reservations.values().map(|r| r.bitrate_mbps).sum::<f64>()
+            + self
+                .http_handoffs
+                .unmeasured(window, metrics["http_egress_mbps"].as_f64());
         drop(reservations);
         let rtsp_publication = self.rtsp_publication.lock().unwrap().clone();
         let node = json!({"rtsp_publication":rtsp_publication,"name":self.node_name,"role":self.options.role,"uptime":self.started.elapsed().as_secs(),"reserved_mbps":reserved_mbps,"uplink_mbps":self.options.uplink_mbps,"active":self.active().await,"reserved":reserved,"limit":self.options.client_limit,"drain":self.options.drain,"http_delivery":self.http_delivery.lock().unwrap().clone()});
@@ -535,7 +543,11 @@ impl App {
         metrics
     }
     pub fn sample_metrics(&self) {
-        self.telemetry.sample_transports(
+        let at = Instant::now();
+        self.http_handoffs
+            .sample(self.telemetry.last_sample_at(), at);
+        self.telemetry.sample_transports_at(
+            at,
             self.egress
                 .load(Ordering::Relaxed)
                 .saturating_add(self.media.http_push_egress.load(Ordering::Relaxed)),
@@ -1145,9 +1157,12 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
             );
         }
         let expected = bitrate_mbps / app.options.uplink_mbps;
-        let n = app.telemetry.snapshot(app.options.uplink_mbps);
+        let (n, window) = app.telemetry.snapshot_with_window(app.options.uplink_mbps);
+        let reserved_mbps: f64 = reservations.values().map(|r| r.bitrate_mbps).sum::<f64>()
+            + app
+                .http_handoffs
+                .unmeasured(window, n["http_egress_mbps"].as_f64());
         let active = app.playback_auth.active();
-        let reserved_mbps: f64 = reservations.values().map(|r| r.bitrate_mbps).sum();
         let srt_full = srt.as_ref().is_some_and(|binding| {
             let listener = app.srt_playback.lock().unwrap();
             let limit = listener["client_limit"].as_u64().unwrap_or(0);
@@ -1177,6 +1192,25 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
         {
             return error(StatusCode::SERVICE_UNAVAILABLE, "node has no capacity");
         }
+        let native_http = matches!(kind, rtsp_balancer::Kind::Http)
+            && app.config.read(|root| {
+                matches!(
+                    crate::vendor_playback::select(root, name, app.config.revision()),
+                    crate::vendor_playback::Selection::Native
+                )
+            });
+        let http_slot = if native_http {
+            let other = reservations
+                .values()
+                .filter(|r| r.http_slot.is_none())
+                .count();
+            let Some(slot) = app.playback_auth.reserve_capacity(other) else {
+                return error(StatusCode::SERVICE_UNAVAILABLE, "node has no capacity");
+            };
+            Some(slot)
+        } else {
+            None
+        };
         let ticket = uuid::Uuid::new_v4().to_string();
         let route = vendor.clone();
         let binding = srt.clone();
@@ -1194,6 +1228,7 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
             reservations.insert(
                 ticket.clone(),
                 Reservation {
+                    http_slot,
                     srt,
                     vendor,
                     kind,
@@ -1549,7 +1584,8 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         .get::<ConnectInfo<SocketAddr>>()
         .map(|v| v.0.ip().to_string())
         .unwrap_or_else(|| "127.0.0.1".into());
-    let grant = if app
+    app.http_handoffs.prune();
+    let mut grant = if app
         .credentials
         .peer(header(request.headers(), "x-flussonix-peer"))
     {
@@ -1575,13 +1611,32 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             referer: header(request.headers(), "referer").unwrap_or("").into(),
             host: header(request.headers(), "host").unwrap_or("").into(),
         };
-        // Ticket requests only validate and redirect; the subsequent clean
-        // media request owns playback occupancy. Cross-protocol rejection must
-        // not leave a phantom HTTP viewer blocking a valid RTSP reservation.
-        let outcome = if query.contains_key("flussonix_ticket") {
-            app.playback_auth
-                .authorize_control(resolved.policy, viewer)
-                .await
+        // Validate protocol before authorization. A valid native HTTP ticket
+        // owns a global slot; possession never bypasses viewer policy checks.
+        let outcome = if let Some(ticket) = query.get("flussonix_ticket") {
+            let slot = {
+                let reservations = app.reservations.lock().await;
+                let Some(r) = reservations.get(ticket).filter(|r| {
+                    r.stream == name
+                        && r.expires > Instant::now()
+                        && matches!(r.kind, rtsp_balancer::Kind::Http)
+                }) else {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "admission ticket invalid or expired",
+                    );
+                };
+                r.http_slot.clone()
+            };
+            if let Some(slot) = slot {
+                app.playback_auth
+                    .authorize_reserved(resolved.policy, viewer, slot)
+                    .await
+            } else {
+                app.playback_auth
+                    .authorize_control(resolved.policy, viewer)
+                    .await
+            }
         } else {
             app.playback_auth.authorize(resolved.policy, viewer).await
         };
@@ -1635,7 +1690,9 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         });
         match valid {
             true => {
-                reservations.remove(ticket);
+                let reservation = reservations.remove(ticket).unwrap();
+                app.http_handoffs
+                    .insert(ticket.clone(), grant, reservation.bitrate_mbps);
                 return App::http_ticket_redirect(raw_path, &query);
             }
             _ => {
@@ -1646,6 +1703,9 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             }
         }
     }
+    // M4F signals and timestamp media are one segmented output session.
+    let segmented = !matches!(file, "mpegts" | "m4s");
+    grant.set_output_credit(app.http_handoffs.take(&grant, segmented));
     let signature = crate::media::media_signature(&cfg);
     let check = async {
         !grant.is_cancelled()
@@ -1988,6 +2048,7 @@ pub(crate) mod publication;
 
 mod admission;
 mod http_balancer;
+mod http_handoff;
 mod http_tickets;
 pub(crate) mod rtsp_balancer;
 mod srt_lookup;
