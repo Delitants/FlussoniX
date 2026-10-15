@@ -89,6 +89,9 @@ impl Worker {
         self.touch();
         self.tx.subscribe()
     }
+    pub(crate) fn ts_backlog(&self) -> (usize, usize) {
+        self.tx.retained()
+    }
     pub fn signature(&self) -> &str {
         &self.signature
     }
@@ -1972,3 +1975,7 @@ mod ts_backlog_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "media/ts_diagnostics_tests.rs"]
+mod ts_diagnostics_tests;
