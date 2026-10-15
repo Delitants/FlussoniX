@@ -78,6 +78,23 @@ struct Args {
     #[arg(long)]
     drain: bool,
 }
+
+fn bind_tcp_listener(address: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = if address.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    // Preserve the generic bind path's Unix rebinding behavior. On Windows,
+    // SO_REUSEADDR could allow another process to hijack an occupied address.
+    #[cfg(unix)]
+    socket.set_reuseaddr(true)?;
+    socket.bind(address)?;
+    // Queue short admission bursts without changing application client limits.
+    // The kernel may cap this backlog at its configured maximum.
+    socket.listen(1024)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -125,18 +142,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = if a.https_only {
         None
     } else {
-        Some(tokio::net::TcpListener::bind(a.listen).await?)
+        Some(bind_tcp_listener(a.listen)?)
     };
     let https_listener = match a.https_listen {
-        Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
+        Some(address) => Some(bind_tcp_listener(address)?),
         None => None,
     };
     let rtsp_listener = match a.rtsp_listen {
-        Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
+        Some(address) => Some(bind_tcp_listener(address)?),
         None => None,
     };
     let tls_listener = match a.rtsps_listen {
-        Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
+        Some(address) => Some(bind_tcp_listener(address)?),
         None => None,
     };
     let udp_pool = match (a.rtsp_udp_ports, rtsp_listener.as_ref()) {
