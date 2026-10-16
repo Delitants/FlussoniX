@@ -180,7 +180,25 @@ async fn copy_publication_decodes_fmp4(audio: &str) {
                 "second decoded audio missing; playlist={playlist}; frames={frames}"
             );
         }
+        let worker = publication.worker.clone();
+        let pid = worker.pid();
+        assert_ne!(pid, 0, "decoded publication must have a live packager");
         drop(publication);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worker.alive.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("publisher cancellation must finish worker cleanup");
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        assert_eq!(
+            worker.pid(),
+            0,
+            "retired packager PID must not stay visible"
+        );
+        assert_eq!(worker.stats()["pid"], 0);
+        assert_eq!(engine.stats("owned").await["pid"], 0);
     })
     .catch_unwind()
     .await;

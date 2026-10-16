@@ -1224,6 +1224,8 @@ impl Engine {
             if let Some(bridge) = tls_input {
                 bridge.close().await;
             }
+            // The process has been reaped; retained workers must not advertise its old PID.
+            w.pid.store(0, Ordering::Relaxed);
             w.alive.store(false, Ordering::Relaxed);
             let _ = done_tx.send(());
         });
@@ -1732,14 +1734,14 @@ mod lifecycle_tests {
         drop(blocked);
         let result = pending.await.unwrap();
         let pid = app.media.stats("owned").await["pid"].clone();
+        let current_pid = current.pid();
         app.media.stop_all().await;
         assert!(
             result.is_err(),
             "stale route passed the engine startup fence"
         );
         assert_eq!(
-            pid,
-            current.pid(),
+            pid, current_pid,
             "queued stale startup replaced the current worker"
         );
     }
