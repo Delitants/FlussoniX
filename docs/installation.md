@@ -2,7 +2,8 @@
 
 FlussoniX is a development preview. Use a test host and an unused port.
 
-The archive contains the server, web interface, this guide and a file manifest.
+The archive contains the server, web interface, installation guides, an optional
+service helper and a file manifest.
 It contains no configuration, credentials, media, FFmpeg or Flussonic components.
 Use Linux with the archive's CPU architecture; libc and CPU requirements depend
 on the supplied binary's build.
@@ -63,7 +64,7 @@ access. The login page is public; management data requires authentication.
 In **Media → Streams**, add `testsrc://`, save and open its player. Then check
 your own input. Press **Ctrl+C** to stop the server and its media workers.
 
-This foreground archive workflow does not install or enable a system service.
+For an optional background service, follow [systemd installation](service-installation.md).
 
 ## Upgrade
 

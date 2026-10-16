@@ -45,7 +45,8 @@ FlussoniX nodes in the same cluster use the same peer key. To start the download
 
 For a verified download and persistent state across upgrades, follow the
 [installation and rollback guide](docs/installation.md). Keep your credentials
-and peer key for future restarts.
+and peer key for future restarts. For background operation, see the optional
+[systemd service guide](docs/service-installation.md).
 
 Open [the admin interface](http://127.0.0.1:18210/admin/) and sign in as `admin` with the password you chose. This address accepts connections from the same machine; use an SSH tunnel for remote access.
 

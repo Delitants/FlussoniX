@@ -19,7 +19,8 @@ or target-host compatibility. Run the extracted archive on its target host befor
 publishing it.
 
 The output contains a `.tar.gz` and matching `.sha256` sidecar. The archive has
-`bin/flussonix`, `web`, the installation guide and `manifest.json`. Only public
+`bin/flussonix`, `bin/flussonix-service`, `web`, installation guides and
+`manifest.json`. Only public
 build assets are accepted; runtime state and credentials are never taken from
 the source checkout. Symlinks and unexpected UI files reject packaging.
 
@@ -38,7 +39,7 @@ a comparison build.
 Run archive regression checks with:
 
 ```bash
-python3 -m unittest discover -s tests -p test_package_preview.py -v
+python3 -m unittest discover -s tests -p 'test_*preview.py' -v
 ```
 
 See [installation and upgrades](installation.md) for the operator workflow.

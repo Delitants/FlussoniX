@@ -60,8 +60,10 @@ class PackagePreviewTests(unittest.TestCase):
             files = {Path(m.name).relative_to(archive.name[:-7]).as_posix(): m
                      for m in tar.getmembers() if m.isfile()}
             self.assertEqual(set(files), {'bin/flussonix', 'web/index.html', 'web/assets/app.js',
-                                          'web/assets/app.css', 'README.md', 'manifest.json'})
+                                          'web/assets/app.css', 'README.md', 'manifest.json',
+                                          'bin/flussonix-service', 'service-installation.md'})
             self.assertEqual(files['bin/flussonix'].mode, 0o755)
+            self.assertEqual(files['bin/flussonix-service'].mode, 0o755)
             self.assertEqual(files['web/assets/app.js'].mode, 0o644)
             manifest = json.loads(tar.extractfile(files['manifest.json']).read())
             self.assertEqual(manifest['source_revision'], REVISION)
