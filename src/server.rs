@@ -494,6 +494,7 @@ impl App {
             streams.push(json!({"name":name,"ready":self.media.ready(&name).await,"stats":self.stream_stats(&name).await}));
         }
         let mut node = self.load_node().await;
+        node["version"] = json!(env!("CARGO_PKG_VERSION"));
         node["streams"] = json!(streams);
         node
     }

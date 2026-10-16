@@ -3,6 +3,23 @@ import dgram from 'node:dgram';
 import fs from 'node:fs';
 import path from 'node:path';
 test.beforeEach(async({page})=>{await page.goto('/admin/');await page.getByLabel('Username').fill(process.env.FLUSSONIX_ADMIN_USER||'admin');await page.getByLabel('Password',{exact:true}).fill(process.env.FLUSSONIX_ADMIN_PASSWORD!);await page.getByRole('button',{name:'Sign in',exact:true}).click();await expect(page.getByRole('heading',{name:'Streams',exact:true})).toBeVisible();});
+test('status strip reports the running server version and follows node status updates',async({page,request})=>{
+ const health=await(await request.get('/health')).json();
+ expect(typeof health.version).toBe('string');expect(health.version.length).toBeGreaterThan(0);
+ await expect(page.locator('.status-strip .right')).toContainText(`v${health.version}`);
+ let version:string|undefined='9.8.7-rc.2';
+ await page.route('**/flussonix/api/v1/node',async route=>{
+  const response=await route.fetch();const data=await response.json();
+  if(version===undefined)delete data.version;else data.version=version;
+  await route.fulfill({response,json:data});
+ });
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await expect(page.locator('.status-strip .right')).toContainText('v9.8.7-rc.2');
+ version=undefined;
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();
+ await expect(page.locator('.status-strip .right')).toContainText('Version unavailable');
+ await expect(page.locator('.status-strip .right')).not.toContainText('v9.8.7-rc.2');
+});
 test('Config shows actual HTTP and HTTPS listeners with startup guidance',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
  const node=await(await request.get('/flussonix/api/v1/node',{headers})).json();
