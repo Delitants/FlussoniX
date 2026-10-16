@@ -30,6 +30,38 @@ test('SRT playback status remains visible in mobile Config',async({page})=>{
  const playback=page.getByRole('region',{name:'SRT playback',exact:true});await expect(playback).toBeVisible();await expect(playback).toContainText('startup options');
  expect(await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth)).toBe(false);
 });
+for (const width of [1440,901,900,393,320]) for (const ipv6 of [false,true]) {
+ test(`Config sidebar values remain readable at ${width}px with ${ipv6?'IPv6':'disabled listeners'}`,async({page},testInfo)=>{
+  const address='[2001:db8:1234:5678:9abc:def0:1234:5678]';
+  await page.route('**/flussonix/api/v1/node',async route=>{
+   const response=await route.fetch();const data=await response.json();
+   data.http_delivery={http:ipv6?`${address}:18210`:'127.0.0.1:18210',https:ipv6?`${address}:443`:null,https_only:false};
+   data.srt_playback={enabled:ipv6,listen:ipv6?`${address}:9998`:null,encrypted:ipv6,latency_ms:120,client_limit:128,clients:0};
+   await route.fulfill({response,json:data});
+  });
+  await page.setViewportSize({width,height:1100});
+  await page.getByRole('button',{name:'Config',exact:true}).click();
+  const sidebar=page.locator('.config-layout aside');
+  await expect(sidebar.getByRole('region',{name:'HTTP delivery',exact:true})).toContainText(ipv6?`${address}:18210`:'127.0.0.1:18210');
+  await expect(sidebar.getByRole('region',{name:'SRT playback',exact:true})).toContainText(ipv6?`${address}:9998`:'Not enabled');
+  await page.evaluate(()=>document.fonts.ready);
+  const values=await sidebar.locator('dd').evaluateAll(elements=>elements.map(element=>{
+   const range=document.createRange();range.selectNodeContents(element);
+   const box=element.getBoundingClientRect();const panel=element.closest('aside')!.getBoundingClientRect();
+   return {text:element.textContent||'',lines:range.getClientRects().length,left:box.left,right:box.right,panelLeft:panel.left,panelRight:panel.right,scrollWidth:element.scrollWidth,width:element.clientWidth};
+  }));
+  await testInfo.attach('sidebar-values',{body:JSON.stringify(values,null,2),contentType:'application/json'});
+  await page.screenshot({path:testInfo.outputPath('config.png'),fullPage:true});
+  expect(values).toHaveLength(8);
+  for(const value of values){
+   expect(value.lines,`${value.text} should remain readable`).toBeLessThanOrEqual(value.text.startsWith('[')?3:1);
+   expect(value.left).toBeGreaterThanOrEqual(value.panelLeft);
+   expect(value.right).toBeLessThanOrEqual(value.panelRight);
+   expect(value.scrollWidth).toBeLessThanOrEqual(value.width+1);
+  }
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+ });
+}
 test('SRT playback URL uses an IPv6 endpoint and token placeholder without saved secrets',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
  expect((await request.put('/streamer/api/v3/streams/srt-ui-playback',{headers,data:{inputs:[{url:'testsrc://'}],static:false}})).ok()).toBeTruthy();
