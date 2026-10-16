@@ -208,7 +208,7 @@ fn remux(input: &Path, output: &Path) {
         output.to_str().unwrap(),
     ]);
 }
-pub async fn paced(mut stdin: tokio::process::ChildStdin, bytes: Vec<u8>) {
+pub async fn paced(mut stdin: impl tokio::io::AsyncWrite + Unpin + Send, bytes: Vec<u8>) {
     paced_observed(&mut stdin, bytes, None).await;
 }
 #[derive(Clone, Default, serde::Serialize)]
@@ -223,7 +223,7 @@ pub struct PacingProgress {
     pub last_written_pts: Option<u64>,
 }
 pub async fn paced_observed(
-    stdin: &mut tokio::process::ChildStdin,
+    stdin: &mut (impl tokio::io::AsyncWrite + Unpin + Send),
     bytes: Vec<u8>,
     progress: Option<std::sync::Arc<std::sync::Mutex<PacingProgress>>>,
 ) {

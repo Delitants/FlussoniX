@@ -13,7 +13,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{io::AsyncWriteExt, process::ChildStdin};
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 struct Lane {
     pair: Pair,
@@ -121,7 +121,7 @@ impl Bridge {
     }
     pub async fn start(
         &mut self,
-        mut stdin: ChildStdin,
+        mut stdin: crate::media::PublicationWriter,
         worker: &Arc<Worker>,
         cancel: &CancellationToken,
     ) -> Result<(), String> {

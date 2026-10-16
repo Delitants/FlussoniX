@@ -41,9 +41,10 @@ enum PublicationInput {
     MpegTs,
     Sdp { secure: bool },
 }
+pub type PublicationWriter = Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync>;
 pub struct Publication {
     pub worker: Arc<Worker>,
-    pub stdin: Option<tokio::process::ChildStdin>,
+    pub stdin: Option<PublicationWriter>,
 }
 impl Drop for Publication {
     fn drop(&mut self) {
@@ -51,7 +52,7 @@ impl Drop for Publication {
     }
 }
 pub struct Worker {
-    publisher_stdin: std::sync::Mutex<Option<tokio::process::ChildStdin>>,
+    publisher_stdin: std::sync::Mutex<Option<PublicationWriter>>,
     publication: bool,
     tx: crate::media_queue::Channel,
     cancel: CancellationToken,
@@ -701,6 +702,8 @@ impl Engine {
         }
         // One encode/mux source feeds both HLS variants and shared live TS fan-out.
         let copy_publication = (publication || direct_input.is_some()) && profile.audio_copy();
+        let inspect_publication =
+            matches!(publishing, Some(PublicationInput::MpegTs)) && profile.audio_copy();
         let native_copy = (m4s_input || m4f_input) && profile.full_copy();
         let native_audio_copy = (m4s_input || m4f_input) && profile.audio_copy();
         let copy_peer_ts = peer_ts && profile.audio_copy();
@@ -729,6 +732,8 @@ impl Engine {
             "__NATIVE_FMP4_FILTER__"
         } else if copy_peer_ts {
             "__PEER_FMP4_FILTER__"
+        } else if inspect_publication {
+            "__PUBLICATION_FMP4_FILTER__"
         } else if copy_publication {
             ":bsfs/a=aac_adtstoasc"
         } else {
@@ -771,10 +776,10 @@ impl Engine {
             dir.join("fmp4/index.m3u8").display()
         );
         let native_input = m4s_input || m4f_input;
-        if !native_input && !peer_ts {
+        if !native_input && !peer_ts && !inspect_publication {
             cmd.args(["-threads", "2", "-f", "tee", &output]);
         }
-        if !native_input && !peer_ts {
+        if !native_input && !peer_ts && !inspect_publication {
             if let Some(target) = caption_target.as_deref() {
                 caption_output(&mut cmd, target, caption_separate);
             }
@@ -782,7 +787,7 @@ impl Engine {
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let mut child = if native_input || peer_ts {
+        let mut child = if native_input || peer_ts || inspect_publication {
             None
         } else {
             Some(
@@ -793,6 +798,21 @@ impl Engine {
         let pid = child.as_ref().and_then(|c| c.id()).unwrap_or(0);
         let tx = ts_channel();
         let mut stdin = child.as_mut().and_then(|c| c.stdin.take());
+        // Reserve the publisher immediately, but bound metadata collection before
+        // spawning a copy packager whose fMP4 filters depend on the PMT codecs.
+        let (publisher_stdin, publication_reader) = if inspect_publication {
+            let (writer, reader) = tokio::io::duplex(64 * 1024);
+            (Some(Box::new(writer) as PublicationWriter), Some(reader))
+        } else {
+            (
+                if publication {
+                    stdin.take().map(|s| Box::new(s) as PublicationWriter)
+                } else {
+                    None
+                },
+                None,
+            )
+        };
         let (done_tx, done) = oneshot::channel();
         let cancel = CancellationToken::new();
         let timeout = Duration::from_secs(
@@ -802,7 +822,7 @@ impl Engine {
                 .clamp(1, 300),
         );
         let worker = Arc::new(Worker {
-            publisher_stdin: std::sync::Mutex::new(if publication { stdin.take() } else { None }),
+            publisher_stdin: std::sync::Mutex::new(publisher_stdin),
             publication,
             tx,
             cancel: cancel.clone(),
@@ -925,6 +945,66 @@ impl Engine {
             // cancels and joins its tasks before signaling completion.
             async {
                 let mut child = if let Some(child) = child {
+                    child
+                } else if let Some(mut reader) = publication_reader {
+                    let metadata = async {
+                        let mut probe = crate::ts_profile::Probe::for_publication();
+                        let mut prefix = Vec::new();
+                        let mut buffer = [0u8; 16384];
+                        while probe.audio.is_none() {
+                            let n = reader.read(&mut buffer).await.map_err(|_| "input_closed")?;
+                            if n == 0 { return Err("input_closed"); }
+                            if prefix.len() + n > 1024 * 1024 { return Err("metadata_limit"); }
+                            probe.push(&buffer[..n]);
+                            prefix.extend_from_slice(&buffer[..n]);
+                        }
+                        Ok((probe, prefix))
+                    };
+                    let (probe, prefix) = tokio::select! { biased;
+                        _=cancel.cancelled()=>return,
+                        result=tokio::time::timeout(timeout, metadata)=>match result {
+                            Ok(Ok(value))=>value,
+                            Ok(Err(reason))=>{w.failed(reason);return;},
+                            Err(_)=>{w.failed("startup_timeout");return;},
+                        },
+                    };
+                    // Map one optional video followed by all audio in PMT order.
+                    // AAC's ADTS conversion must never be applied to MPEG audio.
+                    let offset = usize::from(probe.video.is_some());
+                    let filters = if probe.filter_mapping_known {
+                        probe.audio_types.iter().enumerate()
+                            .filter(|(_, codec)| **codec == 0x0f)
+                            .map(|(index, _)| format!(":bsfs/{}=aac_adtstoasc", offset + index))
+                            .collect::<String>()
+                    } else {
+                        // Preserve existing handling where first-program metadata
+                        // cannot establish FFmpeg's complete all-audio mapping.
+                        ":bsfs/a=aac_adtstoasc".into()
+                    };
+                    let output = output.replace("__PUBLICATION_FMP4_FILTER__", &filters);
+                    cmd.args(["-threads", "2", "-f", "tee", &output]);
+                    if let Some(target)=caption_target.as_deref(){caption_output(&mut cmd,target,caption_separate);}
+                    if cancel.is_cancelled() {return;}
+                    let mut child = match cmd.spawn() {
+                        Ok(child)=>child,
+                        Err(_)=>{w.failed("packaging_failed");return;},
+                    };
+                    w.pid.store(child.id().unwrap_or(0),Ordering::Relaxed);
+                    let mut writer = child.stdin.take().unwrap();
+                    let c = cancel.clone();
+                    let pipe_worker = w.clone();
+                    tasks.push(tokio::spawn(async move {
+                        use tokio::io::AsyncWriteExt;
+                        let result = tokio::select! { biased;
+                            _=c.cancelled()=>return,
+                            result=async {
+                                writer.write_all(&prefix).await?;
+                                tokio::io::copy(&mut reader, &mut writer).await
+                            }=>result,
+                        };
+                        if result.is_err() {pipe_worker.failed("packaging_failed");c.cancel();}
+                        // Dropping the owned pipe delivers EOF to the packager.
+                    }));
                     child
                 } else if peer_ts {
                     let bridge=peer_hls.as_mut().unwrap();
