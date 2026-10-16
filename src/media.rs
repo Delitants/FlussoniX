@@ -538,13 +538,15 @@ impl Engine {
             ]);
             cmd.stdin(std::process::Stdio::piped());
         } else if publication {
+            // Live publishers may reconnect between keyframes; probe through a normal GOP.
+            // The byte cap and worker input watchdog still bound startup.
             cmd.args([
                 "-protocol_whitelist",
                 "pipe",
                 "-probesize",
                 "1048576",
                 "-analyzeduration",
-                "1000000",
+                "5000000",
                 "-f",
                 "mpegts",
                 "-i",

@@ -6,6 +6,10 @@ use tokio::io::AsyncWriteExt;
 
 // Applying an AAC-only tee bitstream filter to MPEG audio must fail this test.
 async fn copy_publication_decodes_fmp4(audio: &str) {
+    copy_publication_at_offset(audio, false).await;
+}
+
+async fn copy_publication_at_offset(audio: &str, late_join: bool) {
     let directory = tempfile::tempdir().unwrap();
     let engine = Engine::new(directory.path().join("media"), "ffmpeg");
     let outcome = std::panic::AssertUnwindSafe(async {
@@ -83,6 +87,70 @@ async fn copy_publication_decodes_fmp4(audio: &str) {
             "{}",
             String::from_utf8_lossy(&generated.stderr)
         );
+        let mut input_bytes = std::fs::read(&input).unwrap();
+        if late_join {
+            let probe = tokio::time::timeout(
+                Duration::from_secs(8),
+                tokio::process::Command::new("ffprobe")
+                    .kill_on_drop(true)
+                    .args([
+                        "-v",
+                        "error",
+                        "-select_streams",
+                        "v:0",
+                        "-show_packets",
+                        "-show_entries",
+                        "packet=pts_time,pos,flags",
+                        "-of",
+                        "json",
+                    ])
+                    .arg(&input)
+                    .output(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(probe.status.success());
+            let packets: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+            let packets = packets["packets"].as_array().unwrap();
+            let first = packets[0]["pts_time"]
+                .as_str()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap();
+            let join = packets
+                .iter()
+                .find(|p| {
+                    p["pts_time"].as_str().unwrap().parse::<f64>().unwrap() >= first + 0.25
+                        && !p["flags"].as_str().unwrap().contains('K')
+                })
+                .unwrap()["pos"]
+                .as_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let next_key = packets
+                .iter()
+                .skip(1)
+                .find(|p| p["flags"].as_str().unwrap().contains('K'))
+                .unwrap()["pos"]
+                .as_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let start = input_bytes
+                .chunks_exact(188)
+                .enumerate()
+                .find(|(n, p)| n * 188 >= join && p[0] == 0x47 && p[1] & 0x5f == 0x40 && p[2] == 0)
+                .unwrap()
+                .0
+                * 188;
+            assert!(
+                start > 0 && start < next_key,
+                "fixture must join between keyframes at PAT"
+            );
+            input_bytes.drain(..start);
+        }
         let cfg = json!({"inputs":[{"url":"publish://"}],
             "transcoder":{"encoder":"copy","acodec":"copy"}});
         let mut publication = engine
@@ -91,11 +159,7 @@ async fn copy_publication_decodes_fmp4(audio: &str) {
             .unwrap();
         tokio::time::timeout(
             Duration::from_secs(8),
-            publication
-                .stdin
-                .as_mut()
-                .unwrap()
-                .write_all(&std::fs::read(input).unwrap()),
+            publication.stdin.as_mut().unwrap().write_all(&input_bytes),
         )
         .await
         .unwrap()
@@ -183,6 +247,57 @@ async fn copy_publication_decodes_fmp4(audio: &str) {
         let worker = publication.worker.clone();
         let pid = worker.pid();
         assert_ne!(pid, 0, "decoded publication must have a live packager");
+        if late_join {
+            let (bootstrap, mut live) = worker.wire.m4s_subscribe();
+            let mut buffered = bootstrap.into_iter();
+            let mut decoder = flussonix::m4s::Decoder::default();
+            let mut tracks = Vec::new();
+            let mut sampled = std::collections::HashSet::new();
+            let mut video_key = false;
+            let mut records = 0;
+            let mut bytes = 0;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let chunk = match buffered.next() {
+                        Some(chunk) => chunk,
+                        None => live.recv().await.unwrap(),
+                    };
+                    records += 1;
+                    bytes += chunk.len();
+                    assert!(records <= 1024 && bytes <= 4 * 1024 * 1024);
+                    for event in decoder.push(&chunk).unwrap() {
+                        match event {
+                            flussonix::m4s::Event::Info {
+                                tracks: announced, ..
+                            } => {
+                                assert_eq!(announced.len(), 2);
+                                assert!(announced.iter().all(|t| !t.config.is_empty()));
+                                assert!(announced.iter().any(|t| t.codec == "h264"));
+                                assert!(announced.iter().any(|t| t.codec == "aac"));
+                                tracks = announced;
+                            }
+                            flussonix::m4s::Event::Frame {
+                                track_id,
+                                key,
+                                body,
+                                ..
+                            } => {
+                                assert!(!body.is_empty());
+                                let track = tracks.iter().find(|t| t.id == track_id).unwrap();
+                                video_key |= track.codec == "h264" && key;
+                                sampled.insert(track_id);
+                            }
+                            _ => panic!("unexpected native record"),
+                        }
+                    }
+                    if tracks.len() == 2 && sampled.len() == 2 && video_key {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("native audio/video initialization after mid-GOP join");
+        }
         drop(publication);
         tokio::time::timeout(Duration::from_secs(5), async {
             while worker.alive.load(std::sync::atomic::Ordering::Relaxed) {
@@ -324,4 +439,9 @@ async fn multiprogram_aac_publication_copy_preserves_all_audio() {
 async fn mixed_publication_copy_filters_only_the_aac_track_in_either_order() {
     copy_publication_decodes_fmp4("mixed-aac-first").await;
     copy_publication_decodes_fmp4("mixed-mp2-first").await;
+}
+
+#[tokio::test]
+async fn mid_gop_publication_copy_waits_for_video_parameters_and_decodes() {
+    copy_publication_at_offset("aac", true).await;
 }
