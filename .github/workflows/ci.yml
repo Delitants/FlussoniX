@@ -12,6 +12,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg libsrtp2-1 tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu fonts-dejavu-core
       - name: Verify vendor components are absent
         run: test ! -e /opt/flussonic
+      - name: Preview package regressions
+        run: python3 -m unittest discover -s tests -p test_package_preview.py -v
       - run: rustup show
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings

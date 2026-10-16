@@ -1,0 +1,44 @@
+# Build a Linux preview archive
+
+The packager requires Python 3.11+ and uses only its standard library. Build the
+server and UI from the revision being packaged, using the pinned Rust toolchain
+and Node.js 22.12+:
+
+```bash
+cargo build --release --locked
+npm ci --prefix web
+npm run build --prefix web
+python3 scripts/package-preview.py \
+  --binary target/release/flussonix --web-dir web/dist \
+  --revision "$(git rev-parse HEAD)" --output-dir .runtime/packages
+```
+
+For cross-compiled artifacts, pass the corresponding executable with `--binary`.
+The packager checks ELF64 x86_64/aarch64 headers; it does not establish libc, CPU
+or target-host compatibility. Run the extracted archive on its target host before
+publishing it.
+
+The output contains a `.tar.gz` and matching `.sha256` sidecar. The archive has
+`bin/flussonix`, `web`, the installation guide and `manifest.json`. Only public
+build assets are accepted; runtime state and credentials are never taken from
+the source checkout. Symlinks and unexpected UI files reject packaging.
+
+The manifest records the supplied source revision and payload hashes. The caller
+must ensure the supplied binary and UI were built from that revision; the
+packager cannot attest build provenance. No official Flussonic runtime files are
+collected or bundled.
+
+The same input bytes, source revision, epoch and packaging toolchain produce the
+same archive bytes, regardless of source permissions or modification times.
+`SOURCE_DATE_EPOCH` or `--epoch` overrides the default source-commit timestamp.
+Ownership, modes, timestamps, entry ordering and gzip headers are normalized.
+Existing output files are never overwritten; use another output directory for
+a comparison build.
+
+Run archive regression checks with:
+
+```bash
+python3 -m unittest discover -s tests -p test_package_preview.py -v
+```
+
+See [installation and upgrades](installation.md) for the operator workflow.

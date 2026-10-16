@@ -23,19 +23,29 @@ Use a test server and an available port. Install **FFmpeg and FFprobe** independ
 [Download a Linux preview](https://github.com/Delitants/FlussoniX/releases). Packaged previews may be older than the current source. Extract the package, open a terminal in its directory and set your credentials:
 
 ```bash
+umask 077
 export FLUSSONIX_ADMIN_USER=admin
 read -r -s -p "Choose an admin password: " FLUSSONIX_ADMIN_PASSWORD
 echo
 export FLUSSONIX_ADMIN_PASSWORD
 export FLUSSONIX_PEER_KEY="$(openssl rand -hex 32)"
+flussonix_data="$HOME/flussonix-data"
+mkdir -p "$flussonix_data"
+chmod 700 "$flussonix_data"
 ```
 
-Keep the peer key the same across nodes in a FlussoniX cluster. To start the downloaded package:
+Save your credentials and generated peer key securely. Reuse them after restarts;
+FlussoniX nodes in the same cluster use the same peer key. To start the downloaded package:
 
 ```bash
 ./bin/flussonix --listen 127.0.0.1:18210 \
-  --config runtime/config.json --media-dir runtime/media --web-dir web
+  --config "$flussonix_data/config.json" \
+  --media-dir "$flussonix_data/media" --web-dir "$PWD/web"
 ```
+
+For a verified download and persistent state across upgrades, follow the
+[installation and rollback guide](docs/installation.md). Keep your credentials
+and peer key for future restarts.
 
 Open [the admin interface](http://127.0.0.1:18210/admin/) and sign in as `admin` with the password you chose. This address accepts connections from the same machine; use an SSH tunnel for remote access.
 
@@ -53,11 +63,12 @@ npm ci --prefix web
 npm run build --prefix web
 ```
 
-Set the credentials shown above, then run:
+Set the credentials and external state directory shown above, then run:
 
 ```bash
 ./target/release/flussonix --listen 127.0.0.1:18210 \
-  --config runtime/config.json --media-dir runtime/media --web-dir web/dist
+  --config "$flussonix_data/config.json" \
+  --media-dir "$flussonix_data/media" --web-dir "$PWD/web/dist"
 ```
 
 ## Documentation
@@ -66,5 +77,6 @@ Set the credentials shown above, then run:
 - [Cluster and load balancing](docs/cluster-loadbalancing.md)
 - [Supported native codecs](docs/native-codecs.md)
 - [GPU transcoding](docs/gpu-codec-controls.md)
+- [Build a preview archive](docs/packaging.md)
 
 The first production release depends on live Flussonic migration and cluster compatibility checks, authorization/failover validation and production-scale testing. There is no confirmed release date yet.
