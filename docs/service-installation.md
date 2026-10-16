@@ -89,6 +89,13 @@ certificates, keys and SDP files somewhere the account can read. GPU transcoding
 also requires device permissions for the service account; this helper does not
 install drivers or change group membership. Check GPU readiness in the UI.
 
+On Linux, direct media subprocesses have parent-death protection so a fatal
+daemon crash does not leave them running during the shutdown grace period.
+Normal cancellation and the unit's 15-second shutdown grace remain in place.
+Use ordinary FFmpeg and Tesseract executables: wrappers that fork or change
+credentials can lose this protection. Whole-service cgroup cleanup remains the
+fallback for those cases.
+
 ## Upgrade or remove
 
 For a cold upgrade, stop the service, back up its state and current unit, then

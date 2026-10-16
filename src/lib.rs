@@ -4,6 +4,7 @@ mod api_filter;
 mod api_select;
 mod api_sort;
 pub mod auth;
+mod child_process;
 pub mod cluster;
 pub mod config;
 mod idle_memory;

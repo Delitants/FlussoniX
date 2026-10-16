@@ -478,7 +478,7 @@ impl Engine {
                     ))
                 })
             });
-        let mut cmd = Command::new(&self.ffmpeg);
+        let mut cmd = crate::child_process::command(&self.ffmpeg);
         cmd.args([
             "-hide_banner",
             "-loglevel",

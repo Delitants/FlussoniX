@@ -6,7 +6,6 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
     sync::broadcast,
 };
 use tokio_util::sync::CancellationToken;
@@ -272,7 +271,7 @@ impl State {
         receiver: &mut crate::media_queue::Receiver,
         cancel: &CancellationToken,
     ) -> &'static str {
-        let mut cmd = Command::new(ffmpeg);
+        let mut cmd = crate::child_process::command(ffmpeg);
         cmd.args([
             "-hide_banner",
             "-loglevel",
