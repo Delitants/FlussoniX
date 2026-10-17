@@ -8,6 +8,7 @@ use crate::{
 };
 use authority::{Authority, check as check_authority};
 use bytes::{Bytes, BytesMut};
+use flussonic::diagnostic::{Diagnostics, Phase};
 use futures_util::StreamExt;
 use std::{
     collections::VecDeque,
@@ -88,6 +89,7 @@ struct SubtitlePolicy<'a> {
     conversion: Option<&'a crate::caption_hls::State>,
     authority: Authority<'a>,
     failure: Option<&'a std::sync::atomic::AtomicU8>,
+    diagnostic: Option<&'a Diagnostics>,
 }
 async fn configs<W: AsyncWrite + Unpin>(
     stdin: &mut W,
@@ -98,6 +100,7 @@ async fn configs<W: AsyncWrite + Unpin>(
     metadata: &mut Option<oneshot::Sender<Vec<Track>>>,
     policy: SubtitlePolicy<'_>,
 ) -> Result<(), String> {
+    Diagnostics::phase(policy.diagnostic, Phase::BridgeMetadata);
     check_authority(policy.authority)?;
     if let Some(state) = policy.conversion {
         state.native_tracks(&new);
@@ -136,7 +139,9 @@ async fn configs<W: AsyncWrite + Unpin>(
                 "native startup cancelled",
             )
         })?;
+        Diagnostics::metadata(policy.diagnostic);
     }
+    Diagnostics::phase(policy.diagnostic, Phase::OutputWrite);
     stdin
         .write_all(&next.tables())
         .await
@@ -153,11 +158,14 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     stdin: &mut W,
     muxer: &mut Option<Muxer>,
     frame: &crate::m4f::Frame,
+    diagnostic: Option<&Diagnostics>,
 ) -> Result<(), String> {
+    Diagnostics::phase(diagnostic, Phase::BridgeFrame);
     let bytes = muxer
         .as_mut()
         .ok_or("native frame before metadata")?
         .frame(frame)?;
+    Diagnostics::phase(diagnostic, Phase::OutputWrite);
     stdin
         .write_all(&bytes)
         .await
@@ -188,6 +196,7 @@ pub(crate) struct PullOptions<'a> {
     pub detected: Option<&'a AtomicU64>,
     pub conversion: Option<&'a crate::caption_hls::State>,
     pub failure: Option<&'a std::sync::atomic::AtomicU8>,
+    pub diagnostic: Option<&'a Diagnostics>,
 }
 pub(crate) async fn pull_ready_with_options<W: AsyncWrite + Unpin>(
     input: &str,
@@ -396,11 +405,13 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
         conversion,
         authority,
         failure: subtitles.failure,
+        diagnostic: subtitles.diagnostic,
     };
     // A closed M4F playback identity can remain denied upstream. Scope the ID
     // to this pull, keeping control and segment requests in the same session.
     let playback_session = (is_m4f && matches!(requests.auth, RequestAuth::Flussonic { .. }))
         .then(|| format!("m4f-{}", uuid::Uuid::new_v4()));
+    Diagnostics::phase(subtitles.diagnostic, Phase::ControlRequest);
     let request = requests
         .get(requests.control.clone(), playback_session.as_deref())?
         .header("X-Supported", "prepush,drop_status");
@@ -410,6 +421,12 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
         .map_err(|_| transient("media setup timed out"))?
         .map_err(|_| transient("media connection failed"))?;
     check_authority(authority)?;
+    Diagnostics::phase(subtitles.diagnostic, Phase::ControlResponse);
+    Diagnostics::response(
+        subtitles.diagnostic,
+        response.status().as_u16(),
+        requests.private_acknowledged(&response),
+    );
     if !requests.accepts(&response) {
         return Err(rejection(&response, "source rejected input").into());
     }
@@ -421,6 +438,7 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
     let mut muxer = None;
     let mut seen: VecDeque<String> = VecDeque::new();
     loop {
+        Diagnostics::phase(subtitles.diagnostic, Phase::ControlRead);
         let bytes = tokio::time::timeout(Duration::from_secs(15), stream.next())
             .await
             .map_err(|_| transient("source timed out"))?
@@ -428,6 +446,7 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
             .map_err(|_| transient("transport failed"))?;
         check_authority(authority)?;
         if is_m4f {
+            Diagnostics::phase(subtitles.diagnostic, Phase::SignalDecode);
             for n in signals.push(&bytes)? {
                 check_authority(authority)?;
                 if seen.contains(&n.name) {
@@ -438,12 +457,19 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                 let request = requests
                     .get(url, playback_session.as_deref())?
                     .timeout(Duration::from_secs(10));
+                Diagnostics::phase(subtitles.diagnostic, Phase::SegmentRequest);
                 check_authority(authority)?;
                 let response = request
                     .send()
                     .await
                     .map_err(|_| transient("M4F fetch failed"))?;
                 check_authority(authority)?;
+                Diagnostics::phase(subtitles.diagnostic, Phase::SegmentResponse);
+                Diagnostics::response(
+                    subtitles.diagnostic,
+                    response.status().as_u16(),
+                    requests.private_acknowledged(&response),
+                );
                 // A missing announced object is an availability failure, not a
                 // permanent source denial. Only the explicit private client can
                 // use this exception; the error body is never consumed.
@@ -457,6 +483,7 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                 }
                 let mut body = BytesMut::new();
                 let mut chunks = response.bytes_stream();
+                Diagnostics::phase(subtitles.diagnostic, Phase::SegmentRead);
                 while let Some(chunk) = chunks.next().await {
                     check_authority(authority)?;
                     let chunk = chunk.map_err(|_| transient("M4F fetch failed"))?;
@@ -466,6 +493,7 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                     body.extend_from_slice(&chunk);
                 }
                 let body = body.freeze();
+                Diagnostics::phase(subtitles.diagnostic, Phase::SegmentDecode);
                 let (new, frames) = crate::m4f::unpack(&body)?;
                 check_authority(authority)?;
                 if let Some(state) = conversion {
@@ -499,9 +527,10 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                 )
                 .await?;
                 for f in &frames {
-                    write_frame(stdin, &mut muxer, f).await?;
+                    write_frame(stdin, &mut muxer, f, subtitles.diagnostic).await?;
                 }
                 if let Some(hub) = hub {
+                    Diagnostics::phase(subtitles.diagnostic, Phase::Relay);
                     check_authority(authority)?;
                     let gop = PackedGop {
                         utc: n.utc,
@@ -526,6 +555,7 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                 }
             }
         } else {
+            Diagnostics::phase(subtitles.diagnostic, Phase::M4sDecode);
             for event in decoder.push(&bytes)? {
                 check_authority(authority)?;
                 match event {
@@ -541,6 +571,7 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                         )
                         .await?;
                         if let Some(h) = hub {
+                            Diagnostics::phase(subtitles.diagnostic, Phase::Relay);
                             check_authority(authority)?;
                             let text = new.iter().any(|t| t.codec == "subtitle");
                             let output = if !preserve && text {
@@ -575,8 +606,9 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                         if let Some(state) = conversion {
                             state.native_frame(&tracks, &f);
                         }
-                        write_frame(stdin, &mut muxer, &f).await?;
+                        write_frame(stdin, &mut muxer, &f, subtitles.diagnostic).await?;
                         if let Some(h) = hub {
+                            Diagnostics::phase(subtitles.diagnostic, Phase::Relay);
                             check_authority(authority)?;
                             if preserve
                                 || tracks
@@ -611,9 +643,10 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                             if let Some(state) = conversion {
                                 state.native_frame(&new, f);
                             }
-                            write_frame(stdin, &mut muxer, f).await?;
+                            write_frame(stdin, &mut muxer, f, subtitles.diagnostic).await?;
                         }
                         if let Some(h) = hub {
+                            Diagnostics::phase(subtitles.diagnostic, Phase::Relay);
                             check_authority(authority)?;
                             if !preserve && new.iter().any(|t| t.codec == "subtitle") {
                                 let body = crate::native_subtitles::segment(&gop.body)?;
@@ -634,6 +667,7 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                     }
                     Event::Other { wire } => {
                         if let Some(h) = hub {
+                            Diagnostics::phase(subtitles.diagnostic, Phase::Relay);
                             check_authority(authority)?;
                             h.m4s.send(wire)?;
                         }

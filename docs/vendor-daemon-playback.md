@@ -83,6 +83,16 @@ source/group gate or query pool can still exhaust them. Discovery does not
 extend a thirty-second lease, admit partial rows, bypass a denial or authorize
 media. This coordination adds no input retry or public source option.
 
+Private input failures emit a `flussonix::private_input` warning with the protocol,
+processing phase, existing retry class, last HTTP status, private acknowledgment
+marker and metadata progress. Status zero means no response headers were received
+for the current request. A later decoding or output failure can retain an earlier
+successful HTTP status; the phase identifies where processing stopped. These
+fields contain no endpoint, stream name, credential, session ID, header value,
+response body or raw error. They supplement the stream's `input_closed` summary
+without changing admission, retry or timeout behavior. Revoked authority does not
+emit this failure warning.
+
 An HLS manifest request retains its normal eight-second read grace and also
 honors the worker's remaining configured input startup allowance (15 seconds by
 default). That allowance starts when the worker is created; another request
