@@ -1862,3 +1862,80 @@ async fn large_catalog_concurrent_playback_renews_one_pull_and_closes_on_removal
         Err(error) => std::panic::resume_unwind(error),
     }
 }
+
+#[tokio::test]
+async fn omitted_groups_daemon_playback_keeps_viewer_token_guard_and_one_shared_pull() {
+    let hash = ring::digest::digest(&ring::digest::SHA256, b"owned-group-viewer")
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let f = Fixture::new(json!({"flussonix_token_sha256":hash})).await;
+    *f.remote.lock().unwrap() = json!([{"name":"owned","named_by":"config","static":false}]);
+    assert_eq!(
+        f.get("/owned/m4s?token=wrong").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(f.media_calls(), 0);
+    let first = f.get("/owned/m4s?token=owned-group-viewer").await;
+    let second = f.get("/owned/m4s?token=owned-group-viewer").await;
+    let statuses = (first.status(), second.status());
+    if statuses != (StatusCode::OK, StatusCode::OK) {
+        drop(first);
+        drop(second);
+        f.stop().await;
+        assert_eq!(statuses, (StatusCode::OK, StatusCode::OK));
+        return;
+    }
+    let mut first = first.into_body();
+    let mut second = second.into_body();
+    assert_eq!(
+        native_info(&mut first).await,
+        native_info(&mut second).await
+    );
+    assert_eq!(f.media_calls(), 1);
+    drop(first);
+    drop(second);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn omitted_groups_new_group_override_retires_existing_session_without_repull() {
+    use http_body_util::BodyExt;
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    *f.remote.lock().unwrap() = json!([{"name":"owned","named_by":"config","static":false}]);
+    let live = f.get("/owned/m4s?token=owned").await;
+    let status = live.status();
+    if status != StatusCode::OK {
+        drop(live);
+        f.stop().await;
+        assert_eq!(status, StatusCode::OK);
+        return;
+    }
+    let mut body = live.into_body();
+    assert!(!native_info(&mut body).await.is_empty());
+    assert_eq!(f.media_calls(), 1);
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"group_config":{"protected":{"on_play":"https://other.invalid/check"}}}),
+        )
+        .unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+        while body.frame().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    let denied = f.get("/owned/m4s?token=owned").await.status();
+    let pulls = f.media_calls();
+    drop(body);
+    f.stop().await;
+    assert!(
+        closed,
+        "nonuniform group edit must fence the existing session"
+    );
+    assert_eq!(denied, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(pulls, 1);
+}

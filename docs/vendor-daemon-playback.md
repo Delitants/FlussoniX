@@ -55,6 +55,12 @@ through the same native callback renewal path. It performs no source discovery;
 missing, inactive, excluded or stale routes return 404. Callback denial closes
 existing guarded responses without reconnecting the private input.
 
+Modern source inventories can omit group membership. The
+[policy-equivalence rule](vendor-group-membership.md) permits configured-origin
+playback only when all memberships produce the same explicit local viewer
+policy. A group override that changes the policy keeps unknown membership
+ineligible and fences existing playback after an edit.
+
 Cold discovery is serialized per source, with at most four concurrent source
 queries, a three-second wire budget, four-second request selection budget and
 500ms minimum spacing between attempts. Complete inventories are cached for their bounded source

@@ -840,3 +840,135 @@ async fn replacement_prepares_new_management_and_media_from_new_profile() {
         credentials_with_key(h, Some("news"), "replacement:key");
     }
 }
+
+// Unknown membership may bind only when local authority proves it cannot affect policy.
+#[tokio::test]
+async fn omitted_groups_modern_binding_preserves_uniform_callback_and_token_guards() {
+    let (server, _) = fixture(
+        json!([{"name":"news","named_by":"config","static":false}]),
+        None,
+    )
+    .await;
+    for groups in [
+        json!({}),
+        json!({"same":{}}),
+        json!({"same":{"on_play":"https://billing.invalid/check","flussonix_token_sha256":"a".repeat(64)}}),
+    ] {
+        let mut config = source(&server.url.replacen("http", "m4s", 1));
+        config["on_play"] = json!("https://billing.invalid/check");
+        config["flussonix_token_sha256"] = json!("a".repeat(64));
+        config["group_config"] = groups;
+        let authority = modern(&config);
+        let list = authority.modern_inventory(&local()).await.unwrap();
+        let candidate = list
+            .candidate("news")
+            .expect("membership-independent local policy should bind");
+        authority.at_modern_current(&candidate, |view, _| {
+            assert_eq!(view.policy.url.as_deref(), Some("https://billing.invalid/check"));
+            assert_eq!(view.policy, &flussonix::playback_auth::Policy::from_config(&json!({"on_play":"https://billing.invalid/check","flussonix_token_sha256":"a".repeat(64)}), &json!({})).unwrap());
+            assert_eq!(view.kind, CandidateKind::OnDemand);
+            assert!(!view.selected_static);
+        }).unwrap();
+    }
+    drop(server);
+}
+
+#[tokio::test]
+async fn omitted_groups_modern_binding_rejects_nonuniform_policy_and_nonlocal_origins() {
+    let (server, _) = fixture(
+        json!([
+            {"name":"news","named_by":"config"},
+            {"name":"relay","named_by":"remote"},
+            {"name":"external","named_by":"external"},
+            {"name":"unknown"},
+            {"name":"disabled","named_by":"config","disabled":true}
+        ]),
+        None,
+    )
+    .await;
+    for group in [
+        json!({"on_play":"https://other.invalid/check"}),
+        json!({"flussonix_token_sha256":"b".repeat(64)}),
+    ] {
+        let mut config = source(&server.url.replacen("http", "m4s", 1));
+        config["group_config"] = json!({"protected":group});
+        let authority = modern(&config);
+        let list = authority.modern_inventory(&local()).await.unwrap();
+        assert_eq!(
+            list.candidate("news").err(),
+            Some(BindingFailure::Projection(ProjectionFailure::Ineligible(
+                EligibilityFailure::UnknownGroups
+            )))
+        );
+    }
+    let config = source(&server.url.replacen("http", "m4s", 1));
+    let authority = modern(&config);
+    let list = authority.modern_inventory(&local()).await.unwrap();
+    for (name, why) in [
+        ("relay", EligibilityFailure::Relayed),
+        ("external", EligibilityFailure::External),
+        ("unknown", EligibilityFailure::UnknownProvenance),
+        ("disabled", EligibilityFailure::Disabled),
+    ] {
+        assert_eq!(
+            list.candidate(name).err(),
+            Some(BindingFailure::Projection(ProjectionFailure::Ineligible(
+                why
+            )))
+        );
+    }
+    let mut missing = config.clone();
+    missing.as_object_mut().unwrap().remove("on_play");
+    let no_policy = modern(&missing);
+    assert!(
+        no_policy
+            .modern_inventory(&local())
+            .await
+            .unwrap()
+            .candidate("news")
+            .is_err()
+    );
+    let mut excluded = config.clone();
+    excluded["except"] = json!(["news"]);
+    assert_eq!(
+        modern(&excluded)
+            .modern_inventory(&local())
+            .await
+            .unwrap()
+            .candidate("news")
+            .err(),
+        Some(BindingFailure::Projection(ProjectionFailure::Excluded))
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn omitted_groups_policy_change_invalidates_old_binding_and_rejects_new_lookup() {
+    let (server, _) = fixture(json!([{"name":"news","named_by":"config"}]), None).await;
+    let mut config = source(&server.url.replacen("http", "m4s", 1));
+    let authority = modern(&config);
+    let old = authority
+        .modern_inventory(&local())
+        .await
+        .unwrap()
+        .candidate("news")
+        .unwrap();
+    config["group_config"] = json!({"protected":{"on_play":"https://other.invalid/check"}});
+    authority.replace(&config, &json!([])).unwrap();
+    assert_eq!(
+        authority.at_modern_current(&old, |_, _| ()).err(),
+        Some(ProjectionFailure::Stale)
+    );
+    assert_eq!(
+        authority
+            .modern_inventory(&local())
+            .await
+            .unwrap()
+            .candidate("news")
+            .err(),
+        Some(BindingFailure::Projection(ProjectionFailure::Ineligible(
+            EligibilityFailure::UnknownGroups
+        )))
+    );
+    drop(server);
+}
