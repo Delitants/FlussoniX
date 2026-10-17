@@ -42,6 +42,7 @@ struct Fixture {
     segment: Arc<Mutex<Vec<u8>>>,
     duration: Arc<std::sync::atomic::AtomicU64>,
     control_epoch: Arc<Mutex<CancellationToken>>,
+    first_media_delay: Arc<std::sync::atomic::AtomicU64>,
     page_delay: Arc<std::sync::atomic::AtomicU64>,
     page_limits: Arc<Mutex<Vec<usize>>>,
     page_snapshots: Arc<Mutex<Vec<(tokio::time::Instant, bool)>>>,
@@ -77,8 +78,10 @@ impl Fixture {
         let limits = page_limits.clone();
         let page_snapshots = Arc::new(Mutex::new(Vec::new()));
         let snapshots = page_snapshots.clone();
+        let first_media_delay = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let media_delay = first_media_delay.clone();
         let service=Router::new().fallback(get(move |OriginalUri(uri):OriginalUri,h:HeaderMap|{
-            record.lock().unwrap().push((uri.path().to_owned(),h.clone()));let rows=rows.clone();let held=held.clone();let payload=payload.clone();let control_duration=control_duration.clone();let epoch=epoch.clone();let delayed=delayed.clone();let limits=limits.clone();let snapshots=snapshots.clone();
+            record.lock().unwrap().push((uri.path().to_owned(),h.clone()));let rows=rows.clone();let held=held.clone();let payload=payload.clone();let control_duration=control_duration.clone();let epoch=epoch.clone();let delayed=delayed.clone();let limits=limits.clone();let snapshots=snapshots.clone();let media_delay=media_delay.clone();
             async move {
                 assert!(!h.contains_key("x-flussonix-peer"),"native credentials reached vendor");
                 if uri.path()=="/owned/m4f" {
@@ -99,8 +102,9 @@ impl Fixture {
                 if uri.path().ends_with("/owned/m4s") {
                     assert!(h.contains_key("cluster-auth-key"));assert!(!h.contains_key("authorization"));
                     let track=Track{id:1,codec:"mp3".into(),config:vec![]};
-                    let body=futures_util::stream::unfold((0u64,track),|(i,track)|async move {
-                        let bytes=if i==0 {wire::encode_info(std::slice::from_ref(&track)).unwrap()} else {
+                    let delay=media_delay.load(std::sync::atomic::Ordering::SeqCst);
+                    let body=futures_util::stream::unfold((0u64,track),move |(i,track)|async move {
+                        let bytes=if i==0 {tokio::time::sleep(Duration::from_millis(delay)).await;wire::encode_info(std::slice::from_ref(&track)).unwrap()} else {
                             tokio::time::sleep(Duration::from_millis(3)).await;
                             wire::encode_frame(&track,&Frame{track_id:1,dts:90000+(i-1)*2351,pts_offset:0,key:true,body:include_bytes!("fixtures/codecs/mp3.bin").to_vec()}).unwrap()
                         };
@@ -176,6 +180,7 @@ impl Fixture {
             segment,
             duration,
             control_epoch,
+            first_media_delay,
             page_delay,
             page_limits,
             page_snapshots,
@@ -1937,5 +1942,135 @@ async fn omitted_groups_new_group_override_retires_existing_session_without_repu
         "nonuniform group edit must fence the existing session"
     );
     assert_eq!(denied, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(pulls, 1);
+}
+
+// A valid input can become ready after the old HTTP wait but before its worker
+// startup budget. The first request must receive the resulting HLS, without a
+// replacement pull or worker. This would fail with the fixed eight-second wait.
+#[tokio::test]
+async fn delayed_vendor_hls_startup_uses_remaining_configured_budget() {
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    f.app
+        .config
+        .put(
+            "templates",
+            "slow-start",
+            json!({"flussonix_input_timeout":20}),
+        )
+        .unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"slow-start"}),
+        )
+        .unwrap();
+    f.first_media_delay
+        .store(9000, std::sync::atomic::Ordering::SeqCst);
+    let began = std::time::Instant::now();
+    let response = f.get("/owned/fmp4/index.m3u8?token=slow").await;
+    let status = response.status();
+    let text = String::from_utf8(bytes(response).await.to_vec()).unwrap();
+    let elapsed = began.elapsed();
+    let stats = f.app.media.stats("owned").await;
+    let pid = stats["pid"].as_u64().unwrap();
+    let pulls = f.media_calls();
+    let ts_status = if status == StatusCode::OK {
+        f.get("/owned/index.m3u8?token=slow").await.status()
+    } else {
+        status
+    };
+    f.stop().await;
+    assert_eq!(status, StatusCode::OK, "first delayed manifest: {text}");
+    assert_eq!(ts_status, StatusCode::OK);
+    assert!(text.contains("#EXTINF:") && text.contains("#EXT-X-MAP:"));
+    assert!(elapsed >= Duration::from_secs(9) && elapsed < Duration::from_secs(12));
+    assert_eq!(pulls, 1);
+    assert_eq!(stats["restart_count"], 0);
+    assert!(stats["last_error"].is_null());
+    assert!(pid > 0 && !std::path::Path::new(&format!("/proc/{pid}")).exists());
+}
+
+#[tokio::test]
+async fn delayed_vendor_hls_startup_still_stops_on_short_worker_timeout() {
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    f.app
+        .config
+        .put(
+            "templates",
+            "short-start",
+            json!({"flussonix_input_timeout":1}),
+        )
+        .unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"short-start"}),
+        )
+        .unwrap();
+    f.first_media_delay
+        .store(9000, std::sync::atomic::Ordering::SeqCst);
+    let began = std::time::Instant::now();
+    let status = f.get("/owned/index.m3u8?token=short").await.status();
+    let elapsed = began.elapsed();
+    let stats = f.app.media.stats("owned").await;
+    let pulls = f.media_calls();
+    f.stop().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(elapsed < Duration::from_secs(3));
+    assert_eq!(stats["pid"], 0);
+    assert_eq!(stats["last_error"], "startup_timeout");
+    assert_eq!(pulls, 1);
+}
+
+#[tokio::test]
+async fn delayed_vendor_hls_startup_is_fenced_by_source_edit() {
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    f.app
+        .config
+        .put(
+            "templates",
+            "slow-start",
+            json!({"flussonix_input_timeout":20}),
+        )
+        .unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"slow-start"}),
+        )
+        .unwrap();
+    f.first_media_delay
+        .store(9000, std::sync::atomic::Ordering::SeqCst);
+    let request = f.get("/owned/index.m3u8?token=edit");
+    let edit = async {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while f.media_calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        f.app
+            .config
+            .put("sources", &f.source, json!({"except":["owned"]}))
+            .unwrap();
+        std::time::Instant::now()
+    };
+    let (response, edited) = tokio::join!(request, edit);
+    let status = response.status();
+    let delay = edited.elapsed();
+    let pulls = f.media_calls();
+    let pid = f.app.media.stats("owned").await["pid"].clone();
+    f.stop().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(delay < Duration::from_secs(2));
+    assert_eq!(pid, 0);
     assert_eq!(pulls, 1);
 }

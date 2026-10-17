@@ -69,6 +69,14 @@ the latest renewed lease. Active sibling routes refresh through shared atomic
 renewal; installing an idle source is serialized with attachment. Configuration,
 source and identity changes still invalidate pending/active generations.
 
+An HLS manifest request retains its normal eight-second read grace and also
+honors the worker's remaining configured input startup allowance (15 seconds by
+default). That allowance starts when the worker is created; another request
+does not reset it. Worker failure, authorization and source/lease changes still
+end the wait. Segment requests do not wait for missing files. Discovery keeps
+its separate budgets above. This avoids an early 503 while a valid cold worker
+is still starting; it does not add input retries or extend its watchdog.
+
 HLS sessions retain admitted demand for up to 30 seconds without another request.
 Default source leases last 30 seconds and renewal is scheduled with a 10 second
 margin. Active continuous responses also keep renewal demand. Native supervision
