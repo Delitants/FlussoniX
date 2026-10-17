@@ -1724,9 +1724,9 @@ async fn large_catalog_concurrent_playback_renews_one_pull_and_closes_on_removal
         .collect();
     rows.push(json!({"name":"owned","groups":[],"named_by":"config","static":false}));
     *f.remote.lock().unwrap() = json!(rows);
-    // Ten old-size pages exceed the actual daemon's three-second budget.
+    // Twelve old80-row pages exceed the actual daemon's five-second budget.
     // The selected target is deliberately the last row, never a partial result.
-    f.page_delay.store(400, Ordering::SeqCst);
+    f.page_delay.store(600, Ordering::SeqCst);
     let outcome = std::panic::AssertUnwindSafe(async {
         let responses = futures_util::future::join_all(
             (0..8).map(|_| f.get("/owned/m4s?token=catalog-viewer")),
@@ -1848,9 +1848,9 @@ async fn large_catalog_concurrent_playback_renews_one_pull_and_closes_on_removal
         assert!(terminals.iter().all(|(time, _)| *time >= absent_snapshot.0), "a response ended before catalog removal was observed");
         let removal_close_delay = closed_at.checked_duration_since(absent_snapshot.0).unwrap();
         assert!(removal_close_delay < Duration::from_secs(2));
-        // A 30-second lease starts before the at-most-three-second lookup.
-        // It cannot expire earlier than 27 seconds after that good snapshot.
-        let earliest_expiry = last_good_snapshot.0 + Duration::from_secs(27);
+        // A 30-second lease starts before the at-most-five-second lookup.
+        // It cannot expire earlier than 25 seconds after that good snapshot.
+        let earliest_expiry = last_good_snapshot.0 + Duration::from_secs(25);
         assert!(closed_at < earliest_expiry, "lease expiry must not satisfy the removal check");
         assert_eq!(f.get("/owned/index.m3u8?token=catalog-viewer").await.status(), StatusCode::NOT_FOUND);
         assert_eq!(f.media_calls(), 1, "removal must not retry private media");
@@ -2073,4 +2073,118 @@ async fn delayed_vendor_hls_startup_is_fenced_by_source_edit() {
     assert!(delay < Duration::from_secs(2));
     assert_eq!(pid, 0);
     assert_eq!(pulls, 1);
+}
+
+// A complete, valid catalog that takes longer than the old3s allowance must
+// still reach viewer authorization without admitting partial inventory/media.
+#[tokio::test]
+async fn slow_vendor_catalog_completes_before_viewer_admission() {
+    use sha2::{Digest, Sha256};
+    let f=Fixture::new(json!({"on_play":"true","flussonix_token_sha256":format!("{:x}",Sha256::digest(b"catalog-slow"))})).await;
+    f.page_delay
+        .store(3500, std::sync::atomic::Ordering::SeqCst);
+    let began = std::time::Instant::now();
+    let wrong = f.get("/owned/index.m3u8?token=wrong").await.status();
+    let elapsed = began.elapsed();
+    let before = f.media_calls();
+    let after_configs = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(p, _)| p.ends_with("/config"))
+        .count();
+    let allowed = if wrong == StatusCode::FORBIDDEN {
+        f.get("/owned/m4s?token=catalog-slow").await.status()
+    } else {
+        wrong
+    };
+    let configs_after_allowed = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(p, _)| p.ends_with("/config"))
+        .count();
+    let pages_after_allowed = f.page_limits.lock().unwrap().len();
+    let pulls = f.media_calls();
+    let pid = f.app.media.stats("owned").await["pid"]
+        .as_u64()
+        .unwrap_or(0);
+    f.stop().await;
+    assert_eq!(
+        wrong,
+        StatusCode::FORBIDDEN,
+        "valid complete catalog must reach independent viewer denial"
+    );
+    assert!(elapsed >= Duration::from_millis(3500) && elapsed < Duration::from_secs(6));
+    assert_eq!(before, 0, "denied viewer must not start private media");
+    assert_eq!(after_configs, 2, "both identity probes must complete");
+    assert_eq!(allowed, StatusCode::OK);
+    assert_eq!(
+        configs_after_allowed, after_configs,
+        "cached admission must not rediscover configuration"
+    );
+    assert_eq!(
+        pages_after_allowed, 1,
+        "cached admission must not refetch the catalog"
+    );
+    assert_eq!(pulls, 1);
+    assert!(pid == 0 || !std::path::Path::new(&format!("/proc/{pid}")).exists());
+}
+
+#[tokio::test]
+async fn slow_vendor_catalog_still_has_a_five_second_hard_deadline() {
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    f.page_delay
+        .store(7000, std::sync::atomic::Ordering::SeqCst);
+    let began = std::time::Instant::now();
+    let status = f.get("/owned/index.m3u8?token=late").await.status();
+    let elapsed = began.elapsed();
+    let pulls = f.media_calls();
+    let sessions = f.app.playback_auth.snapshots().len();
+    f.stop().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(elapsed >= Duration::from_millis(4500) && elapsed < Duration::from_millis(6500));
+    assert_eq!(pulls, 0);
+    assert_eq!(sessions, 0);
+}
+
+#[tokio::test]
+async fn slow_vendor_catalog_is_cancelled_by_runtime_shutdown() {
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    f.page_delay
+        .store(3500, std::sync::atomic::Ordering::SeqCst);
+    let app = f.app.clone();
+    let request = tokio::spawn(async move {
+        router(app)
+            .oneshot(
+                Request::builder()
+                    .uri("/owned/index.m3u8?token=shutdown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.page_limits.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let began = std::time::Instant::now();
+    f.cancel.cancel();
+    let status = tokio::time::timeout(Duration::from_secs(1), request)
+        .await
+        .unwrap()
+        .unwrap();
+    let elapsed = began.elapsed();
+    let pulls = f.media_calls();
+    f.stop().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(elapsed < Duration::from_secs(1));
+    assert_eq!(pulls, 0);
 }

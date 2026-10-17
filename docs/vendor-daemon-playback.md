@@ -61,13 +61,20 @@ playback only when all memberships produce the same explicit local viewer
 policy. A group override that changes the policy keeps unknown membership
 ineligible and fences existing playback after an edit.
 
-Cold discovery is serialized per source, with at most four concurrent source
-queries, a three-second wire budget, four-second request selection budget and
+Cold direct-source discovery is serialized per source, with at most four concurrent source
+queries, a five-second wire budget, six-second request selection budget and
 500ms minimum spacing between attempts. Complete inventories are cached for their bounded source
 lease; absence may remain cached until its original deadline. Managed routes use
 the latest renewed lease. Active sibling routes refresh through shared atomic
 renewal; installing an idle source is serialized with attachment. Configuration,
 source and identity changes still invalidate pending/active generations.
+Replica selection and static catalog polling keep their separate four-second
+selection limits and prepare 750ms wire profiles when creating a source handle.
+They share cached source handles with direct requests: a handle retains its
+original wire budget. A static-created handle can therefore still constrain a
+direct request, while a direct-created five-second profile can be cut short by
+the static wrapper. The direct foreground checks do not qualify these mixed
+owners or extend their nested recovery jobs.
 
 An HLS manifest request retains its normal eight-second read grace and also
 honors the worker's remaining configured input startup allowance (15 seconds by

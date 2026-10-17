@@ -31,6 +31,11 @@ use std::{
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+// Leave bounded WAN headroom for config/catalog/config, and one extra second
+// for serialized selection. The underlying byte, page and lease bounds remain.
+const DIRECT_DISCOVERY_BUDGET: Duration = Duration::from_secs(5);
+const DIRECT_SELECTION_BUDGET: Duration = Duration::from_secs(6);
+
 pub(crate) enum Selection {
     Native,
     Vendor { key: String, revision: u64 },
@@ -344,7 +349,7 @@ impl Runtime {
                     return Err(Failure::Unavailable);
                 }
                 let prepared = captured
-                    .prepare(Duration::from_secs(3))
+                    .prepare(DIRECT_DISCOVERY_BUDGET)
                     .map_err(|_| Failure::Unavailable)?;
                 // Serialize install with attachment, closing the check/install race.
                 let handle = self
@@ -367,6 +372,6 @@ impl Runtime {
             cache.inventory = Some(Arc::new(rows));
             candidate
         };
-        tokio::select! {biased;_=self.closed.cancelled()=>Err(Failure::Closed),result=tokio::time::timeout(Duration::from_secs(4),work)=>result.unwrap_or(Err(Failure::Unavailable))}
+        tokio::select! {biased;_=self.closed.cancelled()=>Err(Failure::Closed),result=tokio::time::timeout(DIRECT_SELECTION_BUDGET,work)=>result.unwrap_or(Err(Failure::Unavailable))}
     }
 }
