@@ -99,6 +99,8 @@ fn vendor_group_requires_paired_valid_identity_and_cannot_mix_with_native_source
 
 #[path = "vendor_daemon_failover/fixture.rs"]
 mod fixture;
+#[path = "vendor_daemon_failover/startup.rs"]
+mod startup;
 use axum::http::StatusCode;
 use std::{sync::atomic::Ordering, time::Duration};
 

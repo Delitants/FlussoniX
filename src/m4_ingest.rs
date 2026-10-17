@@ -437,6 +437,7 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
     let mut declared = None;
     let mut muxer = None;
     let mut seen: VecDeque<String> = VecDeque::new();
+    let mut skipped_startup_segment = None;
     loop {
         Diagnostics::phase(subtitles.diagnostic, Phase::ControlRead);
         let bytes = tokio::time::timeout(Duration::from_secs(15), stream.next())
@@ -449,7 +450,7 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
             Diagnostics::phase(subtitles.diagnostic, Phase::SignalDecode);
             for n in signals.push(&bytes)? {
                 check_authority(authority)?;
-                if seen.contains(&n.name) {
+                if seen.contains(&n.name) || skipped_startup_segment.as_ref() == Some(&n.name) {
                     continue;
                 }
                 let mut url = requests.base.clone();
@@ -473,7 +474,7 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                 // Missing memory segments can fall through to DVR. A vendor
                 // without DVR reports400 with X-Reason:no_dvr instead of404.
                 // Only acknowledged announced objects use these availability
-                // exceptions; error bodies are never consumed or retried here.
+                // exceptions; error bodies are never consumed or refetched.
                 let no_dvr = response.status() == reqwest::StatusCode::BAD_REQUEST && {
                     let mut reasons = response.headers().get_all("x-reason").iter();
                     reasons.next().is_some_and(|v| v.as_bytes() == b"no_dvr")
@@ -482,6 +483,22 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                 if (response.status() == reqwest::StatusCode::NOT_FOUND || no_dvr)
                     && requests.private_acknowledged(&response)
                 {
+                    // A live announcement can outlast the origin's memory copy.
+                    // Before any metadata, allow one distinct missing object and
+                    // keep the existing control session for the next GOP. Worker
+                    // startup/cancellation deadlines still own this entire wait.
+                    if tracks.is_empty() && skipped_startup_segment.is_none() {
+                        skipped_startup_segment = Some(n.name);
+                        tracing::debug!(
+                            target: "flussonix::private_input",
+                            protocol = "m4f",
+                            last_http_status = response.status().as_u16(),
+                            last_private_ack = true,
+                            metadata_sent = false,
+                            "skipped unavailable startup segment"
+                        );
+                        continue;
+                    }
                     return Err(transient("M4F segment unavailable").into());
                 }
                 if !requests.accepts(&response) {

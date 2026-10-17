@@ -94,7 +94,11 @@ async fn failure(
                         && uri.path().ends_with("/m4f")
                         && status != StatusCode::FORBIDDEN;
                     let mut reply = Response::new(Body::from(if control {
-                        b"1 2026/01/01/00/00/00-1000\n".to_vec()
+                        if status == StatusCode::NOT_FOUND {
+                            b"1 2026/01/01/00/00/00-1000\n2 2026/01/01/00/00/01-1000\n".to_vec()
+                        } else {
+                            b"1 2026/01/01/00/00/00-1000\n".to_vec()
+                        }
                     } else {
                         bytes
                     }));
@@ -115,11 +119,11 @@ async fn failure(
         .unwrap()
     });
     let capture = Capture::default();
-    let subscriber = tracing_subscriber::registry().with(
-        capture
-            .clone()
-            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
-    );
+    let subscriber = tracing_subscriber::registry().with(capture.clone().with_filter(
+        tracing_subscriber::filter::filter_fn(|metadata| {
+            metadata.target() == "flussonix::private_input"
+        }),
+    ));
     let input = MediaInput::new(&root, "name-sensitive", transport, "key-sensitive", None).unwrap();
     let (tx, _rx) = tokio::sync::oneshot::channel();
     let mut output = Output(broken);
@@ -154,6 +158,17 @@ async fn failure(
         .iter()
         .filter(|v| v["message"] == "private media input failed")
         .collect::<Vec<_>>();
+    if transport == Transport::M4f && status == StatusCode::NOT_FOUND && ack {
+        let skips = records
+            .iter()
+            .filter(|v| v["message"] == "skipped unavailable startup segment")
+            .collect::<Vec<_>>();
+        assert_eq!(skips.len(), 1);
+        assert_eq!(skips[0]["protocol"], "m4f");
+        assert_eq!(skips[0]["last_http_status"], 404);
+        assert_eq!(skips[0]["last_private_ack"], true);
+        assert_eq!(skips[0]["metadata_sent"], false);
+    }
     assert_eq!(
         events.len(),
         1,
@@ -182,7 +197,7 @@ async fn private_control_denial_reports_response_boundary_without_secrets() {
     assert_eq!(calls, 1);
 }
 #[tokio::test]
-async fn acknowledged_missing_segment_reports_404_without_retry_or_body_exposure() {
+async fn second_missing_startup_segment_reports_404_without_body_exposure() {
     let (kind, fields, calls) = failure(
         Transport::M4f,
         StatusCode::NOT_FOUND,
@@ -197,7 +212,7 @@ async fn acknowledged_missing_segment_reports_404_without_retry_or_body_exposure
     assert_eq!(fields["last_private_ack"], true);
     assert_eq!(fields["metadata_sent"], false);
     assert_eq!(fields["failure"], "Transient");
-    assert_eq!(calls, 2);
+    assert_eq!(calls, 3);
 }
 #[tokio::test]
 async fn malformed_segment_reports_decode_boundary_without_exposing_payload() {

@@ -28,15 +28,21 @@ relationship, its processing or policy starts a new selection plan.
 An announced M4F segment returning404 with exactly one affirmative Cluster
 acknowledgment is treated as temporary media unavailability. The same applies
 to segment400 only when it also carries exactly one `X-Reason: no_dvr` header:
-an absent memory segment can fall through to an origin without DVR. The pull stops
-without accepting the response body, and existing supervised recovery can
+an absent memory segment can fall through to an origin without DVR. Before any
+metadata is delivered, the reader may skip one distinct unavailable announcement
+and wait for the next on the same authenticated control session. Duplicate
+announcements cannot refetch that object. The original worker startup watchdog,
+viewer permission and source authority still bound the wait.
+
+A second unavailable object, or any unavailable object after metadata, stops
+the pull without accepting its response body. Existing supervised recovery can
 revalidate the current catalog and choose an eligible configured replica.
 Control400/404 and authorization401/403 still block rotation, as do segment200/400/404
 responses with invalid or missing acknowledgments. Other segment400 responses,
 including missing, duplicate or altered `no_dvr` reasons, remain rejected.
 Native inputs cannot use these private exceptions. Existing5xx failures remain
 transient even without acknowledgment. Source/viewer revocation takes precedence; no credential
-fallback or extra in-pull retry is introduced. This distinction does not prove
+fallback, control reconnect or retry of the missing object is introduced. This distinction does not prove
 why a particular reference segment was missing or promise seamless recovery.
 
 On-demand recovery uses original native viewer permission and recent playback

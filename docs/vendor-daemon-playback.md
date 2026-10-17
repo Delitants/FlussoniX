@@ -93,6 +93,14 @@ response body or raw error. They supplement the stream's `input_closed` summary
 without changing admission, retry or timeout behavior. Revoked authority does not
 emit this failure warning.
 
+An optional debug event records a skipped unavailable M4F startup announcement
+using only fixed protocol, HTTP status, acknowledgment and metadata fields. One
+such announcement can be skipped before the first metadata, under the original
+startup watchdog; the missing object is never refetched. A second missing
+object still ends the pull as transient. Successful continuation emits no
+terminal failure warning. Authorization, source changes and shutdown still
+cancel the wait.
+
 An HLS manifest request retains its normal eight-second read grace and also
 honors the worker's remaining configured input startup allowance (15 seconds by
 default). That allowance starts when the worker is created; another request

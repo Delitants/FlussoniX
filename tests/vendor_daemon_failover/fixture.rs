@@ -42,6 +42,8 @@ pub(super) struct Origin {
     pub private_calls: Arc<AtomicUsize>,
     pub missing_segment: Arc<AtomicBool>,
     pub no_dvr_segment: Arc<AtomicBool>,
+    pub startup_missing: Arc<AtomicBool>,
+    pub next_signal_delay: Arc<AtomicUsize>,
     pub segment_ack: Arc<AtomicBool>,
     pub segment_calls: Arc<AtomicUsize>,
     pub management_calls: Arc<AtomicUsize>,
@@ -83,6 +85,10 @@ impl Origin {
         let missing_segment = Arc::new(AtomicBool::new(false));
         let no_dvr_segment = Arc::new(AtomicBool::new(false));
         let no_dvr = no_dvr_segment.clone();
+        let startup_missing = Arc::new(AtomicBool::new(false));
+        let once = startup_missing.clone();
+        let next_signal_delay = Arc::new(AtomicUsize::new(0));
+        let signal_delay = next_signal_delay.clone();
         let segment_ack = Arc::new(AtomicBool::new(true));
         let segment_calls = Arc::new(AtomicUsize::new(0));
         let (missing, ack, segments) = (
@@ -107,6 +113,7 @@ impl Origin {
    let held=held.clone();let stalled=stalled.clone();
    let (catalog_count,catalog_wait)=(catalog_count.clone(),catalog_wait.clone());
    let (missing,ack,segments,no_dvr)=(missing.clone(),ack.clone(),segments.clone(),no_dvr.clone());
+   let (once,signal_delay)=(once.clone(),signal_delay.clone());
    let (a,m,r,e,p,c,k)=(a.clone(),m.clone(),r.clone(),e.clone(),p.clone(),c.clone(),k.clone());async move{
     assert!(!headers.contains_key("x-flussonix-peer"));
     if m4f && uri.path().starts_with("/owned/") {
@@ -118,14 +125,15 @@ impl Origin {
       let status=*m.lock().unwrap();
       if status!=StatusCode::OK {let mut out=Response::new(Body::empty());*out.status_mut()=status;return out;}
       let stop=e.lock().unwrap().clone();
-      let stream=futures_util::stream::unfold((0u64,stop),|(i,stop)|async move {
-       tokio::select!{biased;_=stop.cancelled()=>return None,_=tokio::time::sleep(Duration::from_millis(50))=>{}}
+      let stream=futures_util::stream::unfold((0u64,stop,signal_delay),|(i,stop,delay)|async move {
+       let wait=if i==0 {50}else{delay.load(Ordering::SeqCst).max(50) as u64};
+       tokio::select!{biased;_=stop.cancelled()=>return None,_=tokio::time::sleep(Duration::from_millis(wait))=>{}}
        let seconds=i*2;let line=format!("{} 2026/10/17/00/{:02}/{:02}-2000\n",i+1,seconds/60,seconds%60);
-       Some((Ok::<_,std::io::Error>(bytes::Bytes::from(line)),(i+1,stop)))
+       Some((Ok::<_,std::io::Error>(bytes::Bytes::from(line)),(i+1,stop,delay)))
       });Response::new(Body::from_stream(stream))
      } else {
       segments.fetch_add(1,Ordering::SeqCst);
-      if missing.load(Ordering::SeqCst) {
+      if missing.load(Ordering::SeqCst) || once.swap(false,Ordering::SeqCst) {
        let mut out=Response::new(Body::empty());*out.status_mut()=StatusCode::NOT_FOUND;
        if no_dvr.load(Ordering::SeqCst) {*out.status_mut()=StatusCode::BAD_REQUEST;out.headers_mut().insert("x-reason","no_dvr".parse().unwrap());}
        if ack.load(Ordering::SeqCst) {out.headers_mut().insert("cluster-auth","yes".parse().unwrap());}
@@ -182,6 +190,8 @@ impl Origin {
             private_calls,
             missing_segment,
             no_dvr_segment,
+            startup_missing,
+            next_signal_delay,
             segment_ack,
             segment_calls,
             management_calls,
@@ -208,7 +218,7 @@ impl Drop for Origin {
 pub(super) struct Fixture {
     pub app: Arc<App>,
     pub origins: Vec<Origin>,
-    cancel: CancellationToken,
+    pub(super) cancel: CancellationToken,
     owner: Option<tokio::task::JoinHandle<Result<(), String>>>,
     _dir: tempfile::TempDir,
 }
