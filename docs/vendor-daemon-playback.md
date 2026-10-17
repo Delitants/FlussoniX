@@ -91,3 +91,23 @@ Owned SRT tests cover clear/encrypted listeners, independently decoded
 AVC/HEVC/MP3/MP2 from M4F, CPU AAC, wrong transport keys, denied viewers,
 independent revocation, static/HTTP sharing, held callback/metadata edits,
 namespace precedence, replica recovery, pending writes and accepted-byte accounting.
+
+## Large-catalog daemon regression
+
+An owned delayed modern endpoint serves 951 configured-origin rows, with the
+requested stream last. Eight concurrent authenticated M4S responses share one
+complete discovery, one private input and one packager. They receive media for
+32 seconds, with a two-second data-idle bound, across the original 30-second
+lease and one shared catalog renewal.
+The same worker supplies an independently decoded HLS audio segment; incorrect
+viewer tokens cannot open native media or cached HLS segments. Removing the
+stream from the catalog closes all eight responses after a new complete refresh,
+within two seconds of observing removal and before the prior lease could expire.
+It prevents a private-media retry. All fixture sockets, media processes and samples are
+reclaimed, including assertion-failure paths.
+
+The regression fails with the former 100-row page request because the actual
+daemon discovery deadline expires before the final row. It passes with the
+1,000-row request while preserving complete-catalog and authorization gates.
+This is a bounded owned-origin integration check, not live Flussonic
+interoperability, production capacity or seamless playback qualification.
