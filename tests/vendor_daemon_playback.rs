@@ -1350,7 +1350,8 @@ async fn processing_template_conversion_restarts_with_fresh_state_in_the_same_co
     f.stop().await;
     assert!(ended);
     assert!(same_revision);
-    assert_eq!(management, new_management);
+    // Recovery refreshes the origin profile and catalog before reopening it.
+    assert_eq!(new_management, management + 3);
     assert_ne!(old_pid, new_pid);
     assert_ne!(old_file, new_file);
     assert!(String::from_utf8_lossy(&old_text).contains("AMERICA HELLO"));

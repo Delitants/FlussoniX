@@ -764,3 +764,6 @@ async fn authenticated_private_startup_stall_rotates_with_short_and_default_dead
 
 #[path = "vendor_daemon_failover/discovery.rs"]
 mod discovery;
+
+#[path = "vendor_daemon_failover/single_origin.rs"]
+mod single_origin;

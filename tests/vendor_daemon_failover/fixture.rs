@@ -232,6 +232,9 @@ impl Fixture {
     pub async fn configured(role: &str, patch: Value, rows: Option<Value>, grouped: bool) -> Self {
         Self::configured_transport(role, patch, rows, grouped, false, 0).await
     }
+    pub async fn single_m4f() -> Self {
+        Self::configured_transport("standalone", json!({"only":[]}), None, false, true, 0).await
+    }
     pub async fn m4f() -> Self {
         Self::configured_transport("standalone", json!({"only":[]}), None, true, true, 0).await
     }

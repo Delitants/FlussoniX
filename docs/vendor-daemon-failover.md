@@ -14,6 +14,12 @@ two. Members must have matching prefixes, exclusions, resolved processing and
 one equal viewer policy for every possible upstream group membership. Changing
 these settings for an established group requires updating its members together.
 
+A source without a failover group also recovers automatically after temporary
+media loss. It retries only that origin after revalidating its current catalog;
+no other source is inferred to carry equivalent content. Each stream keeps its
+own viewer policy, including upstream group overrides. Recovery uses the same
+original permission, recent viewer demand and bounded backoff described below.
+
 The daemon shares one private input and packager across viewers. A healthy
 backup stays selected when a preferred origin returns. Temporary management or
 private-media failures can select another member. The selected origin's fresh
@@ -36,7 +42,8 @@ viewer permission and source authority still bound the wait.
 
 A second unavailable object, or any unavailable object after metadata, stops
 the pull without accepting its response body. Existing supervised recovery can
-revalidate the current catalog and choose an eligible configured replica.
+revalidate the current catalog and reopen a single configured origin or choose
+an eligible member of an explicit failover group.
 Control400/404 and authorization401/403 still block rotation, as do segment200/400/404
 responses with invalid or missing acknowledgments. Other segment400 responses,
 including missing, duplicate or altered `no_dvr` reasons, remain rejected.

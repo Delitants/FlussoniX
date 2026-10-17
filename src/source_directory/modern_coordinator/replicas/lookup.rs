@@ -131,8 +131,9 @@ impl ReplicaLookup {
             .selector
             .owner
             .at_handle(handle, || {
-                Ok(handle.authority.uniform_policy().ok().flatten()
-                    == Some(self.selector.policy.clone()))
+                Ok(self.selector.policy.as_ref().is_none_or(|expected| {
+                    handle.authority.uniform_policy().ok().flatten().as_ref() == Some(expected)
+                }))
             })
             .map_err(ReplicaFailure::Coordination)?;
         if !uniform {
@@ -170,7 +171,7 @@ impl ReplicaLookup {
                     .selector
                     .owner
                     .publish(&candidate, |view, _| {
-                        if view.policy != &self.selector.policy {
+                        if !self.selector.accepts_policy(view.policy) {
                             return Err(ReplicaFailure::PolicyMismatch);
                         }
                         let mut state = self.selector.state()?;
