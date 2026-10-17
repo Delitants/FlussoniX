@@ -46,6 +46,11 @@ struct PacketTrack {
     audio_end: Option<i128>,
     sequence: u16,
 }
+// Account for the producer limit even when no live receiver needs a copy.
+struct Batch {
+    bytes: Option<Vec<u8>>,
+    length: usize,
+}
 struct State {
     input: Vec<Track>,
     tracks: Vec<PacketTrack>,
@@ -259,18 +264,23 @@ impl Hub {
     /// A packed GOP is one publication so packet bursts cannot evict their own beginning.
     pub fn frames(&self, frames: &[Frame]) {
         let mut s = self.state.lock().unwrap();
-        let mut batch = Vec::new();
+        // Joining also holds state before subscribing to q: a late receiver
+        // sees the completed bootstrap and cannot miss this decision's GOP.
+        let mut batch = Batch {
+            bytes: self.q.has_receivers().then(Vec::new),
+            length: 0,
+        };
         for f in frames {
             Self::packetize(&mut s, f, &mut batch);
             if s.error.is_some() {
                 return;
             }
         }
-        if !batch.is_empty() {
-            let _ = self.q.send(Bytes::from(batch));
+        if let Some(bytes) = batch.bytes.filter(|bytes| !bytes.is_empty()) {
+            let _ = self.q.send(Bytes::from(bytes));
         }
     }
-    fn packetize(s: &mut State, f: &Frame, batch: &mut Vec<u8>) {
+    fn packetize(s: &mut State, f: &Frame, batch: &mut Batch) {
         if s.error.is_some() {
             return;
         }
@@ -348,19 +358,24 @@ impl Hub {
             s.ready = false;
         }
         for (i, p) in packets.into_iter().enumerate() {
-            if batch.len() + 13 + p.len() > 64 * 1024 * 1024 {
+            if batch.length + 13 + p.len() > 64 * 1024 * 1024 {
                 s.error = Some("RTP producer batch exceeds 64 MiB".into());
                 s.generation = s.generation.wrapping_add(1);
                 s.bootstrap.clear();
                 s.bytes = 0;
                 s.ready = false;
-                batch.clear();
+                if let Some(bytes) = &mut batch.bytes {
+                    bytes.clear();
+                }
                 return;
             }
-            batch.extend((p.len() as u32).to_be_bytes());
-            batch.push(u8::from(video && f.key && i == 0));
-            batch.extend(f.dts.to_be_bytes());
-            batch.extend_from_slice(&p);
+            batch.length += 13 + p.len();
+            if let Some(bytes) = &mut batch.bytes {
+                bytes.extend((p.len() as u32).to_be_bytes());
+                bytes.push(u8::from(video && f.key && i == 0));
+                bytes.extend(f.dts.to_be_bytes());
+                bytes.extend_from_slice(&p);
+            }
             if s.ready {
                 s.bytes += p.len();
                 s.bootstrap.push_back((f.dts, p));

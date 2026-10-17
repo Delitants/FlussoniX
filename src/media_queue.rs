@@ -110,6 +110,9 @@ impl Channel {
             next: state.next,
         }
     }
+    pub(crate) fn has_receivers(&self) -> bool {
+        self.inner.state.lock().unwrap().receivers != 0
+    }
     pub fn retained(&self) -> (usize, usize) {
         let s = self.inner.state.lock().unwrap();
         (s.records.len(), s.bytes)
