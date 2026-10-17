@@ -21,6 +21,124 @@ fn rtp(seq: u16, ssrc: u32, payload: &[u8]) -> Vec<u8> {
     b[1] = 96;
     b
 }
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires root in a fresh isolated network namespace; CI invokes explicitly"]
+async fn all_public_track_pairs_survive_private_ephemeral_allocation() {
+    // Never change the host's port range: the launcher must supply its namespace
+    // identity before entering the dedicated test namespace.
+    let parent = std::env::var("FLUSSONIX_BIND_PARENT_NETNS").expect("namespace launcher required");
+    assert!(parent.starts_with("net:[") && parent.ends_with(']'));
+    let current = std::fs::read_link("/proc/self/ns/net").unwrap();
+    assert_ne!(current.to_str().unwrap(), parent);
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    assert!(
+        std::process::Command::new("ip")
+            .args(["link", "set", "lo", "up"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write("/proc/sys/net/ipv4/ip_local_port_range", "40000 40127\n").unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let file = d.path().join("owned.sdp");
+    let ports = [35000, 40000, 40002, 40004, 40006, 40008, 40010, 40012];
+    let mut text = "v=0\no=- 0 0 IN IP4 127.0.0.1\ns=Owned\nc=IN IP4 127.0.0.1\nt=0 0\n".to_owned();
+    for p in ports {
+        text.push_str(&format!("m=audio {p} RTP/AVP 14\na=rtpmap:14 MPA/90000\n"));
+    }
+    std::fs::write(&file, text).unwrap();
+    let cfg = Settings::input(&json!({"url":"rtp://127.0.0.1:35000", "flussonix_rtp":{"profile":"elementary","sdp_file":file}})).unwrap().unwrap();
+    for iteration in 0..256 {
+        let input = Input::bind(&cfg).await.unwrap_or_else(|error| panic!("all public pairs must bind before ephemeral allocation, iteration {iteration}: {error}"));
+        for p in ports.into_iter().flat_map(|p| [p, p + 1]) {
+            assert!(
+                UdpSocket::bind(("127.0.0.1", p)).is_err(),
+                "public pair lost ownership: {p}"
+            );
+        }
+        drop(input);
+        for p in ports.into_iter().flat_map(|p| [p, p + 1]) {
+            assert!(
+                UdpSocket::bind(("127.0.0.1", p)).is_ok(),
+                "public pair leaked after drop: {p}"
+            );
+        }
+    }
+    // Exhaust only this namespace's remaining ephemeral ports. Failure to make
+    // a private pair must release every previously acquired public track pair.
+    let occupied: Vec<_> = (40000..=40127)
+        .filter(|p| {
+            !ports
+                .into_iter()
+                .any(|public| *p == public || *p == public + 1)
+        })
+        .map(|p| UdpSocket::bind(("127.0.0.1", p)).unwrap())
+        .collect();
+    assert_eq!(
+        Input::bind(&cfg).await.err().unwrap(),
+        "Private RTP reservation failed"
+    );
+    for p in ports.into_iter().flat_map(|p| [p, p + 1]) {
+        assert!(
+            UdpSocket::bind(("127.0.0.1", p)).is_ok(),
+            "public pair leaked after private allocation failure: {p}"
+        );
+    }
+    drop(occupied);
+    drop(Input::bind(&cfg).await.unwrap());
+}
+#[tokio::test]
+async fn busy_later_track_releases_earlier_public_pairs_without_reusing_foreign_socket() {
+    let d = tempfile::tempdir().unwrap();
+    for offset in [2, 3] {
+        let (p, mut sockets) = loop {
+            let first = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let p = first.local_addr().unwrap().port();
+            if p > 65530 {
+                continue;
+            }
+            let mut sockets = vec![first];
+            for port in p + 1..p + 4 {
+                if let Ok(socket) = UdpSocket::bind(("127.0.0.1", port)) {
+                    sockets.push(socket);
+                } else {
+                    break;
+                }
+            }
+            if sockets.len() == 4 {
+                break (p, sockets);
+            }
+        };
+        let foreign = sockets.remove(offset);
+        let occupied = foreign.local_addr().unwrap();
+        let file = d.path().join("owned.sdp");
+        std::fs::write(&file, format!("v=0\no=- 0 0 IN IP4 127.0.0.1\ns=Owned\nc=IN IP4 127.0.0.1\nt=0 0\nm=audio {p} RTP/AVP 14\na=rtpmap:14 MPA/90000\nm=audio {} RTP/AVP 14\na=rtpmap:14 MPA/90000\n", p + 2)).unwrap();
+        let cfg = Settings::input(&json!({"url":format!("rtp://127.0.0.1:{p}"),"flussonix_rtp":{"profile":"elementary","sdp_file":file}})).unwrap().unwrap();
+        drop(sockets);
+        let error = Input::bind(&cfg)
+            .await
+            .err()
+            .expect("busy public track must fail");
+        assert_eq!(
+            error,
+            if offset == 2 {
+                "RTP input port unavailable"
+            } else {
+                "RTCP input port unavailable"
+            }
+        );
+        assert_eq!(foreign.local_addr().unwrap(), occupied);
+        for port in p..p + 4 {
+            assert_eq!(
+                UdpSocket::bind(("127.0.0.1", port)).is_err(),
+                port == occupied.port()
+            );
+        }
+        drop(foreign);
+        drop(Input::bind(&cfg).await.unwrap());
+    }
+}
 #[tokio::test]
 async fn sdp_pipe_failure_retains_the_specific_static_input_diagnostic() {
     let d = tempfile::tempdir().unwrap();
