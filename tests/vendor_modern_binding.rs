@@ -228,7 +228,7 @@ async fn configured_modern_defaults_deliver_both_media_transports() {
         assert_eq!(seen[0].0, "/streamer/api/v3/config");
         assert_eq!(
             seen[1].0,
-            "/streamer/api/v3/streams?select=name%2Cnamed_by%2Cgroups%2Cstatic%2Cdisabled&limit=100"
+            "/streamer/api/v3/streams?select=name%2Cnamed_by%2Cgroups%2Cstatic%2Cdisabled&limit=1000"
         );
         assert_eq!(seen[2].0, "/streamer/api/v3/config");
         assert_eq!(seen[3].0, format!("/news/{protocol}"));
