@@ -41,6 +41,7 @@ pub(super) struct Origin {
     pub epoch: Arc<Mutex<CancellationToken>>,
     pub private_calls: Arc<AtomicUsize>,
     pub missing_segment: Arc<AtomicBool>,
+    pub no_dvr_segment: Arc<AtomicBool>,
     pub segment_ack: Arc<AtomicBool>,
     pub segment_calls: Arc<AtomicUsize>,
     pub management_calls: Arc<AtomicUsize>,
@@ -80,6 +81,8 @@ impl Origin {
         let catalog_delay = Arc::new(AtomicUsize::new(0));
         let (catalog_count, catalog_wait) = (catalog_calls.clone(), catalog_delay.clone());
         let missing_segment = Arc::new(AtomicBool::new(false));
+        let no_dvr_segment = Arc::new(AtomicBool::new(false));
+        let no_dvr = no_dvr_segment.clone();
         let segment_ack = Arc::new(AtomicBool::new(true));
         let segment_calls = Arc::new(AtomicUsize::new(0));
         let (missing, ack, segments) = (
@@ -103,7 +106,7 @@ impl Origin {
         let service=Router::new().fallback(get(move|OriginalUri(uri):OriginalUri,headers:HeaderMap|{
    let held=held.clone();let stalled=stalled.clone();
    let (catalog_count,catalog_wait)=(catalog_count.clone(),catalog_wait.clone());
-   let (missing,ack,segments)=(missing.clone(),ack.clone(),segments.clone());
+   let (missing,ack,segments,no_dvr)=(missing.clone(),ack.clone(),segments.clone(),no_dvr.clone());
    let (a,m,r,e,p,c,k)=(a.clone(),m.clone(),r.clone(),e.clone(),p.clone(),c.clone(),k.clone());async move{
     assert!(!headers.contains_key("x-flussonix-peer"));
     if m4f && uri.path().starts_with("/owned/") {
@@ -124,6 +127,7 @@ impl Origin {
       segments.fetch_add(1,Ordering::SeqCst);
       if missing.load(Ordering::SeqCst) {
        let mut out=Response::new(Body::empty());*out.status_mut()=StatusCode::NOT_FOUND;
+       if no_dvr.load(Ordering::SeqCst) {*out.status_mut()=StatusCode::BAD_REQUEST;out.headers_mut().insert("x-reason","no_dvr".parse().unwrap());}
        if ack.load(Ordering::SeqCst) {out.headers_mut().insert("cluster-auth","yes".parse().unwrap());}
        return out;
       }
@@ -177,6 +181,7 @@ impl Origin {
             epoch,
             private_calls,
             missing_segment,
+            no_dvr_segment,
             segment_ack,
             segment_calls,
             management_calls,

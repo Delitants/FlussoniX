@@ -470,10 +470,16 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                     response.status().as_u16(),
                     requests.private_acknowledged(&response),
                 );
-                // A missing announced object is an availability failure, not a
-                // permanent source denial. Only the explicit private client can
-                // use this exception; the error body is never consumed.
-                if response.status() == reqwest::StatusCode::NOT_FOUND
+                // Missing memory segments can fall through to DVR. A vendor
+                // without DVR reports400 with X-Reason:no_dvr instead of404.
+                // Only acknowledged announced objects use these availability
+                // exceptions; error bodies are never consumed or retried here.
+                let no_dvr = response.status() == reqwest::StatusCode::BAD_REQUEST && {
+                    let mut reasons = response.headers().get_all("x-reason").iter();
+                    reasons.next().is_some_and(|v| v.as_bytes() == b"no_dvr")
+                        && reasons.next().is_none()
+                };
+                if (response.status() == reqwest::StatusCode::NOT_FOUND || no_dvr)
                     && requests.private_acknowledged(&response)
                 {
                     return Err(transient("M4F segment unavailable").into());

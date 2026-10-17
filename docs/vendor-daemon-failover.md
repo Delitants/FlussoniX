@@ -26,11 +26,15 @@ preserve these barriers and the selected-origin history. Changing the source
 relationship, its processing or policy starts a new selection plan.
 
 An announced M4F segment returning404 with exactly one affirmative Cluster
-acknowledgment is treated as temporary media unavailability. The pull stops
+acknowledgment is treated as temporary media unavailability. The same applies
+to segment400 only when it also carries exactly one `X-Reason: no_dvr` header:
+an absent memory segment can fall through to an origin without DVR. The pull stops
 without accepting the response body, and existing supervised recovery can
 revalidate the current catalog and choose an eligible configured replica.
-Control404 and authorization401/403 still block rotation, as do segment200/404
-responses with invalid or missing acknowledgments. Existing5xx failures remain
+Control400/404 and authorization401/403 still block rotation, as do segment200/400/404
+responses with invalid or missing acknowledgments. Other segment400 responses,
+including missing, duplicate or altered `no_dvr` reasons, remain rejected.
+Native inputs cannot use these private exceptions. Existing5xx failures remain
 transient even without acknowledgment. Source/viewer revocation takes precedence; no credential
 fallback or extra in-pull retry is introduced. This distinction does not prove
 why a particular reference segment was missing or promise seamless recovery.

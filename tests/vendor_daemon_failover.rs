@@ -172,11 +172,38 @@ async fn private_media_loss_recovers_without_viewer_requests_while_management_st
 
 #[tokio::test]
 async fn acknowledged_m4f_segment_loss_recovers_in_background_without_latching_rejection() {
+    missing_m4f_recovery(false, false).await;
+}
+
+#[tokio::test]
+async fn acknowledged_m4f_no_dvr_segment_loss_recovers_in_background() {
+    missing_m4f_recovery(true, false).await;
+}
+
+#[tokio::test]
+async fn acknowledged_m4f_no_dvr_cold_start_recovers_without_another_viewer_request() {
+    missing_m4f_recovery(true, true).await;
+}
+
+async fn missing_m4f_recovery(no_dvr: bool, cold: bool) {
     let f = fixture::Fixture::m4f().await;
-    let _ = f.playlist().await;
-    let old_pid = f.app.media.stats("owned").await["pid"].as_u64().unwrap();
-    assert!(old_pid > 0);
-    assert_eq!(f.origins[1].private_calls.load(Ordering::SeqCst), 0);
+    f.origins[0].no_dvr_segment.store(no_dvr, Ordering::SeqCst);
+    let old_pid = if cold {
+        f.origins[0].missing_segment.store(true, Ordering::SeqCst);
+        assert_eq!(
+            f.get("/owned/index.m3u8").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        0
+    } else {
+        let _ = f.playlist().await;
+        let pid = f.app.media.stats("owned").await["pid"].as_u64().unwrap();
+        assert!(pid > 0);
+        pid
+    };
+    if !cold {
+        assert_eq!(f.origins[1].private_calls.load(Ordering::SeqCst), 0);
+    }
     let before = f.origins[0].segment_calls.load(Ordering::SeqCst);
     f.origins[0].missing_segment.store(true, Ordering::SeqCst);
     let recovered = tokio::time::timeout(Duration::from_secs(8), async {
@@ -237,9 +264,14 @@ async fn acknowledged_m4f_segment_loss_recovers_in_background_without_latching_r
     f.stop().await;
     assert!(
         recovered.is_ok(),
-        "announced segment404 permanently blocked background recovery"
+        "announced missing segment permanently blocked background recovery (no_dvr={no_dvr})"
     );
-    assert!(missing_requests > before && backup_segments > 0 && old_gone);
+    assert!(
+        (cold || missing_requests > before)
+            && missing_requests > 0
+            && backup_segments > 0
+            && old_gone
+    );
     let decoded = decode.unwrap().unwrap().unwrap();
     assert!(
         decoded.status.success() && decoded.stderr.is_empty(),
@@ -249,9 +281,19 @@ async fn acknowledged_m4f_segment_loss_recovers_in_background_without_latching_r
 
 #[tokio::test]
 async fn unacknowledged_m4f_segment_404_still_blocks_backup() {
+    unacknowledged_m4f_loss(false).await;
+}
+
+#[tokio::test]
+async fn unacknowledged_m4f_no_dvr_segment_still_blocks_backup() {
+    unacknowledged_m4f_loss(true).await;
+}
+
+async fn unacknowledged_m4f_loss(no_dvr: bool) {
     let f = fixture::Fixture::m4f().await;
     let _ = f.playlist().await;
     f.origins[0].segment_ack.store(false, Ordering::SeqCst);
+    f.origins[0].no_dvr_segment.store(no_dvr, Ordering::SeqCst);
     let before = f.origins[0].segment_calls.load(Ordering::SeqCst);
     f.origins[0].missing_segment.store(true, Ordering::SeqCst);
     let observed = tokio::time::timeout(Duration::from_secs(2), async {
