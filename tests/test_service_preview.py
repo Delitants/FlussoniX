@@ -26,6 +26,10 @@ class ServicePreviewTests(unittest.TestCase):
         (self.release / 'web').mkdir()
         shutil.copy2('/usr/bin/true', self.release / 'bin/flussonix')
         (self.release / 'web/index.html').write_text('<html>Owned service fixture</html>')
+        # Model the packaged public release independently of the caller's umask.
+        for directory in (self.release, self.release / 'bin', self.release / 'web'):
+            directory.chmod(0o755)
+        (self.release / 'web/index.html').chmod(0o644)
         files = {str(p.relative_to(self.release)): {'sha256': hashlib.sha256(p.read_bytes()).hexdigest(),
                  'bytes': p.stat().st_size, 'mode': oct(p.stat().st_mode & 0o777)}
                  for p in self.release.rglob('*') if p.is_file()}
