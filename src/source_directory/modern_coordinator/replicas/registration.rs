@@ -28,8 +28,36 @@ impl ReplicaSelector {
         group: &str,
         members: Vec<ReplicaMember>,
     ) -> Result<Self, ReplicaFailure> {
+        Self::build(owner, group, members, false)
+    }
+    /// Internal route fencing for exactly one source, without declaring replicas.
+    /// No uniform cross-stream policy or content equivalence is implied.
+    pub(crate) fn single_origin(
+        owner: Arc<ModernSourceCoordinator>,
+        source_key: &str,
+    ) -> Result<Self, ReplicaFailure> {
+        Self::build(
+            owner,
+            "single-origin",
+            vec![ReplicaMember {
+                source_key: source_key.into(),
+                content_id: "single-origin".into(),
+            }],
+            true,
+        )
+    }
+    fn build(
+        owner: Arc<ModernSourceCoordinator>,
+        group: &str,
+        members: Vec<ReplicaMember>,
+        single: bool,
+    ) -> Result<Self, ReplicaFailure> {
         if !valid_id(group)
-            || !(2..=8).contains(&members.len())
+            || if single {
+                members.len() != 1
+            } else {
+                !(2..=8).contains(&members.len())
+            }
             || members
                 .iter()
                 .any(|m| !valid_id(&m.content_id) || m.content_id != members[0].content_id)
@@ -82,7 +110,7 @@ impl ReplicaSelector {
             ))
         })?;
         let mut policy = None;
-        for source in sources {
+        for source in sources.into_iter().filter(|_| !single) {
             let source =
                 crate::source_directory::flussonic_config::normalized_modern_source(&source)
                     .map_err(|_| ReplicaFailure::Invalid)?;
@@ -103,7 +131,7 @@ impl ReplicaSelector {
             revision,
             group: group.to_owned(),
             members,
-            policy: policy.ok_or(ReplicaFailure::Invalid)?,
+            policy,
             state: Mutex::new(State::default()),
         };
         selector.at_plan(|| Ok(()))?;

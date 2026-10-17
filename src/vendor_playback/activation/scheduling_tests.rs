@@ -107,6 +107,6 @@ async fn retained_name_replaces_obsolete_held_startup_without_waiting_for_timeou
     drop(held);
     assert!(
         result.is_ok(),
-        "same-name successor waited for obsolete job's eight-second timeout"
+        "same-name successor waited for obsolete job's full recovery deadline"
     );
 }

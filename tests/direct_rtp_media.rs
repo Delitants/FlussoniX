@@ -25,6 +25,13 @@ async fn independent_rtp_source_cpu_transcode_and_direct_output_decode() {
         .await
         .unwrap();
     let target = d.path().join("received.ts");
+    // The RTP URL demuxer probes with one socket pair, closes it, then
+    // reopens through SDP. A connected sender can see ICMP in that gap.
+    // Use the same explicit MP2T receiver as the independent copy matrix.
+    let sdp = d.path().join("receiver.sdp");
+    std::fs::write(&sdp, format!(
+        "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=Owned MP2T receiver\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video {output} RTP/AVP 33\r\na=rtpmap:33 MP2T/90000\r\n"
+    )).unwrap();
     let logfile = std::fs::File::create(d.path().join("receiver.log")).unwrap();
     let mut receiver = Command::new("ffmpeg")
         .args([
@@ -35,8 +42,16 @@ async fn independent_rtp_source_cpu_transcode_and_direct_output_decode() {
             "262144",
             "-analyzeduration",
             "1000000",
+            "-protocol_whitelist",
+            "file,udp,rtp",
+            "-localaddr",
+            "127.0.0.1",
+            "-listen_timeout",
+            "12",
+            "-f",
+            "sdp",
             "-i",
-            &format!("rtp://127.0.0.1:{output}?timeout=12000000"),
+            sdp.to_str().unwrap(),
             "-t",
             "6",
             "-map",
@@ -92,16 +107,17 @@ async fn independent_rtp_source_cpu_transcode_and_direct_output_decode() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let received = tokio::time::timeout(Duration::from_secs(16), receiver.wait())
-        .await
-        .unwrap()
-        .unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(16), receiver.wait()).await;
+    if received.is_err() {
+        let _ = receiver.kill().await;
+        let _ = receiver.wait().await;
+    }
     let _ = sender.kill().await;
     let _ = sender.wait().await;
     if let Ok(out) = std::env::var("FLUSSONIX_DIRECT_ARTIFACT_DIR") {
         let out = std::path::Path::new(&out);
         std::fs::create_dir_all(out).unwrap();
-        for name in ["received.ts", "receiver.log", "sender.log"] {
+        for name in ["received.ts", "receiver.log", "receiver.sdp", "sender.log"] {
             let file = d.path().join(name);
             if file.is_file() {
                 std::fs::copy(file, out.join(name)).unwrap();
@@ -128,8 +144,16 @@ async fn independent_rtp_source_cpu_transcode_and_direct_output_decode() {
             }
         }
     }
+    let owned_workers = e.count().await;
+    e.stop_all().await;
+    assert_eq!(owned_workers, 1);
+    assert_eq!(e.count().await, 0);
     assert!(
-        received.success(),
+        received.is_ok(),
+        "independent RTP receiver exceeded 16 seconds"
+    );
+    assert!(
+        received.unwrap().unwrap().success(),
         "{}; source: {}",
         std::fs::read_to_string(d.path().join("receiver.log")).unwrap(),
         std::fs::read_to_string(d.path().join("sender.log")).unwrap()
@@ -195,9 +219,6 @@ async fn independent_rtp_source_cpu_transcode_and_direct_output_decode() {
             > 0
     );
     assert!(e.direct_egress.load(std::sync::atomic::Ordering::Relaxed) > 0);
-    assert_eq!(e.count().await, 1);
-    e.stop_all().await;
-    assert_eq!(e.count().await, 0);
     assert!(
         tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, input))
             .await

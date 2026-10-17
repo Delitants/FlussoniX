@@ -65,6 +65,22 @@ impl ModernLeasedInventory {
             ticket: self.ticket.clone(),
         })
     }
+    // Explicit relay assertions require known membership at the terminal too;
+    // the direct-origin uniform-policy exception does not attest relay paths.
+    pub(crate) fn relay_origin_candidate(
+        &self,
+        name: &str,
+    ) -> Result<ModernLeasedCandidate, LeaseFailure> {
+        let row = self
+            .inventory
+            .inventory
+            .rows
+            .get(name)
+            .ok_or(LeaseFailure::Binding(BindingFailure::Missing))?;
+        row.local_origin_candidate()
+            .map_err(|error| projection(ProjectionFailure::Ineligible(error)))?;
+        self.candidate(name)
+    }
     /// Untrusted management claim, not private-endpoint identity or topology proof.
     pub fn server_id(&self) -> &ObservedServerId {
         self.inventory.server_id()

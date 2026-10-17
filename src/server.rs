@@ -494,6 +494,7 @@ impl App {
             streams.push(json!({"name":name,"ready":self.media.ready(&name).await,"stats":self.stream_stats(&name).await}));
         }
         let mut node = self.load_node().await;
+        node["version"] = json!(env!("CARGO_PKG_VERSION"));
         node["streams"] = json!(streams);
         node
     }
@@ -1797,30 +1798,24 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             .into_response();
     }
     if file == "mpegts" {
-        let rx = worker.subscribe();
-        worker.viewers.fetch_add(1, Ordering::Relaxed);
-        let guard = ViewerGuard(worker.clone(), grant);
-        let egress = app.egress.clone();
-        let stream = futures_util::stream::unfold(
-            (rx, guard, egress),
-            |(mut rx, guard, egress)| async move {
-                match tokio::select! {biased; _=guard.1.cancelled()=>Err(tokio::sync::broadcast::error::RecvError::Closed),_=guard.0.closed()=>Err(tokio::sync::broadcast::error::RecvError::Closed),result=rx.recv()=>result}
-                {
-                    Ok(bytes) => {
-                        guard.1.add_bytes(bytes.len());
-                        egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                        Some((Ok::<Bytes, std::io::Error>(bytes), (rx, guard, egress)))
-                    }
-                    Err(_) => None,
-                }
-            },
-        );
+        let connection = matches!(
+            request.version(),
+            axum::http::Version::HTTP_10 | axum::http::Version::HTTP_11
+        )
+        .then(|| {
+            request
+                .extensions()
+                .get::<crate::http_transport::Control>()
+                .cloned()
+        })
+        .flatten();
+        let body = native_ts_body::body(worker, grant, app.egress.clone(), connection);
         return (
             [
                 ("Content-Type".to_owned(), "video/mp2t".to_owned()),
                 ("Cache-Control".into(), "no-store".into()),
             ],
-            Body::from_stream(stream),
+            body,
         )
             .into_response();
     }
@@ -2037,6 +2032,7 @@ mod continuous_session_tests {
     }
 }
 
+mod native_ts_body;
 #[path = "origin_resolution.rs"]
 mod origin_resolution;
 

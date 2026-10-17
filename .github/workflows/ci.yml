@@ -12,6 +12,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg libsrtp2-1 tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu fonts-dejavu-core
       - name: Verify vendor components are absent
         run: test ! -e /opt/flussonic
+      - name: Preview package and service regressions
+        run: python3 -m unittest discover -s tests -p 'test_*preview.py' -v
       - run: rustup show
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -24,19 +26,29 @@ jobs:
           cargo test --locked --test rtsp_push native_text_preserve_rejects_rtsp_before_connect_and_drop_delivers_audio -- --exact --test-threads=1
       - name: Owned cluster daemon environment isolation
         run: FLUSSONIX_SRT_PLAY_PASSPHRASE=owned-unused-SRT-setting cargo test --locked --test cluster_native_recovery daemon_recovers_equivalent_native_tls_origin_without_viewer_requests -- --exact --test-threads=1
+      - name: Elementary RTP bind order in isolated network namespace
+        run: |
+          cargo test --locked --test elementary_io --no-run --message-format=json > "$RUNNER_TEMP/elementary-bind-build.jsonl"
+          flussonix_bind_test=$(python3 -c 'import json,sys; rows=[json.loads(line) for line in open(sys.argv[1])]; paths=[row["executable"] for row in rows if row.get("reason")=="compiler-artifact" and row.get("target",{}).get("name")=="elementary_io" and row.get("executable")]; assert len(paths)==1; print(paths[0])' "$RUNNER_TEMP/elementary-bind-build.jsonl")
+          sudo env FLUSSONIX_BIND_PARENT_NETNS="$(readlink /proc/self/ns/net)" unshare --net "$flussonix_bind_test" all_public_track_pairs_survive_private_ephemeral_allocation --ignored --exact --nocapture --test-threads=1
       - name: Rust qualification and owned browser caption fixture
         id: rust_qualification
         env:
           FLUSSONIX_ELEMENTARY_ARTIFACT_DIR: ${{ runner.temp }}/flussonix-elementary-evidence
+          FLUSSONIX_DIRECT_ARTIFACT_DIR: ${{ runner.temp }}/flussonix-direct-evidence
+          FLUSSONIX_CAPTION_ARTIFACT_DIR: ${{ runner.temp }}/flussonix-caption-evidence
         run: |
           mkdir -p .runtime
           FLUSSONIX_NATIVE_AUDIO_FIXTURE_FILE="$PWD/.runtime/owned-native-audio.m4s" FLUSSONIX_NATIVE_FIXTURE_FILE="$PWD/.runtime/owned-native.m4s" FLUSSONIX_DVB_FIXTURE_FILE="$PWD/.runtime/owned-dvb.ts" FLUSSONIX_TELETEXT_FIXTURE_FILE="$PWD/.runtime/owned-teletext.ts" FLUSSONIX_708_FIXTURE_FILE="$PWD/.runtime/owned-708.ts" FLUSSONIX_CAPTION_FIXTURE_FILE="$PWD/.runtime/owned-captions.ts" cargo test --locked -- --test-threads=1
-      - name: Retain owned elementary media failure evidence
+      - name: Retain owned media failure evidence
         if: failure() && steps.rust_qualification.outcome == 'failure'
         uses: actions/upload-artifact@v7
         with:
-          name: elementary-media-failure-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/flussonix-elementary-evidence/
+          name: media-failure-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/flussonix-elementary-evidence/
+            ${{ runner.temp }}/flussonix-direct-evidence/
+            ${{ runner.temp }}/flussonix-caption-evidence/
           retention-days: 3
           if-no-files-found: warn
       - uses: actions/setup-node@v7

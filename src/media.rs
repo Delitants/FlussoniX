@@ -20,7 +20,7 @@ use std::{
 use tokio::{
     io::AsyncReadExt,
     process::Command,
-    sync::{Mutex, broadcast, oneshot},
+    sync::{Mutex, oneshot},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -41,9 +41,10 @@ enum PublicationInput {
     MpegTs,
     Sdp { secure: bool },
 }
+pub type PublicationWriter = Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync>;
 pub struct Publication {
     pub worker: Arc<Worker>,
-    pub stdin: Option<tokio::process::ChildStdin>,
+    pub stdin: Option<PublicationWriter>,
 }
 impl Drop for Publication {
     fn drop(&mut self) {
@@ -51,9 +52,9 @@ impl Drop for Publication {
     }
 }
 pub struct Worker {
-    publisher_stdin: std::sync::Mutex<Option<tokio::process::ChildStdin>>,
+    publisher_stdin: std::sync::Mutex<Option<PublicationWriter>>,
     publication: bool,
-    tx: broadcast::Sender<Bytes>,
+    tx: crate::media_queue::Channel,
     cancel: CancellationToken,
     done: Mutex<Option<oneshot::Receiver<()>>>,
     pid: AtomicU32,
@@ -85,9 +86,12 @@ pub struct Worker {
     _idle_activity: crate::idle_memory::Activity,
 }
 impl Worker {
-    pub fn subscribe(&self) -> broadcast::Receiver<Bytes> {
+    pub fn subscribe(&self) -> crate::media_queue::Receiver {
         self.touch();
         self.tx.subscribe()
+    }
+    pub(crate) fn ts_backlog(&self) -> (usize, usize) {
+        self.tx.retained()
     }
     pub fn signature(&self) -> &str {
         &self.signature
@@ -100,6 +104,9 @@ impl Worker {
     }
     pub fn is_closed(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancel.clone()
     }
     pub async fn closed(&self) {
         self.cancel.cancelled().await
@@ -472,7 +479,13 @@ impl Engine {
                     ))
                 })
             });
-        let mut cmd = Command::new(&self.ffmpeg);
+        let timeout = Duration::from_secs(
+            cfg["flussonix_input_timeout"]
+                .as_u64()
+                .unwrap_or(15)
+                .clamp(1, 300),
+        );
+        let mut cmd = crate::child_process::command(&self.ffmpeg);
         cmd.args([
             "-hide_banner",
             "-loglevel",
@@ -531,18 +544,17 @@ impl Engine {
             ]);
             cmd.stdin(std::process::Stdio::piped());
         } else if publication {
+            // Probe across a normal GOP, leaving startup/mux headroom under
+            // shorter configured watchdogs. Keep fractional seconds nonzero.
             cmd.args([
                 "-protocol_whitelist",
                 "pipe",
                 "-probesize",
                 "1048576",
                 "-analyzeduration",
-                "1000000",
-                "-f",
-                "mpegts",
-                "-i",
-                "pipe:0",
-            ]);
+            ])
+            .arg((timeout.as_micros() / 2).min(5_000_000).to_string())
+            .args(["-f", "mpegts", "-i", "pipe:0"]);
             cmd.stdin(std::process::Stdio::piped());
         } else if m4s_input || m4f_input {
             cmd.args([
@@ -695,6 +707,8 @@ impl Engine {
         }
         // One encode/mux source feeds both HLS variants and shared live TS fan-out.
         let copy_publication = (publication || direct_input.is_some()) && profile.audio_copy();
+        let inspect_publication =
+            matches!(publishing, Some(PublicationInput::MpegTs)) && profile.audio_copy();
         let native_copy = (m4s_input || m4f_input) && profile.full_copy();
         let native_audio_copy = (m4s_input || m4f_input) && profile.audio_copy();
         let copy_peer_ts = peer_ts && profile.audio_copy();
@@ -723,6 +737,8 @@ impl Engine {
             "__NATIVE_FMP4_FILTER__"
         } else if copy_peer_ts {
             "__PEER_FMP4_FILTER__"
+        } else if inspect_publication {
+            "__PUBLICATION_FMP4_FILTER__"
         } else if copy_publication {
             ":bsfs/a=aac_adtstoasc"
         } else {
@@ -765,10 +781,10 @@ impl Engine {
             dir.join("fmp4/index.m3u8").display()
         );
         let native_input = m4s_input || m4f_input;
-        if !native_input && !peer_ts {
+        if !native_input && !peer_ts && !inspect_publication {
             cmd.args(["-threads", "2", "-f", "tee", &output]);
         }
-        if !native_input && !peer_ts {
+        if !native_input && !peer_ts && !inspect_publication {
             if let Some(target) = caption_target.as_deref() {
                 caption_output(&mut cmd, target, caption_separate);
             }
@@ -776,7 +792,7 @@ impl Engine {
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let mut child = if native_input || peer_ts {
+        let mut child = if native_input || peer_ts || inspect_publication {
             None
         } else {
             Some(
@@ -785,18 +801,27 @@ impl Engine {
             )
         };
         let pid = child.as_ref().and_then(|c| c.id()).unwrap_or(0);
-        let (tx, _) = broadcast::channel(64);
+        let tx = ts_channel();
         let mut stdin = child.as_mut().and_then(|c| c.stdin.take());
+        // Reserve the publisher immediately, but bound metadata collection before
+        // spawning a copy packager whose fMP4 filters depend on the PMT codecs.
+        let (publisher_stdin, publication_reader) = if inspect_publication {
+            let (writer, reader) = tokio::io::duplex(64 * 1024);
+            (Some(Box::new(writer) as PublicationWriter), Some(reader))
+        } else {
+            (
+                if publication {
+                    stdin.take().map(|s| Box::new(s) as PublicationWriter)
+                } else {
+                    None
+                },
+                None,
+            )
+        };
         let (done_tx, done) = oneshot::channel();
         let cancel = CancellationToken::new();
-        let timeout = Duration::from_secs(
-            cfg["flussonix_input_timeout"]
-                .as_u64()
-                .unwrap_or(15)
-                .clamp(1, 300),
-        );
         let worker = Arc::new(Worker {
-            publisher_stdin: std::sync::Mutex::new(if publication { stdin.take() } else { None }),
+            publisher_stdin: std::sync::Mutex::new(publisher_stdin),
             publication,
             tx,
             cancel: cancel.clone(),
@@ -920,9 +945,74 @@ impl Engine {
             async {
                 let mut child = if let Some(child) = child {
                     child
+                } else if let Some(mut reader) = publication_reader {
+                    let metadata = async {
+                        let mut probe = crate::ts_profile::Probe::for_publication();
+                        let mut prefix = Vec::new();
+                        let mut buffer = [0u8; 16384];
+                        while probe.audio.is_none() {
+                            let n = reader.read(&mut buffer).await.map_err(|_| "input_closed")?;
+                            if n == 0 { return Err("input_closed"); }
+                            if prefix.len() + n > 1024 * 1024 { return Err("metadata_limit"); }
+                            probe.push(&buffer[..n]);
+                            prefix.extend_from_slice(&buffer[..n]);
+                        }
+                        Ok((probe, prefix))
+                    };
+                    let (probe, prefix) = tokio::select! { biased;
+                        _=cancel.cancelled()=>return,
+                        result=tokio::time::timeout(timeout, metadata)=>match result {
+                            Ok(Ok(value))=>value,
+                            Ok(Err(reason))=>{w.failed(reason);return;},
+                            Err(_)=>{w.failed("startup_timeout");return;},
+                        },
+                    };
+                    // Map one optional video followed by all audio in PMT order.
+                    // AAC's ADTS conversion must never be applied to MPEG audio.
+                    if probe.filter_mapping_known && probe.video.is_none() && !probe.audio_types.is_empty() {
+                        // A complete single-program PMT proves there is no
+                        // video keyframe to wait for. Multiplexes keep the GOP budget.
+                        cmd = audio_publication_command(cmd, (timeout.as_micros() / 2).min(1_000_000));
+                    }
+                    let offset = usize::from(probe.video.is_some());
+                    let filters = if probe.filter_mapping_known {
+                        probe.audio_types.iter().enumerate()
+                            .filter(|(_, codec)| **codec == 0x0f)
+                            .map(|(index, _)| format!(":bsfs/{}=aac_adtstoasc", offset + index))
+                            .collect::<String>()
+                    } else {
+                        // Preserve existing handling where first-program metadata
+                        // cannot establish FFmpeg's complete all-audio mapping.
+                        ":bsfs/a=aac_adtstoasc".into()
+                    };
+                    let output = output.replace("__PUBLICATION_FMP4_FILTER__", &filters);
+                    cmd.args(["-threads", "2", "-f", "tee", &output]);
+                    if let Some(target)=caption_target.as_deref(){caption_output(&mut cmd,target,caption_separate);}
+                    if cancel.is_cancelled() {return;}
+                    let mut child = match cmd.spawn() {
+                        Ok(child)=>child,
+                        Err(_)=>{w.failed("packaging_failed");return;},
+                    };
+                    w.pid.store(child.id().unwrap_or(0),Ordering::Relaxed);
+                    let mut writer = child.stdin.take().unwrap();
+                    let c = cancel.clone();
+                    let pipe_worker = w.clone();
+                    tasks.push(tokio::spawn(async move {
+                        use tokio::io::AsyncWriteExt;
+                        let result = tokio::select! { biased;
+                            _=c.cancelled()=>return,
+                            result=async {
+                                writer.write_all(&prefix).await?;
+                                tokio::io::copy(&mut reader, &mut writer).await
+                            }=>result,
+                        };
+                        if result.is_err() {pipe_worker.failed("packaging_failed");c.cancel();}
+                        // Dropping the owned pipe delivers EOF to the packager.
+                    }));
+                    child
                 } else if peer_ts {
                     let bridge=peer_hls.as_mut().unwrap();
-                    let profile=tokio::select!{biased;_=cancel.cancelled()=>return,result=bridge.metadata()=>result};
+                    let profile=tokio::select!{biased;_=cancel.cancelled()=>return,result=tokio::time::timeout(timeout,bridge.metadata())=>match result {Ok(profile)=>profile,Err(_)=>{w.failed("startup_timeout");return;}}};
                     let (audio,_video)=match profile {Ok(profile)=>profile,Err(reason)=>{w.failed(match reason.as_str(){"peer transport metadata exceeds limit"=>"metadata_limit","peer transport metadata timeout"=>"startup_timeout",_=>"input_closed"});return;}};
                     let output=output.replace("__PEER_FMP4_FILTER__",if audio==Some(0x0f){":bsfs/a=aac_adtstoasc"}else{""});
                     cmd.args(["-threads","2","-f","tee",&output]);
@@ -1014,7 +1104,9 @@ impl Engine {
                         let mut transport=crate::caption_transport::Transport::default();
                         loop{let data=tokio::select!{biased;_=c.cancelled()=>break,data=receiver.recv()=>match data{Some(data)=>data,None=>break}};decoder_state.push_source(&data,&mut transport);if decoder_state.failed.load(Ordering::Relaxed){break}}
                     }));
-                    let c=cancel.clone();let drain_state=state.clone();tasks.push(tokio::spawn(async move {let Ok(Ok((mut socket,_)))=(tokio::select!{biased;_=c.cancelled()=>return,r=tokio::time::timeout(Duration::from_secs(5),listener.accept())=>r})else{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");return};let mut buffer=[0;16384];loop{let read=tokio::select!{biased;_=c.cancelled()=>break,r=socket.read(&mut buffer)=>r};match read{Ok(n)if n>0=>{if enqueue_caption(&sender,Bytes::copy_from_slice(&buffer[..n]),&c).await.is_err(){drain_state.failed.store(true,Ordering::Relaxed);break;}},_=>{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");break}}}}));
+                    // FFmpeg opens this output after input probing. Allow the same
+                    // bounded startup interval as the AV listener below.
+                    let c=cancel.clone();let drain_state=state.clone();tasks.push(tokio::spawn(async move {let Ok(Ok((mut socket,_)))=(tokio::select!{biased;_=c.cancelled()=>return,r=tokio::time::timeout(timeout+Duration::from_secs(1),listener.accept())=>r})else{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");return};let mut buffer=[0;16384];loop{let read=tokio::select!{biased;_=c.cancelled()=>break,r=socket.read(&mut buffer)=>r};match read{Ok(n)if n>0=>{if enqueue_caption(&sender,Bytes::copy_from_slice(&buffer[..n]),&c).await.is_err(){drain_state.failed.store(true,Ordering::Relaxed);break;}},_=>{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");break}}}}));
                     for _ in 0..2{tasks.push(tokio::spawn(state.clone().ocr(tesseract.clone(),cancel.clone())));}
                 }
                 if let Some(state) = w.captions.clone() {
@@ -1053,8 +1145,8 @@ impl Engine {
                             loop {
                                 let read=tokio::select! {biased;_=c.cancelled()=>return Ok(()),r=tokio::time::timeout(timeout,socket.read(&mut buffer))=>r};
                                 match read {
-                                    Ok(Ok(0))=>{output.finish(&w.wire)?;return Ok(());},
-                                    Ok(Ok(n))=>output.push(&buffer[..n],&w.wire)?,
+                                    Ok(Ok(0))=>{tokio::select!{biased;_=c.cancelled()=>return Ok(()),result=output.finish(&w.wire)=>result}?;return Ok(());},
+                                    Ok(Ok(n))=>{tokio::select!{biased;_=c.cancelled()=>return Ok(()),result=output.push(&buffer[..n],&w.wire)=>result}?;},
                                     Ok(Err(_))=>return Err("wire_decode_failed"),
                                     Err(_)=>return Err("input_stalled"),
                                 }
@@ -1079,7 +1171,7 @@ impl Engine {
                     };
                     match read {
                         Ok(Ok(0)) => {
-                            let result=if let Some(output)=&mut native_output {output.finish(&w.wire)}
+                            let result=if let Some(output)=&mut native_output {tokio::select!{biased;_=cancel.cancelled()=>break,result=output.finish(&w.wire)=>result}}
                             else if let Some(receiver)=av_done.take() {
                                 tokio::select! {biased;_=cancel.cancelled()=>break,r=tokio::time::timeout(timeout,receiver)=>match r {Ok(Ok(result))=>result,_=>Err("wire_decode_failed")}}
                             } else {Ok(())};
@@ -1101,7 +1193,8 @@ impl Engine {
                         }
                         Ok(Ok(n)) => {
                             if let Some(output)=&mut native_output {
-                                if let Err(reason)=output.push(&buffer[..n],&w.wire) {w.failed(reason);break;}
+                                let result=tokio::select!{biased;_=cancel.cancelled()=>break,result=output.push(&buffer[..n],&w.wire)=>result};
+                                if let Err(reason)=result {w.failed(reason);break;}
                             }
                             if let Some(state)=&w.captions{state.observe_ts(&buffer[..n],&mut output_clock,&mut output_decoder);}
                             w.recovery.lock().unwrap().progress();
@@ -1138,6 +1231,8 @@ impl Engine {
             if let Some(bridge) = tls_input {
                 bridge.close().await;
             }
+            // The process has been reaped; retained workers must not advertise its old PID.
+            w.pid.store(0, Ordering::Relaxed);
             w.alive.store(false, Ordering::Relaxed);
             let _ = done_tx.send(());
         });
@@ -1397,6 +1492,43 @@ impl Engine {
             .collect()
     }
 }
+// Only deferred MPEG-TS publication commands built above use this rebuild:
+// their IO is piped and the factory restores the Linux process ownership guard.
+fn audio_publication_command(cmd: Command, analysis_us: u128) -> Command {
+    let original = cmd.as_std();
+    let mut audio = crate::child_process::command(original.get_program());
+    let duration = analysis_us.to_string();
+    let mut input_options = true;
+    let mut replace_duration = false;
+    for argument in original.get_args() {
+        if replace_duration {
+            audio.arg(&duration);
+        } else {
+            audio.arg(argument);
+        }
+        replace_duration = input_options && argument == "-analyzeduration";
+        if argument == "-i" {
+            input_options = false;
+        }
+    }
+    for (key, value) in original.get_envs() {
+        if let Some(value) = value {
+            audio.env(key, value);
+        } else {
+            audio.env_remove(key);
+        }
+    }
+    if let Some(directory) = original.get_current_dir() {
+        audio.current_dir(directory);
+    }
+    audio
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    audio
+}
+
 async fn enqueue_caption(
     sender: &tokio::sync::mpsc::Sender<Bytes>,
     data: Bytes,
@@ -1474,6 +1606,54 @@ mod lifecycle_tests {
     use crate::server::{App, Options, router};
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
+    #[tokio::test]
+    async fn rtsp_push_releases_ts_probe_before_waiting_for_receiver_setup() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (ready, setup) = tokio::sync::oneshot::channel();
+        let stop = CancellationToken::new();
+        let server_stop = stop.clone();
+        let server = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut byte = [0];
+            socket.read_exact(&mut byte).await.unwrap();
+            ready.send(()).unwrap();
+            server_stop.cancelled().await;
+        });
+        let cfg = json!({"inputs":[{"url":"testsrc://"}],
+            "pushes":[{"url":format!("rtsp://{address}/owned"),"connect_timeout":20}]});
+        let worker = app.media.ensure("owned", &cfg).await.unwrap();
+        let setup_ok = matches!(
+            tokio::time::timeout(Duration::from_secs(8), setup).await,
+            Ok(Ok(()))
+        );
+        let before = worker.bytes.load(Ordering::Relaxed);
+        let flowing = tokio::time::timeout(Duration::from_secs(3), async {
+            while worker.bytes.load(Ordering::Relaxed) < before + 64000 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let retained = worker.tx.retained();
+        app.media.stop_all().await;
+        stop.cancel();
+        server.abort();
+        let _ = server.await;
+        assert!(
+            setup_ok && flowing,
+            "real RTSP setup must be stalled after TS probing while worker flows"
+        );
+        assert_eq!(
+            retained,
+            (0, 0),
+            "RTSP probe must not pin TS after metadata is known"
+        );
+    }
+
     #[tokio::test]
     async fn caption_queue_retains_a_transient_burst_in_order() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
@@ -1598,14 +1778,14 @@ mod lifecycle_tests {
         drop(blocked);
         let result = pending.await.unwrap();
         let pid = app.media.stats("owned").await["pid"].clone();
+        let current_pid = current.pid();
         app.media.stop_all().await;
         assert!(
             result.is_err(),
             "stale route passed the engine startup fence"
         );
         assert_eq!(
-            pid,
-            current.pid(),
+            pid, current_pid,
             "queued stale startup replaced the current worker"
         );
     }
@@ -1887,3 +2067,44 @@ mod caption_sink_tests {
         );
     }
 }
+
+// One shared backlog per worker, never one copy per viewer. This byte budget
+// tolerates GOP bursts across arbitrary stdout read boundaries. The record
+// ceiling also bounds metadata for tiny reads. Fully consumed data is released.
+fn ts_channel() -> crate::media_queue::Channel {
+    crate::media_queue::Channel::live(32 * 1024, 4 * 1024 * 1024)
+}
+
+#[cfg(test)]
+mod ts_backlog_tests {
+    use super::*;
+
+    // A GOP arrives in many small reads; chunk count must not truncate a
+    // healthy viewer while its byte backlog is still small.
+    #[tokio::test]
+    async fn ts_gop_burst_preserves_every_byte_for_all_viewers() {
+        let queue = ts_channel();
+        let mut first = queue.subscribe();
+        let mut second = queue.subscribe();
+        for sequence in 0..256u32 {
+            let mut packet = vec![0x47; 1316];
+            packet[4..8].copy_from_slice(&sequence.to_be_bytes());
+            queue.send(Bytes::from(packet)).unwrap();
+        }
+        for sequence in 0..256u32 {
+            let a = first.recv().await.expect("ordinary GOP must not overflow");
+            let b = second
+                .recv()
+                .await
+                .expect("second viewer must receive the same GOP");
+            assert_eq!(a.len(), 1316);
+            assert_eq!(&a[4..8], &sequence.to_be_bytes());
+            assert!(a[..4].iter().chain(a[8..].iter()).all(|b| *b == 0x47));
+            assert_eq!(a, b);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "media/ts_diagnostics_tests.rs"]
+mod ts_diagnostics_tests;

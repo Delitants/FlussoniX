@@ -126,46 +126,52 @@ impl Forwarder {
             closed: false,
         }
     }
-    fn events(&mut self, events: Vec<Event>, hub: &Hub) -> Result<(), &'static str> {
+    async fn events(&mut self, events: Vec<Event>, hub: &Hub) -> Result<(), &'static str> {
         let now = Instant::now();
         for event in events {
             match event {
                 Event::Info(tracks) => {
                     self.queue.info(&tracks, now)?;
                     hub.info(tracks).map_err(|_| "wire_decode_failed")?;
+                    tokio::task::coop::consume_budget().await;
                 }
                 Event::Frame(frame) => {
                     for frame in self.queue.frame(frame, now)? {
                         hub.frame(frame).map_err(|_| "wire_decode_failed")?;
+                        // Buffered probe output must let ready consumers drain
+                        // the bounded fan-out between batches of native records.
+                        tokio::task::coop::consume_budget().await;
                     }
                 }
             }
         }
         Ok(())
     }
-    pub(crate) fn push(&mut self, data: &[u8], hub: &Hub) -> Result<(), &'static str> {
+    pub(crate) async fn push(&mut self, data: &[u8], hub: &Hub) -> Result<(), &'static str> {
         if self.closed {
             return Err("wire_decode_failed");
         }
-        let result = (|| {
+        let result = async {
             self.queue.check(Instant::now(), self.timeout)?;
             let events = self.decoder.push(data).map_err(|_| "wire_decode_failed")?;
-            self.events(events, hub)
-        })();
+            self.events(events, hub).await
+        }
+        .await;
         if result.is_err() {
             self.closed = true;
         }
         result
     }
-    pub(crate) fn finish(&mut self, hub: &Hub) -> Result<(), &'static str> {
+    pub(crate) async fn finish(&mut self, hub: &Hub) -> Result<(), &'static str> {
         if self.closed {
             return Err("wire_decode_failed");
         }
         self.closed = true;
         let events = self.decoder.finish().map_err(|_| "wire_decode_failed")?;
-        self.events(events, hub)?;
+        self.events(events, hub).await?;
         for frame in self.queue.finish() {
             hub.frame(frame).map_err(|_| "wire_decode_failed")?;
+            tokio::task::coop::consume_budget().await;
         }
         Ok(())
     }
@@ -174,6 +180,70 @@ impl Forwarder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cancellation_discards_a_burst_after_cooperative_publication_yields() {
+        let hub = std::sync::Arc::new(Hub::new());
+        let mut receiver = hub.m4s.subscribe();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let producer_cancel = cancel.clone();
+        let output = hub.clone();
+        let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut forwarder = Forwarder::new(Duration::from_secs(15));
+            let mut events = vec![Event::Info(vec![Track {
+                id: 1,
+                codec: "m2a".into(),
+                config: vec![],
+            }])];
+            for index in 0..512 {
+                events.push(Event::Frame(Frame {
+                    track_id: 1,
+                    dts: 90_000 + index * 2160,
+                    pts_offset: 0,
+                    key: true,
+                    body: include_bytes!("../../tests/fixtures/codecs/mp2.bin").to_vec(),
+                }));
+            }
+            tokio::select! {biased;
+                _ = producer_cancel.cancelled() => false,
+                result = forwarder.events(events, &output) => {result.unwrap();true}
+            }
+        }));
+        let first = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        cancel.cancel();
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            "cancelled publication completed its pending burst"
+        );
+        hub.finish();
+        let mut decoder = crate::m4s::Decoder::default();
+        let mut records = vec![first];
+        loop {
+            match receiver.recv().await {
+                Ok(record) => records.push(record),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(error) => panic!("cancellation witness lost native records: {error}"),
+            }
+        }
+        let mut frames = 0;
+        for record in records {
+            for event in decoder.push(&record).unwrap() {
+                if matches!(event, crate::m4s::Event::Frame { .. }) {
+                    frames += 1;
+                }
+            }
+        }
+        assert!(
+            frames > 0 && frames < 512,
+            "cancellation must stop a partially published burst: {frames}"
+        );
+    }
+
     fn tracks() -> Vec<Track> {
         vec![
             Track {

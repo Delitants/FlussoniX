@@ -52,7 +52,7 @@ impl ReplicaSelector {
         let stamp = self
             .owner
             .publish(&candidate, |view, _| {
-                if view.name != name || view.policy != &self.policy {
+                if view.name != name || !self.accepts_policy(view.policy) {
                     return Err(ReplicaFailure::PolicyMismatch);
                 }
                 let state = self.state()?;
@@ -85,7 +85,7 @@ impl ReplicaSelector {
         }
         self.owner
             .publish(candidate, |view, _| {
-                if view.policy != &self.policy
+                if !self.accepts_policy(view.policy)
                     || candidate.source_key() != self.members[route.stamp.selected].source_key
                 {
                     return Err(ReplicaFailure::PolicyMismatch);

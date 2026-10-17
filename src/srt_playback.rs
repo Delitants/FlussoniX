@@ -88,6 +88,18 @@ async fn connection(
         host: address.to_string(),
         ..Default::default()
     };
+    // Vendor discovery may validate a primary and two bounded replica waves.
+    // This snapshot chooses timing only; ts_admit rechecks actual authority.
+    let admission_budget = if app.config.read(|root| {
+        matches!(
+            crate::vendor_playback::select(root, &viewer.name, app.config.revision()),
+            crate::vendor_playback::Selection::Vendor { .. }
+        )
+    }) {
+        crate::vendor_playback::SRT_ADMISSION_BUDGET
+    } else {
+        Duration::from_secs(10)
+    };
     let admitting = async {
         if let Some(id) = ticket.as_deref() {
             app.ts_admit_ticket(
@@ -103,7 +115,7 @@ async fn connection(
             app.ts_admit(viewer).await
         }
     };
-    let admitted = tokio::select! {biased;_=cancel.cancelled()=>return,result=tokio::time::timeout(Duration::from_secs(10),admitting)=>result};
+    let admitted = tokio::select! {biased;_=cancel.cancelled()=>return,result=tokio::time::timeout(admission_budget,admitting)=>result};
     let Ok(Ok(mut playback)) = admitted else {
         return;
     };

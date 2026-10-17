@@ -99,6 +99,8 @@ fn vendor_group_requires_paired_valid_identity_and_cannot_mix_with_native_source
 
 #[path = "vendor_daemon_failover/fixture.rs"]
 mod fixture;
+#[path = "vendor_daemon_failover/startup.rs"]
+mod startup;
 use axum::http::StatusCode;
 use std::{sync::atomic::Ordering, time::Duration};
 
@@ -168,6 +170,148 @@ async fn private_media_loss_recovers_without_viewer_requests_while_management_st
         "independent decoder rejected recovered HLS"
     );
     f.stop().await;
+}
+
+#[tokio::test]
+async fn acknowledged_m4f_segment_loss_recovers_in_background_without_latching_rejection() {
+    missing_m4f_recovery(false, false).await;
+}
+
+#[tokio::test]
+async fn acknowledged_m4f_no_dvr_segment_loss_recovers_in_background() {
+    missing_m4f_recovery(true, false).await;
+}
+
+#[tokio::test]
+async fn acknowledged_m4f_no_dvr_cold_start_recovers_without_another_viewer_request() {
+    missing_m4f_recovery(true, true).await;
+}
+
+async fn missing_m4f_recovery(no_dvr: bool, cold: bool) {
+    let f = fixture::Fixture::m4f().await;
+    f.origins[0].no_dvr_segment.store(no_dvr, Ordering::SeqCst);
+    let old_pid = if cold {
+        f.origins[0].missing_segment.store(true, Ordering::SeqCst);
+        assert_eq!(
+            f.get("/owned/index.m3u8").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        0
+    } else {
+        let _ = f.playlist().await;
+        let pid = f.app.media.stats("owned").await["pid"].as_u64().unwrap();
+        assert!(pid > 0);
+        pid
+    };
+    if !cold {
+        assert_eq!(f.origins[1].private_calls.load(Ordering::SeqCst), 0);
+    }
+    let before = f.origins[0].segment_calls.load(Ordering::SeqCst);
+    f.origins[0].missing_segment.store(true, Ordering::SeqCst);
+    let recovered = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let stats = f.app.media.stats("owned").await;
+            if f.origins[1].private_calls.load(Ordering::SeqCst) > 0
+                && stats["pid"]
+                    .as_u64()
+                    .is_some_and(|pid| pid > 0 && pid != old_pid)
+                && stats["bytes_in"].as_u64().unwrap_or(0) > 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    let missing_requests = f.origins[0].segment_calls.load(Ordering::SeqCst);
+    let backup_segments = f.origins[1].segment_calls.load(Ordering::SeqCst);
+    let old_gone = !std::path::Path::new(&format!("/proc/{old_pid}")).exists();
+    let decode = if recovered.is_ok() {
+        use http_body_util::BodyExt;
+        let playlist = f.playlist().await;
+        let segment = playlist
+            .lines()
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .unwrap();
+        let response = f.get(&format!("/owned/{segment}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovered-m4f.ts");
+        tokio::fs::write(&path, bytes).await.unwrap();
+        Some(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::process::Command::new("/usr/bin/ffmpeg")
+                    .kill_on_drop(true)
+                    .args([
+                        "-nostdin",
+                        "-v",
+                        "error",
+                        "-xerror",
+                        "-err_detect",
+                        "explode",
+                        "-i",
+                    ])
+                    .arg(path)
+                    .args(["-map", "0:a:0", "-f", "null", "-"])
+                    .stdin(std::process::Stdio::null())
+                    .output(),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    f.stop().await;
+    assert!(
+        recovered.is_ok(),
+        "announced missing segment permanently blocked background recovery (no_dvr={no_dvr})"
+    );
+    assert!(
+        (cold || missing_requests > before)
+            && missing_requests > 0
+            && backup_segments > 0
+            && old_gone
+    );
+    let decoded = decode.unwrap().unwrap().unwrap();
+    assert!(
+        decoded.status.success() && decoded.stderr.is_empty(),
+        "recovered HLS audio did not strictly decode"
+    );
+}
+
+#[tokio::test]
+async fn unacknowledged_m4f_segment_404_still_blocks_backup() {
+    unacknowledged_m4f_loss(false).await;
+}
+
+#[tokio::test]
+async fn unacknowledged_m4f_no_dvr_segment_still_blocks_backup() {
+    unacknowledged_m4f_loss(true).await;
+}
+
+async fn unacknowledged_m4f_loss(no_dvr: bool) {
+    let f = fixture::Fixture::m4f().await;
+    let _ = f.playlist().await;
+    f.origins[0].segment_ack.store(false, Ordering::SeqCst);
+    f.origins[0].no_dvr_segment.store(no_dvr, Ordering::SeqCst);
+    let before = f.origins[0].segment_calls.load(Ordering::SeqCst);
+    f.origins[0].missing_segment.store(true, Ordering::SeqCst);
+    let observed = tokio::time::timeout(Duration::from_secs(2), async {
+        while f.origins[0].segment_calls.load(Ordering::SeqCst) <= before {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let backup_calls = f.origins[1].private_calls.load(Ordering::SeqCst);
+    f.stop().await;
+    assert!(observed.is_ok());
+    assert_eq!(
+        backup_calls, 0,
+        "missing acknowledgment must fence backup recovery"
+    );
 }
 
 #[tokio::test]
@@ -598,7 +742,11 @@ async fn authenticated_private_startup_stall_rotates_with_short_and_default_dead
         f.app.config.replace(root).unwrap();
         f.origins[0].stall_metadata.store(true, Ordering::SeqCst);
         // This viewer creates real demand but never gets metadata from A.
-        let request = f.get("/owned/index.m3u8").await;
+        // The manifest honors the configured worker startup deadline. Keep this
+        // test's outer guard beyond that deadline, including the default 15s.
+        let request = f
+            .get_with_timeout("/owned/index.m3u8", Duration::from_secs(seconds + 8))
+            .await;
         assert_eq!(request.status(), StatusCode::SERVICE_UNAVAILABLE);
         tokio::time::timeout(Duration::from_secs(seconds + 8), async {
             while f.origins[1].private_calls.load(Ordering::SeqCst) == 0 {
@@ -613,3 +761,9 @@ async fn authenticated_private_startup_stall_rotates_with_short_and_default_dead
         f.stop().await;
     }
 }
+
+#[path = "vendor_daemon_failover/discovery.rs"]
+mod discovery;
+
+#[path = "vendor_daemon_failover/single_origin.rs"]
+mod single_origin;

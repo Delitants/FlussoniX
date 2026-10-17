@@ -42,6 +42,10 @@ struct Fixture {
     segment: Arc<Mutex<Vec<u8>>>,
     duration: Arc<std::sync::atomic::AtomicU64>,
     control_epoch: Arc<Mutex<CancellationToken>>,
+    first_media_delay: Arc<std::sync::atomic::AtomicU64>,
+    page_delay: Arc<std::sync::atomic::AtomicU64>,
+    page_limits: Arc<Mutex<Vec<usize>>>,
+    page_snapshots: Arc<Mutex<Vec<(tokio::time::Instant, bool)>>>,
     server: tokio::task::JoinHandle<()>,
     owner: tokio::task::JoinHandle<Result<(), String>>,
     cancel: CancellationToken,
@@ -68,8 +72,16 @@ impl Fixture {
         let control_duration = duration.clone();
         let control_epoch = Arc::new(Mutex::new(CancellationToken::new()));
         let epoch = control_epoch.clone();
+        let page_delay = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let delayed = page_delay.clone();
+        let page_limits = Arc::new(Mutex::new(Vec::new()));
+        let limits = page_limits.clone();
+        let page_snapshots = Arc::new(Mutex::new(Vec::new()));
+        let snapshots = page_snapshots.clone();
+        let first_media_delay = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let media_delay = first_media_delay.clone();
         let service=Router::new().fallback(get(move |OriginalUri(uri):OriginalUri,h:HeaderMap|{
-            record.lock().unwrap().push((uri.path().to_owned(),h.clone()));let rows=rows.clone();let held=held.clone();let payload=payload.clone();let control_duration=control_duration.clone();let epoch=epoch.clone();
+            record.lock().unwrap().push((uri.path().to_owned(),h.clone()));let rows=rows.clone();let held=held.clone();let payload=payload.clone();let control_duration=control_duration.clone();let epoch=epoch.clone();let delayed=delayed.clone();let limits=limits.clone();let snapshots=snapshots.clone();let media_delay=media_delay.clone();
             async move {
                 assert!(!h.contains_key("x-flussonix-peer"),"native credentials reached vendor");
                 if uri.path()=="/owned/m4f" {
@@ -90,8 +102,9 @@ impl Fixture {
                 if uri.path().ends_with("/owned/m4s") {
                     assert!(h.contains_key("cluster-auth-key"));assert!(!h.contains_key("authorization"));
                     let track=Track{id:1,codec:"mp3".into(),config:vec![]};
-                    let body=futures_util::stream::unfold((0u64,track),|(i,track)|async move {
-                        let bytes=if i==0 {wire::encode_info(std::slice::from_ref(&track)).unwrap()} else {
+                    let delay=media_delay.load(std::sync::atomic::Ordering::SeqCst);
+                    let body=futures_util::stream::unfold((0u64,track),move |(i,track)|async move {
+                        let bytes=if i==0 {tokio::time::sleep(Duration::from_millis(delay)).await;wire::encode_info(std::slice::from_ref(&track)).unwrap()} else {
                             tokio::time::sleep(Duration::from_millis(3)).await;
                             wire::encode_frame(&track,&Frame{track_id:1,dts:90000+(i-1)*2351,pts_offset:0,key:true,body:include_bytes!("fixtures/codecs/mp3.bin").to_vec()}).unwrap()
                         };
@@ -104,7 +117,26 @@ impl Fixture {
                     let pause=held.lock().unwrap().take();
                     if let Some((started,release))=pause {let _=started.send(());let _=release.await;}
                 }
-                let value=if uri.path().ends_with("/config") {json!({"stats":{"id":"owned-vendor-origin"}})} else {assert_eq!(uri.path(),"/streamer/api/v3/streams");json!({"server_id":"owned-vendor-origin","streams":rows.lock().unwrap().clone()})};
+                let value=if uri.path().ends_with("/config") {json!({"stats":{"id":"owned-vendor-origin"}})} else {
+                    assert_eq!(uri.path(),"/streamer/api/v3/streams");
+                    let delay=delayed.load(std::sync::atomic::Ordering::SeqCst);
+                    if delay==0 {json!({"server_id":"owned-vendor-origin","streams":rows.lock().unwrap().clone()})}
+                    else {
+                        let query:std::collections::HashMap<_,_>=url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()).into_owned().collect();
+                        assert_eq!(query.get("select").unwrap(),"name,named_by,groups,static,disabled");
+                        let limit:usize=query.get("limit").unwrap().parse().unwrap();
+                        assert!((1..=1000).contains(&limit));
+                        limits.lock().unwrap().push(limit);
+                        let offset=query.get("cursor").map(|c|c.strip_prefix("owned page:").unwrap().parse::<usize>().unwrap()).unwrap_or(0);
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        let catalog=rows.lock().unwrap();let catalog=catalog.as_array().unwrap();
+                        snapshots.lock().unwrap().push((tokio::time::Instant::now(),catalog.iter().any(|row|row["name"]=="owned")));
+                        let end=(offset+limit).min(catalog.len());
+                        let mut value=json!({"server_id":"owned-vendor-origin","streams":catalog[offset..end]});
+                        if end<catalog.len() {value["next"]=json!(format!("owned page:{end}"));}
+                        value
+                    }
+                };
                 Response::new(Body::from(value.to_string()))
             }
         }));
@@ -148,6 +180,10 @@ impl Fixture {
             segment,
             duration,
             control_epoch,
+            first_media_delay,
+            page_delay,
+            page_limits,
+            page_snapshots,
             server,
             owner,
             cancel,
@@ -1314,7 +1350,8 @@ async fn processing_template_conversion_restarts_with_fresh_state_in_the_same_co
     f.stop().await;
     assert!(ended);
     assert!(same_revision);
-    assert_eq!(management, new_management);
+    // Recovery refreshes the origin profile and catalog before reopening it.
+    assert_eq!(new_management, management + 3);
     assert_ne!(old_pid, new_pid);
     assert_ne!(old_file, new_file);
     assert!(String::from_utf8_lossy(&old_text).contains("AMERICA HELLO"));
@@ -1623,7 +1660,22 @@ async fn m4f_vendor_rtsp_decodes_hevc_mp3_and_mp2_with_independent_ffmpeg() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let status = match tokio::time::timeout(Duration::from_secs(20), child.wait()).await {
+    let mut live_pids = std::collections::BTreeSet::new();
+    let playback = async {
+        loop {
+            let pid = f.app.media.stats("owned").await["pid"]
+                .as_u64()
+                .unwrap_or(0);
+            if pid > 0 && std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                live_pids.insert(pid);
+            }
+            tokio::select! {
+                status = child.wait() => break status,
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+    };
+    let status = match tokio::time::timeout(Duration::from_secs(20), playback).await {
         Ok(status) => Some(status.unwrap()),
         Err(_) => {
             child.kill().await.unwrap();
@@ -1638,9 +1690,6 @@ async fn m4f_vendor_rtsp_decodes_hevc_mp3_and_mp2_with_independent_ffmpeg() {
         .iter()
         .filter(|(p, _)| p == "/owned/m4f")
         .count();
-    let pid = f.app.media.stats("owned").await["pid"]
-        .as_u64()
-        .unwrap_or(0);
     cancel.cancel();
     listener.await.unwrap().unwrap();
     f.stop().await;
@@ -1650,9 +1699,493 @@ async fn m4f_vendor_rtsp_decodes_hevc_mp3_and_mp2_with_independent_ffmpeg() {
         std::fs::read_to_string(path).unwrap()
     );
     assert_eq!(pulls, 1);
-    assert!(pid > 0);
-    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    assert!(
+        !live_pids.is_empty(),
+        "real playback must witness a live packager"
+    );
+    for pid in live_pids {
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
 }
 
 #[path = "vendor_daemon_playback/srt.rs"]
 mod srt;
+
+#[tokio::test]
+async fn large_catalog_concurrent_playback_renews_one_pull_and_closes_on_removal() {
+    use futures_util::FutureExt;
+    use http_body_util::BodyExt;
+    use sha2::{Digest, Sha256};
+    use std::sync::atomic::Ordering;
+
+    let hash = format!("{:x}", Sha256::digest(b"catalog-viewer"));
+    let f = Fixture::new(json!({"on_play":"true","flussonix_token_sha256":hash})).await;
+    let mut rows: Vec<Value> = (0..950)
+        .map(|i| json!({"name":format!("filler-{i:04}"),"groups":[],"named_by":"config","static":false}))
+        .collect();
+    rows.push(json!({"name":"owned","groups":[],"named_by":"config","static":false}));
+    *f.remote.lock().unwrap() = json!(rows);
+    // Twelve old80-row pages exceed the actual daemon's five-second budget.
+    // The selected target is deliberately the last row, never a partial result.
+    f.page_delay.store(600, Ordering::SeqCst);
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let responses = futures_util::future::join_all(
+            (0..8).map(|_| f.get("/owned/m4s?token=catalog-viewer")),
+        ).await;
+        let mut bodies = Vec::new();
+        for response in responses {
+            assert_eq!(response.status(), StatusCode::OK, "complete catalog must admit the final row before the daemon deadline");
+            let mut body = response.into_body();
+            let tracks = native_info(&mut body).await;
+            assert!(tracks.iter().any(|track| track.codec == "mp3"));
+            bodies.push(body);
+        }
+        let worker_pid = f.app.media.stats("owned").await["pid"].as_u64().unwrap();
+        assert_eq!(f.media_calls(), 1);
+        assert_eq!(*f.page_limits.lock().unwrap(), [1000]);
+        assert_eq!(f.get("/owned/m4s?token=wrong").await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(*f.page_limits.lock().unwrap(), [1000]);
+
+        let until = tokio::time::Instant::now() + Duration::from_secs(32);
+        let drained = futures_util::future::join_all(bodies.into_iter().map(|mut body| async move {
+            let mut chunks = 0;
+            let mut last_data = tokio::time::Instant::now();
+            loop {
+                if tokio::time::Instant::now() >= until {
+                    break;
+                }
+                let read_deadline = until.min(last_data + Duration::from_secs(2));
+                match tokio::time::timeout_at(read_deadline, body.frame()).await {
+                    Err(_) if tokio::time::Instant::now() >= until => break,
+                    Err(_) => panic!("viewer stopped receiving data for two seconds"),
+                    Ok(Some(Ok(frame))) => {
+                        if let Ok(data) = frame.into_data() {
+                            assert!(!data.is_empty());
+                            let received_at = tokio::time::Instant::now();
+                            assert!(received_at.duration_since(last_data) < Duration::from_secs(2));
+                            chunks += 1;
+                            last_data = received_at;
+                        }
+                    }
+                    other => panic!("viewer closed before the renewed source deadline: {other:?}"),
+                }
+            }
+            assert!(chunks > 100, "viewer did not receive sustained media");
+            assert!(last_data.elapsed() < Duration::from_secs(2));
+            (body, chunks)
+        })).await;
+        assert_eq!(f.app.media.stats("owned").await["pid"], worker_pid);
+        assert_eq!(f.media_calls(), 1);
+        assert_eq!(*f.page_limits.lock().unwrap(), [1000, 1000]);
+        let config_requests = f.calls.lock().unwrap().iter().filter(|(path, _)| path.ends_with("/config")).count();
+        assert_eq!(config_requests, 4, "one bracketed discovery plus one shared renewal");
+
+        let manifest = playlist(&f, "/owned/index.m3u8?token=catalog-viewer").await;
+        let segment = manifest.lines().find(|line| !line.is_empty() && !line.starts_with('#')).unwrap();
+        let response = f.get(&format!("/owned/{segment}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let media = bytes(response).await;
+        assert!(!media.is_empty());
+        assert_eq!(f.get(&format!("/owned/{}", segment.replace("token=catalog-viewer", "token=wrong"))).await.status(), StatusCode::FORBIDDEN);
+        let path = f._dir.path().join("large-catalog.ts");
+        std::fs::write(&path, media).unwrap();
+        let config_before_removal = f.calls.lock().unwrap().iter().filter(|(path, _)| path.ends_with("/config")).count();
+        let pages_before_removal = f.page_limits.lock().unwrap().len();
+        // Both one-page refreshes completed their config brackets; playback
+        // beyond the original lease establishes that the second was committed.
+        assert_eq!(config_before_removal, 4);
+        assert_eq!(pages_before_removal, 2);
+        let last_good_snapshot = f.page_snapshots.lock().unwrap().last().copied().unwrap();
+        assert!(last_good_snapshot.1);
+        let removed_at = tokio::time::Instant::now();
+        f.remote.lock().unwrap().as_array_mut().unwrap().retain(|row| row["name"] != "owned");
+        let counts: Vec<_> = drained.iter().map(|(_, count)| *count).collect();
+        let decode = async {
+        let decoded_path = f._dir.path().join("large-catalog.pcm");
+        let mut decoder = tokio::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-i"])
+            .arg(&path)
+            .args(["-map", "0:a:0", "-frames:a", "10", "-f", "s16le"])
+            .arg(&decoded_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true).spawn().unwrap();
+        let status = match tokio::time::timeout(Duration::from_secs(10), decoder.wait()).await {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                decoder.kill().await.unwrap();
+                let _ = decoder.wait().await;
+                panic!("owned strict decoder timed out");
+            }
+        };
+        assert!(status.success(), "independent strict HLS audio decode failed");
+        let decoded_audio_bytes = std::fs::metadata(&decoded_path).unwrap().len();
+        assert!(decoded_audio_bytes > 0 && decoded_audio_bytes <= 1024 * 1024);
+        let decoder_pid_absent = decoder.id().is_none();
+        assert!(decoder_pid_absent, "strict decoder was not reaped");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&decoded_path).unwrap();
+        (decoded_audio_bytes, decoder_pid_absent)
+        };
+        let close = async {
+        tokio::time::timeout(Duration::from_secs(22), futures_util::future::join_all(drained.into_iter().map(|(mut body, _)| async move {
+                loop {
+                    match body.frame().await {
+                        Some(Ok(_)) => {}
+                        None => break (tokio::time::Instant::now(), false),
+                        Some(Err(_)) => break (tokio::time::Instant::now(), true),
+                    }
+                }
+            }))).await.expect("catalog removal must close every admitted viewer at shared renewal")
+        };
+        let ((decoded_audio_bytes, decoder_pid_absent), terminals) = tokio::join!(decode, close);
+        let closed_at = terminals.iter().map(|(time, _)| *time).max().unwrap();
+        // Inspect the completed removal refresh before a playback GET could discover it.
+        let config_after_removal = f.calls.lock().unwrap().iter().filter(|(path, _)| path.ends_with("/config")).count();
+        assert_eq!(config_after_removal, config_before_removal + 2);
+        assert_eq!(f.page_limits.lock().unwrap().len(), pages_before_removal + 1);
+        let absent_snapshot = f.page_snapshots.lock().unwrap().last().copied().unwrap();
+        assert!(!absent_snapshot.1 && absent_snapshot.0 >= removed_at);
+        assert!(terminals.iter().all(|(time, _)| *time >= absent_snapshot.0), "a response ended before catalog removal was observed");
+        let removal_close_delay = closed_at.checked_duration_since(absent_snapshot.0).unwrap();
+        assert!(removal_close_delay < Duration::from_secs(2));
+        // A 30-second lease starts before the at-most-five-second lookup.
+        // It cannot expire earlier than 25 seconds after that good snapshot.
+        let earliest_expiry = last_good_snapshot.0 + Duration::from_secs(25);
+        assert!(closed_at < earliest_expiry, "lease expiry must not satisfy the removal check");
+        assert_eq!(f.get("/owned/index.m3u8?token=catalog-viewer").await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(f.media_calls(), 1, "removal must not retry private media");
+        json!({"responses":8,"initial_rows":951,"private_pulls":1,"worker_pid":worker_pid,"sustained_chunks_per_response":counts,"config_requests_before_removal":config_requests,"catalog_removal_closed_all_responses":true,"strict_hls_audio_decode":true,"decoded_audio_bytes":decoded_audio_bytes,"decoder_reaped":decoder_pid_absent,"removal_refresh_config_delta":config_after_removal-config_before_removal,"removal_refresh_page_delta":1,"removal_close_delay_ms":removal_close_delay.as_millis(),"closure_before_expiry_bound_ms":earliest_expiry.duration_since(closed_at).as_millis(),"maximum_response_idle_ms":2000,"terminal_body_errors":terminals.iter().filter(|(_,error)|*error).count()})
+    }).catch_unwind().await;
+    // Assertions inside the exercise must not abandon the owner or media child.
+    f.stop().await;
+    match outcome {
+        Ok(report) => {
+            let pid = report["worker_pid"].as_u64().unwrap();
+            assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+            println!("large_catalog_qualification={report}");
+        }
+        Err(error) => std::panic::resume_unwind(error),
+    }
+}
+
+#[tokio::test]
+async fn omitted_groups_daemon_playback_keeps_viewer_token_guard_and_one_shared_pull() {
+    let hash = ring::digest::digest(&ring::digest::SHA256, b"owned-group-viewer")
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let f = Fixture::new(json!({"flussonix_token_sha256":hash})).await;
+    *f.remote.lock().unwrap() = json!([{"name":"owned","named_by":"config","static":false}]);
+    assert_eq!(
+        f.get("/owned/m4s?token=wrong").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(f.media_calls(), 0);
+    let first = f.get("/owned/m4s?token=owned-group-viewer").await;
+    let second = f.get("/owned/m4s?token=owned-group-viewer").await;
+    let statuses = (first.status(), second.status());
+    if statuses != (StatusCode::OK, StatusCode::OK) {
+        drop(first);
+        drop(second);
+        f.stop().await;
+        assert_eq!(statuses, (StatusCode::OK, StatusCode::OK));
+        return;
+    }
+    let mut first = first.into_body();
+    let mut second = second.into_body();
+    assert_eq!(
+        native_info(&mut first).await,
+        native_info(&mut second).await
+    );
+    assert_eq!(f.media_calls(), 1);
+    drop(first);
+    drop(second);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn omitted_groups_new_group_override_retires_existing_session_without_repull() {
+    use http_body_util::BodyExt;
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    *f.remote.lock().unwrap() = json!([{"name":"owned","named_by":"config","static":false}]);
+    let live = f.get("/owned/m4s?token=owned").await;
+    let status = live.status();
+    if status != StatusCode::OK {
+        drop(live);
+        f.stop().await;
+        assert_eq!(status, StatusCode::OK);
+        return;
+    }
+    let mut body = live.into_body();
+    assert!(!native_info(&mut body).await.is_empty());
+    assert_eq!(f.media_calls(), 1);
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"group_config":{"protected":{"on_play":"https://other.invalid/check"}}}),
+        )
+        .unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+        while body.frame().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    let denied = f.get("/owned/m4s?token=owned").await.status();
+    let pulls = f.media_calls();
+    drop(body);
+    f.stop().await;
+    assert!(
+        closed,
+        "nonuniform group edit must fence the existing session"
+    );
+    assert_eq!(denied, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(pulls, 1);
+}
+
+// A valid input can become ready after the old HTTP wait but before its worker
+// startup budget. The first request must receive the resulting HLS, without a
+// replacement pull or worker. This would fail with the fixed eight-second wait.
+#[tokio::test]
+async fn delayed_vendor_hls_startup_uses_remaining_configured_budget() {
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    f.app
+        .config
+        .put(
+            "templates",
+            "slow-start",
+            json!({"flussonix_input_timeout":20}),
+        )
+        .unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"slow-start"}),
+        )
+        .unwrap();
+    f.first_media_delay
+        .store(9000, std::sync::atomic::Ordering::SeqCst);
+    let began = std::time::Instant::now();
+    let response = f.get("/owned/fmp4/index.m3u8?token=slow").await;
+    let status = response.status();
+    let text = String::from_utf8(bytes(response).await.to_vec()).unwrap();
+    let elapsed = began.elapsed();
+    let stats = f.app.media.stats("owned").await;
+    let pid = stats["pid"].as_u64().unwrap();
+    let pulls = f.media_calls();
+    let ts_status = if status == StatusCode::OK {
+        f.get("/owned/index.m3u8?token=slow").await.status()
+    } else {
+        status
+    };
+    f.stop().await;
+    assert_eq!(status, StatusCode::OK, "first delayed manifest: {text}");
+    assert_eq!(ts_status, StatusCode::OK);
+    assert!(text.contains("#EXTINF:") && text.contains("#EXT-X-MAP:"));
+    assert!(elapsed >= Duration::from_secs(9) && elapsed < Duration::from_secs(12));
+    assert_eq!(pulls, 1);
+    assert_eq!(stats["restart_count"], 0);
+    assert!(stats["last_error"].is_null());
+    assert!(pid > 0 && !std::path::Path::new(&format!("/proc/{pid}")).exists());
+}
+
+#[tokio::test]
+async fn delayed_vendor_hls_startup_still_stops_on_short_worker_timeout() {
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    f.app
+        .config
+        .put(
+            "templates",
+            "short-start",
+            json!({"flussonix_input_timeout":1}),
+        )
+        .unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"short-start"}),
+        )
+        .unwrap();
+    f.first_media_delay
+        .store(9000, std::sync::atomic::Ordering::SeqCst);
+    let began = std::time::Instant::now();
+    let status = f.get("/owned/index.m3u8?token=short").await.status();
+    let elapsed = began.elapsed();
+    let stats = f.app.media.stats("owned").await;
+    let pulls = f.media_calls();
+    f.stop().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(elapsed < Duration::from_secs(3));
+    assert_eq!(stats["pid"], 0);
+    assert_eq!(stats["last_error"], "startup_timeout");
+    assert_eq!(pulls, 1);
+}
+
+#[tokio::test]
+async fn delayed_vendor_hls_startup_is_fenced_by_source_edit() {
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    f.app
+        .config
+        .put(
+            "templates",
+            "slow-start",
+            json!({"flussonix_input_timeout":20}),
+        )
+        .unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"slow-start"}),
+        )
+        .unwrap();
+    f.first_media_delay
+        .store(9000, std::sync::atomic::Ordering::SeqCst);
+    let request = f.get("/owned/index.m3u8?token=edit");
+    let edit = async {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while f.media_calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        f.app
+            .config
+            .put("sources", &f.source, json!({"except":["owned"]}))
+            .unwrap();
+        std::time::Instant::now()
+    };
+    let (response, edited) = tokio::join!(request, edit);
+    let status = response.status();
+    let delay = edited.elapsed();
+    let pulls = f.media_calls();
+    let pid = f.app.media.stats("owned").await["pid"].clone();
+    f.stop().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(delay < Duration::from_secs(2));
+    assert_eq!(pid, 0);
+    assert_eq!(pulls, 1);
+}
+
+// A complete, valid catalog that takes longer than the old3s allowance must
+// still reach viewer authorization without admitting partial inventory/media.
+#[tokio::test]
+async fn slow_vendor_catalog_completes_before_viewer_admission() {
+    use sha2::{Digest, Sha256};
+    let f=Fixture::new(json!({"on_play":"true","flussonix_token_sha256":format!("{:x}",Sha256::digest(b"catalog-slow"))})).await;
+    f.page_delay
+        .store(3500, std::sync::atomic::Ordering::SeqCst);
+    let began = std::time::Instant::now();
+    let wrong = f.get("/owned/index.m3u8?token=wrong").await.status();
+    let elapsed = began.elapsed();
+    let before = f.media_calls();
+    let after_configs = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(p, _)| p.ends_with("/config"))
+        .count();
+    let allowed = if wrong == StatusCode::FORBIDDEN {
+        f.get("/owned/m4s?token=catalog-slow").await.status()
+    } else {
+        wrong
+    };
+    let configs_after_allowed = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(p, _)| p.ends_with("/config"))
+        .count();
+    let pages_after_allowed = f.page_limits.lock().unwrap().len();
+    let pulls = f.media_calls();
+    let pid = f.app.media.stats("owned").await["pid"]
+        .as_u64()
+        .unwrap_or(0);
+    f.stop().await;
+    assert_eq!(
+        wrong,
+        StatusCode::FORBIDDEN,
+        "valid complete catalog must reach independent viewer denial"
+    );
+    assert!(elapsed >= Duration::from_millis(3500) && elapsed < Duration::from_secs(6));
+    assert_eq!(before, 0, "denied viewer must not start private media");
+    assert_eq!(after_configs, 2, "both identity probes must complete");
+    assert_eq!(allowed, StatusCode::OK);
+    assert_eq!(
+        configs_after_allowed, after_configs,
+        "cached admission must not rediscover configuration"
+    );
+    assert_eq!(
+        pages_after_allowed, 1,
+        "cached admission must not refetch the catalog"
+    );
+    assert_eq!(pulls, 1);
+    assert!(pid == 0 || !std::path::Path::new(&format!("/proc/{pid}")).exists());
+}
+
+#[tokio::test]
+async fn slow_vendor_catalog_still_has_a_five_second_hard_deadline() {
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    f.page_delay
+        .store(7000, std::sync::atomic::Ordering::SeqCst);
+    let began = std::time::Instant::now();
+    let status = f.get("/owned/index.m3u8?token=late").await.status();
+    let elapsed = began.elapsed();
+    let pulls = f.media_calls();
+    let sessions = f.app.playback_auth.snapshots().len();
+    f.stop().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(elapsed >= Duration::from_millis(4500) && elapsed < Duration::from_millis(6500));
+    assert_eq!(pulls, 0);
+    assert_eq!(sessions, 0);
+}
+
+#[tokio::test]
+async fn slow_vendor_catalog_is_cancelled_by_runtime_shutdown() {
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    f.page_delay
+        .store(3500, std::sync::atomic::Ordering::SeqCst);
+    let app = f.app.clone();
+    let request = tokio::spawn(async move {
+        router(app)
+            .oneshot(
+                Request::builder()
+                    .uri("/owned/index.m3u8?token=shutdown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.page_limits.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let began = std::time::Instant::now();
+    f.cancel.cancel();
+    let status = tokio::time::timeout(Duration::from_secs(1), request)
+        .await
+        .unwrap()
+        .unwrap();
+    let elapsed = began.elapsed();
+    let pulls = f.media_calls();
+    f.stop().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(elapsed < Duration::from_secs(1));
+    assert_eq!(pulls, 0);
+}

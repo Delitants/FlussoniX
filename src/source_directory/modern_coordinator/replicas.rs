@@ -56,7 +56,9 @@ pub struct ReplicaSelector {
     revision: u64,
     group: String,
     members: Vec<ReplicaMember>,
-    policy: Policy,
+    // Multi-origin equivalence requires a uniform policy. Single-origin routes
+    // use each catalog candidate policy; recovery still requires the original grant.
+    policy: Option<Policy>,
     state: Mutex<State>,
 }
 #[derive(Default)]
@@ -117,6 +119,11 @@ pub enum ReplicaAdmissionOutcome {
 }
 
 impl ReplicaSelector {
+    fn accepts_policy(&self, policy: &Policy) -> bool {
+        self.policy
+            .as_ref()
+            .is_none_or(|expected| expected == policy)
+    }
     // Config -> coordinator -> source (where present) -> selector. Never await.
     fn at_plan<T>(
         &self,
@@ -203,7 +210,7 @@ impl ReplicaSelector {
     pub fn current(&self, choice: &ReplicaChoice) -> Result<(), ReplicaFailure> {
         self.owner
             .publish(&choice.candidate, |view, _| {
-                if view.policy != &self.policy {
+                if !self.accepts_policy(view.policy) {
                     return Err(ReplicaFailure::PolicyMismatch);
                 }
                 self.check_stamp(&choice.stamp)

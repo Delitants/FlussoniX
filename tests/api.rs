@@ -17,6 +17,63 @@ fn options() -> Options {
     }
 }
 #[tokio::test]
+async fn node_status_reports_the_running_server_version_to_management_roles() {
+    let d = tempfile::tempdir().unwrap();
+    let app = App::new(
+        d.path().join("config.json"),
+        d.path().join("media"),
+        options(),
+    )
+    .unwrap();
+    let r = router(app);
+    let health = r
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    let health: Value = serde_json::from_slice(
+        &axum::body::to_bytes(health.into_body(), 100_000)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!health["version"].as_str().unwrap().is_empty());
+    for endpoint in ["/flussonix/api/v1/node", "/streamer/api/v3/config/stats"] {
+        for credentials in [None, Some("admin:secret"), Some("viewer:view-secret")] {
+            let mut req = Request::builder().uri(endpoint);
+            if let Some(credentials) = credentials {
+                req = req.header(
+                    "Authorization",
+                    format!("Basic {}", STANDARD.encode(credentials)),
+                );
+            }
+            let response = r
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            if credentials.is_none() {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            } else {
+                assert_eq!(response.status(), StatusCode::OK);
+                let status: Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), 100_000)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(status["version"], health["version"], "{endpoint}");
+            }
+        }
+    }
+}
+#[tokio::test]
 async fn api_auth_nested_names_persistence_and_validate_only() {
     let d = tempfile::tempdir().unwrap();
     let app = App::new(

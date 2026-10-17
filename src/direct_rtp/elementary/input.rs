@@ -76,10 +76,17 @@ impl Input {
         let mut lanes = vec![];
         let mut reservations = vec![];
         let mut reservation_inodes = vec![];
+        // Reserve every configured public pair before choosing ephemeral decoder
+        // or forwarding ports, which could otherwise occupy a later track's pair.
+        let mut public_pairs = Vec::with_capacity(session.tracks.len());
         for track in &session.tracks {
             let mut public = settings.clone();
             public.address.set_port(track.port);
-            let pair = Pair::receive(&public)?;
+            public_pairs.push(Pair::receive(&public)?);
+        }
+        for (track, pair) in session.tracks.iter().zip(public_pairs) {
+            let mut public = settings.clone();
+            public.address.set_port(track.port);
             let reserved = reserve()?;
             use std::os::fd::AsRawFd;
             for socket in [&reserved.0, &reserved.1] {

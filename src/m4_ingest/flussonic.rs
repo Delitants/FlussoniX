@@ -4,6 +4,7 @@
 //! source authority; ordinary native discovery stays separate. No official
 //! Flussonic components are required. Live reference qualification remains a
 //! separate gate.
+pub(crate) mod diagnostic;
 pub(super) mod failure;
 use super::{PullOptions, RequestAuth, Requests};
 use crate::{m4s::Track, wire::Hub};
@@ -70,15 +71,19 @@ impl MediaInput {
         authority: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<(), InputFailure> {
         let slot = std::sync::atomic::AtomicU8::new(InputFailure::Invalid as u8);
+        let diagnostic = diagnostic::Diagnostics::default();
         options.failure = Some(&slot);
+        options.diagnostic = Some(&diagnostic);
         self.pull_guarded(output, hub, metadata, options, authority)
             .await
             .map_err(|_| {
-                if !authority() {
+                let kind = if !authority() {
                     InputFailure::Revoked
                 } else {
                     failure::read(&slot)
-                }
+                };
+                diagnostic.report(self.transport(), kind);
+                kind
             })
     }
     /// The HTTP(S) root may include a trusted proxy prefix. `name` is the literal
@@ -279,6 +284,87 @@ mod tests {
             assert!(headers["cluster-auth-key"].is_sensitive());
             assert!(headers["cluster-auth-time"].is_sensitive());
             assert_eq!(headers.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn revoked_authority_precedes_announced_segment_status_classification() {
+        use axum::{
+            Router, body::Body, extract::OriginalUri, http::StatusCode, response::Response,
+            routing::get,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+        #[derive(Clone)]
+        struct Failures(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Failures {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() == "flussonix::private_input" {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        for status in [StatusCode::NOT_FOUND, StatusCode::FORBIDDEN] {
+            let failures = Arc::new(AtomicUsize::new(0));
+            let subscriber = tracing_subscriber::registry().with(Failures(failures.clone()));
+            let current = Arc::new(AtomicBool::new(true));
+            let live = current.clone();
+            let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let root = format!("http://{}", tcp.local_addr().unwrap());
+            let router = Router::new().fallback(get(move |OriginalUri(uri): OriginalUri| {
+                let live = live.clone();
+                async move {
+                    let mut response = if uri.path() == "/owned/m4f" {
+                        Response::new(Body::from("1 2026/10/17/00/00/00-2000\n"))
+                    } else {
+                        assert_eq!(uri.path(), "/owned/2026/10/17/00/00/00.m4f");
+                        live.store(false, Ordering::SeqCst);
+                        let mut response = Response::new(Body::empty());
+                        *response.status_mut() = status;
+                        response
+                    };
+                    response
+                        .headers_mut()
+                        .insert("cluster-auth", "yes".parse().unwrap());
+                    response
+                }
+            }));
+            let server = tokio::spawn(async move { axum::serve(tcp, router).await.unwrap() });
+            let input = MediaInput::new(&root, "owned", Transport::M4f, "owned-key", None).unwrap();
+            let (tx, rx) = oneshot::channel();
+            let mut output = Vec::new();
+            let hub = Hub::new();
+            let authority = || current.load(Ordering::SeqCst);
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                input
+                    .pull_guarded_classified(
+                        &mut output,
+                        Some(&hub),
+                        tx,
+                        PullOptions::default(),
+                        &authority,
+                    )
+                    .with_subscriber(subscriber),
+            )
+            .await;
+            server.abort();
+            let _ = server.await;
+            assert_eq!(result.unwrap().unwrap_err(), InputFailure::Revoked);
+            assert!(output.is_empty() && rx.await.is_err() && !hub.has_info());
+            assert_eq!(
+                failures.load(Ordering::SeqCst),
+                0,
+                "authority revocation is not a private input failure"
+            );
         }
     }
 }
