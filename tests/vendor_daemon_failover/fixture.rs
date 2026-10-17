@@ -44,6 +44,8 @@ pub(super) struct Origin {
     pub segment_ack: Arc<AtomicBool>,
     pub segment_calls: Arc<AtomicUsize>,
     pub management_calls: Arc<AtomicUsize>,
+    pub catalog_calls: Arc<AtomicUsize>,
+    pub catalog_delay: Arc<AtomicUsize>,
     pub secret: String,
     task: tokio::task::JoinHandle<()>,
 }
@@ -74,6 +76,9 @@ impl Origin {
         let epoch = Arc::new(Mutex::new(CancellationToken::new()));
         let private_calls = Arc::new(AtomicUsize::new(0));
         let management_calls = Arc::new(AtomicUsize::new(0));
+        let catalog_calls = Arc::new(AtomicUsize::new(0));
+        let catalog_delay = Arc::new(AtomicUsize::new(0));
+        let (catalog_count, catalog_wait) = (catalog_calls.clone(), catalog_delay.clone());
         let missing_segment = Arc::new(AtomicBool::new(false));
         let segment_ack = Arc::new(AtomicBool::new(true));
         let segment_calls = Arc::new(AtomicUsize::new(0));
@@ -97,6 +102,7 @@ impl Origin {
         );
         let service=Router::new().fallback(get(move|OriginalUri(uri):OriginalUri,headers:HeaderMap|{
    let held=held.clone();let stalled=stalled.clone();
+   let (catalog_count,catalog_wait)=(catalog_count.clone(),catalog_wait.clone());
    let (missing,ack,segments)=(missing.clone(),ack.clone(),segments.clone());
    let (a,m,r,e,p,c,k)=(a.clone(),m.clone(),r.clone(),e.clone(),p.clone(),c.clone(),k.clone());async move{
     assert!(!headers.contains_key("x-flussonix-peer"));
@@ -152,6 +158,11 @@ impl Origin {
     }
     let auth=headers["authorization"].to_str().unwrap().strip_prefix("Cluster ").unwrap();let (time,hash)=auth.split_once(':').unwrap();assert_eq!(hash,digest(&format!("{time}:{k}")));
     let status=*a.lock().unwrap();if status!=StatusCode::OK {let mut out=Response::new(Body::empty());*out.status_mut()=status;return out;}
+    if uri.path()=="/streamer/api/v3/streams" {
+        catalog_count.fetch_add(1,Ordering::SeqCst);
+        let millis=catalog_wait.load(Ordering::SeqCst);
+        if millis>0 {tokio::time::sleep(Duration::from_millis(millis as u64)).await;}
+    }
     let value=if uri.path().ends_with("/config"){json!({"stats":{"id":id}})}else{assert_eq!(uri.path(),"/streamer/api/v3/streams");json!({"server_id":id,"streams":r.lock().unwrap().clone()})};Response::new(Body::from(value.to_string()))
    }
   }));
@@ -169,6 +180,8 @@ impl Origin {
             segment_ack,
             segment_calls,
             management_calls,
+            catalog_calls,
+            catalog_delay,
             secret,
             task,
         }
@@ -202,10 +215,18 @@ impl Fixture {
         Self::configured(role, json!({"only":[]}), None, true).await
     }
     pub async fn configured(role: &str, patch: Value, rows: Option<Value>, grouped: bool) -> Self {
-        Self::configured_transport(role, patch, rows, grouped, false).await
+        Self::configured_transport(role, patch, rows, grouped, false, 0).await
     }
     pub async fn m4f() -> Self {
-        Self::configured_transport("standalone", json!({"only":[]}), None, true, true).await
+        Self::configured_transport("standalone", json!({"only":[]}), None, true, true, 0).await
+    }
+    pub async fn with_catalog_delay(
+        patch: Value,
+        rows: Option<Value>,
+        grouped: bool,
+        millis: usize,
+    ) -> Self {
+        Self::configured_transport("standalone", patch, rows, grouped, false, millis).await
     }
     async fn configured_transport(
         role: &str,
@@ -213,11 +234,15 @@ impl Fixture {
         rows: Option<Value>,
         grouped: bool,
         m4f: bool,
+        catalog_millis: usize,
     ) -> Self {
         let origins = vec![
             Origin::start_transport("owned-origin-a", m4f).await,
             Origin::start_transport("owned-origin-b", m4f).await,
         ];
+        for origin in &origins {
+            origin.catalog_delay.store(catalog_millis, Ordering::SeqCst);
+        }
         let dir = tempfile::tempdir().unwrap();
         let app = App::new(
             dir.path().join("config.json"),
@@ -261,8 +286,11 @@ impl Fixture {
         }
     }
     pub async fn get(&self, path: &str) -> Response {
+        self.get_with_timeout(path, Duration::from_secs(12)).await
+    }
+    pub async fn get_with_timeout(&self, path: &str, timeout: Duration) -> Response {
         tokio::time::timeout(
-            Duration::from_secs(12),
+            timeout,
             router(self.app.clone())
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap()),
         )

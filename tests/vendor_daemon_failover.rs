@@ -698,7 +698,11 @@ async fn authenticated_private_startup_stall_rotates_with_short_and_default_dead
         f.app.config.replace(root).unwrap();
         f.origins[0].stall_metadata.store(true, Ordering::SeqCst);
         // This viewer creates real demand but never gets metadata from A.
-        let request = f.get("/owned/index.m3u8").await;
+        // The manifest honors the configured worker startup deadline. Keep this
+        // test's outer guard beyond that deadline, including the default 15s.
+        let request = f
+            .get_with_timeout("/owned/index.m3u8", Duration::from_secs(seconds + 8))
+            .await;
         assert_eq!(request.status(), StatusCode::SERVICE_UNAVAILABLE);
         tokio::time::timeout(Duration::from_secs(seconds + 8), async {
             while f.origins[1].private_calls.load(Ordering::SeqCst) == 0 {
@@ -713,3 +717,6 @@ async fn authenticated_private_startup_stall_rotates_with_short_and_default_dead
         f.stop().await;
     }
 }
+
+#[path = "vendor_daemon_failover/discovery.rs"]
+mod discovery;

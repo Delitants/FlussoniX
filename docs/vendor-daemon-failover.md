@@ -52,9 +52,15 @@ The existing active-pulls table reports selected source, group, availability and
 switch count. FlussoniX load balancers use group catalog authority for placement
 on FlussoniX CDNs and never start media workers. Vendor CDN destinations remain separate work. CDN/standalone SRT callers reconnect to the shared recovered input.
 
-Discovery is coalesced per source, with four concurrent queries, a four-second
-group lookup budget and a 750 ms wire budget per origin. Recovery owns at most
-eight concurrent jobs, with retries backing off from one to thirty seconds.
+Discovery is coalesced per source, with four concurrent queries and the same
+five-second wire profile as foreground/static lookup. A sixteen-second group
+selection bound covers the selected origin and two waves of alternatives for
+up to eight members in an otherwise uncontended group. Network results still
+publish in declared rotation order; selected denial/removal is checked first.
+Recovery owns at most eight concurrent jobs, each bounded by twenty seconds,
+with retries backing off from one to thirty seconds. Vendor SRT admission has a
+twenty-second bound; native admission and later transport timers are unchanged.
+Contention may exhaust these deadlines; no stale lease or authority is extended.
 There are at most 256 recovery streams and 20,000 retained native session anchors;
 the selector also bounds stream history without evicting denial authority.
 Configuration, source, identity, route and lease changes fence pending work.

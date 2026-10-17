@@ -160,7 +160,7 @@ impl Runtime {
             self.selected_recovery(name, &group);
             Ok(Candidate::Replica(group.clone(), choice))
         };
-        tokio::select! {biased;_=self.closed.cancelled()=>Err(Failure::Closed),result=tokio::time::timeout(Duration::from_secs(4),work)=>result.unwrap_or(Err(Failure::Unavailable))}
+        tokio::select! {biased;_=self.closed.cancelled()=>Err(Failure::Closed),result=tokio::time::timeout(GROUP_SELECTION_BUDGET,work)=>result.unwrap_or(Err(Failure::Unavailable))}
     }
     pub(super) async fn admit_selection(
         &self,
@@ -235,7 +235,7 @@ impl Runtime {
                 return Err(Failure::Unavailable);
             }
             let prepared = captured
-                .prepare(Duration::from_millis(750))
+                .prepare(DISCOVERY_BUDGET)
                 .map_err(|_| Failure::Unavailable)?;
             let handle = self
                 .inputs

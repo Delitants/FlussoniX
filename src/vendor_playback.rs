@@ -33,8 +33,13 @@ use tokio_util::sync::CancellationToken;
 
 // Leave bounded WAN headroom for config/catalog/config, and one extra second
 // for serialized selection. The underlying byte, page and lease bounds remain.
-const DIRECT_DISCOVERY_BUDGET: Duration = Duration::from_secs(5);
-const DIRECT_SELECTION_BUDGET: Duration = Duration::from_secs(6);
+const DISCOVERY_BUDGET: Duration = Duration::from_secs(5);
+const SOURCE_SELECTION_BUDGET: Duration = Duration::from_secs(6);
+// Selected source plus two alternative waves under the four-query semaphore.
+// Contention may still exhaust this bound; no lease or authority is extended.
+const GROUP_SELECTION_BUDGET: Duration = Duration::from_secs(16);
+const RECOVERY_JOB_BUDGET: Duration = Duration::from_secs(20);
+pub(crate) const SRT_ADMISSION_BUDGET: Duration = Duration::from_secs(20);
 
 pub(crate) enum Selection {
     Native,
@@ -349,7 +354,7 @@ impl Runtime {
                     return Err(Failure::Unavailable);
                 }
                 let prepared = captured
-                    .prepare(DIRECT_DISCOVERY_BUDGET)
+                    .prepare(DISCOVERY_BUDGET)
                     .map_err(|_| Failure::Unavailable)?;
                 // Serialize install with attachment, closing the check/install race.
                 let handle = self
@@ -372,6 +377,6 @@ impl Runtime {
             cache.inventory = Some(Arc::new(rows));
             candidate
         };
-        tokio::select! {biased;_=self.closed.cancelled()=>Err(Failure::Closed),result=tokio::time::timeout(DIRECT_SELECTION_BUDGET,work)=>result.unwrap_or(Err(Failure::Unavailable))}
+        tokio::select! {biased;_=self.closed.cancelled()=>Err(Failure::Closed),result=tokio::time::timeout(SOURCE_SELECTION_BUDGET,work)=>result.unwrap_or(Err(Failure::Unavailable))}
     }
 }

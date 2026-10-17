@@ -5,7 +5,7 @@ use std::{future::Future, pin::Pin};
 impl Runtime {
     async fn poll_static(&self, app: &App, key: &str, revision: u64) {
         let result = tokio::time::timeout(
-            Duration::from_secs(4),
+            SOURCE_SELECTION_BUDGET,
             self.replica_inventory(app, key, revision, true),
         )
         .await;

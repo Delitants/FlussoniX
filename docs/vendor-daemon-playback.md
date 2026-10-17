@@ -61,20 +61,27 @@ playback only when all memberships produce the same explicit local viewer
 policy. A group override that changes the policy keeps unknown membership
 ineligible and fences existing playback after an edit.
 
-Cold direct-source discovery is serialized per source, with at most four concurrent source
-queries, a five-second wire budget, six-second request selection budget and
-500ms minimum spacing between attempts. Complete inventories are cached for their bounded source
-lease; absence may remain cached until its original deadline. Managed routes use
-the latest renewed lease. Active sibling routes refresh through shared atomic
-renewal; installing an idle source is serialized with attachment. Configuration,
-source and identity changes still invalidate pending/active generations.
-Replica selection and static catalog polling keep their separate four-second
-selection limits and prepare 750ms wire profiles when creating a source handle.
-They share cached source handles with direct requests: a handle retains its
-original wire budget. A static-created handle can therefore still constrain a
-direct request, while a direct-created five-second profile can be cut short by
-the static wrapper. The direct foreground checks do not qualify these mixed
-owners or extend their nested recovery jobs.
+All daemon source handles use one five-second complete discovery profile,
+regardless of whether foreground playback, static polling or a replica lookup
+creates the cached handle first. Requests remain serialized per source, with
+four concurrent source queries and 500ms minimum probe spacing. Direct lookup
+and static catalog polling have six-second selection limits. Complete inventories
+are cached for their original bounded lease; active siblings use atomic renewal.
+Configuration, source and identity changes still fence pending/active work.
+
+Replica selection has a sixteen-second limit: five seconds for the selected
+origin followed by up to seven alternatives in two waves under the four-query
+limit, plus bounded selection headroom. The selected origin is checked before
+alternatives, and publication follows declared rotation order. Background
+recovery/static jobs have twenty seconds, retaining their eight-job concurrency
+limit and cancellation on owner/configuration changes. Vendor SRT admission
+also allows twenty seconds; native SRT admission remains ten. RTSP description,
+placement and post-admission media timers are separate phases and are unchanged.
+
+These are outer bounds, not completion guarantees under contention. A busy
+source/group gate or query pool can still exhaust them. Discovery does not
+extend a thirty-second lease, admit partial rows, bypass a denial or authorize
+media. This coordination adds no input retry or public source option.
 
 An HLS manifest request retains its normal eight-second read grace and also
 honors the worker's remaining configured input startup allowance (15 seconds by
