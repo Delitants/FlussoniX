@@ -292,7 +292,11 @@ enum RequestAuth {
     Flussonic { key: Box<str>, name: Box<str> },
 }
 impl Requests {
-    fn get(&self, url: url::Url) -> Result<reqwest::RequestBuilder, String> {
+    fn get(
+        &self,
+        url: url::Url,
+        playback_session: Option<&str>,
+    ) -> Result<reqwest::RequestBuilder, String> {
         let request = self.client.get(url);
         Ok(match &self.auth {
             RequestAuth::Native(Some(key)) => request.header("X-Flussonix-Peer", key.as_ref()),
@@ -302,7 +306,12 @@ impl Requests {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_err(|_| "media authentication clock unavailable")?
                     .as_secs();
-                request.headers(flussonic::media_headers(key, name, timestamp))
+                let request = request.headers(flussonic::media_headers(key, name, timestamp));
+                if let Some(session) = playback_session {
+                    request.header("x-playback-session-id", session)
+                } else {
+                    request
+                }
             }
         })
     }
@@ -383,8 +392,12 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
         authority,
         failure: subtitles.failure,
     };
+    // A closed M4F playback identity can remain denied upstream. Scope the ID
+    // to this pull, keeping control and segment requests in the same session.
+    let playback_session = (is_m4f && matches!(requests.auth, RequestAuth::Flussonic { .. }))
+        .then(|| format!("m4f-{}", uuid::Uuid::new_v4()));
     let request = requests
-        .get(requests.control.clone())?
+        .get(requests.control.clone(), playback_session.as_deref())?
         .header("X-Supported", "prepush,drop_status");
     check_authority(authority)?;
     let response = tokio::time::timeout(Duration::from_secs(10), request.send())
@@ -417,7 +430,9 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                 }
                 let mut url = requests.base.clone();
                 url.set_path(&format!("{}/{}", requests.base.path(), n.name));
-                let request = requests.get(url)?.timeout(Duration::from_secs(10));
+                let request = requests
+                    .get(url, playback_session.as_deref())?
+                    .timeout(Duration::from_secs(10));
                 check_authority(authority)?;
                 let response = request
                     .send()

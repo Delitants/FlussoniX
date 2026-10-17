@@ -1,6 +1,11 @@
 //! Authentication acceptance is distinct from media availability or server identity.
 use axum::{
-    Router, body::Body, extract::OriginalUri, http::HeaderValue, response::Response, routing::get,
+    Router,
+    body::Body,
+    extract::OriginalUri,
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::Response,
+    routing::get,
 };
 use bytes::Bytes;
 use flussonix::{
@@ -254,9 +259,12 @@ async fn acknowledged_m4s_and_m4f_publish_without_inferring_server_identity() {
 async fn public_and_native_peer_inputs_keep_their_existing_response_contract() {
     for key in [None, Some("owned-native-key")] {
         let (tracks, stream, _) = payload();
-        let server = Server::start(Router::new().fallback(get(move || {
+        let server = Server::start(Router::new().fallback(get(move |headers: HeaderMap| {
             let stream = stream.clone();
-            async move { response(stream, &[]) }
+            async move {
+                assert!(!headers.contains_key("x-playback-session-id"));
+                response(stream, &[])
+            }
         })))
         .await;
         let url = server.root.replacen("http://", "m4s://", 1) + "/owned";
@@ -319,4 +327,117 @@ async fn reopening_an_input_does_not_reuse_an_earlier_acknowledgment() {
         assert_eq!(controls.load(Ordering::SeqCst), 2);
         server.stop().await;
     }
+}
+
+// A closed upstream identity must not poison a later pull of the same input.
+// Two segments also catch IDs generated per request instead of per pull.
+#[tokio::test]
+async fn private_m4f_reopening_and_concurrent_pulls_have_distinct_playback_sessions() {
+    use std::{collections::HashSet, sync::Mutex};
+    let identities = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let observed = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let controls = identities.clone();
+    let requests = observed.clone();
+    let (tracks, _, segment) = payload();
+    let original = segment.clone();
+    let server = Server::start(Router::new().fallback(get(
+        move |OriginalUri(uri): OriginalUri, headers: HeaderMap| {
+            let (controls, requests, segment) =
+                (controls.clone(), requests.clone(), segment.clone());
+            async move {
+                let ids: Vec<_> = headers.get_all("x-playback-session-id").iter().collect();
+                let id = ids
+                    .first()
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("");
+                requests
+                    .lock()
+                    .unwrap()
+                    .push((uri.path().to_owned(), id.to_owned()));
+                let valid_id = ids.len() == 1
+                    && id
+                        .strip_prefix("m4f-")
+                        .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok());
+                let valid_key = headers
+                    .get("cluster-auth-time")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|time| {
+                        let digest = ring::digest::digest(
+                            &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+                            format!("{time}:owned-secret:owned").as_bytes(),
+                        );
+                        let expected: String =
+                            digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+                        headers
+                            .get("cluster-auth-key")
+                            .is_some_and(|v| v.as_bytes() == expected.as_bytes())
+                    });
+                let accepted = valid_id
+                    && valid_key
+                    && if uri.path().ends_with("/m4f") {
+                        controls.lock().unwrap().insert(id.to_owned())
+                    } else {
+                        controls.lock().unwrap().contains(id)
+                    };
+                if !accepted {
+                    let mut denied = response(Body::empty(), &[HeaderValue::from_static("yes")]);
+                    *denied.status_mut() = StatusCode::FORBIDDEN;
+                    return denied;
+                }
+                response(
+                    if uri.path().ends_with("/m4f") {
+                        Bytes::from_static(
+                            b"1 2026/10/12/01/00/00-2000\n2 2026/10/12/01/00/02-2000\n",
+                        )
+                    } else {
+                        segment
+                    },
+                    &[HeaderValue::from_static("yes")],
+                )
+            }
+        },
+    )))
+    .await;
+    let input =
+        MediaInput::new(&server.root, "owned", Transport::M4f, "owned-secret", None).unwrap();
+    for _ in 0..2 {
+        let (result, metadata, output, hub) = pull(&input).await;
+        assert_eq!(result.unwrap_err(), "source closed");
+        assert_eq!(metadata.unwrap(), tracks);
+        assert!(!output.is_empty() && hub.has_info());
+        assert_eq!(hub.segment("2026/10/12/01/00/00.m4f").unwrap(), original);
+        assert_eq!(hub.segment("2026/10/12/01/00/02.m4f").unwrap(), original);
+    }
+    let (left, right) = tokio::join!(pull(&input), pull(&input));
+    for (result, metadata, output, hub) in [left, right] {
+        assert_eq!(result.unwrap_err(), "source closed");
+        assert_eq!(metadata.unwrap(), tracks);
+        assert!(!output.is_empty() && hub.has_info());
+        assert_eq!(hub.segment("2026/10/12/01/00/00.m4f").unwrap(), original);
+        assert_eq!(hub.segment("2026/10/12/01/00/02.m4f").unwrap(), original);
+    }
+    assert_eq!(identities.lock().unwrap().len(), 4);
+    let records = observed.lock().unwrap().clone();
+    assert_eq!(records.len(), 12);
+    for id in identities.lock().unwrap().iter() {
+        let paths: Vec<_> = records
+            .iter()
+            .filter(|(_, value)| value == id)
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/owned/m4f",
+                "/owned/2026/10/12/01/00/00.m4f",
+                "/owned/2026/10/12/01/00/02.m4f"
+            ]
+        );
+    }
+    let wrong = MediaInput::new(&server.root, "owned", Transport::M4f, "wrong-key", None).unwrap();
+    let (result, metadata, output, _) = pull(&wrong).await;
+    assert_eq!(result.unwrap_err(), "source rejected input");
+    assert!(metadata.is_none() && output.is_empty());
+    assert_eq!(identities.lock().unwrap().len(), 4);
+    server.stop().await;
 }
