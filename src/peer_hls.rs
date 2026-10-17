@@ -237,26 +237,43 @@ async fn resource(
 async fn inspect_transport(
     f: &Fetcher,
 ) -> Result<(Bytes, reqwest::Response, Option<u8>, Option<u8>), String> {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let mut request = f.client.get(f.origin.clone());
-        if let Some(key) = &f.key {
-            request = request.header("X-Flussonix-Peer", key);
-        }
-        let mut response = request
-            .send()
+    let mut request = f.client.get(f.origin.clone());
+    if let Some(key) = &f.key {
+        request = request.header("X-Flussonix-Peer", key);
+    }
+    let mut response = request
+        .send()
+        .await
+        .map_err(|_| "cannot connect peer transport")?;
+    if response.status() != StatusCode::OK {
+        return Err("peer transport rejected".into());
+    }
+    // A healthy publishing source may still be probing. Engine bounds total
+    // startup; the independent PMT budget starts once actual media arrives.
+    let first = loop {
+        let chunk = response
+            .chunk()
             .await
-            .map_err(|_| "cannot connect peer transport")?;
-        if response.status() != StatusCode::OK {
-            return Err("peer transport rejected".into());
+            .map_err(|_| "peer transport metadata read failed")?
+            .ok_or("peer transport metadata missing")?;
+        if !chunk.is_empty() {
+            break chunk;
         }
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
         let mut probe = crate::ts_profile::Probe::default();
         let mut prefix = BytesMut::new();
+        let mut first = Some(first);
         while probe.audio.is_none() {
-            let chunk = response
-                .chunk()
-                .await
-                .map_err(|_| "peer transport metadata read failed")?
-                .ok_or("peer transport metadata missing")?;
+            let chunk = if let Some(chunk) = first.take() {
+                chunk
+            } else {
+                response
+                    .chunk()
+                    .await
+                    .map_err(|_| "peer transport metadata read failed")?
+                    .ok_or("peer transport metadata missing")?
+            };
             if prefix.len() + chunk.len() > 1024 * 1024 {
                 return Err("peer transport metadata exceeds limit".into());
             }

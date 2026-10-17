@@ -479,6 +479,12 @@ impl Engine {
                     ))
                 })
             });
+        let timeout = Duration::from_secs(
+            cfg["flussonix_input_timeout"]
+                .as_u64()
+                .unwrap_or(15)
+                .clamp(1, 300),
+        );
         let mut cmd = crate::child_process::command(&self.ffmpeg);
         cmd.args([
             "-hide_banner",
@@ -538,20 +544,17 @@ impl Engine {
             ]);
             cmd.stdin(std::process::Stdio::piped());
         } else if publication {
-            // Live publishers may reconnect between keyframes; probe through a normal GOP.
-            // The byte cap and worker input watchdog still bound startup.
+            // Probe across a normal GOP, leaving startup/mux headroom under
+            // shorter configured watchdogs. Keep fractional seconds nonzero.
             cmd.args([
                 "-protocol_whitelist",
                 "pipe",
                 "-probesize",
                 "1048576",
                 "-analyzeduration",
-                "5000000",
-                "-f",
-                "mpegts",
-                "-i",
-                "pipe:0",
-            ]);
+            ])
+            .arg((timeout.as_micros() / 2).min(5_000_000).to_string())
+            .args(["-f", "mpegts", "-i", "pipe:0"]);
             cmd.stdin(std::process::Stdio::piped());
         } else if m4s_input || m4f_input {
             cmd.args([
@@ -817,12 +820,6 @@ impl Engine {
         };
         let (done_tx, done) = oneshot::channel();
         let cancel = CancellationToken::new();
-        let timeout = Duration::from_secs(
-            cfg["flussonix_input_timeout"]
-                .as_u64()
-                .unwrap_or(15)
-                .clamp(1, 300),
-        );
         let worker = Arc::new(Worker {
             publisher_stdin: std::sync::Mutex::new(publisher_stdin),
             publication,
@@ -972,6 +969,11 @@ impl Engine {
                     };
                     // Map one optional video followed by all audio in PMT order.
                     // AAC's ADTS conversion must never be applied to MPEG audio.
+                    if probe.filter_mapping_known && probe.video.is_none() && !probe.audio_types.is_empty() {
+                        // A complete single-program PMT proves there is no
+                        // video keyframe to wait for. Multiplexes keep the GOP budget.
+                        cmd = audio_publication_command(cmd, (timeout.as_micros() / 2).min(1_000_000));
+                    }
                     let offset = usize::from(probe.video.is_some());
                     let filters = if probe.filter_mapping_known {
                         probe.audio_types.iter().enumerate()
@@ -1010,7 +1012,7 @@ impl Engine {
                     child
                 } else if peer_ts {
                     let bridge=peer_hls.as_mut().unwrap();
-                    let profile=tokio::select!{biased;_=cancel.cancelled()=>return,result=bridge.metadata()=>result};
+                    let profile=tokio::select!{biased;_=cancel.cancelled()=>return,result=tokio::time::timeout(timeout,bridge.metadata())=>match result {Ok(profile)=>profile,Err(_)=>{w.failed("startup_timeout");return;}}};
                     let (audio,_video)=match profile {Ok(profile)=>profile,Err(reason)=>{w.failed(match reason.as_str(){"peer transport metadata exceeds limit"=>"metadata_limit","peer transport metadata timeout"=>"startup_timeout",_=>"input_closed"});return;}};
                     let output=output.replace("__PEER_FMP4_FILTER__",if audio==Some(0x0f){":bsfs/a=aac_adtstoasc"}else{""});
                     cmd.args(["-threads","2","-f","tee",&output]);
@@ -1102,7 +1104,9 @@ impl Engine {
                         let mut transport=crate::caption_transport::Transport::default();
                         loop{let data=tokio::select!{biased;_=c.cancelled()=>break,data=receiver.recv()=>match data{Some(data)=>data,None=>break}};decoder_state.push_source(&data,&mut transport);if decoder_state.failed.load(Ordering::Relaxed){break}}
                     }));
-                    let c=cancel.clone();let drain_state=state.clone();tasks.push(tokio::spawn(async move {let Ok(Ok((mut socket,_)))=(tokio::select!{biased;_=c.cancelled()=>return,r=tokio::time::timeout(Duration::from_secs(5),listener.accept())=>r})else{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");return};let mut buffer=[0;16384];loop{let read=tokio::select!{biased;_=c.cancelled()=>break,r=socket.read(&mut buffer)=>r};match read{Ok(n)if n>0=>{if enqueue_caption(&sender,Bytes::copy_from_slice(&buffer[..n]),&c).await.is_err(){drain_state.failed.store(true,Ordering::Relaxed);break;}},_=>{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");break}}}}));
+                    // FFmpeg opens this output after input probing. Allow the same
+                    // bounded startup interval as the AV listener below.
+                    let c=cancel.clone();let drain_state=state.clone();tasks.push(tokio::spawn(async move {let Ok(Ok((mut socket,_)))=(tokio::select!{biased;_=c.cancelled()=>return,r=tokio::time::timeout(timeout+Duration::from_secs(1),listener.accept())=>r})else{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");return};let mut buffer=[0;16384];loop{let read=tokio::select!{biased;_=c.cancelled()=>break,r=socket.read(&mut buffer)=>r};match read{Ok(n)if n>0=>{if enqueue_caption(&sender,Bytes::copy_from_slice(&buffer[..n]),&c).await.is_err(){drain_state.failed.store(true,Ordering::Relaxed);break;}},_=>{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");break}}}}));
                     for _ in 0..2{tasks.push(tokio::spawn(state.clone().ocr(tesseract.clone(),cancel.clone())));}
                 }
                 if let Some(state) = w.captions.clone() {
@@ -1141,8 +1145,8 @@ impl Engine {
                             loop {
                                 let read=tokio::select! {biased;_=c.cancelled()=>return Ok(()),r=tokio::time::timeout(timeout,socket.read(&mut buffer))=>r};
                                 match read {
-                                    Ok(Ok(0))=>{output.finish(&w.wire)?;return Ok(());},
-                                    Ok(Ok(n))=>output.push(&buffer[..n],&w.wire)?,
+                                    Ok(Ok(0))=>{tokio::select!{biased;_=c.cancelled()=>return Ok(()),result=output.finish(&w.wire)=>result}?;return Ok(());},
+                                    Ok(Ok(n))=>{tokio::select!{biased;_=c.cancelled()=>return Ok(()),result=output.push(&buffer[..n],&w.wire)=>result}?;},
                                     Ok(Err(_))=>return Err("wire_decode_failed"),
                                     Err(_)=>return Err("input_stalled"),
                                 }
@@ -1167,7 +1171,7 @@ impl Engine {
                     };
                     match read {
                         Ok(Ok(0)) => {
-                            let result=if let Some(output)=&mut native_output {output.finish(&w.wire)}
+                            let result=if let Some(output)=&mut native_output {tokio::select!{biased;_=cancel.cancelled()=>break,result=output.finish(&w.wire)=>result}}
                             else if let Some(receiver)=av_done.take() {
                                 tokio::select! {biased;_=cancel.cancelled()=>break,r=tokio::time::timeout(timeout,receiver)=>match r {Ok(Ok(result))=>result,_=>Err("wire_decode_failed")}}
                             } else {Ok(())};
@@ -1189,7 +1193,8 @@ impl Engine {
                         }
                         Ok(Ok(n)) => {
                             if let Some(output)=&mut native_output {
-                                if let Err(reason)=output.push(&buffer[..n],&w.wire) {w.failed(reason);break;}
+                                let result=tokio::select!{biased;_=cancel.cancelled()=>break,result=output.push(&buffer[..n],&w.wire)=>result};
+                                if let Err(reason)=result {w.failed(reason);break;}
                             }
                             if let Some(state)=&w.captions{state.observe_ts(&buffer[..n],&mut output_clock,&mut output_decoder);}
                             w.recovery.lock().unwrap().progress();
@@ -1487,6 +1492,43 @@ impl Engine {
             .collect()
     }
 }
+// Only deferred MPEG-TS publication commands built above use this rebuild:
+// their IO is piped and the factory restores the Linux process ownership guard.
+fn audio_publication_command(cmd: Command, analysis_us: u128) -> Command {
+    let original = cmd.as_std();
+    let mut audio = crate::child_process::command(original.get_program());
+    let duration = analysis_us.to_string();
+    let mut input_options = true;
+    let mut replace_duration = false;
+    for argument in original.get_args() {
+        if replace_duration {
+            audio.arg(&duration);
+        } else {
+            audio.arg(argument);
+        }
+        replace_duration = input_options && argument == "-analyzeduration";
+        if argument == "-i" {
+            input_options = false;
+        }
+    }
+    for (key, value) in original.get_envs() {
+        if let Some(value) = value {
+            audio.env(key, value);
+        } else {
+            audio.env_remove(key);
+        }
+    }
+    if let Some(directory) = original.get_current_dir() {
+        audio.current_dir(directory);
+    }
+    audio
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    audio
+}
+
 async fn enqueue_caption(
     sender: &tokio::sync::mpsc::Sender<Bytes>,
     data: Bytes,

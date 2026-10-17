@@ -1623,7 +1623,22 @@ async fn m4f_vendor_rtsp_decodes_hevc_mp3_and_mp2_with_independent_ffmpeg() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let status = match tokio::time::timeout(Duration::from_secs(20), child.wait()).await {
+    let mut live_pids = std::collections::BTreeSet::new();
+    let playback = async {
+        loop {
+            let pid = f.app.media.stats("owned").await["pid"]
+                .as_u64()
+                .unwrap_or(0);
+            if pid > 0 && std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                live_pids.insert(pid);
+            }
+            tokio::select! {
+                status = child.wait() => break status,
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+    };
+    let status = match tokio::time::timeout(Duration::from_secs(20), playback).await {
         Ok(status) => Some(status.unwrap()),
         Err(_) => {
             child.kill().await.unwrap();
@@ -1638,9 +1653,6 @@ async fn m4f_vendor_rtsp_decodes_hevc_mp3_and_mp2_with_independent_ffmpeg() {
         .iter()
         .filter(|(p, _)| p == "/owned/m4f")
         .count();
-    let pid = f.app.media.stats("owned").await["pid"]
-        .as_u64()
-        .unwrap_or(0);
     cancel.cancel();
     listener.await.unwrap().unwrap();
     f.stop().await;
@@ -1650,8 +1662,13 @@ async fn m4f_vendor_rtsp_decodes_hevc_mp3_and_mp2_with_independent_ffmpeg() {
         std::fs::read_to_string(path).unwrap()
     );
     assert_eq!(pulls, 1);
-    assert!(pid > 0);
-    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    assert!(
+        !live_pids.is_empty(),
+        "real playback must witness a live packager"
+    );
+    for pid in live_pids {
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
 }
 
 #[path = "vendor_daemon_playback/srt.rs"]
