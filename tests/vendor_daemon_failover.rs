@@ -171,6 +171,106 @@ async fn private_media_loss_recovers_without_viewer_requests_while_management_st
 }
 
 #[tokio::test]
+async fn acknowledged_m4f_segment_loss_recovers_in_background_without_latching_rejection() {
+    let f = fixture::Fixture::m4f().await;
+    let _ = f.playlist().await;
+    let old_pid = f.app.media.stats("owned").await["pid"].as_u64().unwrap();
+    assert!(old_pid > 0);
+    assert_eq!(f.origins[1].private_calls.load(Ordering::SeqCst), 0);
+    let before = f.origins[0].segment_calls.load(Ordering::SeqCst);
+    f.origins[0].missing_segment.store(true, Ordering::SeqCst);
+    let recovered = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let stats = f.app.media.stats("owned").await;
+            if f.origins[1].private_calls.load(Ordering::SeqCst) > 0
+                && stats["pid"]
+                    .as_u64()
+                    .is_some_and(|pid| pid > 0 && pid != old_pid)
+                && stats["bytes_in"].as_u64().unwrap_or(0) > 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    let missing_requests = f.origins[0].segment_calls.load(Ordering::SeqCst);
+    let backup_segments = f.origins[1].segment_calls.load(Ordering::SeqCst);
+    let old_gone = !std::path::Path::new(&format!("/proc/{old_pid}")).exists();
+    let decode = if recovered.is_ok() {
+        use http_body_util::BodyExt;
+        let playlist = f.playlist().await;
+        let segment = playlist
+            .lines()
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .unwrap();
+        let response = f.get(&format!("/owned/{segment}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovered-m4f.ts");
+        tokio::fs::write(&path, bytes).await.unwrap();
+        Some(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::process::Command::new("/usr/bin/ffmpeg")
+                    .kill_on_drop(true)
+                    .args([
+                        "-nostdin",
+                        "-v",
+                        "error",
+                        "-xerror",
+                        "-err_detect",
+                        "explode",
+                        "-i",
+                    ])
+                    .arg(path)
+                    .args(["-map", "0:a:0", "-f", "null", "-"])
+                    .stdin(std::process::Stdio::null())
+                    .output(),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    f.stop().await;
+    assert!(
+        recovered.is_ok(),
+        "announced segment404 permanently blocked background recovery"
+    );
+    assert!(missing_requests > before && backup_segments > 0 && old_gone);
+    let decoded = decode.unwrap().unwrap().unwrap();
+    assert!(
+        decoded.status.success() && decoded.stderr.is_empty(),
+        "recovered HLS audio did not strictly decode"
+    );
+}
+
+#[tokio::test]
+async fn unacknowledged_m4f_segment_404_still_blocks_backup() {
+    let f = fixture::Fixture::m4f().await;
+    let _ = f.playlist().await;
+    f.origins[0].segment_ack.store(false, Ordering::SeqCst);
+    let before = f.origins[0].segment_calls.load(Ordering::SeqCst);
+    f.origins[0].missing_segment.store(true, Ordering::SeqCst);
+    let observed = tokio::time::timeout(Duration::from_secs(2), async {
+        while f.origins[0].segment_calls.load(Ordering::SeqCst) <= before {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let backup_calls = f.origins[1].private_calls.load(Ordering::SeqCst);
+    f.stop().await;
+    assert!(observed.is_ok());
+    assert_eq!(
+        backup_calls, 0,
+        "missing acknowledgment must fence backup recovery"
+    );
+}
+
+#[tokio::test]
 async fn private_rejection_blocks_backup_through_catalog_success_and_later_api_outage() {
     let f = fixture::Fixture::new().await;
     *f.origins[0].media.lock().unwrap() = StatusCode::FORBIDDEN;

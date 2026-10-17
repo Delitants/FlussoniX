@@ -281,4 +281,61 @@ mod tests {
             assert_eq!(headers.len(), 2);
         }
     }
+
+    #[tokio::test]
+    async fn revoked_authority_precedes_announced_segment_status_classification() {
+        use axum::{
+            Router, body::Body, extract::OriginalUri, http::StatusCode, response::Response,
+            routing::get,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        for status in [StatusCode::NOT_FOUND, StatusCode::FORBIDDEN] {
+            let current = Arc::new(AtomicBool::new(true));
+            let live = current.clone();
+            let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let root = format!("http://{}", tcp.local_addr().unwrap());
+            let router = Router::new().fallback(get(move |OriginalUri(uri): OriginalUri| {
+                let live = live.clone();
+                async move {
+                    let mut response = if uri.path() == "/owned/m4f" {
+                        Response::new(Body::from("1 2026/10/17/00/00/00-2000\n"))
+                    } else {
+                        assert_eq!(uri.path(), "/owned/2026/10/17/00/00/00.m4f");
+                        live.store(false, Ordering::SeqCst);
+                        let mut response = Response::new(Body::empty());
+                        *response.status_mut() = status;
+                        response
+                    };
+                    response
+                        .headers_mut()
+                        .insert("cluster-auth", "yes".parse().unwrap());
+                    response
+                }
+            }));
+            let server = tokio::spawn(async move { axum::serve(tcp, router).await.unwrap() });
+            let input = MediaInput::new(&root, "owned", Transport::M4f, "owned-key", None).unwrap();
+            let (tx, rx) = oneshot::channel();
+            let mut output = Vec::new();
+            let hub = Hub::new();
+            let authority = || current.load(Ordering::SeqCst);
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                input.pull_guarded_classified(
+                    &mut output,
+                    Some(&hub),
+                    tx,
+                    PullOptions::default(),
+                    &authority,
+                ),
+            )
+            .await;
+            server.abort();
+            let _ = server.await;
+            assert_eq!(result.unwrap().unwrap_err(), InputFailure::Revoked);
+            assert!(output.is_empty() && rx.await.is_err() && !hub.has_info());
+        }
+    }
 }

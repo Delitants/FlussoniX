@@ -6,10 +6,11 @@ reference analysis. It shares FlussoniX's decoder, codec handling, metadata
 handshake, worker bridge and native relay. Official Flussonic components are
 not used at build, test or runtime.
 
-This client is deliberately not selected by daemon source configuration or
-the resolver. It does not establish viewer access, import remote policy, or
-enable mixed-vendor cluster routing. Bounded read-only reference checks have observed positive/negative control
-authentication; live decoder delivery and endpoint identity remain separate gates.
+Explicitly configured Flussonic sources use this client after current source and
+viewer admission; see [daemon playback](vendor-daemon-playback.md). Ordinary
+native/public inputs keep their own contracts. The client does not grant viewer
+access or establish endpoint identity. Bounded reference captures have decoded
+H.264/AAC over both private transports; complete interoperability remains open.
 
 ## Construction and name binding
 
@@ -71,6 +72,15 @@ writes. The caller owns retry/backoff and cancellation. Dropping its future
 cancels the current request/body; no detached media-fetch task is created.
 An EOF or rejected request ends the session; reconnection is explicit.
 
+The classified API reports an announced M4F segment's HTTP404 as `Transient`
+only after an accepted control and exactly one `cluster-auth: yes` on that
+segment response. It ends the pull without reading the error body or accepting
+metadata/media from it. Control404 and segment401/403 remain `Rejected`, as do
+segment200/404 responses with missing or invalid acknowledgments. Existing5xx
+failures remain transient even without acknowledgment. Revoked authority takes precedence. There is
+no internal retry; the [daemon supervisor](vendor-daemon-failover.md) retains its
+existing backoff, source revalidation and permission checks when recovering.
+
 The existing native input limits apply: five-second TCP connect timeout,
 ten-second control setup and M4F segment request timeouts, fifteen-second
 control-chunk idle timeout, 8192-byte signal lines, 16 MiB M4F segments and
@@ -79,9 +89,8 @@ window. Canonical M4F date signals determine segment paths under the configured
 stream; arbitrary URLs or traversal signals are rejected before another GET.
 
 The public method retains the existing public ingest subtitle defaults:
-subtitle tracks are omitted from the native relay. The daemon's existing
-subtitle controls are unchanged. Wiring explicit vendor inputs into daemon
-workers with source/group viewer policy and subtitle options is future work.
+subtitle tracks are omitted from the native relay. Admitted daemon inputs use
+the configured subtitle options and current source/group viewer policy.
 
 ## Independent qualification
 
@@ -106,5 +115,6 @@ The independent [configured-source binding](vendor-source-binding.md) now retain
 validated endpoints, key, transport and per-leg TLS trust under one source profile.
 Opaque complete inventory results produce candidates for current-profile media
 construction; stale fetch success/errors and cross-authority publication fail.
-This remains library-only: actual topology, live interoperability, global daemon
-fences, leases and worker/session lifetime still gate vendor routing.
+The daemon uses this binding under its source, lease, viewer and route fences.
+Actual topology and complete live interoperability still require deployment
+qualification.

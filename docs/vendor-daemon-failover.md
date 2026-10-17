@@ -25,6 +25,16 @@ private metadata from the same origin can clear it. Unrelated settings saves
 preserve these barriers and the selected-origin history. Changing the source
 relationship, its processing or policy starts a new selection plan.
 
+An announced M4F segment returning404 with exactly one affirmative Cluster
+acknowledgment is treated as temporary media unavailability. The pull stops
+without accepting the response body, and existing supervised recovery can
+revalidate the current catalog and choose an eligible configured replica.
+Control404 and authorization401/403 still block rotation, as do segment200/404
+responses with invalid or missing acknowledgments. Existing5xx failures remain
+transient even without acknowledgment. Source/viewer revocation takes precedence; no credential
+fallback or extra in-pull retry is introduced. This distinction does not prove
+why a particular reference segment was missing or promise seamless recovery.
+
 On-demand recovery uses original native viewer permission and recent playback
 demand. [Selected static streams](vendor-static-activation.md) recover through
 separate daemon ownership without viewer sessions. Background work does not

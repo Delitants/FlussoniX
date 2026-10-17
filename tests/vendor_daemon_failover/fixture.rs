@@ -40,6 +40,9 @@ pub(super) struct Origin {
     pub rows: Arc<Mutex<Value>>,
     pub epoch: Arc<Mutex<CancellationToken>>,
     pub private_calls: Arc<AtomicUsize>,
+    pub missing_segment: Arc<AtomicBool>,
+    pub segment_ack: Arc<AtomicBool>,
+    pub segment_calls: Arc<AtomicUsize>,
     pub management_calls: Arc<AtomicUsize>,
     pub secret: String,
     task: tokio::task::JoinHandle<()>,
@@ -53,8 +56,15 @@ fn digest(value: &str) -> String {
 }
 impl Origin {
     pub async fn start(id: &'static str) -> Self {
+        Self::start_transport(id, false).await
+    }
+    async fn start_transport(id: &'static str, m4f: bool) -> Self {
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let key = format!("m4s://{}", tcp.local_addr().unwrap());
+        let key = format!(
+            "{}://{}",
+            if m4f { "m4f" } else { "m4s" },
+            tcp.local_addr().unwrap()
+        );
         let secret = format!("owned-{id}-private-key");
         let api = Arc::new(Mutex::new(StatusCode::OK));
         let media = Arc::new(Mutex::new(StatusCode::OK));
@@ -64,6 +74,14 @@ impl Origin {
         let epoch = Arc::new(Mutex::new(CancellationToken::new()));
         let private_calls = Arc::new(AtomicUsize::new(0));
         let management_calls = Arc::new(AtomicUsize::new(0));
+        let missing_segment = Arc::new(AtomicBool::new(false));
+        let segment_ack = Arc::new(AtomicBool::new(true));
+        let segment_calls = Arc::new(AtomicUsize::new(0));
+        let (missing, ack, segments) = (
+            missing_segment.clone(),
+            segment_ack.clone(),
+            segment_calls.clone(),
+        );
         let hold: Hold = Arc::new(Mutex::new(None));
         let held = hold.clone();
         let stall_metadata = Arc::new(AtomicBool::new(false));
@@ -79,8 +97,37 @@ impl Origin {
         );
         let service=Router::new().fallback(get(move|OriginalUri(uri):OriginalUri,headers:HeaderMap|{
    let held=held.clone();let stalled=stalled.clone();
+   let (missing,ack,segments)=(missing.clone(),ack.clone(),segments.clone());
    let (a,m,r,e,p,c,k)=(a.clone(),m.clone(),r.clone(),e.clone(),p.clone(),c.clone(),k.clone());async move{
     assert!(!headers.contains_key("x-flussonix-peer"));
+    if m4f && uri.path().starts_with("/owned/") {
+     assert!(uri.query().is_none());assert!(!headers.contains_key("authorization"));
+     let time=headers["cluster-auth-time"].to_str().unwrap();assert_eq!(headers["cluster-auth-key"],digest(&format!("{time}:{k}:owned")));
+     assert!(headers["x-playback-session-id"].to_str().unwrap().starts_with("m4f-"));
+     let mut out=if uri.path()=="/owned/m4f" {
+      p.fetch_add(1,Ordering::SeqCst);
+      let status=*m.lock().unwrap();
+      if status!=StatusCode::OK {let mut out=Response::new(Body::empty());*out.status_mut()=status;return out;}
+      let stop=e.lock().unwrap().clone();
+      let stream=futures_util::stream::unfold((0u64,stop),|(i,stop)|async move {
+       tokio::select!{biased;_=stop.cancelled()=>return None,_=tokio::time::sleep(Duration::from_millis(50))=>{}}
+       let seconds=i*2;let line=format!("{} 2026/10/17/00/{:02}/{:02}-2000\n",i+1,seconds/60,seconds%60);
+       Some((Ok::<_,std::io::Error>(bytes::Bytes::from(line)),(i+1,stop)))
+      });Response::new(Body::from_stream(stream))
+     } else {
+      segments.fetch_add(1,Ordering::SeqCst);
+      if missing.load(Ordering::SeqCst) {
+       let mut out=Response::new(Body::empty());*out.status_mut()=StatusCode::NOT_FOUND;
+       if ack.load(Ordering::SeqCst) {out.headers_mut().insert("cluster-auth","yes".parse().unwrap());}
+       return out;
+      }
+      let stamp=uri.path().strip_prefix("/owned/2026/10/17/00/").unwrap().strip_suffix(".m4f").unwrap();
+      let (minute,second)=stamp.split_once('/').unwrap();let number=(minute.parse::<u64>().unwrap()*60+second.parse::<u64>().unwrap())/2;
+      let track=Track{id:1,codec:"mp3".into(),config:vec![]};
+      let frames=(0..77).map(|j|Frame{track_id:1,dts:90_000+number*180_000+j*2351,pts_offset:0,key:true,body:include_bytes!("../fixtures/codecs/mp3.bin").to_vec()}).collect::<Vec<_>>();
+      Response::new(Body::from(flussonix::m4f::pack(&[track],&frames,180_000).unwrap()))
+     };out.headers_mut().insert("cluster-auth","yes".parse().unwrap());return out;
+    }
     if let Some(name)=uri.path().strip_prefix('/').and_then(|p|p.strip_suffix("/m4s")) {
      p.fetch_add(1,Ordering::SeqCst);assert!(uri.query().is_none());assert!(!headers.contains_key("authorization"));
      let time=headers["cluster-auth-time"].to_str().unwrap();assert_eq!(headers["cluster-auth-key"],digest(&format!("{time}:{k}:{name}")));
@@ -118,6 +165,9 @@ impl Origin {
             rows,
             epoch,
             private_calls,
+            missing_segment,
+            segment_ack,
+            segment_calls,
             management_calls,
             secret,
             task,
@@ -152,9 +202,21 @@ impl Fixture {
         Self::configured(role, json!({"only":[]}), None, true).await
     }
     pub async fn configured(role: &str, patch: Value, rows: Option<Value>, grouped: bool) -> Self {
+        Self::configured_transport(role, patch, rows, grouped, false).await
+    }
+    pub async fn m4f() -> Self {
+        Self::configured_transport("standalone", json!({"only":[]}), None, true, true).await
+    }
+    async fn configured_transport(
+        role: &str,
+        patch: Value,
+        rows: Option<Value>,
+        grouped: bool,
+        m4f: bool,
+    ) -> Self {
         let origins = vec![
-            Origin::start("owned-origin-a").await,
-            Origin::start("owned-origin-b").await,
+            Origin::start_transport("owned-origin-a", m4f).await,
+            Origin::start_transport("owned-origin-b", m4f).await,
         ];
         let dir = tempfile::tempdir().unwrap();
         let app = App::new(

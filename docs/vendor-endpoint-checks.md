@@ -34,13 +34,17 @@ checks observed a closed explicit M4F playback ID rejected with
 `connection_closed`, fresh IDs accepted at the control boundary, and one fresh-ID
 segment returning404. A no-ID control also succeeded after elapsed time. These
 observations do not establish a single cause for all intermittent failures.
+A later bounded two-session check fetched six announced segments successfully
+and did not reproduce the404. Early publication or expiration was not proven.
 
 Explicit vendor M4F pulls now send a fresh opaque `x-playback-session-id` for
 each pull, shared by its control and segment requests. Reopening or concurrently
 pulling the same input uses distinct IDs, matching the inspected reader's session
 lifetime. The ID is not a credential or server identity assertion. Status and
-Cluster acknowledgment checks still apply to every response; no retry or
-credential fallback is introduced. Public/native inputs and vendor M4S retain
+Cluster acknowledgment checks still apply to every response; there is no
+in-pull retry or credential fallback. An acknowledged announced-segment404
+ends the pull as transient unavailability for existing supervised recovery;
+it does not accept the response as media. Public/native inputs and vendor M4S retain
 their existing header behavior.
 
 ## What operators can rely on

@@ -320,15 +320,20 @@ impl Requests {
             RequestAuth::Flussonic { .. } => {
                 // A public media200 is not acknowledgment of privileged auth.
                 // This marker confirms acceptance only, never server identity.
-                let mut markers = response.headers().get_all("cluster-auth").iter();
-                response.status() == reqwest::StatusCode::OK
-                    && markers
-                        .next()
-                        .is_some_and(|value| value.as_bytes() == b"yes")
-                    && markers.next().is_none()
+                response.status() == reqwest::StatusCode::OK && self.private_acknowledged(response)
             }
             RequestAuth::Native(_) => response.status().is_success(),
         }
+    }
+    fn private_acknowledged(&self, response: &reqwest::Response) -> bool {
+        if !matches!(self.auth, RequestAuth::Flussonic { .. }) {
+            return false;
+        }
+        let mut markers = response.headers().get_all("cluster-auth").iter();
+        markers
+            .next()
+            .is_some_and(|value| value.as_bytes() == b"yes")
+            && markers.next().is_none()
     }
 }
 async fn consume<W: AsyncWrite + Unpin>(
@@ -439,6 +444,14 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                     .await
                     .map_err(|_| transient("M4F fetch failed"))?;
                 check_authority(authority)?;
+                // A missing announced object is an availability failure, not a
+                // permanent source denial. Only the explicit private client can
+                // use this exception; the error body is never consumed.
+                if response.status() == reqwest::StatusCode::NOT_FOUND
+                    && requests.private_acknowledged(&response)
+                {
+                    return Err(transient("M4F segment unavailable").into());
+                }
                 if !requests.accepts(&response) {
                     return Err(rejection(&response, "M4F segment denied").into());
                 }
