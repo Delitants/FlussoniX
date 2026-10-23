@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "repository": "Delitants/FlussoniX",
+  "baseline": "32d7a7bb6e07fe86ee824393e967ef0704ddb5a8",
+  "public_docs": [],
+  "public_data": [],
+  "release_assets": [
+    "flussonix-*-linux-x86_64*.tar.gz",
+    "flussonix-*-linux-x86_64*.tar.gz.sha256",
+    "SHA256SUMS"
+  ]
+}
