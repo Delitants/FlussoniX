@@ -42,4 +42,13 @@ Run archive regression checks with:
 python3 -m unittest discover -s tests -p 'test_*preview.py' -v
 ```
 
+For a release-candidate cold-upgrade check, verify both archive checksums and
+extract the previous and candidate Linux packages into separate directories.
+Then run `python3 scripts/smoke-cold-upgrade.py --previous OLD_DIR --current NEW_DIR`.
+The smoke uses a temporary owner-only state directory and an unused loopback
+port. It checks saved stream/template reads through old → new → old, then checks
+that the new package can reopen its separate IPTV data after an old-version
+rollback. It does not qualify live viewer continuity, changed-schema rollback,
+rolling clusters, or recovery under load.
+
 See [installation and upgrades](installation.md) for the operator workflow.
