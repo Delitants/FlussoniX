@@ -43,12 +43,14 @@ impl PreAuthGate {
         Some(PreAuthLease {
             gate: self.clone(),
             ip,
+            deadline: tokio::time::Instant::now() + PREAUTH_LIFETIME,
         })
     }
 }
 struct PreAuthLease {
     gate: Arc<PreAuthGate>,
     ip: IpAddr,
+    deadline: tokio::time::Instant,
 }
 impl Drop for PreAuthLease {
     fn drop(&mut self) {
@@ -134,6 +136,11 @@ impl Listener {
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
             incoming = self.endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
+                // Charge an address only after QUIC Retry proves the sender can receive there.
+                if !incoming.remote_address_validated() {
+                    let _ = incoming.retry();
+                    continue;
+                }
                 let Ok(permit) = slots.clone().try_acquire_owned() else {
                     incoming.refuse();
                     continue;
@@ -156,9 +163,10 @@ impl Listener {
                         incoming.refuse();
                         return;
                     };
+                    let setup_deadline = preauth_lease.deadline.min(tokio::time::Instant::now() + SETUP);
                     let connection = tokio::select! {
                         _ = cancel.cancelled() => return,
-                        result = tokio::time::timeout(SETUP, incoming) => match result {
+                        result = tokio::time::timeout_at(setup_deadline, incoming) => match result {
                             Ok(Ok(connection)) => connection,
                             _ => return,
                         },
@@ -186,9 +194,7 @@ async fn serve_peer(
     egress: Arc<AtomicU64>,
     preauth_lease: Option<PreAuthLease>,
 ) {
-    let deadline = preauth_lease
-        .as_ref()
-        .map(|_| tokio::time::Instant::now() + PREAUTH_LIFETIME);
+    let deadline = preauth_lease.as_ref().map(|lease| lease.deadline);
     let mut deadline = deadline;
     let preauth_lease = Arc::new(Mutex::new(preauth_lease));
     let mut tasks = JoinSet::new();

@@ -3,6 +3,105 @@ use crate::fxlink::{ClientPool, transport};
 use futures_util::future::BoxFuture;
 use std::sync::Arc;
 
+#[tokio::test]
+async fn unvalidated_quic_initial_receives_retry_before_preauth_accounting() {
+    use tokio::net::UdpSocket;
+
+    let _serial = transport::test_lock().lock().await;
+    let cert = crate::transport_tls_fixture::Certificates::new();
+    let listener = Listener::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        &cert.cert,
+        &cert.key,
+        Settings::default(),
+    )
+    .unwrap();
+    let address = listener.address();
+    let stop = CancellationToken::new();
+    let server = tokio::spawn(listener.serve(Arc::new(Ready), stop.clone()));
+
+    let proxy = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut tls = (*cert.client()).clone();
+    tls.alpn_protocols = control::protocols();
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+    let pending = endpoint
+        .connect(proxy.local_addr().unwrap(), "localhost")
+        .unwrap();
+    let mut packet = [0u8; 1500];
+    let (len, _client) = tokio::time::timeout(Duration::from_secs(2), proxy.recv_from(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    proxy.send_to(&packet[..len], address).await.unwrap();
+    let (len, _) = tokio::time::timeout(Duration::from_secs(2), proxy.recv_from(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(len > 1);
+    assert_eq!(
+        packet[0] & 0xf0,
+        0xf0,
+        "server must issue QUIC Retry before charging a spoofable address"
+    );
+
+    drop(pending);
+    endpoint.close(0u32.into(), b"done");
+    stop.cancel();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn preauth_lifetime_includes_connection_setup_delay() {
+    let _serial = transport::test_lock().lock().await;
+    let cert = crate::transport_tls_fixture::Certificates::new();
+    let listener = Listener::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        &cert.cert,
+        &cert.key,
+        Settings::default(),
+    )
+    .unwrap();
+    let gate = PreAuthGate::new();
+    let lease = gate.acquire("127.0.0.1".parse().unwrap()).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let mut tls = (*cert.client()).clone();
+    tls.alpn_protocols = control::protocols();
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+    let client = endpoint.connect(listener.address(), "localhost").unwrap();
+    let server = async { listener.endpoint.accept().await.unwrap().await.unwrap() };
+    let (client, server) = tokio::join!(client, server);
+    let client = client.unwrap();
+    let budget = peer_budget(server.remote_address().ip()).unwrap();
+    let _queues = budget.reserve(QUEUE_BYTES).unwrap();
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(serve_peer(
+        server,
+        Arc::new(Ready),
+        Settings::default(),
+        budget,
+        stop.clone(),
+        Arc::new(AtomicU64::new(0)),
+        Some(lease),
+    ));
+    let closed = tokio::time::timeout(Duration::from_secs(19), client.closed())
+        .await
+        .is_ok();
+    stop.cancel();
+    client.close(0u32.into(), b"done");
+    task.await.unwrap();
+    endpoint.close(0u32.into(), b"done");
+    listener.endpoint.close(0u32.into(), b"done");
+    assert!(
+        closed,
+        "the setup delay extended the pre-auth lease beyond 20 seconds"
+    );
+}
+
 struct Ready;
 impl Provider for Ready {
     fn subscribe(&self, request: Request, _: SocketAddr) -> BoxFuture<'_, Result<Source, u16>> {
