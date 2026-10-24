@@ -50,5 +50,9 @@ port. It checks saved stream/template reads through old → new → old, then ch
 that the new package can reopen its separate IPTV data after an old-version
 rollback. It does not qualify live viewer continuity, changed-schema rollback,
 rolling clusters, or recovery under load.
+Add `--media` to start an owned `testsrc://` worker in each version and verify a
+packaged HLS segment with independent FFprobe. This requires FFmpeg and FFprobe;
+the smoke signals its isolated process group and waits for the daemon to exit
+after each phase.
 
 See [installation and upgrades](installation.md) for the operator workflow.

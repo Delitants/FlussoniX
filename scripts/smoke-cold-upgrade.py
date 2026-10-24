@@ -8,11 +8,14 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
+import signal
 import socket
 import subprocess
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -36,7 +39,7 @@ def require(condition, message):
 
 
 class Lab:
-    def __init__(self, directory):
+    def __init__(self, directory, media=False):
         self.root = directory
         self.state = directory / 'state'
         self.state.mkdir(mode=0o700)
@@ -52,6 +55,10 @@ class Lab:
                     'FLUSSONIX_PEER_KEY': secrets.token_hex(32)}
         self.opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}), NoRedirect())
+        self.ffmpeg = shutil.which('ffmpeg', path=os.defpath) if media else None
+        self.ffprobe = shutil.which('ffprobe', path=os.defpath) if media else None
+        if media and (not self.ffmpeg or not self.ffprobe):
+            raise RuntimeError('media smoke requires independent FFmpeg and FFprobe')
 
     def request(self, path, method='GET', body=None, authenticated=False):
         headers = {'Authorization': self.auth} if authenticated else {}
@@ -77,8 +84,9 @@ class Lab:
                 '--config', str(self.state / 'config.json'),
                 '--media-dir', str(self.state / 'media'),
                 '--web-dir', str(release / 'web'),
-                '--ffmpeg', '/owned-cold-upgrade-no-media-process'],
-                cwd=release, env=self.env, stdout=output, stderr=subprocess.STDOUT)
+                '--ffmpeg', self.ffmpeg or '/owned-cold-upgrade-no-media-process'],
+                cwd=release, env=self.env, stdout=output, stderr=subprocess.STDOUT,
+                start_new_session=True)
             try:
                 for _ in range(100):
                     if process.poll() is not None:
@@ -92,12 +100,17 @@ class Lab:
                     raise RuntimeError(f'{phase}: health deadline exceeded')
                 yield
             finally:
-                if process.poll() is None:
-                    process.terminate()
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
                 try:
                     process.wait(timeout=8)
                 except subprocess.TimeoutExpired:
-                    process.kill()
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                     process.wait(timeout=8)
 
     def saved_config(self, create=False):
@@ -135,16 +148,53 @@ class Lab:
         require(user['packages'] == ['upgrade'] and user['token'] == self.token,
                 'IPTV subscriber changed')
 
+    def media_probe(self):
+        deadline = time.monotonic() + 20
+        manifest = None
+        while time.monotonic() < deadline:
+            try:
+                _, body = self.request('/upgrade_smoke/index.m3u8')
+                if b'#EXTM3U' in body and b'#EXTINF' in body:
+                    manifest = body.decode('utf-8')
+                    break
+            except urllib.error.HTTPError as error:
+                if error.code not in (404, 425, 503):
+                    raise
+            time.sleep(0.2)
+        require(manifest is not None, 'test stream produced no HLS segment')
+        segments = [line.strip() for line in manifest.splitlines()
+                    if line.strip() and not line.startswith('#')]
+        require(bool(segments), 'HLS playlist has no media URI')
+        url = urllib.parse.urlsplit(urllib.parse.urljoin(
+            f'http://127.0.0.1:{self.port}/upgrade_smoke/index.m3u8', segments[-1]))
+        require(url.hostname == '127.0.0.1' and url.port == self.port
+                and url.path.startswith('/upgrade_smoke/') and not url.fragment,
+                'HLS segment escaped owned loopback stream')
+        _, segment = self.request(url.path + ('?' + url.query if url.query else ''))
+        require(isinstance(segment, bytes) and len(segment) >= 1880,
+                'HLS segment is missing or too short')
+        probe = subprocess.run([
+            self.ffprobe, '-v', 'error', '-show_entries', 'stream=codec_name',
+            '-of', 'json', '-i', 'pipe:0'], input=segment, capture_output=True,
+            timeout=8, check=True, env=self.env)
+        streams = json.loads(probe.stdout)['streams']
+        require(any(stream.get('codec_name') == 'h264' for stream in streams),
+                'packaged stream did not decode as H.264')
 
-def smoke(previous, current):
+
+def smoke(previous, current, media=False):
     with tempfile.TemporaryDirectory(prefix='flussonix-cold-upgrade-') as name:
-        lab = Lab(Path(name))
+        lab = Lab(Path(name), media)
         with lab.daemon(previous, 'previous-first'):
             lab.saved_config(create=True)
+            if media:
+                lab.media_probe()
         config = (lab.state / 'config.json').read_bytes()
         with lab.daemon(current, 'current-first'):
             lab.saved_config()
             lab.subscriber(create=True)
+            if media:
+                lab.media_probe()
         iptv = lab.state / 'iptv.json'
         iptv_bytes = iptv.read_bytes()
         require((lab.state / 'config.json').read_bytes() == config,
@@ -154,12 +204,16 @@ def smoke(previous, current):
         require(iptv.stat().st_mode & 0o077 == 0, 'IPTV data is not owner-only')
         with lab.daemon(previous, 'previous-rollback'):
             lab.saved_config()
+            if media:
+                lab.media_probe()
         require((lab.state / 'config.json').read_bytes() == config,
                 'rollback changed saved configuration')
         require(iptv.read_bytes() == iptv_bytes, 'rollback changed IPTV data')
         with lab.daemon(current, 'current-return'):
             lab.saved_config()
             lab.subscriber()
+            if media:
+                lab.media_probe()
         require((lab.state / 'config.json').read_bytes() == config,
                 'return to current changed saved configuration')
         require(iptv.read_bytes() == iptv_bytes, 'return to current changed IPTV data')
@@ -170,8 +224,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--previous', required=True, type=Path)
     parser.add_argument('--current', required=True, type=Path)
+    parser.add_argument('--media', action='store_true',
+                        help='also decode packaged HLS output with independent FFprobe')
     args = parser.parse_args()
-    smoke(package(args.previous), package(args.current))
+    smoke(package(args.previous), package(args.current), args.media)
 
 
 if __name__ == '__main__':
