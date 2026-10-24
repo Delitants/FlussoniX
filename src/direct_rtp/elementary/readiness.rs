@@ -143,7 +143,20 @@ mod tests {
     }
     #[test]
     fn owned_readiness_observes_pairs_without_claiming_free_ports() {
-        let first = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        // Other parallel media tests use ephemeral UDP ports. Choose a free
+        // port below that range so their socket churn cannot falsify this
+        // observer's after-close assertion.
+        let ephemeral_start = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+            .unwrap()
+            .split_ascii_whitespace()
+            .next()
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+        let first = (1025..ephemeral_start)
+            .rev()
+            .find_map(|port| std::net::UdpSocket::bind(("127.0.0.1", port)).ok())
+            .expect("free non-ephemeral UDP fixture port");
         let p = first.local_addr().unwrap().port();
         assert!(bound(&[p]).unwrap());
         drop(first);
