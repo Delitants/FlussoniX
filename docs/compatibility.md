@@ -140,8 +140,10 @@ prefixed with `-`; the first differing field decides the order. Dotted paths
 traverse objects in the returned effective stream or saved template row.
 Ordering precedes pagination and `select`, so fields omitted from the response
 can still determine order. Filters, search and collection envelopes retain
-their existing behavior. Default ordering remains ascending `name`. Ascending
-`name` breaks ties unless explicitly requested, including explicit `-name`.
+their existing behavior. Streams without `sort` use ascending `position`, with
+ascending `name` breaking ties; Templates still default to ascending `name`.
+Explicit `sort=name` keeps name order, including when it differs from the
+Streams default.
 
 Integers compare numerically without loss of signed/unsigned 64-bit precision.
 Strings use case-sensitive UTF-8 lexical order; booleans sort `false` before
@@ -161,9 +163,11 @@ their existing behavior. Sorting neither saves configuration nor starts media.
 This independently implemented scalar profile follows the official
 [sorting design](https://flussonic.com/doc/fms/api/flussonic-api-design/#sorting-collections)
 and read-only inspection of the installed 26.04.1 collection comparator and
-[public handler](https://github.com/flussonic/openapi_handler). Vendor ordering
-of complete arrays/objects, implicit position/default-key parity and sort-key
-cursors across changing snapshots remain unqualified as vendor parity. The
+[public handler](https://github.com/flussonic/openapi_handler). A bounded,
+read-only reference check on 2026-10-24 confirmed position-ordered default
+Streams pages and position-only continuation bounds. Vendor ordering of complete
+arrays/objects, missing/noninteger positions and sort-key cursors across changing
+snapshots remain unqualified as vendor parity. The
 [independent value-based cursor profile](#implemented-value-based-collection-cursors)
 now continues the supported scalar order across insertions and deletions.
 
@@ -171,9 +175,10 @@ now continues the supported scalar order across insertions and deletions.
 
 Streams and Templates collections return opaque `next` and `prev` tokens.
 URL-encode a token as the next request's `cursor`; retain the collection, sort,
-filter and search arguments. `limit` and `select` may change. Omitted sort and
-explicit `sort=name` share the same context. Counts describe the current filtered
-collection before the cursor and page limit. Empty pages have null navigation.
+filter and search arguments. `limit` and `select` may change. Omitted Streams
+sort and explicit `sort=name` have different orders; Templates retain name order
+by default. Counts describe the current filtered collection before the cursor
+and page limit. Empty pages have null navigation.
 Item GET and other collections keep their existing contracts.
 
 The independent native token is standard Base64 of a URL query containing one
@@ -194,14 +199,21 @@ across a boundary; snapshot isolation and exactly-once traversal during such
 changes are not promised. New rows before an already-passed boundary are not
 included in its forward continuation.
 
-Inbound legacy `$position_gt=<nonnegative integer>` tokens remain accepted,
-including safe exhaustion at the platform's maximum integer. For identity-only
-`name` or `-name` sorting, reference `name_gt` / `name_lt` bounds are accepted;
+For default Streams pages with nonnegative integer positions, outgoing tokens
+use the reference's Base64-encoded `$position_gt` or `$position_lt` with
+`$reversed=true` for backward pages. A boundary that splits equal positions
+uses the native value-based token so no row is skipped. Pages with missing or
+noninteger positions also use native tokens. Incoming default-position bounds
+compare row positions, including safe exhaustion at the platform's maximum
+integer. Explicit `sort=name` retains the earlier positional-offset token
+compatibility. For identity-only `name` or `-name` sorting, reference
+`name_gt` / `name_lt` bounds are accepted;
 backward bounds include `$reversed=true`. An optional reference `$position_gt`
 or `$position_lt` is validated and treated as redundant with the unique name.
 For example, Base64 of `$position_gt=2&name_gt=a1` continues ascending names
 strictly after `a1`. These incoming reference/legacy tokens lack native context
-binding. New responses always return the native profile, even after legacy input.
+binding. New default Streams responses use reference position bounds when safe;
+other responses use the native profile.
 
 Malformed Base64, URL escapes or UTF-8; duplicate inner query keys; unsupported
 reference compound bounds; native schema/version/context/key mismatches; and
@@ -215,9 +227,10 @@ may require restarting from the first page because argument values are bound.
 This profile follows the official
 [cursor API design](https://flussonic.com/doc/fms/api/flussonic-api-design/#cursors)
 and read-only reference inspection, without a vendor build/runtime dependency.
-Full vendor compound-cursor serialization, implicit position/default ordering,
-and reference filtering quirks remain unqualified. Vendor clients that decode or
-construct other cursor dialects require further interoperability qualification.
+Full vendor compound-cursor serialization, positions assigned for streams that
+omit them, and reference filtering quirks remain unqualified. Vendor clients
+that decode or construct other cursor dialects require further interoperability
+qualification.
 
 ## Cluster and load-balancing contract
 

@@ -85,7 +85,11 @@ async fn get(
 }
 
 async fn names(app: &Arc<App>, kind: &str, pairs: &[(&str, &str)], expected: &[&str]) {
-    let (status, body) = get(app, kind, pairs, true).await;
+    let mut query = pairs.to_vec();
+    if kind == "streams" && !query.iter().any(|(key, _)| *key == "sort") {
+        query.push(("sort", "name"));
+    }
+    let (status, body) = get(app, kind, &query, true).await;
     assert_eq!(status, StatusCode::OK, "{pairs:?}: {body}");
     let actual = body[kind]
         .as_array()

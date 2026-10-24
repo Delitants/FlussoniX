@@ -33,6 +33,7 @@ struct Boundary {
 enum Cursor {
     Start,
     Position(usize),
+    PositionBound(usize, Direction),
     Boundary(Boundary),
 }
 
@@ -47,7 +48,13 @@ pub(crate) fn paginate(
     kind: &str,
     query: &HashMap<String, String>,
 ) -> Result<Page, &'static str> {
-    let sort = Sort::new(query.get("sort").map(String::as_str));
+    let default_stream_order = kind == "streams" && !query.contains_key("sort");
+    let sort = Sort::new(
+        query
+            .get("sort")
+            .map(String::as_str)
+            .or(default_stream_order.then_some("position")),
+    );
     // Bind the collection, canonical sort specification and original filter/search
     // arguments. Projection and page size may change without changing membership.
     let membership = query
@@ -61,10 +68,14 @@ pub(crate) fn paginate(
         )
     );
     let cursor = match query.get("cursor") {
-        Some(token) => decode(token, &sort, &context)?,
+        Some(token) => decode(token, &sort, &context, default_stream_order)?,
         None => Cursor::Start,
     };
     items.sort_by(|left, right| sort.compare(left, right));
+    let reference_positions = default_stream_order
+        && items
+            .iter()
+            .all(|row| row.get("position").and_then(Value::as_u64).is_some());
     let limit = query
         .get("limit")
         .and_then(|v| v.parse::<usize>().ok())
@@ -75,6 +86,22 @@ pub(crate) fn paginate(
         Cursor::Position(offset) => {
             let start = offset.min(items.len());
             (start, start.saturating_add(limit).min(items.len()))
+        }
+        Cursor::PositionBound(position, Direction::Forward) => {
+            if !reference_positions {
+                return Err(INVALID);
+            }
+            let start =
+                items.partition_point(|row| row["position"].as_u64().unwrap() <= position as u64);
+            (start, start.saturating_add(limit).min(items.len()))
+        }
+        Cursor::PositionBound(position, Direction::Backward) => {
+            if !reference_positions {
+                return Err(INVALID);
+            }
+            let end =
+                items.partition_point(|row| row["position"].as_u64().unwrap() < position as u64);
+            (end.saturating_sub(limit), end)
         }
         Cursor::Boundary(boundary) => match boundary.direction {
             Direction::Forward => {
@@ -98,19 +125,41 @@ pub(crate) fn paginate(
     };
     if start < end {
         if end < items.len() {
-            page.next = Some(encode(
-                &sort,
-                &context,
-                &items[end - 1],
-                Direction::Forward,
-            )?);
+            page.next = Some(
+                if reference_positions && items[end - 1]["position"] != items[end]["position"] {
+                    encode_reference_position(&items[end - 1], Direction::Forward)?
+                } else {
+                    encode(&sort, &context, &items[end - 1], Direction::Forward)?
+                },
+            );
         }
         if start > 0 {
-            page.prev = Some(encode(&sort, &context, &items[start], Direction::Backward)?);
+            page.prev = Some(
+                if reference_positions && items[start - 1]["position"] != items[start]["position"] {
+                    encode_reference_position(&items[start], Direction::Backward)?
+                } else {
+                    encode(&sort, &context, &items[start], Direction::Backward)?
+                },
+            );
         }
         page.items = items.drain(start..end).collect();
     }
     Ok(page)
+}
+
+fn encode_reference_position(row: &Value, direction: Direction) -> Result<String, &'static str> {
+    let position = row["position"].as_u64().ok_or(INVALID)?.to_string();
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    match direction {
+        Direction::Forward => {
+            query.append_pair("$position_gt", &position);
+        }
+        Direction::Backward => {
+            query.append_pair("$position_lt", &position);
+            query.append_pair("$reversed", "true");
+        }
+    }
+    Ok(STANDARD.encode(query.finish()))
 }
 
 fn encode(
@@ -136,7 +185,12 @@ fn encode(
     Ok(token)
 }
 
-fn decode(token: &str, sort: &Sort<'_>, context: &str) -> Result<Cursor, &'static str> {
+fn decode(
+    token: &str,
+    sort: &Sort<'_>,
+    context: &str,
+    default_stream_order: bool,
+) -> Result<Cursor, &'static str> {
     if token.len() > MAX_TOKEN {
         return Err(INVALID);
     }
@@ -163,6 +217,26 @@ fn decode(token: &str, sort: &Sort<'_>, context: &str) -> Result<Cursor, &'stati
             return Err(INVALID);
         }
         return Ok(Cursor::Boundary(boundary));
+    }
+    if default_stream_order {
+        if pairs.len() == 1
+            && let Some(position) = pairs.get("$position_gt")
+        {
+            return Ok(Cursor::PositionBound(
+                position_value(position)?,
+                Direction::Forward,
+            ));
+        }
+        if pairs.len() == 2
+            && pairs.get("$reversed").is_some_and(|value| value == "true")
+            && let Some(position) = pairs.get("$position_lt")
+        {
+            return Ok(Cursor::PositionBound(
+                position_value(position)?,
+                Direction::Backward,
+            ));
+        }
+        return Err(INVALID);
     }
     if pairs.len() == 1
         && let Some(position) = pairs.get("$position_gt")
