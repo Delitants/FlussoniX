@@ -101,6 +101,9 @@ async fn cancellation_wakes_pending_read_write_vectored_flush_and_shutdown() {
             },
             cancelled: Box::pin(control.abort.clone().cancelled_owned()),
             reset: false,
+            first_request: Arc::new(AtomicBool::new(false)),
+            header_deadline: None,
+            _reservation: None,
         };
         let task = tokio::spawn(async move {
             let error = match operation {
@@ -128,6 +131,97 @@ async fn cancellation_wakes_pending_read_write_vectored_flush_and_shutdown() {
 }
 
 use crate::transport_tls_fixture as tls_fixture;
+
+#[tokio::test]
+async fn incomplete_http_headers_expire_before_routing() {
+    use axum::routing::get;
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let stop = CancellationToken::new();
+    let server = tokio::spawn(serve_listener(
+        tcp,
+        Router::new().route("/", get(|| async { "ready" })),
+        stop,
+    ));
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: local")
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(12), async {
+        stream.read(&mut [0; 1]).await
+    })
+    .await;
+    server.abort();
+    let _ = server.await;
+    assert!(
+        result.is_ok(),
+        "incomplete header socket outlived its admission deadline"
+    );
+}
+
+#[tokio::test]
+async fn incomplete_https_headers_expire_after_tls_handshake() {
+    use axum::routing::get;
+    use tokio_rustls::rustls::pki_types::ServerName;
+    let cert = tls_fixture::Certificates::new();
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let stop = CancellationToken::new();
+    let server = tokio::spawn(serve_listener(
+        crate::http_tls::Listener::new(tcp, cert.server()),
+        Router::new().route("/", get(|| async { "ready" })),
+        stop,
+    ));
+    let socket = TcpStream::connect(address).await.unwrap();
+    let connector = tokio_rustls::TlsConnector::from(cert.client());
+    let mut stream = connector
+        .connect(ServerName::try_from("localhost").unwrap(), socket)
+        .await
+        .unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: local")
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(12), async {
+        stream.read(&mut [0; 1]).await
+    })
+    .await;
+    server.abort();
+    let _ = server.await;
+    assert!(
+        result.is_ok(),
+        "incomplete HTTPS header socket outlived its admission deadline"
+    );
+}
+
+#[tokio::test]
+async fn admission_rejects_excess_sockets_and_releases_capacity_on_drop() {
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let mut guarded = Guarded(tcp, Arc::new(Admission::new(1, 1)));
+    let first_client = TcpStream::connect(address).await.unwrap();
+    let (first_io, _) = guarded.accept().await;
+    let accepting = tokio::spawn(async move { guarded.accept().await });
+
+    let mut excess_client = TcpStream::connect(address).await.unwrap();
+    let mut byte = [0; 1];
+    let rejected = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        excess_client.read(&mut byte),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(rejected, Ok(0) | Err(_)));
+
+    drop(first_io);
+    drop(first_client);
+    let _replacement_client = TcpStream::connect(address).await.unwrap();
+    let (_replacement_io, _) = tokio::time::timeout(std::time::Duration::from_secs(1), accepting)
+        .await
+        .unwrap()
+        .unwrap();
+}
 struct HeldBody {
     body: axum::body::Body,
     _watch: Watch,

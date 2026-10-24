@@ -7,20 +7,24 @@ use axum::{
     serve::{IncomingStream, Listener},
 };
 use std::{
+    collections::HashMap,
     future::Future,
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicU8, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     task::{Context, Poll},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
+    sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
+    time::Sleep,
 };
 use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
@@ -34,6 +38,7 @@ pub(crate) enum Reason {
 pub(crate) struct Control {
     abort: CancellationToken,
     active: Arc<Mutex<Option<Arc<()>>>>,
+    first_request: Arc<AtomicBool>,
 }
 pub(crate) struct Watch {
     control: Control,
@@ -132,9 +137,24 @@ struct Io<T> {
     inner: T,
     cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
     reset: bool,
+    first_request: Arc<AtomicBool>,
+    header_deadline: Option<Pin<Box<Sleep>>>,
+    _reservation: Option<Reservation>,
 }
 impl<T: ResetSocket + Unpin> Io<T> {
     fn check(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        if !self.first_request.load(Ordering::Acquire)
+            && self
+                .header_deadline
+                .as_mut()
+                .is_some_and(|deadline| deadline.as_mut().poll(cx).is_ready())
+        {
+            self.inner.reset_on_drop()?;
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP request headers expired",
+            ));
+        }
         if self.cancelled.as_mut().poll(cx).is_ready() {
             if !self.reset {
                 self.inner.reset_on_drop()?;
@@ -187,7 +207,70 @@ impl<T: AsyncWrite + ResetSocket + Unpin> AsyncWrite for Io<T> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
-struct Guarded<L>(L);
+struct Admission {
+    slots: Arc<Semaphore>,
+    by_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    per_ip: usize,
+}
+struct Reservation {
+    _slot: OwnedSemaphorePermit,
+    by_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut by_ip = self.by_ip.lock().unwrap();
+        if let Some(count) = by_ip.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                by_ip.remove(&self.ip);
+            }
+        }
+    }
+}
+impl Admission {
+    fn new(total: usize, per_ip: usize) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(total)),
+            by_ip: Arc::new(Mutex::new(HashMap::new())),
+            per_ip,
+        }
+    }
+    fn for_process() -> Arc<Self> {
+        static SHARED: OnceLock<Arc<Admission>> = OnceLock::new();
+        SHARED
+            .get_or_init(|| {
+                let mut limits = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                let soft_limit =
+                    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } == 0 {
+                        limits.rlim_cur.min(65_536) as usize
+                    } else {
+                        1024
+                    };
+                let total = (soft_limit / 2).clamp(32, 32_768);
+                Arc::new(Self::new(total, (total * 3 / 4).max(1)))
+            })
+            .clone()
+    }
+    fn try_reserve(&self, ip: IpAddr) -> Option<Reservation> {
+        let slot = self.slots.clone().try_acquire_owned().ok()?;
+        let mut by_ip = self.by_ip.lock().unwrap();
+        let count = by_ip.entry(ip).or_default();
+        if *count >= self.per_ip {
+            return None;
+        }
+        *count += 1;
+        Some(Reservation {
+            _slot: slot,
+            by_ip: self.by_ip.clone(),
+            ip,
+        })
+    }
+}
+struct Guarded<L>(L, Arc<Admission>);
 impl<L: Listener<Addr = SocketAddr>> Listener for Guarded<L>
 where
     L::Io: ResetSocket,
@@ -195,7 +278,13 @@ where
     type Io = Io<L::Io>;
     type Addr = Peer;
     async fn accept(&mut self) -> (Self::Io, Peer) {
-        let (inner, address) = self.0.accept().await;
+        let (inner, address, reservation) = loop {
+            let (inner, address) = self.0.accept().await;
+            if let Some(reservation) = self.1.try_reserve(address.ip()) {
+                break (inner, address, reservation);
+            }
+            drop(inner);
+        };
         let control = Control::default();
         let cancelled = Box::pin(control.abort.clone().cancelled_owned());
         (
@@ -203,6 +292,9 @@ where
                 inner,
                 cancelled,
                 reset: false,
+                first_request: control.first_request.clone(),
+                header_deadline: Some(Box::pin(tokio::time::sleep(Duration::from_secs(5)))),
+                _reservation: Some(reservation),
             },
             Peer { address, control },
         )
@@ -227,6 +319,7 @@ async fn context(
     mut request: Request,
     next: Next,
 ) -> Response {
+    peer.control.first_request.store(true, Ordering::Release);
     request.extensions_mut().insert(ConnectInfo(peer.address));
     request.extensions_mut().insert(peer.control);
     next.run(request).await
@@ -241,7 +334,7 @@ where
     L::Io: ResetSocket,
 {
     axum::serve(
-        Guarded(listener),
+        Guarded(listener, Admission::for_process()),
         router
             .layer(from_fn(context))
             .into_make_service_with_connect_info::<Peer>(),

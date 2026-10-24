@@ -764,8 +764,10 @@ fn redact_view_value(value: &mut Value) {
                         | "on_publish"
                 ) {
                     *field = Value::String("[redacted]".into());
-                } else if matches!(key.as_str(), "url" | "endpoint" | "upstream_source")
-                    || key.ends_with("_url")
+                } else if matches!(
+                    key.as_str(),
+                    "url" | "endpoint" | "upstream_source" | "source"
+                ) || key.ends_with("_url")
                 {
                     *field = match field.as_str() {
                         Some("testsrc://" | "publish://") => field.clone(),
@@ -2448,6 +2450,30 @@ mod vendor_namespace_tests {
             "previous native authority survived vendor namespace reservation"
         );
         app.media.stop_all().await;
+    }
+}
+
+#[cfg(test)]
+mod view_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn viewer_role_hides_source_activation_addresses_in_node_status() {
+        let mut node = json!({
+            "source_activation": {"owned": {"source": "https://origin.internal:8443"}},
+            "vendor_source_activation": {"owned": {"source": "https://vendor.internal:8443"}},
+            "active": 3
+        });
+        redact_view_value(&mut node);
+        assert_eq!(
+            node["source_activation"]["owned"]["source"],
+            "https://[redacted]"
+        );
+        assert_eq!(
+            node["vendor_source_activation"]["owned"]["source"],
+            "https://[redacted]"
+        );
+        assert_eq!(node["active"], 3);
     }
 }
 
