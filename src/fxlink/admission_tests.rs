@@ -116,6 +116,7 @@ async fn cached_compact_mix_survives_cold_190ms_rtt_without_extending_500ms_reco
             budget,
             halt,
             listener.egress.clone(),
+            None,
         )
         .await;
         listener.endpoint.close(0u32.into(), b"done");
