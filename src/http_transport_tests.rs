@@ -243,3 +243,189 @@ async fn completed_http_and_https_bodies_keep_the_same_connection_after_late_can
         }
     }
 }
+
+#[tokio::test]
+async fn incomplete_http_header_expires_without_stopping_healthy_requests() {
+    use axum::routing::get;
+
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let stop = CancellationToken::new();
+    let server = tokio::spawn(serve_listener(
+        tcp,
+        Router::new().route("/healthy", get(|| async { "ready" })),
+        stop.clone(),
+    ));
+
+    let mut slow = TcpStream::connect(address).await.unwrap();
+    slow.write_all(b"GET /healthy HTTP/1.1\r\nHost: localhost\r\nX-Hold:")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    let closed = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        slow.read_to_end(&mut response),
+    )
+    .await;
+    let healthy = reqwest::get(format!("http://{address}/healthy"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    stop.cancel();
+    server.abort();
+    let _ = server.await;
+
+    assert!(closed.is_ok(), "an incomplete header must have a deadline");
+    assert_eq!(healthy, "ready");
+}
+
+#[tokio::test]
+async fn incomplete_https_header_expires_after_tls_handshake() {
+    use axum::routing::get;
+
+    let cert = tls_fixture::Certificates::new();
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let stop = CancellationToken::new();
+    let server = tokio::spawn(serve_listener(
+        crate::http_tls::Listener::new(tcp, cert.server()),
+        Router::new().route("/healthy", get(|| async { "ready" })),
+        stop.clone(),
+    ));
+
+    let socket = TcpStream::connect(address).await.unwrap();
+    let connector = tokio_rustls::TlsConnector::from(cert.client());
+    let mut slow = connector
+        .connect(
+            tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            socket,
+        )
+        .await
+        .unwrap();
+    slow.write_all(b"GET /healthy HTTP/1.1\r\nHost: localhost\r\nX-Hold:")
+        .await
+        .unwrap();
+    let mut received = Vec::new();
+    let closed = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        slow.read_to_end(&mut received),
+    )
+    .await;
+    stop.cancel();
+    server.abort();
+    let _ = server.await;
+
+    assert!(
+        closed.is_ok(),
+        "completed TLS must not disable the HTTP deadline"
+    );
+}
+
+#[tokio::test]
+async fn second_keepalive_request_gets_a_fresh_header_deadline() {
+    use axum::routing::get;
+
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let stop = CancellationToken::new();
+    let server = tokio::spawn(serve_listener(
+        tcp,
+        Router::new().route("/healthy", get(|| async { "ready" })),
+        stop.clone(),
+    ));
+
+    let mut socket = TcpStream::connect(address).await.unwrap();
+    socket
+        .write_all(b"GET /healthy HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut first = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !first.windows(5).any(|bytes| bytes == b"ready") {
+            let mut chunk = [0; 1024];
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "first response closed unexpectedly");
+            first.extend_from_slice(&chunk[..count]);
+        }
+    })
+    .await
+    .unwrap();
+    socket
+        .write_all(b"GET /healthy HTTP/1.1\r\nHost: localhost\r\nX-Hold:")
+        .await
+        .unwrap();
+    let mut second = Vec::new();
+    let closed = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        socket.read_to_end(&mut second),
+    )
+    .await;
+    stop.cancel();
+    server.abort();
+    let _ = server.await;
+
+    assert!(
+        closed.is_ok(),
+        "keep-alive request headers need a new deadline"
+    );
+}
+
+#[tokio::test]
+async fn established_connection_limit_rejects_excess_and_recovers_after_deadline() {
+    use axum::routing::get;
+
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let stop = CancellationToken::new();
+    let server = tokio::spawn(serve_listener_bounded(
+        tcp,
+        Router::new().route("/healthy", get(|| async { "ready" })),
+        stop.clone(),
+        1,
+    ));
+
+    let mut slow = TcpStream::connect(address).await.unwrap();
+    slow.write_all(b"GET /healthy HTTP/1.1\r\nHost: localhost\r\nX-Hold:")
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let mut excess = TcpStream::connect(address).await.unwrap();
+    excess
+        .write_all(b"GET /healthy HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut received = Vec::new();
+    let closed = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        excess.read_to_end(&mut received),
+    )
+    .await;
+    let mut ignored = Vec::new();
+    let slow_expired = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        slow.read_to_end(&mut ignored),
+    )
+    .await;
+    let healthy = reqwest::get(format!("http://{address}/healthy"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    stop.cancel();
+    server.abort();
+    let _ = server.await;
+
+    assert!(closed.is_ok(), "excess connection must be closed promptly");
+    assert!(
+        received.is_empty(),
+        "excess connection must not receive media"
+    );
+    assert!(
+        slow_expired.is_ok(),
+        "a partial request must release its slot"
+    );
+    assert_eq!(healthy, "ready");
+}
