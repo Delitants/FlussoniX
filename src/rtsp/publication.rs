@@ -480,6 +480,7 @@ pub(super) async fn receive<W: AsyncWrite + Unpin>(
     cancel: &CancellationToken,
     secure: bool,
     pool: Option<Arc<udp::Pool>>,
+    preauth_lease: &mut Option<super::PreAuthLease>,
 ) -> std::io::Result<()> {
     let auth = auth::Auth::new(&r.uri);
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -513,6 +514,7 @@ pub(super) async fn receive<W: AsyncWrite + Unpin>(
             Err(code) => return reply(write, cancel, code, r.cseq, &[]).await,
         }
     };
+    drop(preauth_lease.take());
     let result = run(&mut s, r.cseq, controls, write, app, cancel).await;
     if let Some(p) = s.publication.take() {
         let worker = p.worker.clone();

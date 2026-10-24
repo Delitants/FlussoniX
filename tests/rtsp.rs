@@ -5,12 +5,13 @@ use flussonix::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
+    net::SocketAddr,
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
 };
 use tokio_util::sync::CancellationToken;
 async fn fixture(
@@ -51,6 +52,59 @@ async fn connect(url: &str) -> BufReader<TcpStream> {
             .await
             .unwrap(),
     )
+}
+#[tokio::test]
+async fn unauthenticated_options_from_one_address_cannot_exhaust_rtsp_listener() {
+    let (_d, app, url, cancel, task) = fixture("standalone").await;
+    let endpoint = url::Url::parse(&url).unwrap();
+    let address: SocketAddr = format!(
+        "{}:{}",
+        endpoint.host_str().unwrap(),
+        endpoint.port().unwrap()
+    )
+    .parse()
+    .unwrap();
+    let mut held = Vec::new();
+    for _ in 0..256 {
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        let _ = socket
+            .write_all(format!("OPTIONS {url} RTSP/1.0\r\nCSeq: 1\r\n\r\n").as_bytes())
+            .await;
+        held.push(socket);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+    let mut independent = BufReader::new(socket.connect(address).await.unwrap());
+    assert_eq!(request(&mut independent, "OPTIONS", &url, "").await.0, 200);
+    drop(held);
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+    app.media.stop_all().await;
+}
+#[tokio::test]
+async fn authenticated_viewers_release_preauth_capacity_for_same_address() {
+    let (_d, app, url, cancel, task) = fixture("standalone").await;
+    let mut admitted = Vec::new();
+    for _ in 0..20 {
+        let mut socket = connect(&url).await;
+        assert_eq!(
+            request(
+                &mut socket,
+                "DESCRIBE",
+                &format!("{url}?token=owned-token"),
+                "Accept: application/sdp\r\n"
+            )
+            .await
+            .0,
+            200
+        );
+        admitted.push(socket);
+    }
+    drop(admitted);
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+    app.media.stop_all().await;
 }
 async fn request(
     s: &mut BufReader<TcpStream>,

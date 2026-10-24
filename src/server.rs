@@ -697,6 +697,9 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     if method != axum::http::Method::GET && role != Role::Edit {
         return error(StatusCode::FORBIDDEN, "edit credentials required");
     }
+    if method != axum::http::Method::GET && !management_browser_origin_allowed(&request) {
+        return error(StatusCode::FORBIDDEN, "cross-origin management request");
+    }
     let tail = percent_encoding::percent_decode_str(
         request.uri().path().trim_start_matches("/streamer/api/v3/"),
     )
@@ -945,6 +948,80 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     }
     result[kind] = json!(page);
     management_read_response(role, result)
+}
+
+fn management_browser_origin_allowed(request: &Request) -> bool {
+    if let Some(site) = request.headers().get("sec-fetch-site") {
+        if !matches!(site.to_str(), Ok("same-origin" | "none")) {
+            return false;
+        }
+    }
+    // A legacy browser may omit Origin and Fetch Metadata on a simple form POST.
+    // The config POST only validates text, but other management POSTs can act.
+    if request.method() == axum::http::Method::POST
+        && request.uri().path() != "/streamer/api/v3/config"
+        && request.headers().get("origin").is_none()
+        && request.headers().get("sec-fetch-site").is_none()
+        && request
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                matches!(
+                    value
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain"
+                )
+            })
+    {
+        return false;
+    }
+    let Some(origin) = request.headers().get("origin") else {
+        return true;
+    };
+    let Some(authority) = request
+        .uri()
+        .authority()
+        .map(|value| value.as_str())
+        .or_else(|| {
+            request
+                .headers()
+                .get("host")
+                .and_then(|value| value.to_str().ok())
+        })
+    else {
+        return false;
+    };
+    let scheme = if request
+        .extensions()
+        .get::<crate::http_tls::SecureHttp>()
+        .is_some()
+    {
+        "https"
+    } else {
+        "http"
+    };
+    let target = url::Url::parse(&format!("{scheme}://{authority}/"));
+    let supplied = origin
+        .to_str()
+        .ok()
+        .and_then(|value| url::Url::parse(value).ok());
+    match (target, supplied) {
+        (Ok(target), Some(supplied)) => {
+            supplied.path() == "/"
+                && supplied.query().is_none()
+                && supplied.fragment().is_none()
+                && supplied.username().is_empty()
+                && supplied.password().is_none()
+                && supplied.origin() == target.origin()
+        }
+        _ => false,
+    }
 }
 async fn read_json(request: Request) -> Result<Value, (StatusCode, String)> {
     let bytes = axum::body::to_bytes(request.into_body(), 2 * 1024 * 1024)

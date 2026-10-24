@@ -11,19 +11,65 @@ use crate::{
 use protocol::{Event, Request, Transport};
 use std::{
     collections::{HashMap, VecDeque},
-    net::SocketAddr,
-    sync::{Arc, atomic::Ordering},
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex, atomic::Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncWriteExt, BufReader},
     net::TcpListener,
-    sync::{Semaphore, mpsc},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     task::{JoinHandle, JoinSet},
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 const PUBLIC: &str = "OPTIONS, DESCRIBE, SETUP, PLAY, ANNOUNCE, RECORD, GET_PARAMETER, TEARDOWN";
+const MAX_PREAUTH_CONNECTIONS: usize = 64;
+const MAX_PREAUTH_PER_IP: usize = 16;
+struct PreAuthGate {
+    slots: Arc<Semaphore>,
+    by_ip: Mutex<HashMap<IpAddr, usize>>,
+}
+impl PreAuthGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            slots: Arc::new(Semaphore::new(MAX_PREAUTH_CONNECTIONS)),
+            by_ip: Mutex::new(HashMap::new()),
+        })
+    }
+    fn acquire(self: &Arc<Self>, ip: IpAddr) -> Option<PreAuthLease> {
+        let permit = self.slots.clone().try_acquire_owned().ok()?;
+        let mut by_ip = self.by_ip.lock().unwrap_or_else(|e| e.into_inner());
+        let count = by_ip.entry(ip).or_default();
+        if *count >= MAX_PREAUTH_PER_IP {
+            return None;
+        }
+        *count += 1;
+        Some(PreAuthLease {
+            gate: self.clone(),
+            ip,
+            _permit: permit,
+            started: Instant::now(),
+        })
+    }
+}
+pub(super) struct PreAuthLease {
+    gate: Arc<PreAuthGate>,
+    ip: IpAddr,
+    _permit: OwnedSemaphorePermit,
+    started: Instant,
+}
+impl Drop for PreAuthLease {
+    fn drop(&mut self) {
+        let mut by_ip = self.gate.by_ip.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = by_ip.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                by_ip.remove(&self.ip);
+            }
+        }
+    }
+}
 struct ReaderTask(JoinHandle<()>);
 impl Drop for ReaderTask {
     fn drop(&mut self) {
@@ -159,10 +205,48 @@ async fn serve_connections(
     udp::Pacer::new(rate).map_err(std::io::Error::other)?;
     let udp = pool.map(|pool| UdpOptions { pool, rate });
     let permits = Arc::new(Semaphore::new(256));
+    let preauth = PreAuthGate::new();
     let mut clients = JoinSet::new();
     let result = loop {
-        tokio::select! {biased;_=cancel.cancelled()=>break Ok(()),Some(_)=clients.join_next(),if !clients.is_empty()=>{},accepted=listener.accept()=>{match accepted{Ok((socket,peer))=>{if let Ok(permit)=permits.clone().try_acquire_owned(){let app=app.clone();let cancel=cancel.clone();let udp=udp.clone();let tls=tls.clone();clients.spawn(async move{let _permit=permit;if socket.set_nodelay(true).is_err(){return;}
-        if let Some(tls)=tls{let accepted=tokio::select!{biased;_=cancel.cancelled()=>return,result=tokio::time::timeout(Duration::from_secs(8),tls.accept(socket))=>result};if let Ok(Ok(stream))=accepted{let _=connection(stream,peer,app,cancel,udp,true).await;}}else{let _=connection(socket,peer,app,cancel,udp,false).await;}});}},Err(e)=>break Err(e)}}}
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break Ok(()),
+            Some(_) = clients.join_next(), if !clients.is_empty() => {},
+            accepted = listener.accept() => {
+                let (socket, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => break Err(error),
+                };
+                let Ok(permit) = permits.clone().try_acquire_owned() else {
+                    continue;
+                };
+                let Some(preauth_lease) = preauth.acquire(peer.ip()) else {
+                    continue;
+                };
+                let app = app.clone();
+                let cancel = cancel.clone();
+                let udp = udp.clone();
+                let tls = tls.clone();
+                clients.spawn(async move {
+                    let _permit = permit;
+                    if socket.set_nodelay(true).is_err() {
+                        return;
+                    }
+                    if let Some(tls) = tls {
+                        let accepted = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return,
+                            result = tokio::time::timeout(Duration::from_secs(8), tls.accept(socket)) => result,
+                        };
+                        if let Ok(Ok(stream)) = accepted {
+                            let _ = connection(stream, peer, app, cancel, udp, true, preauth_lease).await;
+                        }
+                    } else {
+                        let _ = connection(socket, peer, app, cancel, udp, false, preauth_lease).await;
+                    }
+                });
+            },
+        }
     };
     cancel.cancel();
     let drain = async { while clients.join_next().await.is_some() {} };
@@ -190,7 +274,9 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
     cancel: CancellationToken,
     udp: Option<UdpOptions>,
     secure: bool,
+    preauth_lease: PreAuthLease,
 ) -> std::io::Result<()> {
+    let mut preauth_lease = Some(preauth_lease);
     let (read, mut write) = tokio::io::split(socket);
     let (tx, mut controls) = mpsc::channel(8);
     let _reader = ReaderTask(tokio::spawn(async move {
@@ -209,12 +295,15 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
     let mut reports = tokio::time::interval(Duration::from_secs(5));
     reports.tick().await;
     loop {
-        let deadline = last_control
+        let mut deadline = last_control
             + Duration::from_secs(if session.as_ref().is_some_and(|s| !s.senders.is_empty()) {
                 60
             } else {
                 30
             });
+        if let Some(lease) = &preauth_lease {
+            deadline = deadline.min(lease.started + Duration::from_secs(30));
+        }
         let due = match session
             .as_mut()
             .and_then(|s| s.pending.as_ref().zip(s.pacer.as_mut()))
@@ -332,11 +421,15 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
                         &cancel,
                         secure,
                         udp.as_ref().map(|o| o.pool.clone()),
+                        &mut preauth_lease,
                     )
                     .await?;
                     break;
                 }
                 let reply = tokio::select! {biased;_=cancel.cancelled()=>break,reply=handle(&request,&mut session,&app,peer,udp.as_ref(),secure)=>reply};
+                if session.is_some() {
+                    drop(preauth_lease.take());
+                }
                 let bytes =
                     protocol::response(reply.code, request.cseq, &reply.headers, &reply.body);
                 bounded_write(&mut write, &bytes, &cancel, session.as_ref()).await?;
