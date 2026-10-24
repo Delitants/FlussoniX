@@ -6,6 +6,7 @@ use crate::source_directory::modern_coordinator::{
 };
 pub use sessions::{HlsSessionFailure, SharedHlsOptions, SharedHlsSessions};
 use std::collections::VecDeque;
+use tokio::sync::broadcast;
 
 #[derive(Default)]
 pub(super) struct StartMode {
@@ -49,7 +50,7 @@ pub struct PackagedSubscription {
     receiver: Receiver,
 }
 enum Receiver {
-    Ts(broadcast::Receiver<Bytes>),
+    Ts(crate::media_queue::Receiver),
     Native(crate::media_queue::Receiver),
 }
 impl Engine {
@@ -194,6 +195,10 @@ impl Engine {
     }
 }
 impl PackagedPlayback {
+    /// Original worker startup allowance; later requests cannot restart it.
+    pub(crate) fn startup_deadline(&self) -> Instant {
+        self.inner.worker.started + self.inner.worker.input_timeout
+    }
     /// Internal protocol adapters retain this playback permission for every
     /// read/write; a worker reference alone never authorizes shared output.
     pub(crate) fn worker(&self) -> Arc<Worker> {

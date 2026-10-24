@@ -197,7 +197,8 @@ async fn encrypted_destination_never_sends_plaintext_and_releases_local_pair() {
         .await
         .unwrap();
     let state=State::new(outputs(&json!({"flussonix_rtp_outputs":[{"url":format!("srtp://127.0.0.1:{p}"),"flussonix_rtp":{"key_file":file}}]})).unwrap().remove(0),0);
-    let (tx, receiver) = tokio::sync::broadcast::channel(4);
+    let tx = flussonix::media_queue::Channel::new(4, 4 * 1024 * 1024);
+    let receiver = tx.subscribe();
     let c = CancellationToken::new();
     let stop = c.clone();
     let s = state.clone();
@@ -333,7 +334,8 @@ async fn unavailable_or_unsafe_key_fails_closed_without_plaintext_or_input_socke
     assert!(UdpSocket::bind((cfg.address.ip(), p + 1)).await.is_ok());
     let listener = UdpSocket::bind(cfg.address).await.unwrap();
     let state=State::new(outputs(&json!({"flussonix_rtp_outputs":[{"url":cfg.endpoint(),"flussonix_rtp":{"key_file":file}}]})).unwrap().remove(0),0);
-    let (tx, rx) = tokio::sync::broadcast::channel(4);
+    let tx = flussonix::media_queue::Channel::new(4, 4 * 1024 * 1024);
+    let rx = tx.subscribe();
     tx.send(bytes::Bytes::from(ts().repeat(7))).unwrap();
     state.clone().run(rx, CancellationToken::new()).await;
     assert_eq!(state.stats()["status"], "failed");

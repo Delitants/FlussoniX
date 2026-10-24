@@ -246,6 +246,34 @@ impl Entries {
             !sessions.is_empty()
         });
     }
+    /// Called under the cache lock, which also serializes new Arc/Weak owners.
+    fn prune(&mut self, now: Instant, capacity_pressure: bool) {
+        self.retain(|_, entry| {
+            // Renewal callbacks carry Arc ownership without an admission count.
+            if Arc::strong_count(entry) > 1
+                || entry.live.load(Ordering::Relaxed) > 0
+                || entry.admissions.load(Ordering::Relaxed) > 0
+            {
+                return true;
+            }
+            let state = entry.state.lock().unwrap();
+            if state.revoked_until.is_some_and(|until| until > now)
+                || state
+                    .playback_seen
+                    .is_some_and(|seen| now.duration_since(seen) < Duration::from_secs(30))
+            {
+                return true;
+            }
+            if capacity_pressure {
+                // Ordinary failed decisions may be checked early, but allowed
+                // sessions keep their normal reconnect/renewal semantics.
+                matches!(state.decision, Decision::Allow)
+            } else {
+                now.duration_since(state.last_seen) < Duration::from_secs(30)
+                    || (!matches!(state.decision, Decision::Allow) && state.next_check > now)
+            }
+        });
+    }
 }
 impl Entry {
     fn occupied(&self) -> bool {
@@ -519,15 +547,12 @@ impl PlaybackAuth {
                 return AuthOutcome::Denied;
             }
             let mut all = self.entries.lock().unwrap();
-            all.retain(|_, e| {
-                let s = e.state.lock().unwrap();
-                e.live.load(Ordering::Relaxed) > 0
-                    || e.admissions.load(Ordering::Relaxed) > 0
-                    || s.last_seen.elapsed() < Duration::from_secs(30)
-                    || (!matches!(s.decision, Decision::Allow) && s.next_check > Instant::now())
-            });
+            all.prune(Instant::now(), false);
             if !all.contains_key(&request.name, &identity) && all.len() >= 20_000 {
-                return AuthOutcome::Denied;
+                all.prune(Instant::now(), true);
+                if all.len() >= 20_000 {
+                    return AuthOutcome::Denied;
+                }
             }
             let entry = all
                 .by_stream
@@ -838,13 +863,7 @@ impl PlaybackAuth {
         use futures_util::{StreamExt, stream};
         let mut due = {
             let mut all = self.entries.lock().unwrap();
-            all.retain(|_, e| {
-                let s = e.state.lock().unwrap();
-                e.live.load(Ordering::Relaxed) > 0
-                    || e.admissions.load(Ordering::Relaxed) > 0
-                    || s.last_seen.elapsed() < Duration::from_secs(30)
-                    || (!matches!(s.decision, Decision::Allow) && s.next_check > Instant::now())
-            });
+            all.prune(Instant::now(), false);
             all.values()
                 .filter_map(|e| {
                     let s = e.state.lock().unwrap();
@@ -1036,6 +1055,9 @@ impl PlaybackAuth {
 
 #[cfg(test)]
 mod idle_memory_tests;
+
+#[cfg(test)]
+mod capacity_tests;
 
 #[cfg(test)]
 mod tests {

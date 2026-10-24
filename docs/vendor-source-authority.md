@@ -54,6 +54,9 @@ revision. A snapshot can outlive edits and asynchronous inventory requests.
 [local-origin preflight](vendor-source-inventory.md#local-origin-candidate-preflight),
 then applies the source namespace/exclusions and composes local viewer policy
 using explicit memberships. Missing memberships never become an empty list.
+Legacy binding remains strict. Modern configured-origin binding can apply the
+policy-equivalence rule without claiming membership
+is known.
 Missing local policy or conflicting groups fail. Remote policy/input fields
 never supply local authority.
 

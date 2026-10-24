@@ -6,6 +6,7 @@ use axum::{
     middleware::{self, Next},
     response::IntoResponse,
 };
+use base64::Engine as _;
 use flussonix::{
     http_tls,
     media::Engine,
@@ -178,6 +179,98 @@ fn credentialed_input(src: &Source, scheme: &str, resource: &str, password: &str
         cfg["inputs"][0]["flussonix_tls_ca"] = json!(src.cert.ca);
     }
     cfg
+}
+
+#[tokio::test]
+async fn uncredentialed_plain_hls_inputs_decode_same_origin_media() {
+    use futures_util::FutureExt;
+    for scheme in ["hls", "http"] {
+        let src = source_with_basic(false, None, false, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "ffmpeg");
+        let result = std::panic::AssertUnwindSafe(async {
+            let address = src.url.strip_prefix("http://").unwrap();
+            let input = format!("{scheme}://{address}/owned/index.m3u8?token=owned-viewer");
+            engine
+                .ensure("plain-hls", &json!({"inputs":[{"url":input}]}))
+                .await
+                .unwrap();
+            decode(&delivered(&engine, "plain-hls").await).await;
+            assert!(src.hits.load(Ordering::SeqCst) > 0);
+        })
+        .catch_unwind()
+        .await;
+        engine.stop_all().await;
+        src.stop().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[tokio::test]
+async fn uncredentialed_plain_http_ts_inputs_decode_continuous_media() {
+    use futures_util::FutureExt;
+    for scheme in ["tshttp", "http"] {
+        let src = source_with_basic(false, None, false, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "ffmpeg");
+        let result = std::panic::AssertUnwindSafe(async {
+            let address = src.url.strip_prefix("http://").unwrap();
+            let input = format!("{scheme}://{address}/transport?token=owned-viewer");
+            let worker = engine
+                .ensure("plain-ts", &json!({"inputs":[{"url":input}]}))
+                .await
+                .unwrap();
+            #[cfg(target_os = "linux")]
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let pid = worker.pid();
+                    if pid != 0
+                        && let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline"))
+                    {
+                        assert!(
+                            !cmdline
+                                .windows(b"owned-viewer".len())
+                                .any(|w| w == b"owned-viewer"),
+                            "FFmpeg argv contains the upstream query secret"
+                        );
+                        let args: Vec<_> = cmdline.split(|b| *b == 0).collect();
+                        let input_arg = args
+                            .windows(2)
+                            .find(|pair| pair[0] == b"-i")
+                            .map(|pair| pair[1])
+                            .expect("FFmpeg input URL");
+                        let url = url::Url::parse(std::str::from_utf8(input_arg).unwrap()).unwrap();
+                        assert_eq!(url.host_str(), Some("127.0.0.1"));
+                        let token = url.path_segments().unwrap().nth(1).unwrap();
+                        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .decode(token)
+                            .unwrap();
+                        assert!(
+                            !decoded
+                                .windows(b"owned-viewer".len())
+                                .any(|w| w == b"owned-viewer"),
+                            "FFmpeg argv contains a reversible upstream query secret"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("FFmpeg process must start");
+            decode(&delivered(&engine, "plain-ts").await).await;
+            assert!(src.hits.load(Ordering::SeqCst) > 0);
+        })
+        .catch_unwind()
+        .await;
+        engine.stop_all().await;
+        src.stop().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
 }
 
 #[tokio::test]

@@ -13,6 +13,7 @@ FlussoniX does not require any official Flussonic components.
 - Transcode video and audio with the CPU or supported Intel/NVIDIA GPUs. The UI reports GPU readiness.
 - Preserve, convert or remove subtitles; supported conversion profiles produce HLS WebVTT.
 - Build a FlussoniX source/CDN cluster with LAN stream pulls and load balancing based on uplink, CPU and RAM.
+- Try FXLink, an opt-in experimental native transport with loss recovery; cross-host and load qualification is pending.
 
 Protocol, codec and API coverage is still incomplete. Mixed Flussonic clusters are under development; [mapped CDN routing](docs/vendor-cdn-placement.md) includes HTTP/RTSP redirects and HTTPS SRT lookup for compatible clients. Explicit Flussonic HTTP source profiles support playback and [equivalent-origin failover](docs/vendor-daemon-failover.md). See [compatibility](docs/compatibility.md) before planning a migration.
 
@@ -23,19 +24,30 @@ Use a test server and an available port. Install **FFmpeg and FFprobe** independ
 [Download a Linux preview](https://github.com/Delitants/FlussoniX/releases). Packaged previews may be older than the current source. Extract the package, open a terminal in its directory and set your credentials:
 
 ```bash
+umask 077
 export FLUSSONIX_ADMIN_USER=admin
 read -r -s -p "Choose an admin password: " FLUSSONIX_ADMIN_PASSWORD
 echo
 export FLUSSONIX_ADMIN_PASSWORD
 export FLUSSONIX_PEER_KEY="$(openssl rand -hex 32)"
+flussonix_data="$HOME/flussonix-data"
+mkdir -p "$flussonix_data"
+chmod 700 "$flussonix_data"
 ```
 
-Keep the peer key the same across nodes in a FlussoniX cluster. To start the downloaded package:
+Save your credentials and generated peer key securely. Reuse them after restarts;
+FlussoniX nodes in the same cluster use the same peer key. To start the downloaded package:
 
 ```bash
 ./bin/flussonix --listen 127.0.0.1:18210 \
-  --config runtime/config.json --media-dir runtime/media --web-dir web
+  --config "$flussonix_data/config.json" \
+  --media-dir "$flussonix_data/media" --web-dir "$PWD/web"
 ```
+
+Keep the state directory, credentials and peer key when upgrading or rolling
+back the binary. The [installation guide](docs/installation.md) covers verified
+downloads and rollback; the [service guide](docs/service-installation.md) covers
+optional systemd operation.
 
 Open [the admin interface](http://127.0.0.1:18210/admin/) and sign in as `admin` with the password you chose. This address accepts connections from the same machine; use an SSH tunnel for remote access.
 
@@ -53,11 +65,12 @@ npm ci --prefix web
 npm run build --prefix web
 ```
 
-Set the credentials shown above, then run:
+Set the credentials and external state directory shown above, then run:
 
 ```bash
 ./target/release/flussonix --listen 127.0.0.1:18210 \
-  --config runtime/config.json --media-dir runtime/media --web-dir web/dist
+  --config "$flussonix_data/config.json" \
+  --media-dir "$flussonix_data/media" --web-dir "$PWD/web/dist"
 ```
 
 ## Documentation

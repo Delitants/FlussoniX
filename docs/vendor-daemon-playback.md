@@ -55,13 +55,59 @@ through the same native callback renewal path. It performs no source discovery;
 missing, inactive, excluded or stale routes return 404. Callback denial closes
 existing guarded responses without reconnecting the private input.
 
-Cold discovery is serialized per source, with at most four concurrent source
-queries, a three-second wire budget, four-second request selection budget and
-500ms minimum spacing between attempts. Complete inventories are cached for their bounded source
-lease; absence may remain cached until its original deadline. Managed routes use
-the latest renewed lease. Active sibling routes refresh through shared atomic
-renewal; installing an idle source is serialized with attachment. Configuration,
-source and identity changes still invalidate pending/active generations.
+Modern source inventories can omit group membership. The
+policy-equivalence rule permits configured-origin
+playback only when all memberships produce the same explicit local viewer
+policy. A group override that changes the policy keeps unknown membership
+ineligible and fences existing playback after an edit.
+
+All daemon source handles use one five-second complete discovery profile,
+regardless of whether foreground playback, static polling or a replica lookup
+creates the cached handle first. Requests remain serialized per source, with
+four concurrent source queries and 500ms minimum probe spacing. Direct lookup
+and static catalog polling have six-second selection limits. Complete inventories
+are cached for their original bounded lease; active siblings use atomic renewal.
+Configuration, source and identity changes still fence pending/active work.
+
+Replica selection has a sixteen-second limit: five seconds for the selected
+origin followed by up to seven alternatives in two waves under the four-query
+limit, plus bounded selection headroom. The selected origin is checked before
+alternatives, and publication follows declared rotation order. Background
+recovery/static jobs have twenty seconds, retaining their eight-job concurrency
+limit and cancellation on owner/configuration changes. Vendor SRT admission
+also allows twenty seconds; native SRT admission remains ten. RTSP description,
+placement and post-admission media timers are separate phases and are unchanged.
+
+These are outer bounds, not completion guarantees under contention. A busy
+source/group gate or query pool can still exhaust them. Discovery does not
+extend a thirty-second lease, admit partial rows, bypass a denial or authorize
+media. This coordination adds no input retry or public source option.
+
+Private input failures emit a `flussonix::private_input` warning with the protocol,
+processing phase, existing retry class, last HTTP status, private acknowledgment
+marker and metadata progress. Status zero means no response headers were received
+for the current request. A later decoding or output failure can retain an earlier
+successful HTTP status; the phase identifies where processing stopped. These
+fields contain no endpoint, stream name, credential, session ID, header value,
+response body or raw error. They supplement the stream's `input_closed` summary
+without changing admission, retry or timeout behavior. Revoked authority does not
+emit this failure warning.
+
+An optional debug event records a skipped unavailable M4F startup announcement
+using only fixed protocol, HTTP status, acknowledgment and metadata fields. One
+such announcement can be skipped before the first metadata, under the original
+startup watchdog; the missing object is never refetched. A second missing
+object still ends the pull as transient. Successful continuation emits no
+terminal failure warning. Authorization, source changes and shutdown still
+cancel the wait.
+
+An HLS manifest request retains its normal eight-second read grace and also
+honors the worker's remaining configured input startup allowance (15 seconds by
+default). That allowance starts when the worker is created; another request
+does not reset it. Worker failure, authorization and source/lease changes still
+end the wait. Segment requests do not wait for missing files. Discovery keeps
+its separate budgets above. This avoids an early 503 while a valid cold worker
+is still starting; it does not add input retries or extend its watchdog.
 
 HLS sessions retain admitted demand for up to 30 seconds without another request.
 Default source leases last 30 seconds and renewal is scheduled with a 10 second
@@ -91,3 +137,23 @@ Owned SRT tests cover clear/encrypted listeners, independently decoded
 AVC/HEVC/MP3/MP2 from M4F, CPU AAC, wrong transport keys, denied viewers,
 independent revocation, static/HTTP sharing, held callback/metadata edits,
 namespace precedence, replica recovery, pending writes and accepted-byte accounting.
+
+## Large-catalog daemon regression
+
+An owned delayed modern endpoint serves 951 configured-origin rows, with the
+requested stream last. Eight concurrent authenticated M4S responses share one
+complete discovery, one private input and one packager. They receive media for
+32 seconds, with a two-second data-idle bound, across the original 30-second
+lease and one shared catalog renewal.
+The same worker supplies an independently decoded HLS audio segment; incorrect
+viewer tokens cannot open native media or cached HLS segments. Removing the
+stream from the catalog closes all eight responses after a new complete refresh,
+within two seconds of observing removal and before the prior lease could expire.
+It prevents a private-media retry. All fixture sockets, media processes and samples are
+reclaimed, including assertion-failure paths.
+
+The regression fails with the former 100-row page request because the actual
+daemon discovery deadline expires before the final row. It passes with the
+1,000-row request while preserving complete-catalog and authorization gates.
+This is a bounded owned-origin integration check, not live Flussonic
+interoperability, production capacity or seamless playback qualification.

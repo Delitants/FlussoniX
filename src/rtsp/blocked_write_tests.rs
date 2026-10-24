@@ -34,6 +34,7 @@ async fn pending_vendor_rtsp_write_is_cancelled_without_retiring_other_static_vi
         url,
         id: "owned-session".into(),
         senders: HashMap::new(),
+        report_epoch: None,
         playing: true,
         initial: VecDeque::new(),
         pending: None,

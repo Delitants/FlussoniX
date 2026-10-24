@@ -39,9 +39,19 @@ checks authority during writes and idle input, and stops on route loss, lease
 expiry, viewer revocation, shutdown or caller cancellation. Exported clients need
 equivalent guards; selection status is diagnostic data, not authorization.
 
-The selector retains at most 20,000 stream entries. New names fail closed at
-capacity; authoritative blocks are not evicted to make room. It owns no retry
-tasks, media workers, background I/O or lease renewal. Shutdown is permanent.
+The selector retains at most 20,000 stream entries. A provisional name holds
+its selected origin only while a lookup, choice, callback or reservation owns
+it; after the final owner leaves without admission, a later request starts at
+the declared first member. Successful native admission or static activation
+retains the route. Complete source-catalog denials are kept separately as
+bounded source summaries, so reclaiming a temporary name does not permit
+fallback past an authoritative denial. An unrelated configuration save carries
+only committed routes and current source denials for the exact unchanged source
+relationship. Source replacement, delete-and-re-add, relationship edits and
+shutdown invalidate that transfer, even if later edits restore the same values.
+New names fail closed at capacity; active owners and committed
+routes are not evicted to make room. It owns no retry tasks, media workers,
+background I/O or lease renewal. Shutdown is permanent.
 The daemon supplies typed private-input failure classification and shared-worker
 recovery through guarded managed routes. Automatic static activation uses separate grantless ownership; see
 [vendor static activation](vendor-static-activation.md). Vendor RTSP/RTSPS delivery is described in [vendor playback](vendor-daemon-playback.md).

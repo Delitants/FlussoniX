@@ -49,14 +49,22 @@ impl ModernSourceCoordinator {
         auth: &PlaybackAuth,
         request: ViewerRequest,
     ) -> Result<AdmissionOutcome, AdmissionFailure> {
+        let name = request.name.clone();
         let candidate = self.with_reserved_current(reserved, || CoordinatedCandidate {
             handle: reserved.candidate.handle.clone(),
             candidate: reserved.candidate.candidate.copy_for_worker(),
         })?;
         let mut outcome = self.admit(candidate, auth, request).await?;
-        self.with_reserved_current(reserved, || ())?;
         if let AdmissionOutcome::Allowed(admitted) = &mut outcome {
+            self.at_admission_candidate(&reserved.candidate, &name, |_, _| {
+                if let Some(scope) = &reserved.selection {
+                    scope.commit().map_err(|_| AdmissionFailure::Revoked)?;
+                }
+                Ok(())
+            })?;
             admitted.selection = reserved.selection.clone();
+        } else {
+            self.with_reserved_current(reserved, || ())?;
         }
         Ok(outcome)
     }

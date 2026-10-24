@@ -14,9 +14,13 @@ fn unused_udp_port() -> u16 {
 }
 
 async fn receiver(path: &Path, port: u16, secret: &str) -> tokio::process::Child {
+    receiver_at(path, &format!("127.0.0.1:{port}"), secret).await
+}
+
+async fn receiver_at(path: &Path, authority: &str, secret: &str) -> tokio::process::Child {
     let mut cmd = Command::new("ffmpeg");
     let url = format!(
-        "srt://127.0.0.1:{port}?mode=listener&listen_timeout=15000000&timeout=5000000&enforced_encryption=1"
+        "srt://{authority}?mode=listener&listen_timeout=15000000&timeout=5000000&enforced_encryption=1"
     );
     cmd.args(["-passphrase", secret]);
     let log = std::fs::File::create(path.with_extension("log")).unwrap();
@@ -50,6 +54,31 @@ async fn receiver(path: &Path, port: u16, secret: &str) -> tokio::process::Child
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     child
+}
+
+#[tokio::test]
+async fn encrypted_srt_caller_accepts_ipv6_destination() {
+    let _lock = MEDIA_LOCK.lock().await;
+    let Ok(probe) = std::net::UdpSocket::bind("[::1]:0") else {
+        return;
+    };
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ipv6.ts");
+    let mut rx = receiver_at(&path, &format!("[::1]:{port}"), "owned-secret-123").await;
+    let engine = flussonix::media::Engine::new(dir.path().join("media"), "ffmpeg");
+    let worker = engine
+        .ensure(
+            "owned",
+            &json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":format!("srt://[::1]:{port}"),"passphrase":"owned-secret-123"}]}),
+        )
+        .await
+        .unwrap();
+    wait_push(&worker, 0, "sending").await;
+    received(&mut rx, &path, "h264", "aac").await;
+    engine.stop_all().await;
+    assert_eq!(worker.stats()["flussonix_pushes"][0]["pid"], 0);
 }
 
 async fn received(child: &mut tokio::process::Child, path: &Path, video: &str, audio: &str) {
@@ -129,6 +158,17 @@ async fn encrypted_srt_delivers_h264_hevc_with_aac_layer_ii_and_mp3() {
             let worker = engine.ensure("owned", &cfg).await.unwrap();
             let s = wait_push(&worker, 0, "sending").await;
             assert!(s["muxed_bytes"].as_u64().unwrap() > 0);
+            #[cfg(target_os = "linux")]
+            {
+                let pid = s["pid"].as_u64().unwrap();
+                let args = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+                for secret in ["owned-secret-123", "owned-sensitive-id"] {
+                    assert!(
+                        !args.windows(secret.len()).any(|w| w == secret.as_bytes()),
+                        "SRT push FFmpeg argv exposed a credential"
+                    );
+                }
+            }
             assert!(!worker.stats().to_string().contains("owned-secret"));
             assert!(!worker.stats().to_string().contains("owned-sensitive-id"));
             received(&mut rx, &path, video, audio).await;
@@ -251,7 +291,27 @@ async fn stalled_push_is_reaped_while_the_shared_worker_keeps_running() {
     std::fs::write(&wrapper,"#!/usr/bin/python3\nimport os,sys,time\nif '-progress' in sys.argv: time.sleep(30)\nelse: os.execv('/usr/bin/ffmpeg',['ffmpeg']+sys.argv[1:])\n").unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let engine = flussonix::media::Engine::new(dir.path().join("media"), wrapper.to_str().unwrap());
-    let cfg = json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":"srt://127.0.0.1:19999","retry_timeout":5}]});
+    let port = unused_udp_port();
+    let mut idle_receiver = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-i",
+            &format!(
+                "srt://127.0.0.1:{port}?mode=listener&listen_timeout=20000000&timeout=20000000"
+            ),
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let cfg = json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":format!("srt://127.0.0.1:{port}"),"retry_timeout":5}]});
     let w = engine.ensure("owned", &cfg).await.unwrap();
     let pid = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -278,6 +338,8 @@ async fn stalled_push_is_reaped_while_the_shared_worker_keeps_running() {
         .unwrap();
     assert!(started.elapsed() < Duration::from_secs(2));
     assert_eq!(w.stats()["flussonix_pushes"][0]["pid"], 0);
+    let _ = idle_receiver.kill().await;
+    let _ = idle_receiver.wait().await;
 }
 
 #[test]
@@ -392,6 +454,10 @@ async fn a_long_connection_timeout_is_not_cut_short_by_the_output_watchdog() {
     engine.stop_all().await;
     assert_eq!(s["status"], "connecting");
     assert_eq!(s["attempts"], 1);
+    assert_eq!(
+        s["pid"], 0,
+        "FFmpeg must not start before the SRT handshake"
+    );
 }
 
 #[path = "support/dvb_fixture.rs"]

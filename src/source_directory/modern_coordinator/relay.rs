@@ -168,7 +168,7 @@ impl ModernSourceCoordinator {
             let candidate = if intermediate {
                 observed.inventory.relay_candidate(&declared.name)
             } else {
-                observed.inventory.candidate(&declared.name)
+                observed.inventory.relay_origin_candidate(&declared.name)
             }
             .map_err(lease)?;
             hops.push(CoordinatedCandidate {

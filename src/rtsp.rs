@@ -47,12 +47,49 @@ struct Sender {
     ssrc: u32,
     packets: u32,
     octets: u32,
+    report_clock: Option<ReportClock>,
+}
+#[derive(Clone, Copy)]
+struct ReportEpoch {
+    instant: std::time::Instant,
+    ntp: u64,
+}
+impl ReportEpoch {
+    fn sample() -> Self {
+        let before = std::time::Instant::now();
+        let ntp = ntp_timestamp(SystemTime::now());
+        let after = std::time::Instant::now();
+        Self {
+            instant: before + (after - before) / 2,
+            ntp,
+        }
+    }
+}
+struct ReportClock {
+    ntp_origin: u64,
+    origin_ticks: u128,
+}
+impl ReportClock {
+    fn new(origin_ticks: u128, ntp_origin: u64) -> Self {
+        Self {
+            ntp_origin,
+            origin_ticks,
+        }
+    }
+    fn at(&self, ticks: u128, rate: u32) -> u64 {
+        let elapsed = ticks as i128 - self.origin_ticks as i128;
+        // One NTP tick is 2^-32 seconds. Derive every report from the same
+        // RTP origin so receiver rescaling cannot shift media by one tick.
+        (i128::from(self.ntp_origin) + (elapsed * (1i128 << 32)).div_euclid(i128::from(rate)))
+            as u64
+    }
 }
 struct Session {
     playback: Playback,
     url: url::Url,
     id: String,
     senders: HashMap<u32, Sender>,
+    report_epoch: Option<ReportEpoch>,
     playing: bool,
     initial: VecDeque<Packet>,
     pending: Option<Packet>,
@@ -347,24 +384,58 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
                 }
             }
             Next::Report => {
-                if let Some(s) = &session {
+                if let Some(s) = &mut session {
                     if s.playing {
+                        if s.report_epoch.is_none()
+                            && s.senders.values().any(|sender| sender.packets > 0)
+                        {
+                            s.report_epoch = Some(ReportEpoch::sample());
+                        }
+                        let sample = std::time::Instant::now();
                         for track in &s.playback.description.tracks {
-                            if let Some(sender) = s.senders.get(&track.id) {
-                                if sender.packets == 0 {
-                                    continue;
-                                }
-                                let stamp = s.playback.worker.wire.rtp.clock(track.id).unwrap_or(0);
-                                let body =
-                                    sender_report(track.ssrc, stamp, sender.packets, sender.octets);
-                                let bytes =
-                                    deliver(sender, &mut write, &body, true, &cancel, s).await?;
-                                app.rtsp_egress.fetch_add(bytes as u64, Ordering::Relaxed);
-                                s.playback.add_bytes(bytes);
-                                if matches!(sender.delivery, Delivery::Udp { .. }) {
-                                    app.rtsp_udp_egress
-                                        .fetch_add(bytes as u64, Ordering::Relaxed);
-                                }
+                            let ticks = s
+                                .playback
+                                .worker
+                                .wire
+                                .rtp
+                                .clock_at(track.id, sample)
+                                .unwrap_or(0);
+                            let stamp = ticks as u32;
+                            let Some(sender) = s.senders.get_mut(&track.id) else {
+                                continue;
+                            };
+                            let Some(epoch) = s.report_epoch else {
+                                continue;
+                            };
+                            let origin_ticks = s
+                                .playback
+                                .worker
+                                .wire
+                                .rtp
+                                .clock_at(track.id, epoch.instant)
+                                .unwrap_or(ticks);
+                            let clock = sender
+                                .report_clock
+                                .get_or_insert_with(|| ReportClock::new(origin_ticks, epoch.ntp));
+                            if sender.packets == 0 {
+                                continue;
+                            }
+                            let ntp = clock.at(ticks, track.clock);
+                            let body = sender_report_ntp(
+                                sender.ssrc,
+                                stamp,
+                                sender.packets,
+                                sender.octets,
+                                ntp,
+                            );
+                            let sender = s.senders.get(&track.id).unwrap();
+                            let bytes =
+                                deliver(sender, &mut write, &body, true, &cancel, s).await?;
+                            app.rtsp_egress.fetch_add(bytes as u64, Ordering::Relaxed);
+                            s.playback.add_bytes(bytes);
+                            if matches!(sender.delivery, Delivery::Udp { .. }) {
+                                app.rtsp_udp_egress
+                                    .fetch_add(bytes as u64, Ordering::Relaxed);
                             }
                         }
                     }
@@ -595,6 +666,7 @@ async fn handle(
             url,
             id: uuid::Uuid::new_v4().simple().to_string(),
             senders: HashMap::new(),
+            report_epoch: None,
             playing: false,
             initial: VecDeque::new(),
             pending: None,
@@ -726,6 +798,7 @@ async fn handle(
                 packets: 0,
                 octets: 0,
                 ssrc,
+                report_clock: None,
             },
         );
         let mut reply = Reply::code(200);
@@ -839,8 +912,11 @@ fn valid_rtcp(body: &[u8]) -> bool {
     }
     !body.is_empty()
 }
-pub(crate) fn sender_report(ssrc: u32, stamp: u32, packets: u32, octets: u32) -> Vec<u8> {
-    sender_report_at(ssrc, stamp, packets, octets, SystemTime::now())
+fn ntp_timestamp(time: SystemTime) -> u64 {
+    let now = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let seconds = now.as_secs().wrapping_add(2208988800) as u32;
+    let fraction = ((now.subsec_nanos() as u64) << 32).div_euclid(1_000_000_000) as u32;
+    (u64::from(seconds) << 32) | u64::from(fraction)
 }
 pub(crate) fn sender_report_at(
     ssrc: u32,
@@ -849,16 +925,11 @@ pub(crate) fn sender_report_at(
     octets: u32,
     time: SystemTime,
 ) -> Vec<u8> {
-    let now = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    sender_report_ntp(ssrc, stamp, packets, octets, ntp_timestamp(time))
+}
+fn sender_report_ntp(ssrc: u32, stamp: u32, packets: u32, octets: u32, ntp: u64) -> Vec<u8> {
     let mut b = vec![0x80, 200, 0, 6];
-    for value in [
-        ssrc,
-        now.as_secs().wrapping_add(2208988800) as u32,
-        ((now.subsec_nanos() as u64) << 32).div_euclid(1_000_000_000) as u32,
-        stamp,
-        packets,
-        octets,
-    ] {
+    for value in [ssrc, (ntp >> 32) as u32, ntp as u32, stamp, packets, octets] {
         b.extend(value.to_be_bytes());
     }
     let name = b"flussonix";
@@ -887,6 +958,69 @@ fn live_range(value: &str) -> bool {
 }
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn sender_reports_keep_ntp_and_rtp_on_one_exact_media_clock() {
+        let start = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for rate in [48_000, 90_000] {
+            for first in [90_000, u32::MAX - 180_000] {
+                let clock = ReportClock::new(u128::from(first), ntp_timestamp(start));
+                let initial = clock.at(u128::from(first), rate);
+                let mut ticks = u128::from(first);
+                let mut elapsed = 0u64;
+                for step in [rate * 5, rate * 5, rate * 7, rate * 11] {
+                    ticks += u128::from(step);
+                    elapsed += u64::from(step);
+                    let ntp = clock.at(ticks, rate);
+                    let ntp_delta = ntp.wrapping_sub(initial);
+                    let decoded =
+                        ((u128::from(ntp_delta) * u128::from(rate) + (1 << 31)) >> 32) as u64;
+                    assert_eq!(decoded, elapsed, "{rate} Hz at RTP {ticks}");
+                    let report = sender_report_ntp(7, ticks as u32, 1, 100, ntp);
+                    assert_eq!(
+                        u32::from_be_bytes(report[16..20].try_into().unwrap()),
+                        ticks as u32
+                    );
+                    assert_eq!(
+                        u32::from_be_bytes(report[8..12].try_into().unwrap()),
+                        (ntp >> 32) as u32
+                    );
+                    assert_eq!(
+                        u32::from_be_bytes(report[12..16].try_into().unwrap()),
+                        ntp as u32
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sender_reports_share_one_epoch_across_tracks() {
+        let start = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let epoch = ReportEpoch {
+            instant: std::time::Instant::now(),
+            ntp: ntp_timestamp(start),
+        };
+        let video = ReportClock::new(90_000, epoch.ntp);
+        // A stalled sender loop must not make a second track use a later
+        // wall-clock origin for the same media instant.
+        std::thread::sleep(Duration::from_millis(20));
+        let audio = ReportClock::new(48_000, epoch.ntp);
+        assert_eq!(video.at(180_000, 90_000), audio.at(96_000, 48_000));
+    }
+
+    #[test]
+    fn sender_report_survives_delayed_track_start_beyond_signed_rtp_range() {
+        let start = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let origin = 90_000;
+        let clock = ReportClock::new(origin, ntp_timestamp(start));
+        let first = clock.at(origin, 90_000);
+        let delayed = origin + 7 * 60 * 60 * 90_000;
+        let next = clock.at(delayed, 90_000);
+        assert_eq!((next - first) >> 32, 7 * 60 * 60);
+    }
+
     #[test]
     fn live_ranges_accept_decimal_zero_but_not_seeks() {
         for v in ["npt=0-", "npt=0.000-", "npt=now-"] {

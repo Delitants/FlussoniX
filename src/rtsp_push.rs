@@ -4,13 +4,11 @@ mod bridge;
 mod client;
 mod dispatch;
 mod udp;
-use bytes::Bytes;
 use serde_json::{Value, json};
 use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct Destination {
@@ -174,7 +172,6 @@ impl State {
     pub async fn run(
         self: Arc<Self>,
         worker: Arc<crate::media::Worker>,
-        mut receiver: broadcast::Receiver<Bytes>,
         cancel: CancellationToken,
     ) {
         if self.destination.disabled {
@@ -186,7 +183,7 @@ impl State {
                 c.status = "connecting";
                 c.attempts += 1;
             }
-            let error = self.attempt(&worker, &mut receiver, &cancel).await;
+            let error = self.attempt(&worker, &cancel).await;
             if cancel.is_cancelled() {
                 break;
             }
@@ -196,7 +193,6 @@ impl State {
                 c.last_error = Some(error);
             }
             tokio::select! {biased;_=cancel.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(self.destination.retry_seconds))=>{}}
-            receiver = receiver.resubscribe();
         }
         let mut c = self.counters.lock().unwrap();
         c.status = "stopped";
@@ -205,13 +201,13 @@ impl State {
     async fn attempt(
         &self,
         worker: &Arc<crate::media::Worker>,
-        receiver: &mut broadcast::Receiver<Bytes>,
         cancel: &CancellationToken,
     ) -> &'static str {
         let started = Instant::now();
         let deadline = started + Duration::from_secs(self.destination.connect_seconds + 5);
         let mut probe = crate::ts_profile::Probe::default();
         let mut initial = Vec::new();
+        let mut receiver = worker.subscribe();
         let metadata = tokio::select! {biased;_=cancel.cancelled()=>return "push_stopped", result=tokio::time::timeout_at(tokio::time::Instant::from_std(deadline),async {
             while probe.audio.is_none() {
                 let data=receiver.recv().await.map_err(|_|"push_queue_overflow")?;
@@ -226,6 +222,9 @@ impl State {
             Ok(Err(error)) => return error,
             Err(_) => return "push_metadata_timeout",
         }
+        // TS is only a metadata probe. Native RTP delivery must not retain an
+        // unread TS cursor while connecting, publishing or waiting for retry.
+        drop(receiver);
         let snapshot = tokio::select! {biased;
             _=cancel.cancelled()=>return "push_stopped",
             result=tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
