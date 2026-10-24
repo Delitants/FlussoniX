@@ -33,6 +33,7 @@ use tokio::sync::Mutex;
 pub struct Options {
     pub admin_user: String,
     pub admin_password: String,
+    pub admin_public_origin: Option<url::Url>,
     pub view_user: Option<String>,
     pub view_password: Option<String>,
     pub peer_key: String,
@@ -51,6 +52,7 @@ impl Default for Options {
         Self {
             admin_user: "admin".into(),
             admin_password: String::new(),
+            admin_public_origin: None,
             view_user: None,
             view_password: None,
             peer_key: String::new(),
@@ -163,6 +165,19 @@ impl App {
     ) -> Result<Arc<Self>, String> {
         if options.admin_password.is_empty() || options.peer_key.len() < 12 {
             return Err("admin password required; peer key must be at least 12 characters".into());
+        }
+        if options.admin_public_origin.as_ref().is_some_and(|origin| {
+            origin.scheme() != "https"
+                || origin.host_str().is_none()
+                || origin.path() != "/"
+                || origin.query().is_some()
+                || origin.fragment().is_some()
+                || !origin.username().is_empty()
+                || origin.password().is_some()
+        }) {
+            return Err(
+                "admin public origin must be an HTTPS origin without path or credentials".into(),
+            );
         }
         if !["standalone", "source", "cdn", "lb"].contains(&options.role.as_str()) {
             return Err("unknown node role".into());
@@ -697,6 +712,11 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     if method != axum::http::Method::GET && role != Role::Edit {
         return error(StatusCode::FORBIDDEN, "edit credentials required");
     }
+    if method != axum::http::Method::GET
+        && !management_browser_origin_allowed(&request, app.options.admin_public_origin.as_ref())
+    {
+        return error(StatusCode::FORBIDDEN, "cross-origin management request");
+    }
     let tail = percent_encoding::percent_decode_str(
         request.uri().path().trim_start_matches("/streamer/api/v3/"),
     )
@@ -945,6 +965,85 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     }
     result[kind] = json!(page);
     management_read_response(role, result)
+}
+
+fn management_browser_origin_allowed(request: &Request, public_origin: Option<&url::Url>) -> bool {
+    if let Some(site) = request.headers().get("sec-fetch-site") {
+        if !matches!(site.to_str(), Ok("same-origin" | "none")) {
+            return false;
+        }
+    }
+    // A legacy browser may omit Origin and Fetch Metadata on a simple form POST.
+    // The config POST only validates text, but other management POSTs can act.
+    if request.method() == axum::http::Method::POST
+        && request.uri().path() != "/streamer/api/v3/config"
+        && request.headers().get("origin").is_none()
+        && request.headers().get("sec-fetch-site").is_none()
+        && request
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                matches!(
+                    value
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain"
+                )
+            })
+    {
+        return false;
+    }
+    let Some(origin) = request.headers().get("origin") else {
+        return true;
+    };
+    let Some(authority) = request
+        .uri()
+        .authority()
+        .map(|value| value.as_str())
+        .or_else(|| {
+            request
+                .headers()
+                .get("host")
+                .and_then(|value| value.to_str().ok())
+        })
+    else {
+        return false;
+    };
+    let scheme = if request
+        .extensions()
+        .get::<crate::http_tls::SecureHttp>()
+        .is_some()
+    {
+        "https"
+    } else {
+        "http"
+    };
+    let target = url::Url::parse(&format!("{scheme}://{authority}/"));
+    let supplied = origin
+        .to_str()
+        .ok()
+        .and_then(|value| url::Url::parse(value).ok());
+    match (target, supplied) {
+        (Ok(target), Some(supplied)) => {
+            supplied.path() == "/"
+                && supplied.query().is_none()
+                && supplied.fragment().is_none()
+                && supplied.username().is_empty()
+                && supplied.password().is_none()
+                && (supplied.origin() == target.origin()
+                    || public_origin.is_some_and(|public| {
+                        public.host_str() == target.host_str()
+                            && public.port() == target.port()
+                            && supplied.origin() == public.origin()
+                    }))
+        }
+        _ => false,
+    }
 }
 async fn read_json(request: Request) -> Result<Value, (StatusCode, String)> {
     let bytes = axum::body::to_bytes(request.into_body(), 2 * 1024 * 1024)
