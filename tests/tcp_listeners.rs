@@ -64,6 +64,28 @@ async fn response<S: AsyncRead + AsyncWrite + Unpin>(mut socket: S, rtsp: bool) 
     assert!(line.starts_with(expected), "unexpected response: {line}");
 }
 
+// RTSP permits only a bounded number of unauthenticated sockets per IP. A
+// connection picked arbitrarily from the 256 queued handshakes may therefore
+// be rejected even when the listener backlog is healthy.
+async fn rtsp_probe<S: AsyncRead + AsyncWrite + Unpin>(mut socket: S) -> bool {
+    if socket
+        .write_all(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let mut line = String::new();
+    matches!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            BufReader::new(socket).read_line(&mut line)
+        )
+        .await,
+        Ok(Ok(n)) if n > 0
+    ) && line.starts_with("RTSP/1.0 200")
+}
+
 // A regression to the generic bind path (backlog 128) must fail: there are
 // deliberately no accepts until all 256 clients have completed their handshake.
 // The subsequent request also proves the queued connection remains usable.
@@ -129,7 +151,35 @@ async fn delayed_accept_burst(field: &str, tls: bool, rtsp: bool) {
         }
         signal(&child, libc::SIGCONT);
         let connected = clients.len();
-        if let Some(socket) = clients.pop() {
+        if rtsp {
+            let mut probes = JoinSet::new();
+            for socket in clients {
+                let client_config = tls.then(|| cert.client());
+                probes.spawn(async move {
+                    if let Some(client_config) = client_config {
+                        let connector = tokio_rustls::TlsConnector::from(client_config);
+                        match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            connector.connect("localhost".try_into().unwrap(), socket),
+                        )
+                        .await
+                        {
+                            Ok(Ok(socket)) => rtsp_probe(socket).await,
+                            _ => false,
+                        }
+                    } else {
+                        rtsp_probe(socket).await
+                    }
+                });
+            }
+            let mut served = 0;
+            while let Some(result) = probes.join_next().await {
+                if result.unwrap() {
+                    served += 1;
+                }
+            }
+            assert!(served > 0, "no queued RTSP connection received a response");
+        } else if let Some(socket) = clients.pop() {
             // Free the remaining handshake slots before the protocol probe.
             drop(clients);
             if tls {
