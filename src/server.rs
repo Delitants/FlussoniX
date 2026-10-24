@@ -15,7 +15,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::Engine as _;
 use bytes::Bytes;
 use serde_json::{Value, json};
 use std::{
@@ -1055,30 +1055,11 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         if query.get("sort").is_some_and(|s| s == "-name") {
             items.reverse()
         }
-        let offset = query
-            .get("cursor")
-            .and_then(|s| STANDARD.decode(s).ok())
-            .and_then(|b| String::from_utf8(b).ok())
-            .map(|s| parse_query(Some(&s)))
-            .and_then(|p| p.get("$position_gt").and_then(|v| v.parse::<usize>().ok()))
-            .map(|p| p.saturating_add(1))
-            .unwrap_or(0);
-        let limit = query
-            .get("limit")
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(100)
-            .clamp(1, 1000);
-        let page = items
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .collect::<Vec<_>>();
-        let next = if offset.saturating_add(page.len()) < total {
-            Some(STANDARD.encode(format!("%24position_gt={}", offset + page.len() - 1)))
-        } else {
-            None
+        let page = match crate::api_cursor::paginate_positions(items, &query) {
+            Ok(page) => page,
+            Err(message) => return error(StatusCode::BAD_REQUEST, message),
         };
-        (page, next, None)
+        (page.items, page.next, page.prev)
     };
     let mut result = json!({"estimated_count":total,"timing":{},"next":next,"prev":prev});
     if matches!(kind, "streams" | "templates" | "peers" | "sources")

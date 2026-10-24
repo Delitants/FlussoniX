@@ -151,6 +151,65 @@ async fn cluster_selection_follows_search_order_counts_and_cursor_pages() {
 }
 
 #[tokio::test]
+async fn cluster_pages_round_trip_reference_position_cursors() {
+    let (_dir, app) = fixture();
+    for kind in ["sources", "peers"] {
+        let base = format!("/streamer/api/v3/cluster/{kind}?select=hostname&limit=1");
+        let first = selected(&app, &base).await;
+        assert_eq!(first[kind], json!([{"hostname":"alpha"}]));
+        assert_eq!(
+            STANDARD.decode(first["next"].as_str().unwrap()).unwrap(),
+            b"%24position_gt=0"
+        );
+        let second = selected(
+            &app,
+            &format!(
+                "{base}&{}",
+                url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("cursor", first["next"].as_str().unwrap())
+                    .finish()
+            ),
+        )
+        .await;
+        assert_eq!(second[kind], json!([{"hostname":"beta"}]));
+        assert_eq!(
+            STANDARD.decode(second["prev"].as_str().unwrap()).unwrap(),
+            b"%24position_lt=1&%24reversed=true"
+        );
+        let previous = selected(
+            &app,
+            &format!(
+                "{base}&{}",
+                url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("cursor", second["prev"].as_str().unwrap())
+                    .finish()
+            ),
+        )
+        .await;
+        assert_eq!(previous[kind], first[kind]);
+        assert_eq!(previous["prev"], Value::Null);
+
+        for malformed in [
+            "%24position_gt=oops",
+            "%24position_gt=0&%24position_gt=1",
+            "%24position_lt=1&%24reversed=false",
+            "%24position_gt=0&%24position_lt=1",
+        ] {
+            let cursor = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("cursor", &STANDARD.encode(malformed))
+                .finish();
+            let (status, _) = get(
+                &app,
+                &format!("{base}&{cursor}"),
+                Some("viewer:owned-view-secret"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{kind}: {malformed}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn empty_unknown_and_scalar_child_selection_does_not_expose_cluster_fields() {
     let (_dir, app) = fixture();
     for kind in ["peers", "sources"] {

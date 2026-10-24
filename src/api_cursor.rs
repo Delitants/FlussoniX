@@ -43,6 +43,69 @@ pub(crate) struct Page {
     pub(crate) prev: Option<String>,
 }
 
+/// Paginate an already sorted collection using the reference API's positional
+/// cursor dialect. Cluster peers and sources have no stable row position field;
+/// their positions refer to the current sorted collection.
+pub(crate) fn paginate_positions(
+    mut items: Vec<Value>,
+    query: &HashMap<String, String>,
+) -> Result<Page, &'static str> {
+    let limit = query
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 1000);
+    let (start, end) = match query.get("cursor") {
+        None => (0, limit.min(items.len())),
+        Some(token) => {
+            let pairs = cursor_pairs(token)?;
+            if pairs.len() == 1
+                && let Some(position) = pairs.get("$position_gt")
+            {
+                let start = position_value(position)?.saturating_add(1).min(items.len());
+                (start, start.saturating_add(limit).min(items.len()))
+            } else if pairs.len() == 2
+                && pairs.get("$reversed").is_some_and(|value| value == "true")
+                && let Some(position) = pairs.get("$position_lt")
+            {
+                let end = position_value(position)?.min(items.len());
+                (end.saturating_sub(limit), end)
+            } else {
+                return Err(INVALID);
+            }
+        }
+    };
+    let mut page = Page {
+        items: Vec::new(),
+        next: None,
+        prev: None,
+    };
+    if start < end {
+        if end < items.len() {
+            page.next = Some(encode_position(end - 1, Direction::Forward));
+        }
+        if start > 0 {
+            page.prev = Some(encode_position(start, Direction::Backward));
+        }
+        page.items = items.drain(start..end).collect();
+    }
+    Ok(page)
+}
+
+fn encode_position(position: usize, direction: Direction) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    match direction {
+        Direction::Forward => {
+            query.append_pair("$position_gt", &position.to_string());
+        }
+        Direction::Backward => {
+            query.append_pair("$position_lt", &position.to_string());
+            query.append_pair("$reversed", "true");
+        }
+    }
+    STANDARD.encode(query.finish())
+}
+
 pub(crate) fn paginate(
     mut items: Vec<Value>,
     kind: &str,
@@ -191,22 +254,7 @@ fn decode(
     context: &str,
     default_stream_order: bool,
 ) -> Result<Cursor, &'static str> {
-    if token.len() > MAX_TOKEN {
-        return Err(INVALID);
-    }
-    let decoded = STANDARD.decode(token).map_err(|_| INVALID)?;
-    if decoded.len() > MAX_DECODED {
-        return Err(INVALID);
-    }
-    let decoded = std::str::from_utf8(&decoded).map_err(|_| INVALID)?;
-    let mut pairs = HashMap::new();
-    for pair in decoded.split('&') {
-        let (key, value) = pair.split_once('=').ok_or(INVALID)?;
-        let key = component(key)?;
-        if key.is_empty() || pairs.insert(key, component(value)?).is_some() {
-            return Err(INVALID);
-        }
-    }
+    let pairs = cursor_pairs(token)?;
     if let Some(json) = pairs.get(NATIVE) {
         if pairs.len() != 1 {
             return Err(INVALID);
@@ -278,6 +326,26 @@ fn decode(
         direction,
         keys: vec![Key::Text(name.clone())],
     }))
+}
+
+fn cursor_pairs(token: &str) -> Result<HashMap<String, String>, &'static str> {
+    if token.len() > MAX_TOKEN {
+        return Err(INVALID);
+    }
+    let decoded = STANDARD.decode(token).map_err(|_| INVALID)?;
+    if decoded.len() > MAX_DECODED {
+        return Err(INVALID);
+    }
+    let decoded = std::str::from_utf8(&decoded).map_err(|_| INVALID)?;
+    let mut pairs = HashMap::new();
+    for pair in decoded.split('&') {
+        let (key, value) = pair.split_once('=').ok_or(INVALID)?;
+        let key = component(key)?;
+        if key.is_empty() || pairs.insert(key, component(value)?).is_some() {
+            return Err(INVALID);
+        }
+    }
+    Ok(pairs)
 }
 
 fn position_value(value: &str) -> Result<usize, &'static str> {

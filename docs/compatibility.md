@@ -80,6 +80,9 @@ Selection runs after the existing search, ordering and positional pagination,
 preserving counts, navigation and timing. Without `select`, full rows remain
 unchanged. Item GET ignores `select` as before. Both view and edit management
 credentials can read selected rows; projection does not replace authorization.
+Forward and backward Cluster pages use bounded Base64 position cursors;
+malformed cursors return HTTP 400. Positions refer to the current sorted
+collection, so concurrent edits can shift a page boundary.
 
 Empty or unknown-only selections return `{}` per row; cluster rows have no
 automatically retained identity. Scalar child paths are omitted. Whole values,
