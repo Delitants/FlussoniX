@@ -101,6 +101,7 @@ impl Peer {
                 budget,
                 halted,
                 server_egress,
+                None,
             )
             .await;
         });

@@ -211,13 +211,27 @@ async fn full_route_case(expire: bool, repair_batch: usize) {
     let burst = BurstGuard::new(&sub.state);
     let started = Instant::now();
     tx.send(Ok(expected.clone())).await.unwrap();
-    until(|| {
+    // The recoverable route has 1,500 ms of original record lifetime. Give
+    // its 319-packet loopback burst room for CI scheduling before judging the
+    // decoder; the 500 ms expiry case retains the earlier 350 ms bound.
+    let burst_window = Duration::from_millis(if expire { 350 } else { 900 });
+    let burst_ready = tokio::time::timeout(burst_window, async {
         // Keep the decoder gated through the complete original burst. Opening
         // at the first overflow lets later originals arrive after draining;
         // FEC alone can then recover the loss, without any retransmission.
-        !sub.current() || burst.observed() == ORIGINAL_SHARDS
+        while sub.current() && burst.observed() != ORIGINAL_SHARDS {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
     })
     .await;
+    assert!(
+        burst_ready.is_ok(),
+        "original burst incomplete before decoder release: observed={}, routed={}, dropped={}, egress_bytes={}",
+        burst.observed(),
+        sub.state.routed_packets.load(Ordering::Acquire),
+        sub.state.telemetry.queue_dropped.load(Ordering::Acquire),
+        egress.load(Ordering::Acquire)
+    );
     let survived_full = sub.current();
     let burst_observed = burst.observed();
     drop(burst);

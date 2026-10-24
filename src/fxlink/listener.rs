@@ -7,11 +7,62 @@ use super::{
 };
 use futures_util::StreamExt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{collections::VecDeque, net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    net::{IpAddr, SocketAddr},
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 // Independent of Receiver::max_records: completed audio/video records remain repairable through their TTL.
 const MAX_CACHED_RECORDS: usize = 1024;
+const MAX_PREAUTH_PER_IP: usize = 4;
+const PREAUTH_LIFETIME: Duration = Duration::from_secs(20);
+struct PreAuthGate {
+    by_ip: Mutex<HashMap<IpAddr, usize>>,
+}
+impl PreAuthGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            by_ip: Mutex::new(HashMap::new()),
+        })
+    }
+    fn acquire(self: &Arc<Self>, ip: IpAddr) -> Option<PreAuthLease> {
+        let ip = match ip {
+            IpAddr::V6(value) => value.to_ipv4_mapped().map_or(IpAddr::V6(value), IpAddr::V4),
+            value => value,
+        };
+        let mut by_ip = self.by_ip.lock().unwrap_or_else(|e| e.into_inner());
+        let count = by_ip.entry(ip).or_default();
+        if *count >= MAX_PREAUTH_PER_IP {
+            return None;
+        }
+        *count += 1;
+        Some(PreAuthLease {
+            gate: self.clone(),
+            ip,
+            deadline: tokio::time::Instant::now() + PREAUTH_LIFETIME,
+        })
+    }
+}
+struct PreAuthLease {
+    gate: Arc<PreAuthGate>,
+    ip: IpAddr,
+    deadline: tokio::time::Instant,
+}
+impl Drop for PreAuthLease {
+    fn drop(&mut self) {
+        let mut by_ip = self.gate.by_ip.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = by_ip.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                by_ip.remove(&self.ip);
+            }
+        }
+    }
+}
 enum Input {
     Reliable(Control),
     Datagram(super::feedback::DatagramRequest),
@@ -76,17 +127,53 @@ impl Listener {
         cancel: CancellationToken,
     ) -> Result<(), String> {
         let slots = Arc::new(Semaphore::new(64));
+        let preauth = PreAuthGate::new();
         let mut tasks = JoinSet::new();
         loop {
-            tokio::select! {biased;
-            _=cancel.cancelled()=>break,
-            Some(_)=tasks.join_next(),if !tasks.is_empty()=>{},
-            incoming=self.endpoint.accept()=>{let Some(incoming)=incoming else{break};let Ok(permit)=slots.clone().try_acquire_owned() else{incoming.refuse();continue};
-            let settings=self.settings.clone();let provider=provider.clone();let cancel=cancel.child_token();let egress=self.egress.clone();
-            tasks.spawn(async move {let _permit=permit;let Ok(budget)=peer_budget(incoming.remote_address().ip()) else{incoming.refuse();return};let Ok(_queues)=budget.reserve(QUEUE_BYTES) else{incoming.refuse();return};
-            let connection=tokio::select!{_=cancel.cancelled()=>return,r=tokio::time::timeout(SETUP,incoming)=>match r{Ok(Ok(c))=>c,_=>return}};
-            serve_peer(connection,provider,settings,budget,cancel,egress).await;
-            });}
+            tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
+            incoming = self.endpoint.accept() => {
+                let Some(incoming) = incoming else { break };
+                // Charge an address only after QUIC Retry proves the sender can receive there.
+                if !incoming.remote_address_validated() {
+                    let _ = incoming.retry();
+                    continue;
+                }
+                let Ok(permit) = slots.clone().try_acquire_owned() else {
+                    incoming.refuse();
+                    continue;
+                };
+                let Some(preauth_lease) = preauth.acquire(incoming.remote_address().ip()) else {
+                    incoming.refuse();
+                    continue;
+                };
+                let settings = self.settings.clone();
+                let provider = provider.clone();
+                let cancel = cancel.child_token();
+                let egress = self.egress.clone();
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    let Ok(budget) = peer_budget(incoming.remote_address().ip()) else {
+                        incoming.refuse();
+                        return;
+                    };
+                    let Ok(_queues) = budget.reserve(QUEUE_BYTES) else {
+                        incoming.refuse();
+                        return;
+                    };
+                    let setup_deadline = preauth_lease.deadline.min(tokio::time::Instant::now() + SETUP);
+                    let connection = tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        result = tokio::time::timeout_at(setup_deadline, incoming) => match result {
+                            Ok(Ok(connection)) => connection,
+                            _ => return,
+                        },
+                    };
+                    serve_peer(connection, provider, settings, budget, cancel, egress, Some(preauth_lease)).await;
+                });
+            }
             }
         }
         self.endpoint.close(0u32.into(), b"shutdown");
@@ -105,7 +192,11 @@ async fn serve_peer(
     budget: super::Budget,
     cancel: CancellationToken,
     egress: Arc<AtomicU64>,
+    preauth_lease: Option<PreAuthLease>,
 ) {
+    let deadline = preauth_lease.as_ref().map(|lease| lease.deadline);
+    let mut deadline = deadline;
+    let preauth_lease = Arc::new(Mutex::new(preauth_lease));
     let mut tasks = JoinSet::new();
     let routes = super::feedback::Routes::default();
     // V9 remains unadvertised until the explicit feature/negotiation wiring.
@@ -125,6 +216,10 @@ async fn serve_peer(
         let hint_wake = geometry.as_ref().and_then(|hub| hub.wake_at(now()));
         tokio::select! {
         _=cancel.cancelled()=>break,
+        _=async {tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)).await},if deadline.is_some()=>{
+            deadline=None;
+            if preauth_lease.lock().unwrap_or_else(|e|e.into_inner()).is_some(){break;}
+        },
         _=async {geometry.as_ref().unwrap().changed.notified().await},if geometry.is_some()=>{
             dispatch_geometry(geometry.as_ref().unwrap(),&connection,&egress);
         },
@@ -139,7 +234,8 @@ async fn serve_peer(
         let c=connection.clone();let p=provider.clone();let s=settings.clone();let b=budget.child(SUB_BYTES);let stop=cancel.child_token();let egress=egress.clone();
         let routes=routes.clone();
         let geometry=geometry.clone();
-        tasks.spawn(async move{let _=serve_subscription(c,p,s,b,stop,(send,recv),egress,routes,empty_datagram_space,geometry).await;stream_id});
+        let preauth_lease=preauth_lease.clone();
+        tasks.spawn(async move{let _=serve_subscription(c,p,s,b,stop,(send,recv),egress,routes,empty_datagram_space,geometry,preauth_lease).await;stream_id});
         }
         }
     }
@@ -165,6 +261,9 @@ fn dispatch_geometry(
 #[cfg(test)]
 #[path = "geometry/endpoint_tests.rs"]
 pub(super) mod geometry_endpoint_tests;
+#[cfg(test)]
+#[path = "preauth_tests.rs"]
+mod preauth_tests;
 #[allow(clippy::too_many_arguments)]
 async fn serve_subscription(
     connection: quinn::Connection,
@@ -177,6 +276,7 @@ async fn serve_subscription(
     routes: super::feedback::Routes,
     empty_datagram_space: usize,
     hub: Option<Arc<super::geometry::send::Hub>>,
+    preauth_lease: Arc<Mutex<Option<PreAuthLease>>>,
 ) -> Result<(), String> {
     let result = async {
         let _metadata = budget.reserve(65536).map_err(|e| e.to_string())?;
@@ -215,6 +315,7 @@ async fn serve_subscription(
         mtu(&connection, &settings)?;
         let demand=super::demand::register(&connection,&source,&cancel)?;
         source_write(&mut send, &Control::Accepted, &mut source, &cancel, now()+settings.latency_ms).await?;
+        drop(preauth_lease.lock().unwrap_or_else(|e| e.into_inner()).take());
         let mut probe=super::service_trace::Probe::new(connection.stable_id(),id,generation,&source);
         // The handle is declared after cache, so it retires before cached media
         // drops. A separate per-record guard fences an early in-flight exit.
