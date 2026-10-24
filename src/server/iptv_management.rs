@@ -1,5 +1,4 @@
 use super::*;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Serialize;
 
 pub(super) async fn dispatch(app: Arc<App>, request: Request, tail: &str, role: Role) -> Response {
@@ -153,7 +152,6 @@ fn collection(app: Arc<App>, kind: &str, role: Role, query: &HashMap<String, Str
     if kind == "packages" {
         collection_rows(
             snapshot.document().packages.iter().collect(),
-            |row| row.name.as_str(),
             kind,
             role,
             query,
@@ -161,7 +159,6 @@ fn collection(app: Arc<App>, kind: &str, role: Role, query: &HashMap<String, Str
     } else {
         collection_rows(
             snapshot.document().subscribers.iter().collect(),
-            |row| row.name.as_str(),
             kind,
             role,
             query,
@@ -170,43 +167,46 @@ fn collection(app: Arc<App>, kind: &str, role: Role, query: &HashMap<String, Str
 }
 
 fn collection_rows<T: Serialize>(
-    mut rows: Vec<&T>,
-    name: impl Fn(&T) -> &str,
+    rows: Vec<&T>,
     kind: &str,
     role: Role,
     query: &HashMap<String, String>,
 ) -> Response {
-    rows.sort_by(|a, b| name(a).cmp(name(b)));
-    let count = rows.len();
-    let limit = match query.get("limit") {
-        Some(raw) => match raw.parse::<usize>() {
-            Ok(value) => value.clamp(1, 1_000),
-            Err(_) => return error(StatusCode::BAD_REQUEST, "invalid IPTV limit"),
-        },
-        None => 100,
-    };
-    let offset = match query.get("cursor") {
-        Some(raw) => match URL_SAFE_NO_PAD
-            .decode(raw)
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .and_then(|value| value.parse::<usize>().ok())
-        {
-            Some(offset) if offset <= count => offset,
-            _ => return error(StatusCode::BAD_REQUEST, "invalid IPTV cursor"),
-        },
-        None => 0,
-    };
-    let page: Vec<Value> = rows
+    if query
+        .get("limit")
+        .is_some_and(|raw| raw.parse::<usize>().is_err())
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid IPTV limit");
+    }
+    let items: Vec<Value> = rows
         .into_iter()
-        .skip(offset)
-        .take(limit)
         .filter_map(|row| serde_json::to_value(row).ok())
         .collect();
-    let next_offset = offset.saturating_add(page.len());
-    let next = (next_offset < count).then(|| URL_SAFE_NO_PAD.encode(next_offset.to_string()));
-    let mut body = json!({"estimated_count":count,"timing":{},"next":next,"prev":null});
-    body[kind] = json!(page);
+    let count = items.len();
+    let page = if query.contains_key("sort") {
+        crate::api_cursor::paginate(items, kind, query)
+    } else {
+        crate::api_cursor::paginate_positions(items, query)
+    };
+    let page = match page {
+        Ok(page) => page,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
+    let mut body = json!({"estimated_count":count,"timing":{"select":0,"sort":0,"load":0,"filter":0,"limit":0}});
+    if let Some(next) = page.next {
+        body["next"] = json!(next);
+    }
+    if let Some(prev) = page.prev {
+        body["prev"] = json!(prev);
+    }
+    let mut rows = page.items;
+    if let Some(select) = query.get("select") {
+        let selection = crate::api_select::Selection::new(select);
+        for row in &mut rows {
+            *row = selection.project(row, true);
+        }
+    }
+    body[kind] = json!(rows);
     management_read_response(role, body)
 }
 

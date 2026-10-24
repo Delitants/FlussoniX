@@ -24,7 +24,7 @@ All paths below are relative to `/streamer/api/v3`.
 | IPTV compatibility | `/iptv`, `/iptv/packages`, `/iptv/subscribers` and their item operations |
 | Operational visibility | Applicable monitoring, configuration statistics and event integration |
 
-FlussoniX now implements a local built-in IPTV subset independently of the installed reference. It accepts existing static subscriber tokens, manages packages and subscribers through dedicated API routes, issues protected playlists and checks current access on playback. Exact response parity with a pinned Flussonic release remains unqualified; the demonstration server is not migration data.
+FlussoniX now implements a local built-in IPTV subset independently of the installed reference. It accepts existing static subscriber tokens, manages packages and subscribers through dedicated API routes, issues protected playlists and checks current access on playback. Read-only comparison with installed Flussonic 26.04.1 covers the IPTV collection envelope, default position pages, explicit name sorting and selection. Full management and playlist response parity remains unqualified; the demonstration server is not migration data.
 
 The separate owner-only `iptv.json` stores tokens outside `/config`. Use exact `on_play: "iptv://"` on a stream or template and set `--iptv-public-origin` for playlist links. Expiry and positive subscriber `max_sessions` are supported; limits count viewers on one node only. Successful edits revoke local IPTV grants, while a failed save keeps the last committed data and grants. The web UI provides **Config → IPTV** forms. [Token carriers and unsupported output routes](iptv-transport.md) are documented separately.
 

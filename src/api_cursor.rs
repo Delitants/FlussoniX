@@ -139,6 +139,10 @@ pub(crate) fn paginate(
         && items
             .iter()
             .all(|row| row.get("position").and_then(Value::as_u64).is_some());
+    let reference_names = matches!(
+        query.get("sort").map(String::as_str),
+        Some("name" | "-name")
+    );
     let limit = query
         .get("limit")
         .and_then(|v| v.parse::<usize>().ok())
@@ -191,6 +195,12 @@ pub(crate) fn paginate(
             page.next = Some(
                 if reference_positions && items[end - 1]["position"] != items[end]["position"] {
                     encode_reference_position(&items[end - 1], Direction::Forward)?
+                } else if reference_names && items[end - 1]["name"] != items[end]["name"] {
+                    encode_reference_name(
+                        &items[end - 1],
+                        Direction::Forward,
+                        sort.identity_direction().ok_or(INVALID)?,
+                    )?
                 } else {
                     encode(&sort, &context, &items[end - 1], Direction::Forward)?
                 },
@@ -200,6 +210,12 @@ pub(crate) fn paginate(
             page.prev = Some(
                 if reference_positions && items[start - 1]["position"] != items[start]["position"] {
                     encode_reference_position(&items[start], Direction::Backward)?
+                } else if reference_names && items[start - 1]["name"] != items[start]["name"] {
+                    encode_reference_name(
+                        &items[start],
+                        Direction::Backward,
+                        sort.identity_direction().ok_or(INVALID)?,
+                    )?
                 } else {
                     encode(&sort, &context, &items[start], Direction::Backward)?
                 },
@@ -221,6 +237,25 @@ fn encode_reference_position(row: &Value, direction: Direction) -> Result<String
             query.append_pair("$position_lt", &position);
             query.append_pair("$reversed", "true");
         }
+    }
+    Ok(STANDARD.encode(query.finish()))
+}
+
+fn encode_reference_name(
+    row: &Value,
+    direction: Direction,
+    descending: bool,
+) -> Result<String, &'static str> {
+    let name = row["name"].as_str().ok_or(INVALID)?;
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    let key = if descending ^ matches!(direction, Direction::Backward) {
+        "name_lt"
+    } else {
+        "name_gt"
+    };
+    query.append_pair(key, name);
+    if matches!(direction, Direction::Backward) {
+        query.append_pair("$reversed", "true");
     }
     Ok(STANDARD.encode(query.finish()))
 }

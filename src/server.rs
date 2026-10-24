@@ -15,7 +15,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use base64::Engine as _;
 use bytes::Bytes;
 use serde_json::{Value, json};
 use std::{

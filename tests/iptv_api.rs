@@ -226,6 +226,106 @@ async fn package_crud_preserves_encoded_names_and_pages_results() {
 }
 
 #[tokio::test]
+async fn iptv_default_pages_preserve_position_and_omit_absent_navigation() {
+    let (_dir, app) = app();
+    enable(app.clone()).await;
+    for name in ["zeta", "alpha", "middle"] {
+        assert_eq!(
+            edit(
+                app.clone(),
+                Method::PUT,
+                &format!("iptv/packages/{name}"),
+                json!({"channels":[]}),
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    let (status, first) = edit(
+        app.clone(),
+        Method::GET,
+        "iptv/packages?limit=2&select=channels",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        first["packages"],
+        json!([{"name":"zeta","channels":[]},{"name":"alpha","channels":[]}])
+    );
+    assert_eq!(first["estimated_count"], 3);
+    assert_eq!(
+        first["timing"],
+        json!({"select":0,"sort":0,"load":0,"filter":0,"limit":0})
+    );
+    assert!(first.get("prev").is_none());
+    let next = first["next"].as_str().unwrap();
+    assert_eq!(STANDARD.decode(next).unwrap(), b"%24position_gt=1");
+
+    let (status, last) = edit(
+        app.clone(),
+        Method::GET,
+        &format!("iptv/packages?limit=2&cursor={next}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(last["packages"], json!([{"name":"middle","channels":[]}]));
+    assert!(last.get("next").is_none());
+    assert_eq!(
+        STANDARD.decode(last["prev"].as_str().unwrap()).unwrap(),
+        b"%24position_lt=2&%24reversed=true"
+    );
+}
+
+#[tokio::test]
+async fn iptv_name_sorted_pages_emit_reference_name_bounds() {
+    let (_dir, app) = app();
+    enable(app.clone()).await;
+    for name in ["zeta", "alpha", "middle"] {
+        assert_eq!(
+            edit(
+                app.clone(),
+                Method::PUT,
+                &format!("iptv/packages/{name}"),
+                json!({"channels":[]}),
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    let (_, first) = edit(
+        app.clone(),
+        Method::GET,
+        "iptv/packages?limit=1&sort=name&select=name",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(first["packages"], json!([{"name":"alpha"}]));
+    assert_eq!(
+        STANDARD.decode(first["next"].as_str().unwrap()).unwrap(),
+        b"name_gt=alpha"
+    );
+    let (_, second) = edit(
+        app.clone(),
+        Method::GET,
+        &format!(
+            "iptv/packages?limit=1&sort=name&select=name&cursor={}",
+            first["next"].as_str().unwrap()
+        ),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(second["packages"], json!([{"name":"middle"}]));
+    assert_eq!(
+        STANDARD.decode(second["prev"].as_str().unwrap()).unwrap(),
+        b"name_lt=middle&%24reversed=true"
+    );
+}
+
+#[tokio::test]
 async fn subscriber_crud_generates_unique_tokens_and_validates_access_fields() {
     let (_dir, app) = app();
     enable(app.clone()).await;
