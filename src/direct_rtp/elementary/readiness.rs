@@ -143,19 +143,32 @@ mod tests {
     }
     #[test]
     fn owned_readiness_observes_pairs_without_claiming_free_ports() {
-        let first = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let p = first.local_addr().unwrap().port();
-        assert!(bound(&[p]).unwrap());
-        drop(first);
-        assert!(!bound(&[p]).unwrap());
         // The decoder can bind immediately after every readiness observation;
-        // the observer never holds a probe socket while it starts.
-        for _ in 0..128 {
-            assert!(!bound(&[p]).unwrap());
-            let decoder = std::net::UdpSocket::bind(("127.0.0.1", p)).unwrap();
+        // the observer never holds a probe socket while it starts. Other
+        // parallel tests may claim a released ephemeral port, so retry those
+        // attempts with a new port rather than mistaking them for a probe.
+        let mut observed = 0;
+        for _ in 0..256 {
+            let first = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let p = first.local_addr().unwrap().port();
+            assert!(bound(&[p]).unwrap());
+            drop(first);
+            if bound(&[p]).unwrap() {
+                continue;
+            }
+            let decoder = match std::net::UdpSocket::bind(("127.0.0.1", p)) {
+                Ok(decoder) => decoder,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(error) => panic!("decoder bind failed: {error}"),
+            };
             assert!(bound(&[p]).unwrap());
             drop(decoder);
+            observed += 1;
+            if observed == 128 {
+                break;
+            }
         }
+        assert_eq!(observed, 128, "too many concurrent port claims");
     }
     #[test]
     fn readiness_requires_every_loopback_port_and_rejects_wildcards() {
