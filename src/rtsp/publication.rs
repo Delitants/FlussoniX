@@ -483,21 +483,22 @@ pub(super) async fn receive<W: AsyncWrite + Unpin>(
     preauth_lease: &mut Option<super::PreAuthLease>,
 ) -> std::io::Result<()> {
     let auth = auth::Auth::new(&r.uri);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = preauth_lease.as_ref().map_or_else(
+        || Instant::now() + Duration::from_secs(30),
+        |lease| lease.started + Duration::from_secs(30),
+    );
     let mut challenges = 0;
     let mut s = loop {
         let admission = tokio::select! {biased;_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep_until(deadline)=>return Ok(()),s=admit(&r,app,peer,secure,pool.clone(),&auth)=>s};
         match admission {
             Ok(s) => break s,
             Err(401) => {
-                reply(
-                    write,
-                    cancel,
-                    401,
-                    r.cseq,
-                    &[("WWW-Authenticate", auth.challenge())],
-                )
-                .await?;
+                let headers = [("WWW-Authenticate", auth.challenge())];
+                tokio::select! {
+                    biased;
+                    _=tokio::time::sleep_until(deadline)=>return Ok(()),
+                    result=reply(write,cancel,401,r.cseq,&headers)=>result?,
+                }
                 if challenges == 2 {
                     return Ok(());
                 }
@@ -506,12 +507,22 @@ pub(super) async fn receive<W: AsyncWrite + Unpin>(
                 match event {
                     Some(Ok(Event::Request(next))) if next.method == "ANNOUNCE" => r = next,
                     Some(Ok(Event::Request(next))) => {
-                        return reply(write, cancel, 400, next.cseq, &[]).await;
+                        return tokio::select! {
+                            biased;
+                            _=tokio::time::sleep_until(deadline)=>Ok(()),
+                            result=reply(write,cancel,400,next.cseq,&[])=>result,
+                        };
                     }
                     _ => return Ok(()),
                 }
             }
-            Err(code) => return reply(write, cancel, code, r.cseq, &[]).await,
+            Err(code) => {
+                return tokio::select! {
+                    biased;
+                    _=tokio::time::sleep_until(deadline)=>Ok(()),
+                    result=reply(write,cancel,code,r.cseq,&[])=>result,
+                };
+            }
         }
     };
     drop(preauth_lease.take());

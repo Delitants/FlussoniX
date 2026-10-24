@@ -17,6 +17,9 @@ struct Args {
     /// Disable plaintext HTTP binding; requires an HTTPS listener.
     #[arg(long, requires = "https_listen")]
     https_only: bool,
+    /// Public HTTPS origin when a trusted reverse proxy terminates TLS for the admin UI.
+    #[arg(long, env = "FLUSSONIX_ADMIN_PUBLIC_ORIGIN")]
+    admin_public_origin: Option<url::Url>,
     /// Optional RTSP/1.0 playback and publication listener (disabled by default).
     #[arg(long)]
     rtsp_listen: Option<SocketAddr>,
@@ -190,6 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = Options {
         admin_user: a.admin_user,
         admin_password: a.admin_password,
+        admin_public_origin: a.admin_public_origin,
         view_user: a.view_user,
         view_password: a.view_password,
         peer_key: a.peer_key,

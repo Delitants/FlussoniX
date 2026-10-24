@@ -81,6 +81,51 @@ async fn cross_origin_browser_cannot_stop_stream_with_cached_basic_credentials()
 }
 
 #[tokio::test]
+async fn configured_https_proxy_origin_allows_same_origin_admin_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = App::new(
+        dir.path().join("config.json"),
+        dir.path().join("media"),
+        Options {
+            admin_user: "admin".into(),
+            admin_password: "edit-password".into(),
+            peer_key: "owned-peer-secret".into(),
+            admin_public_origin: Some("https://console.example:8080".parse().unwrap()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    app.config
+        .put("streams", "owned", json!({"inputs":[{"url":"testsrc://"}]}))
+        .unwrap();
+    app.media
+        .ensure("owned", &app.config.effective("owned").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        stop(
+            app.clone(),
+            Some("https://attacker.example:8080"),
+            Some("same-origin")
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(app.media.count().await, 1);
+    assert_eq!(
+        stop(
+            app.clone(),
+            Some("https://console.example:8080"),
+            Some("same-origin")
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(app.media.count().await, 0);
+    app.media.stop_all().await;
+}
+
+#[tokio::test]
 async fn browser_fetch_metadata_blocks_cross_site_mutation_without_origin_header() {
     let dir = tempfile::tempdir().unwrap();
     let app = App::new(

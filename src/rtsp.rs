@@ -233,10 +233,12 @@ async fn serve_connections(
                         return;
                     }
                     if let Some(tls) = tls {
+                        let setup_deadline = (preauth_lease.started + Duration::from_secs(30))
+                            .min(Instant::now() + Duration::from_secs(8));
                         let accepted = tokio::select! {
                             biased;
                             _ = cancel.cancelled() => return,
-                            result = tokio::time::timeout(Duration::from_secs(8), tls.accept(socket)) => result,
+                            result = tokio::time::timeout_at(setup_deadline, tls.accept(socket)) => result,
                         };
                         if let Ok(Ok(stream)) = accepted {
                             let _ = connection(stream, peer, app, cancel, udp, true, preauth_lease).await;
@@ -389,11 +391,12 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
             Next::Feedback(false) => {}
             Next::Control(None) => break,
             Next::Control(Some(Err(error))) => {
-                let _ = bounded_write(
+                let _ = preauth_bounded_write(
                     &mut write,
                     &protocol::response(error.code, error.cseq.unwrap_or(0), &[], &[]),
                     &cancel,
                     session.as_ref(),
+                    preauth_lease.as_ref(),
                 )
                 .await;
                 break;
@@ -426,13 +429,25 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
                     .await?;
                     break;
                 }
-                let reply = tokio::select! {biased;_=cancel.cancelled()=>break,reply=handle(&request,&mut session,&app,peer,udp.as_ref(),secure)=>reply};
+                let reply = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = async { tokio::time::sleep_until(preauth_lease.as_ref().unwrap().started + Duration::from_secs(30)).await }, if preauth_lease.is_some() => break,
+                    reply = handle(&request,&mut session,&app,peer,udp.as_ref(),secure) => reply
+                };
                 if session.is_some() {
                     drop(preauth_lease.take());
                 }
                 let bytes =
                     protocol::response(reply.code, request.cseq, &reply.headers, &reply.body);
-                bounded_write(&mut write, &bytes, &cancel, session.as_ref()).await?;
+                preauth_bounded_write(
+                    &mut write,
+                    &bytes,
+                    &cancel,
+                    session.as_ref(),
+                    preauth_lease.as_ref(),
+                )
+                .await?;
                 if reply.close {
                     break;
                 }
@@ -641,6 +656,23 @@ async fn bounded_write<W: tokio::io::AsyncWrite + Unpin>(
         return Err(std::io::ErrorKind::Interrupted.into());
     }
     result
+}
+async fn preauth_bounded_write<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    cancel: &CancellationToken,
+    session: Option<&Session>,
+    lease: Option<&PreAuthLease>,
+) -> std::io::Result<()> {
+    if let Some(lease) = lease {
+        tokio::select! {
+            biased;
+            _=tokio::time::sleep_until(lease.started+Duration::from_secs(30))=>Err(std::io::ErrorKind::TimedOut.into()),
+            result=bounded_write(writer,bytes,cancel,session)=>result,
+        }
+    } else {
+        bounded_write(writer, bytes, cancel, session).await
+    }
 }
 fn location(uri: &str) -> Result<(url::Url, String), u16> {
     let url = url::Url::parse(uri).map_err(|_| 400u16)?;
@@ -1052,6 +1084,136 @@ fn live_range(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn expired_preauth_lease_interrupts_stalled_describe_admission() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            crate::server::Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.config
+            .put(
+                "streams",
+                "owned",
+                serde_json::json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+            )
+            .unwrap();
+        let held_startup = app.media.hold_startups_for_test().await;
+        let mut lease = PreAuthGate::new()
+            .acquire("127.0.0.1".parse().unwrap())
+            .unwrap();
+        lease.started = Instant::now() - Duration::from_secs(29);
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(connection(
+            server,
+            "127.0.0.1:12000".parse().unwrap(),
+            app.clone(),
+            CancellationToken::new(),
+            None,
+            false,
+            lease,
+        ));
+        client
+            .write_all(b"DESCRIBE rtsp://127.0.0.1/owned RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("expired pre-auth lease remained held inside media admission")
+            .unwrap()
+            .unwrap();
+        drop(held_startup);
+        app.media.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn expired_preauth_lease_interrupts_blocked_announce_reply() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            crate::server::Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut lease = PreAuthGate::new()
+            .acquire("127.0.0.1".parse().unwrap())
+            .unwrap();
+        lease.started = Instant::now() - Duration::from_secs(29);
+        let (mut client, server) = tokio::io::duplex(8);
+        let task = tokio::spawn(connection(
+            server,
+            "127.0.0.1:12001".parse().unwrap(),
+            app,
+            CancellationToken::new(),
+            None,
+            false,
+            lease,
+        ));
+        client
+            .write_all(b"ANNOUNCE rtsp://127.0.0.1/owned RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(1500), task)
+            .await
+            .expect("blocked ANNOUNCE response held the pre-auth lease past its deadline")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_preauth_lease_interrupts_blocked_options_reply() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            crate::server::Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut lease = PreAuthGate::new()
+            .acquire("127.0.0.1".parse().unwrap())
+            .unwrap();
+        lease.started = Instant::now() - Duration::from_secs(29);
+        let (mut client, server) = tokio::io::duplex(8);
+        let task = tokio::spawn(connection(
+            server,
+            "127.0.0.1:12002".parse().unwrap(),
+            app,
+            CancellationToken::new(),
+            None,
+            false,
+            lease,
+        ));
+        client
+            .write_all(b"OPTIONS rtsp://127.0.0.1/owned RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(1500), task)
+            .await
+            .expect("blocked OPTIONS response held the pre-auth lease past its deadline")
+            .unwrap()
+            .expect_err("blocked response should return the deadline error");
+    }
 
     #[test]
     fn sender_reports_keep_ntp_and_rtp_on_one_exact_media_clock() {
