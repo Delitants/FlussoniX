@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -160,6 +160,9 @@ struct State {
     next_check: Instant,
     // Retry scheduling must not extend the permission used for autonomous restart.
     allowed_until: Instant,
+    // Explicit operator reauthorization fences recovery; a routine early
+    // callback renewal does not retire permission before its hard deadline.
+    recovery_fenced: bool,
     created: Instant,
     last_seen: Instant,
     playback_seen: Option<Instant>,
@@ -171,10 +174,14 @@ struct State {
     available: bool,
     revoked_until: Option<Instant>,
     cancel: CancellationToken,
+    expiry_task: Option<tokio::task::AbortHandle>,
 }
 impl State {
     fn cancel_playback(&mut self) {
         self.cancel.cancel();
+        if let Some(task) = self.expiry_task.take() {
+            task.abort();
+        }
         self.playback_seen = None;
         self.allowed_until = Instant::now();
     }
@@ -184,12 +191,19 @@ impl State {
             && matches!(self.decision, Decision::Allow)
             && self.available
             && !self.cancel.is_cancelled()
-            && self.next_check > now
+            && ((self.policy.url.is_some() && !self.recovery_fenced) || self.next_check > now)
             && self.allowed_until > now
             && !self.revoked_until.is_some_and(|until| until > now)
             && current == Some(&self.policy)
             && self.policy.accepts_token(&self.request.token))
         .then_some(seen)
+    }
+}
+impl Drop for State {
+    fn drop(&mut self) {
+        if let Some(task) = self.expiry_task.take() {
+            task.abort();
+        }
     }
 }
 struct Entry {
@@ -199,6 +213,13 @@ struct Entry {
     live: AtomicU64,
     admissions: AtomicU64,
     bytes: AtomicU64,
+    background_pending: AtomicBool,
+}
+struct BackgroundRenewal(Arc<Entry>);
+impl Drop for BackgroundRenewal {
+    fn drop(&mut self) {
+        self.0.background_pending.store(false, Ordering::Release);
+    }
 }
 /// Per-pass stream/activity only, never cached permission or retained session ownership.
 pub(crate) struct RecoveryDemand {
@@ -244,6 +265,34 @@ impl Entries {
         self.by_stream.retain(|_, sessions| {
             sessions.retain(|identity, entry| keep(identity, entry));
             !sessions.is_empty()
+        });
+    }
+    /// Called under the cache lock, which also serializes new Arc/Weak owners.
+    fn prune(&mut self, now: Instant, capacity_pressure: bool) {
+        self.retain(|_, entry| {
+            // Renewal callbacks carry Arc ownership without an admission count.
+            if Arc::strong_count(entry) > 1
+                || entry.live.load(Ordering::Relaxed) > 0
+                || entry.admissions.load(Ordering::Relaxed) > 0
+            {
+                return true;
+            }
+            let state = entry.state.lock().unwrap();
+            if state.revoked_until.is_some_and(|until| until > now)
+                || state
+                    .playback_seen
+                    .is_some_and(|seen| now.duration_since(seen) < Duration::from_secs(30))
+            {
+                return true;
+            }
+            if capacity_pressure {
+                // Ordinary failed decisions may be checked early, but allowed
+                // sessions keep their normal reconnect/renewal semantics.
+                matches!(state.decision, Decision::Allow)
+            } else {
+                now.duration_since(state.last_seen) < Duration::from_secs(30)
+                    || (!matches!(state.decision, Decision::Allow) && state.next_check > now)
+            }
         });
     }
 }
@@ -380,6 +429,7 @@ pub struct PlaybackAuth {
     entries: Arc<Mutex<Entries>>,
     client: reqwest::Client,
     callbacks: Semaphore,
+    background_jobs: Arc<Semaphore>,
     limit: usize,
 }
 impl PlaybackAuth {
@@ -395,6 +445,7 @@ impl PlaybackAuth {
                 .build()
                 .expect("HTTP client"),
             callbacks: Semaphore::new(128),
+            background_jobs: Arc::new(Semaphore::new(64)),
             limit,
         }
     }
@@ -519,15 +570,12 @@ impl PlaybackAuth {
                 return AuthOutcome::Denied;
             }
             let mut all = self.entries.lock().unwrap();
-            all.retain(|_, e| {
-                let s = e.state.lock().unwrap();
-                e.live.load(Ordering::Relaxed) > 0
-                    || e.admissions.load(Ordering::Relaxed) > 0
-                    || s.last_seen.elapsed() < Duration::from_secs(30)
-                    || (!matches!(s.decision, Decision::Allow) && s.next_check > Instant::now())
-            });
+            all.prune(Instant::now(), false);
             if !all.contains_key(&request.name, &identity) && all.len() >= 20_000 {
-                return AuthOutcome::Denied;
+                all.prune(Instant::now(), true);
+                if all.len() >= 20_000 {
+                    return AuthOutcome::Denied;
+                }
             }
             let entry = all
                 .by_stream
@@ -543,6 +591,7 @@ impl PlaybackAuth {
                             decision: Decision::Unknown,
                             next_check: Instant::now(),
                             allowed_until: Instant::now(),
+                            recovery_fenced: false,
                             created: Instant::now(),
                             last_seen: Instant::now(),
                             playback_seen: None,
@@ -554,11 +603,13 @@ impl PlaybackAuth {
                             available: true,
                             revoked_until: None,
                             cancel: CancellationToken::new(),
+                            expiry_task: None,
                         }),
                         flight: AsyncMutex::new(()),
                         live: AtomicU64::new(0),
                         admissions: AtomicU64::new(0),
                         bytes: AtomicU64::new(0),
+                        background_pending: AtomicBool::new(false),
                     })
                 })
                 .clone();
@@ -601,6 +652,13 @@ impl PlaybackAuth {
                 .count()
                 .saturating_sub(usize::from(own_pending));
             let mut s = entry.state.lock().unwrap();
+            if matches!(s.decision, Decision::Allow)
+                && s.policy.url.is_some()
+                && s.allowed_until <= Instant::now()
+            {
+                s.cancel_playback();
+                s.decision = Decision::Unknown;
+            }
             match &s.decision {
                 Decision::Allow => {
                     let others = all
@@ -688,6 +746,7 @@ impl PlaybackAuth {
         let mut user_id = None;
         let mut max = policy.max_sessions;
         let mut unique = false;
+        let mut callback_latency = Duration::ZERO;
         if !policy.accepts_token(&r.token) {
             decision = Decision::Deny;
         } else if let Some(url) = &policy.url {
@@ -736,10 +795,12 @@ impl PlaybackAuth {
                 }
                 s.number += 1;
             }
+            let started = Instant::now();
             let Ok(response) = self.client.get(url).query(&fields).send().await else {
                 self.retry(entry, generation);
                 return;
             };
+            callback_latency = started.elapsed();
             let headers = response.headers();
             let header = |key: &str| headers.get(key).and_then(|v| v.to_str().ok());
             seconds = header("x-authduration")
@@ -822,9 +883,43 @@ impl PlaybackAuth {
         s.effective_max = max;
         s.unique = unique;
         s.decision = decision;
-        s.next_check = Instant::now() + Duration::from_secs(seconds);
+        s.recovery_fenced = false;
+        let now = Instant::now();
+        let lifetime = Duration::from_secs(seconds);
+        let expires = now + lifetime;
+        s.next_check = expires;
+        if let Some(task) = s.expiry_task.take() {
+            task.abort();
+        }
         if matches!(s.decision, Decision::Allow) {
-            s.allowed_until = s.next_check;
+            s.allowed_until = expires;
+        }
+        if matches!(s.decision, Decision::Allow) && s.policy.url.is_some() {
+            // First renewal is deliberately early so an unmeasured backend
+            // has room to respond. Thereafter, measured callback latency plus
+            // polling margin avoids repeatedly querying fast backends.
+            let lead = if number == 0 {
+                lifetime - Duration::from_millis(100)
+            } else {
+                callback_latency + Duration::from_millis(300)
+            }
+            .min(Duration::from_secs(4))
+            .min(lifetime - Duration::from_millis(100));
+            s.next_check = expires - lead;
+            let entry = Arc::downgrade(entry);
+            let task = tokio::spawn(async move {
+                tokio::time::sleep_until(expires.into()).await;
+                if let Some(entry) = entry.upgrade() {
+                    let mut state = entry.state.lock().unwrap();
+                    if matches!(state.decision, Decision::Allow)
+                        && state.allowed_until <= Instant::now()
+                    {
+                        state.cancel_playback();
+                        state.decision = Decision::Unknown;
+                    }
+                }
+            });
+            s.expiry_task = Some(task.abort_handle());
         }
     }
     fn retry(&self, entry: &Entry, generation: u64) {
@@ -833,18 +928,10 @@ impl PlaybackAuth {
             s.next_check = Instant::now() + Duration::from_secs(10);
         }
     }
-    /// Only sessions with ongoing activity are renewed. Work is bounded and oldest deadlines run first.
-    pub async fn renew_due(&self) {
-        use futures_util::{StreamExt, stream};
+    fn due_entries(&self) -> Vec<(bool, Instant, Arc<Entry>)> {
         let mut due = {
             let mut all = self.entries.lock().unwrap();
-            all.retain(|_, e| {
-                let s = e.state.lock().unwrap();
-                e.live.load(Ordering::Relaxed) > 0
-                    || e.admissions.load(Ordering::Relaxed) > 0
-                    || s.last_seen.elapsed() < Duration::from_secs(30)
-                    || (!matches!(s.decision, Decision::Allow) && s.next_check > Instant::now())
-            });
+            all.prune(Instant::now(), false);
             all.values()
                 .filter_map(|e| {
                     let s = e.state.lock().unwrap();
@@ -853,15 +940,54 @@ impl PlaybackAuth {
                         && s.available
                         && s.next_check <= Instant::now()
                         && matches!(s.decision, Decision::Allow | Decision::Unknown))
-                    .then_some((s.next_check, e.clone()))
+                    .then_some((
+                        !s.recovery_fenced,
+                        if s.policy.url.is_some() && matches!(s.decision, Decision::Allow) {
+                            s.allowed_until
+                        } else {
+                            s.next_check
+                        },
+                        e.clone(),
+                    ))
                 })
                 .collect::<Vec<_>>()
         };
-        due.sort_by_key(|(time, _)| *time);
+        due.sort_by_key(|(ordinary, time, _)| (*ordinary, *time));
+        due
+    }
+    /// Production polling never waits for a remote callback. One job per
+    /// session and a separate 64-job budget bound work during backend stalls.
+    pub fn schedule_due(self: &Arc<Self>) {
+        for (_, _, entry) in self.due_entries() {
+            if entry.background_pending.load(Ordering::Acquire) {
+                continue;
+            }
+            let Ok(permit) = self.background_jobs.clone().try_acquire_owned() else {
+                break;
+            };
+            if entry
+                .background_pending
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            let auth = self.clone();
+            tokio::spawn(async move {
+                let _pending = BackgroundRenewal(entry.clone());
+                let _permit = permit;
+                auth.refresh(&entry).await;
+            });
+        }
+    }
+    /// Deterministic, awaited sweep for tests and explicit maintenance calls.
+    pub async fn renew_due(&self) {
+        use futures_util::{StreamExt, stream};
         stream::iter(
-            due.into_iter()
+            self.due_entries()
+                .into_iter()
                 .take(128)
-                .map(|(_, e)| async move { self.refresh(&e).await }),
+                .map(|(_, _, e)| async move { self.refresh(&e).await }),
         )
         .buffer_unordered(16)
         .collect::<Vec<_>>()
@@ -912,9 +1038,17 @@ impl PlaybackAuth {
         for entry in self.entries.lock().unwrap().values() {
             let mut state = entry.state.lock().unwrap();
             if state.request.name == name {
+                let keep_builtin_allow = state.policy.url.is_none();
                 let permission_deadline = state.allowed_until;
                 state.cancel_playback();
-                state.allowed_until = permission_deadline;
+                if keep_builtin_allow {
+                    state.allowed_until = permission_deadline;
+                } else {
+                    // The old callback timer was retired with the old grant.
+                    // A new viewer must obtain a fresh callback and timer.
+                    state.decision = Decision::Unknown;
+                    state.next_check = Instant::now();
+                }
                 state.cancel = CancellationToken::new();
                 state.generation += 1;
             }
@@ -931,6 +1065,7 @@ impl PlaybackAuth {
                 && !s.revoked_until.is_some_and(|until| until > Instant::now())
             {
                 s.next_check = Instant::now();
+                s.recovery_fenced = true;
                 s.generation += 1;
                 count += 1;
             }
@@ -1036,6 +1171,9 @@ impl PlaybackAuth {
 
 #[cfg(test)]
 mod idle_memory_tests;
+
+#[cfg(test)]
+mod capacity_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1395,6 +1533,374 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_callback_allow_cancels_live_grant_and_denies_reconnect_during_outage() {
+        let backend = ControlBackend::with_duration(false, 1).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "hls".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(grant) = auth.authorize(snapshot.clone(), request.clone()).await
+        else {
+            panic!("initial authorization")
+        };
+        backend.close().await;
+        tokio::time::timeout(Duration::from_secs(2), grant.cancelled())
+            .await
+            .expect("authorization must expire even when callback renewal fails");
+        assert!(grant.is_cancelled());
+        assert!(matches!(
+            auth.authorize(snapshot, request).await,
+            AuthOutcome::Denied
+        ));
+    }
+
+    #[tokio::test]
+    async fn healthy_callback_renewal_keeps_live_playback_open() {
+        let backend = ControlBackend::with_duration(false, 1).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "hls".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(grant) = auth.authorize(snapshot, request).await else {
+            panic!("initial authorization")
+        };
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(2300) {
+            auth.renew_due().await;
+            assert!(
+                !grant.is_cancelled(),
+                "healthy renewal interrupted playback"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(backend.calls.load(Ordering::Relaxed) >= 3);
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn six_hundred_millisecond_callback_renews_one_second_grant() {
+        let backend = ControlBackend::with_duration_and_delay(false, 1, 600).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let AuthOutcome::Allowed(grant) = auth
+            .authorize(
+                snapshot,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "hls".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("initial authorization")
+        };
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(1800) {
+            auth.renew_due().await;
+            assert!(
+                !grant.is_cancelled(),
+                "successful short callback missed lease"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(backend.calls.load(Ordering::Relaxed) >= 3);
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn stalled_callback_does_not_block_another_short_lease() {
+        let stalled = ControlBackend::with_timing(true, 3600, 0, 2200).await;
+        let healthy = ControlBackend::with_duration(true, 1).await;
+        let auth = Arc::new(PlaybackAuth::new(8));
+        let slow = auth
+            .publish(
+                "slow",
+                Some(Policy::from_config(&json!({"on_play":stalled.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let AuthOutcome::Allowed(slow_grant) = auth
+            .authorize(
+                slow,
+                ViewerRequest {
+                    name: "slow".into(),
+                    proto: "hls".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("slow initial authorization")
+        };
+        assert_eq!(auth.force_reauth("slow"), 1);
+        auth.schedule_due();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stalled.calls.load(Ordering::Relaxed) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stalled callback did not start");
+        let fast = auth
+            .publish(
+                "fast",
+                Some(Policy::from_config(&json!({"on_play":healthy.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let AuthOutcome::Allowed(fast_grant) = auth
+            .authorize(
+                fast,
+                ViewerRequest {
+                    name: "fast".into(),
+                    proto: "hls".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("fast initial authorization")
+        };
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(1350) {
+            auth.schedule_due();
+            assert!(
+                !fast_grant.is_cancelled(),
+                "stalled sibling expired fast viewer"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(healthy.calls.load(Ordering::Relaxed) >= 2);
+        assert!(!slow_grant.is_cancelled());
+        stalled.close().await;
+        healthy.close().await;
+    }
+
+    #[tokio::test]
+    async fn fast_one_second_callback_renews_without_excessive_requests() {
+        let backend = ControlBackend::with_duration(false, 1).await;
+        let auth = Arc::new(PlaybackAuth::new(8));
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let AuthOutcome::Allowed(grant) = auth
+            .authorize(
+                snapshot,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "hls".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("initial authorization")
+        };
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(2100) {
+            auth.schedule_due();
+            assert!(!grant.is_cancelled());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let calls = backend.calls.load(Ordering::Relaxed);
+        assert!(calls >= 3, "renewal did not run: {calls}");
+        assert!(calls <= 6, "fast callback was overpolled: {calls}");
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn early_callback_renewal_does_not_pause_recovery_demand() {
+        let backend = ControlBackend::with_duration(false, 1).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let AuthOutcome::Allowed(grant) = auth
+            .authorize(
+                snapshot,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "hls".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("initial authorization")
+        };
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !auth.recovery_demand().is_empty(),
+            "scheduled early callback renewal must not retire valid recovery demand"
+        );
+        assert!(!grant.is_cancelled());
+        auth.force_reauth("owned");
+        assert!(auth.recovery_demand().is_empty());
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn operator_stop_requires_new_callback_before_reusing_allow() {
+        let backend = ControlBackend::with_duration(false, 1).await;
+        let auth = PlaybackAuth::new(8);
+        let policy = Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap();
+        let snapshot = auth.publish("owned", Some(policy.clone())).unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "hls".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(old) = auth.authorize(snapshot, request.clone()).await else {
+            panic!("initial authorization")
+        };
+        auth.stop_playback("owned");
+        assert!(old.is_cancelled());
+        let snapshot = auth.publish("owned", Some(policy)).unwrap();
+        let AuthOutcome::Allowed(new) = auth.authorize(snapshot, request).await else {
+            panic!("post-stop authorization")
+        };
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 2);
+        backend.close().await;
+        tokio::time::timeout(Duration::from_secs(2), new.cancelled())
+            .await
+            .expect("post-stop callback allow must retain its expiry timer");
+    }
+
+    #[tokio::test]
+    async fn forced_reauthorization_retires_previous_expiry_tasks() {
+        let backend = ControlBackend::new(false).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let AuthOutcome::Allowed(grant) = auth
+            .authorize(
+                snapshot,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "hls".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("initial authorization")
+        };
+        let entry = grant.entry.as_ref().unwrap();
+        for _ in 0..3 {
+            let old = entry
+                .state
+                .lock()
+                .unwrap()
+                .expiry_task
+                .as_ref()
+                .unwrap()
+                .clone();
+            assert_eq!(auth.force_reauth("owned"), 1);
+            auth.renew_due().await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !old.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("superseded expiry task must be aborted");
+            assert!(!grant.is_cancelled());
+        }
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn failed_forced_reauthorization_keeps_original_expiry() {
+        let backend = ControlBackend::with_duration(false, 1).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let AuthOutcome::Allowed(grant) = auth
+            .authorize(
+                snapshot,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "hls".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("initial authorization")
+        };
+        assert_eq!(auth.force_reauth("owned"), 1);
+        backend.close().await;
+        auth.renew_due().await;
+        tokio::time::timeout(Duration::from_secs(2), grant.cancelled())
+            .await
+            .expect("failed forced callback must not extend the original permission");
+    }
+
+    #[tokio::test]
+    async fn builtin_token_policy_has_no_callback_deadline() {
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "hls".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(grant) = auth.authorize(snapshot.clone(), request.clone()).await
+        else {
+            panic!("initial authorization")
+        };
+        {
+            let entries = auth.entries.lock().unwrap();
+            let entry = entries.values().next().unwrap();
+            entry.state.lock().unwrap().allowed_until = Instant::now() - Duration::from_secs(1);
+        }
+        assert!(!grant.is_cancelled());
+        assert!(matches!(
+            auth.authorize(snapshot, request).await,
+            AuthOutcome::Allowed(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn stale_control_grant_cannot_repopulate_activity_after_policy_change() {
         let backend = ControlBackend::new(false).await;
         let auth = PlaybackAuth::new(8);
@@ -1582,6 +2088,17 @@ mod tests {
             Self::with_duration(unique, 3600).await
         }
         async fn with_duration(unique: bool, duration: u64) -> Self {
+            Self::with_duration_and_delay(unique, duration, 0).await
+        }
+        async fn with_duration_and_delay(unique: bool, duration: u64, delay_ms: u64) -> Self {
+            Self::with_timing(unique, duration, delay_ms, 0).await
+        }
+        async fn with_timing(
+            unique: bool,
+            duration: u64,
+            delay_ms: u64,
+            renewal_delay_ms: u64,
+        ) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}/auth", listener.local_addr().unwrap());
             let calls = Arc::new(AtomicU64::new(0));
@@ -1598,6 +2115,17 @@ mod tests {
                         let reject = reject.clone();
                         async move {
                             count.fetch_add(1, Ordering::Relaxed);
+                            let pause = if q
+                                .get("request_type")
+                                .is_some_and(|value| value == "update_session")
+                            {
+                                renewal_delay_ms.max(delay_ms)
+                            } else {
+                                delay_ms
+                            };
+                            if pause > 0 {
+                                tokio::time::sleep(Duration::from_millis(pause)).await;
+                            }
                             let mut headers = axum::http::HeaderMap::new();
                             headers.insert("x-authduration", duration.to_string().parse().unwrap());
                             headers.insert("x-userid", "account".parse().unwrap());

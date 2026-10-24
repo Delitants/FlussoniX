@@ -117,7 +117,7 @@ async fn disabled_malformed_and_denied_authority_remain_blocked_during_outages()
     for rows in [
         json!([{"name":NAME,"named_by":"config","static":true,"groups":[],"disabled":true}]),
         json!([{"name":NAME,"static":true,"groups":[]}]),
-        json!([{"name":NAME,"named_by":"config","static":true}]),
+        json!([{"name":NAME,"named_by":"config","static":true,"groups":"invalid"}]),
         json!([{"name":NAME,"static":"invalid"}]),
     ] {
         let f = Fixture::new().await;
@@ -140,6 +140,39 @@ async fn disabled_malformed_and_denied_authority_remain_blocked_during_outages()
         assert!(s.status(NAME).unwrap().blocked);
         assert_eq!(later.next_source().unwrap(), None);
     }
+}
+
+#[tokio::test]
+async fn omitted_membership_with_uniform_policy_selects_origin_and_fences_policy_edits() {
+    let f = Fixture::new().await;
+    let selector = f.selector();
+    let handle = f.handle(0);
+    *f.origins[0].rows.lock().unwrap() = json!([{"name":NAME,"named_by":"config","static":true}]);
+    let choice = selector
+        .begin(NAME)
+        .unwrap()
+        .observe(
+            &handle,
+            f.owner.inventory(&handle, Duration::from_secs(30)).await,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(choice.source_key(), f.origins[0].key);
+    selector.current(&choice).unwrap();
+    assert!(!selector.status(NAME).unwrap().blocked);
+    assert!(
+        f.origins
+            .iter()
+            .all(|o| o.private_calls.load(Ordering::SeqCst) == 0)
+    );
+    f.config
+        .put(
+            "sources",
+            &f.origins[0].key,
+            json!({"group_config":{"paid":{"flussonix_token_sha256":"b".repeat(64)}}}),
+        )
+        .unwrap();
+    assert!(selector.current(&choice).is_err());
 }
 
 #[tokio::test]
@@ -369,11 +402,12 @@ async fn configuration_identity_and_shutdown_fence_outstanding_choices() {
 async fn stream_registry_limit_rejects_new_names_without_discovery_or_eviction_of_blocks() {
     let f = Fixture::new().await;
     let s = f.selector();
-    for index in 0..20_000 {
-        s.begin(&format!("bounded-{index}")).unwrap();
-    }
+    let held: Vec<_> = (0..20_000)
+        .map(|index| s.begin(&format!("bounded-{index}")).unwrap())
+        .collect();
     assert!(s.begin("one-too-many").is_err());
     assert!(s.begin("bounded-0").is_ok());
+    assert_eq!(held.len(), 20_000);
     assert!(
         f.origins
             .iter()

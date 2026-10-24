@@ -137,38 +137,57 @@ impl Muxer {
             .collect();
         Ok(())
     }
-    pub fn frame(&mut self, f: &Frame) -> Result<Vec<u8>, String> {
+    fn stream_index(&self, f: &Frame) -> Result<Option<usize>, String> {
         if self.subtitles.contains(&f.track_id) {
-            return Ok(Vec::new());
+            return Ok(None);
         }
-        let index = self
-            .streams
+        self.streams
             .iter()
             .position(|s| s.track.id == f.track_id)
-            .ok_or("unknown worker track")?;
+            .map(Some)
+            .ok_or_else(|| "unknown worker track".into())
+    }
+    // Emit borrowed slices into a private payload or a counting-only preflight.
+    // Neither caller publishes these slices before every check succeeds.
+    fn sample(
+        &self,
+        index: usize,
+        f: &Frame,
+        previous: Option<u64>,
+        mut emit: impl FnMut(&[u8]),
+    ) -> Result<u64, String> {
         let s = &self.streams[index];
         if f.body.is_empty() || f.body.len() > SAMPLE_LIMIT {
             return Err("invalid worker sample size".into());
         }
-        if s.last_dts.is_some_and(|d| f.dts < d) {
+        if previous.is_some_and(|d| f.dts < d) {
             return Err("worker track DTS goes backwards".into());
         }
         let pts = u64::try_from(i128::from(f.dts) + i128::from(f.pts_offset))
             .map_err(|_| "worker PTS outside timeline")?;
-        let mut payload = vec![];
+        let mut length = 0;
+        let mut write = |bytes: &[u8]| {
+            length += bytes.len();
+            emit(bytes);
+        };
         match &s.format {
             Format::Hevc(config) => {
-                let unit = config.access_unit(&f.body)?;
-                payload.extend([0, 0, 0, 1, 0x46, 1, 0x50]);
+                write(&[0, 0, 0, 1, 0x46, 1, 0x50]);
                 if f.key {
-                    payload.extend(config.annex_b());
+                    for nal in config.initialization_nals() {
+                        write(&[0, 0, 0, 1]);
+                        write(nal);
+                    }
                 }
-                payload.extend(unit.annex_b);
+                config.visit_access_unit(&f.body, |nal| {
+                    write(&[0, 0, 0, 1]);
+                    write(nal);
+                })?;
             }
             Format::Avc { width, init } => {
-                payload.extend([0, 0, 0, 1, 9, 0xf0]);
+                write(&[0, 0, 0, 1, 9, 0xf0]);
                 if f.key {
-                    payload.extend(init);
+                    write(init);
                 }
                 let mut at = 0;
                 let mut count = 0;
@@ -184,8 +203,8 @@ impl Muxer {
                     if count > 4096 {
                         return Err("too many AVC NALs".into());
                     }
-                    payload.extend([0, 0, 0, 1]);
-                    payload.extend(nal);
+                    write(&[0, 0, 0, 1]);
+                    write(nal);
                     at += n;
                 }
             }
@@ -194,7 +213,7 @@ impl Muxer {
                 if n > 8191 {
                     return Err("AAC sample exceeds ADTS length".into());
                 }
-                payload.extend([
+                write(&[
                     0xff,
                     0xf1,
                     0x40 | (rate << 2) | (channels >> 2),
@@ -203,19 +222,41 @@ impl Muxer {
                     ((n as u8 & 7) << 5) | 31,
                     0xfc,
                 ]);
-                payload.extend(&f.body);
+                write(&f.body);
             }
             Format::Mpeg => {
                 crate::mpeg_audio::inspect(s.kind, &f.body)?;
-                payload.extend(&f.body);
+                write(&f.body);
             }
         }
+        if !s.kind.is_video() && 13 + length > 65535 {
+            return Err("audio PES exceeds length".into());
+        }
+        Ok(pts)
+    }
+    /// Validate an entire GOP without copying payloads or changing mux state.
+    pub fn validate_frames(&self, frames: &[Frame]) -> Result<(), String> {
+        let mut previous: Vec<_> = self.streams.iter().map(|s| s.last_dts).collect();
+        for f in frames {
+            if let Some(index) = self.stream_index(f)? {
+                self.sample(index, f, previous[index], |_| {})?;
+                previous[index] = Some(f.dts);
+            }
+        }
+        Ok(())
+    }
+    pub fn frame(&mut self, f: &Frame) -> Result<Vec<u8>, String> {
+        let Some(index) = self.stream_index(f)? else {
+            return Ok(Vec::new());
+        };
+        let s = &self.streams[index];
+        let mut payload = vec![];
+        let pts = self.sample(index, f, s.last_dts, |bytes| {
+            payload.extend_from_slice(bytes)
+        })?;
         let pid = s.pid;
         let video = s.kind.is_video();
         let size = 13 + payload.len();
-        if !video && size > 65535 {
-            return Err("audio PES exceeds length".into());
-        }
         let len = if video { 0 } else { size as u16 };
         let mut pes = vec![
             0,

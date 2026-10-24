@@ -85,6 +85,16 @@ Shared RTP records retain decode timestamps outside the unchanged wire bytes. Ea
 
 RTSP input defaults to TCP. The normal input form selects TCP or UDP; UDP is saved as `{"url":"rtsp://...","rtp":"udp"}` and inherited through templates. Changing the URL to another protocol clears the option. The `rtsp-udp://` input alias also selects unicast UDP without an `rtp` option; a redundant `rtp:"udp"` is accepted. The saved URL and input statistics retain `rtsp-udp`, while the independent FFmpeg adapter receives `rtsp://` with explicit UDP transport. Only the scheme changes: userinfo, path and query bytes are retained. The friendly selector and inherited input summary recognize the alias. Selecting TCP replaces its scheme with `rtsp://` and removes `rtp`; switching away from plain RTSP clears the transport option. The alias is plaintext and does not accept a trusted CA setting. Independent FFmpeg UDP clients decode H.264 and AAC together; UDP input is repackaged to independently decoded HLS, and native M4S/M4F private CDN pulls feed UDP output without an additional encoder.
 
+For copied-video RTSP inputs, the friendly **RTSP startup** selector defaults
+to Auto-detect. On a cold start, Auto may make a separate short DESCRIBE
+request to identify H.264 when the URL has no credentials. Sources with single-use tokens or charged
+admissions can select **H.264 (no extra probe)** when the codec is known, or
+**Conservative (no extra probe)** for HEVC or unknown codecs. These save
+`flussonix_rtsp_startup: "h264"` or `"conservative"` on the input row and
+inherit through Templates. The explicit choice bypasses the extra probe;
+an incorrect H.264 choice can make HEVC startup fail. The option is accepted
+only on RTSP, RTSP-UDP, RTSP2 and RTSPS inputs.
+
 RTSPS, direct RTP, SRTP, RTSP publication/push, multicast, Basic/Digest viewer authentication, RTSP LB redirects, retransmission and migration/large-scale performance qualification remain pending.
 
 

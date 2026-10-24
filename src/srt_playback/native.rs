@@ -21,12 +21,14 @@ struct Api {
     create: unsafe extern "C" fn() -> i32,
     close: unsafe extern "C" fn(i32) -> c_int,
     bind: unsafe extern "C" fn(i32, *const sockaddr, c_int) -> c_int,
+    connect: unsafe extern "C" fn(i32, *const sockaddr, c_int) -> c_int,
     listen: unsafe extern "C" fn(i32, c_int) -> c_int,
     accept: AddressFn,
     address: AddressFn,
     set: unsafe extern "C" fn(i32, c_int, *const c_void, c_int) -> c_int,
     get: unsafe extern "C" fn(i32, c_int, *mut c_void, *mut c_int) -> c_int,
     send: unsafe extern "C" fn(i32, *const c_char, c_int, c_int, c_int) -> c_int,
+    recv: unsafe extern "C" fn(i32, *mut c_char, c_int) -> c_int,
     state: unsafe extern "C" fn(i32) -> c_int,
     error: unsafe extern "C" fn(*mut c_int) -> c_int,
 }
@@ -105,12 +107,14 @@ impl Api {
                 create: symbol(&library, b"srt_create_socket\0")?,
                 close: symbol(&library, b"srt_close\0")?,
                 bind: symbol(&library, b"srt_bind\0")?,
+                connect: symbol(&library, b"srt_connect\0")?,
                 listen: symbol(&library, b"srt_listen\0")?,
                 accept: symbol(&library, b"srt_accept\0")?,
                 address: symbol(&library, b"srt_getsockname\0")?,
                 set: symbol(&library, b"srt_setsockflag\0")?,
                 get: symbol(&library, b"srt_getsockflag\0")?,
                 send: symbol(&library, b"srt_sendmsg\0")?,
+                recv: symbol(&library, b"srt_recvmsg\0")?,
                 state: symbol(&library, b"srt_getsockstate\0")?,
                 error: symbol(&library, b"srt_getlasterror\0")?,
                 _library: library,
@@ -216,10 +220,206 @@ impl Socket {
         }
         Err(failure("SRT output failed"))
     }
+    pub(crate) fn try_recv(&self, data: &mut [u8]) -> io::Result<Option<usize>> {
+        if data.is_empty() || data.len() > c_int::MAX as usize {
+            return Err(failure("invalid SRT receive buffer"));
+        }
+        // SAFETY: The writable buffer remains valid throughout the synchronous
+        // nonblocking receive call; libsrt writes at most its supplied length.
+        let result =
+            unsafe { (self.api.recv)(self.id, data.as_mut_ptr().cast(), data.len() as c_int) };
+        if result > 0 {
+            return Ok(Some(result as usize));
+        }
+        // SAFETY: Thread-local numeric error; optional OS-error output is null.
+        if result < 0 && unsafe { (self.api.error)(std::ptr::null_mut()) } == 6002 {
+            return Ok(None);
+        }
+        Err(failure("SRT input closed"))
+    }
     pub fn is_connected(&self) -> bool {
         // SAFETY: Valid owned descriptor and process-lifetime function pointer.
         unsafe { (self.api.state)(self.id) == 5 }
     }
+
+    pub(crate) fn is_connecting(&self) -> bool {
+        // SAFETY: Valid owned descriptor and process-lifetime function pointer.
+        unsafe { (self.api.state)(self.id) == 4 }
+    }
+}
+
+pub(crate) struct ReceiveSettings {
+    pub streamid: String,
+    pub passphrase: String,
+    pub pbkeylen: i32,
+    pub tsbpd: bool,
+    pub latency_millis: i32,
+    pub connect_millis: i32,
+    pub idle_millis: i32,
+    pub rcvbuf_bytes: i32,
+}
+
+fn receiver_socket(settings: &ReceiveSettings) -> io::Result<Socket> {
+    let socket = Socket::create()?;
+    socket.option(50, &0i32)?; // SRTT_LIVE.
+    socket.option(21, &0u8)?; // Receiver, not media sender.
+    socket.option(22, &(settings.tsbpd as u8))?;
+    socket.option(23, &settings.latency_millis)?;
+    // SRT requires the receive buffer to fit within its flight-control
+    // window. Configure that window first, then the bounded byte capacity.
+    let flight_packets = (settings.rcvbuf_bytes + 1315) / 1316 + 1024;
+    socket.option(4, &flight_packets)?;
+    socket.option(6, &settings.rcvbuf_bytes)?;
+    socket.option(55, &settings.idle_millis)?;
+    socket.option(53, &1u8)?; // Reject mismatched encryption.
+    if !settings.streamid.is_empty() {
+        // SAFETY: The validated UTF-8 stream ID is copied during the option call.
+        let result = unsafe {
+            (socket.api.set)(
+                socket.id,
+                46,
+                settings.streamid.as_ptr().cast(),
+                settings.streamid.len() as c_int,
+            )
+        };
+        if result != 0 {
+            return Err(failure("SRT input stream ID setup failed"));
+        }
+    }
+    if !settings.passphrase.is_empty() {
+        // SAFETY: The validated ASCII secret is copied during the option call.
+        let result = unsafe {
+            (socket.api.set)(
+                socket.id,
+                26,
+                settings.passphrase.as_ptr().cast(),
+                settings.passphrase.len() as c_int,
+            )
+        };
+        if result != 0 {
+            return Err(failure("SRT input encryption setup failed"));
+        }
+        socket.option(27, &settings.pbkeylen)?;
+    }
+    socket.nonblocking()?;
+    Ok(socket)
+}
+
+pub(crate) fn receiver_caller(
+    address: SocketAddr,
+    settings: &ReceiveSettings,
+) -> io::Result<Socket> {
+    let socket = receiver_socket(settings)?;
+    socket.option(36, &settings.connect_millis)?;
+    let (storage, len) = encode_address(address);
+    // SAFETY: The aligned address has the exact initialized address length.
+    let result =
+        unsafe { (socket.api.connect)(socket.id, std::ptr::from_ref(&storage).cast(), len) };
+    if result != 0 && !socket.is_connecting() && !socket.is_connected() {
+        return Err(failure("SRT input connection failed"));
+    }
+    Ok(socket)
+}
+
+pub(crate) struct ReceiverListener(Socket);
+impl ReceiverListener {
+    pub(crate) fn bind(address: SocketAddr, settings: &ReceiveSettings) -> io::Result<Self> {
+        let socket = receiver_socket(settings)?;
+        socket.option(15, &0u8)?; // Never share an occupied UDP port.
+        let (storage, len) = encode_address(address);
+        // SAFETY: The aligned address has the exact initialized address length.
+        if unsafe { (socket.api.bind)(socket.id, std::ptr::from_ref(&storage).cast(), len) } != 0 {
+            return Err(failure("SRT input listener bind failed"));
+        }
+        // SAFETY: Valid bound native descriptor and bounded accept backlog.
+        if unsafe { (socket.api.listen)(socket.id, 8) } != 0 {
+            return Err(failure("SRT input listener setup failed"));
+        }
+        Ok(Self(socket))
+    }
+    pub(crate) fn accept(&self) -> io::Result<Option<Socket>> {
+        // SAFETY: Zeroed sockaddr_storage is a valid writable C address buffer.
+        let mut storage: sockaddr_storage = unsafe { mem::zeroed() };
+        let mut len = mem::size_of_val(&storage) as c_int;
+        // SAFETY: The listener is nonblocking and the address buffer is bounded.
+        let id = unsafe {
+            (self.0.api.accept)(self.0.id, std::ptr::from_mut(&mut storage).cast(), &mut len)
+        };
+        if id < 0 {
+            // SAFETY: Thread-local numeric error; optional OS-error output is null.
+            if unsafe { (self.0.api.error)(std::ptr::null_mut()) } == 6002 {
+                return Ok(None);
+            }
+            return Err(failure("SRT input accept failed"));
+        }
+        let socket = Socket {
+            api: Arc::clone(&self.0.api),
+            id,
+        };
+        socket.nonblocking()?;
+        Ok(Some(socket))
+    }
+}
+
+/// Begin a nonblocking caller handshake. The socket owns secrets in libsrt;
+/// the FFmpeg remuxer only receives and writes local MPEG-TS pipes.
+pub(crate) fn caller(
+    address: SocketAddr,
+    streamid: &str,
+    passphrase: &str,
+    latency_millis: u64,
+    connect_seconds: u64,
+) -> io::Result<Socket> {
+    let socket = Socket::create()?;
+    socket.option(50, &0i32)?; // SRTO_TRANSTYPE = SRTT_LIVE.
+    socket.option(21, &1u8)?; // SRTO_SENDER.
+    socket.option(49, &1316i32)?; // SRTO_PAYLOADSIZE.
+    socket.option(23, &(latency_millis as i32))?;
+    socket.option(36, &((connect_seconds * 1000) as i32))?;
+    socket.option(5, &(1316i32 * 128))?; // Finite application send queue.
+    socket.option(55, &10000i32)?; // Match the former 10-second peer idle timeout.
+    socket.option(53, &1u8)?; // SRTO_ENFORCEDENCRYPTION.
+    if !streamid.is_empty() {
+        // SAFETY: Config validation bounds the UTF-8 string to 512 bytes;
+        // libsrt copies it during this synchronous option call.
+        let result = unsafe {
+            (socket.api.set)(
+                socket.id,
+                46,
+                streamid.as_ptr().cast(),
+                streamid.len() as c_int,
+            )
+        };
+        if result != 0 {
+            return Err(failure("SRT stream ID setup failed"));
+        }
+    }
+    if !passphrase.is_empty() {
+        // SAFETY: Config validation bounds ASCII passphrases to 10..79 bytes;
+        // libsrt copies the bytes during this synchronous option call.
+        let result = unsafe {
+            (socket.api.set)(
+                socket.id,
+                26,
+                passphrase.as_ptr().cast(),
+                passphrase.len() as c_int,
+            )
+        };
+        if result != 0 {
+            return Err(failure("SRT encryption setup failed"));
+        }
+        socket.option(27, &16i32)?; // AES-128, matching the public push profile.
+    }
+    socket.nonblocking()?;
+    let (storage, len) = encode_address(address);
+    // SAFETY: Aligned sockaddr_storage holds the exact initialized address;
+    // a nonblocking connect may report in-progress through socket state.
+    let result =
+        unsafe { (socket.api.connect)(socket.id, std::ptr::from_ref(&storage).cast(), len) };
+    if result != 0 && !socket.is_connecting() && !socket.is_connected() {
+        return Err(failure("SRT caller connection failed"));
+    }
+    Ok(socket)
 }
 pub struct Listener {
     socket: Socket,
@@ -381,5 +581,55 @@ fn decode_address(storage: &sockaddr_storage, len: c_int) -> io::Result<SocketAd
             }
             _ => Err(failure("invalid SRT peer address")),
         }
+    }
+}
+
+#[cfg(test)]
+mod receive_tests {
+    use super::*;
+
+    #[test]
+    fn configured_receive_capacity_reaches_libsrt_with_a_sufficient_flight_window() {
+        let settings = ReceiveSettings {
+            streamid: String::new(),
+            passphrase: String::new(),
+            pbkeylen: 16,
+            tsbpd: true,
+            latency_millis: 1500,
+            connect_millis: 3000,
+            idle_millis: 10000,
+            rcvbuf_bytes: 32 * 1024 * 1024,
+        };
+        let socket = receiver_socket(&settings).unwrap();
+        let mut capacity = 0i32;
+        let mut length = std::mem::size_of::<i32>() as c_int;
+        // SAFETY: The owned socket and exact writable scalar buffer remain live.
+        assert_eq!(
+            unsafe {
+                (socket.api.get)(
+                    socket.id,
+                    6,
+                    std::ptr::from_mut(&mut capacity).cast(),
+                    &mut length,
+                )
+            },
+            0
+        );
+        assert!(capacity >= settings.rcvbuf_bytes - 1456);
+        let mut flight = 0i32;
+        length = std::mem::size_of::<i32>() as c_int;
+        // SAFETY: The owned socket and exact writable scalar buffer remain live.
+        assert_eq!(
+            unsafe {
+                (socket.api.get)(
+                    socket.id,
+                    4,
+                    std::ptr::from_mut(&mut flight).cast(),
+                    &mut length,
+                )
+            },
+            0
+        );
+        assert!(flight >= capacity.div_euclid(1456));
     }
 }

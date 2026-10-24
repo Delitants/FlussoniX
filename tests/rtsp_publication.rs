@@ -1028,10 +1028,21 @@ fn publisher_transport(
         "rtsp",
         "-rtsp_transport",
         transport,
-    ])
-    .arg(input_url)
-    .stderr(std::process::Stdio::piped())
-    .kill_on_drop(true);
+    ]);
+    if transport == "udp" {
+        // FFmpeg's default range overlaps both the server pool and OS ephemeral
+        // sockets. An RTCP collision can make its fallback advertise odd RTP.
+        // Reserve a separate range with room for its random starting offset.
+        let tracks = audio.len() + usize::from(video.is_some());
+        let (range, held) = udp_fixture::reserved(u16::try_from(4 * tracks).unwrap());
+        let range = range.to_string();
+        let (first, last) = range.split_once('-').unwrap();
+        cmd.args(["-min_port", first, "-max_port", last]);
+        drop(held);
+    }
+    cmd.arg(input_url)
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
     cmd.spawn().unwrap()
 }
 async fn qualify(video: Option<&str>, audio: &[&str], profile: serde_json::Value, tls: bool) {
@@ -1487,6 +1498,8 @@ async fn callback_denial_and_pending_renewal_never_admit_a_worker() {
         assert_eq!(first["request_number"], 0);
         assert_eq!(first["request_type"], "new_session");
         assert_eq!(first["bytes"], 0);
+        assert_eq!(first["qs"], "token=owned-token");
+        assert!(!first.to_string().contains("owned-publish"));
         if !deny {
             let second = tokio::time::timeout(Duration::from_secs(3), rx.recv())
                 .await
@@ -1495,6 +1508,7 @@ async fn callback_denial_and_pending_renewal_never_admit_a_worker() {
             assert_eq!(second["session_id"], first["session_id"]);
             assert_eq!(second["request_number"], 1);
             assert_eq!(second["request_type"], "update_session");
+            assert_eq!(second["qs"], "token=owned-token");
             let mut b = Vec::new();
             tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut b))
                 .await

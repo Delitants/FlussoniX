@@ -52,9 +52,11 @@ Only successful leased modern discovery constructs `ModernLeasedInventory`.
 It exposes sorted literal `names()`, the untrusted observed `server_id()` and the
 process-local `expires_at()` deadline. Inspection can continue after expiry.
 `candidate(name)` returns `ModernLeasedCandidate` only through the existing
-local-origin, explicit membership, prefix/exclusion/selection and complete local
-viewer-policy checks. Relayed, disabled or unknown-membership rows remain
-ineligible. Remote keys, inputs and policy never override local configuration.
+local-origin, membership-aware policy, prefix/exclusion/selection and complete local
+viewer-policy checks. Relayed and disabled rows remain ineligible. Unknown
+membership is accepted only under the modern configured-origin
+policy-equivalence rule; group-dependent or
+unresolved policy still fails. Remote keys, inputs and policy never override local configuration.
 
 Both types have private fields, no public constructor/importer and no Debug or
 serialization. Plain observations, unleased bound candidates, legacy identity

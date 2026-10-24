@@ -337,3 +337,189 @@ async fn early_m4f_subscriber_receives_metadata_before_first_and_changed_gops() 
         );
     }
 }
+
+struct OwnedWire(std::sync::Arc<Vec<u8>>);
+impl AsRef<[u8]> for OwnedWire {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+fn owned_wire(data: Vec<u8>) -> (Bytes, std::sync::Weak<Vec<u8>>) {
+    let owner = std::sync::Arc::new(data);
+    let weak = std::sync::Arc::downgrade(&owner);
+    (Bytes::from_owner(OwnedWire(owner)), weak)
+}
+
+#[test]
+fn m4s_history_without_subscribers_releases_old_frame_records() {
+    let hub = Hub::new();
+    hub.info(tracks()).unwrap();
+    let first = frame(true, 0);
+    let (wire, old) = owned_wire(encode_frame(&tracks()[0], &first).unwrap());
+    hub.relay_frame(first, wire).unwrap();
+    assert!(
+        old.upgrade().is_some(),
+        "current bootstrap must own its keyframe"
+    );
+    hub.frame(frame(true, 90000)).unwrap();
+    assert!(
+        old.upgrade().is_none(),
+        "unused fan-out must release the old GOP"
+    );
+    let (bootstrap, _) = hub.m4s_subscribe();
+    let mut decoder = Decoder::default();
+    let events: Vec<_> = bootstrap
+        .iter()
+        .flat_map(|b| decoder.push(b).unwrap())
+        .collect();
+    assert!(matches!(
+        events.as_slice(),
+        [
+            Event::Info { .. },
+            Event::Frame {
+                key: true,
+                dts: 90000,
+                ..
+            }
+        ]
+    ));
+}
+
+#[tokio::test]
+async fn m4s_history_last_subscriber_release_preserves_returned_bytes_and_late_join() {
+    let hub = Hub::new();
+    hub.info(tracks()).unwrap();
+    let (_, first) = hub.m4s_subscribe();
+    let (_, mut second) = hub.m4s_subscribe();
+    let f = frame(true, 0);
+    let original = encode_frame(&tracks()[0], &f).unwrap();
+    let (wire, old) = owned_wire(original.clone());
+    hub.relay_frame(f, wire).unwrap();
+    hub.frame(frame(true, 90000)).unwrap();
+    drop(first);
+    assert!(
+        old.upgrade().is_some(),
+        "another viewer still needs this record"
+    );
+    let held = tokio::time::timeout(Duration::from_secs(1), second.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.as_ref(), original);
+    drop(second);
+    assert_eq!(
+        held.as_ref(),
+        original,
+        "returned bytes outlive the last receiver"
+    );
+    drop(held);
+    assert!(
+        old.upgrade().is_none(),
+        "last receiver must release old history"
+    );
+    let (bootstrap, mut late) = hub.m4s_subscribe();
+    let mut decoder = Decoder::default();
+    let events: Vec<_> = bootstrap
+        .iter()
+        .flat_map(|b| decoder.push(b).unwrap())
+        .collect();
+    assert!(matches!(
+        events.as_slice(),
+        [
+            Event::Info { .. },
+            Event::Frame {
+                key: true,
+                dts: 90000,
+                ..
+            }
+        ]
+    ));
+    let next = frame(false, 93600);
+    let original = encode_frame(&tracks()[0], &next).unwrap();
+    hub.relay_frame(next, Bytes::from(original.clone()))
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), late.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        original
+    );
+}
+
+#[test]
+fn m4s_history_without_subscribers_releases_packed_wire_and_keeps_m4f_segments() {
+    let hub = Hub::new();
+    let mut old = None;
+    let mut first_segment = None;
+    for sequence in 1..=2 {
+        let body =
+            Bytes::from(pack(&tracks(), &[frame(true, sequence as u64 * 90000)], 90000).unwrap());
+        let gop = PackedGop {
+            utc: 1700000000 + sequence * 2,
+            dts_ms: sequence as f64 * 1000.0,
+            sequence,
+            duration_ms: 1000.0,
+            body: body.clone(),
+        };
+        let name = if sequence == 1 {
+            "2023/11/14/22/13/22.m4f"
+        } else {
+            "2023/11/14/22/13/24.m4f"
+        };
+        let (wire, weak) = owned_wire(flussonix::m4s::encode_gop(&gop).unwrap().to_vec());
+        hub.relay_gop(gop, tracks(), wire).unwrap();
+        if sequence == 1 {
+            old = Some(weak);
+            first_segment = Some(body.clone());
+        }
+        assert_eq!(
+            hub.segment(name),
+            if sequence == 1 {
+                first_segment.clone()
+            } else {
+                Some(body)
+            }
+        );
+    }
+    assert!(
+        old.unwrap().upgrade().is_none(),
+        "unused fan-out must release the previous packed GOP record"
+    );
+    assert_eq!(hub.segment("2023/11/14/22/13/22.m4f"), first_segment);
+    let (bootstrap, _) = hub.m4s_subscribe();
+    let mut decoder = Decoder::default();
+    let events: Vec<_> = bootstrap
+        .iter()
+        .flat_map(|b| decoder.push(b).unwrap())
+        .collect();
+    assert!(matches!(
+        events.as_slice(),
+        [
+            Event::Info { .. },
+            Event::Gop {
+                gop: PackedGop { sequence: 2, .. },
+                ..
+            }
+        ]
+    ));
+}
+
+#[tokio::test]
+async fn m4s_history_active_subscriber_still_reports_record_backlog_lag() {
+    let hub = Hub::new();
+    hub.info(tracks()).unwrap();
+    let (_, mut slow) = hub.m4s_subscribe();
+    for i in 0..257 {
+        hub.frame(frame(i == 0, i * 3600)).unwrap();
+    }
+    assert!(matches!(
+        slow.recv().await,
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(1))
+    ));
+    assert_eq!(
+        slow.recv().await.unwrap().as_ref(),
+        encode_frame(&tracks()[0], &frame(false, 3600)).unwrap()
+    );
+}

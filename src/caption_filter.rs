@@ -1,6 +1,11 @@
 //! Length-preserving HLS caption suppression. Unrelated SEI and AV bytes survive.
 use crate::m4s::boxes;
 type Patch = (usize, u8);
+#[cfg(test)]
+thread_local! {
+    static MAPPING_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn number(b: &[u8], at: usize) -> Result<u32, String> {
     Ok(u32::from_be_bytes(
         b.get(at..at + 4)
@@ -213,17 +218,33 @@ pub fn ts(data: &mut [u8]) -> Result<(), String> {
         }
         let start = 9 + usize::from(pes[8]);
         let payload = pes.get(start..).ok_or("short caption PES")?;
+        #[cfg(test)]
+        let mut mapping_work = 0usize;
+        // Both PES spans and Annex-B patches are in source order. A cursor
+        // local to this flush visits at most spans + patches mapping rows.
+        let mut span = 0;
         for (offset, value) in annex_patches(payload, hevc)? {
             let at = start + offset;
+            while mapping.get(span).is_some_and(|(len, _, local)| {
+                #[cfg(test)]
+                {
+                    mapping_work += 1;
+                }
+                at >= local + len
+            }) {
+                span += 1;
+            }
             let (_, original, local) = mapping
-                .iter()
-                .find(|(len, _, local)| at >= *local && at < local + len)
+                .get(span)
+                .filter(|(_, _, local)| at >= *local)
                 .ok_or("caption mapping absent")?;
             patches.push((original + at - local, value));
             if patches.len() > 65536 {
                 return Err("caption filter patch limit".into());
             }
         }
+        #[cfg(test)]
+        MAPPING_WORK.with(|work| work.set(work.get() + mapping_work));
         Ok(())
     };
     for (i, p) in data.chunks_exact(188).enumerate() {
@@ -445,3 +466,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "caption_mapping_tests.rs"]
+mod mapping_tests;

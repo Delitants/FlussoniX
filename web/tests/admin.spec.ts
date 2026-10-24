@@ -3,6 +3,23 @@ import dgram from 'node:dgram';
 import fs from 'node:fs';
 import path from 'node:path';
 test.beforeEach(async({page})=>{await page.goto('/admin/');await page.getByLabel('Username').fill(process.env.FLUSSONIX_ADMIN_USER||'admin');await page.getByLabel('Password',{exact:true}).fill(process.env.FLUSSONIX_ADMIN_PASSWORD!);await page.getByRole('button',{name:'Sign in',exact:true}).click();await expect(page.getByRole('heading',{name:'Streams',exact:true})).toBeVisible();});
+test('status strip reports the running server version and follows node status updates',async({page,request})=>{
+ const health=await(await request.get('/health')).json();
+ expect(typeof health.version).toBe('string');expect(health.version.length).toBeGreaterThan(0);
+ await expect(page.locator('.status-strip .right')).toContainText(`v${health.version}`);
+ let version:string|undefined='9.8.7-rc.2';
+ await page.route('**/flussonix/api/v1/node',async route=>{
+  const response=await route.fetch();const data=await response.json();
+  if(version===undefined)delete data.version;else data.version=version;
+  await route.fulfill({response,json:data});
+ });
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await expect(page.locator('.status-strip .right')).toContainText('v9.8.7-rc.2');
+ version=undefined;
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();
+ await expect(page.locator('.status-strip .right')).toContainText('Version unavailable');
+ await expect(page.locator('.status-strip .right')).not.toContainText('v9.8.7-rc.2');
+});
 test('Config shows actual HTTP and HTTPS listeners with startup guidance',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
  const node=await(await request.get('/flussonix/api/v1/node',{headers})).json();
@@ -30,6 +47,45 @@ test('SRT playback status remains visible in mobile Config',async({page})=>{
  const playback=page.getByRole('region',{name:'SRT playback',exact:true});await expect(playback).toBeVisible();await expect(playback).toContainText('startup options');
  expect(await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth)).toBe(false);
 });
+for (const width of [1440,901,900,393,320]) for (const ipv6 of [false,true]) {
+ test(`Config sidebar values remain readable at ${width}px with ${ipv6?'IPv6':'disabled listeners'}`,async({page},testInfo)=>{
+  const address='[2001:db8:1234:5678:9abc:def0:1234:5678]';
+  await page.route('**/flussonix/api/v1/node',async route=>{
+   const response=await route.fetch();const data=await response.json();
+   data.http_delivery={http:ipv6?`${address}:18210`:'127.0.0.1:18210',https:ipv6?`${address}:443`:null,https_only:false};
+   data.srt_playback={enabled:ipv6,listen:ipv6?`${address}:9998`:null,encrypted:ipv6,latency_ms:120,client_limit:128,clients:0};
+   data.fxlink={...data.fxlink,enabled:ipv6,listen:ipv6?`${address}:55000`:null};
+   await route.fulfill({response,json:data});
+  });
+  await page.setViewportSize({width,height:1100});
+  await page.getByRole('button',{name:'Config',exact:true}).click();
+  const sidebar=page.locator('.config-layout aside');
+  await expect(sidebar.getByRole('region',{name:'HTTP delivery',exact:true}).locator('dd')).toHaveText([
+   ipv6?`${address}:18210`:'127.0.0.1:18210',ipv6?`${address}:443`:'Not enabled',ipv6?'HTTP and HTTPS':'HTTP',
+  ]);
+  await expect(sidebar.getByRole('region',{name:'SRT playback',exact:true}).locator('dd')).toHaveText([
+   ipv6?`${address}:9998`:'Not enabled',ipv6?'Encrypted':'—',ipv6?'120 ms':'—',ipv6?'128':'—',ipv6?'0':'—',
+  ]);
+  await expect(sidebar.getByRole('region',{name:'FXLink transport',exact:true}).locator('dd')).toHaveText([
+   ipv6?`${address}:55000`:'Not enabled','TLS + Reed–Solomon FEC','1,000 ms',
+  ]);
+  await page.evaluate(()=>document.fonts.ready);
+  const values=await sidebar.locator('dd').evaluateAll(elements=>elements.map(element=>{
+   const range=document.createRange();range.selectNodeContents(element);
+   const box=element.getBoundingClientRect();const panel=element.closest('aside')!.getBoundingClientRect();
+   return {label:element.previousElementSibling?.textContent,text:element.textContent||'',lines:range.getClientRects().length,left:box.left,right:box.right,panelLeft:panel.left,panelRight:panel.right,scrollWidth:element.scrollWidth,width:element.clientWidth};
+  }));
+  await testInfo.attach('sidebar-values',{body:JSON.stringify(values,null,2),contentType:'application/json'});
+  await page.screenshot({path:testInfo.outputPath('config.png'),fullPage:true});
+  for(const value of values){
+   expect(value.lines,`${value.text} should remain readable`).toBeLessThanOrEqual(value.text.startsWith('[')?3:value.label==='Protection'?2:1);
+   expect(value.left).toBeGreaterThanOrEqual(value.panelLeft);
+   expect(value.right).toBeLessThanOrEqual(value.panelRight);
+   expect(value.scrollWidth).toBeLessThanOrEqual(value.width+1);
+  }
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+ });
+}
 test('SRT playback URL uses an IPv6 endpoint and token placeholder without saved secrets',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
  expect((await request.put('/streamer/api/v3/streams/srt-ui-playback',{headers,data:{inputs:[{url:'testsrc://'}],static:false}})).ok()).toBeTruthy();
@@ -50,6 +106,15 @@ test('configuration edits can be validated without applying',async({page,request
  await page.getByRole('button',{name:'Save & apply',exact:true}).click();await expect(page.locator('.notice[role=status]')).toContainText('saved and applied');
  expect((await request.get('/streamer/api/v3/streams/staged-stream',{headers})).ok()).toBeTruthy();
  await expect(page.locator('textarea')).toHaveCount(0);
+});
+test('Config displays validation details returned by the server',async({page})=>{
+ await page.route('**/streamer/api/v3/config',async route=>{
+  if(route.request().method()==='POST')await route.fulfill({status:400,contentType:'application/json',body:JSON.stringify({error:'unknown_key',detail:'server option unsupported_feature is not implemented',path:['server_config','unsupported_feature'],config:{unsupported_feature:true}})});
+  else await route.continue();
+ });
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await page.getByRole('button',{name:'Validate',exact:true}).click();
+ await expect(page.getByRole('alert')).toContainText('unsupported_feature');
 });
 test('cluster and template screens use configured data',async({page})=>{await page.getByRole('button',{name:'Templates',exact:true}).click();await expect(page.getByRole('heading',{name:'Templates',exact:true})).toBeVisible();await page.getByRole('button',{name:'Cluster',exact:true}).click();await expect(page.getByText('Viewer entry point',{exact:true})).toBeVisible();await page.getByRole('button',{name:'Source servers',exact:true}).click();await expect(page.getByText('No sources configured')).toBeVisible();await page.screenshot({path:'../.runtime/screenshots/cluster.png',fullPage:true});});
 test('editing a title preserves template inheritance',async({page,request})=>{
@@ -205,6 +270,38 @@ test('RTSP input transport uses a friendly selector and clears UDP when changing
  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await transport.selectOption('udp');await page.getByLabel('Input URL',{exact:true}).fill('hls://example.net/camera/index.m3u8');await expect(transport).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();
  state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].rtp).toBeUndefined();await expect(page.locator('textarea')).toHaveCount(0);
  await request.delete('/streamer/api/v3/streams/'+name,{headers});
+});
+
+test('RTSP startup mode saves a single-admission hint and clears it for other protocols',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-rtsp-startup-'+Date.now();
+ try{
+  expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,static:false,inputs:[{url:'rtsp://127.0.0.1:19990/camera'}]}})).ok()).toBeTruthy();
+  await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+  const mode=page.getByLabel('RTSP startup',{exact:true});await expect(mode).toHaveValue('auto');await mode.selectOption('h264');await page.getByRole('button',{name:'Save',exact:true}).click();
+  let state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_rtsp_startup).toBe('h264');
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(mode).toHaveValue('h264');await mode.selectOption('conservative');await page.getByRole('button',{name:'Save',exact:true}).click();
+  state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_rtsp_startup).toBe('conservative');
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await mode.selectOption('auto');await page.getByRole('button',{name:'Save',exact:true}).click();
+  state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_rtsp_startup).toBeUndefined();
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await mode.selectOption('h264');await page.getByLabel('Input URL',{exact:true}).fill('hls://example.net/camera/index.m3u8');await expect(mode).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();
+  state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_rtsp_startup).toBeUndefined();await expect(page.locator('textarea')).toHaveCount(0);
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});}
+});
+
+test('RTSP startup mode is editable in Templates and visible to inherited streams',async({page,request})=>{
+ test.setTimeout(45000);
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const template='ui-rtsp-startup-template-'+Date.now(),name='ui-rtsp-startup-child-'+Date.now();
+ try{
+  expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{$reset:true,inputs:[{url:'rtsps://localhost:19990/camera'}]}})).ok()).toBeTruthy();
+  await page.getByRole('button',{name:'Templates',exact:true}).click();await page.getByRole('row').filter({has:page.getByRole('cell',{name:template,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+  const mode=page.getByLabel('RTSP startup',{exact:true});await expect(mode).toHaveValue('auto');await mode.selectOption('h264');await page.getByRole('button',{name:'Save',exact:true}).click();
+  const saved=await(await request.get('/streamer/api/v3/templates/'+template,{headers})).json();expect(saved.inputs[0].flussonix_rtsp_startup).toBe('h264');
+  expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,template,static:false}})).ok()).toBeTruthy();
+  await page.getByRole('button',{name:'Streams',exact:true}).click();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Input',exact:true}).click();
+  await expect(page.getByText(/H\.264 startup · no probe/)).toBeVisible();
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});await request.delete('/streamer/api/v3/templates/'+template,{headers});}
 });
 
 
@@ -652,7 +749,12 @@ test('direct transport template destinations inherit, override and clear without
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};const template='ui-direct-template-'+Date.now(),name=template+'-stream';
  const outputs=[{url:'rtp://127.0.0.1:39004',disabled:true,max_mbps:20}];
  expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{disabled:true,static:false,inputs:[{url:'testsrc://'}],flussonix_rtp_outputs:outputs}})).ok()).toBeTruthy();expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{template}})).ok()).toBeTruthy();
- try{await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(page.getByLabel('Direct transport destinations',{exact:true})).toHaveValue('inherit');await page.getByLabel('Direct transport destinations',{exact:true}).selectOption('override');await expect(page.getByLabel('RTP maximum bitrate (Mbps) 1',{exact:true})).toHaveValue('20');await page.getByLabel('RTP maximum bitrate (Mbps) 1',{exact:true}).fill('30');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+ try{await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+ // The fixtures are created outside the UI. A poll can read templates before
+ // creation and streams after it, so wait for the inherited destination to load.
+ const destinations=page.getByRole('group',{name:'RTP and SRTP destinations',exact:true});
+ await expect(destinations).toContainText('1. rtp://127.0.0.1:39004 · Disabled · Plaintext · MPEG-TS / PT33');
+ await expect(page.getByLabel('Direct transport destinations',{exact:true})).toHaveValue('inherit');await page.getByLabel('Direct transport destinations',{exact:true}).selectOption('override');await expect(page.getByLabel('RTP maximum bitrate (Mbps) 1',{exact:true})).toHaveValue('20');await page.getByLabel('RTP maximum bitrate (Mbps) 1',{exact:true}).fill('30');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
  let data=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(data.config_on_disk.flussonix_rtp_outputs[0].max_mbps).toBe(30);
  for(const mode of ['none','inherit']){await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Direct transport destinations',{exact:true}).selectOption(mode);await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);data=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();if(mode==='none')expect(data.flussonix_rtp_outputs).toEqual([]);else{expect(data.config_on_disk.flussonix_rtp_outputs).toBeUndefined();expect(data.flussonix_rtp_outputs).toEqual(outputs);}}
  }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});await request.delete('/streamer/api/v3/templates/'+template,{headers});}

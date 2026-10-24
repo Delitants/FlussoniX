@@ -355,7 +355,7 @@ impl Runtime {
                             if let Some(group)=group {self.recover_one(app,&name,group).await;}
                         }
                     }};
-                    tokio::select!{biased;_=token.cancelled()=>{},_=tokio::time::timeout(Duration::from_secs(8),work)=>{}}name
+                    tokio::select!{biased;_=token.cancelled()=>{},_=tokio::time::timeout(RECOVERY_JOB_BUDGET,work)=>{}}name
                 }));
             }
         }

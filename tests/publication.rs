@@ -37,7 +37,10 @@ async fn publication_is_fenced_exclusive_owned_and_reconnects_immediately() {
         .expect("publisher starts worker");
     let old = p.worker.clone();
     assert!(p.stdin.is_some());
-    assert_eq!(engine.ensure("owned", &cfg).await.unwrap().pid(), old.pid());
+    assert!(Arc::ptr_eq(
+        &engine.ensure("owned", &cfg).await.unwrap(),
+        &old
+    ));
     assert!(
         engine
             .publish_guarded("owned", &cfg, std::future::ready(true))
@@ -53,7 +56,7 @@ async fn publication_is_fenced_exclusive_owned_and_reconnects_immediately() {
         .publish_guarded("owned", &cfg, std::future::ready(true))
         .await
         .expect("reconnect without pull backoff");
-    assert_ne!(replacement.worker.pid(), old.pid());
+    assert!(!Arc::ptr_eq(&replacement.worker, &old));
     engine.stop_if_current("owned", &old).await;
     assert!(
         !replacement.worker.is_closed(),
@@ -485,7 +488,7 @@ async fn publisher_callback_uses_post_metadata_and_renews_same_session_before_de
     a.config.put("streams","owned",json!({"inputs":[{"url":"publish://"}],"password":"publisher","on_publish":format!("{url}/publish")})).unwrap();
     let (tx, t) = upload(
         a.clone(),
-        "/owned/mpegts?password=publisher&token=owned%2Btoken&extra=one%20two",
+        "/owned/mpegts?%70assword=publisher&token=owned%2Btoken&extra=one%20two",
     )
     .await;
     tx.send(Ok(transport_packet())).await.unwrap();
@@ -510,7 +513,9 @@ async fn publisher_callback_uses_post_metadata_and_renews_same_session_before_de
     assert_eq!(log[1]["request_type"], "update_session");
     assert_eq!(log[0]["session_id"], log[1]["session_id"]);
     assert_eq!(log[1]["bytes"], 188);
-    assert!(log[0]["qs"].as_str().unwrap().contains("extra=one%20two"));
+    assert_eq!(log[0]["qs"], "token=owned%2Btoken&extra=one%20two");
+    assert_eq!(log[1]["qs"], "token=owned%2Btoken&extra=one%20two");
+    assert!(!log[0].to_string().contains("publisher"));
     drop(log);
     a.media.stop_all().await;
     backend.abort();

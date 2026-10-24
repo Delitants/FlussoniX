@@ -77,7 +77,10 @@ async fn client_count(f: &Fixture) -> usize {
     value["srt_playback"]["clients"].as_u64().unwrap() as usize
 }
 async fn connections(f: &Fixture, expected: usize) -> bool {
-    tokio::time::timeout(Duration::from_secs(4), async {
+    connections_within(f, expected, Duration::from_secs(4)).await
+}
+async fn connections_within(f: &Fixture, expected: usize, within: Duration) -> bool {
+    tokio::time::timeout(within, async {
         while client_count(f).await != expected {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -111,11 +114,18 @@ async fn clear_vendor_srt_revokes_one_viewer_without_stopping_static_or_http() {
     first.stop().await;
     second.stop().await;
     drop(response);
-    let empty = connections(&f, 0).await;
+    let closed_at = std::time::Instant::now();
+    // stop() kills the caller without an SRT shutdown. Allow the listener's
+    // five-second peer-idle timeout plus its polling/scheduling margin.
+    let empty = connections_within(&f, 0, Duration::from_secs(7)).await;
+    let closed_seconds = closed_at.elapsed().as_secs_f64();
     let static_alive = f.app.media.count().await == 1;
     serving.stop().await;
     f.stop().await;
-    assert!(two && http_ok && revoked && one && other_alive && same_pull && empty && static_alive);
+    assert!(
+        two && http_ok && revoked && one && other_alive && same_pull && empty && static_alive,
+        "two={two} http_ok={http_ok} revoked={revoked} one={one} other_alive={other_alive} same_pull={same_pull} empty={empty} closed_seconds={closed_seconds} static_alive={static_alive}"
+    );
 }
 #[tokio::test]
 async fn wrong_or_missing_transport_secret_never_discovers_or_pulls_vendor_media() {

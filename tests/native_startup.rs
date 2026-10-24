@@ -16,7 +16,7 @@ use std::{
 };
 use tokio::io::AsyncReadExt;
 
-async fn metadata_handshake(protocol: &str, invalid: bool) {
+async fn metadata_handshake(protocol: &str, invalid: bool, malformed: bool) {
     let tracks = vec![Track {
         id: 37,
         codec: "hevc".into(),
@@ -35,7 +35,15 @@ async fn metadata_handshake(protocol: &str, invalid: bool) {
     };
     let mut native = flussonix::wire::encode_info(&tracks).unwrap();
     native.extend(flussonix::wire::encode_frame(&tracks[0], &frame).unwrap());
-    let segment = Bytes::from(m4f::pack(&tracks, std::slice::from_ref(&frame), 180000).unwrap());
+    let mut frames = vec![frame.clone()];
+    if malformed {
+        frames.push(Frame {
+            dts: 180000,
+            body: vec![0; 8],
+            ..frame.clone()
+        });
+    }
+    let segment = Bytes::from(m4f::pack(&tracks, &frames, 180000).unwrap());
     let control = if protocol == "m4s" {
         Bytes::from(native)
     } else {
@@ -43,6 +51,7 @@ async fn metadata_handshake(protocol: &str, invalid: bool) {
     };
     let count = Arc::new(AtomicUsize::new(0));
     let c = count.clone();
+    let expected_segment = segment.clone();
     let router = axum::Router::new()
         .route(
             &format!("/owned/{protocol}"),
@@ -82,12 +91,57 @@ async fn metadata_handshake(protocol: &str, invalid: bool) {
         assert!(metadata.is_err());
         assert!(pull.await.unwrap().is_err());
         assert!(hub.m4s_subscribe().0.is_empty());
+    } else if malformed {
+        assert_eq!(metadata.unwrap(), tracks);
+        let tables = Muxer::new(&tracks).unwrap().tables();
+        let mut bytes = vec![0; tables.len()];
+        tokio::time::timeout(Duration::from_secs(2), reader.read_exact(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), pull)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(hub.m4s_subscribe().0.is_empty());
+        assert!(hub.segment("2026/10/03/01/00/00.m4f").is_none());
+        assert!(hub.rtp.description().is_none());
     } else {
         assert_eq!(metadata.unwrap(), tracks);
         assert!(!pull.is_finished());
         let mut muxer = Muxer::new(&tracks).unwrap();
-        let mut expected = muxer.tables();
-        expected.extend(muxer.frame(&frame).unwrap());
+        let tables = muxer.tables();
+        let mut actual_tables = vec![0; tables.len()];
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            reader.read_exact(&mut actual_tables),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(actual_tables, tables);
+        if protocol == "m4f" {
+            // Leave the one-byte bridge blocked on the first sample. A complete
+            // received GOP must already be available to native relay consumers.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while hub.segment("2026/10/03/01/00/00.m4f").is_none() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("native M4F relay waits for the packaging pipe");
+            assert_eq!(
+                hub.segment("2026/10/03/01/00/00.m4f").unwrap(),
+                expected_segment
+            );
+            assert!(!hub.m4s_subscribe().0.is_empty());
+            assert!(hub.rtp.description().unwrap().is_ok());
+            assert!(!pull.is_finished());
+        }
+        let expected = muxer.frame(&frame).unwrap();
         let mut actual = vec![0; expected.len()];
         tokio::time::timeout(Duration::from_secs(2), reader.read_exact(&mut actual))
             .await
@@ -104,19 +158,19 @@ async fn metadata_handshake(protocol: &str, invalid: bool) {
 
 #[tokio::test]
 async fn m4s_metadata_precedes_pipe_backpressure_without_reconnecting() {
-    metadata_handshake("m4s", false).await;
+    metadata_handshake("m4s", false, false).await;
 }
 #[tokio::test]
 async fn m4f_metadata_precedes_pipe_backpressure_without_refetching() {
-    metadata_handshake("m4f", false).await;
+    metadata_handshake("m4f", false, false).await;
 }
 #[tokio::test]
 async fn m4s_invalid_initial_metadata_closes_handshake_before_relay() {
-    metadata_handshake("m4s", true).await;
+    metadata_handshake("m4s", true, false).await;
 }
 #[tokio::test]
 async fn m4f_invalid_initial_metadata_closes_handshake_before_relay() {
-    metadata_handshake("m4f", true).await;
+    metadata_handshake("m4f", true, false).await;
 }
 
 struct PendingSource(Arc<std::sync::atomic::AtomicBool>);
@@ -281,4 +335,9 @@ async fn native_spawn_failure_is_a_recoverable_worker_failure() {
     assert!(!worker.alive.load(Ordering::SeqCst));
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn malformed_m4f_sample_never_reaches_native_relay_while_bridge_is_blocked() {
+    metadata_handshake("m4f", false, true).await;
 }

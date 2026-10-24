@@ -222,11 +222,25 @@ impl Profile {
     }
 }
 
+#[derive(Clone)]
+pub(crate) enum ModernFact {
+    Eligible {
+        observation: Arc<()>,
+        names: Arc<[String]>,
+    },
+    Rejected {
+        observation: Arc<()>,
+    },
+}
+
 struct State {
     revision: u64,
     profile: Option<Arc<Profile>>,
     lease_turn: Option<Arc<()>>,
     renewal_turn: Option<Arc<()>>,
+    // Compact facts minted only by accepted modern discovery/renewal. A
+    // caller's copied LeaseFailure is never source-wide rejection proof.
+    modern_fact: Option<ModernFact>,
 }
 
 /// Owns one independent local source authority. Not the daemon's configuration
@@ -261,6 +275,7 @@ impl SourceAuthority {
                 profile: Some(profile),
                 lease_turn: None,
                 renewal_turn: None,
+                modern_fact: None,
             }),
         })
     }
@@ -306,6 +321,7 @@ impl SourceAuthority {
         state.revision = revision;
         state.lease_turn = None;
         state.renewal_turn = None;
+        state.modern_fact = None;
         Ok(())
     }
     pub fn remove(&self) -> Result<(), ProjectionFailure> {
@@ -318,6 +334,7 @@ impl SourceAuthority {
         state.revision = revision;
         state.lease_turn = None;
         state.renewal_turn = None;
+        state.modern_fact = None;
         Ok(())
     }
     /// Hold the authority lock while committing a current candidate. Never await
@@ -355,9 +372,21 @@ impl SourceSnapshot {
         self.revision
     }
     pub fn candidate(&self, row: &InventoryStream) -> Result<Candidate, ProjectionFailure> {
-        let kind = row
-            .local_origin_candidate()
-            .map_err(ProjectionFailure::Ineligible)?;
+        let kind = match row.local_origin_candidate() {
+            Ok(kind) => kind,
+            // Modern management responses can omit memberships. Preserve that
+            // uncertainty; selected_candidate must prove policy independence.
+            Err(super::flussonic::EligibilityFailure::UnknownGroups)
+                if matches!(&self.profile.inventory, Inventory::Modern(_)) =>
+            {
+                if row.is_static {
+                    CandidateKind::Static
+                } else {
+                    CandidateKind::OnDemand
+                }
+            }
+            Err(error) => return Err(ProjectionFailure::Ineligible(error)),
+        };
         self.selected_candidate(row, kind)
     }
     // Only the explicit all-hop coordinator can use remote rows. Preserve the
@@ -393,11 +422,23 @@ impl SourceSnapshot {
         if !super::allows(&self.profile.source, &row.name) {
             return Err(ProjectionFailure::Excluded);
         }
-        let policy = self
-            .profile
-            .policies
-            .for_groups(&json!(row.groups))
-            .map_err(ProjectionFailure::Policy)?;
+        let policy = if let Some(groups) = &row.groups {
+            self.profile
+                .policies
+                .for_groups(&json!(groups))
+                .map_err(ProjectionFailure::Policy)?
+        } else {
+            // Every possible subset of configured groups must produce the
+            // same explicit local policy. Unknown memberships never become [].
+            self.profile
+                .uniform
+                .get_or_init(|| self.profile.policies.uniform())
+                .clone()
+                .map_err(ProjectionFailure::Policy)?
+                .ok_or(ProjectionFailure::Ineligible(
+                    super::flussonic::EligibilityFailure::UnknownGroups,
+                ))?
+        };
         let selected_static = kind == CandidateKind::Static
             && super::selected_static(&self.profile.source, &row.name);
         Ok(Candidate {

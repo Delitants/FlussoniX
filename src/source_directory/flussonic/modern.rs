@@ -150,7 +150,7 @@ impl ModernInventoryClient {
                 let mut query = url.query_pairs_mut();
                 query
                     .append_pair("select", SELECT)
-                    .append_pair("limit", "100");
+                    .append_pair("limit", "1000");
                 if let Some(cursor) = &cursor {
                     query.append_pair("cursor", cursor);
                 }

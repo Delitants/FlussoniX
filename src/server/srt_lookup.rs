@@ -163,9 +163,7 @@ impl App {
                 if grant.is_cancelled() {
                     return Err(403);
                 }
-                if result.is_ok() {
-                    grant.playback();
-                }
+                // Only the destination owns playback when this ticket is redeemed.
                 result
             })
             .ok_or(503u16)?

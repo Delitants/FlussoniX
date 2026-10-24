@@ -1,12 +1,13 @@
 //! Four owned catalog jobs; complete inventories only, no I/O under publication locks.
 use super::*;
+use crate::vendor_playback::replicas::Probe;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{future::Future, pin::Pin};
 impl Runtime {
     async fn poll_static(&self, app: &App, key: &str, revision: u64) {
         let result = tokio::time::timeout(
-            Duration::from_secs(4),
-            self.replica_inventory(app, key, revision, true),
+            SOURCE_SELECTION_BUDGET,
+            self.replica_inventory(app, key, revision, Probe::Fresh),
         )
         .await;
         let rows = match result {

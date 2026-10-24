@@ -156,6 +156,47 @@ async fn native_lookup_returns_an_opaque_token_bound_ticket_without_lb_media() {
     cdn.close().await;
 }
 #[tokio::test]
+async fn unredeemed_native_lookups_do_not_occupy_lb_viewer_capacity() {
+    let cdn = Native::new(4).await;
+    let dir = tempfile::tempdir().unwrap();
+    let lb = App::new(
+        dir.path().join("config.json"),
+        dir.path().join("media"),
+        Options {
+            role: "lb".into(),
+            node_name: "owned-lb".into(),
+            admin_password: "owned-admin".into(),
+            peer_key: KEY.into(),
+            client_limit: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    lb.config
+        .put(
+            "streams",
+            "local/news",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    lb.config.put("peers", "cdn", cdn.peer()).unwrap();
+    let https = Https::new(lb.clone()).await;
+    let first = https.lookup("#!::r=local/news,u=first", None).await;
+    assert_eq!(first.status(), 200);
+    assert_eq!(lb.playback_auth.active(), 0, "lookup is not playback");
+    let second = https.lookup("#!::r=local/news,u=second", None).await;
+    assert_eq!(
+        second.status(),
+        200,
+        "an unused lookup must not exhaust the LB"
+    );
+    assert_eq!(lb.playback_auth.active(), 0);
+    assert_eq!(cdn.node().await["reserved"], 2);
+    assert_eq!(lb.media.count().await, 0);
+    https.close().await;
+    cdn.close().await;
+}
+#[tokio::test]
 async fn native_admission_reserves_listener_slots_and_fails_closed_without_encryption_binding() {
     let cdn = Native::new(1).await;
     let r = cdn.admit("viewer").await;

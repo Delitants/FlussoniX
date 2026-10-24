@@ -6,6 +6,12 @@ while at least one RTP receiver exists. Streams watched through HTTP or native
 M4F/M4S no longer fill an unused RTP delivery queue. Closing the last RTP
 receiver releases that queue; media already held by a response remains valid.
 
+When no RTP receiver exists, packetization also skips the separate contiguous
+live GOP copy. Codec validation, packet sequence numbers, and the keyframe
+bootstrap still advance, so a later viewer can join normally. The 64 MiB
+producer limit remains enforced even when this copy is omitted. This reduces
+allocation work; sustained RSS must be measured separately.
+
 Active receivers retain the existing shared 4096-record / 64 MiB bounds and
 lag detection. Clean EOF still lets existing receivers drain their queued
 packets. The bootstrap, codec validation, RTP packetization, authorization,
