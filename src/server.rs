@@ -1063,7 +1063,25 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         };
         (page.items, page.next, page.prev)
     };
-    let mut result = json!({"estimated_count":total,"timing":{},"next":next,"prev":prev});
+    // The reference's explicit name scan counts only the requested page plus
+    // one look-ahead row. Default position pages retain their full count.
+    let estimated_count = if kind == "streams" && query.get("sort").is_some_and(|s| s == "name") {
+        let limit = query
+            .get("limit")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100)
+            .clamp(1, 1000);
+        total.min(limit.saturating_add(1))
+    } else {
+        total
+    };
+    let mut result = json!({"estimated_count":estimated_count,"timing":{}});
+    if let Some(next) = next {
+        result["next"] = json!(next);
+    }
+    if let Some(prev) = prev {
+        result["prev"] = json!(prev);
+    }
     if matches!(kind, "streams" | "templates" | "peers" | "sources")
         && let Some(select) = query.get("select")
     {

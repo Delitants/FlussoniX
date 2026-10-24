@@ -84,7 +84,22 @@ async fn page(
             .collect::<Vec<_>>(),
         expected
     );
-    assert_eq!(body["estimated_count"], total);
+    let explicit_name_scan = kind == "streams"
+        && pairs
+            .iter()
+            .any(|(key, value)| *key == "sort" && *value == "name");
+    let estimated = if explicit_name_scan {
+        let limit = pairs
+            .iter()
+            .find(|(key, _)| *key == "limit")
+            .and_then(|(_, value)| value.parse::<usize>().ok())
+            .unwrap_or(100)
+            .clamp(1, 1000);
+        total.min(limit.saturating_add(1))
+    } else {
+        total
+    };
+    assert_eq!(body["estimated_count"], estimated);
     assert_eq!(body["timing"], json!({}));
     body
 }

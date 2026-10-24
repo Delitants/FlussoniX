@@ -218,6 +218,12 @@ strictly after `a1`. These incoming reference/legacy tokens lack native context
 binding. New default Streams responses use reference position bounds when safe;
 other responses use the native profile.
 
+Collection responses omit `next` or `prev` when that page does not exist. For
+Streams with explicit `sort=name`, `estimated_count` is capped at one row beyond
+the requested limit, including on later pages; it is an estimate, not the full
+filtered total. Default position pages retain their full count. Other sort and
+mixed-origin count behavior still needs reference qualification.
+
 Malformed Base64, URL escapes or UTF-8; duplicate inner query keys; unsupported
 reference compound bounds; native schema/version/context/key mismatches; and
 nonfinite or nonscalar boundary values return HTTP 400 after authentication.

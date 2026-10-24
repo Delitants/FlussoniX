@@ -88,7 +88,7 @@ async fn peer_selection_returns_only_requested_fields() {
     .await;
     assert_eq!(
         body,
-        json!({"estimated_count":3,"next":null,"prev":null,"timing":{},"peers":[
+        json!({"estimated_count":3,"timing":{},"peers":[
             {"hostname":"alpha","private_payload_url":"https://[redacted]"},
             {"hostname":"beta","private_payload_url":"https://[redacted]"},
             {"hostname":"gamma","private_payload_url":"https://[redacted]"}
@@ -143,10 +143,7 @@ async fn cluster_selection_follows_search_order_counts_and_cursor_pages() {
             &format!("/streamer/api/v3/cluster/{kind}?select=hostname&q=absent-owned-value"),
         )
         .await;
-        assert_eq!(
-            empty,
-            json!({"estimated_count":0,"next":null,"prev":null,"timing":{},kind:[]})
-        );
+        assert_eq!(empty, json!({"estimated_count":0,"timing":{},kind:[]}));
     }
 }
 
