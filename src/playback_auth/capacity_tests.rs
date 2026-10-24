@@ -108,6 +108,7 @@ fn seed(auth: &PlaybackAuth, snapshot: &PolicySnapshot, count: usize, decision: 
                     decision: decision.clone(),
                     next_check: now + Duration::from_secs(180),
                     allowed_until: now,
+                    recovery_fenced: false,
                     created: now,
                     last_seen: now,
                     playback_seen: None,
@@ -119,11 +120,13 @@ fn seed(auth: &PlaybackAuth, snapshot: &PolicySnapshot, count: usize, decision: 
                     available: true,
                     revoked_until: None,
                     cancel: CancellationToken::new(),
+                    expiry_task: None,
                 }),
                 flight: AsyncMutex::new(()),
                 live: AtomicU64::new(0),
                 admissions: AtomicU64::new(0),
                 bytes: AtomicU64::new(0),
+                background_pending: AtomicBool::new(false),
             }),
         );
     }
@@ -132,6 +135,47 @@ fn seed(auth: &PlaybackAuth, snapshot: &PolicySnapshot, count: usize, decision: 
 fn cached(auth: &PlaybackAuth, snapshot: &PolicySnapshot, token: &str) -> Arc<Entry> {
     auth.entries.lock().unwrap().by_stream["owned"][&snapshot.policy.identity(&request(token))]
         .clone()
+}
+
+#[tokio::test]
+async fn forced_long_lease_precedes_a_full_batch_of_short_renewals() {
+    for callback in [false, true] {
+        let auth = PlaybackAuth::new(200);
+        let policy = Policy::from_config(
+            &if callback {
+                json!({"on_play":"http://127.0.0.1:9/auth"})
+            } else {
+                json!({})
+            },
+            &json!({}),
+        )
+        .unwrap();
+        let snapshot = auth.publish("owned", Some(policy)).unwrap();
+        seed(&auth, &snapshot, 129, Decision::Allow);
+        let target = cached(&auth, &snapshot, "seed-0");
+        let now = Instant::now();
+        for entry in auth.entries.lock().unwrap().values() {
+            let mut state = entry.state.lock().unwrap();
+            state.next_check = now - Duration::from_millis(1);
+            state.allowed_until = now + Duration::from_secs(1);
+        }
+        {
+            let mut state = target.state.lock().unwrap();
+            state.next_check = now + Duration::from_secs(3590);
+            state.allowed_until = now + Duration::from_secs(3600);
+            state.playback_seen = Some(now);
+        }
+        target.live.store(1, Ordering::Relaxed);
+        assert_eq!(auth.force_reauth("owned"), 1);
+        let due = auth.due_entries();
+        assert_eq!(due.len(), 129);
+        assert!(
+            due.into_iter()
+                .take(128)
+                .any(|(_, _, entry)| Arc::ptr_eq(&entry, &target)),
+            "explicit reauthorization was excluded; callback={callback}"
+        );
+    }
 }
 
 // Retaining ordinary failures to their callback TTL must not exhaust admission.

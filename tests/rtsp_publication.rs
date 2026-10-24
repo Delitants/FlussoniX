@@ -1498,6 +1498,8 @@ async fn callback_denial_and_pending_renewal_never_admit_a_worker() {
         assert_eq!(first["request_number"], 0);
         assert_eq!(first["request_type"], "new_session");
         assert_eq!(first["bytes"], 0);
+        assert_eq!(first["qs"], "token=owned-token");
+        assert!(!first.to_string().contains("owned-publish"));
         if !deny {
             let second = tokio::time::timeout(Duration::from_secs(3), rx.recv())
                 .await
@@ -1506,6 +1508,7 @@ async fn callback_denial_and_pending_renewal_never_admit_a_worker() {
             assert_eq!(second["session_id"], first["session_id"]);
             assert_eq!(second["request_number"], 1);
             assert_eq!(second["request_type"], "update_session");
+            assert_eq!(second["qs"], "token=owned-token");
             let mut b = Vec::new();
             tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut b))
                 .await

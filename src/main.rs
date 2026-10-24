@@ -288,9 +288,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth_app = app.clone();
     let auth_cancel = cancel.clone();
     let authorization = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        // Short callback grants can become due after 100 ms; sample often
+        // enough to start renewal before the hard expiry deadline.
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
-            tokio::select! { _=auth_cancel.cancelled()=>break, _=interval.tick()=>auth_app.playback_auth.renew_due().await }
+            tokio::select! { _=auth_cancel.cancelled()=>break, _=interval.tick()=>auth_app.playback_auth.schedule_due() }
         }
     });
     let telemetry_app = app.clone();

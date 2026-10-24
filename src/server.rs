@@ -108,7 +108,7 @@ pub struct App {
     pub options: Options,
     client: reqwest::Client,
     cluster_clients: std::sync::Mutex<(u64, HashMap<String, reqwest::Client>)>,
-    pub playback_auth: PlaybackAuth,
+    pub playback_auth: Arc<PlaybackAuth>,
     reservations: Mutex<HashMap<String, Reservation>>,
     http_handoffs: http_handoff::Registry,
     rtsp_routes: rtsp_balancer::Registry,
@@ -220,7 +220,7 @@ impl App {
                 .build()
                 .map_err(|e| e.to_string())?,
             cluster_clients: std::sync::Mutex::new((0, HashMap::new())),
-            playback_auth: PlaybackAuth::new(options.client_limit as usize),
+            playback_auth: Arc::new(PlaybackAuth::new(options.client_limit as usize)),
             reservations: Mutex::new(HashMap::new()),
             http_handoffs: http_handoff::Registry::default(),
             rtsp_routes: rtsp_balancer::Registry::default(),
