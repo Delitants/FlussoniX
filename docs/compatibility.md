@@ -68,8 +68,8 @@ The contract is grounded in the installed 26.04.1 schema, read-only inspection
 of its collection selector, and the public
 [API design principles](https://flussonic.com/doc/fms/api/flussonic-api-design/#limiting-the-field-set-of-the-result).
 Unknown/non-object paths are handled without reproducing reference exceptions.
-The tests and implementation use no vendor components. Reference default
-ordering and full vendor cursor parity remain separate tasks.
+The tests and implementation use no vendor components. The observed default
+Streams position order is implemented; full vendor cursor parity remains open.
 
 ### Cluster collection field selection
 
