@@ -102,6 +102,7 @@ struct Probe {
     routing_active: AtomicUsize,
     routing_peak: AtomicUsize,
     admits: AtomicUsize,
+    admission_limit: AtomicUsize,
     pulls: AtomicUsize,
     bad_key: AtomicBool,
     snapshot: Mutex<Option<Value>>,
@@ -230,7 +231,11 @@ async fn intercept(
                 p.admission_delay_ms.load(Ordering::SeqCst) as u64,
             ))
             .await;
-            p.admits.fetch_add(1, Ordering::SeqCst);
+            let count = p.admits.fetch_add(1, Ordering::SeqCst) + 1;
+            let limit = p.admission_limit.load(Ordering::SeqCst);
+            if limit != 0 && count > limit {
+                return StatusCode::FORBIDDEN.into_response();
+            }
             if p.pause.load(Ordering::SeqCst) {
                 p.entered.notify_one();
                 p.release.notified().await;
@@ -614,6 +619,20 @@ impl Lab {
 const QS: &str = "token=owned%2Bviewer&customer=a%26b&blank=&client=owned";
 #[tokio::test]
 async fn configured_rtsps_relay_decodes_native_lb_cdn_source_chain() {
+    configured_rtsps_relay_decodes_native_lb_cdn_source_chain_profile(None, false).await;
+}
+#[tokio::test]
+async fn explicit_h264_rtsps_relay_decodes_with_one_upstream_admission() {
+    configured_rtsps_relay_decodes_native_lb_cdn_source_chain_profile(Some("h264"), false).await;
+}
+#[tokio::test]
+async fn rtsps_fallback_uses_selected_input_startup_mode() {
+    configured_rtsps_relay_decodes_native_lb_cdn_source_chain_profile(Some("h264"), true).await;
+}
+async fn configured_rtsps_relay_decodes_native_lb_cdn_source_chain_profile(
+    startup: Option<&str>,
+    fallback: bool,
+) {
     let mut lab = Lab::new(1000).await;
     let mut relay = Node::new("standalone", 1000).await;
     let result = std::panic::AssertUnwindSafe(async {
@@ -624,11 +643,24 @@ async fn configured_rtsps_relay_decodes_native_lb_cdn_source_chain() {
         assert_eq!(lab.lb.describe(true, "region/owned", "token=wrong").await.0, 403);
         assert_eq!(lab.cdn.probe.admits.load(Ordering::SeqCst), 0);
         assert_eq!(lab.source.app.media.count().await, 0);
+        if startup.is_some() {
+            lab.cdn.probe.admission_limit.store(1, Ordering::SeqCst);
+        }
         let trust = relay._dir.path().join("cluster-ca.pem");
         let mut roots = std::fs::read(&lab.lb.cert.ca).unwrap();
         roots.extend_from_slice(&std::fs::read(&lab.cdn.cert.ca).unwrap());
         std::fs::write(&trust, roots).unwrap();
-        relay.app.config.put("streams", "relay", json!({"static":false,"inputs":[{"url":format!("{}/region/owned?{QS}", lab.lb.tls),"flussonix_tls_ca":trust}]})).unwrap();
+        let mut input = json!({"url":format!("{}/region/owned?{QS}", lab.lb.tls),"flussonix_tls_ca":trust});
+        if let Some(startup) = startup { input["flussonix_rtsp_startup"] = json!(startup); }
+        let inputs = if fallback {
+            vec![
+                json!({"url":"rtsps://127.0.0.1:9/unused", "flussonix_tls_ca":trust, "flussonix_rtsp_startup":"conservative"}),
+                input,
+            ]
+        } else {
+            vec![input]
+        };
+        relay.app.config.put("streams", "relay", json!({"static":false,"inputs":inputs})).unwrap();
         let playback = format!("{}/relay/fmp4/index.m3u8", relay.http);
         let http = client();
         let ready = tokio::time::timeout(Duration::from_secs(25), async {
@@ -639,6 +671,9 @@ async fn configured_rtsps_relay_decodes_native_lb_cdn_source_chain() {
             }
         }).await.unwrap_or(false);
         assert!(ready, "configured verified RTSPS relay must produce HLS");
+        if fallback {
+            assert_eq!(relay.app.media.stats("relay").await["input_index"], 1);
+        }
         for _ in 0..2 {
             let output = tokio::time::timeout(Duration::from_secs(30), tokio::process::Command::new("ffmpeg")
                 .args(["-nostdin", "-v", "error", "-i", &playback, "-t", "2", "-map", "0:v:0", "-map", "0:a:0", "-threads", "1", "-f", "framemd5", "-"])
@@ -654,6 +689,9 @@ async fn configured_rtsps_relay_decodes_native_lb_cdn_source_chain() {
         assert_eq!(lab.source.app.media.count().await, 1);
         assert_eq!(relay.app.media.count().await, 1);
         assert_eq!(lab.source.probe.pulls.load(Ordering::SeqCst), 1, "one shared private M4S pull");
+        if startup.is_some() {
+            assert_eq!(lab.cdn.probe.admits.load(Ordering::SeqCst), 1, "explicit codec must consume only the media session admission");
+        }
         assert!(!lab.cdn.probe.bad_key.load(Ordering::SeqCst));
         assert!(!lab.source.probe.bad_key.load(Ordering::SeqCst));
     }).catch_unwind().await;

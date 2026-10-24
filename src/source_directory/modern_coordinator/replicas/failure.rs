@@ -13,6 +13,7 @@ fn matches(entry: &Entry, stamp: &RouteStamp) -> bool {
     entry.available
         && !entry.blocked
         && entry.selected == stamp.selected
+        && Arc::ptr_eq(&entry.identity, &stamp.identity)
         && Arc::ptr_eq(&entry.route, &stamp.route)
         && !stamp.route.cancel.is_cancelled()
 }
@@ -54,12 +55,19 @@ impl ReplicaRoute {
             .map_err(|_| super::super::AdmissionFailure::Revoked)?;
         let entry = state
             .entries
-            .get_mut(&self.stamp.name)
+            .get(&self.stamp.name)
             .ok_or(super::super::AdmissionFailure::Revoked)?;
         if !matches(entry, &self.stamp) {
             return Err(super::super::AdmissionFailure::Revoked);
         }
-        let result = commit()?;
+        let result = {
+            let _fenced = FencedClosure::new(&self.stamp.selector, &mut state);
+            commit()?
+        };
+        let entry = state
+            .entries
+            .get_mut(&self.stamp.name)
+            .ok_or(super::super::AdmissionFailure::Revoked)?;
         entry.private_rejected = false;
         Ok(result)
     }

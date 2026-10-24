@@ -1,4 +1,5 @@
 //! Viewer authorization is independent of worker ownership and cluster peer credentials.
+use crate::iptv::store::IptvStore;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -7,7 +8,7 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -15,14 +16,22 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
     pub url: Option<String>,
+    kind: PolicyKind,
     keys: Vec<String>,
     max_sessions: Option<u64>,
     token_hash: Option<String>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PolicyKind {
+    Open,
+    Callback,
+    Iptv,
 }
 impl Policy {
     pub fn from_config(cfg: &Value, root: &Value) -> Result<Self, String> {
         let mut policy = Self {
             url: None,
+            kind: PolicyKind::Open,
             keys: ["name", "proto", "ip", "token"].map(str::to_owned).to_vec(),
             max_sessions: None,
             token_hash: cfg
@@ -46,6 +55,11 @@ impl Policy {
                     .any(|k| !["url", "session_keys", "max_sessions"].contains(&k.as_str()))
                 {
                     return Err("unsupported on_play field".into());
+                }
+                if obj.get("url").and_then(Value::as_str) == Some("iptv://")
+                    && (obj.contains_key("session_keys") || obj.contains_key("max_sessions"))
+                {
+                    return Err("IPTV on_play does not accept callback options".into());
                 }
                 if let Some(keys) = obj.get("session_keys") {
                     policy.keys = keys
@@ -79,6 +93,13 @@ impl Policy {
                     .and_then(Value::as_str)
                     .ok_or("on_play.url required")?
             };
+            if raw == "iptv://" {
+                policy.kind = PolicyKind::Iptv;
+                return Ok(policy);
+            }
+            if raw.starts_with("iptv://") {
+                return Err("IPTV on_play must be exactly iptv://".into());
+            }
             let url = if let Some(name) = raw.strip_prefix("auth://") {
                 crate::config::valid_name(name)?;
                 root["auth_backends"]
@@ -91,6 +112,7 @@ impl Policy {
             };
             validate_http(url)?;
             policy.url = Some(url.to_owned());
+            policy.kind = PolicyKind::Callback;
         }
         Ok(policy)
     }
@@ -246,6 +268,34 @@ impl Entries {
             !sessions.is_empty()
         });
     }
+    /// Called under the cache lock, which also serializes new Arc/Weak owners.
+    fn prune(&mut self, now: Instant, capacity_pressure: bool) {
+        self.retain(|_, entry| {
+            // Renewal callbacks carry Arc ownership without an admission count.
+            if Arc::strong_count(entry) > 1
+                || entry.live.load(Ordering::Relaxed) > 0
+                || entry.admissions.load(Ordering::Relaxed) > 0
+            {
+                return true;
+            }
+            let state = entry.state.lock().unwrap();
+            if state.revoked_until.is_some_and(|until| until > now)
+                || state
+                    .playback_seen
+                    .is_some_and(|seen| now.duration_since(seen) < Duration::from_secs(30))
+            {
+                return true;
+            }
+            if capacity_pressure {
+                // Ordinary failed decisions may be checked early, but allowed
+                // sessions keep their normal reconnect/renewal semantics.
+                matches!(state.decision, Decision::Allow)
+            } else {
+                now.duration_since(state.last_seen) < Duration::from_secs(30)
+                    || (!matches!(state.decision, Decision::Allow) && state.next_check > now)
+            }
+        });
+    }
 }
 impl Entry {
     fn occupied(&self) -> bool {
@@ -375,6 +425,14 @@ pub enum AuthOutcome {
     Redirect(String),
 }
 pub struct PlaybackAuth {
+    iptv: Option<Arc<IptvStore>>,
+    #[cfg(test)]
+    iptv_lookup_gate: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     idle_memory: crate::idle_memory::Controller,
     authority: Mutex<HashMap<String, Authority>>,
     entries: Arc<Mutex<Entries>>,
@@ -384,7 +442,16 @@ pub struct PlaybackAuth {
 }
 impl PlaybackAuth {
     pub fn new(limit: usize) -> Self {
+        Self::build(limit, None)
+    }
+    pub fn with_iptv(limit: usize, store: Arc<IptvStore>) -> Self {
+        Self::build(limit, Some(store))
+    }
+    fn build(limit: usize, iptv: Option<Arc<IptvStore>>) -> Self {
         Self {
+            iptv,
+            #[cfg(test)]
+            iptv_lookup_gate: Mutex::new(None),
             idle_memory: crate::idle_memory::Controller::default(),
             authority: Mutex::new(HashMap::new()),
             entries: Arc::new(Mutex::new(Entries::default())),
@@ -510,6 +577,25 @@ impl PlaybackAuth {
         if !policy.accepts_token(&request.token) {
             return AuthOutcome::Denied;
         }
+        if policy.kind == PolicyKind::Iptv
+            && !self.iptv.as_ref().is_some_and(|store| {
+                store
+                    .snapshot()
+                    .authorize(&request.token, &request.name, SystemTime::now())
+                    .is_some()
+            })
+        {
+            return AuthOutcome::Denied;
+        }
+        #[cfg(test)]
+        if policy.kind == PolicyKind::Iptv {
+            let gate = self.iptv_lookup_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+        }
+        let iptv_request = (policy.kind == PolicyKind::Iptv).then(|| request.clone());
         let identity = policy.identity(&request);
         let entry = {
             let authority = self.authority.lock().unwrap();
@@ -519,15 +605,12 @@ impl PlaybackAuth {
                 return AuthOutcome::Denied;
             }
             let mut all = self.entries.lock().unwrap();
-            all.retain(|_, e| {
-                let s = e.state.lock().unwrap();
-                e.live.load(Ordering::Relaxed) > 0
-                    || e.admissions.load(Ordering::Relaxed) > 0
-                    || s.last_seen.elapsed() < Duration::from_secs(30)
-                    || (!matches!(s.decision, Decision::Allow) && s.next_check > Instant::now())
-            });
+            all.prune(Instant::now(), false);
             if !all.contains_key(&request.name, &identity) && all.len() >= 20_000 {
-                return AuthOutcome::Denied;
+                all.prune(Instant::now(), true);
+                if all.len() >= 20_000 {
+                    return AuthOutcome::Denied;
+                }
             }
             let entry = all
                 .by_stream
@@ -575,7 +658,7 @@ impl PlaybackAuth {
             s.last_seen = Instant::now();
         }
         self.refresh(&entry).await;
-        let outcome = {
+        let admit = || {
             let authority = self.authority.lock().unwrap();
             if !authority.get(&snapshot.name).is_some_and(|p| {
                 p.revision == snapshot.revision && p.policy.as_ref() == Some(&policy)
@@ -652,6 +735,26 @@ impl PlaybackAuth {
                 _ => AuthOutcome::Denied,
             }
         };
+        let outcome = if let Some(iptv_request) = iptv_request {
+            let Some(store) = self.iptv.as_ref() else {
+                return AuthOutcome::Denied;
+            };
+            let current = store.snapshot();
+            store
+                .at_current(current.revision(), || {
+                    if current
+                        .authorize(&iptv_request.token, &iptv_request.name, SystemTime::now())
+                        .is_none()
+                    {
+                        AuthOutcome::Denied
+                    } else {
+                        admit()
+                    }
+                })
+                .unwrap_or(AuthOutcome::Denied)
+        } else {
+            admit()
+        };
         // Model preemption/cancellation before the caller receives the outcome.
         // Its already-constructed grant owns capacity through this boundary.
         #[cfg(test)]
@@ -678,7 +781,7 @@ impl PlaybackAuth {
         };
         // Background renewal can outlive a media worker. Only real callback
         // work holds this fence; an empty periodic sweep stays passive.
-        let _activity = if policy.url.is_some() {
+        let _activity = if policy.kind == PolicyKind::Callback {
             Some(self.idle_memory.activity().await)
         } else {
             None
@@ -688,8 +791,27 @@ impl PlaybackAuth {
         let mut user_id = None;
         let mut max = policy.max_sessions;
         let mut unique = false;
+        let mut expiry_window = None;
         if !policy.accepts_token(&r.token) {
             decision = Decision::Deny;
+        } else if policy.kind == PolicyKind::Iptv {
+            match self.iptv.as_ref().and_then(|store| {
+                store
+                    .snapshot()
+                    .authorize(&r.token, &r.name, SystemTime::now())
+            }) {
+                Some(facts) => {
+                    user_id = Some(format!("{:x}", Sha256::digest(facts.subscriber.as_bytes())));
+                    max = facts.max_sessions.map(u64::from);
+                    expiry_window = facts
+                        .expires_at
+                        .and_then(|expiry| expiry.duration_since(SystemTime::now()).ok());
+                    if facts.expires_at.is_some() && expiry_window.is_none() {
+                        decision = Decision::Deny;
+                    }
+                }
+                None => decision = Decision::Deny,
+            }
         } else if let Some(url) = &policy.url {
             let Ok(_permit) = self.callbacks.try_acquire() else {
                 self.retry(entry, generation);
@@ -823,6 +945,9 @@ impl PlaybackAuth {
         s.unique = unique;
         s.decision = decision;
         s.next_check = Instant::now() + Duration::from_secs(seconds);
+        if let Some(window) = expiry_window {
+            s.next_check = s.next_check.min(Instant::now() + window);
+        }
         if matches!(s.decision, Decision::Allow) {
             s.allowed_until = s.next_check;
         }
@@ -838,13 +963,7 @@ impl PlaybackAuth {
         use futures_util::{StreamExt, stream};
         let mut due = {
             let mut all = self.entries.lock().unwrap();
-            all.retain(|_, e| {
-                let s = e.state.lock().unwrap();
-                e.live.load(Ordering::Relaxed) > 0
-                    || e.admissions.load(Ordering::Relaxed) > 0
-                    || s.last_seen.elapsed() < Duration::from_secs(30)
-                    || (!matches!(s.decision, Decision::Allow) && s.next_check > Instant::now())
-            });
+            all.prune(Instant::now(), false);
             all.values()
                 .filter_map(|e| {
                     let s = e.state.lock().unwrap();
@@ -888,6 +1007,22 @@ impl PlaybackAuth {
             .collect::<Vec<_>>();
         for name in names {
             self.publish(&name, policy_for(&name));
+        }
+    }
+    /// Called while IPTV publication holds the store write lock. The order is
+    /// store -> authority -> entries -> state, matching final admission.
+    pub fn invalidate_iptv(&self) {
+        let _authority = self.authority.lock().unwrap();
+        let entries = self.entries.lock().unwrap();
+        for entry in entries.values() {
+            let mut state = entry.state.lock().unwrap();
+            if state.policy.kind != PolicyKind::Iptv {
+                continue;
+            }
+            state.cancel_playback();
+            state.decision = Decision::Unknown;
+            state.next_check = Instant::now();
+            state.generation += 1;
         }
     }
     pub fn revoke(&self, id: &str) -> bool {
@@ -1038,8 +1173,111 @@ impl PlaybackAuth {
 mod idle_memory_tests;
 
 #[cfg(test)]
+mod capacity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn subscriber_edit_between_lookup_and_admission_cannot_publish_old_token() {
+        for edit in [
+            "token",
+            "package",
+            "subscriber",
+            "limit",
+            "disable",
+            "expiry",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = IptvStore::open(dir.path().join("iptv.json")).unwrap();
+            store.set_enabled(true).unwrap();
+            store
+                .put_package("basic", json!({"channels":["news","sports"]}))
+                .unwrap();
+            store
+                .put_subscriber(
+                    "alice",
+                    json!({"token":"old-token","packages":["basic"],"max_sessions":2}),
+                )
+                .unwrap();
+            let auth = Arc::new(PlaybackAuth::with_iptv(8, store.clone()));
+            let weak = Arc::downgrade(&auth);
+            store.set_on_change(Box::new(move || {
+                if let Some(auth) = weak.upgrade() {
+                    auth.invalidate_iptv();
+                }
+            }));
+            let policy = Policy::from_config(&json!({"on_play":"iptv://"}), &json!({})).unwrap();
+            let news = auth.publish("news", Some(policy.clone())).unwrap();
+            let sports = auth.publish("sports", Some(policy)).unwrap();
+            let viewer = |name: &str| ViewerRequest {
+                name: name.into(),
+                proto: "mpegts".into(),
+                token: "old-token".into(),
+                ..Default::default()
+            };
+            let held = if edit == "limit" {
+                let AuthOutcome::Allowed(grant) =
+                    auth.authorize(news.clone(), viewer("news")).await
+                else {
+                    panic!("initial grant");
+                };
+                Some(grant)
+            } else {
+                None
+            };
+            let (selected, request) = if edit == "limit" {
+                (sports, viewer("sports"))
+            } else {
+                (news, viewer("news"))
+            };
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            *auth.iptv_lookup_gate.lock().unwrap() = Some((entered_tx, release_rx));
+            let pending = tokio::spawn({
+                let auth = auth.clone();
+                async move { auth.authorize(selected, request).await }
+            });
+            entered_rx.await.unwrap();
+            match edit {
+                "token" => {
+                    store
+                        .put_subscriber("alice", json!({"token":"new-token"}))
+                        .unwrap();
+                }
+                "package" => {
+                    store.delete_package("basic").unwrap();
+                }
+                "subscriber" => {
+                    store.delete_subscriber("alice").unwrap();
+                }
+                "limit" => {
+                    store
+                        .put_subscriber("alice", json!({"max_sessions":1}))
+                        .unwrap();
+                }
+                "disable" => {
+                    store.set_enabled(false).unwrap();
+                }
+                "expiry" => {
+                    store
+                        .put_subscriber(
+                            "alice",
+                            json!({"flussonix_expires_at":"2000-01-01T00:00:00Z"}),
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            release_tx.send(()).unwrap();
+            assert!(
+                matches!(pending.await.unwrap(), AuthOutcome::Denied),
+                "{edit}"
+            );
+            drop(held);
+        }
+    }
 
     async fn candidate_fixture() -> (Arc<PlaybackAuth>, RecoveryDemand, Arc<Entry>, Arc<Entry>) {
         let auth = Arc::new(PlaybackAuth::new(128));

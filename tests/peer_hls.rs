@@ -14,6 +14,90 @@ use std::{
     time::Duration,
 };
 
+// Break caught: an uncredentialed HLS input lets FFmpeg fetch a segment from
+// an unrelated HTTP origin instead of enforcing the configured source origin.
+async fn reject_plain_hls_foreign_segment(scheme: &str, path: &str) {
+    let foreign_hits = Arc::new(AtomicUsize::new(0));
+    let observed = foreign_hits.clone();
+    let foreign_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let foreign_url = format!(
+        "http://{}/foreign.ts",
+        foreign_listener.local_addr().unwrap()
+    );
+    let foreign = tokio::spawn(async move {
+        axum::serve(
+            foreign_listener,
+            Router::new().route(
+                "/foreign.ts",
+                get(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    async { vec![0x47; 188 * 10] }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let source_hits = Arc::new(AtomicUsize::new(0));
+    let seen = source_hits.clone();
+    let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let input = format!("{scheme}://{}{path}", source_listener.local_addr().unwrap());
+    let route = path.to_owned();
+    let source = tokio::spawn(async move {
+        axum::serve(
+            source_listener,
+            Router::new().route(
+                &route,
+                get(move || {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let segment = foreign_url.clone();
+                    async move {
+                        (
+                            [("content-type", "application/vnd.apple.mpegurl")],
+                            format!("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\n{segment}\n#EXT-X-ENDLIST\n"),
+                        )
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Engine::new(directory.path(), "ffmpeg");
+    engine
+        .ensure(
+            "owned-plain-hls",
+            &json!({"inputs":[{"url":input}],"flussonix_input_timeout":1}),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    engine.stop_all().await;
+    source.abort();
+    foreign.abort();
+    assert!(
+        source_hits.load(Ordering::SeqCst) > 0,
+        "HLS input was not exercised"
+    );
+    assert_eq!(foreign_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn plain_hls_input_never_fetches_a_foreign_segment() {
+    reject_plain_hls_foreign_segment("hls", "/entry.m3u8").await;
+}
+
+#[tokio::test]
+async fn plain_http_playlist_never_fetches_a_foreign_segment() {
+    reject_plain_hls_foreign_segment("http", "/entry.m3u8").await;
+}
+
+#[tokio::test]
+async fn plain_http_extensionless_playlist_never_fetches_a_foreign_segment() {
+    reject_plain_hls_foreign_segment("http", "/entry").await;
+}
+
 async fn reject_foreign_credentials(redirect: bool) {
     let leaked = Arc::new(AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -133,6 +133,87 @@ fn invalid_auth_settings_never_save_or_disable_inherited_protection() {
 }
 
 #[test]
+fn iptv_policy_saves_exactly_and_rejects_suffixes_and_callback_fields() {
+    let d = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(d.path().join("c.json")).unwrap();
+    store
+        .put(
+            "templates",
+            "subscriber",
+            json!({"on_play":{"url":"iptv://"}}),
+        )
+        .unwrap();
+    store
+        .put(
+            "streams",
+            "news",
+            json!({"template":"subscriber","inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    assert_eq!(
+        store.effective("news").unwrap()["on_play"]["url"],
+        "iptv://"
+    );
+    for policy in [
+        json!("iptv://suffix"),
+        json!({"url":"iptv://x"}),
+        json!({"url":"iptv://","session_keys":["name","proto"]}),
+        json!({"url":"iptv://","max_sessions":2}),
+    ] {
+        let before = store.snapshot();
+        assert!(
+            store
+                .put("streams", "bad", json!({"on_play":policy}))
+                .is_err()
+        );
+        assert_eq!(store.snapshot(), before);
+    }
+    assert!(
+        store
+            .put("auth_backends", "invalid", json!({"url":"iptv://"}))
+            .is_err()
+    );
+}
+
+#[test]
+fn iptv_policy_rejects_tokenless_outputs_even_when_inherited_or_added_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(dir.path().join("c.json")).unwrap();
+    store.put("streams", "news", json!({"inputs":[{"url":"testsrc://"}],"flussonix_rtp_outputs":[{"url":"rtp://127.0.0.1:39000"}]})).unwrap();
+    let before = store.snapshot();
+    assert!(
+        store
+            .put("streams", "news", json!({"on_play":"iptv://"}))
+            .is_err()
+    );
+    assert_eq!(store.snapshot(), before);
+    store
+        .put("templates", "subscriber", json!({"on_play":"iptv://"}))
+        .unwrap();
+    assert!(
+        store
+            .put("streams", "news", json!({"template":"subscriber"}))
+            .is_err()
+    );
+    store
+        .put(
+            "templates",
+            "push",
+            json!({"pushes":[{"url":"srt://127.0.0.1:39001"}]}),
+        )
+        .unwrap();
+    assert!(
+        store
+            .put(
+                "streams",
+                "new",
+                json!({"template":"push","on_play":"iptv://","inputs":[{"url":"testsrc://"}]})
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn structured_auth_policy_validates_keys_and_preserves_template_options() {
     let d = tempfile::tempdir().unwrap();
     let store = ConfigStore::open(d.path().join("c.json")).unwrap();
@@ -382,6 +463,54 @@ fn rtsp_udp_input_option_is_validated_inherited_and_persisted() {
 }
 
 #[test]
+fn rtsp_startup_mode_is_inherited_and_rejects_unrelated_inputs() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("c.json");
+    let store = ConfigStore::open(&path).unwrap();
+    store
+        .put(
+            "templates",
+            "camera",
+            json!({"inputs":[{"url":"rtsp://camera/live","flussonix_rtsp_startup":"h264"}]}),
+        )
+        .unwrap();
+    store
+        .put(
+            "streams",
+            "owned",
+            json!({"template":"camera","static":false}),
+        )
+        .unwrap();
+    assert_eq!(
+        store.effective("owned").unwrap()["inputs"][0]["flussonix_rtsp_startup"],
+        "h264"
+    );
+    store.put("templates", "camera", json!({"inputs":[{"url":"rtsps://camera/live","flussonix_rtsp_startup":"conservative"}]})).unwrap();
+    assert_eq!(
+        store.effective("owned").unwrap()["inputs"][0]["flussonix_rtsp_startup"],
+        "conservative"
+    );
+    for input in [
+        json!({"url":"rtsp://camera/live","flussonix_rtsp_startup":"unknown"}),
+        json!({"url":"rtsp://camera/live","flussonix_rtsp_startup":true}),
+        json!({"url":"hls://camera/live/index.m3u8","flussonix_rtsp_startup":"h264"}),
+        json!({"url":"publish://","flussonix_rtsp_startup":"h264"}),
+    ] {
+        assert!(
+            store
+                .put("streams", "owned", json!({"inputs":[input]}))
+                .is_err()
+        );
+    }
+    drop(store);
+    let reloaded = ConfigStore::open(path).unwrap();
+    assert_eq!(
+        reloaded.effective("owned").unwrap()["inputs"][0]["flussonix_rtsp_startup"],
+        "conservative"
+    );
+}
+
+#[test]
 fn rtsps_ca_input_is_persisted_inherited_and_rejects_unsafe_options() {
     let d = tempfile::tempdir().unwrap();
     let c = tls_fixture::Certificates::new();
@@ -420,6 +549,41 @@ fn rtsps_ca_input_is_persisted_inherited_and_rejects_unsafe_options() {
                 .put("streams", "owned", json!({"inputs":[input]}))
                 .is_err()
         );
+        assert_eq!(store.snapshot(), saved);
+    }
+}
+
+#[test]
+fn srt_input_options_are_checked_before_a_stream_is_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(dir.path().join("c.json")).unwrap();
+    store
+        .put(
+            "streams",
+            "owned",
+            json!({"inputs":[{"url":"srt://127.0.0.1:9000#passphrase=owned#input-secret-123"}]}),
+        )
+        .unwrap();
+    store
+        .put(
+            "streams",
+            "owned",
+            json!({"inputs":[{"url":"srt://127.0.0.1:9000?mode=caller&passphrase=owned-input-secret&tsbpd=0&srt_streamid=owned-route"}]}),
+        )
+        .unwrap();
+    let saved = store.snapshot();
+    for url in [
+        "srt://127.0.0.1:9000?passphrase=owned-input-secret&unknown=1",
+        "srt://127.0.0.1:9000?passphrase=owned-input-secret&passphrase=other-secret",
+        "srt://127.0.0.1:9000?passphrase=owned-input-secret&pbkeylen=48",
+        "srt://127.0.0.1:9000?mode=rendezvous",
+        "srt://127.0.0.1:9000?mode=listener&streamid=misleading-id",
+        "srt://user:secret@127.0.0.1:9000",
+    ] {
+        let error = store
+            .put("streams", "owned", json!({"inputs":[{"url":url}]}))
+            .unwrap_err();
+        assert!(!error.contains("owned-input-secret"));
         assert_eq!(store.snapshot(), saved);
     }
 }
@@ -754,6 +918,34 @@ fn nvidia_hevc_profile_preserves_independent_audio_and_template_inheritance() {
         s.effective("owned").unwrap()["transcoder"]["encoder"],
         "hevc_nvenc"
     );
+}
+
+#[test]
+fn rtsp_input_urls_reject_malformed_targets_before_saving() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(dir.path().join("rtsp.json")).unwrap();
+    store
+        .put(
+            "streams",
+            "owned",
+            json!({"inputs":[{"url":"rtsp://user:owned-secret@camera:554/live"}]}),
+        )
+        .unwrap();
+    let saved = store.snapshot();
+    for url in [
+        "rtsp://user:owned-secret@camera/live\nfile '/tmp/owned'",
+        "rtsp-udp://camera/live#redirect",
+        "rtsp2://:554/live",
+        "rtsps://camera/live\r",
+        "rtsp://camera/live?token=%GGowned-secret",
+        "rtsp://camera:0/live",
+    ] {
+        let error = store
+            .put("streams", "owned", json!({"inputs":[{"url":url}]}))
+            .unwrap_err();
+        assert!(!error.contains("owned-secret"));
+        assert_eq!(store.snapshot(), saved);
+    }
 }
 
 #[test]

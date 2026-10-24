@@ -363,7 +363,7 @@ async fn source_lists_order_url_identities_and_project_selected_fields() {
         "GET",
         "/streamer/api/v3/cluster/sources?select=url&limit=1",
         Value::Null,
-        Some("viewer:owned-view-secret"),
+        Some("admin:owned-admin-secret"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -375,7 +375,7 @@ async fn source_lists_order_url_identities_and_project_selected_fields() {
         "GET",
         "/streamer/api/v3/cluster/sources?select=url&sort=-name",
         Value::Null,
-        Some("viewer:owned-view-secret"),
+        Some("admin:owned-admin-secret"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);

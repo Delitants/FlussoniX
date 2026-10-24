@@ -37,7 +37,10 @@ async fn publication_is_fenced_exclusive_owned_and_reconnects_immediately() {
         .expect("publisher starts worker");
     let old = p.worker.clone();
     assert!(p.stdin.is_some());
-    assert_eq!(engine.ensure("owned", &cfg).await.unwrap().pid(), old.pid());
+    assert!(Arc::ptr_eq(
+        &engine.ensure("owned", &cfg).await.unwrap(),
+        &old
+    ));
     assert!(
         engine
             .publish_guarded("owned", &cfg, std::future::ready(true))
@@ -53,7 +56,7 @@ async fn publication_is_fenced_exclusive_owned_and_reconnects_immediately() {
         .publish_guarded("owned", &cfg, std::future::ready(true))
         .await
         .expect("reconnect without pull backoff");
-    assert_ne!(replacement.worker.pid(), old.pid());
+    assert!(!Arc::ptr_eq(&replacement.worker, &old));
     engine.stop_if_current("owned", &old).await;
     assert!(
         !replacement.worker.is_closed(),

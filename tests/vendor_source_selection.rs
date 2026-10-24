@@ -539,6 +539,14 @@ async fn public_crud_persists_vendor_fields_and_dry_run_errors_are_atomic() {
     let bytes = axum::body::to_bytes(response.into_body(), 100000)
         .await
         .unwrap();
+    let viewed: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(viewed["on_play"], "[redacted]");
+    assert_eq!(viewed["cluster_key"], "[redacted]");
+    let response = send("GET", &path, Value::Null, true).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 100000)
+        .await
+        .unwrap();
     let saved: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(saved["flussonix_source_kind"], "flussonic");
     assert_eq!(saved["on_play"], "true");

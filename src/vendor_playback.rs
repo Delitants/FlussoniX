@@ -1,5 +1,7 @@
 //! App-owned direct vendor playback. No implicit native/vendor failover.
 mod activation;
+#[cfg(test)]
+mod catalog_consumption_tests;
 mod recovery;
 mod replicas;
 mod response;
@@ -12,8 +14,8 @@ use crate::{
     source_directory::{
         allows,
         modern_coordinator::{
-            CoordinatedCandidate, CoordinatedInventory, ModernSourceCoordinator, SharedInputs,
-            SourceHandle,
+            CoordinatedCandidate, CoordinatedInventory, CoordinationFailure,
+            ModernSourceCoordinator, SharedInputs, SourceHandle,
         },
     },
 };
@@ -21,7 +23,7 @@ pub(crate) use response::HttpRequest;
 pub(crate) use rtsp::RtspRequest;
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -30,6 +32,16 @@ use std::{
 };
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
+
+// Leave bounded WAN headroom for config/catalog/config, and one extra second
+// for serialized selection. The underlying byte, page and lease bounds remain.
+const DISCOVERY_BUDGET: Duration = Duration::from_secs(5);
+const SOURCE_SELECTION_BUDGET: Duration = Duration::from_secs(6);
+// Selected source plus two alternative waves under the four-query semaphore.
+// Contention may still exhaust this bound; no lease or authority is extended.
+const GROUP_SELECTION_BUDGET: Duration = Duration::from_secs(16);
+const RECOVERY_JOB_BUDGET: Duration = Duration::from_secs(20);
+pub(crate) const SRT_ADMISSION_BUDGET: Duration = Duration::from_secs(20);
 
 pub(crate) enum Selection {
     Native,
@@ -92,9 +104,19 @@ enum Failure {
 }
 #[derive(Default)]
 struct Cache {
+    revision: u64,
     handle: Option<SourceHandle>,
-    inventory: Option<Arc<CoordinatedInventory>>,
+    inventory: Option<Result<Arc<CoordinatedInventory>, CoordinationFailure>>,
     next_probe: Option<Instant>,
+}
+impl Cache {
+    fn at_revision(&mut self, revision: u64) {
+        if self.revision != revision {
+            self.revision = revision;
+            self.inventory = None;
+            self.next_probe = None;
+        }
+    }
 }
 #[derive(Default)]
 struct Caches {
@@ -128,6 +150,46 @@ impl Drop for RunGuard<'_> {
     }
 }
 impl Runtime {
+    async fn source_cache_slot(
+        &self,
+        app: &App,
+        key: &str,
+        revision: u64,
+    ) -> Result<Arc<Mutex<Cache>>, Failure> {
+        let needs_revision = self.caches.lock().await.revision != revision;
+        let configured = if needs_revision {
+            Some(
+                app.config
+                    .at_revision(revision, |root| {
+                        root["sources"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|source| crate::config::item_key("sources", source))
+                            .map(str::to_owned)
+                            .collect::<HashSet<_>>()
+                    })
+                    .ok_or(Failure::Unavailable)?,
+            )
+        } else {
+            None
+        };
+        let mut caches = self.caches.lock().await;
+        if app.config.revision() != revision {
+            return Err(Failure::Unavailable);
+        }
+        if caches.revision != revision {
+            let configured = configured.ok_or(Failure::Unavailable)?;
+            caches
+                .sources
+                .retain(|source, _| configured.contains(source));
+            caches.revision = revision;
+        }
+        if caches.sources.len() >= 64 && !caches.sources.contains_key(key) {
+            return Err(Failure::Unavailable);
+        }
+        Ok(caches.sources.entry(key.to_owned()).or_default().clone())
+    }
     pub(crate) fn new(owner: Arc<ModernSourceCoordinator>) -> Self {
         let inputs = Arc::new(SharedInputs::new(owner.clone()));
         Self {
@@ -265,7 +327,16 @@ impl Runtime {
             caches.sources.get(key)?.clone()
         };
         let cache = slot.try_lock().ok()?;
-        cache.inventory.as_ref()?.candidate(name).ok()
+        if cache.revision != revision {
+            return None;
+        }
+        cache
+            .inventory
+            .as_ref()?
+            .as_ref()
+            .ok()?
+            .candidate(name)
+            .ok()
     }
     async fn direct_candidate(
         &self,
@@ -285,21 +356,9 @@ impl Runtime {
             return Ok(candidate);
         }
         let work = async {
-            let slot = {
-                let mut caches = self.caches.lock().await;
-                if app.config.revision() != revision {
-                    return Err(Failure::Unavailable);
-                }
-                if caches.revision != revision {
-                    caches.sources.clear();
-                    caches.revision = revision;
-                }
-                if caches.sources.len() >= 64 && !caches.sources.contains_key(key) {
-                    return Err(Failure::Unavailable);
-                }
-                caches.sources.entry(key.to_owned()).or_default().clone()
-            };
+            let slot = self.source_cache_slot(app, key, revision).await?;
             let mut cache = slot.lock().await;
+            cache.at_revision(revision);
             // Recheck after a concurrent cold request, without repeated discovery.
             if let Ok(candidate) = self.inputs.current_candidate(name)
                 && candidate.source_key() == key
@@ -307,7 +366,7 @@ impl Runtime {
             {
                 return Ok(candidate);
             }
-            if let Some(rows) = &cache.inventory
+            if let Some(Ok(rows)) = &cache.inventory
                 && rows.expires_at() > Instant::now()
             {
                 match rows.candidate(name) {
@@ -328,6 +387,7 @@ impl Runtime {
                 return Err(Failure::Unavailable);
             }
             cache.next_probe = Some(Instant::now() + Duration::from_millis(500));
+            cache.inventory = None;
             let _permit = self.queries.acquire().await.map_err(|_| Failure::Closed)?;
             let rows = if let Some(handle) = &cache.handle
                 && self.inputs.source_in_use(handle)
@@ -344,12 +404,12 @@ impl Runtime {
                     return Err(Failure::Unavailable);
                 }
                 let prepared = captured
-                    .prepare(Duration::from_secs(3))
+                    .prepare(DISCOVERY_BUDGET)
                     .map_err(|_| Failure::Unavailable)?;
                 // Serialize install with attachment, closing the check/install race.
                 let handle = self
                     .inputs
-                    .install_idle(prepared)
+                    .install_idle(prepared, cache.handle.as_ref())
                     .map_err(|_| Failure::Unavailable)?;
                 cache.handle = Some(handle.clone());
                 self.owner
@@ -364,9 +424,9 @@ impl Runtime {
                     Failure::Absent
                 }
             });
-            cache.inventory = Some(Arc::new(rows));
+            cache.inventory = Some(Ok(Arc::new(rows)));
             candidate
         };
-        tokio::select! {biased;_=self.closed.cancelled()=>Err(Failure::Closed),result=tokio::time::timeout(Duration::from_secs(4),work)=>result.unwrap_or(Err(Failure::Unavailable))}
+        tokio::select! {biased;_=self.closed.cancelled()=>Err(Failure::Closed),result=tokio::time::timeout(SOURCE_SELECTION_BUDGET,work)=>result.unwrap_or(Err(Failure::Unavailable))}
     }
 }

@@ -89,9 +89,9 @@ async fn peer_selection_returns_only_requested_fields() {
     assert_eq!(
         body,
         json!({"estimated_count":3,"next":null,"prev":null,"timing":{},"peers":[
-            {"hostname":"alpha","private_payload_url":"https://needle-a.invalid/lan"},
-            {"hostname":"beta","private_payload_url":"https://other.invalid/lan"},
-            {"hostname":"gamma","private_payload_url":"https://needle-g.invalid/lan"}
+            {"hostname":"alpha","private_payload_url":"https://[redacted]"},
+            {"hostname":"beta","private_payload_url":"https://[redacted]"},
+            {"hostname":"gamma","private_payload_url":"https://[redacted]"}
         ]})
     );
 }
@@ -119,7 +119,7 @@ async fn cluster_selection_follows_search_order_counts_and_cursor_pages() {
     let (_dir, app) = fixture();
     for kind in ["peers", "sources"] {
         let path =
-            format!("/streamer/api/v3/cluster/{kind}?select=drain&q=needle&sort=-name&limit=1");
+            format!("/streamer/api/v3/cluster/{kind}?select=drain&q=false&sort=-name&limit=1");
         let first = selected(&app, &path).await;
         assert_eq!(first["estimated_count"], 2);
         assert_eq!(first[kind], json!([{"drain":false}]));
@@ -128,10 +128,16 @@ async fn cluster_selection_follows_search_order_counts_and_cursor_pages() {
         let cursor = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("cursor", first["next"].as_str().unwrap())
             .finish();
-        let second = selected(&app, &format!("/streamer/api/v3/cluster/{kind}?select=hostname&q=needle&sort=-name&limit=1&{cursor}")).await;
+        let second = selected(&app, &format!("/streamer/api/v3/cluster/{kind}?select=hostname&q=false&sort=-name&limit=1&{cursor}")).await;
         assert_eq!(second[kind], json!([{"hostname":"alpha"}]));
         assert_eq!(second["estimated_count"], 2);
         assert_eq!(second["next"], Value::Null);
+        let hidden = selected(
+            &app,
+            &format!("/streamer/api/v3/cluster/{kind}?select=hostname&q=needle"),
+        )
+        .await;
+        assert_eq!(hidden["estimated_count"], 0, "View search exposed a URL");
         let empty = selected(
             &app,
             &format!("/streamer/api/v3/cluster/{kind}?select=hostname&q=absent-owned-value"),
@@ -141,6 +147,65 @@ async fn cluster_selection_follows_search_order_counts_and_cursor_pages() {
             empty,
             json!({"estimated_count":0,"next":null,"prev":null,"timing":{},kind:[]})
         );
+    }
+}
+
+#[tokio::test]
+async fn cluster_pages_round_trip_reference_position_cursors() {
+    let (_dir, app) = fixture();
+    for kind in ["sources", "peers"] {
+        let base = format!("/streamer/api/v3/cluster/{kind}?select=hostname&limit=1");
+        let first = selected(&app, &base).await;
+        assert_eq!(first[kind], json!([{"hostname":"alpha"}]));
+        assert_eq!(
+            STANDARD.decode(first["next"].as_str().unwrap()).unwrap(),
+            b"%24position_gt=0"
+        );
+        let second = selected(
+            &app,
+            &format!(
+                "{base}&{}",
+                url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("cursor", first["next"].as_str().unwrap())
+                    .finish()
+            ),
+        )
+        .await;
+        assert_eq!(second[kind], json!([{"hostname":"beta"}]));
+        assert_eq!(
+            STANDARD.decode(second["prev"].as_str().unwrap()).unwrap(),
+            b"%24position_lt=1&%24reversed=true"
+        );
+        let previous = selected(
+            &app,
+            &format!(
+                "{base}&{}",
+                url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("cursor", second["prev"].as_str().unwrap())
+                    .finish()
+            ),
+        )
+        .await;
+        assert_eq!(previous[kind], first[kind]);
+        assert_eq!(previous["prev"], Value::Null);
+
+        for malformed in [
+            "%24position_gt=oops",
+            "%24position_gt=0&%24position_gt=1",
+            "%24position_lt=1&%24reversed=false",
+            "%24position_gt=0&%24position_lt=1",
+        ] {
+            let cursor = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("cursor", &STANDARD.encode(malformed))
+                .finish();
+            let (status, _) = get(
+                &app,
+                &format!("{base}&{cursor}"),
+                Some("viewer:owned-view-secret"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{kind}: {malformed}");
+        }
     }
 }
 
@@ -216,14 +281,29 @@ async fn selection_preserves_full_item_other_collection_and_saved_configuration(
     let before = app.config.snapshot();
     let disk = std::fs::read(dir.path().join("config.json")).unwrap();
     for kind in ["peers", "sources"] {
+        let mut expected_view = before[kind].clone();
+        for row in expected_view.as_array_mut().unwrap() {
+            row["api_url"] = json!("https://[redacted]");
+            row["private_payload_url"] = json!("https://[redacted]");
+            row["public_payload_url"] = json!("https://[redacted]");
+            row["cluster_key"] = json!("[redacted]");
+        }
         let full = selected(&app, &format!("/streamer/api/v3/cluster/{kind}")).await;
-        assert_eq!(full[kind], before[kind]);
+        assert_eq!(full[kind], expected_view);
         let item = selected(
             &app,
             &format!("/streamer/api/v3/cluster/{kind}/alpha?select=hostname"),
         )
         .await;
-        assert_eq!(item, before[kind][0]);
+        assert_eq!(item, expected_view[0]);
+        let (edit_status, edit) = get(
+            &app,
+            &format!("/streamer/api/v3/cluster/{kind}"),
+            Some("admin:owned-admin-secret"),
+        )
+        .await;
+        assert_eq!(edit_status, StatusCode::OK);
+        assert_eq!(edit[kind], before[kind]);
         let subset = selected(
             &app,
             &format!("/streamer/api/v3/cluster/{kind}?select=hostname"),
@@ -232,7 +312,10 @@ async fn selection_preserves_full_item_other_collection_and_saved_configuration(
         assert_eq!(subset[kind][0], json!({"hostname":"alpha"}));
     }
     let auth = selected(&app, "/streamer/api/v3/auth_backends?select=name").await;
-    assert_eq!(auth["auth_backends"], before["auth_backends"]);
+    assert_eq!(
+        auth["auth_backends"],
+        json!([{"name":"owned-auth","url":"http://[redacted]"}])
+    );
     assert_eq!(app.config.snapshot(), before);
     assert_eq!(std::fs::read(dir.path().join("config.json")).unwrap(), disk);
     assert_eq!(app.media.count().await, 0);

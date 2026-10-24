@@ -193,9 +193,33 @@ impl App {
         let api = source["api_url"].as_str().ok_or(())?;
         let private = source["private_payload_url"].as_str().unwrap_or(api);
         let transport = source["flussonix_transport"].as_str().unwrap_or("hls");
-        let input = crate::cluster::source_input_url(private, name, transport).map_err(|_| ())?;
+        let input = if transport == "fxlink" {
+            let endpoint = source["flussonix_fxlink_url"].as_str().ok_or(())?;
+            let address = crate::fxlink::Address::parse(endpoint, false).map_err(|_| ())?;
+            if address.stream.is_some() || !crate::source_directory::native_source(source) {
+                return Err(());
+            }
+            let encoded = name
+                .split('/')
+                .map(|p| {
+                    percent_encoding::utf8_percent_encode(p, percent_encoding::NON_ALPHANUMERIC)
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            format!("{}/{encoded}", endpoint.trim_end_matches('/'))
+        } else {
+            crate::cluster::source_input_url(private, name, transport).map_err(|_| ())?
+        };
         c["inputs"] = json!([{"url":input}]);
-        if url::Url::parse(private).is_ok_and(|u| u.scheme() == "https") {
+        if transport == "fxlink" {
+            for field in ["flussonix_fxlink", "flussonix_fxlink_token"] {
+                if let Some(value) = source.get(field) {
+                    c["inputs"][0][field] = value.clone();
+                }
+            }
+        }
+        if transport == "fxlink" || url::Url::parse(private).is_ok_and(|u| u.scheme() == "https") {
             if let Some(ca) = source
                 .get("flussonix_media_tls_ca")
                 .or_else(|| source.get("flussonix_tls_ca"))
@@ -212,6 +236,9 @@ impl App {
                 .as_str()
                 .unwrap_or(&self.options.peer_key)
         );
+        if let Some(allow) = source.get("flussonix_allow_insecure_peer_http") {
+            c["flussonix_allow_insecure_peer_http"] = allow.clone();
+        }
         Ok(c)
     }
     fn publish_claimed(

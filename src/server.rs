@@ -1,7 +1,8 @@
 use crate::{
     auth::{Credentials, Role},
     cluster::{NodeLoad, TieRotation},
-    config::{ConfigStore, KINDS, valid_name},
+    config::{ConfigStore, KINDS, nested_validation_path, parse_text, valid_name},
+    iptv::store::IptvStore,
     media::{Engine, Worker},
     playback_auth::{
         AuthOutcome, Grant, PlaybackAuth, Policy, PolicySnapshot, RecoveryDemand, ViewerRequest,
@@ -14,7 +15,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::Engine as _;
 use bytes::Bytes;
 use serde_json::{Value, json};
 use std::{
@@ -33,6 +34,7 @@ use tokio::sync::Mutex;
 pub struct Options {
     pub admin_user: String,
     pub admin_password: String,
+    pub admin_public_origin: Option<url::Url>,
     pub view_user: Option<String>,
     pub view_password: Option<String>,
     pub peer_key: String,
@@ -43,13 +45,17 @@ pub struct Options {
     pub uplink_interface: String,
     pub client_limit: u64,
     pub web_dir: PathBuf,
+    pub iptv_public_origin: Option<url::Url>,
+    pub iptv_data: Option<PathBuf>,
     pub drain: bool,
+    pub fxlink_features: crate::fxlink::Features,
 }
 impl Default for Options {
     fn default() -> Self {
         Self {
             admin_user: "admin".into(),
             admin_password: String::new(),
+            admin_public_origin: None,
             view_user: None,
             view_password: None,
             peer_key: String::new(),
@@ -60,7 +66,10 @@ impl Default for Options {
             uplink_interface: "auto".into(),
             client_limit: 1000,
             web_dir: "web/dist".into(),
+            iptv_public_origin: None,
+            iptv_data: None,
             drain: false,
+            fxlink_features: crate::fxlink::Features::default(),
         }
     }
 }
@@ -94,8 +103,10 @@ struct Resolved {
 pub struct App {
     http_delivery: std::sync::Mutex<Value>,
     srt_playback: std::sync::Mutex<Value>,
+    fxlink: std::sync::Mutex<(Value, Arc<AtomicU64>)>,
     rtsp_publication: std::sync::Mutex<Value>,
     pub config: Arc<ConfigStore>,
+    pub iptv: Arc<IptvStore>,
     node_name: String,
     modern_sources:
         Option<Arc<crate::source_directory::modern_coordinator::ModernSourceCoordinator>>,
@@ -105,7 +116,7 @@ pub struct App {
     pub options: Options,
     client: reqwest::Client,
     cluster_clients: std::sync::Mutex<(u64, HashMap<String, reqwest::Client>)>,
-    pub playback_auth: PlaybackAuth,
+    pub playback_auth: Arc<PlaybackAuth>,
     reservations: Mutex<HashMap<String, Reservation>>,
     http_handoffs: http_handoff::Registry,
     rtsp_routes: rtsp_balancer::Registry,
@@ -118,7 +129,7 @@ pub struct App {
     pub(crate) srt_connections: AtomicU64,
     telemetry: crate::telemetry::Sampler,
     pub started: Instant,
-    mirrors: Mutex<HashMap<String, Mirror>>,
+    mirrors: fxlink_access::Mirrors,
     source_queries: tokio::sync::Semaphore,
     source_activation: Mutex<source_activation::State>,
     source_activation_refresh: Mutex<()>,
@@ -161,6 +172,19 @@ impl App {
         if options.admin_password.is_empty() || options.peer_key.len() < 12 {
             return Err("admin password required; peer key must be at least 12 characters".into());
         }
+        if options.admin_public_origin.as_ref().is_some_and(|origin| {
+            origin.scheme() != "https"
+                || origin.host_str().is_none()
+                || origin.path() != "/"
+                || origin.query().is_some()
+                || origin.fragment().is_some()
+                || !origin.username().is_empty()
+                || origin.password().is_some()
+        }) {
+            return Err(
+                "admin public origin must be an HTTPS origin without path or credentials".into(),
+            );
+        }
         if !["standalone", "source", "cdn", "lb"].contains(&options.role.as_str()) {
             return Err("unknown node role".into());
         }
@@ -168,6 +192,17 @@ impl App {
             || options.client_limit == 0
         {
             return Err("positive uplink and client limit required".into());
+        }
+        if options.iptv_public_origin.as_ref().is_some_and(|origin| {
+            !matches!(origin.scheme(), "http" | "https")
+                || origin.host_str().is_none()
+                || !origin.username().is_empty()
+                || origin.password().is_some()
+                || origin.path() != "/"
+                || origin.query().is_some()
+                || origin.fragment().is_some()
+        }) {
+            return Err("IPTV public origin must be a plain HTTP(S) origin".into());
         }
         let credentials = Credentials::new(
             &options.admin_user,
@@ -178,7 +213,15 @@ impl App {
                 .zip(options.view_password.as_deref()),
             &options.peer_key,
         );
-        let config = Arc::new(ConfigStore::open(config)?);
+        let config_path = config.as_ref();
+        let iptv_path = options.iptv_data.clone().unwrap_or_else(|| {
+            config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("iptv.json")
+        });
+        let iptv = IptvStore::open(iptv_path)?;
+        let config = Arc::new(ConfigStore::open(config_path)?);
         let modern_sources =
             crate::source_directory::modern_coordinator::ModernSourceCoordinator::new(
                 config.clone(),
@@ -189,6 +232,10 @@ impl App {
         let vendor_playback = modern_sources
             .as_ref()
             .map(|owner| crate::vendor_playback::Runtime::new(owner.clone()));
+        let playback_auth = Arc::new(PlaybackAuth::with_iptv(
+            options.client_limit as usize,
+            iptv.clone(),
+        ));
         let app = Arc::new(Self {
             http_delivery: std::sync::Mutex::new(
                 json!({"http":null,"https":null,"https_only":false}),
@@ -199,11 +246,16 @@ impl App {
             srt_playback: std::sync::Mutex::new(
                 json!({"enabled":false,"listen":null,"encrypted":false}),
             ),
+            fxlink: std::sync::Mutex::new((
+                json!({"enabled":false,"listen":null,"encrypted":true,"latency_ms":1000,"min_latency_ms":500,"max_latency_ms":1500,"fec":{"data_shards":20,"parity_shards":4,"profiles":["20+2","20+4","20+6","1+1"]}}),
+                Arc::new(AtomicU64::new(0)),
+            )),
             config,
+            iptv: iptv.clone(),
             node_name: options.node_name.clone(),
             modern_sources,
             vendor_playback,
-            media: Engine::new(media, &options.ffmpeg),
+            media: Engine::new_with_fxlink(media, &options.ffmpeg, options.fxlink_features),
             credentials,
             options: options.clone(),
             client: reqwest::Client::builder()
@@ -213,7 +265,7 @@ impl App {
                 .build()
                 .map_err(|e| e.to_string())?,
             cluster_clients: std::sync::Mutex::new((0, HashMap::new())),
-            playback_auth: PlaybackAuth::new(options.client_limit as usize),
+            playback_auth,
             reservations: Mutex::new(HashMap::new()),
             http_handoffs: http_handoff::Registry::default(),
             rtsp_routes: rtsp_balancer::Registry::default(),
@@ -226,13 +278,19 @@ impl App {
             srt_connections: AtomicU64::new(0),
             telemetry: crate::telemetry::Sampler::new(&options.uplink_interface)?,
             started: Instant::now(),
-            mirrors: Mutex::new(HashMap::new()),
+            mirrors: fxlink_access::Mirrors::default(),
             source_queries: tokio::sync::Semaphore::new(64),
             source_activation: Mutex::new(source_activation::State::default()),
             source_activation_refresh: Mutex::new(()),
             publishers: Arc::new(tokio::sync::Semaphore::new(64)),
             source_lookups: Mutex::new(HashMap::new()),
         });
+        let weak = Arc::downgrade(&app.playback_auth);
+        app.iptv.set_on_change(Box::new(move || {
+            if let Some(auth) = weak.upgrade() {
+                auth.invalidate_iptv();
+            }
+        }));
         app.sample_metrics();
         Ok(app)
     }
@@ -261,6 +319,15 @@ impl App {
         };
     }
     fn cluster_client(&self, node: &Value) -> Result<reqwest::Client, String> {
+        let endpoint = node["api_url"]
+            .as_str()
+            .and_then(|value| url::Url::parse(value).ok())
+            .ok_or("invalid cluster API URL")?;
+        crate::peer_transport::require(
+            &endpoint,
+            node["flussonix_allow_insecure_peer_http"] == true,
+        )
+        .map_err(str::to_owned)?;
         let Some(ca) = node.get("flussonix_tls_ca") else {
             return Ok(self.client.clone());
         };
@@ -494,6 +561,7 @@ impl App {
             streams.push(json!({"name":name,"ready":self.media.ready(&name).await,"stats":self.stream_stats(&name).await}));
         }
         let mut node = self.load_node().await;
+        node["version"] = json!(env!("CARGO_PKG_VERSION"));
         node["streams"] = json!(streams);
         node
     }
@@ -509,6 +577,7 @@ impl App {
         metrics["rtsp_udp_bytes_out"] = json!(self.rtsp_udp_egress.load(Ordering::Relaxed));
         metrics["direct_rtp_bytes_out"] = json!(self.media.direct_egress.load(Ordering::Relaxed));
         metrics["srt_bytes_out"] = json!(self.srt_egress.load(Ordering::Relaxed));
+        metrics["fxlink"] = self.fxlink.lock().unwrap().0.clone();
         let mut srt = self.srt_playback.lock().unwrap().clone();
         srt["clients"] = json!(self.srt_connections.load(Ordering::Relaxed));
         metrics["srt_playback"] = srt;
@@ -530,7 +599,7 @@ impl App {
                 .unmeasured(window, metrics["http_egress_mbps"].as_f64());
         drop(reservations);
         let rtsp_publication = self.rtsp_publication.lock().unwrap().clone();
-        let node = json!({"rtsp_publication":rtsp_publication,"name":self.node_name,"role":self.options.role,"uptime":self.started.elapsed().as_secs(),"reserved_mbps":reserved_mbps,"uplink_mbps":self.options.uplink_mbps,"active":self.active().await,"reserved":reserved,"limit":self.options.client_limit,"drain":self.options.drain,"http_delivery":self.http_delivery.lock().unwrap().clone()});
+        let node = json!({"rtsp_publication":rtsp_publication,"name":self.node_name,"role":self.options.role,"uptime":self.started.elapsed().as_secs(),"reserved_mbps":reserved_mbps,"uplink_mbps":self.options.uplink_mbps,"active":self.active().await,"reserved":reserved,"limit":self.options.client_limit,"drain":self.options.drain,"http_delivery":self.http_delivery.lock().unwrap().clone(),"iptv_public_origin":self.options.iptv_public_origin.as_ref().map(url::Url::as_str)});
         metrics
             .as_object_mut()
             .unwrap()
@@ -546,7 +615,7 @@ impl App {
         let at = Instant::now();
         self.http_handoffs
             .sample(self.telemetry.last_sample_at(), at);
-        self.telemetry.sample_transports_at(
+        self.telemetry.sample_with_fxlink_at(
             at,
             self.egress
                 .load(Ordering::Relaxed)
@@ -556,6 +625,7 @@ impl App {
                 .saturating_add(self.media.rtsp_push_egress.load(Ordering::Relaxed)),
             self.srt_egress.load(Ordering::Relaxed),
             self.media.direct_egress.load(Ordering::Relaxed),
+            self.fxlink.lock().unwrap().1.load(Ordering::Relaxed),
         );
     }
 
@@ -586,6 +656,146 @@ pub(crate) fn error(code: StatusCode, message: &str) -> Response {
 fn json_response(value: Value) -> Response {
     axum::Json(value).into_response()
 }
+fn management_read_response(role: Role, mut value: Value) -> Response {
+    if role == Role::View {
+        redact_view_value(&mut value);
+    }
+    json_response(value)
+}
+fn browser_management_write_allowed(request: &Request, public_origin: Option<&url::Url>) -> bool {
+    if let Some(site) = request.headers().get("sec-fetch-site") {
+        if !matches!(site.to_str(), Ok("same-origin" | "none")) {
+            return false;
+        }
+    }
+    // Browsers can submit simple form POSTs without Origin or Fetch Metadata.
+    if request.method() == axum::http::Method::POST
+        && request.uri().path() != "/streamer/api/v3/config"
+        && request.headers().get("origin").is_none()
+        && request.headers().get("sec-fetch-site").is_none()
+        && request
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                matches!(
+                    value
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain"
+                )
+            })
+    {
+        return false;
+    }
+    let Some(origin) = request.headers().get("origin") else {
+        return true;
+    };
+    let Some(authority) = request
+        .uri()
+        .authority()
+        .map(|value| value.as_str())
+        .or_else(|| {
+            request
+                .headers()
+                .get("host")
+                .and_then(|value| value.to_str().ok())
+        })
+    else {
+        return false;
+    };
+    let scheme = if request
+        .extensions()
+        .get::<crate::http_tls::SecureHttp>()
+        .is_some()
+    {
+        "https"
+    } else {
+        "http"
+    };
+    let target = url::Url::parse(&format!("{scheme}://{authority}/"));
+    let supplied = origin
+        .to_str()
+        .ok()
+        .and_then(|value| url::Url::parse(value).ok());
+    match (target, supplied) {
+        (Ok(target), Some(supplied)) => {
+            supplied.path() == "/"
+                && supplied.query().is_none()
+                && supplied.fragment().is_none()
+                && supplied.username().is_empty()
+                && supplied.password().is_none()
+                && (supplied.origin() == target.origin()
+                    || public_origin.is_some_and(|public| {
+                        public.host_str() == target.host_str()
+                            && public.port() == target.port()
+                            && supplied.origin() == public.origin()
+                    }))
+        }
+        _ => false,
+    }
+}
+fn redact_view_value(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            for (key, field) in fields {
+                // Configuration appears both on disk and inherited in effective streams.
+                // Keep the shape for status readers, but never return credentials,
+                // callback destinations, key-file paths, or full endpoint URLs.
+                if matches!(
+                    key.as_str(),
+                    "password"
+                        | "passphrase"
+                        | "cluster_key"
+                        | "flussonix_peer_key"
+                        | "flussonix_fxlink_token"
+                        | "flussonix_token_sha256"
+                        | "token"
+                        | "streamid"
+                        | "key_file"
+                        | "sdp_file"
+                        | "flussonix_tls_ca"
+                        | "flussonix_media_tls_ca"
+                        | "on_play"
+                        | "on_publish"
+                ) {
+                    *field = Value::String("[redacted]".into());
+                } else if matches!(key.as_str(), "url" | "endpoint" | "upstream_source")
+                    || key.ends_with("_url")
+                {
+                    *field = match field.as_str() {
+                        Some("testsrc://" | "publish://") => field.clone(),
+                        Some(url) => match url.split_once("://") {
+                            Some((scheme, _))
+                                if scheme.len() <= 32
+                                    && !scheme.is_empty()
+                                    && scheme.bytes().all(|b| {
+                                        b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')
+                                    }) =>
+                            {
+                                Value::String(format!("{scheme}://[redacted]"))
+                            }
+                            _ => Value::String("[redacted]".into()),
+                        },
+                        None => Value::String("[redacted]".into()),
+                    };
+                } else {
+                    redact_view_value(field);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_view_value(item);
+            }
+        }
+        _ => {}
+    }
+}
 pub(crate) fn parse_query(q: Option<&str>) -> HashMap<String, String> {
     url::form_urlencoded::parse(q.unwrap_or("").as_bytes())
         .into_owned()
@@ -594,10 +804,18 @@ pub(crate) fn parse_query(q: Option<&str>) -> HashMap<String, String> {
 pub fn router(app: Arc<App>) -> Router {
     Router::new().route("/health",axum::routing::get(||async{axum::Json(json!({"status":"ok","service":"FlussoniX","version":env!("CARGO_PKG_VERSION")}))}))
  .route("/streamer/api/v3/{*tail}",axum::routing::any(management))
+ .route("/tv/playlists/{subscriber}",axum::routing::get(iptv_playlist_http))
  .route("/flussonix/api/v1/srt-lookup",axum::routing::any(srt_lookup::lookup))
  .route("/flussonix/api/v1/{*tail}",axum::routing::any(native))
  .nest_service("/admin",tower_http::services::ServeDir::new(&app.options.web_dir).append_index_html_on_directories(true))
  .fallback(media_request).with_state(app).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024))
+}
+async fn iptv_playlist_http(
+    State(app): State<Arc<App>>,
+    axum::extract::Path(subscriber): axum::extract::Path<String>,
+    request: Request,
+) -> Response {
+    iptv_playlist::get(app, request, &subscriber)
 }
 async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     let role = app
@@ -615,6 +833,11 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     if method != axum::http::Method::GET && role != Role::Edit {
         return error(StatusCode::FORBIDDEN, "edit credentials required");
     }
+    if method != axum::http::Method::GET
+        && !browser_management_write_allowed(&request, app.options.admin_public_origin.as_ref())
+    {
+        return error(StatusCode::FORBIDDEN, "cross-origin management request");
+    }
     let tail = percent_encoding::percent_decode_str(
         request.uri().path().trim_start_matches("/streamer/api/v3/"),
     )
@@ -624,33 +847,36 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     let mut parts = tail.splitn(2, '/');
     let resource = parts.next().unwrap_or("");
     let name = parts.next();
+    if resource == "iptv" {
+        return iptv_management::dispatch(app, request, &tail, role).await;
+    }
     if resource == "config" {
         if name == Some("stats") && method == "GET" {
-            return json_response(app.node().await);
+            let mut node = app.node().await;
+            node["management_role"] = json!(if role == Role::View { "view" } else { "edit" });
+            return management_read_response(role, node);
         }
         if name.is_some() {
             return error(StatusCode::NOT_FOUND, "unknown config operation");
         }
         if method == "GET" {
-            return json_response(app.config.snapshot());
+            return management_read_response(role, app.config.snapshot());
+        }
+        if method == "POST" {
+            return validate_config_request(&app.config, request).await;
         }
         let body = match read_json(request).await {
             Ok(b) => b,
             Err((code, message)) => return error(code, &message),
         };
-        let result = if method == "POST" {
-            app.config.validate(body)
-        } else if method == "PUT" {
-            app.config.replace(body)
-        } else {
+        if method != "PUT" {
             return error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
-        };
+        }
+        let result = app.config.replace(body);
         return match result {
             Ok(v) => {
-                if method == "PUT" {
-                    app.invalidate_sessions().await;
-                    app.reconcile().await;
-                }
+                app.invalidate_sessions().await;
+                app.reconcile().await;
                 json_response(v)
             }
             Err(e) => error(StatusCode::BAD_REQUEST, &e),
@@ -685,7 +911,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         if let Some(id) = name {
             if method == "GET" {
                 return match app.playback_auth.snapshot(id) {
-                    Some(s) => json_response(s),
+                    Some(s) => management_read_response(role, s),
                     None => error(StatusCode::NOT_FOUND, "session not found"),
                 };
             }
@@ -702,7 +928,10 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
                 sessions.retain(|s| s["name"] == name.as_str());
             }
             sessions.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-            return json_response(json!({"estimated_count":sessions.len(),"sessions":sessions}));
+            return management_read_response(
+                role,
+                json!({"estimated_count":sessions.len(),"sessions":sessions}),
+            );
         }
         return error(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -737,7 +966,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
                     if kind == "streams" {
                         v["stats"] = app.stream_stats(name).await;
                     }
-                    json_response(v)
+                    management_read_response(role, v)
                 }
                 None => error(StatusCode::NOT_FOUND, "not found"),
             };
@@ -799,6 +1028,11 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
             }
         }
     }
+    if role == Role::View {
+        for item in &mut items {
+            redact_view_value(item);
+        }
+    }
     if matches!(kind, "streams" | "templates") {
         let filters = match crate::api_filter::Filters::parse(&query, kind == "streams") {
             Ok(filters) => filters,
@@ -821,30 +1055,11 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         if query.get("sort").is_some_and(|s| s == "-name") {
             items.reverse()
         }
-        let offset = query
-            .get("cursor")
-            .and_then(|s| STANDARD.decode(s).ok())
-            .and_then(|b| String::from_utf8(b).ok())
-            .map(|s| parse_query(Some(&s)))
-            .and_then(|p| p.get("$position_gt").and_then(|v| v.parse::<usize>().ok()))
-            .map(|p| p.saturating_add(1))
-            .unwrap_or(0);
-        let limit = query
-            .get("limit")
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(100)
-            .clamp(1, 1000);
-        let page = items
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .collect::<Vec<_>>();
-        let next = if offset.saturating_add(page.len()) < total {
-            Some(STANDARD.encode(format!("%24position_gt={}", offset + page.len() - 1)))
-        } else {
-            None
+        let page = match crate::api_cursor::paginate_positions(items, &query) {
+            Ok(page) => page,
+            Err(message) => return error(StatusCode::BAD_REQUEST, message),
         };
-        (page, next, None)
+        (page.items, page.next, page.prev)
     };
     let mut result = json!({"estimated_count":total,"timing":{},"next":next,"prev":prev});
     if matches!(kind, "streams" | "templates" | "peers" | "sources")
@@ -856,13 +1071,107 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         }
     }
     result[kind] = json!(page);
-    json_response(result)
+    management_read_response(role, result)
 }
 async fn read_json(request: Request) -> Result<Value, (StatusCode, String)> {
     let bytes = axum::body::to_bytes(request.into_body(), 2 * 1024 * 1024)
         .await
         .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "body exceeds limit".into()))?;
     serde_json::from_slice(&bytes).map_err(|_| (StatusCode::BAD_REQUEST, "invalid JSON".into()))
+}
+async fn validate_config_request(config: &ConfigStore, request: Request) -> Response {
+    let text_plain = request
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/plain"));
+    let bytes = match axum::body::to_bytes(request.into_body(), 2 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "body exceeds limit"),
+    };
+    let patch: Value = if text_plain {
+        let body = match std::str::from_utf8(&bytes) {
+            Ok(body) => body,
+            Err(error) => {
+                let prefix = std::str::from_utf8(&bytes[..error.valid_up_to()])
+                    .expect("UTF-8 error prefix is valid");
+                let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+                let col = prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "error":"invalid_config", "config":{}, "detail":"text configuration must be UTF-8",
+                        "line":line, "col":col, "path":[]
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        match parse_text(body) {
+            Ok(patch) => patch,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "error":e.error, "config":e.config, "detail":e.detail,
+                        "line":e.line, "col":e.col, "path":[]
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match serde_json::from_slice(&bytes) {
+            Ok(patch) => patch,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "error":"invalid_json", "config":{}, "detail":e.to_string(),
+                        "line":e.line(), "col":e.column().max(1), "path":[]
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+    match config.validate(patch.clone()) {
+        Ok(validated) => json_response(validated),
+        Err(detail) => {
+            let unknown = detail
+                .strip_prefix("server option ")
+                .and_then(|rest| {
+                    rest.strip_suffix(
+                        " is not implemented; listener/auth/limits are startup options",
+                    )
+                })
+                .filter(|key| patch.get(*key).is_some());
+            let wrong_collection = detail
+                .strip_suffix(" must be an array")
+                .filter(|kind| KINDS.contains(kind) && patch.get(*kind).is_some());
+            let nested = (!text_plain)
+                .then(|| nested_validation_path(&patch, &detail))
+                .flatten();
+            let (code, path) = if let Some((code, path)) = nested {
+                (code, path)
+            } else if let Some(key) = unknown {
+                ("unknown_key".into(), json!(["server_config", key]))
+            } else if let Some(kind) = wrong_collection {
+                ("invalid_config".into(), json!(["server_config", kind]))
+            } else {
+                ("invalid_config".into(), json!([]))
+            };
+            let recoverable = if patch.is_object() { patch } else { json!({}) };
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "error":code, "config":recoverable, "detail":detail, "path":path
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
     let tail = percent_encoding::percent_decode_str(
@@ -962,13 +1271,18 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
     if tail == "node" && request.method() == "GET" {
         let mut node = app.node().await;
         node["idle_memory_cleanup"] = app.media.idle_memory.snapshot();
-        return json_response(node);
+        node["management_role"] = json!(if role == Some(Role::View) {
+            "view"
+        } else {
+            "edit"
+        });
+        return management_read_response(role.unwrap_or(Role::Edit), node);
     }
     if tail == "capabilities" && request.method() == "GET" {
         let (gpu_profiles, vaapi_profiles) =
             tokio::join!(app.media.gpu_capabilities(), app.media.vaapi_capabilities());
         return json_response(
-            json!({"rtsp_publication":app.rtsp_publication.lock().unwrap().clone(),"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","rtsp-udp (unicast RTP/RTCP)","rtsp2 (RTSP/1.0 camera input, AAC audio default)","rtsps (verified TLS, interleaved TCP)","srt","rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","publish:// (HTTP MPEG-TS; RTSP TCP / opt-in unicast UDP; RTSPS TLS TCP receive; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","srt (caller push / global listener playback, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","http / https / tshttp / tshttps (native continuous MPEG-TS POST push, optional Basic; verified HTTPS TLS)","rtsp (TCP or unicast UDP publish push; TCP / opt-in unicast UDP playback; H264/HEVC/AAC-LC/MP2/MP3)","rtsps (verified TLS TCP publish push; opt-in TLS TCP playback; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["SDP negotiation","DTLS-SRTP / automatic key negotiation","rtsp Basic / Digest viewer auth","dvr","push protocols beyond SRT/RTSP/RTSPS/HTTP MPEG-TS","srt publication policy / per-stream playback listeners"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA / VAAPI H.264 / HEVC; profile readiness check, no software fallback","gpu_profiles":gpu_profiles,"vaapi_profiles":vaapi_profiles},"direct_srtp":{"available":crate::direct_rtp::crypto::availability(),"profile":"AES_CM_128_HMAC_SHA1_80","library":"independent system libsrtp2"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP/RTSP/RTSPS redirects"}),
+            json!({"fxlink":app.fxlink.lock().unwrap().0.clone(),"rtsp_publication":app.rtsp_publication.lock().unwrap().clone(),"api":"Flussonic v3 subset","input":["fxlink (verified QUIC TLS, original native records, FEC)","hls","hlss","tshttp","tshttps","rtsp","rtsp-udp (unicast RTP/RTCP)","rtsp2 (RTSP/1.0 camera input, AAC audio default)","rtsps (verified TLS, interleaved TCP)","srt","rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","publish:// (HTTP MPEG-TS; RTSP TCP / opt-in unicast UDP; RTSPS TLS TCP receive; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","srt (caller push / global listener playback, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","http / https / tshttp / tshttps (native continuous MPEG-TS POST push, optional Basic; verified HTTPS TLS)","rtsp (TCP or unicast UDP publish push; TCP / opt-in unicast UDP playback; H264/HEVC/AAC-LC/MP2/MP3)","rtsps (verified TLS TCP publish push; opt-in TLS TCP playback; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["SDP negotiation","DTLS-SRTP / automatic key negotiation","rtsp Basic / Digest viewer auth","dvr","push protocols beyond SRT/RTSP/RTSPS/HTTP MPEG-TS","srt publication policy / per-stream playback listeners"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA / VAAPI H.264 / HEVC; profile readiness check, no software fallback","gpu_profiles":gpu_profiles,"vaapi_profiles":vaapi_profiles},"direct_srtp":{"available":crate::direct_rtp::crypto::availability(),"profile":"AES_CM_128_HMAC_SHA1_80","library":"independent system libsrtp2"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP/RTSP/RTSPS redirects"}),
         );
     }
     if let Some(name) = tail.strip_prefix("stream/") {
@@ -985,10 +1299,12 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
                                 );
                             }
                         };
-                        if value.is_object() {
-                            c["on_play"]["url"] = json!(policy.url);
-                        } else {
-                            c["on_play"] = json!(policy.url);
+                        if let Some(url) = policy.url {
+                            if value.is_object() {
+                                c["on_play"]["url"] = json!(url);
+                            } else {
+                                c["on_play"] = json!(url);
+                            }
                         }
                     }
                     // Discovery conveys playback policy and identity, never publisher
@@ -1708,10 +2024,13 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     grant.set_output_credit(app.http_handoffs.take(&grant, segmented));
     let signature = crate::media::media_signature(&cfg);
     let check = async {
-        !grant.is_cancelled()
-            && app.media_config(name).await.is_some_and(|(c, _)| {
-                c["disabled"] != true && crate::media::media_signature(&c) == signature
-            })
+        if grant.is_cancelled() {
+            return false;
+        }
+        let current = app.media_config(name).await.is_some_and(|(c, _)| {
+            c["disabled"] != true && crate::media::media_signature(&c) == signature
+        });
+        current && !grant.is_cancelled()
     };
     let worker = match app.media.ensure_guarded(name, &cfg, true, check).await {
         Ok(w) => w,
@@ -1722,12 +2041,17 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             );
         }
     };
-    if grant.is_cancelled()
-        || !app.media_config(name).await.is_some_and(|(c, _)| {
-            c["disabled"] != true && crate::media::media_signature(&c) == worker.signature()
-        })
-    {
+    let current = app.media_config(name).await.is_some_and(|(c, _)| {
+        c["disabled"] != true && crate::media::media_signature(&c) == worker.signature()
+    });
+    if !current {
         app.media.stop_if_current(name, &worker).await;
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stream changed during startup",
+        );
+    }
+    if grant.is_cancelled() {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "stream changed during startup",
@@ -1797,30 +2121,24 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             .into_response();
     }
     if file == "mpegts" {
-        let rx = worker.subscribe();
-        worker.viewers.fetch_add(1, Ordering::Relaxed);
-        let guard = ViewerGuard(worker.clone(), grant);
-        let egress = app.egress.clone();
-        let stream = futures_util::stream::unfold(
-            (rx, guard, egress),
-            |(mut rx, guard, egress)| async move {
-                match tokio::select! {biased; _=guard.1.cancelled()=>Err(tokio::sync::broadcast::error::RecvError::Closed),_=guard.0.closed()=>Err(tokio::sync::broadcast::error::RecvError::Closed),result=rx.recv()=>result}
-                {
-                    Ok(bytes) => {
-                        guard.1.add_bytes(bytes.len());
-                        egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                        Some((Ok::<Bytes, std::io::Error>(bytes), (rx, guard, egress)))
-                    }
-                    Err(_) => None,
-                }
-            },
-        );
+        let connection = matches!(
+            request.version(),
+            axum::http::Version::HTTP_10 | axum::http::Version::HTTP_11
+        )
+        .then(|| {
+            request
+                .extensions()
+                .get::<crate::http_transport::Control>()
+                .cloned()
+        })
+        .flatten();
+        let body = native_ts_body::body(worker, grant, app.egress.clone(), connection);
         return (
             [
                 ("Content-Type".to_owned(), "video/mp2t".to_owned()),
                 ("Cache-Control".into(), "no-store".into()),
             ],
-            Body::from_stream(stream),
+            body,
         )
             .into_response();
     }
@@ -2037,9 +2355,14 @@ mod continuous_session_tests {
     }
 }
 
+mod iptv_management;
+mod iptv_playlist;
+mod native_ts_body;
 #[path = "origin_resolution.rs"]
 mod origin_resolution;
+mod ts_startup;
 
+mod fxlink_access;
 mod idle_body;
 pub(crate) mod rtsp_access;
 pub(crate) mod ts_access;
@@ -2130,3 +2453,40 @@ mod vendor_namespace_tests {
 
 #[cfg(test)]
 mod test_vendor_admission;
+
+#[cfg(test)]
+#[path = "server/viewer_worker_tests.rs"]
+mod viewer_worker_tests;
+
+#[cfg(test)]
+mod peer_transport_tests {
+    use super::*;
+
+    // Break caught: every native LB probe and admission can use the raw key on HTTP.
+    #[test]
+    fn cluster_client_rejects_remote_plaintext_peer_endpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = App::new(
+            directory.path().join("config.json"),
+            directory.path().join("media"),
+            Options {
+                admin_password: "owned-admin-password".into(),
+                peer_key: "owned-native-peer-key".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            app.cluster_client(&json!({"api_url":"http://remote.example"}))
+                .is_err()
+        );
+        assert!(
+            app.cluster_client(&json!({"api_url":"http://remote.example","flussonix_allow_insecure_peer_http":true}))
+                .is_ok()
+        );
+        assert!(
+            app.cluster_client(&json!({"api_url":"http://127.0.0.1:9000"}))
+                .is_ok()
+        );
+    }
+}

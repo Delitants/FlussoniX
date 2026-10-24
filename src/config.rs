@@ -1,17 +1,34 @@
+mod diagnostic;
+mod stream_watch;
+mod text;
 pub(crate) mod vendor_peers;
 mod vendor_sources;
+pub(crate) use diagnostic::nested_validation_path;
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     fs,
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
+pub(crate) use stream_watch::StreamWatch;
+pub(crate) use text::parse_text;
 
 pub const KINDS: &[&str] = &["streams", "templates", "peers", "sources", "auth_backends"];
+const INPUT_FIELDS: &[&str] = &[
+    "url",
+    "rtp",
+    "flussonix_tls_ca",
+    "flussonix_rtp",
+    "flussonix_fxlink",
+    "flussonix_fxlink_token",
+    "flussonix_rtsp_startup",
+];
+const INPUT_FIELDS_DETAIL: &str = "supported input fields: url, RTSP rtp=udp and flussonix_rtsp_startup, verified TLS flussonix_tls_ca, direct RTP/SRTP flussonix_rtp, FXLink flussonix_fxlink/token";
 
 pub fn merge(old: &Value, patch: &Value) -> Value {
     if let Some(p) = patch.as_object() {
@@ -39,7 +56,11 @@ pub fn merge(old: &Value, patch: &Value) -> Value {
 pub struct ConfigStore {
     path: PathBuf,
     data: Mutex<Value>,
+    // A source relationship changes identity at the successful save boundary,
+    // including delete/re-add between two reads of the final configuration.
+    source_lineages: Mutex<HashMap<String, Arc<()>>>,
     revision: AtomicU64,
+    stream_watches: stream_watch::Watches,
 }
 impl ConfigStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
@@ -52,10 +73,19 @@ impl ConfigStore {
         };
         normalize_sources(&mut data)?;
         validate_root(&data)?;
+        let source_lineages = data["sources"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|source| item_key("sources", source))
+            .map(|key| (key.to_owned(), Arc::new(())))
+            .collect();
         Ok(Self {
             path,
             data: Mutex::new(data),
+            source_lineages: Mutex::new(source_lineages),
             revision: AtomicU64::new(0),
+            stream_watches: Default::default(),
         })
     }
     pub fn revision(&self) -> u64 {
@@ -71,6 +101,44 @@ impl ConfigStore {
     }
     pub fn snapshot(&self) -> Value {
         self.data.lock().unwrap().clone()
+    }
+    /// Call while reading the configuration to bind an exact source
+    /// relationship to its successful edit history.
+    pub(crate) fn source_lineage(&self, key: &str) -> Option<Arc<()>> {
+        self.source_lineages.lock().unwrap().get(key).cloned()
+    }
+    fn refresh_source_lineages(&self, current: &Value, next: &Value) {
+        let mut lineages = self.source_lineages.lock().unwrap();
+        let mut updated = HashMap::new();
+        let previous: HashMap<&str, &Value> = current["sources"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|source| item_key("sources", source).map(|key| (key, source)))
+            .collect();
+        let backends_same = current["auth_backends"] == next["auth_backends"];
+        let templates_same = current["templates"] == next["templates"];
+        if let Some(sources) = next["sources"].as_array() {
+            for source in sources {
+                let Some(key) = item_key("sources", source) else {
+                    continue;
+                };
+                let same_relationship = previous.get(key).is_some_and(|old| {
+                    *old == source
+                        && backends_same
+                        && (templates_same
+                            || crate::vendor_output::resolve(current, old).ok()
+                                == crate::vendor_output::resolve(next, source).ok())
+                });
+                let lineage = if same_relationship {
+                    lineages.get(key).cloned().unwrap_or_else(|| Arc::new(()))
+                } else {
+                    Arc::new(())
+                };
+                updated.insert(key.to_owned(), lineage);
+            }
+        }
+        *lineages = updated;
     }
     pub fn validate(&self, patch: Value) -> Result<Value, String> {
         let mut next = merge(&self.snapshot(), &patch);
@@ -107,6 +175,8 @@ impl ConfigStore {
         normalize_sources(&mut next)?;
         validate_root(&next)?;
         self.save(&next)?;
+        self.retire_stream_watches(&next);
+        self.refresh_source_lineages(&data, &next);
         *data = next.clone();
         self.revision.fetch_add(1, Ordering::Release);
         Ok(next)
@@ -150,6 +220,8 @@ impl ConfigStore {
         normalize_sources(&mut next)?;
         validate_root(&next)?;
         self.save(&next)?;
+        self.retire_stream_watches(&next);
+        self.refresh_source_lineages(&data, &next);
         let item = next[kind]
             .as_array()
             .unwrap()
@@ -175,6 +247,8 @@ impl ConfigStore {
         let removed = items.len() != before;
         validate_root(&next)?;
         self.save(&next)?;
+        self.retire_stream_watches(&next);
+        self.refresh_source_lineages(&data, &next);
         *data = next;
         self.revision.fetch_add(1, Ordering::Release);
         Ok(removed)
@@ -429,6 +503,8 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "password",
                     "flussonix_token_sha256",
                     "flussonix_input_timeout",
+                    "flussonix_peer_key",
+                    "flussonix_allow_insecure_peer_http",
                     "flussonix_subtitle_tracks",
                     "flussonix_hls_captions",
                     "flussonix_hls_subtitles",
@@ -447,8 +523,12 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "flussonix_stream_map",
                     "private_payload_url",
                     "cluster_key",
+                    "flussonix_allow_insecure_peer_http",
                     "drain",
                     "flussonix_transport",
+                    "flussonix_fxlink_url",
+                    "flussonix_fxlink",
+                    "flussonix_fxlink_token",
                     "flussonix_source_group",
                     "prefix",
                     "except",
@@ -465,6 +545,12 @@ fn validate_root(root: &Value) -> Result<(), String> {
                 {
                     return Err(format!("{kind} option {key} is not implemented"));
                 }
+            }
+            if item
+                .get("flussonix_allow_insecure_peer_http")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                return Err("flussonix_allow_insecure_peer_http must be boolean".into());
             }
             if *kind == "sources" {
                 vendor_sources::validate(item, root)?;
@@ -590,15 +676,43 @@ fn validate_root(root: &Value) -> Result<(), String> {
                         if field == "flussonix_media_tls_ca" && *kind != "sources" {
                             return Err("private media CA is source-only".into());
                         }
-                        if !endpoint
-                            .and_then(|u| url::Url::parse(u).ok())
-                            .is_some_and(|u| u.scheme() == "https")
+                        if !(field == "flussonix_media_tls_ca"
+                            && item["flussonix_transport"] == "fxlink")
+                            && !endpoint
+                                .and_then(|u| url::Url::parse(u).ok())
+                                .is_some_and(|u| u.scheme() == "https")
                         {
                             return Err("cluster CA requires an HTTPS endpoint".into());
                         }
                         let path = ca.as_str().ok_or("TLS CA must be an absolute PEM path")?;
                         crate::tls_input::client(Some(std::path::Path::new(path)))?;
                     }
+                }
+                let fxlink_source = *kind == "sources" && item["flussonix_transport"] == "fxlink";
+                let fxlink_fields = [
+                    "flussonix_fxlink_url",
+                    "flussonix_fxlink",
+                    "flussonix_fxlink_token",
+                ];
+                if fxlink_source {
+                    if !crate::source_directory::native_source(item) || item.get("url").is_some() {
+                        return Err(
+                            "FXLink requires a named native source with explicit management URL"
+                                .into(),
+                        );
+                    }
+                    let endpoint = item["flussonix_fxlink_url"]
+                        .as_str()
+                        .ok_or("FXLink source requires an explicit UDP endpoint")?;
+                    let address = crate::fxlink::Address::parse(endpoint, false)
+                        .map_err(|e| e.to_string())?;
+                    if address.stream.is_some() {
+                        return Err("FXLink source endpoint must omit the stream name".into());
+                    }
+                    fxlink_settings(item)?;
+                    fxlink_token(item)?;
+                } else if fxlink_fields.iter().any(|field| item.get(field).is_some()) {
+                    return Err("FXLink source controls require a native FXLink source".into());
                 }
                 if item.get("drain").is_some_and(|v| !v.is_boolean()) {
                     return Err("drain must be boolean".into());
@@ -607,10 +721,11 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     if *kind != "sources"
                         || !transport
                             .as_str()
-                            .is_some_and(|t| ["hls", "m4s", "m4f", "mpegts"].contains(&t))
+                            .is_some_and(|t| ["hls", "m4s", "m4f", "mpegts", "fxlink"].contains(&t))
                     {
                         return Err(
-                            "flussonix_transport is source-only: hls, m4s, m4f or mpegts".into(),
+                            "flussonix_transport is source-only: hls, m4s, m4f, mpegts or fxlink"
+                                .into(),
                         );
                     }
                 }
@@ -662,22 +777,54 @@ fn validate_root(root: &Value) -> Result<(), String> {
                         }
                     }
                 }
+                if let Some(key) = item.get("flussonix_peer_key") {
+                    let value = key.as_str().ok_or("native peer key must be a string")?;
+                    if value.len() < 12 || value.len() > 4096 || value.chars().any(char::is_control)
+                    {
+                        return Err(
+                            "native peer key must contain 12 to 4096 non-control bytes".into()
+                        );
+                    }
+                }
                 if let Some(inputs) = item.get("inputs") {
                     let inputs = inputs.as_array().ok_or("inputs must be array")?;
                     for input in inputs {
-                        if input.as_object().is_none_or(|v| {
-                            v.keys().any(|k| {
-                                k != "url"
-                                    && k != "rtp"
-                                    && k != "flussonix_tls_ca"
-                                    && k != "flussonix_rtp"
-                            })
-                        }) {
-                            return Err("supported input fields: url, RTSP rtp=udp, secure HTTP/RTSP flussonix_tls_ca, and direct RTP/SRTP flussonix_rtp".into());
+                        if input
+                            .as_object()
+                            .is_none_or(|v| v.keys().any(|k| !INPUT_FIELDS.contains(&k.as_str())))
+                        {
+                            return Err(INPUT_FIELDS_DETAIL.into());
                         }
                         let u = input["url"].as_str().ok_or("input url required")?;
                         let scheme = u.split("://").next().unwrap_or("");
                         crate::direct_rtp::config::Settings::input(input)?;
+                        if scheme == "srt" {
+                            crate::srt_input::Input::parse(u)?;
+                        }
+                        if ["rtsp", "rtsp-udp", "rtsp2", "rtsps"].contains(&scheme) {
+                            let target = if scheme == "rtsps" {
+                                u.to_owned()
+                            } else {
+                                crate::media::translate_input(u)?
+                            };
+                            crate::media::validate_rtsp_input_url(&target)?;
+                        }
+                        if let Some(mode) = input.get("flussonix_rtsp_startup") {
+                            if !["rtsp", "rtsp-udp", "rtsp2", "rtsps"].contains(&scheme)
+                                || !matches!(mode.as_str(), Some("h264" | "conservative"))
+                            {
+                                return Err("RTSP startup mode requires an RTSP input and value h264 or conservative".into());
+                            }
+                        }
+                        if scheme == "fxlink" {
+                            crate::fxlink::Address::parse(u, true).map_err(|e| e.to_string())?;
+                            fxlink_settings(input)?;
+                            fxlink_token(input)?;
+                        } else if input.get("flussonix_fxlink").is_some()
+                            || input.get("flussonix_fxlink_token").is_some()
+                        {
+                            return Err("FXLink controls require an fxlink input".into());
+                        }
                         if scheme == "publish"
                             && (u != "publish://"
                                 || inputs.len() != 1
@@ -694,11 +841,13 @@ fn validate_root(root: &Value) -> Result<(), String> {
                             return Err("rtp input option requires RTSP and value udp".into());
                         }
                         if let Some(ca) = input.get("flussonix_tls_ca") {
-                            if !["rtsps", "m4fs", "m4ss", "hlss", "tshttps", "https"]
-                                .contains(&scheme)
+                            if ![
+                                "rtsps", "m4fs", "m4ss", "hlss", "tshttps", "https", "fxlink",
+                            ]
+                            .contains(&scheme)
                             {
                                 return Err(
-                                    "TLS CA input option requires RTSPS, M4FS, M4SS, HLSS, TSHTTPS or HTTPS".into()
+                                    "TLS CA input option requires RTSPS, M4FS, M4SS, HLSS, TSHTTPS, HTTPS or FXLink".into()
                                 );
                             }
                             let path = ca.as_str().ok_or("TLS CA must be an absolute PEM path")?;
@@ -716,16 +865,10 @@ fn validate_root(root: &Value) -> Result<(), String> {
                             // removing userinfo from the persisted input configuration.
                             crate::http_basic::take_url_credentials(&mut parsed)?;
                         }
-                        if scheme == "rtsps" {
-                            let parsed = url::Url::parse(u).map_err(|_| "invalid RTSPS URL")?;
-                            if parsed.host_str().is_none() || parsed.fragment().is_some() {
-                                return Err("RTSPS host required and fragments forbidden".into());
-                            }
-                        }
                         if ![
                             "testsrc", "http", "https", "hls", "hlss", "tshttp", "tshttps", "rtsp",
                             "rtsps", "rtsp-udp", "rtsp2", "srt", "m4s", "m4ss", "m4f", "m4fs",
-                            "publish", "rtp", "srtp",
+                            "publish", "rtp", "srtp", "fxlink",
                         ]
                         .contains(&scheme)
                         {
@@ -745,6 +888,21 @@ fn validate_root(root: &Value) -> Result<(), String> {
     for s in root["streams"].as_array().unwrap() {
         if let Some(effective) = effective(root, s["name"].as_str().unwrap()) {
             crate::transcoder::Profile::resolve(&effective, false)?;
+            if effective["inputs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|input| {
+                    input["url"]
+                        .as_str()
+                        .is_some_and(|url| url.starts_with("fxlink://"))
+                })
+                && !effective["flussonix_peer_key"].is_string()
+            {
+                return Err(
+                    "FXLink input requires a native peer key on the stream or template".into(),
+                );
+            }
         }
         if let Some(t) = s["template"].as_str() {
             if !root["templates"]
@@ -757,6 +915,65 @@ fn validate_root(root: &Value) -> Result<(), String> {
             }
         }
     }
+    let templates = root["templates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|template| Some((template["name"].as_str()?, template)))
+        .collect::<HashMap<_, _>>();
+    for stream in root["streams"].as_array().unwrap() {
+        let resolved = stream["template"]
+            .as_str()
+            .and_then(|name| templates.get(name))
+            .map_or_else(|| stream.clone(), |template| merge(template, stream));
+        if crate::iptv::tokenless_output_conflict(&resolved) {
+            return Err(crate::iptv::TOKENLESS_OUTPUT_ERROR.into());
+        }
+    }
     vendor_sources::validate_groups(root)?;
+    Ok(())
+}
+
+/// Only operator-facing FXLink controls may override negotiated defaults.
+pub(crate) fn fxlink_settings(input: &Value) -> Result<crate::fxlink::Settings, String> {
+    let mut settings = crate::fxlink::Settings::default();
+    if let Some(value) = input.get("flussonix_fxlink") {
+        let fields = value
+            .as_object()
+            .ok_or("FXLink settings must be an object")?;
+        for (key, value) in fields {
+            let n = value
+                .as_u64()
+                .ok_or("FXLink settings must be positive integers")?;
+            match key.as_str() {
+                "latency_ms" => settings.latency_ms = n,
+                "data_shards" => {
+                    settings.data_shards =
+                        usize::try_from(n).map_err(|_| "invalid FXLink data count")?
+                }
+                "parity_shards" => {
+                    settings.parity_shards =
+                        usize::try_from(n).map_err(|_| "invalid FXLink parity count")?
+                }
+                _ => return Err("unsupported FXLink setting".into()),
+            }
+        }
+    }
+    settings.validate().map_err(|e| e.to_string())?;
+    if ![(20, 2), (20, 4), (20, 6), (1, 1)]
+        .contains(&(settings.data_shards, settings.parity_shards))
+    {
+        return Err("FXLink protection must use a supported FEC preset".into());
+    }
+    Ok(settings)
+}
+
+fn fxlink_token(input: &Value) -> Result<(), String> {
+    if let Some(token) = input.get("flussonix_fxlink_token") {
+        let value = token.as_str().ok_or("FXLink token must be a string")?;
+        if value.len() > 4096 || value.chars().any(char::is_control) {
+            return Err("FXLink token must contain at most 4096 non-control bytes".into());
+        }
+    }
     Ok(())
 }

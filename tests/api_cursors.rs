@@ -110,6 +110,70 @@ fn native(value: &Value) -> String {
 }
 
 #[tokio::test]
+async fn default_stream_pages_follow_position_and_use_reference_position_bounds() {
+    let (_dir, app) = fixture();
+    app.config
+        .put("streams", "zulu", json!({"position":5,"static":false}))
+        .unwrap();
+
+    let first = page(&app, "streams", &[("limit", "2")], &["zulu", "alpha"], 5).await;
+    let next = first["next"].as_str().unwrap();
+    let decoded = STANDARD.decode(next).unwrap();
+    assert_eq!(decoded, b"%24position_gt=10");
+
+    let second = page(
+        &app,
+        "streams",
+        &[("limit", "2"), ("cursor", next)],
+        &["beta", "delta"],
+        5,
+    )
+    .await;
+    let previous = page(
+        &app,
+        "streams",
+        &[("limit", "2"), ("cursor", second["prev"].as_str().unwrap())],
+        &["zulu", "alpha"],
+        5,
+    )
+    .await;
+    assert!(previous["prev"].is_null());
+
+    // A position-only bound would skip delta when the page splits position 20.
+    let tied = page(
+        &app,
+        "streams",
+        &[("limit", "1"), ("cursor", &token("%24position_gt=10"))],
+        &["beta"],
+        5,
+    )
+    .await;
+    let tied_next = tied["next"].as_str().unwrap();
+    assert!(
+        String::from_utf8(STANDARD.decode(tied_next).unwrap())
+            .unwrap()
+            .starts_with("%24flussonix_cursor=")
+    );
+    page(
+        &app,
+        "streams",
+        &[("limit", "1"), ("cursor", tied_next)],
+        &["delta"],
+        5,
+    )
+    .await;
+
+    page(
+        &app,
+        "streams",
+        &[("sort", "name"), ("limit", "2")],
+        &["alpha", "beta"],
+        5,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn forward_cursor_survives_insert_delete_before_boundary_and_deleted_anchor() {
     for mutation in ["insert", "delete", "anchor"] {
         let (_dir, app) = fixture();
@@ -182,7 +246,11 @@ async fn backward_cursor_survives_deleted_anchor_and_insertion_before_it() {
     let last = page(
         &app,
         "streams",
-        &[("cursor", &token("name_gt=beta")), ("limit", "2")],
+        &[
+            ("sort", "name"),
+            ("cursor", &token("name_gt=beta")),
+            ("limit", "2"),
+        ],
         &["delta", "gamma"],
         4,
     )
@@ -194,7 +262,11 @@ async fn backward_cursor_survives_deleted_anchor_and_insertion_before_it() {
     page(
         &app,
         "streams",
-        &[("cursor", last["prev"].as_str().unwrap()), ("limit", "2")],
+        &[
+            ("sort", "name"),
+            ("cursor", last["prev"].as_str().unwrap()),
+            ("limit", "2"),
+        ],
         &["beta", "charlie"],
         4,
     )
@@ -516,17 +588,29 @@ async fn reference_name_bounds_support_forward_backward_and_descending() {
 }
 
 #[tokio::test]
-async fn legacy_position_input_remains_accepted_and_maximum_does_not_overflow() {
+async fn reference_position_input_uses_row_positions_and_maximum_does_not_overflow() {
     let (_dir, app) = fixture();
     let body = page(
         &app,
         "streams",
         &[("limit", "2"), ("cursor", &token("%24position_gt=1"))],
+        &["alpha", "beta"],
+        4,
+    )
+    .await;
+    assert!(body["prev"].is_null());
+    page(
+        &app,
+        "streams",
+        &[
+            ("sort", "name"),
+            ("limit", "2"),
+            ("cursor", &token("%24position_gt=1")),
+        ],
         &["delta", "gamma"],
         4,
     )
     .await;
-    assert!(body["prev"].is_string());
     let empty = page(
         &app,
         "streams",
@@ -620,7 +704,14 @@ async fn native_cursor_schema_and_size_are_validated() {
 async fn exhausted_boundaries_and_empty_collections_return_null_navigation() {
     let (_dir, app) = fixture();
     for query in ["name_gt=zzzz", "name_lt=aaaa&%24reversed=true"] {
-        let body = page(&app, "streams", &[("cursor", &token(query))], &[], 4).await;
+        let body = page(
+            &app,
+            "streams",
+            &[("sort", "name"), ("cursor", &token(query))],
+            &[],
+            4,
+        )
+        .await;
         assert!(body["next"].is_null() && body["prev"].is_null());
     }
     for name in ["alpha", "beta", "delta", "gamma"] {

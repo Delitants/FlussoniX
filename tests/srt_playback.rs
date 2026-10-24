@@ -311,6 +311,48 @@ async fn denied_token_and_lb_role_never_start_workers_or_send_media() {
         lab.stop().await;
     }
 }
+
+#[tokio::test]
+async fn iptv_subscriber_token_in_stream_id_controls_srt_playback() {
+    let _lock = MEDIA.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg["on_play"] = json!("iptv://");
+    let lab = Lab::start(cfg, "standalone", "", 4).await;
+    lab.app.iptv.set_enabled(true).unwrap();
+    lab.app
+        .iptv
+        .put_package("basic", json!({"channels":["owned"]}))
+        .unwrap();
+    lab.app
+        .iptv
+        .put_subscriber(
+            "alice",
+            json!({"token":"subscriber-token","packages":["basic"]}),
+        )
+        .unwrap();
+    let denied_path = dir.path().join("denied.ts");
+    let mut denied = receiver(&lab, "wrong-token", &denied_path, "1");
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(8), denied.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(lab.app.media.count().await, 0);
+    let accepted_path = dir.path().join("accepted.ts");
+    let mut accepted = receiver(&lab, "subscriber-token", &accepted_path, "1");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(15), accepted.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert!(accepted_path.metadata().unwrap().len() > 0);
+    lab.stop().await;
+}
 #[derive(Clone)]
 struct Backend {
     allow: Arc<AtomicBool>,

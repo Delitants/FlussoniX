@@ -63,6 +63,8 @@ pub async fn query(
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
             return Err(LookupFailure::Invalid);
         }
+        crate::peer_transport::require(&url, source["flussonix_allow_insecure_peer_http"] == true)
+            .map_err(|_| LookupFailure::Invalid)?;
         let name = name
             .split('/')
             .map(|p| {
@@ -156,6 +158,8 @@ pub(crate) async fn inventory(
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
             return Err(LookupFailure::Invalid);
         }
+        crate::peer_transport::require(&url, source["flussonix_allow_insecure_peer_http"] == true)
+            .map_err(|_| LookupFailure::Invalid)?;
         url.set_path(&format!(
             "{}/flussonix/api/v1/source-streams",
             url.path().trim_end_matches('/')
@@ -217,6 +221,47 @@ pub mod modern_coordinator;
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+    #[tokio::test]
+    async fn inventory_blocks_remote_plaintext_key_unless_source_opts_in() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let router = axum::Router::new().route(
+            "/flussonix/api/v1/source-streams",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(headers["x-flussonix-peer"], "owned-inventory-key");
+                async { axum::Json(serde_json::json!({"streams":[]})) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("remote.example", address)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let mut source =
+            serde_json::json!({"api_url":format!("http://remote.example:{}",address.port())});
+        assert_eq!(
+            inventory(&client, &source, "owned-inventory-key").await,
+            Err(LookupFailure::Invalid)
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        source["flussonix_allow_insecure_peer_http"] = serde_json::json!(true);
+        assert_eq!(
+            inventory(&client, &source, "owned-inventory-key").await,
+            Ok(Vec::new())
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        task.abort();
+        let _ = task.await;
+    }
     #[tokio::test]
     async fn native_inventory_rejects_vendor_and_unknown_kind_without_dialing() {
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
