@@ -21,6 +21,45 @@ fn client() -> reqwest::Client {
         .build()
         .unwrap()
 }
+// Break caught: a remote plaintext management address receives a reusable peer key.
+#[tokio::test]
+async fn remote_plaintext_native_discovery_does_not_send_peer_key_by_default() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = requests.clone();
+    let (local, task) = serve(Router::new().fallback(get(move |headers: HeaderMap| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(headers["x-flussonix-peer"], "owned-private-key");
+        async { axum::Json(json!({"name":"music","streams":[]})) }
+    })))
+    .await;
+    let address = local.strip_prefix("http://").unwrap().parse().unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .resolve("remote.example", address)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let source = json!({"api_url":format!("http://remote.example:{}", address.port())});
+    assert_eq!(
+        query(&client, &source, "music", "owned-private-key").await,
+        Err(LookupFailure::Invalid)
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    let mut allowed = source;
+    allowed["flussonix_allow_insecure_peer_http"] = json!(true);
+    assert!(
+        query(&client, &allowed, "music", "owned-private-key")
+            .await
+            .is_ok()
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    task.abort();
+    let _ = task.await;
+}
 // Break caught: prefix misses reach upstream, exclusions use local full names, or lookup strips names.
 #[tokio::test]
 async fn source_prefix_filters_requests_and_exclusions_are_relative_without_renaming() {

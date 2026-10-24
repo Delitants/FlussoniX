@@ -166,22 +166,27 @@ impl App {
         let (cfg, _) = self.media_config(&name).await.ok_or(404u16)?;
         let signature = crate::media::media_signature(&cfg);
         let check = async {
-            !grant.is_cancelled()
-                && self.media_config(&name).await.is_some_and(|(c, _)| {
-                    c["disabled"] != true && crate::media::media_signature(&c) == signature
-                })
+            if grant.is_cancelled() {
+                return false;
+            }
+            let current = self.media_config(&name).await.is_some_and(|(c, _)| {
+                c["disabled"] != true && crate::media::media_signature(&c) == signature
+            });
+            current && !grant.is_cancelled()
         };
         let worker = self
             .media
             .ensure_guarded(&name, &cfg, true, check)
             .await
             .map_err(|_| 503u16)?;
-        if grant.is_cancelled()
-            || !self.media_config(&name).await.is_some_and(|(c, _)| {
-                c["disabled"] != true && crate::media::media_signature(&c) == worker.signature()
-            })
-        {
+        let current = self.media_config(&name).await.is_some_and(|(c, _)| {
+            c["disabled"] != true && crate::media::media_signature(&c) == worker.signature()
+        });
+        if !current {
             self.media.stop_if_current(&name, &worker).await;
+            return Err(503);
+        }
+        if grant.is_cancelled() {
             return Err(503);
         }
         let description=tokio::time::timeout(Duration::from_secs(8),async{loop{if let Some(description)=worker.wire.rtp.description(){return description.map_err(|_|415u16);}tokio::select!{biased;_=grant.cancelled()=>return Err(403),_=worker.closed()=>return Err(503),_=tokio::time::sleep(Duration::from_millis(25))=>{}}}}).await.map_err(|_|503u16)??;

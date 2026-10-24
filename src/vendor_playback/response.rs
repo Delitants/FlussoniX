@@ -209,7 +209,9 @@ impl Runtime {
             };
             return continuous(subscription, app.egress.clone(), file);
         }
-        let deadline = Instant::now() + Duration::from_secs(8);
+        // Keep the normal read grace, but do not cut short a current worker's
+        // configured startup allowance. The allowance belongs to its generation.
+        let deadline = (Instant::now() + Duration::from_secs(8)).max(playback.startup_deadline());
         let bytes = loop {
             let read = tokio::select! {biased;_=self.closed.cancelled()=>return error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),result=app.media.read_shared(&playback,file)=>result};
             match read {

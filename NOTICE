@@ -1,0 +1,12 @@
+FlussoniX
+Copyright 2026 FlussoniX contributors
+
+FlussoniX's original code is licensed under the Apache License, Version 2.0.
+See LICENSE for the complete terms.
+
+Third-party code and dependencies retain their original licenses and notices.
+In particular, vendor/quinn-proto retains its Apache-2.0 OR MIT licensing;
+its license texts are included in that directory.
+
+External media samples, reference material, and separately installed software
+are not relicensed by the FlussoniX license.

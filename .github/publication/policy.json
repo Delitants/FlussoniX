@@ -2,8 +2,21 @@
   "schema": 1,
   "repository": "Delitants/FlussoniX",
   "baseline": "32d7a7bb6e07fe86ee824393e967ef0704ddb5a8",
-  "public_docs": [],
-  "public_data": [],
+  "public_docs": [
+    "docs/fxlink.md",
+    "docs/installation.md",
+    "docs/iptv-transport.md",
+    "docs/licensing.md",
+    "docs/packaging.md",
+    "docs/service-installation.md",
+    "docs/srt-input.md",
+    "docs/vendor-group-membership.md",
+    "docs/vendor-replica-discovery.md",
+    "vendor/quinn-proto/FLUSSONIX_PATCH.md"
+  ],
+  "public_data": [
+    "vendor/quinn-proto/.cargo_vcs_info.json"
+  ],
   "release_assets": [
     "flussonix-*-linux-x86_64*.tar.gz",
     "flussonix-*-linux-x86_64*.tar.gz.sha256",

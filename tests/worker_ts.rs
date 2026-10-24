@@ -283,3 +283,28 @@ fn negative_composition_offset_is_explicitly_preserved_in_pes() {
     assert_eq!(decode(&pes[9..14]), 86400);
     assert_eq!(decode(&pes[14..19]), 90000);
 }
+
+#[test]
+fn gop_preflight_preserves_mux_state_and_checks_intra_and_inter_gop_clocks() {
+    let tracks = [audio("m2a", 2)];
+    let mut mux = Muxer::new(&tracks).unwrap();
+    let mut expected = Muxer::new(&tracks).unwrap();
+    let first = frame(2, 90000, mp2());
+    assert_eq!(mux.frame(&first).unwrap(), expected.frame(&first).unwrap());
+    assert!(mux.validate_frames(&[frame(2, 89999, mp2())]).is_err());
+    assert!(
+        mux.validate_frames(&[frame(2, 95000, mp2()), frame(2, 94000, mp2())])
+            .is_err()
+    );
+    assert!(mux.validate_frames(&[frame(2, 95000, vec![0; 4])]).is_err());
+    assert!(
+        mux.validate_frames(&[frame(2, 95000, mp2()), frame(2, 97160, vec![0; 4])])
+            .is_err()
+    );
+    let next = [frame(2, 92160, mp2()), frame(2, 94320, mp2())];
+    mux.validate_frames(&next).unwrap();
+    mux.validate_frames(&next).unwrap();
+    for f in &next {
+        assert_eq!(mux.frame(f).unwrap(), expected.frame(f).unwrap());
+    }
+}

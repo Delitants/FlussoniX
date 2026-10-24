@@ -267,29 +267,36 @@ impl Runtime {
         }
         let activation = match candidate {
             Candidate::Direct(c) => self.owner.activate(c).ok(),
-            Candidate::Replica(g, c) => g.selector.activate(c).ok(),
+            Candidate::Replica(g, c) => g.selector.activate_provisional(c).ok(),
         };
         let Some(activation) = activation else {
             return false;
         };
         let control = activation.control();
-        let accepted = app
-            .config
-            .at_revision(revision, |_| {
-                let mut state = self.activation.lock().unwrap();
-                let Some(d) = state
-                    .demands
-                    .get_mut(name)
-                    .filter(|d| Arc::ptr_eq(&d.epoch, &epoch))
-                else {
-                    return false;
-                };
-                if let Some(old) = d.control.replace(control.clone()) {
-                    old.cancel();
-                }
-                true
-            })
-            .unwrap_or(false);
+        let accept = || {
+            let mut state = self.activation.lock().unwrap();
+            let Some(d) = state
+                .demands
+                .get_mut(name)
+                .filter(|d| Arc::ptr_eq(&d.epoch, &epoch))
+            else {
+                return false;
+            };
+            if let Some(old) = d.control.replace(control.clone()) {
+                old.cancel();
+            }
+            true
+        };
+        let accepted = match &group {
+            Some(g) => g
+                .selector
+                .commit_static_demand(&activation, accept)
+                .unwrap_or(false),
+            None => app
+                .config
+                .at_revision(revision, |_| accept())
+                .unwrap_or(false),
+        };
         if !accepted {
             control.cancel();
             return false;

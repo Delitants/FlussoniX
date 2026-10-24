@@ -791,7 +791,7 @@ async fn rtsp2_camera_default_keeps_video_decodable_with_reencoded_audio() {
 }
 async fn udp_input_roundtrip(scheme: &str, explicit_udp: bool) {
     let (_d, app, url, c, t, _pool) = fixture_udp("standalone", 2, 100.0).await;
-    let mut input = json!({"url":format!("{}?token=owned%2Dtoken", url.replacen("rtsp://", &format!("{scheme}://"), 1))});
+    let mut input = json!({"url":format!("{}?token=owned%2Dtoken", url.replacen("rtsp://", &format!("{scheme}://owned-user:owned-input-secret@"), 1))});
     if explicit_udp {
         input["rtp"] = json!("udp");
     }
@@ -803,6 +803,19 @@ async fn udp_input_roundtrip(scheme: &str, explicit_udp: bool) {
             .await
             .unwrap();
         assert_eq!(worker.stats()["input_protocol"], scheme);
+        let args = std::fs::read(format!("/proc/{}/cmdline", worker.pid())).unwrap();
+        assert!(
+            !args
+                .windows(b"owned%2Dtoken".len())
+                .any(|part| part == b"owned%2Dtoken"),
+            "RTSP source token appeared in decoder arguments"
+        );
+        assert!(
+            !args
+                .windows(b"owned-input-secret".len())
+                .any(|part| part == b"owned-input-secret"),
+            "RTSP source password appeared in decoder arguments"
+        );
         let mut path = None;
         for _ in 0..180 {
             if let Ok(data) = relay.read("roundtrip", "index.m3u8").await {

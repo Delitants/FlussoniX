@@ -24,7 +24,9 @@ All paths below are relative to `/streamer/api/v3`.
 | IPTV compatibility | `/iptv`, `/iptv/packages`, `/iptv/subscribers` and their item operations |
 | Operational visibility | Applicable monitoring, configuration statistics and event integration |
 
-The demo demonstrates built-in IPTV authorization. Include this compatibility mode, while keeping its demonstration configuration separate from actual migration requirements. Public IPTV API routes are in the installed schema.
+FlussoniX now implements a local built-in IPTV subset independently of the installed reference. It accepts existing static subscriber tokens, manages packages and subscribers through dedicated API routes, issues protected playlists and checks current access on playback. Exact response parity with a pinned Flussonic release remains unqualified; the demonstration server is not migration data.
+
+The separate owner-only `iptv.json` stores tokens outside `/config`. Use exact `on_play: "iptv://"` on a stream or template and set `--iptv-public-origin` for playlist links. Expiry and positive subscriber `max_sessions` are supported; limits count viewers on one node only. Successful edits revoke local IPTV grants, while a failed save keeps the last committed data and grants. The web UI provides **Config → IPTV** forms. [Token carriers and unsupported output routes](iptv-transport.md) are documented separately.
 
 Some UI behaviors depend on private routes, such as explicit input selection. Record them separately from public operations and decide each feature's first-release implementation deliberately.
 
@@ -308,7 +310,7 @@ Support `X-AuthDuration`, `X-UserId`, `X-Max-Sessions` and applicable legacy `X-
 
 **RTSP/RTP sessions:** authorize RTSP playback/publication before enabling media and preserve the reference's credential/token semantics. Direct RTP/SRTP uses an approved configured or negotiated endpoint/session; media packets do not carry an HTTP-style authorization callback. Bind the endpoint and, for SRTP, the key context to that decision.
 
-**IPTV:** implement subscriber/package authorization, existing token acceptance, expiration and channel permissions, plus the supporting management/playlists contracts. Do not infer a database layout or token algorithm from the demo's `iptv://` scheme alone.
+**IPTV:** the built-in local mode supports subscriber/package authorization, static token acceptance and generation, expiration, channel permissions and protected HLS playlists. Exact Flussonic management and playlist parity is pending a pinned independent reference comparison. Multi-node subscriber distribution, global session limits and ownership after node failure remain unqualified. Do not infer a vendor database layout or token algorithm from the demo's `iptv://` scheme alone.
 
 For horizontal operation, define session-limit scope and ownership explicitly. Account for reconnect races, duplicate requests and node failure; telemetry counts are not authoritative admission reservations. Any native cluster credentials or session tickets must remain outside the legacy wire adapter unless peers explicitly support them.
 
@@ -493,6 +495,8 @@ This implements the blacklist portion of the [reference source behavior](https:/
 Native sources additionally accept the reference `url` primary key through `/streamer/api/v3/cluster/sources/{url}`. Encode the entire source address as a path component. A URL source uses a lowercase `m4f://`, `m4fs://`, `m4s://` or `m4ss://` server root with an optional port and trailing slash. The address is a literal, case-sensitive identity preserved as supplied, up to 4,096 ASCII bytes. Credentials, stream paths, queries, fragments, percent escapes, empty/zero ports and malformed addresses are rejected. Existing `hostname` rows remain valid; a source cannot carry both identities.
 
 For example, PUT `/streamer/api/v3/cluster/sources/m4s%3A%2F%2Forigin.example%3A8080` with `{}` creates a source whose `url` is `m4s://origin.example:8080`, native `api_url` is `http://origin.example:8080/`, and native `flussonix_transport` is `m4s`. Secure variants infer HTTPS and retain certificate/identity verification. Explicit native management/private endpoints and transport settings override those defaults; their actual schemes determine TLS. The API returns and persists the inferred native fields. Null-removing an endpoint/transport override or resetting a row re-applies its address defaults. A conflicting body URL is rejected; the request identity stays fixed.
+
+The inferred `http://` address remains visible for API compatibility, but a remote native peer-key request to it is blocked by default. Use an `m4ss://`/`m4fs://` source, configure HTTPS management and private media endpoints, or explicitly set `flussonix_allow_insecure_peer_http: true` on this source for a trusted private HTTP link. The exception is scoped to that saved relationship; it does not change the protocol used by other sources or peers.
 
 The same normalization applies to config validation, replacement and startup imports. Validation does not save; startup does not rewrite the file. Source updates retain configuration revision fencing, viewer authority invalidation and worker reconciliation. URL identities appear in source lists, selected fields, selected-origin telemetry and replica switch accounting. The source editor provides a Source identity selector and a fixed Source address field, alongside existing endpoint controls and staged Config editing.
 

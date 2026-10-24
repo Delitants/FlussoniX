@@ -598,6 +598,297 @@ async fn hevc_aac_tcp_playback_decodes_owned_pictures() {
     playback("tcp", true).await
 }
 #[tokio::test]
+async fn hevc_rtsp_input_repackages_independently_decoded_hls() {
+    hevc_rtsp_input_repackages_independently_decoded_hls_profile(false).await;
+}
+#[tokio::test]
+async fn hevc_rtsp_input_with_reencoded_audio_repackages_independently_decoded_hls() {
+    hevc_rtsp_input_repackages_independently_decoded_hls_profile(true).await;
+}
+async fn hevc_rtsp_input_repackages_independently_decoded_hls_profile(reencode_audio: bool) {
+    use futures_util::FutureExt;
+    let lab = fixture_profile("tcp", true, "aac").await;
+    let dir = tempfile::tempdir().unwrap();
+    let relay = flussonix::media::Engine::new(dir.path(), "ffmpeg");
+    let result = std::panic::AssertUnwindSafe(async {
+        let input = format!("{}?token=owned-viewer", lab.url);
+        let mut cfg = json!({"inputs":[{"url":input}]});
+        if reencode_audio {
+            cfg["transcoder"] = json!({"encoder":"copy","acodec":"aac"});
+        }
+        let worker = relay.ensure("relay", &cfg).await.unwrap();
+        let args = std::fs::read(format!("/proc/{}/cmdline", worker.pid())).unwrap();
+        assert!(
+            !args
+                .windows(b"owned-viewer".len())
+                .any(|part| part == b"owned-viewer"),
+            "HEVC RTSP source token appeared in decoder arguments"
+        );
+        let mut segment = None;
+        for _ in 0..180 {
+            if let Ok(playlist) = relay.read("relay", "index.m3u8").await {
+                segment = String::from_utf8_lossy(&playlist)
+                    .lines()
+                    .find(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(str::to_owned);
+                if segment.is_some() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let segment = segment.unwrap_or_else(|| panic!("HEVC HLS: {}", worker.stats()));
+        let media = relay.read("relay", &segment).await.unwrap();
+        let path = dir.path().join("hevc-relay.ts");
+        std::fs::write(&path, media).unwrap();
+        let timing = tokio::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=pts,dts",
+                "-of",
+                "json",
+            ])
+            .arg(&path)
+            .output()
+            .await
+            .unwrap();
+        assert!(timing.status.success());
+        let timing: serde_json::Value = serde_json::from_slice(&timing.stdout).unwrap();
+        let packets = timing["packets"].as_array().unwrap();
+        assert!(packets.len() >= 10, "too few HEVC packets: {packets:?}");
+        let source: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("fixtures/codecs/hevc-timing.json")).unwrap();
+        let offsets: Vec<i64> = source
+            .iter()
+            .map(|frame| {
+                (frame["pts"].as_i64().unwrap() - frame["dts"].as_i64().unwrap()) * 90000 / 12800
+            })
+            .collect();
+        let emitted_offsets: Vec<i64> = packets
+            .iter()
+            .map(|packet| {
+                packet["pts"].as_i64().expect("HEVC PTS")
+                    - packet["dts"].as_i64().expect("HEVC DTS")
+            })
+            .collect();
+        assert!(
+            (0..offsets.len()).any(|start| emitted_offsets
+                .iter()
+                .enumerate()
+                .all(|(i, offset)| *offset == offsets[(start + i) % offsets.len()])),
+            "HEVC source composition pattern changed: {emitted_offsets:?}"
+        );
+        let mut previous_dts = None;
+        for packet in packets {
+            let dts = packet["dts"].as_i64().expect("HEVC DTS");
+            if let Some(previous) = previous_dts {
+                assert_eq!(dts - previous, 3600, "HEVC decode clock changed");
+            }
+            previous_dts = Some(dts);
+        }
+        let probe = tokio::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&path)
+            .output()
+            .await
+            .unwrap();
+        assert!(probe.status.success());
+        let codecs = String::from_utf8_lossy(&probe.stdout);
+        assert!(codecs.lines().any(|line| line == "hevc"), "{codecs}");
+        assert!(codecs.lines().any(|line| line == "aac"), "{codecs}");
+        let decoded = tokio::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-i"])
+            .arg(path)
+            .args(["-map", "0:v:0", "-threads", "1", "-f", "framemd5", "-"])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            decoded.status.success() && decoded.stderr.is_empty(),
+            "HEVC relay decode: {}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+        let actual = hashes(&decoded.stdout, 0);
+        assert!(
+            actual.len() >= 10,
+            "too few decoded HEVC pictures: {actual:?}"
+        );
+        assert!(
+            actual.is_subset(&lab.expected),
+            "relayed HEVC pictures differ from independent source oracle"
+        );
+    })
+    .catch_unwind()
+    .await;
+    relay.stop_all().await;
+    lab.stop().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+#[tokio::test]
+async fn hevc_rtsp_copy_preserves_late_hls_decode_clock_across_segments() {
+    hevc_rtsp_copy_preserves_late_hls_decode_clock_across_segments_profile("tcp", None).await;
+}
+#[tokio::test]
+async fn hevc_rtsps_copy_preserves_late_hls_decode_clock_across_segments() {
+    hevc_rtsp_copy_preserves_late_hls_decode_clock_across_segments_profile("tls", None).await;
+}
+#[tokio::test]
+async fn hevc_rtsps_conservative_mode_preserves_late_decode_clock() {
+    hevc_rtsp_copy_preserves_late_hls_decode_clock_across_segments_profile(
+        "tls",
+        Some("conservative"),
+    )
+    .await;
+}
+async fn hevc_rtsp_copy_preserves_late_hls_decode_clock_across_segments_profile(
+    transport: &str,
+    startup: Option<&str>,
+) {
+    use futures_util::FutureExt;
+    let lab = fixture_profile(transport, true, "aac").await;
+    let dir = tempfile::tempdir().unwrap();
+    let relay = flussonix::media::Engine::new(dir.path(), "ffmpeg");
+    let result = std::panic::AssertUnwindSafe(async {
+        let mut input = json!({"url":format!("{}?token=owned-viewer",lab.url)});
+        if transport == "tls" {
+            input["flussonix_tls_ca"] = json!(lab.cert.ca.to_string_lossy().as_ref());
+        }
+        if let Some(startup) = startup {
+            input["flussonix_rtsp_startup"] = json!(startup);
+        }
+        let worker = relay
+            .ensure("relay", &json!({"inputs":[input]}))
+            .await
+            .unwrap();
+        let mut seen = HashSet::new();
+        let mut late_pair = None;
+        for _ in 0..180 {
+            if let Ok(playlist) = relay.read("relay", "index.m3u8").await {
+                let segments: Vec<_> = String::from_utf8_lossy(&playlist)
+                    .lines()
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(str::to_owned)
+                    .collect();
+                seen.extend(segments.iter().cloned());
+                if seen.len() >= 5 && segments.len() >= 2 {
+                    late_pair = Some(segments[segments.len() - 2..].to_vec());
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let late_pair = late_pair.unwrap_or_else(|| {
+            panic!(
+                "too few completed late HEVC HLS segments: {}",
+                worker.stats()
+            )
+        });
+        let mut media = Vec::new();
+        for segment in late_pair {
+            media.extend_from_slice(&relay.read("relay", &segment).await.unwrap());
+        }
+        let path = dir.path().join("late-hevc.ts");
+        std::fs::write(&path, media).unwrap();
+        let timing = tokio::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=pts,dts",
+                "-of",
+                "json",
+            ])
+            .arg(&path)
+            .output()
+            .await
+            .unwrap();
+        assert!(timing.status.success(), "late HEVC packet probe failed");
+        let timing: serde_json::Value = serde_json::from_slice(&timing.stdout).unwrap();
+        let packets = timing["packets"].as_array().unwrap();
+        assert!(packets.len() >= 30, "too few later HEVC packets");
+        let gaps: Vec<_> = packets
+            .windows(2)
+            .enumerate()
+            .filter_map(|(index, pair)| {
+                let previous = pair[0]["dts"].as_i64().expect("late HEVC DTS");
+                let next = pair[1]["dts"].as_i64().expect("late HEVC DTS");
+                (next - previous != 3600).then_some((
+                    index,
+                    previous,
+                    next,
+                    pair[0]["pts"].as_i64(),
+                    pair[1]["pts"].as_i64(),
+                ))
+            })
+            .collect();
+        assert!(gaps.is_empty(), "later HEVC decode clock changed: {gaps:?}");
+        let source: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("fixtures/codecs/hevc-timing.json")).unwrap();
+        let offsets: Vec<i64> = source
+            .iter()
+            .map(|frame| {
+                (frame["pts"].as_i64().unwrap() - frame["dts"].as_i64().unwrap()) * 90000 / 12800
+            })
+            .collect();
+        let emitted_offsets: Vec<i64> = packets
+            .iter()
+            .map(|packet| {
+                packet["pts"].as_i64().expect("late HEVC PTS")
+                    - packet["dts"].as_i64().expect("late HEVC DTS")
+            })
+            .collect();
+        assert!(
+            (0..offsets.len()).any(|start| emitted_offsets
+                .iter()
+                .enumerate()
+                .all(|(i, offset)| *offset == offsets[(start + i) % offsets.len()])),
+            "later HEVC source composition pattern changed: {emitted_offsets:?}"
+        );
+        let decoded = tokio::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-i"])
+            .arg(&path)
+            .args(["-map", "0:v:0", "-threads", "1", "-f", "framemd5", "-"])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            decoded.status.success() && decoded.stderr.is_empty(),
+            "late HEVC decode: {}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+        let actual = hashes(&decoded.stdout, 0);
+        assert!(actual.len() >= 10, "too few later HEVC pictures");
+        assert!(
+            actual.is_subset(&lab.expected),
+            "later HEVC pictures differ from source oracle"
+        );
+    })
+    .catch_unwind()
+    .await;
+    relay.stop_all().await;
+    lab.stop().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+#[tokio::test]
 async fn hevc_aac_udp_playback_decodes_owned_pictures() {
     playback("udp", true).await
 }

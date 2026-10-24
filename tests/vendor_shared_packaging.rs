@@ -1456,7 +1456,7 @@ async fn hls_blocked_startup_reserves_capacity_and_shutdown_cancels_it_before_pr
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("owned-probe");
     let marker = dir.path().join("probe");
-    std::fs::write(&script,format!("#!/usr/bin/python3\nimport os,sys,time\nfrom pathlib import Path\nif any('nvenc' in a for a in sys.argv):\n Path({:?}).write_text(str(os.getpid()))\n time.sleep(30)\nelse:os.execv('/usr/bin/ffmpeg',['ffmpeg']+sys.argv[1:])\n",marker.to_str().unwrap())).unwrap();
+    std::fs::write(&script,format!("#!/usr/bin/python3\nimport os,sys,time\nfrom pathlib import Path\nif any('nvenc' in a for a in sys.argv):\n ready=Path({:?})\n pending=ready.with_suffix('.pending')\n pending.write_text(str(os.getpid()))\n pending.replace(ready)\n time.sleep(30)\nelse:os.execv('/usr/bin/ffmpeg',['ffmpeg']+sys.argv[1:])\n",marker.to_str().unwrap())).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     let engine = Engine::new(dir.path(), script.to_str().unwrap());
     let (sessions, cancel, task) = session_owner(
@@ -1854,7 +1854,7 @@ async fn hls_old_pending_reservation_cannot_remove_a_new_epoch_session() {
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("owned-probe");
     let marker = dir.path().join("probe");
-    std::fs::write(&script,format!("#!/usr/bin/python3\nimport os,sys,time\nfrom pathlib import Path\nif any('nvenc' in a for a in sys.argv):\n Path({:?}).write_text(str(os.getpid()))\n time.sleep(30)\nelse:os.execv('/usr/bin/ffmpeg',['ffmpeg']+sys.argv[1:])\n",marker.to_str().unwrap())).unwrap();
+    std::fs::write(&script,format!("#!/usr/bin/python3\nimport os,sys,time\nfrom pathlib import Path\nif any('nvenc' in a for a in sys.argv):\n ready=Path({:?})\n pending=ready.with_suffix('.pending')\n pending.write_text(str(os.getpid()))\n pending.replace(ready)\n time.sleep(30)\nelse:os.execv('/usr/bin/ffmpeg',['ffmpeg']+sys.argv[1:])\n",marker.to_str().unwrap())).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     let engine = Engine::new(dir.path(), script.to_str().unwrap());
     let (sessions, cancel, task) = session_owner(
