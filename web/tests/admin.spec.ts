@@ -83,6 +83,17 @@ test('IPTV remains reachable from mobile Configuration',async({page})=>{
  await page.setViewportSize({width:375,height:800});await page.getByRole('button',{name:'Config',exact:true}).click();
  await page.getByRole('button',{name:'IPTV',exact:true}).click();await expect(page.getByRole('heading',{name:'IPTV',exact:true})).toBeVisible();
 });
+test('IPTV screen warns when a CDN lacks cluster authority',async({page})=>{
+ await page.route('**/flussonix/api/v1/node',async route=>{
+  const response=await route.fetch();const node=await response.json();
+  node.iptv_cluster={mode:'missing_authority',configured:false,ready:false,reason:'IPTV authority is required for cluster session limits'};
+  await route.fulfill({response,json:node});
+ });
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await page.getByRole('button',{name:'IPTV',exact:true}).click();
+ await expect(page.getByRole('alert')).toContainText('authority is required');
+ await expect(page.getByRole('button',{name:'Enable IPTV',exact:true})).toHaveCount(0);
+});
 test('status strip reports the running server version and follows node status updates',async({page,request})=>{
  const health=await(await request.get('/health')).json();
  expect(typeof health.version).toBe('string');expect(health.version.length).toBeGreaterThan(0);

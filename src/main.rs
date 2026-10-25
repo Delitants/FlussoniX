@@ -93,6 +93,19 @@ struct Args {
         requires = "iptv_lease_authority"
     )]
     iptv_peer_allow_insecure_loopback: bool,
+    /// Single FlussoniX IPTV authority origin for this viewer-serving node.
+    #[arg(long, env = "FLUSSONIX_IPTV_AUTHORITY")]
+    iptv_authority: Option<url::Url>,
+    /// Private CA PEM used to verify the IPTV authority certificate.
+    #[arg(long, env = "FLUSSONIX_IPTV_AUTHORITY_CA", requires = "iptv_authority")]
+    iptv_authority_ca: Option<PathBuf>,
+    /// Allow the IPTV authority client to use literal loopback plaintext for tests.
+    #[arg(
+        long,
+        env = "FLUSSONIX_IPTV_AUTHORITY_ALLOW_INSECURE_LOOPBACK",
+        requires = "iptv_authority"
+    )]
+    iptv_authority_allow_insecure_loopback: bool,
     #[arg(long, default_value = "runtime/media")]
     media_dir: PathBuf,
     #[arg(long, default_value = "web/dist")]
@@ -243,6 +256,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         iptv_public_origin: a.iptv_public_origin,
         iptv_lease_authority: a.iptv_lease_authority,
         iptv_peer_allow_insecure_loopback: a.iptv_peer_allow_insecure_loopback,
+        iptv_authority: a.iptv_authority,
+        iptv_authority_ca: a.iptv_authority_ca,
+        iptv_authority_allow_insecure_loopback: a.iptv_authority_allow_insecure_loopback,
         drain: a.drain,
         fxlink_features,
     };

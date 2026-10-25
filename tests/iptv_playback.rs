@@ -75,6 +75,96 @@ async fn hls_and_ts_require_current_subscriber_entitlement() {
 }
 
 #[tokio::test]
+async fn cdn_never_accepts_its_local_subscriber_file_as_cluster_authority() {
+    let (_dir, app) = app();
+    // The fixture has a valid local subscriber, as a stale CDN copy might.
+    // Changing its role must not turn that copy into a cluster grant.
+    let dir = tempfile::tempdir().unwrap();
+    let cdn = App::new(
+        dir.path().join("config.json"),
+        dir.path().join("media"),
+        Options {
+            admin_password: "admin-secret-123".into(),
+            peer_key: "peer-secret-1234".into(),
+            role: "cdn".into(),
+            iptv_data: Some(dir.path().join("iptv.json")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    cdn.config
+        .put(
+            "streams",
+            "news",
+            json!({"inputs":[{"url":"testsrc://"}],"on_play":"iptv://"}),
+        )
+        .unwrap();
+    cdn.iptv.set_enabled(true).unwrap();
+    cdn.iptv
+        .put_package("basic", json!({"channels":["news"]}))
+        .unwrap();
+    cdn.iptv
+        .put_subscriber(
+            "alice",
+            json!({"token":"alice-private-token","packages":["basic"]}),
+        )
+        .unwrap();
+    assert!(
+        app.iptv
+            .snapshot()
+            .authorize("alice-private-token", "news", std::time::SystemTime::now())
+            .is_some()
+    );
+    assert_eq!(
+        media(&cdn, "/news/index.m3u8?token=alice-private-token")
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    cdn.media.stop_all().await;
+}
+
+#[tokio::test]
+async fn standalone_with_remote_authority_never_falls_back_to_local_subscriber_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = App::new(
+        dir.path().join("config.json"),
+        dir.path().join("media"),
+        Options {
+            admin_password: "admin-secret-123".into(),
+            peer_key: "peer-secret-1234".into(),
+            iptv_authority: Some(url::Url::parse("https://authority.example/").unwrap()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    app.config
+        .put(
+            "streams",
+            "news",
+            json!({"inputs":[{"url":"testsrc://"}],"on_play":"iptv://"}),
+        )
+        .unwrap();
+    app.iptv.set_enabled(true).unwrap();
+    app.iptv
+        .put_package("basic", json!({"channels":["news"]}))
+        .unwrap();
+    app.iptv
+        .put_subscriber(
+            "alice",
+            json!({"token":"alice-private-token","packages":["basic"]}),
+        )
+        .unwrap();
+    assert_eq!(
+        media(&app, "/news/index.m3u8?token=alice-private-token")
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    app.media.stop_all().await;
+}
+
+#[tokio::test]
 async fn subscriber_limits_span_streams_and_session_views_hide_token() {
     let (_dir, app) = app();
     let first = media(&app, "/news/mpegts?token=alice-private-token").await;

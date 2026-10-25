@@ -1,3 +1,4 @@
+pub mod client;
 pub mod lease;
 pub mod store;
 

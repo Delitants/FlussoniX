@@ -4,13 +4,15 @@ type Request = (url:string,method?:string,body?:unknown)=>Promise<any>;
 type Package = {name:string;channels:string[]};
 type Subscriber = {name:string;token:string;packages:string[];max_sessions?:number|null;flussonix_expires_at?:string|null};
 type Editor = {kind:'package'|'subscriber';original:string;name:string;selected:string[];limit:string;expires:string;token:string;rotate:boolean};
+type Cluster = {mode?:string;ready?:boolean;reason?:string};
 const api='/streamer/api/v3/iptv';
 const validName=(name:string)=>name.length>0&&new TextEncoder().encode(name).length<=256&&!name.split('/').some(part=>!part||part==='.'||part==='..')&&!/[\\?#\x00-\x1f\x7f]/.test(name);
 const itemPath=(name:string)=>encodeURIComponent(name);
 const utcField=(value?:string|null)=>value?.slice(0,16)||'';
 
-export function IptvPage({request,publicOrigin,managementRole,onBack}:{request:Request;publicOrigin?:string|null;managementRole?:string;onBack:()=>void}){
- const canEdit=managementRole==='edit';
+export function IptvPage({request,publicOrigin,managementRole,cluster,onBack}:{request:Request;publicOrigin?:string|null;managementRole?:string;cluster?:Cluster;onBack:()=>void}){
+ const remote=cluster?.mode==='client'||cluster?.mode==='missing_authority';
+ const canEdit=managementRole==='edit'&&!remote;
  const[enabled,setEnabled]=useState<boolean|null>(null);
  const[packages,setPackages]=useState<Package[]>([]),[subscribers,setSubscribers]=useState<Subscriber[]>([]),[channels,setChannels]=useState<string[]>([]);
  const[packageNext,setPackageNext]=useState<string|null>(null),[subscriberNext,setSubscriberNext]=useState<string|null>(null);
@@ -35,7 +37,7 @@ export function IptvPage({request,publicOrigin,managementRole,onBack}:{request:R
    setError('');
   }catch(cause){setError((cause as Error).message);}
  }
- useEffect(()=>{void refresh()},[]);
+ useEffect(()=>{if(!remote)void refresh()},[remote]);
  async function more(kind:'packages'|'subscribers',cursor:string){
   try{const page=await request(`${api}/${kind}?limit=1000&cursor=${encodeURIComponent(cursor)}`);
    if(kind==='packages'){setPackages(previous=>[...previous,...page.packages]);setPackageNext(page.next||null)}
@@ -86,7 +88,8 @@ export function IptvPage({request,publicOrigin,managementRole,onBack}:{request:R
  return <section className="iptv-page">
   <div className="page-heading"><div><div className="breadcrumb">System / Config / IPTV</div><h1>IPTV</h1></div><div className="heading-actions"><button onClick={onBack}>← Configuration</button>{canEdit&&enabled!==null&&<button className={enabled?'danger':'primary'} disabled={busy} onClick={toggleModule}>{enabled?'Disable IPTV':'Enable IPTV'}</button>}</div></div>
   {error&&<div className="error" role="alert">{error}</div>}{notice&&<div className="notice" role="status">{notice}</div>}
-  <div className="panel padded iptv-intro"><h2>Subscriber access</h2><p>{enabled===null?'Loading IPTV status…':enabled?'IPTV is enabled. Assign channels to packages, then packages to subscribers.':'IPTV is disabled. Enable it to manage packages and subscribers.'}</p><p className="muted">Subscriber data and tokens are saved in a separate owner-only file. Limits apply separately on each node.</p>{!publicOrigin&&<p className="muted">Set the IPTV public origin at startup to offer subscriber playlist links.</p>}{publicOrigin?.startsWith('http://')&&<p className="iptv-http-warning" role="alert">This HTTP origin sends subscriber tokens without encryption. Use HTTPS for public or untrusted networks.</p>}</div>
+  {cluster&&cluster.ready===false&&<div className="error" role="alert">{cluster.reason||'IPTV cluster admission is unavailable.'}</div>}
+  <div className="panel padded iptv-intro"><h2>Subscriber access</h2><p>{remote?'Subscriber catalog and playlists are managed by the IPTV authority.':enabled===null?'Loading IPTV status…':enabled?'IPTV is enabled. Assign channels to packages, then packages to subscribers.':'IPTV is disabled. Enable it to manage packages and subscribers.'}</p><p className="muted">{cluster?.mode==='authority'?'Subscriber data is saved in an owner-only file on this authority.':remote?'This node does not use a local subscriber file for viewer access.':'Subscriber data and tokens are saved in a separate owner-only file. Limits apply separately on each node.'}</p>{!remote&&!publicOrigin&&<p className="muted">Set the IPTV public origin at startup to offer subscriber playlist links.</p>}{!remote&&publicOrigin?.startsWith('http://')&&<p className="iptv-http-warning" role="alert">This HTTP origin sends subscriber tokens without encryption. Use HTTPS for public or untrusted networks.</p>}</div>
   {enabled&&<><div className="tabs"><button className={tab==='packages'?'selected':''} onClick={()=>{setShownToken(null);setTab('packages')}}>Packages</button><button className={tab==='subscribers'?'selected':''} onClick={()=>{setShownToken(null);setTab('subscribers')}}>Subscribers</button></div>
    {tab==='packages'?<section className="panel"><div className="panel-heading"><h2>Packages</h2>{canEdit&&<button className="primary" onClick={()=>open('package')}>Add package</button>}</div><div className="table-wrap"><table><thead><tr><th>Name</th><th>Channels</th>{canEdit&&<th>Actions</th>}</tr></thead><tbody>{packages.map(row=><tr key={row.name}><td className="mono">{row.name}</td><td>{row.channels.length?row.channels.join(', '):'No channels'}</td>{canEdit&&<td className="actions"><button onClick={()=>open('package',row)}>Edit</button><button className="danger" onClick={()=>remove('package',row.name)}>Delete</button></td>}</tr>)}</tbody></table>{!packages.length&&<p className="padded muted">No packages yet.</p>}</div>{packageNext&&<div className="editor-footer"><button onClick={()=>more('packages',packageNext)}>Load more packages</button></div>}</section>:
    <section className="panel"><div className="panel-heading"><h2>Subscribers</h2>{canEdit&&<button className="primary" onClick={()=>open('subscriber')}>Add subscriber</button>}</div><div className="table-wrap"><table><thead><tr><th>Name</th><th>Packages</th><th>Session limit</th><th>Expires (UTC)</th><th>Token</th><th>Actions</th></tr></thead><tbody>{subscribers.map(row=>{const secret=canEdit&&row.token!=='[redacted]';const url=playlist(row);return <tr key={row.name}><td className="mono">{row.name}</td><td>{row.packages.join(', ')||'None'}</td><td>{row.max_sessions??'No limit'}</td><td>{row.flussonix_expires_at||'Never'}</td><td className="mono iptv-token">{secret?(shownToken===row.name?row.token:'••••'):'[redacted]'}</td><td className="actions">{secret&&<><button onClick={()=>setShownToken(shownToken===row.name?null:row.name)}>{shownToken===row.name?'Hide token':'Reveal token'}</button><button onClick={()=>copy(row.token,'Token')}>Copy token</button></>}{url&&<button onClick={()=>copy(url,'Playlist link')}>Copy playlist link</button>}{canEdit&&<><button onClick={()=>open('subscriber',row)}>Edit</button><button className="danger" onClick={()=>remove('subscriber',row.name)}>Delete</button></>}</td></tr>})}</tbody></table>{!subscribers.length&&<p className="padded muted">No subscribers yet.</p>}</div>{subscriberNext&&<div className="editor-footer"><button onClick={()=>more('subscribers',subscriberNext)}>Load more subscribers</button></div>}</section>}
