@@ -59,7 +59,8 @@ export FLUSSONIX_PEER_KEY
 Choose a different port if 18210 is occupied. Open
 [the admin interface](http://127.0.0.1:18210/admin/) and sign in with your saved
 credentials. This listener is local to the host; use an SSH tunnel for remote
-access. For a public listener, use [HTTPS](https-delivery.md) for the UI and API:
+access. For a public listener, configure built-in HTTPS with `--https-listen`,
+`--https-cert`, and `--https-key` for the UI and API:
 remote plaintext HTTP still serves media, but denies the admin page and
 management credentials. The login page is public on safe origins; management
 data requires authentication. An explicit
