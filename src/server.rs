@@ -678,9 +678,9 @@ impl App {
         {
             json!({"mode":"local","configured":false,"ready":true})
         } else if self.options.iptv_lease_authority {
-            json!({"mode":"authority","configured":true,"ready":false,"reason":"IPTV authority playback lease integration pending"})
+            json!({"mode":"authority","configured":true,"ready":false,"reason":"Shared IPTV authority limits are under release qualification"})
         } else if let Some(client) = &self.iptv_authority_client {
-            json!({"mode":"client","configured":true,"ready":false,"connected":client.recently_reachable(),"reason":"IPTV authority playback lease integration pending"})
+            json!({"mode":"client","configured":true,"ready":false,"connected":client.recently_reachable(),"reason":"Shared IPTV authority limits are under release qualification"})
         } else {
             json!({"mode":"missing_authority","configured":false,"ready":false,"reason":"IPTV authority is required for cluster session limits"})
         };

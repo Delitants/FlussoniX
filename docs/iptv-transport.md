@@ -1,6 +1,6 @@
 # IPTV subscriber tokens by playback transport
 
-`on_play: "iptv://"` uses the built-in subscriber and package store. Each viewer must present its current subscriber token. Tokens are checked again at final admission; successful subscriber edits cancel existing IPTV sessions.
+`on_play: "iptv://"` uses the built-in subscriber and package store. Each viewer must present its current subscriber token. Tokens are checked again at final admission. Subscriber edits revoke affected sessions immediately on a standalone node and by the lease deadline on nodes using a shared authority.
 
 Subscriber tokens are bearer credentials in playlist and media URLs. Configure an HTTPS IPTV public origin and serve the playlist over HTTPS when viewers cross an untrusted network. An explicitly configured HTTP origin exposes those tokens to observers on that link; use it only on a trusted network.
 
@@ -11,7 +11,9 @@ Subscriber tokens are bearer credentials in playlist and media URLs. Configure a
 | M4S/M4F HTTP(S) playback | `?token=...` | Checked before media access. The M4S/M4F ingest URLs are source credentials, not subscriber playback tokens. |
 | RTSP/RTSPS playback | `?token=...` on the initial DESCRIBE URL | The token is bound to the session; an edit closes the session. |
 | SRT listener playback | `u=...` in `#!::r=<stream>,m=request,u=<token>` stream ID | Checked before media delivery. |
-| Native load-balancer redirect | The original viewer token is retained in the destination URL or stream ID | Each destination node checks its own subscriber store; independent stores are not a coordinated cluster authority. |
+| Native load-balancer redirect | The original viewer token is retained in the destination URL or stream ID | With a shared authority, the load balancer validates the viewer, releases its temporary slot before redirecting, and the destination checks the token and acquires its own lease. |
 | Configured RTP/SRTP or push output | No per-viewer token carrier | Unsupported for an IPTV-protected stream; worker startup fails closed when such an output is enabled. |
 
-Subscriber records and `max_sessions` are local to a node. Multi-node subscriber distribution and a global session limit remain separate release qualifications.
+On a single standalone node, subscriber records and `max_sessions` stay local. The shared-authority profile uses one FlussoniX node with `--iptv-lease-authority` and an HTTPS listener. Configure `--iptv-authority https://<authority>/` and the same peer key on every FlussoniX node that serves IPTV viewers, including a source or load balancer that accepts viewer requests. A load balancer that also hosts the authority needs its own `--iptv-authority` URL. Use `--iptv-authority-ca` when the authority has a private CA. Plain HTTP is accepted only with explicit literal-loopback test options.
+
+Manage packages, subscribers and playlists on the authority. CDN subscriber files do not grant access. The authority applies one `max_sessions` count to FlussoniX viewers across its nodes; existing Flussonic-node viewers are outside that count. If the authority is unavailable, new admissions fail and existing viewers stop by their short lease deadline. After an authority restart, admissions pause for 11 seconds so old leases expire before new ones are issued. This single-authority profile is still under release qualification; mixed-version rolling upgrades and authority high availability are not established.

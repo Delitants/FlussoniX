@@ -10,7 +10,7 @@ FlussoniX does not require any official Flussonic components.
 - Manage streams, templates, server settings and cluster nodes through normal web forms.
 - Receive and deliver HLS, HTTP MPEG-TS, M4F/M4S, SRT, RTSP/RTSPS and RTP/SRTP using the supported profiles.
 - Use HTTPS and encrypted transports, viewer tokens and authorization callbacks, and upstream/publisher Basic authentication.
-- Manage local IPTV packages and subscribers, issue token-protected playlists and revoke viewers when access changes.
+- Manage IPTV packages and subscribers, issue token-protected playlists and revoke viewers when access changes.
 - Transcode video and audio with the CPU or supported Intel/NVIDIA GPUs. The UI reports GPU readiness.
 - Preserve, convert or remove subtitles; supported conversion profiles produce HLS WebVTT.
 - Build a FlussoniX source/CDN cluster with LAN stream pulls and load balancing based on uplink, CPU and RAM.
