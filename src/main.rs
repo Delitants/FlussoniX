@@ -17,6 +17,9 @@ struct Args {
     /// Disable plaintext HTTP binding; requires an HTTPS listener.
     #[arg(long, requires = "https_listen")]
     https_only: bool,
+    /// Permit management credentials over remote plaintext HTTP (unsafe).
+    #[arg(long, env = "FLUSSONIX_ALLOW_INSECURE_REMOTE_MANAGEMENT")]
+    allow_insecure_remote_management: bool,
     /// Public HTTPS origin when a trusted reverse proxy terminates TLS for the admin UI.
     #[arg(long, env = "FLUSSONIX_ADMIN_PUBLIC_ORIGIN")]
     admin_public_origin: Option<url::Url>,
@@ -207,6 +210,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let a = Args::parse();
+    if a.allow_insecure_remote_management {
+        eprintln!(
+            "WARNING: insecure remote HTTP management is enabled; credentials may be exposed on the network"
+        );
+    }
     a.validate_iptv_authority_transport()?;
     let fxlink_features = a.fxlink_features()?;
     let udp_rate = a.rtsp_udp_mbps.unwrap_or(100.0);
@@ -247,6 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         admin_user: a.admin_user,
         admin_password: a.admin_password,
         admin_public_origin: a.admin_public_origin,
+        allow_insecure_remote_management: a.allow_insecure_remote_management,
         view_user: a.view_user,
         view_password: a.view_password,
         peer_key: a.peer_key,
@@ -940,5 +949,24 @@ mod tests {
         assert!(args(&["--fxlink-listen", "127.0.0.1:0"]).is_err());
         assert!(args(&["--fxlink-cert", "cert.pem"]).is_err());
         assert!(args(&["--fxlink-key", "key.pem"]).is_err());
+    }
+
+    #[test]
+    fn remote_http_management_override_is_opt_in() {
+        let base = [
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+        ];
+        let plain = Args::try_parse_from(base).unwrap();
+        assert!(!plain.allow_insecure_remote_management);
+        let explicit = Args::try_parse_from(
+            base.into_iter()
+                .chain(["--allow-insecure-remote-management"]),
+        )
+        .unwrap();
+        assert!(explicit.allow_insecure_remote_management);
     }
 }
