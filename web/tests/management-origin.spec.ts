@@ -2,7 +2,7 @@ import {expect, test} from '@playwright/test';
 import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {managementOriginAllowed} from '../src/management_origin';
+import {guardedManagementFetch, managementOriginAllowed} from '../src/management_origin';
 
 const dist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../dist');
 
@@ -35,6 +35,20 @@ test('management origin accepts HTTPS and exact loopback HTTP only', () => {
     ['http:', '128.0.0.1'],
     ['file:', 'localhost'],
   ]) expect(managementOriginAllowed(protocol, host)).toBe(false);
+});
+
+test('credential request seam rejects remote HTTP before calling fetch', async () => {
+  let calls = 0;
+  const fetcher = async () => {
+    calls++;
+    return new Response('{}', {status: 200});
+  };
+  await expect(guardedManagementFetch('http:', 'remote.example', '/flussonix/api/v1/node', {
+    headers: {Authorization: 'Basic b3duZWQ6c2VjcmV0'},
+  }, fetcher)).rejects.toThrow('Remote management requires HTTPS');
+  expect(calls).toBe(0);
+  await expect(guardedManagementFetch('http:', '127.0.0.1', '/flussonix/api/v1/node', {}, fetcher)).resolves.toBeTruthy();
+  expect(calls).toBe(1);
 });
 
 test('remote HTTP admin page does not offer a credential form', async ({page}) => {

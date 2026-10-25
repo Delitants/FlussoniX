@@ -2,18 +2,31 @@ use super::*;
 use std::sync::atomic::AtomicUsize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-struct SyntheticRemote<L>(L);
-impl<L: Listener<Addr = SocketAddr>> Listener for SyntheticRemote<L> {
+struct SyntheticPeer<L> {
+    listener: L,
+    address: SocketAddr,
+}
+
+impl<L> SyntheticPeer<L> {
+    fn remote(listener: L) -> Self {
+        Self {
+            listener,
+            address: "198.51.100.7:40000".parse().unwrap(),
+        }
+    }
+}
+
+impl<L: Listener<Addr = SocketAddr>> Listener for SyntheticPeer<L> {
     type Io = L::Io;
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        let (io, _) = self.0.accept().await;
-        (io, "198.51.100.7:40000".parse().unwrap())
+        let (io, _) = self.listener.accept().await;
+        (io, self.address)
     }
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
-        self.0.local_addr()
+        self.listener.local_addr()
     }
 }
 
@@ -24,7 +37,7 @@ async fn remote_plaintext_denies_management_before_routing_but_preserves_media_a
     let address = tcp.local_addr().unwrap();
     let stop = CancellationToken::new();
     let server = tokio::spawn(serve_listener(
-        SyntheticRemote(tcp),
+        SyntheticPeer::remote(tcp),
         Router::new().fallback(any(|| async { "routed" })),
         stop,
         TransportPolicy::default(),
@@ -71,6 +84,13 @@ async fn remote_plaintext_denies_management_before_routing_but_preserves_media_a
         .await
         .unwrap();
     assert_eq!(publish.status(), reqwest::StatusCode::OK);
+    let peer_basic = client
+        .get(format!("{base}/flussonix/api/v1/admit"))
+        .header("Authorization", "Basic cGVlcjpzZWNyZXQ=")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(peer_basic.status(), reqwest::StatusCode::FORBIDDEN);
     server.abort();
     let _ = server.await;
 }
@@ -84,7 +104,7 @@ async fn remote_plaintext_rejects_credential_paths_while_local_tls_and_override_
     let address = tcp.local_addr().unwrap();
     let stop = CancellationToken::new();
     let server = tokio::spawn(serve_listener(
-        SyntheticRemote(tcp),
+        SyntheticPeer::remote(tcp),
         Router::new().fallback(any(|| async { "routed" })),
         stop,
         TransportPolicy::default(),
@@ -137,7 +157,12 @@ async fn remote_plaintext_rejects_credential_paths_while_local_tls_and_override_
         let stop = CancellationToken::new();
         let router = Router::new().fallback(any(|| async { "routed" }));
         let server = if remote {
-            tokio::spawn(serve_listener(SyntheticRemote(tcp), router, stop, policy))
+            tokio::spawn(serve_listener(
+                SyntheticPeer::remote(tcp),
+                router,
+                stop,
+                policy,
+            ))
         } else {
             tokio::spawn(serve_listener(tcp, router, stop, policy))
         };
@@ -156,7 +181,7 @@ async fn remote_plaintext_rejects_credential_paths_while_local_tls_and_override_
     let address = tcp.local_addr().unwrap();
     let stop = CancellationToken::new();
     let server = tokio::spawn(serve_listener(
-        SyntheticRemote(crate::http_tls::Listener::new(tcp, cert.server())),
+        SyntheticPeer::remote(crate::http_tls::Listener::new(tcp, cert.server())),
         Router::new().fallback(any(|| async { "routed" })),
         stop,
         TransportPolicy {
@@ -177,6 +202,116 @@ async fn remote_plaintext_rejects_credential_paths_while_local_tls_and_override_
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.unwrap();
     assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn ipv4_mapped_peer_uses_embedded_ipv4_address_for_management_boundary() {
+    use axum::routing::any;
+    let client = reqwest::Client::new();
+    for (peer, expected) in [
+        ("[::ffff:127.0.0.1]:40000", reqwest::StatusCode::OK),
+        (
+            "[::ffff:198.51.100.7]:40000",
+            reqwest::StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        let stop = CancellationToken::new();
+        let server = tokio::spawn(serve_listener(
+            SyntheticPeer {
+                listener: tcp,
+                address: peer.parse().unwrap(),
+            },
+            Router::new().fallback(any(|| async { "routed" })),
+            stop,
+            TransportPolicy::default(),
+        ));
+        for path in ["/admin/", "/streamer/api/v3/config"] {
+            let response = client
+                .get(format!("http://{address}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{peer} {path}");
+        }
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn remote_plaintext_guard_wraps_the_real_management_router() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = crate::server::App::new(
+        dir.path().join("config.json"),
+        dir.path().join("media"),
+        crate::server::Options {
+            admin_password: "owned-admin-secret".into(),
+            peer_key: "owned-peer-secret".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let server = tokio::spawn(serve_listener(
+        SyntheticPeer::remote(tcp),
+        crate::server::router(app),
+        CancellationToken::new(),
+        TransportPolicy::default(),
+    ));
+    let client = reqwest::Client::new();
+    let base = format!("http://{address}");
+    assert_eq!(
+        client
+            .get(format!("{base}/health"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/admin/"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/streamer/api/v3/config"))
+            .header("Authorization", "Basic YWRtaW46b3duZWQtYWRtaW4tc2VjcmV0")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/flussonix/api/v1/node"))
+            .header("Authorization", "Basic YWRtaW46b3duZWQtYWRtaW4tc2VjcmV0")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/flussonix/api/v1/node"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
     server.abort();
     let _ = server.await;
 }

@@ -335,7 +335,7 @@ async fn context(
     peer.control.first_request.store(true, Ordering::Release);
     if !policy.secure
         && !policy.allow_insecure_remote_management
-        && !peer.address.ip().is_loopback()
+        && !is_loopback_peer(peer.address.ip())
         && remote_management_request(&request)
     {
         return (
@@ -348,6 +348,15 @@ async fn context(
     request.extensions_mut().insert(ConnectInfo(peer.address));
     request.extensions_mut().insert(peer.control);
     next.run(request).await
+}
+
+fn is_loopback_peer(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(ipv4) => ipv4.is_loopback(),
+        IpAddr::V6(ipv6) => {
+            ipv6.is_loopback() || ipv6.to_ipv4_mapped().is_some_and(|ipv4| ipv4.is_loopback())
+        }
+    }
 }
 // Existing public TLS Listener and its handshake bounds remain unchanged.
 pub(crate) async fn serve_listener<L: Listener<Addr = SocketAddr>>(

@@ -8,3 +8,16 @@ export function managementOriginAllowed(protocol: string, hostname: string): boo
     && octets[0] === '127'
     && octets.slice(1).every(octet => /^(0|[1-9][0-9]{0,2})$/.test(octet) && Number(octet) <= 255);
 }
+
+export function guardedManagementFetch(
+  protocol: string,
+  hostname: string,
+  input: RequestInfo | URL,
+  init?: RequestInit,
+  fetcher: typeof fetch = fetch,
+): Promise<Response> {
+  if (!managementOriginAllowed(protocol, hostname)) {
+    return Promise.reject(new Error('Remote management requires HTTPS or a local tunnel.'));
+  }
+  return fetcher(input, init);
+}
