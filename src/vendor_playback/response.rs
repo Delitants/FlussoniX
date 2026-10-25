@@ -55,6 +55,7 @@ impl HttpRequest {
             user_agent: header(request.headers(), "user-agent").unwrap_or("").into(),
             referer: header(request.headers(), "referer").unwrap_or("").into(),
             host: header(request.headers(), "host").unwrap_or("").into(),
+            finite_media: file.ends_with(".m4f"),
         };
         Self {
             raw_path: request.uri().path().to_owned(),

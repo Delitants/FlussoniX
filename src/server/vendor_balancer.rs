@@ -115,6 +115,7 @@ mod tests {
             user_agent: String::new(),
             referer: String::new(),
             host: String::new(),
+            finite_media: false,
         };
         let result = app
             .balance_vendor_rtsp(
@@ -258,6 +259,7 @@ mod vendor_destination_tests {
             user_agent: String::new(),
             referer: String::new(),
             host: String::new(),
+            finite_media: false,
         };
         let response = app
             .balance_vendor_rtsp(
@@ -310,6 +312,7 @@ mod vendor_destination_tests {
             user_agent: String::new(),
             referer: String::new(),
             host: String::new(),
+            finite_media: false,
         };
         let response = app
             .balance_vendor_srt(owner, &admitted, &viewer, "#!::r=owned,m=request", true)

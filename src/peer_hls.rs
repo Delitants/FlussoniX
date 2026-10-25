@@ -195,6 +195,32 @@ fn playlist(f: &Fetcher, base: &Url, bytes: &[u8]) -> Result<Bytes, ()> {
     }
     Ok(Bytes::from(out))
 }
+
+fn unexpected_text_media(bytes: &[u8]) -> bool {
+    // HLS media is binary except for WebVTT. FFmpeg can autodetect a textual
+    // manifest in a segment response and fetch URLs from that manifest without
+    // going through this origin-scoped proxy. Inspect content, not the suffix
+    // or MIME type, which the upstream controls.
+    if bytes.first() == Some(&0x47) && bytes.len() % 188 == 0 {
+        return false;
+    }
+    let body = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    let start = body
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(body.len());
+    let body = &body[start..];
+    let prefix_bytes = &body[..body.len().min(256)];
+    let prefix = match std::str::from_utf8(prefix_bytes) {
+        Ok(text) => text,
+        Err(error) => std::str::from_utf8(&prefix_bytes[..error.valid_up_to()]).unwrap(),
+    };
+    if prefix.starts_with("WEBVTT") {
+        return false;
+    }
+    let mut chars = prefix.chars().take(32);
+    chars.clone().count() == 32 && chars.all(|ch| !ch.is_control() || ch.is_whitespace())
+}
 async fn fetch(
     f: &Fetcher,
     resource: &str,
@@ -273,6 +299,9 @@ async fn fetch(
         // The configured HLS entry must remain a playlist. FFmpeg may
         // otherwise auto-detect a different network manifest format and
         // resolve its media references outside this origin-scoped proxy.
+        return Err(());
+    }
+    if !is_playlist && unexpected_text_media(&data) {
         return Err(());
     }
     let body = if is_playlist {
@@ -519,6 +548,71 @@ impl PeerHls {
 mod external_origin_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn media_text_guard_accepts_hls_media_and_rejects_embedded_manifests() {
+        let ts_packet = [0x47u8; 188];
+        for body in [
+            b"<?xml version=\"1.0\"?><MPD><BaseURL>https://example.invalid/clip.mp4</BaseURL></MPD>".as_slice(),
+            "<?xml version=\"1.0\"?><!--é--><MPD><BaseURL>https://example.invalid/clip.mp4</BaseURL></MPD>".as_bytes(),
+            b"\xef\xbb\xbf  <MPD><BaseURL>https://example.invalid/clip.mp4</BaseURL></MPD>",
+            b"ffconcat version 1.0\nfile http://example.invalid/clip.ts\n",
+            b"   #EXTM3U\nhttps://example.invalid/clip.ts\n",
+        ] {
+            assert!(unexpected_text_media(body), "rejected text manifest: {body:?}");
+        }
+        for body in [
+            b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n".as_slice(),
+            ts_packet.as_slice(),
+            b"\x00\x00\x00\x18ftypiso6\x00\x00\x00\x00iso6dash",
+            b"0123456789abcdef",
+        ] {
+            assert!(!unexpected_text_media(body), "accepted media: {body:?}");
+        }
+        assert!(!unexpected_text_media(&[0xff; 188]));
+    }
+
+    #[tokio::test]
+    async fn proxy_rejects_text_manifest_bytes_in_a_segment() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = listener.local_addr().unwrap();
+        let source = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/entry.m3u8",
+                        get(|| async { "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nsegment.bin\n#EXT-X-ENDLIST\n" }),
+                    )
+                    .route(
+                        "/segment.bin",
+                        get(|| async {
+                            "<?xml version=\"1.0\"?><MPD><BaseURL>http://example.invalid/foreign.mp4</BaseURL></MPD>"
+                        }),
+                    ),
+            )
+            .await
+            .unwrap();
+        });
+        let input = format!("http://{source_addr}/entry.m3u8");
+        let bridge = PeerHls::start_external(&input, None, false).await.unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let playlist = client
+            .get(&bridge.url)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let segment = playlist
+            .lines()
+            .find(|line| line.starts_with("http://"))
+            .unwrap();
+        assert_eq!(client.get(segment).send().await.unwrap().status(), 502);
+        drop(bridge);
+        source.abort();
+    }
 
     #[test]
     fn resource_tokens_reject_modification_and_other_fetchers() {

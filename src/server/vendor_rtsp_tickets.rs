@@ -110,6 +110,7 @@ mod tests {
             user_agent: String::new(),
             referer: String::new(),
             host: String::new(),
+            finite_media: false,
         };
         assert!(
             owner
@@ -192,6 +193,7 @@ mod tests {
             user_agent: String::new(),
             referer: String::new(),
             host: String::new(),
+            finite_media: false,
         };
         assert!(
             owner

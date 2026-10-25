@@ -1920,6 +1920,32 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         .map(|v| v.0.ip().to_string())
         .unwrap_or_else(|| "127.0.0.1".into());
     app.http_handoffs.prune();
+    if query.contains_key("flussonix_ticket") && query.contains_key("flussonix_handoff") {
+        return error(StatusCode::BAD_REQUEST, "conflicting admission markers");
+    }
+    if query.contains_key("flussonix_handoff")
+        && app
+            .credentials
+            .peer(header(request.headers(), "x-flussonix-peer"))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "peer playback cannot claim a viewer handoff",
+        );
+    }
+    let mut handoff = if let Some(ticket) = query.get("flussonix_handoff") {
+        match app.http_handoffs.claim(ticket) {
+            Some(grant) => Some(grant),
+            None => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "admission handoff invalid or expired",
+                );
+            }
+        }
+    } else {
+        None
+    };
     let mut grant = if app
         .credentials
         .peer(header(request.headers(), "x-flussonix-peer"))
@@ -1945,10 +1971,15 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             user_agent: header(request.headers(), "user-agent").unwrap_or("").into(),
             referer: header(request.headers(), "referer").unwrap_or("").into(),
             host: header(request.headers(), "host").unwrap_or("").into(),
+            finite_media: file.ends_with(".m4f"),
         };
         // Validate protocol before authorization. A valid native HTTP ticket
         // owns a global slot; possession never bypasses viewer policy checks.
-        let outcome = if let Some(ticket) = query.get("flussonix_ticket") {
+        let outcome = if let Some(handoff) = handoff.as_ref() {
+            app.playback_auth
+                .authorize_handoff(resolved.policy, viewer, handoff)
+                .await
+        } else if let Some(ticket) = query.get("flussonix_ticket") {
             let slot = {
                 let reservations = app.reservations.lock().await;
                 let Some(r) = reservations.get(ticket).filter(|r| {
@@ -2026,8 +2057,11 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         match valid {
             true => {
                 let reservation = reservations.remove(ticket).unwrap();
-                app.http_handoffs
-                    .insert(ticket.clone(), grant, reservation.bitrate_mbps);
+                if reservation.http_slot.is_some() && grant.session_identity().is_some() {
+                    app.http_handoffs
+                        .insert(ticket.clone(), grant, reservation.bitrate_mbps);
+                    return App::native_http_handoff_redirect(raw_path, &query, ticket);
+                }
                 return App::http_ticket_redirect(raw_path, &query);
             }
             _ => {
@@ -2040,7 +2074,13 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     }
     // M4F signals and timestamp media are one segmented output session.
     let segmented = !matches!(file, "mpegts" | "m4s");
-    grant.set_output_credit(app.http_handoffs.take(&grant, segmented));
+    let credit = if let Some(ref mut claimed) = handoff {
+        app.http_handoffs.activate(claimed, &grant, segmented)
+    } else {
+        app.http_handoffs.take(&grant, segmented && file != "m4f")
+    };
+    grant.set_output_credit(credit);
+    drop(handoff);
     let signature = crate::media::media_signature(&cfg);
     let check = async {
         if grant.is_cancelled() {
@@ -2181,6 +2221,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     let bytes = if file.ends_with(".m3u8") {
         let mut q = query.clone();
         q.remove("flussonix_ticket");
+        q.remove("flussonix_handoff");
         let suffix = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(q.iter())
             .finish();

@@ -13,6 +13,7 @@ struct Segmented {
 }
 struct TrackedCredit {
     shared: bool,
+    activated: bool,
     identity: Option<String>,
     credit: Weak<OutputCredit>,
     cancel: tokio_util::sync::CancellationToken,
@@ -38,11 +39,13 @@ pub(super) struct Registry(StdMutex<State>);
 impl Registry {
     pub(super) fn insert(&self, ticket: String, mut grant: Grant, mbps: f64) {
         grant.release_capacity_reservation();
+        grant.mark_handoff();
         let mut state = self.0.lock().unwrap();
         state.prune();
         let credit = Arc::new(OutputCredit::new(mbps));
         state.credits.push(TrackedCredit {
             shared: false,
+            activated: false,
             identity: grant.session_identity().map(str::to_owned),
             credit: Arc::downgrade(&credit),
             cancel: grant.cancellation_token(),
@@ -56,7 +59,48 @@ impl Registry {
             },
         );
     }
+    pub(super) fn claim(&self, ticket: &str) -> Option<Grant> {
+        let mut state = self.0.lock().unwrap();
+        state.prune();
+        Some(state.handoffs.remove(ticket)?.grant)
+    }
+    pub(super) fn activate(
+        &self,
+        handoff: &mut Grant,
+        grant: &Grant,
+        segmented: bool,
+    ) -> Option<Arc<OutputCredit>> {
+        let identity = grant.session_identity()?;
+        if handoff.session_identity() != Some(identity) || handoff.is_cancelled() {
+            return None;
+        }
+        let credit = handoff.take_output_credit()?;
+        let mut state = self.0.lock().unwrap();
+        state.prune();
+        for tracked in &mut state.credits {
+            if Weak::ptr_eq(&tracked.credit, &Arc::downgrade(&credit)) {
+                tracked.activated = true;
+                tracked.shared = segmented;
+            }
+        }
+        if segmented {
+            state.segmented.insert(
+                identity.into(),
+                Segmented {
+                    credit: credit.clone(),
+                    cancel: grant.cancellation_token(),
+                    expires: Instant::now() + Duration::from_secs(30),
+                },
+            );
+        }
+        Some(credit)
+    }
     pub(super) fn take(&self, grant: &Grant, segmented: bool) -> Option<Arc<OutputCredit>> {
+        if !segmented {
+            // A second continuous response must not inherit another viewer's
+            // bitrate credit just because their authorization key matches.
+            return None;
+        }
         let identity = grant.session_identity()?;
         let mut state = self.0.lock().unwrap();
         state.prune();
@@ -64,22 +108,13 @@ impl Registry {
             s.expires = Instant::now() + Duration::from_secs(30);
             return Some(s.credit.clone());
         }
-        let ticket = state
-            .handoffs
+        // A live M4F signal response still owns the credit after a long
+        // segment pause. Pending handoffs require their one-time proof.
+        let credit = state
+            .credits
             .iter()
-            .find(|(_, h)| h.grant.session_identity() == Some(identity))
-            .map(|(t, _)| t.clone());
-        let credit = if let Some(ticket) = ticket {
-            state.handoffs.remove(&ticket)?.grant.take_output_credit()?
-        } else {
-            // A live M4F signal response still owns the credit after a long
-            // segment pause. Its later finite media must remain attributable.
-            state
-                .credits
-                .iter()
-                .filter(|tracked| tracked.identity.as_deref() == Some(identity))
-                .find_map(|tracked| tracked.credit.upgrade())?
-        };
+            .filter(|tracked| tracked.activated && tracked.identity.as_deref() == Some(identity))
+            .find_map(|tracked| tracked.credit.upgrade())?;
         if segmented {
             for tracked in &mut state.credits {
                 if Weak::ptr_eq(&tracked.credit, &Arc::downgrade(&credit)) {
@@ -159,6 +194,15 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn activate_ticket(
+        registry: &Registry,
+        ticket: &str,
+        grant: &Grant,
+        segmented: bool,
+    ) -> Option<Arc<OutputCredit>> {
+        let mut handoff = registry.claim(ticket)?;
+        registry.activate(&mut handoff, grant, segmented)
+    }
     async fn viewer(
         auth: &PlaybackAuth,
         policy: PolicySnapshot,
@@ -200,7 +244,7 @@ mod tests {
             );
         }
         let mut a = viewer(&auth, policy.clone(), "a", true).await;
-        a.set_output_credit(registry.take(&a, false));
+        a.set_output_credit(activate_ticket(&registry, "a", &a, false));
         a.add_bytes(5_000_000); // 40 Mbps for the first viewer only.
         let to = from + Duration::from_secs(1);
         registry.sample(Some(from), to);
@@ -211,6 +255,27 @@ mod tests {
             "credit cannot discount bytes absent from transport telemetry"
         );
         assert_eq!(registry.unmeasured(None, None), 80.0);
+    }
+    #[tokio::test]
+    async fn second_continuous_body_does_not_inherit_first_viewers_output_credit() {
+        let auth = PlaybackAuth::new(2);
+        let policy = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let registry = Registry::default();
+        registry.insert(
+            "a".into(),
+            viewer(&auth, policy.clone(), "same", false).await,
+            40.0,
+        );
+        let mut first = viewer(&auth, policy.clone(), "same", true).await;
+        let credit = activate_ticket(&registry, "a", &first, false).unwrap();
+        first.set_output_credit(Some(credit));
+        let second = viewer(&auth, policy, "same", true).await;
+        assert!(registry.take(&second, false).is_none());
     }
     #[tokio::test]
     async fn segmented_credit_survives_finite_grants_and_stops_on_revocation_or_expiry() {
@@ -229,7 +294,7 @@ mod tests {
         );
         let mut a = viewer(&auth, policy.clone(), "a", true).await;
         let identity = a.session_identity().unwrap().to_owned();
-        a.set_output_credit(registry.take(&a, true));
+        a.set_output_credit(activate_ticket(&registry, "a", &a, true));
         drop(a); // A finite manifest has returned; no response grant remains.
         assert_eq!(registry.unmeasured(None, None), 40.0);
         let mut segment = viewer(&auth, policy.clone(), "a", true).await;
@@ -245,7 +310,7 @@ mod tests {
         );
         let mut b = viewer(&auth, policy, "b", true).await;
         let identity = b.session_identity().unwrap().to_owned();
-        b.set_output_credit(registry.take(&b, true));
+        b.set_output_credit(activate_ticket(&registry, "b", &b, true));
         drop(b);
         registry
             .0
@@ -275,7 +340,7 @@ mod tests {
         );
         let mut signal = viewer(&auth, policy.clone(), "a", true).await;
         let identity = signal.session_identity().unwrap().to_owned();
-        let original = registry.take(&signal, true).unwrap();
+        let original = activate_ticket(&registry, "a", &signal, true).unwrap();
         signal.set_output_credit(Some(original.clone()));
         registry.insert(
             "abandoned-duplicate".into(),
@@ -327,7 +392,7 @@ mod tests {
         let abandoned = registry.0.lock().unwrap().handoffs.remove("a").unwrap();
         let mut signal = viewer(&auth, policy.clone(), "same", true).await;
         let identity = signal.session_identity().unwrap().to_owned();
-        let selected = registry.take(&signal, true).unwrap();
+        let selected = activate_ticket(&registry, "b", &signal, true).unwrap();
         signal.set_output_credit(Some(selected.clone()));
         drop(abandoned);
         registry.prune();
@@ -367,7 +432,7 @@ mod tests {
         );
         let mut a = viewer(&auth, policy.clone(), "same", true).await;
         let identity = a.session_identity().unwrap().to_owned();
-        a.set_output_credit(registry.take(&a, true));
+        a.set_output_credit(activate_ticket(&registry, "a", &a, true));
         registry.insert(
             "b".into(),
             viewer(&auth, policy.clone(), "same", false).await,
@@ -391,7 +456,7 @@ mod tests {
             .expires = Instant::now() - Duration::from_secs(1);
         registry.prune();
         let mut b = viewer(&auth, policy, "same", true).await;
-        b.set_output_credit(registry.take(&b, true));
+        b.set_output_credit(activate_ticket(&registry, "b", &b, true));
         b.add_bytes(10_000_000); // Both clients' finite media is attributed to the shared active credit.
         let end = to + Duration::from_secs(1);
         registry.sample(Some(to), end);

@@ -13,6 +13,7 @@ async fn admit(f: &Fixture, token: &str, url: &url::Url) -> Playback {
         user_agent: String::new(),
         referer: String::new(),
         host: "127.0.0.1".into(),
+        finite_media: false,
     };
     match f.app.rtsp_admit(viewer, url, false).await.unwrap() {
         crate::server::rtsp_access::Admission::Playback(p) => p,

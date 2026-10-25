@@ -323,6 +323,70 @@ async fn app_store_edit_closes_live_http_viewer_but_preserves_public_viewer() {
 }
 
 #[tokio::test]
+async fn one_subscriber_cannot_open_two_simultaneous_http_ts_bodies() {
+    use futures_util::FutureExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = App::new(
+        dir.path().join("c.json"),
+        dir.path().join("media"),
+        Options {
+            admin_password: "admin-secret-123".into(),
+            peer_key: "peer-secret-1234".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    app.config
+        .put(
+            "streams",
+            "news",
+            json!({"inputs":[{"url":"testsrc://"}],"on_play":"iptv://"}),
+        )
+        .unwrap();
+    app.iptv.set_enabled(true).unwrap();
+    app.iptv
+        .put_package("basic", json!({"channels":["news"]}))
+        .unwrap();
+    app.iptv
+        .put_subscriber(
+            "alice",
+            json!({"token":"subscriber-token","packages":["basic"],"max_sessions":1}),
+        )
+        .unwrap();
+    let request = || {
+        Request::builder()
+            .uri("/news/mpegts?token=subscriber-token")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let result = std::panic::AssertUnwindSafe(async {
+        let first = router(app.clone()).oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = router(app.clone()).oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::FORBIDDEN);
+        assert_eq!(app.playback_auth.active(), 1);
+        let mut body = first.into_body().into_data_stream();
+        let bytes = tokio::time::timeout(Duration::from_secs(10), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!bytes.is_empty(), "first subscriber retained playback");
+        drop(body);
+        let reconnect = router(app.clone()).oneshot(request()).await.unwrap();
+        assert_eq!(reconnect.status(), StatusCode::OK);
+        drop(reconnect);
+    })
+    .catch_unwind()
+    .await;
+    app.media.stop_all().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
 async fn tokenless_push_and_rtp_outputs_cannot_start_on_iptv_stream() {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(dir.path(), "ffmpeg");

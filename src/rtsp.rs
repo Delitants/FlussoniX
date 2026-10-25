@@ -774,6 +774,7 @@ async fn handle(
             user_agent: r.headers.get("user-agent").cloned().unwrap_or_default(),
             referer: r.headers.get("referer").cloned().unwrap_or_default(),
             host: url.host_str().unwrap().into(),
+            finite_media: false,
         };
         let playback = match app.rtsp_admit(viewer, &url, secure).await {
             Ok(crate::server::rtsp_access::Admission::Playback(p)) => p,

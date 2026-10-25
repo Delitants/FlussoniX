@@ -151,6 +151,7 @@ fn viewer(token: &str) -> ViewerRequest {
         user_agent: String::new(),
         referer: String::new(),
         host: "owned".into(),
+        finite_media: false,
     }
 }
 

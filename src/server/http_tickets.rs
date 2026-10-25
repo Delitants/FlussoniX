@@ -47,7 +47,7 @@ impl App {
             .filter(|pair| {
                 url::form_urlencoded::parse(pair.as_bytes())
                     .next()
-                    .is_none_or(|(key, _)| key != "flussonix_ticket")
+                    .is_none_or(|(key, _)| key != "flussonix_ticket" && key != "flussonix_handoff")
             })
             .collect::<Vec<_>>()
             .join("&")
@@ -69,6 +69,16 @@ impl App {
             format!("{path}?{clean}")
         };
         (StatusCode::FOUND, [("location", location)]).into_response()
+    }
+
+    pub(crate) fn native_http_handoff_redirect(
+        path: &str,
+        query: &HashMap<String, String>,
+        ticket: &str,
+    ) -> Response {
+        let mut next = query.clone();
+        next.insert("flussonix_handoff".into(), ticket.into());
+        Self::http_ticket_redirect(path, &next)
     }
 
     /// Cheap rejection before vendor discovery; this does not consume authority.
