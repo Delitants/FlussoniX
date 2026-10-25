@@ -1,3 +1,4 @@
+pub mod lease;
 pub mod store;
 
 use serde_json::Value;
