@@ -3,8 +3,9 @@ use axum::{
     middleware::{self, Next},
 };
 use flussonix::{
-    rtsp,
+    http_tls, rtsp,
     server::{App, Options, router},
+    srt_playback,
 };
 use serde_json::{Value, json};
 use std::{
@@ -22,6 +23,8 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
+#[path = "support/tls.rs"]
+mod tls_fixture;
 
 async fn describe(address: SocketAddr, path: &str) -> (u16, Option<String>) {
     let mut socket = TcpStream::connect(address).await.unwrap();
@@ -141,6 +144,12 @@ async fn lb_redirect_does_not_hold_the_only_iptv_slot_needed_by_its_cdn() {
         .put_subscriber(
             "alice",
             json!({"token":"private-viewer-token","packages":["basic"],"max_sessions":1}),
+        )
+        .unwrap();
+    lb.iptv
+        .put_subscriber(
+            "bob",
+            json!({"token":"srt-viewer-token","packages":["basic"],"max_sessions":1}),
         )
         .unwrap();
     for node in [&cdn, &lb] {
@@ -288,6 +297,109 @@ async fn lb_redirect_does_not_hold_the_only_iptv_slot_needed_by_its_cdn() {
         status, 200,
         "RTSP CDN could not claim the only subscriber slot"
     );
+    let srt_listener = srt_playback::Listener::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        srt_playback::Settings::new(120, 4, "owned-srt-passphrase".into()).unwrap(),
+    )
+    .unwrap();
+    let srt_address = format!("srt://{}", srt_listener.address());
+    let srt_stop = CancellationToken::new();
+    let srt_task = tokio::spawn(srt_playback::serve(
+        srt_listener,
+        cdn.clone(),
+        srt_stop.clone(),
+    ));
+    lb.config
+        .put(
+            "peers",
+            "edge",
+            json!({"api_url":cdn_url,"public_payload_url":cdn_url,"private_payload_url":cdn_url,"flussonix_srt_url":srt_address,"flussonix_srt_encrypted":true}),
+        )
+        .unwrap();
+    let cert = tls_fixture::Certificates::new();
+    let tls_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tls_url = format!("https://{}", tls_listener.local_addr().unwrap());
+    let tls_stop = CancellationToken::new();
+    let tls_task = tokio::spawn(http_tls::serve(
+        tls_listener,
+        cert.server(),
+        lb.clone(),
+        tls_stop.clone(),
+    ));
+    let secure_client = reqwest::Client::builder()
+        .no_proxy()
+        .use_preconfigured_tls((*cert.client()).clone())
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let node = client
+                .get(format!("{cdn_url}/flussonix/api/v1/node"))
+                .header("X-Flussonix-Peer", "owned-cluster-peer-123")
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap();
+            if node["srt_playback"]["enabled"] == true {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("SRT CDN never became eligible");
+    let lookup = tokio::spawn(async move {
+        secure_client
+            .get(format!("{tls_url}/flussonix/api/v1/srt-lookup"))
+            .query(&[("streamid", "#!::r=news,u=srt-viewer-token,m=request")])
+            .send()
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(7), gate.entered.notified())
+        .await
+        .expect("SRT lookup did not release its temporary IPTV lease");
+    assert!(
+        !lookup.is_finished(),
+        "SRT lookup escaped before lease release"
+    );
+    gate.proceed.notify_one();
+    let lookup = lookup.await.unwrap();
+    assert_eq!(
+        lookup.status(),
+        200,
+        "SRT load balancer did not place viewer"
+    );
+    let srt_target: Value = lookup.json().await.unwrap();
+    assert_eq!(srt_target["address"], srt_address);
+    let admitted = client
+        .get(format!("{cdn_url}/news/index.m3u8?token=srt-viewer-token"))
+        .send()
+        .await
+        .unwrap();
+    let admitted = if admitted.status().is_redirection() {
+        let location = admitted.headers()["location"].to_str().unwrap();
+        client
+            .get(format!("{cdn_url}{location}"))
+            .send()
+            .await
+            .unwrap()
+    } else {
+        admitted
+    };
+    assert_eq!(
+        admitted.status(),
+        200,
+        "CDN could not claim the subscriber slot after SRT lookup"
+    );
+    assert!(admitted.text().await.unwrap().starts_with("#EXTM3U"));
+    tls_stop.cancel();
+    srt_stop.cancel();
+    tls_task.await.unwrap().unwrap();
+    srt_task.await.unwrap().unwrap();
     cdn_stop.cancel();
     lb_stop.cancel();
     cdn_rtsp_task.await.unwrap().unwrap();
