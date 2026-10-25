@@ -83,6 +83,16 @@ struct Args {
     /// Public HTTP(S) origin used in subscriber playlists.
     #[arg(long, env = "FLUSSONIX_IPTV_PUBLIC_ORIGIN")]
     iptv_public_origin: Option<url::Url>,
+    /// Enable this node as the one IPTV lease authority.
+    #[arg(long, env = "FLUSSONIX_IPTV_LEASE_AUTHORITY")]
+    iptv_lease_authority: bool,
+    /// Permit peer lease RPC over plaintext from the actual loopback socket only.
+    #[arg(
+        long,
+        env = "FLUSSONIX_IPTV_PEER_ALLOW_INSECURE_LOOPBACK",
+        requires = "iptv_lease_authority"
+    )]
+    iptv_peer_allow_insecure_loopback: bool,
     #[arg(long, default_value = "runtime/media")]
     media_dir: PathBuf,
     #[arg(long, default_value = "web/dist")]
@@ -130,6 +140,24 @@ fn bind_tcp_listener(address: SocketAddr) -> std::io::Result<tokio::net::TcpList
 }
 
 impl Args {
+    fn validate_iptv_authority_transport(&self) -> Result<(), String> {
+        if self.iptv_lease_authority
+            && self.https_listen.is_none()
+            && !self.iptv_peer_allow_insecure_loopback
+        {
+            return Err(
+                "IPTV lease authority requires HTTPS or explicit loopback test mode".into(),
+            );
+        }
+        if self.iptv_peer_allow_insecure_loopback
+            && !self.https_only
+            && !self.listen.ip().is_loopback()
+        {
+            return Err("IPTV insecure peer test mode requires a loopback HTTP listener".into());
+        }
+        Ok(())
+    }
+
     fn fxlink_features(&self) -> Result<flussonix::fxlink::Features, String> {
         if self.fxlink_repair_parity && !self.fxlink_trimmed_records {
             return Err("FXLink parity repair requires --fxlink-trimmed-records".into());
@@ -161,6 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let a = Args::parse();
+    a.validate_iptv_authority_transport()?;
     let fxlink_features = a.fxlink_features()?;
     let udp_rate = a.rtsp_udp_mbps.unwrap_or(100.0);
     let https_config = match (&a.https_cert, &a.https_key) {
@@ -212,6 +241,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         web_dir: a.web_dir,
         iptv_data: a.iptv_data,
         iptv_public_origin: a.iptv_public_origin,
+        iptv_lease_authority: a.iptv_lease_authority,
+        iptv_peer_allow_insecure_loopback: a.iptv_peer_allow_insecure_loopback,
         drain: a.drain,
         fxlink_features,
     };
@@ -420,6 +451,55 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn iptv_authority_requires_tls_or_explicit_loopback_exception() {
+        let base = [
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+            "--iptv-lease-authority",
+        ];
+        assert!(
+            Args::try_parse_from(base)
+                .unwrap()
+                .validate_iptv_authority_transport()
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from(base.into_iter().chain([
+                "--https-listen",
+                "127.0.0.1:18443",
+                "--https-cert",
+                "cert.pem",
+                "--https-key",
+                "key.pem"
+            ]))
+            .unwrap()
+            .validate_iptv_authority_transport()
+            .is_ok()
+        );
+        assert!(
+            Args::try_parse_from(
+                base.into_iter()
+                    .chain(["--iptv-peer-allow-insecure-loopback"])
+            )
+            .unwrap()
+            .validate_iptv_authority_transport()
+            .is_ok()
+        );
+        assert!(
+            Args::try_parse_from(base.into_iter().chain([
+                "--iptv-peer-allow-insecure-loopback",
+                "--listen",
+                "0.0.0.0:18210"
+            ]))
+            .unwrap()
+            .validate_iptv_authority_transport()
+            .is_err()
+        );
+    }
     #[test]
     fn fxlink_geometry_startup_matrix() {
         const TEST: &str = "tests::fxlink_geometry_startup_matrix";

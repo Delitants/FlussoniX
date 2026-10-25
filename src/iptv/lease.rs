@@ -27,6 +27,26 @@ impl SubscriberId {
     fn shard(self) -> usize {
         usize::from(self.0[0]) % SHARDS
     }
+
+    pub fn as_hex(self) -> String {
+        let mut encoded = String::with_capacity(64);
+        for byte in self.0 {
+            use std::fmt::Write;
+            let _ = write!(encoded, "{byte:02x}");
+        }
+        encoded
+    }
+
+    pub fn parse_hex(value: &str) -> Option<Self> {
+        if value.len() != 64 || !value.is_ascii() {
+            return None;
+        }
+        let mut bytes = [0; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+        }
+        Some(Self(bytes))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

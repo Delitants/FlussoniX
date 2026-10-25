@@ -2,7 +2,7 @@ use crate::{
     auth::{Credentials, Role},
     cluster::{NodeLoad, TieRotation},
     config::{ConfigStore, KINDS, nested_validation_path, parse_text, valid_name},
-    iptv::store::IptvStore,
+    iptv::{lease::Ledger, store::IptvStore},
     media::{Engine, Worker},
     playback_auth::{
         AuthOutcome, Grant, PlaybackAuth, Policy, PolicySnapshot, RecoveryDemand, ViewerRequest,
@@ -46,6 +46,8 @@ pub struct Options {
     pub web_dir: PathBuf,
     pub iptv_public_origin: Option<url::Url>,
     pub iptv_data: Option<PathBuf>,
+    pub iptv_lease_authority: bool,
+    pub iptv_peer_allow_insecure_loopback: bool,
     pub drain: bool,
     pub fxlink_features: crate::fxlink::Features,
 }
@@ -67,6 +69,8 @@ impl Default for Options {
             web_dir: "web/dist".into(),
             iptv_public_origin: None,
             iptv_data: None,
+            iptv_lease_authority: false,
+            iptv_peer_allow_insecure_loopback: false,
             drain: false,
             fxlink_features: crate::fxlink::Features::default(),
         }
@@ -106,6 +110,7 @@ pub struct App {
     rtsp_publication: std::sync::Mutex<Value>,
     pub config: Arc<ConfigStore>,
     pub iptv: Arc<IptvStore>,
+    pub iptv_leases: Arc<Ledger>,
     node_name: String,
     modern_sources:
         Option<Arc<crate::source_directory::modern_coordinator::ModernSourceCoordinator>>,
@@ -133,6 +138,7 @@ pub struct App {
     source_activation: Mutex<source_activation::State>,
     source_activation_refresh: Mutex<()>,
     pub(crate) publishers: Arc<tokio::sync::Semaphore>,
+    iptv_peer_admission: iptv_peer::Admission,
     source_lookups: Mutex<HashMap<String, origin_resolution::Ticket>>,
 }
 impl App {
@@ -170,6 +176,9 @@ impl App {
     ) -> Result<Arc<Self>, String> {
         if options.admin_password.is_empty() || options.peer_key.len() < 12 {
             return Err("admin password required; peer key must be at least 12 characters".into());
+        }
+        if options.iptv_peer_allow_insecure_loopback && !options.iptv_lease_authority {
+            return Err("IPTV loopback peer exception requires IPTV lease authority".into());
         }
         if options.admin_public_origin.as_ref().is_some_and(|origin| {
             origin.scheme() != "https"
@@ -220,6 +229,8 @@ impl App {
                 .join("iptv.json")
         });
         let iptv = IptvStore::open(iptv_path)?;
+        let started = Instant::now();
+        let iptv_leases = Arc::new(Ledger::new(started, 100_000, iptv.revision()));
         let config = Arc::new(ConfigStore::open(config_path)?);
         let modern_sources =
             crate::source_directory::modern_coordinator::ModernSourceCoordinator::new(
@@ -251,6 +262,7 @@ impl App {
             )),
             config,
             iptv: iptv.clone(),
+            iptv_leases: iptv_leases.clone(),
             node_name: options.node_name.clone(),
             modern_sources,
             vendor_playback,
@@ -276,16 +288,18 @@ impl App {
             srt_egress: Arc::new(AtomicU64::new(0)),
             srt_connections: AtomicU64::new(0),
             telemetry: crate::telemetry::Sampler::new(&options.uplink_interface)?,
-            started: Instant::now(),
+            started,
             mirrors: fxlink_access::Mirrors::default(),
             source_queries: tokio::sync::Semaphore::new(64),
             source_activation: Mutex::new(source_activation::State::default()),
             source_activation_refresh: Mutex::new(()),
             publishers: Arc::new(tokio::sync::Semaphore::new(64)),
+            iptv_peer_admission: iptv_peer::Admission::new(),
             source_lookups: Mutex::new(HashMap::new()),
         });
         let weak = Arc::downgrade(&app.playback_auth);
-        app.iptv.set_on_change(Box::new(move || {
+        app.iptv.set_on_change(Box::new(move |revision| {
+            iptv_leases.observe_revision(revision);
             if let Some(auth) = weak.upgrade() {
                 auth.invalidate_iptv();
             }
@@ -806,6 +820,11 @@ pub fn router(app: Arc<App>) -> Router {
     Router::new().route("/health",axum::routing::get(||async{axum::Json(json!({"status":"ok","service":"FlussoniX","version":env!("CARGO_PKG_VERSION")}))}))
  .route("/streamer/api/v3/{*tail}",axum::routing::any(management))
  .route("/tv/playlists/{subscriber}",axum::routing::get(iptv_playlist_http))
+ .route("/flussonix/peer/v1/iptv/leases/acquire",axum::routing::post(iptv_peer::acquire))
+ .route("/flussonix/peer/v1/iptv/leases/commit",axum::routing::post(iptv_peer::commit))
+ .route("/flussonix/peer/v1/iptv/leases/renew",axum::routing::post(iptv_peer::renew))
+ .route("/flussonix/peer/v1/iptv/leases/release",axum::routing::post(iptv_peer::release))
+ .route("/flussonix/peer/v1/iptv/leases/rollback",axum::routing::post(iptv_peer::rollback))
  .route("/flussonix/api/v1/srt-lookup",axum::routing::any(srt_lookup::lookup))
  .route("/flussonix/api/v1/{*tail}",axum::routing::any(native))
  .nest_service("/admin",tower_http::services::ServeDir::new(&app.options.web_dir).append_index_html_on_directories(true))
@@ -2456,6 +2475,7 @@ mod continuous_session_tests {
 }
 
 mod iptv_management;
+mod iptv_peer;
 mod iptv_playlist;
 mod native_ts_body;
 #[path = "origin_resolution.rs"]

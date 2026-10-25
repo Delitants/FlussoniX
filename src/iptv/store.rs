@@ -141,8 +141,10 @@ pub struct IptvStore {
     path: PathBuf,
     writer: Mutex<()>,
     active: RwLock<Arc<IptvSnapshot>>,
-    on_change: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    on_change: Mutex<Option<ChangeHook>>,
 }
+
+type ChangeHook = Box<dyn Fn(u64) + Send + Sync>;
 
 impl IptvStore {
     pub fn open(path: PathBuf) -> Result<Arc<Self>, String> {
@@ -169,7 +171,7 @@ impl IptvStore {
         (current.revision == revision).then(f)
     }
 
-    pub fn set_on_change(&self, callback: Box<dyn Fn() + Send + Sync>) {
+    pub fn set_on_change(&self, callback: Box<dyn Fn(u64) + Send + Sync>) {
         *self.on_change.lock().unwrap() = Some(callback);
     }
 
@@ -201,7 +203,7 @@ impl IptvStore {
         let mut active = self.active.write().unwrap();
         *active = next.clone();
         if let Some(callback) = self.on_change.lock().unwrap().as_ref() {
-            callback();
+            callback(next_revision);
         }
         Ok(next)
     }

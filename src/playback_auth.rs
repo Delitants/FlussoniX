@@ -1760,7 +1760,7 @@ mod tests {
                 .unwrap();
             let auth = Arc::new(PlaybackAuth::with_iptv(8, store.clone()));
             let weak = Arc::downgrade(&auth);
-            store.set_on_change(Box::new(move || {
+            store.set_on_change(Box::new(move |_| {
                 if let Some(auth) = weak.upgrade() {
                     auth.invalidate_iptv();
                 }
