@@ -14,6 +14,133 @@ use std::{
     time::Duration,
 };
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn protected_hls_proxy_capability_stays_out_of_ffmpeg_argv() {
+    use axum::extract::Path;
+    use bytes::Bytes;
+    use std::collections::HashMap;
+    use tokio::process::Command;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let playlist_path = fixture.path().join("index.m3u8");
+    let segment_pattern = fixture.path().join("segment%d.ts");
+    let mut generator = Command::new("ffmpeg");
+    generator.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=64x64:rate=10",
+        "-t",
+        "3",
+        "-c:v",
+        "libx264",
+        "-g",
+        "10",
+        "-sc_threshold",
+        "0",
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "hls",
+        "-hls_time",
+        "1",
+        "-hls_list_size",
+        "0",
+        "-hls_segment_filename",
+    ]);
+    generator
+        .arg(&segment_pattern)
+        .arg(&playlist_path)
+        .kill_on_drop(true);
+    let generated = tokio::time::timeout(Duration::from_secs(15), generator.output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "fixture generation failed: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let playlist = std::fs::read_to_string(&playlist_path)
+        .unwrap()
+        .replace("#EXT-X-ENDLIST\n", "");
+    let mut files = HashMap::new();
+    files.insert("index.m3u8".to_owned(), Bytes::from(playlist));
+    for name in ["segment0.ts", "segment1.ts", "segment2.ts"] {
+        files.insert(
+            name.to_owned(),
+            Bytes::from(std::fs::read(fixture.path().join(name)).unwrap()),
+        );
+    }
+    let files = Arc::new(files);
+    let source = Router::new().route(
+        "/{file}",
+        get(move |Path(file): Path<String>, headers: HeaderMap| {
+            let files = files.clone();
+            async move {
+                if headers
+                    .get("x-flussonix-peer")
+                    .and_then(|v| v.to_str().ok())
+                    != Some("owned-peer-secret")
+                {
+                    return (StatusCode::FORBIDDEN, Bytes::new());
+                }
+                files
+                    .get(&file)
+                    .cloned()
+                    .map_or((StatusCode::NOT_FOUND, Bytes::new()), |body| {
+                        (StatusCode::OK, body)
+                    })
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("hls://{}/index.m3u8", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, source).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Engine::new(directory.path(), "ffmpeg");
+    let worker = engine
+        .ensure(
+            "owned",
+            &json!({"inputs":[{"url":url}],"flussonix_peer_key":"owned-peer-secret"}),
+        )
+        .await
+        .unwrap();
+    let pid = worker.pid();
+    assert!(pid > 0, "FFmpeg did not start");
+    let argv = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+    let argv = String::from_utf8_lossy(&argv);
+    let leaked_proxy = argv.contains("resource.m3u8") || argv.contains("owned-peer-secret");
+    let decoded = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if engine.read("owned", "index.m3u8").await.is_ok() {
+                break true;
+            }
+            if worker.is_closed() {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    engine.stop_all().await;
+    server.abort();
+    let _ = server.await;
+    assert!(
+        decoded,
+        "protected HLS input did not produce an output playlist"
+    );
+    assert!(
+        !leaked_proxy,
+        "private HLS proxy capability leaked into FFmpeg argv"
+    );
+}
+
 // Break caught: an uncredentialed HLS input lets FFmpeg fetch a segment from
 // an unrelated HTTP origin instead of enforcing the configured source origin.
 async fn reject_plain_hls_foreign_segment(scheme: &str, path: &str) {

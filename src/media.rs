@@ -1,6 +1,7 @@
 mod shared;
 use crate::wire::Hub;
 use bytes::Bytes;
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use shared::StartMode;
@@ -44,6 +45,10 @@ pub struct Engine {
 enum PublicationInput {
     MpegTs,
     Sdp { secure: bool },
+}
+enum OwnedInput {
+    Script(String),
+    LiveTs(String),
 }
 pub type PublicationWriter = Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync>;
 pub struct Publication {
@@ -615,7 +620,8 @@ impl Engine {
         ]);
         crate::transcoder::Profile::resolve(cfg, false)?.prepare(&mut cmd);
         let mut peer_hls = None;
-        let mut rtsp_script = None;
+        let mut owned_input = None;
+        let mut proxy_hls_extensions = false;
 
         let ts_input = input.starts_with("tshttp://") || input.starts_with("tshttps://");
         let peer_ts = cfg["flussonix_peer_key"].is_string() && ts_input;
@@ -774,12 +780,9 @@ impl Engine {
                 translated = proxy.url.clone();
                 // All remote resources are fetched inside our origin-scoped
                 // proxy; FFmpeg never receives the native peer credential.
-                if url::Url::parse(&translate_input(input)?)
-                    .is_ok_and(|u| u.path().ends_with(".m3u8"))
-                {
-                    cmd.args(["-allowed_extensions", "ALL"]);
-                }
-                cmd.args(["-protocol_whitelist", "http,tcp,crypto"]);
+                proxy_hls_extensions = !peer_ts
+                    && !url::Url::parse(&translate_input(input)?)
+                        .is_ok_and(|u| u.path().ends_with("/mpegts"));
                 peer_hls = Some(proxy);
             } else if [
                 "hls://",
@@ -806,20 +809,10 @@ impl Engine {
                 translated = proxy.url.clone();
                 // Only the origin-scoped fetcher contacts this source. The
                 // decoder receives neither Basic credentials nor a peer key.
-                if !live {
-                    cmd.args(["-allowed_extensions", "ALL", "-f", "hls"]);
-                } else {
-                    // A streaming response cannot select a network demuxer
-                    // that would fetch resources outside the verifier.
-                    cmd.args(["-f", "mpegts"]);
-                    if !ts_input {
-                        cmd.args(["-fix_teletext_pts", "0"]);
-                    }
-                }
-                cmd.args(["-protocol_whitelist", "http,tcp,crypto"]);
+                proxy_hls_extensions = !live;
                 peer_hls = Some(proxy);
             }
-            if ts_input {
+            if ts_input && peer_hls.is_none() {
                 // Our source mux may deliver a subtitle PES before its video.
                 // FFmpeg's default PCR heuristic clamps that valid PTS, making
                 // cue timing depend on mux scheduling. Preserve the PES clock.
@@ -832,7 +825,10 @@ impl Engine {
                 } else {
                     "tcp"
                 };
-                rtsp_script = Some(rtsp_input_script(&translated, transport)?);
+                owned_input = Some(OwnedInput::Script(rtsp_input_script(
+                    &translated,
+                    transport,
+                )?));
                 cmd.args([
                     "-protocol_whitelist",
                     "pipe,rtsp,tcp,udp,rtp,crypto",
@@ -843,6 +839,30 @@ impl Engine {
                     "-i",
                     "pipe:0",
                 ]);
+                cmd.stdin(std::process::Stdio::piped());
+            } else if peer_hls.is_some() {
+                // The local proxy URL is a bearer capability. A subprocess
+                // command line is visible to other local users on common
+                // Linux configurations, so pass it through the owned pipe.
+                if proxy_hls_extensions {
+                    owned_input = Some(OwnedInput::Script(proxy_input_script(&translated)?));
+                    cmd.args([
+                        "-protocol_whitelist",
+                        "pipe,http,tcp,crypto",
+                        "-f",
+                        "concat",
+                        "-safe",
+                        "0",
+                        "-i",
+                        "pipe:0",
+                    ]);
+                } else {
+                    validate_local_media_proxy_url(&translated)?;
+                    owned_input = Some(OwnedInput::LiveTs(translated.clone()));
+                    // Force MPEG-TS. Autodetection here can turn a mismatched
+                    // response into an HLS playlist with nested media fetches.
+                    cmd.args(["-fix_teletext_pts", "0", "-f", "mpegts", "-i", "pipe:0"]);
+                }
                 cmd.stdin(std::process::Stdio::piped());
             } else {
                 cmd.args(["-i", &translated]);
@@ -868,7 +888,11 @@ impl Engine {
         ]);
         let profile = crate::transcoder::Profile::resolve_for_input(cfg, input)?;
         profile.apply(&mut cmd);
-        if rtsp_script.is_some() && profile.video_copy() && h264_input.as_deref() != Some(input) {
+        if owned_input.is_some()
+            && peer_hls.is_none()
+            && profile.video_copy()
+            && h264_input.as_deref() != Some(input)
+        {
             // HEVC can start with an untimed reordered unit. Hold copied video
             // until a timed keyframe so TS does not start on an inter picture.
             // Confirmed H.264 skips this gate to preserve its initial GOP.
@@ -1162,24 +1186,11 @@ impl Engine {
                     cancel.cancel();
                 }
             }
-            if let Some(script) = rtsp_script {
-                if let Some(mut writer) = stdin.take() {
-                    let c = cancel.clone();
-                    let input_worker = w.clone();
-                    tasks.push(tokio::spawn(async move {
-                        use tokio::io::AsyncWriteExt;
-                        let result = tokio::select! {biased;
-                            _=c.cancelled()=>return,
-                            result=async {
-                                writer.write_all(script.as_bytes()).await?;
-                                writer.shutdown().await
-                            }=>result,
-                        };
-                        if result.is_err() && !c.is_cancelled() {
-                            input_worker.failed("input_closed");
-                            c.cancel();
-                        }
-                    }));
+            if child.is_some()
+                && let Some(input) = owned_input.take()
+            {
+                if let Some(writer) = stdin.take() {
+                    spawn_owned_input(&mut tasks, writer, input, cancel.clone(), w.clone());
                 } else {
                     w.failed("packaging_failed");
                     cancel.cancel();
@@ -1263,8 +1274,16 @@ impl Engine {
                     cmd.args(["-threads","2","-f","tee",&output]);
                     if let Some(target)=caption_target.as_deref(){caption_output(&mut cmd,target,caption_separate);}
                     if cancel.is_cancelled(){return;}
-                    let child=match cmd.spawn(){Ok(child)=>child,Err(_)=>{w.failed("packaging_failed");return;}};
+                    let mut child=match cmd.spawn(){Ok(child)=>child,Err(_)=>{w.failed("packaging_failed");return;}};
                     w.pid.store(child.id().unwrap_or(0),Ordering::Relaxed);
+                    if let Some(input) = owned_input.take() {
+                        if let Some(writer) = child.stdin.take() {
+                            spawn_owned_input(&mut tasks, writer, input, cancel.clone(), w.clone());
+                        } else {
+                            w.failed("packaging_failed");
+                            return;
+                        }
+                    }
                     child
                 } else {
                     let (mut reader, mut writer) = tokio::io::duplex(64 * 1024);
@@ -1883,6 +1902,81 @@ fn rtsp_input_script(input: &str, transport: &str) -> Result<String, String> {
     Ok(format!(
         "ffconcat version 1.0\nfile '{escaped}'\noption rtsp_transport {transport}\n"
     ))
+}
+
+fn validate_local_media_proxy_url(input: &str) -> Result<(), String> {
+    let url = url::Url::parse(input).map_err(|_| "invalid local media proxy URL")?;
+    if url.scheme() != "http"
+        || url.host_str() != Some("127.0.0.1")
+        || url.port().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !input
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b":/._-".contains(&byte))
+    {
+        return Err("invalid local media proxy URL".into());
+    }
+    Ok(())
+}
+
+fn proxy_input_script(input: &str) -> Result<String, String> {
+    validate_local_media_proxy_url(input)?;
+    Ok(format!(
+        "ffconcat version 1.0\nfile '{input}'\noption rw_timeout 10000000\noption allowed_extensions ALL\n"
+    ))
+}
+
+fn spawn_owned_input(
+    tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    writer: tokio::process::ChildStdin,
+    input: OwnedInput,
+    cancel: CancellationToken,
+    worker: Arc<Worker>,
+) {
+    tasks.push(tokio::spawn(async move {
+        let result = tokio::select! { biased;
+            _ = cancel.cancelled() => return,
+            result = feed_owned_input(writer, input) => result,
+        };
+        if result.is_err() && !cancel.is_cancelled() {
+            worker.failed("input_closed");
+            cancel.cancel();
+        }
+    }));
+}
+
+async fn feed_owned_input(
+    mut writer: tokio::process::ChildStdin,
+    input: OwnedInput,
+) -> Result<(), ()> {
+    use tokio::io::AsyncWriteExt;
+    match input {
+        OwnedInput::Script(script) => writer.write_all(script.as_bytes()).await.map_err(|_| ())?,
+        OwnedInput::LiveTs(url) => {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(5))
+                .read_timeout(Duration::from_secs(10))
+                .build()
+                .map_err(|_| ())?;
+            let response = client.get(url).send().await.map_err(|_| ())?;
+            if response.status() != reqwest::StatusCode::OK {
+                return Err(());
+            }
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                writer
+                    .write_all(&chunk.map_err(|_| ())?)
+                    .await
+                    .map_err(|_| ())?;
+            }
+        }
+    }
+    writer.shutdown().await.map_err(|_| ())
 }
 
 pub fn media_signature(cfg: &Value) -> String {

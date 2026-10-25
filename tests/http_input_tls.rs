@@ -6,7 +6,6 @@ use axum::{
     middleware::{self, Next},
     response::IntoResponse,
 };
-use base64::Engine as _;
 use flussonix::{
     http_tls,
     media::Engine,
@@ -241,17 +240,12 @@ async fn uncredentialed_plain_http_ts_inputs_decode_continuous_media() {
                             .find(|pair| pair[0] == b"-i")
                             .map(|pair| pair[1])
                             .expect("FFmpeg input URL");
-                        let url = url::Url::parse(std::str::from_utf8(input_arg).unwrap()).unwrap();
-                        assert_eq!(url.host_str(), Some("127.0.0.1"));
-                        let token = url.path_segments().unwrap().nth(1).unwrap();
-                        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                            .decode(token)
-                            .unwrap();
+                        assert_eq!(input_arg, b"pipe:0");
                         assert!(
-                            !decoded
-                                .windows(b"owned-viewer".len())
-                                .any(|w| w == b"owned-viewer"),
-                            "FFmpeg argv contains a reversible upstream query secret"
+                            !cmdline
+                                .windows(b"resource.bin".len())
+                                .any(|w| w == b"resource.bin"),
+                            "FFmpeg argv contains the private local proxy capability"
                         );
                         break;
                     }

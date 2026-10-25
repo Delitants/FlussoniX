@@ -420,6 +420,17 @@ async fn aac_only_peer_ts_retains_native_bootstrap_and_actual_media() {
         "AAC-only native output missing: {}",
         worker.stats()
     );
+    #[cfg(target_os = "linux")]
+    {
+        let pid = worker.pid();
+        assert!(pid > 0, "peer TS packager did not start");
+        let argv = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+        let argv = String::from_utf8_lossy(&argv);
+        assert!(
+            !argv.contains("resource.bin") && !argv.contains("owned-radio-peer"),
+            "private peer TS proxy capability leaked into FFmpeg argv"
+        );
+    }
     let mut decoder = flussonix::m4s::Decoder::default();
     let mut tracks = Vec::new();
     let mut frames = 0;
