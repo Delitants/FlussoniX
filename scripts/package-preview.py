@@ -133,8 +133,11 @@ def package(args):
     arch = architecture(binary)
     if args.output_dir.resolve().is_relative_to(args.web_dir.resolve()):
         raise ValueError('output directory must be outside the built UI')
+    installation = read_regular(ROOT / 'docs/installation.md', 1024 * 1024)
     payload = {'bin/flussonix': (binary, 0o755),
-               'README.md': (read_regular(ROOT / 'docs/installation.md', 1024 * 1024), 0o644),
+               'README.md': (installation, 0o644),
+               'installation.md': (installation, 0o644),
+               'iptv-transport.md': (read_regular(ROOT / 'docs/iptv-transport.md', 1024 * 1024), 0o644),
                'bin/flussonix-service': (read_regular(ROOT / 'scripts/service-preview.py', 1024 * 1024), 0o755),
                'service-installation.md': (read_regular(ROOT / 'docs/service-installation.md', 1024 * 1024), 0o644)}
     payload.update(web_payload(args.web_dir))

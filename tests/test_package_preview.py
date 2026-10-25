@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -60,7 +61,8 @@ class PackagePreviewTests(unittest.TestCase):
             files = {Path(m.name).relative_to(archive.name[:-7]).as_posix(): m
                      for m in tar.getmembers() if m.isfile()}
             self.assertEqual(set(files), {'bin/flussonix', 'web/index.html', 'web/assets/app.js',
-                                          'web/assets/app.css', 'README.md', 'manifest.json',
+                                          'web/assets/app.css', 'README.md', 'installation.md',
+                                          'iptv-transport.md', 'manifest.json',
                                           'bin/flussonix-service', 'service-installation.md'})
             self.assertEqual(files['bin/flussonix'].mode, 0o755)
             self.assertEqual(files['bin/flussonix-service'].mode, 0o755)
@@ -86,6 +88,19 @@ class PackagePreviewTests(unittest.TestCase):
                 path.chmod(0o600)
         second = self.successful('second').read_bytes()
         self.assertEqual(first, second)
+
+    def test_packaged_guides_have_no_missing_relative_markdown_links(self):
+        archive = self.successful()
+        with tarfile.open(archive) as tar:
+            files = {Path(member.name).relative_to(archive.name[:-7]).as_posix(): member
+                     for member in tar.getmembers() if member.isfile()}
+            for name, member in files.items():
+                if not name.endswith('.md'):
+                    continue
+                guide = tar.extractfile(member).read().decode('utf-8')
+                for target in re.findall(r'\]\(([^)#]+\.md)(?:#[^)]*)?\)', guide):
+                    self.assertIn((Path(name).parent / target).as_posix(), files,
+                                  f'{name} links to missing {target}')
 
     def test_existing_output_is_never_overwritten(self):
         archive = self.successful()
