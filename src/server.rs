@@ -678,7 +678,16 @@ impl App {
         {
             json!({"mode":"local","configured":false,"ready":true})
         } else if self.options.iptv_lease_authority {
-            json!({"mode":"authority","configured":true,"ready":false,"reason":"Shared IPTV authority limits are under release qualification"})
+            let enabled = self.iptv.snapshot().enabled();
+            let ready = enabled && self.iptv_leases.accepting_new_leases(Instant::now());
+            let reason = if ready {
+                None
+            } else if !enabled {
+                Some("IPTV is disabled")
+            } else {
+                Some("IPTV authority restart quarantine is active")
+            };
+            json!({"mode":"authority","configured":true,"ready":ready,"reason":reason})
         } else if let Some(client) = &self.iptv_authority_client {
             json!({"mode":"client","configured":true,"ready":false,"connected":client.recently_reachable(),"reason":"Shared IPTV authority limits are under release qualification"})
         } else {

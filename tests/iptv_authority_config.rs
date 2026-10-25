@@ -2,6 +2,7 @@ use axum::{body::Body, http::Request};
 use flussonix::server::router;
 use flussonix::server::{App, Options};
 use std::path::PathBuf;
+use std::time::Duration;
 use tower::ServiceExt;
 
 fn start(url: &str, insecure_loopback: bool, ca: Option<PathBuf>) -> Result<(), String> {
@@ -51,6 +52,54 @@ fn authority_rejects_credentials_paths_queries_fragments_and_http_ca() {
         )
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn authority_status_becomes_ready_after_restart_quarantine_and_reflects_iptv_disable() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = App::new(
+        dir.path().join("config.json"),
+        dir.path().join("media"),
+        Options {
+            admin_password: "owned-admin-password".into(),
+            peer_key: "owned-peer-key-123".into(),
+            role: "lb".into(),
+            iptv_lease_authority: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    app.iptv.set_enabled(true).unwrap();
+
+    async fn status(app: &std::sync::Arc<App>) -> serde_json::Value {
+        let response = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/flussonix/api/v1/node")
+                    .header("x-flussonix-peer", "owned-peer-key-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1_000_000)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    let quarantined = status(&app).await;
+    assert_eq!(quarantined["iptv_cluster"]["mode"], "authority");
+    assert_eq!(quarantined["iptv_cluster"]["ready"], false);
+
+    tokio::time::sleep(Duration::from_millis(11_050)).await;
+    assert_eq!(status(&app).await["iptv_cluster"]["ready"], true);
+
+    app.iptv.set_enabled(false).unwrap();
+    assert_eq!(status(&app).await["iptv_cluster"]["ready"], false);
 }
 
 #[tokio::test]

@@ -140,6 +140,10 @@ impl Ledger {
         self.active.load(Ordering::Relaxed)
     }
 
+    pub fn accepting_new_leases(&self, now: Instant) -> bool {
+        now >= self.quarantine_until
+    }
+
     pub fn sweep_count(&self) -> u64 {
         self.sweeps.load(Ordering::Relaxed)
     }
@@ -292,7 +296,7 @@ impl Ledger {
         wall: SystemTime,
         req: &LeaseRequest,
     ) -> Result<LeaseGrant, Error> {
-        if now < self.quarantine_until {
+        if !self.accepting_new_leases(now) {
             return Err(Error::Quarantine);
         }
         if req.units == 0 || req.units > 1024 || req.limit == Some(0) {
@@ -476,7 +480,7 @@ impl Ledger {
         req: &LeaseRequest,
         id: Uuid,
     ) -> Result<LeaseGrant, Error> {
-        if now < self.quarantine_until {
+        if !self.accepting_new_leases(now) {
             return Err(Error::Quarantine);
         }
         let deadline = Self::deadline(now, wall, req.subscriber_expires_at, LEASE_TTL)?;
