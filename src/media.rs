@@ -23,7 +23,7 @@ use std::{
 use tokio::{
     io::AsyncReadExt,
     process::Command,
-    sync::{Mutex, oneshot},
+    sync::{Mutex, Semaphore, oneshot},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -34,6 +34,7 @@ pub struct Engine {
     hls_epoch: crate::hls_generation::Epoch,
     workers: Mutex<HashMap<String, Arc<Worker>>>,
     startup_gates: std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
+    rtsp_probe_slots: Semaphore,
     fxlink_pool: Arc<crate::fxlink::ClientPool>,
     gpu: crate::gpu::Checks,
     pub(crate) idle_memory: crate::idle_memory::Controller,
@@ -241,6 +242,7 @@ impl Engine {
             hls_epoch: crate::hls_generation::Epoch::new(),
             workers: Mutex::new(HashMap::new()),
             startup_gates: std::sync::Mutex::new(HashMap::new()),
+            rtsp_probe_slots: Semaphore::new(32),
             fxlink_pool: Arc::new(crate::fxlink::ClientPool::with_features(features)),
             gpu: crate::gpu::Checks::default(),
             idle_memory: crate::idle_memory::Controller::default(),
@@ -403,7 +405,6 @@ impl Engine {
         }
         let _startup = self.startup_gate(name).lock_owned().await;
         let profile = crate::transcoder::Profile::resolve(cfg, false)?;
-        self.gpu.require_profile(&self.ffmpeg, &profile).await?;
         // A DESCRIBE-only codec probe must not hold the global worker map over
         // a network round trip. A per-stream gate prevents cold-viewer herds.
         let rtsp_candidate = if profile.video_copy()
@@ -453,6 +454,36 @@ impl Engine {
         } else {
             None
         };
+        // Distinct cold streams have separate gates. Reserve before any codec
+        // network I/O, then check capacity without holding the worker map over
+        // the remote probe. The final worker-map check remains authoritative.
+        let _probe_slot = if rtsp_candidate
+            .as_ref()
+            .is_some_and(|(_, _, mode)| mode.is_none())
+        {
+            let slot = self
+                .rtsp_probe_slots
+                .try_acquire()
+                .map_err(|_| "RTSP probe limit reached")?;
+            {
+                let workers = self.workers.lock().await;
+                if workers
+                    .values()
+                    .filter(|w| w.alive.load(Ordering::Relaxed))
+                    .count()
+                    >= 256
+                    && !workers
+                        .get(name)
+                        .is_some_and(|w| w.alive.load(Ordering::Relaxed))
+                {
+                    return Err("worker limit reached".into());
+                }
+            }
+            Some(slot)
+        } else {
+            None
+        };
+        self.gpu.require_profile(&self.ffmpeg, &profile).await?;
         // Reject an obviously unusable explicit FFmpeg path before Auto makes
         // an upstream DESCRIBE request. Command::spawn remains authoritative
         // because the file or its permissions can change after this check.
@@ -2491,3 +2522,7 @@ mod ts_backlog_tests {
 #[cfg(test)]
 #[path = "media/ts_diagnostics_tests.rs"]
 mod ts_diagnostics_tests;
+
+#[cfg(test)]
+#[path = "media/rtsp_startup_tests.rs"]
+mod rtsp_startup_tests;
