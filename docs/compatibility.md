@@ -28,6 +28,8 @@ FlussoniX now implements a local built-in IPTV subset independently of the insta
 
 The separate owner-only `iptv.json` stores tokens outside `/config`. Use exact `on_play: "iptv://"` on a stream or template and set `--iptv-public-origin` for playlist links. Expiry and positive subscriber `max_sessions` are supported. Limits count viewers on one standalone node, or across FlussoniX nodes configured to use the same IPTV authority; viewers on existing Flussonic nodes are outside that count. Successful edits revoke local IPTV grants, while a failed save keeps the last committed data and grants. The web UI provides **Config → IPTV** forms. [Token carriers and shared-authority operation](iptv-transport.md) are documented separately.
 
+The current HLS limit groups requests with the same stream, IP address and token on one node, so multiple players behind a shared IP may count as one session. Continuous playback connections are counted separately. The [transport guide](iptv-transport.md) describes this limit; strict per-player HLS counting is not yet claimed.
+
 Some UI behaviors depend on private routes, such as explicit input selection. Record them separately from public operations and decide each feature's first-release implementation deliberately.
 
 ### Semantics that must be implemented explicitly
