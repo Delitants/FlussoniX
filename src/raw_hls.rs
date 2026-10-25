@@ -1,6 +1,6 @@
 //! Raw regional subtitle carriage in TS-HLS. FFmpeg's HLS mux routes separate
 //! subtitles to WebVTT, so use its MPEG-TS segment mux and publish the live list.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
@@ -59,6 +59,39 @@ fn normalize<'a>(
     Some((text, start, files))
 }
 
+async fn prune_before(
+    dir: &Path,
+    prefix: &str,
+    start: u64,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    let mut entries = tokio::fs::read_dir(dir)
+        .await
+        .map_err(|_| "cannot retain raw HLS window")?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|_| "cannot retain raw HLS window")?
+    {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        let name = entry.file_name();
+        let Some(index) = name
+            .to_str()
+            .and_then(|s| s.strip_prefix(prefix))
+            .and_then(|s| s.strip_suffix(".ts"))
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if index < start.saturating_sub(2) {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+    Ok(())
+}
+
 pub async fn watch(
     dir: PathBuf,
     generation: String,
@@ -85,6 +118,7 @@ pub async fn watch(
         let Some((text, start, files)) = normalize(value, &prefix, epoch, discontinuity) else {
             continue;
         };
+        prune_before(&dir, &prefix, start, &cancel).await?;
         let mut complete = true;
         for name in files {
             if !tokio::fs::metadata(dir.join(name))
@@ -106,30 +140,6 @@ pub async fn watch(
             .await
             .map_err(|_| "cannot publish raw HLS list")?;
         last = raw;
-        let mut entries = tokio::fs::read_dir(&dir)
-            .await
-            .map_err(|_| "cannot retain raw HLS window")?;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|_| "cannot retain raw HLS window")?
-        {
-            if cancel.is_cancelled() {
-                return Ok(());
-            }
-            let name = entry.file_name();
-            let Some(index) = name
-                .to_str()
-                .and_then(|s| s.strip_prefix(&prefix))
-                .and_then(|s| s.strip_suffix(".ts"))
-                .and_then(|s| s.parse::<u64>().ok())
-            else {
-                continue;
-            };
-            if index < start.saturating_sub(2) {
-                let _ = tokio::fs::remove_file(entry.path()).await;
-            }
-        }
     }
 }
 
@@ -143,5 +153,56 @@ mod tests {
         assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:9000000002\n"));
         assert!(text.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1\n"));
         assert!(!text.contains("#EXT-X-DISCONTINUITY\n"));
+    }
+
+    #[tokio::test]
+    async fn oversized_listed_segment_does_not_block_old_file_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        tokio::fs::write(path.join("gowned_p1.ts"), b"old")
+            .await
+            .unwrap();
+        tokio::fs::write(path.join("gowned_p4.ts"), b"retained")
+            .await
+            .unwrap();
+        tokio::fs::write(path.join("gother_p1.ts"), b"other")
+            .await
+            .unwrap();
+        tokio::fs::write(path.join("gowned_p6.ts"), b"current")
+            .await
+            .unwrap();
+        let oversized = path.join("gowned_p7.ts");
+        let file = tokio::fs::File::create(&oversized).await.unwrap();
+        file.set_len(32 * 1024 * 1024 + 1).await.unwrap();
+        tokio::fs::write(
+            path.join("passthrough.m3u8"),
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:6\n#EXTINF:2,\ngowned_p6.ts\n#EXTINF:2,\ngowned_p7.ts\n",
+        )
+        .await
+        .unwrap();
+
+        let cancel = CancellationToken::new();
+        let watcher = tokio::spawn(watch(
+            path.to_path_buf(),
+            "owned".into(),
+            0,
+            false,
+            cancel.clone(),
+        ));
+        let pruned = tokio::time::timeout(std::time::Duration::from_millis(600), async {
+            while path.join("gowned_p1.ts").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok();
+        cancel.cancel();
+        watcher.await.unwrap().unwrap();
+        assert!(pruned, "old same-generation file survived invalid list");
+        assert!(path.join("gowned_p4.ts").exists());
+        assert!(path.join("gowned_p6.ts").exists());
+        assert!(oversized.exists());
+        assert!(path.join("gother_p1.ts").exists());
+        assert!(!path.join("index.m3u8").exists());
     }
 }
