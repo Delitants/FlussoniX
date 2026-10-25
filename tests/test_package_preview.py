@@ -1,9 +1,11 @@
 """Archive-boundary tests; the tiny ELF fixture is not a runnable daemon."""
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
 import re
+import runpy
 import struct
 import subprocess
 import sys
@@ -60,12 +62,17 @@ class PackagePreviewTests(unittest.TestCase):
         with tarfile.open(archive) as tar:
             files = {Path(m.name).relative_to(archive.name[:-7]).as_posix(): m
                      for m in tar.getmembers() if m.isfile()}
-            self.assertEqual(set(files), {'bin/flussonix', 'web/index.html', 'web/assets/app.js',
-                                          'web/assets/app.css', 'README.md', 'installation.md',
-                                          'iptv-transport.md', 'manifest.json', 'LICENSE', 'NOTICE',
-                                          'vendor/quinn-proto/LICENSE-APACHE',
-                                          'vendor/quinn-proto/LICENSE-MIT',
-                                          'bin/flussonix-service', 'service-installation.md'})
+            expected = {'bin/flussonix', 'web/index.html', 'web/assets/app.js',
+                        'web/assets/app.css', 'README.md', 'installation.md',
+                        'iptv-transport.md', 'manifest.json', 'LICENSE', 'NOTICE',
+                        'vendor/quinn-proto/LICENSE-APACHE',
+                        'vendor/quinn-proto/LICENSE-MIT',
+                        'bin/flussonix-service', 'service-installation.md',
+                        'THIRD_PARTY_NOTICES.txt', 'third_party/manifest.json'}
+            bundle = json.loads((ROOT / 'third_party/manifest.json').read_text())
+            expected.update('third_party/' + entry['path'] for package in bundle['packages']
+                            for entry in package['files'])
+            self.assertEqual(set(files), expected)
             self.assertEqual(files['bin/flussonix'].mode, 0o755)
             self.assertEqual(files['bin/flussonix-service'].mode, 0o755)
             self.assertEqual(files['web/assets/app.js'].mode, 0o644)
@@ -113,6 +120,21 @@ class PackagePreviewTests(unittest.TestCase):
                 member = archive.name[:-7] + '/' + name
                 self.assertIn(member, tar.getnames())
                 self.assertEqual(tar.extractfile(member).read(), (ROOT / name).read_bytes())
+
+    def test_archive_carries_locked_third_party_texts(self):
+        archive = self.successful()
+        bundle = json.loads((ROOT / 'third_party/manifest.json').read_text())
+        required = {'THIRD_PARTY_NOTICES.txt', 'third_party/manifest.json'}
+        required.update('third_party/' + entry['path']
+                        for package in bundle['packages'] for entry in package['files'])
+        with tarfile.open(archive) as tar:
+            members = {Path(m.name).relative_to(archive.name[:-7]).as_posix(): m
+                       for m in tar.getmembers() if m.isfile()}
+            self.assertTrue(required <= members.keys())
+            for package in bundle['packages']:
+                for entry in package['files']:
+                    data = tar.extractfile(members['third_party/' + entry['path']]).read()
+                    self.assertEqual(hashlib.sha256(data).hexdigest(), entry['sha256'])
 
     def test_existing_output_is_never_overwritten(self):
         archive = self.successful()
@@ -206,6 +228,94 @@ class PackagePreviewTests(unittest.TestCase):
                 result, destination = self.package(f'attributes-{i}')
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(list(destination.glob('*.tar.gz*')))
+
+
+class NoticeBundleTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='flussonix-notices-test-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / 'third_party/licenses/rust/example-1.0.0').mkdir(parents=True)
+        (self.root / 'Cargo.lock').write_text('locked rust')
+        (self.root / 'Cargo.toml').write_text('manifest rust')
+        (self.root / 'web').mkdir()
+        (self.root / 'web/package-lock.json').write_text('locked web')
+        (self.root / 'web/package.json').write_text('manifest web')
+        (self.root / 'vendor/quinn-proto').mkdir(parents=True)
+        (self.root / 'vendor/quinn-proto/Cargo.toml').write_text('patched transport')
+        notice = b'Example license text\n'
+        (self.root / 'third_party/licenses/rust/example-1.0.0/LICENSE').write_bytes(notice)
+        index = b'Example third-party notices\n'
+        (self.root / 'THIRD_PARTY_NOTICES.txt').write_bytes(index)
+        self.manifest = {
+            'format': 1,
+            'cargo_lock_sha256': hashlib.sha256(b'locked rust').hexdigest(),
+            'web_lock_sha256': hashlib.sha256(b'locked web').hexdigest(),
+            'cargo_manifest_sha256': hashlib.sha256(b'manifest rust').hexdigest(),
+            'web_manifest_sha256': hashlib.sha256(b'manifest web').hexdigest(),
+            'vendor_quinn_manifest_sha256': hashlib.sha256(b'patched transport').hexdigest(),
+            'notices_sha256': hashlib.sha256(index).hexdigest(),
+            'targets': ['x86_64-unknown-linux-gnu'],
+            'packages': [{'ecosystem': 'rust', 'name': 'example', 'version': '1.0.0',
+                          'declared_license': 'MIT', 'files': [{
+                              'path': 'licenses/rust/example-1.0.0/LICENSE',
+                              'sha256': hashlib.sha256(notice).hexdigest(),
+                              'bytes': len(notice)}]}],
+        }
+        self.save_manifest()
+
+    def save_manifest(self):
+        (self.root / 'third_party/manifest.json').write_text(json.dumps(self.manifest))
+
+    def bundle(self, arch=None):
+        functions = runpy.run_path(str(SCRIPT))
+        self.assertIn('read_notice_bundle', functions)
+        if arch is not None:
+            self.assertIn('arch', inspect.signature(functions['read_notice_bundle']).parameters)
+        return (functions['read_notice_bundle'](self.root) if arch is None else
+                functions['read_notice_bundle'](self.root, arch))
+
+    def test_locked_notice_bundle_loads_exact_texts(self):
+        payload = self.bundle()
+        self.assertEqual(payload['third_party/licenses/rust/example-1.0.0/LICENSE'][0],
+                         b'Example license text\n')
+        self.assertEqual(payload['THIRD_PARTY_NOTICES.txt'][0],
+                         b'Example third-party notices\n')
+
+    def test_stale_lock_and_changed_notice_are_rejected(self):
+        (self.root / 'Cargo.lock').write_text('new dependency')
+        with self.assertRaisesRegex(ValueError, 'Cargo.lock'):
+            self.bundle()
+        (self.root / 'Cargo.lock').write_text('locked rust')
+        (self.root / 'third_party/licenses/rust/example-1.0.0/LICENSE').write_text('changed')
+        with self.assertRaisesRegex(ValueError, 'license'):
+            self.bundle()
+
+    def test_changed_dependency_manifests_are_rejected(self):
+        for name in ('Cargo.toml', 'web/package.json', 'vendor/quinn-proto/Cargo.toml'):
+            with self.subTest(name=name):
+                path = self.root / name
+                original = path.read_bytes()
+                path.write_bytes(original + b' changed')
+                with self.assertRaisesRegex(ValueError, name.replace('.', r'\.')):
+                    self.bundle()
+                path.write_bytes(original)
+
+    def test_unlisted_or_linked_notice_is_rejected(self):
+        extra = self.root / 'third_party/licenses/rust/example-1.0.0/extra.txt'
+        extra.write_text('unlisted')
+        with self.assertRaisesRegex(ValueError, 'unlisted'):
+            self.bundle()
+        extra.unlink()
+        license_file = self.root / 'third_party/licenses/rust/example-1.0.0/LICENSE'
+        license_file.unlink()
+        license_file.symlink_to(self.root / 'Cargo.lock')
+        with self.assertRaises(ValueError):
+            self.bundle()
+
+    def test_architecture_must_be_in_notice_scope(self):
+        with self.assertRaisesRegex(ValueError, 'architecture'):
+            self.bundle('aarch64')
 
 
 if __name__ == '__main__':

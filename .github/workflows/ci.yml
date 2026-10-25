@@ -16,7 +16,9 @@ jobs:
       - name: Verify vendor components are absent
         run: test ! -e /opt/flussonic
       - name: Preview package and service regressions
-        run: python3 -m unittest discover -s tests -p 'test_*preview.py' -v
+        run: |
+          python3 -m unittest discover -s tests -p 'test_*preview.py' -v
+          python3 -m unittest discover -s tests -p 'test_generate_notices.py' -v
       - run: rustup show
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
