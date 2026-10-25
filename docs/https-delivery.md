@@ -10,7 +10,7 @@ flussonix --listen 127.0.0.1:18210 \
   --config /etc/flussonix/config.json --media-dir /var/lib/flussonix/media
 ```
 
-Set the normal admin/peer environment credentials first. Certificate/key paths must be readable by the service account. Both TLS flags are required with the HTTPS listener. Add `--https-only` to skip the HTTP bind entirely; it requires HTTPS and does not affect separate optional RTSP/RTSPS listeners. Without HTTPS options, existing HTTP behavior is preserved. Bind only unused test ports when another media server runs on the host.
+Set the normal admin/peer environment credentials first. Certificate/key paths must be readable by the service account. Both TLS flags are required with the HTTPS listener. Add `--https-only` to skip the HTTP bind entirely; it requires HTTPS and does not affect separate optional RTSP/RTSPS listeners. Without HTTPS options, remote HTTP media remains available, while the admin page and management credentials require local access. Bind only unused test ports when another media server runs on the host.
 
 If a trusted reverse proxy terminates HTTPS for the admin UI, keep the backend listener private, preserve the original `Host` header, and set `FLUSSONIX_ADMIN_PUBLIC_ORIGIN=https://console.example` (including a nonstandard port, if used). Management writes then accept that exact HTTPS browser origin. FlussoniX does not trust client-supplied `Forwarded` or `X-Forwarded-Proto` headers for this decision.
 

@@ -83,6 +83,9 @@ if the new unit was written successfully. Inspect any failure before continuing.
 Open [the local admin interface](http://127.0.0.1:18210/admin/), sign in and check
 actual playback. Use an SSH tunnel for remote access. Once validated, optionally
 enable startup at boot with `sudo systemctl enable flussonix-preview.service`.
+Remote HTTP media can remain public, but management requires HTTPS or a local
+tunnel. The shipped UI refuses remote HTTP login even if the legacy
+`--allow-insecure-remote-management` API override is enabled.
 
 The service writes only inside its state directory and temporary directory. Put
 certificates, keys and SDP files somewhere the account can read. GPU transcoding

@@ -50,7 +50,7 @@ For a verified download and persistent state across upgrades, follow the
 and peer key for future restarts. For background operation, see the optional
 [systemd service guide](docs/service-installation.md).
 
-Open [the admin interface](http://127.0.0.1:18210/admin/) and sign in as `admin` with the password you chose. This address accepts connections from the same machine; use an SSH tunnel for remote access.
+Open [the admin interface](http://127.0.0.1:18210/admin/) and sign in as `admin` with the password you chose. Use an SSH tunnel or [HTTPS](docs/https-delivery.md) for remote administration; remote HTTP remains available for media, not ordinary management.
 
 In **Media → Streams**, add your input URL or use `testsrc://` for a test picture. Save the stream and open its player to check playback. Settings persist in the configuration file. Press **Ctrl+C** to stop the server and its workers.
 
