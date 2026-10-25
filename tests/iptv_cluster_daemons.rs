@@ -202,3 +202,112 @@ async fn two_cdn_daemons_share_one_iptv_limit_during_hls_and_continuous_playback
     drop((ts_body, first, second));
     server.abort();
 }
+
+#[tokio::test]
+async fn daemon_closes_iptv_media_on_authority_partition_and_readmits_after_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = App::new(
+        dir.path().join("authority-config.json"),
+        dir.path().join("authority-media"),
+        Options {
+            admin_password: "owned-admin".into(),
+            peer_key: PEER_KEY.into(),
+            role: "lb".into(),
+            iptv_data: Some(dir.path().join("authority-iptv.json")),
+            iptv_lease_authority: true,
+            iptv_peer_allow_insecure_loopback: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    authority.iptv.set_enabled(true).unwrap();
+    authority
+        .iptv
+        .put_package("basic", json!({"channels":["news"]}))
+        .unwrap();
+    authority
+        .iptv
+        .put_subscriber(
+            "alice",
+            json!({"token":TOKEN,"packages":["basic"],"max_sessions":1}),
+        )
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let origin = url::Url::parse(&format!("http://{address}/")).unwrap();
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            router(authority.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .into_future(),
+    );
+    let cdn = Cdn::start(dir.path(), "cdn-partition", &origin).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    let ts_url = format!("{}/news/mpegts?token={TOKEN}", cdn.base);
+    let response = tokio::time::timeout(Duration::from_secs(8), client.get(&ts_url).send())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let mut body = response.bytes_stream();
+    let first = tokio::time::timeout(Duration::from_secs(8), body.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!first.is_empty());
+    assert_eq!(authority.iptv_leases.active_leases(), 1);
+
+    server.abort();
+    let _ = server.await;
+    let outage_started = std::time::Instant::now();
+    let closed = tokio::time::timeout(Duration::from_secs(9), async {
+        while let Some(chunk) = body.next().await {
+            if chunk.is_err() {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "CDN kept delivering IPTV after authority loss"
+    );
+    let hls = tokio::time::timeout(
+        Duration::from_secs(8),
+        client
+            .get(format!("{}/news/index.m3u8?token={TOKEN}", cdn.base))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(hls.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let listener = TcpListener::bind(address).await.unwrap();
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            router(authority.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .into_future(),
+    );
+    tokio::time::sleep(Duration::from_secs(11).saturating_sub(outage_started.elapsed())).await;
+    let response = tokio::time::timeout(Duration::from_secs(8), client.get(&ts_url).send())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let mut resumed = response.bytes_stream();
+    let media = tokio::time::timeout(Duration::from_secs(8), resumed.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!media.is_empty(), "recovered CDN emitted no media");
+    assert_eq!(authority.iptv_leases.active_leases(), 1);
+    drop((body, resumed, cdn));
+    server.abort();
+}
