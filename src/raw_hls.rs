@@ -92,6 +92,47 @@ async fn prune_before(
     Ok(())
 }
 
+async fn check_generation_budget(dir: &Path, prefix: &str) -> Result<(), String> {
+    const MAX_SEGMENT: u64 = 64 * 1024 * 1024;
+    const MAX_TOTAL: u64 = 256 * 1024 * 1024;
+    const MAX_FILES: usize = 64;
+    let mut entries = tokio::fs::read_dir(dir)
+        .await
+        .map_err(|_| "cannot inspect raw HLS segment budget")?;
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|_| "cannot inspect raw HLS segment budget")?
+    {
+        let name = entry.file_name();
+        if !name
+            .to_str()
+            .and_then(|s| s.strip_prefix(prefix))
+            .and_then(|s| s.strip_suffix(".ts"))
+            .is_some_and(|s| s.parse::<u64>().is_ok())
+        {
+            continue;
+        }
+        let metadata = match tokio::fs::metadata(entry.path()).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err("cannot inspect raw HLS segment budget".into()),
+        };
+        files += 1;
+        bytes = bytes.saturating_add(metadata.len());
+        if !metadata.is_file()
+            || metadata.len() > MAX_SEGMENT
+            || files > MAX_FILES
+            || bytes > MAX_TOTAL
+        {
+            return Err("raw HLS segment budget exceeded".into());
+        }
+    }
+    Ok(())
+}
+
 pub async fn watch(
     dir: PathBuf,
     generation: String,
@@ -101,9 +142,19 @@ pub async fn watch(
 ) -> Result<(), String> {
     let prefix = format!("g{generation}_p");
     let mut last = Vec::new();
+    let mut published_start = None::<u64>;
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    // A slow filesystem pass must not keep the high-frequency list tick ready
+    // forever and starve the lower-frequency disk-budget check.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut budget_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
-        tokio::select! { biased; _=cancel.cancelled()=>return Ok(()), _=tick.tick()=>{} }
+        tokio::select! {
+            biased;
+            _=cancel.cancelled()=>return Ok(()),
+            _=tick.tick()=>{},
+            _=budget_tick.tick()=>check_generation_budget(&dir, &prefix).await?,
+        }
         let Ok(file) = tokio::fs::File::open(dir.join("passthrough.m3u8")).await else {
             continue;
         };
@@ -118,7 +169,15 @@ pub async fn watch(
         let Some((text, start, files)) = normalize(value, &prefix, epoch, discontinuity) else {
             continue;
         };
-        prune_before(&dir, &prefix, start, &cancel).await?;
+        // An invalid new list must not remove files still named by the last
+        // public list. The independent budget check bounds that backlog.
+        prune_before(
+            &dir,
+            &prefix,
+            published_start.map_or(start, |old| old.min(start)),
+            &cancel,
+        )
+        .await?;
         let mut complete = true;
         for name in files {
             if !tokio::fs::metadata(dir.join(name))
@@ -140,6 +199,8 @@ pub async fn watch(
             .await
             .map_err(|_| "cannot publish raw HLS list")?;
         last = raw;
+        published_start = Some(start);
+        prune_before(&dir, &prefix, start, &cancel).await?;
     }
 }
 
@@ -204,5 +265,169 @@ mod tests {
         assert!(oversized.exists());
         assert!(path.join("gother_p1.ts").exists());
         assert!(!path.join("index.m3u8").exists());
+    }
+
+    #[tokio::test]
+    async fn unlisted_growing_segment_fails_the_worker_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = tokio::fs::File::create(dir.path().join("gowned_p0.ts"))
+            .await
+            .unwrap();
+        file.set_len(64 * 1024 * 1024 + 1).await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            watch(
+                dir.path().to_path_buf(),
+                "owned".into(),
+                0,
+                false,
+                CancellationToken::new(),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "active segment escaped budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_playlist_cannot_retain_unbounded_small_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..65 {
+            tokio::fs::write(dir.path().join(format!("gowned_p{index}.ts")), b"x")
+                .await
+                .unwrap();
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            watch(
+                dir.path().to_path_buf(),
+                "owned".into(),
+                0,
+                false,
+                CancellationToken::new(),
+            ),
+        )
+        .await;
+        assert!(matches!(result, Ok(Err(_))), "file count escaped budget");
+    }
+
+    #[tokio::test]
+    async fn stalled_playlist_cannot_retain_excess_total_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..5 {
+            let file = tokio::fs::File::create(dir.path().join(format!("gowned_p{index}.ts")))
+                .await
+                .unwrap();
+            file.set_len(60 * 1024 * 1024).await.unwrap();
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            watch(
+                dir.path().to_path_buf(),
+                "owned".into(),
+                0,
+                false,
+                CancellationToken::new(),
+            ),
+        )
+        .await;
+        assert!(matches!(result, Ok(Err(_))), "total bytes escaped budget");
+    }
+
+    #[tokio::test]
+    async fn playlist_prunes_obsolete_files_before_budget_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        for index in 0..5 {
+            let file = tokio::fs::File::create(path.join(format!("gowned_p{index}.ts")))
+                .await
+                .unwrap();
+            file.set_len(60 * 1024 * 1024).await.unwrap();
+        }
+        tokio::fs::write(path.join("gowned_p100.ts"), b"current")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            path.join("passthrough.m3u8"),
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:100\n#EXTINF:2,\ngowned_p100.ts\n",
+        )
+        .await
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let watcher = tokio::spawn(watch(
+            path.to_path_buf(),
+            "owned".into(),
+            0,
+            false,
+            cancel.clone(),
+        ));
+        let pruned = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while path.join("gowned_p0.ts").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok();
+        cancel.cancel();
+        let result = watcher.await.unwrap();
+        assert!(pruned, "valid live list did not prune obsolete files");
+        assert!(result.is_ok(), "budget rejected a prunable backlog");
+        assert!(path.join("gowned_p100.ts").exists());
+    }
+
+    #[tokio::test]
+    async fn invalid_new_list_preserves_files_in_last_published_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        for index in 0..2 {
+            tokio::fs::write(path.join(format!("gowned_p{index}.ts")), b"published")
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(
+            path.join("passthrough.m3u8"),
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2,\ngowned_p0.ts\n#EXTINF:2,\ngowned_p1.ts\n",
+        )
+        .await
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let watcher = tokio::spawn(watch(
+            path.to_path_buf(),
+            "owned".into(),
+            0,
+            false,
+            cancel.clone(),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !path.join("index.m3u8").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::fs::write(path.join("gowned_p6.ts"), b"new")
+            .await
+            .unwrap();
+        let oversized = tokio::fs::File::create(path.join("gowned_p7.ts"))
+            .await
+            .unwrap();
+        oversized.set_len(32 * 1024 * 1024 + 1).await.unwrap();
+        tokio::fs::write(
+            path.join("passthrough.m3u8"),
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:6\n#EXTINF:2,\ngowned_p6.ts\n#EXTINF:2,\ngowned_p7.ts\n",
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        cancel.cancel();
+        watcher.await.unwrap().unwrap();
+        let published = tokio::fs::read_to_string(path.join("index.m3u8"))
+            .await
+            .unwrap();
+        assert!(published.contains("gowned_p0.ts"));
+        assert!(path.join("gowned_p0.ts").exists());
+        assert!(path.join("gowned_p1.ts").exists());
     }
 }
