@@ -1,5 +1,9 @@
 //! Viewer authorization is independent of worker ownership and cluster peer credentials.
-use crate::iptv::store::IptvStore;
+use crate::iptv::{
+    client::{AuthorityClient, LeaseInput, LeaseReply},
+    lease::SessionKey,
+    store::IptvStore,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -10,7 +14,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -288,9 +292,31 @@ struct Entry {
     id: String,
     state: Mutex<State>,
     flight: AsyncMutex<()>,
+    remote: AsyncMutex<RemoteState>,
+    remote_notify: Notify,
+    remote_epoch: Instant,
+    remote_deadline_micros: AtomicU64,
     live: AtomicU64,
     admissions: AtomicU64,
     bytes: AtomicU64,
+}
+struct RemoteState {
+    current: Option<RemoteLease>,
+    running: bool,
+    session: uuid::Uuid,
+}
+impl Default for RemoteState {
+    fn default() -> Self {
+        Self {
+            current: None,
+            running: false,
+            session: uuid::Uuid::new_v4(),
+        }
+    }
+}
+struct RemoteLease {
+    input: LeaseInput,
+    reply: LeaseReply,
 }
 /// Per-pass stream/activity only, never cached permission or retained session ownership.
 pub(crate) struct RecoveryDemand {
@@ -368,6 +394,18 @@ impl Entries {
     }
 }
 impl Entry {
+    fn set_remote_deadline(&self, deadline: Instant) {
+        let micros = deadline
+            .saturating_duration_since(self.remote_epoch)
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        self.remote_deadline_micros
+            .store(micros.max(1), Ordering::Release);
+    }
+    fn remote_lease_expired(&self) -> bool {
+        let deadline = self.remote_deadline_micros.load(Ordering::Acquire);
+        deadline != 0 && self.remote_epoch.elapsed().as_micros() >= u128::from(deadline)
+    }
     fn occupied_units(&self, node_capacity: bool) -> usize {
         let s = self.state.lock().unwrap();
         let live = usize::try_from(self.live.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
@@ -415,6 +453,14 @@ enum GrantKind {
     ConsumedHandoff,
 }
 impl GrantKind {
+    fn for_request(playback: bool, segmented: bool) -> Self {
+        match (playback, segmented) {
+            (false, false) => Self::Control,
+            (false, true) => Self::SegmentedControl,
+            (true, false) => Self::Continuous,
+            (true, true) => Self::Segmented,
+        }
+    }
     fn from_u8(value: u8) -> Self {
         match value {
             1 => Self::Continuous,
@@ -547,6 +593,10 @@ impl Grant {
             || self
                 .expires_at
                 .is_some_and(|expires_at| SystemTime::now() >= expires_at)
+            || self
+                .entry
+                .as_ref()
+                .is_some_and(|entry| entry.remote_lease_expired())
     }
     pub fn add_bytes(&self, bytes: usize) {
         if bytes > 0
@@ -584,6 +634,8 @@ impl Drop for Grant {
             let mut s = e.state.lock().unwrap();
             s.remove_grant(GrantKind::from_u8(self.kind.load(Ordering::Relaxed)));
             e.live.fetch_sub(1, Ordering::Relaxed);
+            drop(s);
+            e.remote_notify.notify_one();
         }
     }
 }
@@ -594,6 +646,8 @@ pub enum AuthOutcome {
 }
 pub struct PlaybackAuth {
     iptv: Option<Arc<IptvStore>>,
+    remote_iptv: Option<Arc<AuthorityClient>>,
+    remote_boot: uuid::Uuid,
     #[cfg(test)]
     iptv_lookup_gate: Mutex<
         Option<(
@@ -609,15 +663,173 @@ pub struct PlaybackAuth {
     limit: usize,
 }
 impl PlaybackAuth {
+    async fn retire_remote_lease(remote: &mut RemoteState, client: &AuthorityClient) {
+        if let Some(lease) = remote.current.take() {
+            // Keep the per-entry operation gate held through the release RPC.
+            // The next grant gets a new session key so a delayed old release
+            // cannot remove a replacement lease after an ambiguous timeout.
+            let _ = client.release(&lease.input, &lease.reply).await;
+        }
+        remote.session = uuid::Uuid::new_v4();
+        remote.running = false;
+    }
+    async fn watch_remote_lease(entry: Arc<Entry>, client: Arc<AuthorityClient>) {
+        loop {
+            let wake = entry.remote_notify.notified();
+            let mut remote = entry.remote.lock().await;
+            let Some(current) = remote.current.as_ref() else {
+                remote.running = false;
+                return;
+            };
+            let reply = current.reply;
+            let (units, cancelled) = {
+                let state = entry.state.lock().unwrap();
+                let live =
+                    usize::try_from(entry.live.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+                (
+                    state.capacity_units(live, true),
+                    state.cancel.is_cancelled(),
+                )
+            };
+            if cancelled || units == 0 || reply.deadline <= Instant::now() {
+                if reply.deadline <= Instant::now() {
+                    entry.state.lock().unwrap().cancel_playback();
+                }
+                Self::retire_remote_lease(&mut remote, &client).await;
+                return;
+            }
+            let input = current.input.clone();
+            let mut updated = None;
+            if units != reply.units as usize {
+                let Ok(units) = u32::try_from(units) else {
+                    entry.state.lock().unwrap().cancel_playback();
+                    Self::retire_remote_lease(&mut remote, &client).await;
+                    return;
+                };
+                let mut replacement = input.clone();
+                replacement.operation = uuid::Uuid::new_v4();
+                replacement.units = units;
+                replacement.lease_id = None;
+                if let Ok(pending) = client.acquire(&replacement).await {
+                    let mut with_id = replacement.clone();
+                    with_id.lease_id = Some(pending.lease_id);
+                    match client.commit(&with_id).await {
+                        Ok(committed) => updated = Some((replacement, committed)),
+                        Err(_) => {
+                            let _ = client.rollback(&replacement, &pending).await;
+                        }
+                    }
+                }
+                if updated.is_none() {
+                    entry.state.lock().unwrap().cancel_playback();
+                    Self::retire_remote_lease(&mut remote, &client).await;
+                    return;
+                }
+            } else if reply.deadline <= Instant::now() + Duration::from_secs(5) {
+                let mut renewal = input.clone();
+                renewal.lease_id = Some(reply.lease_id);
+                match client.renew(&renewal).await {
+                    Ok(renewed) => updated = Some((input.clone(), renewed)),
+                    Err(_) => {
+                        entry.state.lock().unwrap().cancel_playback();
+                        Self::retire_remote_lease(&mut remote, &client).await;
+                        return;
+                    }
+                }
+            }
+            // A response received after this grant's old local deadline must
+            // never turn an already-expired media output back on. The newly
+            // renewed authority slot is released and the viewer reconnects.
+            if reply.deadline <= Instant::now() {
+                entry.state.lock().unwrap().cancel_playback();
+                if let Some((input, renewed)) = updated {
+                    remote.current = Some(RemoteLease {
+                        input,
+                        reply: renewed,
+                    });
+                }
+                Self::retire_remote_lease(&mut remote, &client).await;
+                return;
+            }
+            if let Some((input, reply)) = updated {
+                remote.current = Some(RemoteLease { input, reply });
+                entry.set_remote_deadline(reply.deadline);
+                let cancelled = {
+                    let mut state = entry.state.lock().unwrap();
+                    if state.cancel.is_cancelled() {
+                        true
+                    } else {
+                        state.allowed_until = reply.deadline;
+                        state.next_check = reply.deadline;
+                        false
+                    }
+                };
+                if cancelled {
+                    Self::retire_remote_lease(&mut remote, &client).await;
+                    return;
+                }
+            }
+            let remaining = remote
+                .current
+                .as_ref()
+                .unwrap()
+                .reply
+                .deadline
+                .saturating_duration_since(Instant::now());
+            let sleep = remaining
+                .saturating_sub(Duration::from_secs(5))
+                .min(Duration::from_secs(4));
+            drop(remote);
+            tokio::select! {
+                _ = wake => {},
+                _ = tokio::time::sleep(sleep) => {},
+            }
+        }
+    }
+    fn projected_remote_units(
+        entry: &Arc<Entry>,
+        playback: bool,
+        segmented: bool,
+        handoff: Option<&Grant>,
+    ) -> Option<usize> {
+        let state = entry.state.lock().unwrap();
+        if !matches!(state.decision, Decision::Allow) || state.cancel.is_cancelled() {
+            return None;
+        }
+        let handoff_valid = handoff.is_some_and(|grant| {
+            grant
+                .entry
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(owner, entry))
+                && GrantKind::from_u8(grant.kind.load(Ordering::Relaxed)) == GrantKind::Handoff
+                && !grant.is_cancelled()
+        });
+        if handoff.is_some() && !handoff_valid {
+            return None;
+        }
+        Some(
+            state.projected_capacity_units(
+                GrantKind::for_request(playback, segmented),
+                handoff_valid,
+            ),
+        )
+    }
     pub fn new(limit: usize) -> Self {
         Self::build(limit, None)
     }
     pub fn with_iptv(limit: usize, store: Arc<IptvStore>) -> Self {
         Self::build(limit, Some(store))
     }
+    pub fn with_remote_iptv(limit: usize, client: Arc<AuthorityClient>) -> Self {
+        let mut auth = Self::build(limit, None);
+        auth.remote_iptv = Some(client);
+        auth
+    }
     fn build(limit: usize, iptv: Option<Arc<IptvStore>>) -> Self {
         Self {
             iptv,
+            remote_iptv: None,
+            remote_boot: uuid::Uuid::new_v4(),
             #[cfg(test)]
             iptv_lookup_gate: Mutex::new(None),
             idle_memory: crate::idle_memory::Controller::default(),
@@ -782,6 +994,7 @@ impl PlaybackAuth {
             return AuthOutcome::Denied;
         }
         if policy.kind == PolicyKind::Iptv
+            && self.remote_iptv.is_none()
             && !self.iptv.as_ref().is_some_and(|store| {
                 store
                     .snapshot()
@@ -857,6 +1070,10 @@ impl PlaybackAuth {
                             cancel: CancellationToken::new(),
                         }),
                         flight: AsyncMutex::new(()),
+                        remote: AsyncMutex::new(RemoteState::default()),
+                        remote_notify: Notify::new(),
+                        remote_epoch: Instant::now(),
+                        remote_deadline_micros: AtomicU64::new(0),
                         live: AtomicU64::new(0),
                         admissions: AtomicU64::new(0),
                         bytes: AtomicU64::new(0),
@@ -876,7 +1093,7 @@ impl PlaybackAuth {
             s.last_seen = Instant::now();
         }
         self.refresh(&entry).await;
-        let admit = || {
+        let admit = |remote_units: Option<usize>| {
             let authority = self.authority.lock().unwrap();
             if !authority.get(&snapshot.name).is_some_and(|p| {
                 p.revision == snapshot.revision && p.policy.as_ref() == Some(&policy)
@@ -910,17 +1127,7 @@ impl PlaybackAuth {
                         .collect::<Vec<_>>();
                     let live =
                         usize::try_from(entry.live.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
-                    let kind = if !playback {
-                        if segmented_delivery {
-                            GrantKind::SegmentedControl
-                        } else {
-                            GrantKind::Control
-                        }
-                    } else if segmented_delivery {
-                        GrantKind::Segmented
-                    } else {
-                        GrantKind::Continuous
-                    };
+                    let kind = GrantKind::for_request(playback, segmented_delivery);
                     let own_slots = s.capacity_units(live, true);
                     let handoff_valid = handoff.is_some_and(|h| {
                         h.entry.as_ref().is_some_and(|e| Arc::ptr_eq(e, &entry))
@@ -945,6 +1152,7 @@ impl PlaybackAuth {
                         }
                     });
                     if handoff.is_some() && !handoff_valid
+                        || remote_units.is_some_and(|units| units != projected)
                         || additional > 0
                             && slots.saturating_add(pending).saturating_add(additional) > self.limit
                         || !s.unique && exceeds_user_limit
@@ -963,7 +1171,7 @@ impl PlaybackAuth {
                                 }
                             }
                         }
-                        if playback {
+                        if playback && remote_units.is_none() {
                             s.playback_seen = Some(Instant::now());
                         }
                         if handoff_valid {
@@ -996,32 +1204,130 @@ impl PlaybackAuth {
             }
         };
         let outcome = if let Some(iptv_request) = iptv_request {
-            let Some(store) = self.iptv.as_ref() else {
-                return AuthOutcome::Denied;
-            };
-            let current = store.snapshot();
-            store
-                .at_current(current.revision(), || {
-                    match current.authorize(
-                        &iptv_request.token,
-                        &iptv_request.name,
-                        SystemTime::now(),
-                    ) {
-                        Some(facts) => {
-                            let mut outcome = admit();
-                            if let (Some(expires_at), AuthOutcome::Allowed(grant)) =
-                                (facts.expires_at, &mut outcome)
-                            {
-                                grant.expire_at(expires_at);
-                            }
-                            outcome
-                        }
-                        None => AuthOutcome::Denied,
+            if let Some(client) = &self.remote_iptv {
+                let mut remote = entry.remote.lock().await;
+                let Some(units) =
+                    Self::projected_remote_units(&entry, playback, segmented_delivery, handoff)
+                else {
+                    return AuthOutcome::Denied;
+                };
+                let Ok(units_u32) = u32::try_from(units) else {
+                    return AuthOutcome::Denied;
+                };
+                let existing = remote.current.as_ref().filter(|lease| {
+                    lease.reply.units == units_u32
+                        && lease.reply.deadline > Instant::now() + Duration::from_secs(1)
+                        && lease.input.token == iptv_request.token
+                        && lease.input.channel == iptv_request.name
+                });
+                let (input, pending, needs_commit) = if let Some(lease) = existing {
+                    (lease.input.clone(), lease.reply, false)
+                } else {
+                    let input = LeaseInput {
+                        token: iptv_request.token.clone(),
+                        channel: iptv_request.name.clone(),
+                        session: SessionKey {
+                            boot: self.remote_boot,
+                            local: remote.session,
+                        },
+                        operation: uuid::Uuid::new_v4(),
+                        units: units_u32,
+                        lease_id: None,
+                    };
+                    let Ok(pending) = client.acquire(&input).await else {
+                        return AuthOutcome::Denied;
+                    };
+                    (input, pending, true)
+                };
+                let mut outcome = admit(Some(units));
+                if !matches!(outcome, AuthOutcome::Allowed(_)) {
+                    if needs_commit {
+                        let _ = client.rollback(&input, &pending).await;
                     }
-                })
-                .unwrap_or(AuthOutcome::Denied)
+                    return outcome;
+                }
+                let committed = if needs_commit {
+                    let mut with_id = input.clone();
+                    with_id.lease_id = Some(pending.lease_id);
+                    match client.commit(&with_id).await {
+                        Ok(reply) => reply,
+                        Err(_) => {
+                            drop(outcome);
+                            let _ = client.rollback(&input, &pending).await;
+                            return AuthOutcome::Denied;
+                        }
+                    }
+                } else {
+                    pending
+                };
+                if needs_commit {
+                    remote.current = Some(RemoteLease {
+                        input: input.clone(),
+                        reply: committed,
+                    });
+                }
+                entry.set_remote_deadline(committed.deadline);
+                let cancelled = {
+                    let mut state = entry.state.lock().unwrap();
+                    if state.cancel.is_cancelled() {
+                        true
+                    } else {
+                        if playback {
+                            state.playback_seen = Some(Instant::now());
+                        }
+                        state.user_id = committed.subscriber.as_hex();
+                        state.allowed_until = committed.deadline;
+                        state.next_check = committed.deadline;
+                        false
+                    }
+                };
+                if cancelled {
+                    drop(outcome);
+                    Self::retire_remote_lease(&mut remote, client).await;
+                    return AuthOutcome::Denied;
+                }
+                if let (Some(expiry), AuthOutcome::Allowed(grant)) =
+                    (committed.subscriber_expires_at, &mut outcome)
+                {
+                    grant.expire_at(expiry);
+                }
+                if !remote.running {
+                    remote.running = true;
+                    let watcher_entry = entry.clone();
+                    let watcher_client = client.clone();
+                    tokio::spawn(async move {
+                        Self::watch_remote_lease(watcher_entry, watcher_client).await;
+                    });
+                }
+                outcome
+            } else {
+                let Some(store) = self.iptv.as_ref() else {
+                    return AuthOutcome::Denied;
+                };
+                let current = store.snapshot();
+                store
+                    .at_current(current.revision(), || {
+                        match current.authorize(
+                            &iptv_request.token,
+                            &iptv_request.name,
+                            SystemTime::now(),
+                        ) {
+                            Some(facts) => {
+                                let mut outcome = admit(None);
+                                if let (Some(expires_at), AuthOutcome::Allowed(grant)) =
+                                    (facts.expires_at, &mut outcome)
+                                {
+                                    grant.expire_at(expires_at);
+                                }
+                                outcome
+                            }
+                            None => AuthOutcome::Denied,
+                        }
+                    })
+                    .unwrap_or(AuthOutcome::Denied)
+            }
         } else {
-            admit()
+            admit(None)
         };
         // Model preemption/cancellation before the caller receives the outcome.
         // Its already-constructed grant owns capacity through this boundary.
@@ -1062,7 +1368,7 @@ impl PlaybackAuth {
         let mut expiry_window = None;
         if !policy.accepts_token(&r.token) {
             decision = Decision::Deny;
-        } else if policy.kind == PolicyKind::Iptv {
+        } else if policy.kind == PolicyKind::Iptv && self.remote_iptv.is_none() {
             match self.iptv.as_ref().and_then(|store| {
                 store
                     .snapshot()
@@ -1443,6 +1749,29 @@ mod capacity_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn remote_grant_checks_its_monotonic_deadline_even_if_watcher_is_delayed() {
+        let auth = PlaybackAuth::new(2);
+        let snapshot = auth
+            .publish(
+                "news",
+                Some(Policy::from_config(&json!({}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let viewer = ViewerRequest {
+            name: "news".into(),
+            proto: "mpegts".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(grant) = auth.authorize(snapshot, viewer).await else {
+            panic!("grant");
+        };
+        let entry = grant.entry.as_ref().unwrap();
+        entry.remote_deadline_micros.store(1, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert!(grant.is_cancelled());
+    }
 
     #[tokio::test]
     async fn projected_iptv_units_share_hls_but_count_independent_continuous_outputs() {

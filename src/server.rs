@@ -299,9 +299,9 @@ impl App {
                 && !options.iptv_lease_authority
             {
                 PlaybackAuth::with_iptv(options.client_limit as usize, iptv.clone())
+            } else if let Some(client) = &iptv_authority_client {
+                PlaybackAuth::with_remote_iptv(options.client_limit as usize, client.clone())
             } else {
-                // A clustered viewer node cannot authorize from its own (possibly
-                // stale) subscriber file. Remote lease admission is wired separately.
                 PlaybackAuth::new(options.client_limit as usize)
             },
         );

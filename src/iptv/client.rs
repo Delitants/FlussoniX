@@ -22,6 +22,7 @@ pub enum Error {
     Invalid,
 }
 
+#[derive(Clone)]
 pub struct LeaseInput {
     pub token: String,
     pub channel: String,
