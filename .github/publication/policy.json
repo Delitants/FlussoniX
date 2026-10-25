@@ -15,6 +15,13 @@
     "vendor/quinn-proto/FLUSSONIX_PATCH.md"
   ],
   "public_data": [
+    "THIRD_PARTY_NOTICES.txt",
+    "third_party/manifest.json",
+    "third_party/licenses/rust/*/LICENSE*",
+    "third_party/licenses/rust/*/COPYRIGHT*",
+    "third_party/licenses/rust/*/COPYING*",
+    "third_party/licenses/rust/*/UNLICENSE*",
+    "third_party/licenses/web/*/LICENSE*",
     "vendor/quinn-proto/.cargo_vcs_info.json"
   ],
   "release_assets": [
