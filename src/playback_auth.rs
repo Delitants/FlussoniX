@@ -202,6 +202,27 @@ struct State {
     cancel: CancellationToken,
 }
 impl State {
+    /// Slot count after a prospective grant, using the same grouping as
+    /// `capacity_units` but without publishing or changing live state.
+    fn projected_capacity_units(&self, kind: GrantKind, consumes_handoff: bool) -> usize {
+        let active = self
+            .control_live
+            .saturating_add(self.handoff_live)
+            .saturating_add(self.continuous_live)
+            .saturating_sub(usize::from(consumes_handoff))
+            .saturating_add(usize::from(matches!(
+                kind,
+                GrantKind::Control | GrantKind::Continuous | GrantKind::Handoff
+            )));
+        let segmented = self
+            .segmented_live
+            .saturating_add(self.segmented_control_live)
+            .saturating_add(usize::from(matches!(
+                kind,
+                GrantKind::Segmented | GrantKind::SegmentedControl
+            )));
+        active.saturating_add(usize::from(active == 0 && segmented > 0))
+    }
     fn capacity_units(&self, live: usize, per_connection: bool) -> usize {
         if live == 0 {
             return usize::from(
@@ -889,9 +910,6 @@ impl PlaybackAuth {
                         .collect::<Vec<_>>();
                     let live =
                         usize::try_from(entry.live.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
-                    let recent = s
-                        .playback_seen
-                        .is_some_and(|seen| seen.elapsed() < Duration::from_secs(30));
                     let kind = if !playback {
                         if segmented_delivery {
                             GrantKind::SegmentedControl
@@ -910,20 +928,8 @@ impl PlaybackAuth {
                                 == GrantKind::Handoff
                             && !h.is_cancelled()
                     });
-                    // A continuous output can consume an existing handoff or
-                    // finite-fragment group once. Further outputs are separate.
-                    let already = match kind {
-                        GrantKind::Continuous => {
-                            handoff_valid
-                                || (s.segmented_live > 0
-                                    && s.continuous_live == 0
-                                    && s.control_live == 0
-                                    && s.handoff_live == 0)
-                                || (live == 0 && recent)
-                        }
-                        GrantKind::Control => live == 0 && recent,
-                        _ => own_slots > 0 || recent,
-                    };
+                    let projected = s.projected_capacity_units(kind, handoff_valid);
+                    let additional = projected.saturating_sub(own_slots);
                     let slots = others.iter().fold(own_slots, |sum, e| {
                         sum.saturating_add(e.occupied_units(true))
                     });
@@ -933,17 +939,14 @@ impl PlaybackAuth {
                         .fold(0usize, |sum, e| sum.saturating_add(e.occupied_units(false)));
                     let exceeds_user_limit = s.effective_max.is_some_and(|max| {
                         if policy.kind == PolicyKind::Iptv {
-                            other_user_slots
-                                .saturating_add(s.capacity_units(live, true))
-                                .saturating_add(usize::from(!already))
-                                as u64
-                                > max
+                            other_user_slots.saturating_add(projected) as u64 > max
                         } else {
                             other_user_slots as u64 >= max
                         }
                     });
                     if handoff.is_some() && !handoff_valid
-                        || !already && slots.saturating_add(pending) >= self.limit
+                        || additional > 0
+                            && slots.saturating_add(pending).saturating_add(additional) > self.limit
                         || !s.unique && exceeds_user_limit
                     {
                         // Capacity is transient; do not poison the cached policy.
@@ -1440,6 +1443,87 @@ mod capacity_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn projected_iptv_units_share_hls_but_count_independent_continuous_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IptvStore::open(dir.path().join("iptv.json")).unwrap();
+        store.set_enabled(true).unwrap();
+        store
+            .put_package("basic", json!({"channels":["news"]}))
+            .unwrap();
+        store
+            .put_subscriber(
+                "alice",
+                json!({"token":"subscriber","packages":["basic"],"max_sessions":3}),
+            )
+            .unwrap();
+        let auth = PlaybackAuth::with_iptv(8, store);
+        let policy = auth
+            .publish(
+                "news",
+                Some(Policy::from_config(&json!({"on_play":"iptv://"}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let viewer = ViewerRequest {
+            name: "news".into(),
+            proto: "hls".into(),
+            token: "subscriber".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(segment) = auth.authorize(policy.clone(), viewer.clone()).await
+        else {
+            panic!("first segment");
+        };
+        let entry = segment.entry.as_ref().unwrap().clone();
+        {
+            let state = entry.state.lock().unwrap();
+            assert_eq!(
+                state.projected_capacity_units(GrantKind::Segmented, false),
+                1
+            );
+        }
+        drop(segment);
+        {
+            let state = entry.state.lock().unwrap();
+            assert_eq!(
+                state.capacity_units(0, true),
+                1,
+                "recent HLS group retains a slot"
+            );
+            assert_eq!(
+                state.projected_capacity_units(GrantKind::Segmented, false),
+                1
+            );
+        }
+        let ts = ViewerRequest {
+            proto: "mpegts".into(),
+            ..viewer
+        };
+        let AuthOutcome::Allowed(first) = auth.authorize(policy.clone(), ts.clone()).await else {
+            panic!("first continuous output");
+        };
+        let continuous = first.entry.as_ref().unwrap();
+        assert_eq!(
+            continuous
+                .state
+                .lock()
+                .unwrap()
+                .projected_capacity_units(GrantKind::Continuous, false),
+            2
+        );
+        let AuthOutcome::Allowed(mut control) = auth.authorize_control(policy, ts).await else {
+            panic!("control handoff");
+        };
+        control.mark_handoff();
+        let owner = control.entry.as_ref().unwrap();
+        let state = owner.state.lock().unwrap();
+        let live = owner.live.load(Ordering::Relaxed) as usize;
+        assert_eq!(
+            state.projected_capacity_units(GrantKind::Continuous, true),
+            state.capacity_units(live, true)
+        );
+    }
 
     #[tokio::test]
     async fn expiring_grant_cancels_its_transport_token_without_canceling_parent() {
