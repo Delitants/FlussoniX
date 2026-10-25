@@ -62,7 +62,9 @@ class PackagePreviewTests(unittest.TestCase):
                      for m in tar.getmembers() if m.isfile()}
             self.assertEqual(set(files), {'bin/flussonix', 'web/index.html', 'web/assets/app.js',
                                           'web/assets/app.css', 'README.md', 'installation.md',
-                                          'iptv-transport.md', 'manifest.json',
+                                          'iptv-transport.md', 'manifest.json', 'LICENSE', 'NOTICE',
+                                          'vendor/quinn-proto/LICENSE-APACHE',
+                                          'vendor/quinn-proto/LICENSE-MIT',
                                           'bin/flussonix-service', 'service-installation.md'})
             self.assertEqual(files['bin/flussonix'].mode, 0o755)
             self.assertEqual(files['bin/flussonix-service'].mode, 0o755)
@@ -101,6 +103,16 @@ class PackagePreviewTests(unittest.TestCase):
                 for target in re.findall(r'\]\(([^)#]+\.md)(?:#[^)]*)?\)', guide):
                     self.assertIn((Path(name).parent / target).as_posix(), files,
                                   f'{name} links to missing {target}')
+
+    def test_archive_carries_own_and_vendored_license_texts(self):
+        archive = self.successful()
+        required = ['LICENSE', 'NOTICE', 'vendor/quinn-proto/LICENSE-APACHE',
+                    'vendor/quinn-proto/LICENSE-MIT']
+        with tarfile.open(archive) as tar:
+            for name in required:
+                member = archive.name[:-7] + '/' + name
+                self.assertIn(member, tar.getnames())
+                self.assertEqual(tar.extractfile(member).read(), (ROOT / name).read_bytes())
 
     def test_existing_output_is_never_overwritten(self):
         archive = self.successful()

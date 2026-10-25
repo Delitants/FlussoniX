@@ -140,6 +140,9 @@ def package(args):
                'iptv-transport.md': (read_regular(ROOT / 'docs/iptv-transport.md', 1024 * 1024), 0o644),
                'bin/flussonix-service': (read_regular(ROOT / 'scripts/service-preview.py', 1024 * 1024), 0o755),
                'service-installation.md': (read_regular(ROOT / 'docs/service-installation.md', 1024 * 1024), 0o644)}
+    for name in ('LICENSE', 'NOTICE', 'vendor/quinn-proto/LICENSE-APACHE',
+                 'vendor/quinn-proto/LICENSE-MIT'):
+        payload[name] = (read_regular(ROOT / name, 1024 * 1024), 0o644)
     payload.update(web_payload(args.web_dir))
     manifest = {'format': 1, 'name': 'FlussoniX', 'version': version,
                 'source_revision': args.revision, 'source_date_epoch': epoch,
