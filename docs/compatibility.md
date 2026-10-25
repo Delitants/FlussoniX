@@ -176,12 +176,12 @@ now continues the supported scalar order across insertions and deletions.
 
 ## Implemented value-based collection cursors
 
-Streams and Templates collections return opaque `next` and `prev` tokens.
+Streams, Templates and IPTV collections return opaque `next` and `prev` tokens.
 URL-encode a token as the next request's `cursor`; retain the collection, sort,
 filter and search arguments. `limit` and `select` may change. Omitted Streams
 sort and explicit `sort=name` have different orders; Templates retain name order
 by default. Counts describe the current filtered collection before the cursor
-and page limit. Empty pages have null navigation.
+and page limit. Pages without a continuation omit that navigation field.
 Item GET and other collections keep their existing contracts.
 
 The independent native token is standard Base64 of a URL query containing one
@@ -208,15 +208,18 @@ use the reference's Base64-encoded `$position_gt` or `$position_lt` with
 uses the native value-based token so no row is skipped. Pages with missing or
 noninteger positions also use native tokens. Incoming default-position bounds
 compare row positions, including safe exhaustion at the platform's maximum
-integer. Explicit `sort=name` retains the earlier positional-offset token
-compatibility. For identity-only `name` or `-name` sorting, reference
-`name_gt` / `name_lt` bounds are accepted;
-backward bounds include `$reversed=true`. An optional reference `$position_gt`
-or `$position_lt` is validated and treated as redundant with the unique name.
+integer. Explicit `sort=name` accepts earlier positional-offset tokens. For
+explicit identity-only `name` or `-name` sorting, outgoing tokens use reference
+`name_gt` / `name_lt` bounds when adjacent names differ; those bounds are also
+accepted on input. Duplicate-name boundaries use native tokens. Reference
+name-bound tokens do not bind the collection or filters, so clients must retain
+their original query arguments. Backward bounds include `$reversed=true`. An
+optional reference `$position_gt` or `$position_lt` is validated and treated as
+redundant with the unique name.
 For example, Base64 of `$position_gt=2&name_gt=a1` continues ascending names
-strictly after `a1`. These incoming reference/legacy tokens lack native context
-binding. New default Streams responses use reference position bounds when safe;
-other responses use the native profile.
+strictly after `a1`. Reference and legacy tokens lack native context binding.
+New default Streams responses use reference position bounds when safe; IPTV
+default pages use positional bounds; other scalar sorts use the native profile.
 
 Collection responses omit `next` or `prev` when that page does not exist. For
 Streams with explicit `sort=name`, `estimated_count` is capped at one row beyond

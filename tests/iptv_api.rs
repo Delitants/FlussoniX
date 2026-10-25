@@ -326,6 +326,63 @@ async fn iptv_name_sorted_pages_emit_reference_name_bounds() {
 }
 
 #[tokio::test]
+async fn view_role_subscriber_sort_cursors_never_contain_tokens() {
+    let (_dir, app) = app();
+    enable(app.clone()).await;
+    for (name, token) in [
+        ("alice", "private-alpha-token"),
+        ("bob", "private-bravo-token"),
+    ] {
+        assert_eq!(
+            edit(
+                app.clone(),
+                Method::PUT,
+                &format!("iptv/subscribers/{name}"),
+                json!({"token":token,"packages":[]}),
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    for sort in ["token", "-token"] {
+        let (status, first) = call(
+            app.clone(),
+            Method::GET,
+            &format!("iptv/subscribers?sort={sort}&limit=1"),
+            Value::Null,
+            Some("viewer:view-password"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first["subscribers"][0]["token"], "[redacted]");
+        let next = first["next"].as_str().unwrap();
+        let decoded = String::from_utf8(STANDARD.decode(next).unwrap()).unwrap();
+        assert!(!decoded.contains("private-alpha-token"));
+        assert!(!decoded.contains("private-bravo-token"));
+
+        let (status, last) = call(
+            app.clone(),
+            Method::GET,
+            &format!("iptv/subscribers?sort={sort}&limit=1&cursor={next}"),
+            Value::Null,
+            Some("viewer:view-password"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(last["subscribers"][0]["token"], "[redacted]");
+        let decoded =
+            String::from_utf8(STANDARD.decode(last["prev"].as_str().unwrap()).unwrap()).unwrap();
+        assert!(!decoded.contains("private-alpha-token"));
+        assert!(!decoded.contains("private-bravo-token"));
+    }
+}
+
+#[tokio::test]
 async fn subscriber_crud_generates_unique_tokens_and_validates_access_fields() {
     let (_dir, app) = app();
     enable(app.clone()).await;
