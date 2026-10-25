@@ -154,6 +154,11 @@ fn bind_tcp_listener(address: SocketAddr) -> std::io::Result<tokio::net::TcpList
 
 impl Args {
     fn validate_iptv_authority_transport(&self) -> Result<(), String> {
+        if self.iptv_lease_authority && self.iptv_authority.is_none() {
+            return Err(
+                "IPTV lease authority requires --iptv-authority for viewer admission".into(),
+            );
+        }
         if self.iptv_lease_authority
             && self.https_listen.is_none()
             && !self.iptv_peer_allow_insecure_loopback
@@ -497,6 +502,8 @@ mod tests {
             "--peer-key",
             "owned-peer-key-123",
             "--iptv-lease-authority",
+            "--iptv-authority",
+            "https://authority.example/",
         ];
         assert!(
             Args::try_parse_from(base)
@@ -536,6 +543,52 @@ mod tests {
             .validate_iptv_authority_transport()
             .is_err()
         );
+    }
+    #[test]
+    fn lease_authority_requires_its_own_viewer_authority_client_in_every_role() {
+        let base = [
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+            "--role",
+            "lb",
+            "--iptv-lease-authority",
+            "--iptv-peer-allow-insecure-loopback",
+        ];
+        let missing = Args::try_parse_from(base).unwrap();
+        assert!(
+            missing
+                .validate_iptv_authority_transport()
+                .unwrap_err()
+                .contains("--iptv-authority")
+        );
+        let configured = Args::try_parse_from(base.into_iter().chain([
+            "--iptv-authority",
+            "http://127.0.0.1:18443/",
+            "--iptv-authority-allow-insecure-loopback",
+        ]))
+        .unwrap();
+        assert!(configured.validate_iptv_authority_transport().is_ok());
+        for role in ["standalone", "source", "cdn"] {
+            let missing = Args::try_parse_from([
+                "flussonix",
+                "--admin-password",
+                "owned-admin",
+                "--peer-key",
+                "owned-peer-key-123",
+                "--role",
+                role,
+                "--iptv-lease-authority",
+                "--iptv-peer-allow-insecure-loopback",
+            ])
+            .unwrap();
+            assert!(
+                missing.validate_iptv_authority_transport().is_err(),
+                "{role} authority must not start without its viewer client"
+            );
+        }
     }
     #[test]
     fn fxlink_geometry_startup_matrix() {
