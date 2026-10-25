@@ -15,7 +15,7 @@ test('IPTV forms create packages and subscribers without JSON fields',async({pag
  await page.getByRole('button',{name:'Save package',exact:true}).click();await expect(page.getByRole('cell',{name:pack,exact:true})).toBeVisible();
  await page.getByRole('button',{name:'Subscribers',exact:true}).click();await page.getByRole('button',{name:'Add subscriber',exact:true}).click();
  await page.getByLabel('Subscriber name',{exact:true}).fill(subscriber);await page.getByLabel(pack,{exact:true}).check();
- await page.getByLabel('Maximum sessions per node',{exact:true}).fill('2');await page.getByLabel('Expires at (UTC)',{exact:true}).fill('2099-01-01T00:00');
+ await page.getByLabel('Maximum sessions on this node',{exact:true}).fill('2');await page.getByLabel('Expires at (UTC)',{exact:true}).fill('2099-01-01T00:00');
  await expect(page.getByRole('dialog').locator('textarea')).toHaveCount(0);await page.getByRole('button',{name:'Save subscriber',exact:true}).click();
  const saved=await(await request.get('/streamer/api/v3/iptv/subscribers/'+subscriber,{headers})).json();
  expect(saved.packages).toEqual([pack]);expect(saved.max_sessions).toBe(2);expect(saved.flussonix_expires_at).toBe('2099-01-01T00:00:00Z');expect(saved.token.length).toBeGreaterThanOrEqual(32);
@@ -47,7 +47,7 @@ test('IPTV subscriber fields validate inline and disabling explains viewer revoc
  await request.put('/streamer/api/v3/iptv',{headers,data:{}});
  await page.getByRole('button',{name:'Config',exact:true}).click();await page.getByRole('button',{name:'IPTV',exact:true}).click();
  await page.getByRole('button',{name:'Subscribers',exact:true}).click();await page.getByRole('button',{name:'Add subscriber',exact:true}).click();
- await page.getByLabel('Subscriber name',{exact:true}).fill('ui-invalid-'+Date.now());await page.getByLabel('Maximum sessions per node',{exact:true}).fill('0');
+ await page.getByLabel('Subscriber name',{exact:true}).fill('ui-invalid-'+Date.now());await page.getByLabel('Maximum sessions on this node',{exact:true}).fill('0');
  await page.getByRole('button',{name:'Save subscriber',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('positive');
  await page.getByRole('button',{name:'Cancel',exact:true}).click();
  await page.getByRole('button',{name:'Disable IPTV',exact:true}).click();await expect(page.getByRole('status')).toContainText('viewers');
