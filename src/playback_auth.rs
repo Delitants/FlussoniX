@@ -663,6 +663,34 @@ pub struct PlaybackAuth {
     limit: usize,
 }
 impl PlaybackAuth {
+    /// A load balancer redirects without delivering media. Return its short
+    /// authorization lease before the CDN attempts its own admission.
+    pub(crate) async fn release_redirect_lease(&self, grant: &Grant) -> bool {
+        let Some(entry) = grant.entry.as_ref() else {
+            return true;
+        };
+        if entry.state.lock().unwrap().policy.kind != PolicyKind::Iptv {
+            return true;
+        }
+        let Some(client) = &self.remote_iptv else {
+            return false;
+        };
+        let mut remote = entry.remote.lock().await;
+        if grant.is_cancelled() {
+            return false;
+        }
+        let Some(lease) = remote.current.as_ref() else {
+            return false;
+        };
+        if client.release(&lease.input, &lease.reply).await.is_err() {
+            return false;
+        }
+        remote.current = None;
+        remote.session = uuid::Uuid::new_v4();
+        Self::revoke_remote_grant(entry);
+        entry.remote_notify.notify_one();
+        true
+    }
     fn revoke_remote_grant(entry: &Entry) {
         let mut state = entry.state.lock().unwrap();
         state.cancel_playback();

@@ -1710,10 +1710,18 @@ async fn balance(
     revision: u64,
 ) -> Response {
     let work = balance_inner(app, name, path, query, secure, grant, revision);
-    tokio::select! { biased;
+    let response = tokio::select! { biased;
         _=grant.cancelled()=>error(StatusCode::FORBIDDEN,"playback policy changed"),
         result=tokio::time::timeout(Duration::from_secs(8),work)=>result.unwrap_or_else(|_|error(StatusCode::SERVICE_UNAVAILABLE,"placement deadline exceeded")),
+    };
+    if response.status().is_redirection() && !app.playback_auth.release_redirect_lease(grant).await
+    {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "IPTV redirect lease release failed",
+        );
     }
+    response
 }
 async fn balance_inner(
     app: &Arc<App>,
