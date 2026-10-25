@@ -663,6 +663,13 @@ pub struct PlaybackAuth {
     limit: usize,
 }
 impl PlaybackAuth {
+    fn revoke_remote_grant(entry: &Entry) {
+        let mut state = entry.state.lock().unwrap();
+        state.cancel_playback();
+        state.decision = Decision::Unknown;
+        state.next_check = Instant::now();
+        state.generation += 1;
+    }
     async fn retire_remote_lease(remote: &mut RemoteState, client: &AuthorityClient) {
         if let Some(lease) = remote.current.take() {
             // Keep the per-entry operation gate held through the release RPC.
@@ -693,7 +700,7 @@ impl PlaybackAuth {
             };
             if cancelled || units == 0 || reply.deadline <= Instant::now() {
                 if reply.deadline <= Instant::now() {
-                    entry.state.lock().unwrap().cancel_playback();
+                    Self::revoke_remote_grant(&entry);
                 }
                 Self::retire_remote_lease(&mut remote, &client).await;
                 return;
@@ -702,7 +709,7 @@ impl PlaybackAuth {
             let mut updated = None;
             if units != reply.units as usize {
                 let Ok(units) = u32::try_from(units) else {
-                    entry.state.lock().unwrap().cancel_playback();
+                    Self::revoke_remote_grant(&entry);
                     Self::retire_remote_lease(&mut remote, &client).await;
                     return;
                 };
@@ -721,7 +728,7 @@ impl PlaybackAuth {
                     }
                 }
                 if updated.is_none() {
-                    entry.state.lock().unwrap().cancel_playback();
+                    Self::revoke_remote_grant(&entry);
                     Self::retire_remote_lease(&mut remote, &client).await;
                     return;
                 }
@@ -731,7 +738,7 @@ impl PlaybackAuth {
                 match client.renew(&renewal).await {
                     Ok(renewed) => updated = Some((input.clone(), renewed)),
                     Err(_) => {
-                        entry.state.lock().unwrap().cancel_playback();
+                        Self::revoke_remote_grant(&entry);
                         Self::retire_remote_lease(&mut remote, &client).await;
                         return;
                     }
@@ -741,7 +748,7 @@ impl PlaybackAuth {
             // never turn an already-expired media output back on. The newly
             // renewed authority slot is released and the viewer reconnects.
             if reply.deadline <= Instant::now() {
-                entry.state.lock().unwrap().cancel_playback();
+                Self::revoke_remote_grant(&entry);
                 if let Some((input, renewed)) = updated {
                     remote.current = Some(RemoteLease {
                         input,

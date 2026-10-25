@@ -26,6 +26,7 @@ fn node(dir: &tempfile::TempDir, name: &str, authority: Option<url::Url>) -> Arc
             peer_key: "owned-cluster-peer-123".into(),
             role: "cdn".into(),
             node_name: name.into(),
+            iptv_data: Some(dir.path().join(format!("{name}-iptv.json"))),
             iptv_authority: authority,
             iptv_authority_allow_insecure_loopback: true,
             ..Options::default()
@@ -625,6 +626,7 @@ async fn failed_commit_rolls_back_reservation_without_leaking_a_subscriber_slot(
             peer_key: "owned-cluster-peer-123".into(),
             role: "cdn".into(),
             client_limit: 1,
+            iptv_data: Some(dir.path().join("cdn-iptv.json")),
             iptv_authority: Some(url),
             iptv_authority_allow_insecure_loopback: true,
             ..Options::default()
@@ -794,5 +796,379 @@ async fn a_late_renewal_response_cannot_revive_an_expired_viewer_grant() {
         grant.is_cancelled(),
         "late renewal response revived media after an expired lease"
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn token_rotation_revokes_two_cdn_viewers_and_admits_the_replacement_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = App::new(
+        dir.path().join("authority-config.json"),
+        dir.path().join("authority-media"),
+        Options {
+            admin_password: "owned-admin".into(),
+            peer_key: "owned-cluster-peer-123".into(),
+            role: "lb".into(),
+            iptv_lease_authority: true,
+            iptv_peer_allow_insecure_loopback: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    authority.iptv.set_enabled(true).unwrap();
+    authority
+        .iptv
+        .put_package("basic", json!({"channels":["news"]}))
+        .unwrap();
+    authority
+        .iptv
+        .put_subscriber(
+            "alice",
+            json!({"token":"old-viewer-token","packages":["basic"],"max_sessions":2}),
+        )
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            router(authority.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .into_future(),
+    );
+    let cdn_a = node(&dir, "cdn-a", Some(url.clone()));
+    let cdn_b = node(&dir, "cdn-b", Some(url));
+    let policy = Policy::from_config(&json!({"on_play":"iptv://"}), &json!({})).unwrap();
+    let first = cdn_a
+        .playback_auth
+        .publish("news", Some(policy.clone()))
+        .unwrap();
+    let second = cdn_b.playback_auth.publish("news", Some(policy)).unwrap();
+    let request = |token: &str| ViewerRequest {
+        name: "news".into(),
+        proto: "mpegts".into(),
+        token: token.into(),
+        ..Default::default()
+    };
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    let AuthOutcome::Allowed(old_a) = cdn_a
+        .playback_auth
+        .authorize(first.clone(), request("old-viewer-token"))
+        .await
+    else {
+        panic!("first CDN viewer");
+    };
+    let AuthOutcome::Allowed(old_b) = cdn_b
+        .playback_auth
+        .authorize(second.clone(), request("old-viewer-token"))
+        .await
+    else {
+        panic!("second CDN viewer");
+    };
+    assert_eq!(authority.iptv_leases.active_leases(), 2);
+    authority
+        .iptv
+        .put_subscriber("alice", json!({"token":"new-viewer-token"}))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(9), async {
+        while !old_a.is_cancelled() || !old_b.is_cancelled() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("old CDN viewers survived subscriber token rotation");
+    assert!(matches!(
+        cdn_a
+            .playback_auth
+            .authorize(first.clone(), request("old-viewer-token"))
+            .await,
+        AuthOutcome::Denied
+    ));
+    let AuthOutcome::Allowed(new) = cdn_b
+        .playback_auth
+        .authorize(second.clone(), request("new-viewer-token"))
+        .await
+    else {
+        panic!("new subscriber token denied after rotation");
+    };
+    assert!(!new.is_cancelled());
+    authority.iptv.delete_package("basic").unwrap();
+    tokio::time::timeout(Duration::from_secs(9), async {
+        while !new.is_cancelled() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("package deletion did not revoke the CDN viewer");
+    assert!(matches!(
+        cdn_b
+            .playback_auth
+            .authorize(second, request("new-viewer-token"))
+            .await,
+        AuthOutcome::Denied
+    ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn reducing_subscriber_limit_reclaims_two_node_leases_before_readmission() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = App::new(
+        dir.path().join("authority-config.json"),
+        dir.path().join("authority-media"),
+        Options {
+            admin_password: "owned-admin".into(),
+            peer_key: "owned-cluster-peer-123".into(),
+            role: "lb".into(),
+            iptv_lease_authority: true,
+            iptv_peer_allow_insecure_loopback: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    authority.iptv.set_enabled(true).unwrap();
+    authority
+        .iptv
+        .put_package("basic", json!({"channels":["news"]}))
+        .unwrap();
+    authority
+        .iptv
+        .put_subscriber(
+            "alice",
+            json!({"token":"private-viewer-token","packages":["basic"],"max_sessions":2}),
+        )
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            router(authority.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .into_future(),
+    );
+    let cdn_a = node(&dir, "cdn-a", Some(url.clone()));
+    let cdn_b = node(&dir, "cdn-b", Some(url));
+    let policy = Policy::from_config(&json!({"on_play":"iptv://"}), &json!({})).unwrap();
+    let first = cdn_a
+        .playback_auth
+        .publish("news", Some(policy.clone()))
+        .unwrap();
+    let second = cdn_b.playback_auth.publish("news", Some(policy)).unwrap();
+    let request = ViewerRequest {
+        name: "news".into(),
+        proto: "mpegts".into(),
+        token: "private-viewer-token".into(),
+        ..Default::default()
+    };
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    let AuthOutcome::Allowed(old_a) = cdn_a
+        .playback_auth
+        .authorize(first.clone(), request.clone())
+        .await
+    else {
+        panic!("first CDN viewer");
+    };
+    let AuthOutcome::Allowed(old_b) = cdn_b
+        .playback_auth
+        .authorize(second.clone(), request.clone())
+        .await
+    else {
+        panic!("second CDN viewer");
+    };
+    assert_eq!(authority.iptv_leases.active_leases(), 2);
+    authority
+        .iptv
+        .put_subscriber("alice", json!({"max_sessions":1}))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(9), async {
+        while !old_a.is_cancelled()
+            || !old_b.is_cancelled()
+            || authority.iptv_leases.active_leases() != 0
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("old two-node leases survived a lower subscriber limit");
+    // A real transport drops its old grant when cancellation closes the
+    // viewer. Release the test-owned handles before modeling the reconnect.
+    drop((old_a, old_b));
+    let AuthOutcome::Allowed(new) = cdn_a.playback_auth.authorize(first, request.clone()).await
+    else {
+        panic!("one viewer should readmit under the lower limit");
+    };
+    assert!(matches!(
+        cdn_b.playback_auth.authorize(second, request).await,
+        AuthOutcome::Denied
+    ));
+    assert!(!new.is_cancelled());
+    assert_eq!(authority.iptv_leases.active_leases(), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn authority_restart_quarantines_new_admissions_until_old_leases_expire() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority_options = || Options {
+        admin_password: "owned-admin".into(),
+        peer_key: "owned-cluster-peer-123".into(),
+        role: "lb".into(),
+        iptv_lease_authority: true,
+        iptv_peer_allow_insecure_loopback: true,
+        ..Options::default()
+    };
+    let authority_path = dir.path().join("authority-config.json");
+    let authority_media = dir.path().join("authority-media");
+    let first_authority = App::new(&authority_path, &authority_media, authority_options()).unwrap();
+    first_authority.iptv.set_enabled(true).unwrap();
+    first_authority
+        .iptv
+        .put_package("basic", json!({"channels":["news"]}))
+        .unwrap();
+    first_authority
+        .iptv
+        .put_subscriber(
+            "alice",
+            json!({"token":"private-viewer-token","packages":["basic"],"max_sessions":1}),
+        )
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let url = url::Url::parse(&format!("http://{address}/")).unwrap();
+    let first_server = tokio::spawn(
+        axum::serve(
+            listener,
+            router(first_authority.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .into_future(),
+    );
+    let cdn = node(&dir, "cdn", Some(url));
+    let policy = cdn
+        .playback_auth
+        .publish(
+            "news",
+            Some(Policy::from_config(&json!({"on_play":"iptv://"}), &json!({})).unwrap()),
+        )
+        .unwrap();
+    let request = ViewerRequest {
+        name: "news".into(),
+        proto: "mpegts".into(),
+        token: "private-viewer-token".into(),
+        ..Default::default()
+    };
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    let AuthOutcome::Allowed(old) = cdn
+        .playback_auth
+        .authorize(policy.clone(), request.clone())
+        .await
+    else {
+        panic!("initial CDN admission");
+    };
+    first_server.abort();
+    let _ = first_server.await;
+    let second_authority =
+        App::new(&authority_path, &authority_media, authority_options()).unwrap();
+    let restarted_at = std::time::Instant::now();
+    let listener = TcpListener::bind(address).await.unwrap();
+    let second_server = tokio::spawn(
+        axum::serve(
+            listener,
+            router(second_authority.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .into_future(),
+    );
+    assert!(matches!(
+        cdn.playback_auth
+            .authorize(policy.clone(), request.clone())
+            .await,
+        AuthOutcome::Denied
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !old.is_cancelled() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("old grant survived restarted authority quarantine");
+    drop(old);
+    tokio::time::sleep(
+        Duration::from_secs(11).saturating_sub(restarted_at.elapsed()) + Duration::from_millis(100),
+    )
+    .await;
+    let AuthOutcome::Allowed(new) = cdn.playback_auth.authorize(policy, request).await else {
+        panic!("CDN did not readmit after authority quarantine");
+    };
+    assert!(!new.is_cancelled());
+    assert_eq!(second_authority.iptv_leases.active_leases(), 1);
+    second_server.abort();
+}
+
+#[tokio::test]
+async fn authority_load_balancer_viewer_uses_the_same_subscriber_cap_as_a_cdn() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let authority = App::new(
+        dir.path().join("authority-config.json"),
+        dir.path().join("authority-media"),
+        Options {
+            admin_password: "owned-admin".into(),
+            peer_key: "owned-cluster-peer-123".into(),
+            role: "lb".into(),
+            iptv_lease_authority: true,
+            iptv_peer_allow_insecure_loopback: true,
+            iptv_authority: Some(url.clone()),
+            iptv_authority_allow_insecure_loopback: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    authority.iptv.set_enabled(true).unwrap();
+    authority
+        .iptv
+        .put_package("basic", json!({"channels":["news"]}))
+        .unwrap();
+    authority
+        .iptv
+        .put_subscriber(
+            "alice",
+            json!({"token":"private-viewer-token","packages":["basic"],"max_sessions":1}),
+        )
+        .unwrap();
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            router(authority.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .into_future(),
+    );
+    let cdn = node(&dir, "cdn", Some(url));
+    let policy = Policy::from_config(&json!({"on_play":"iptv://"}), &json!({})).unwrap();
+    let lb_stream = authority
+        .playback_auth
+        .publish("news", Some(policy.clone()))
+        .unwrap();
+    let cdn_stream = cdn.playback_auth.publish("news", Some(policy)).unwrap();
+    let viewer = ViewerRequest {
+        name: "news".into(),
+        proto: "mpegts".into(),
+        token: "private-viewer-token".into(),
+        ..Default::default()
+    };
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    let AuthOutcome::Allowed(lb_grant) = authority
+        .playback_auth
+        .authorize(lb_stream, viewer.clone())
+        .await
+    else {
+        panic!("authority load balancer should use its own shared lease");
+    };
+    assert_eq!(authority.iptv_leases.active_leases(), 1);
+    assert!(matches!(
+        cdn.playback_auth.authorize(cdn_stream, viewer).await,
+        AuthOutcome::Denied
+    ));
+    drop(lb_grant);
     server.abort();
 }
