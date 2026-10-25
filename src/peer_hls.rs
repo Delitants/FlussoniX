@@ -269,6 +269,12 @@ async fn fetch(
         data.extend_from_slice(&chunk);
     }
     let is_playlist = data.starts_with(b"#EXTM3U");
+    if !f.live && url == f.origin && !is_playlist {
+        // The configured HLS entry must remain a playlist. FFmpeg may
+        // otherwise auto-detect a different network manifest format and
+        // resolve its media references outside this origin-scoped proxy.
+        return Err(());
+    }
     let body = if is_playlist {
         playlist(f, &response_url, &data)?
     } else {

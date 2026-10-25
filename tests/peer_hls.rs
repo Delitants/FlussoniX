@@ -225,6 +225,105 @@ async fn plain_http_extensionless_playlist_never_fetches_a_foreign_segment() {
     reject_plain_hls_foreign_segment("http", "/entry").await;
 }
 
+// A response at an HLS URL may be a different manifest format. The decoder
+// must not autodetect DASH and fetch its media outside the origin-scoped proxy.
+async fn reject_dash_manifest_with_foreign_media_url(as_segment: bool) {
+    let foreign_hits = Arc::new(AtomicUsize::new(0));
+    let observed = foreign_hits.clone();
+    let foreign_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let foreign_url = format!(
+        "http://{}/foreign.mp4",
+        foreign_listener.local_addr().unwrap()
+    );
+    let foreign = tokio::spawn(async move {
+        axum::serve(
+            foreign_listener,
+            Router::new().route(
+                "/foreign.mp4",
+                get(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    async { vec![0u8; 128] }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let source_hits = Arc::new(AtomicUsize::new(0));
+    let seen = source_hits.clone();
+    let segment_hits = Arc::new(AtomicUsize::new(0));
+    let segment_seen = segment_hits.clone();
+    let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let input = format!("hls://{}/entry.m3u8", source_listener.local_addr().unwrap());
+    let mpd = format!(
+        "<?xml version=\"1.0\"?><MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\" mediaPresentationDuration=\"PT1S\" minBufferTime=\"PT1S\" profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\"><Period duration=\"PT1S\"><AdaptationSet mimeType=\"video/mp4\"><Representation id=\"1\" bandwidth=\"1000\" codecs=\"avc1.42E01E\" width=\"16\" height=\"16\"><BaseURL>{foreign_url}</BaseURL><SegmentBase indexRange=\"0-100\"/></Representation></AdaptationSet></Period></MPD>"
+    );
+    let entry = if as_segment {
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.0,\nsegment.bin\n#EXT-X-ENDLIST\n".to_owned()
+    } else {
+        mpd.clone()
+    };
+    let source = tokio::spawn(async move {
+        axum::serve(
+            source_listener,
+            Router::new()
+                .route(
+                    "/entry.m3u8",
+                    get(move || {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        let body = entry.clone();
+                        async move { body }
+                    }),
+                )
+                .route(
+                    "/segment.bin",
+                    get(move || {
+                        segment_seen.fetch_add(1, Ordering::SeqCst);
+                        let body = mpd.clone();
+                        async move { body }
+                    }),
+                ),
+        )
+        .await
+        .unwrap();
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Engine::new(directory.path(), "ffmpeg");
+    engine
+        .ensure("owned-dash", &json!({"inputs":[{"url":input}]}))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    engine.stop_all().await;
+    source.abort();
+    foreign.abort();
+    assert!(
+        source_hits.load(Ordering::SeqCst) > 0,
+        "HLS input was not exercised"
+    );
+    if as_segment {
+        assert!(
+            segment_hits.load(Ordering::SeqCst) > 0,
+            "HLS segment was not exercised"
+        );
+    }
+    assert_eq!(
+        foreign_hits.load(Ordering::SeqCst),
+        0,
+        "non-HLS manifest fetched media outside the configured origin"
+    );
+}
+
+#[tokio::test]
+async fn hls_input_rejects_a_dash_manifest_with_a_foreign_media_url() {
+    reject_dash_manifest_with_foreign_media_url(false).await;
+}
+
+#[tokio::test]
+async fn hls_segment_rejects_a_dash_manifest_with_a_foreign_media_url() {
+    reject_dash_manifest_with_foreign_media_url(true).await;
+}
+
 async fn reject_foreign_credentials(redirect: bool) {
     let leaked = Arc::new(AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
