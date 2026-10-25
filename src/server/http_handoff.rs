@@ -17,11 +17,14 @@ struct Reusable {
     cancel: tokio_util::sync::CancellationToken,
     expires: Instant,
 }
-pub(super) enum Claim {
+pub(super) struct Claim(ClaimKind);
+enum ClaimKind {
     First {
-        grant: Grant,
+        grant: Option<Grant>,
         ticket: Option<String>,
         signal: Option<watch::Sender<bool>>,
+        expires: Instant,
+        ledger: Option<Arc<StdMutex<State>>>,
     },
     Reuse {
         identity: String,
@@ -30,23 +33,63 @@ pub(super) enum Claim {
 }
 impl Claim {
     pub(super) fn once(grant: Grant) -> Self {
-        Self::First {
-            grant,
+        Self(ClaimKind::First {
+            grant: Some(grant),
             ticket: None,
             signal: None,
-        }
+            expires: Instant::now(),
+            ledger: None,
+        })
     }
     pub(super) fn grant(&self) -> Option<&Grant> {
-        match self {
-            Self::First { grant, .. } => Some(grant),
-            Self::Reuse { .. } => None,
+        match &self.0 {
+            ClaimKind::First { grant, .. } => grant.as_ref(),
+            ClaimKind::Reuse { .. } => None,
         }
     }
     pub(super) fn reuse_identity(&self) -> Option<&str> {
-        match self {
-            Self::Reuse { identity, .. } => Some(identity),
-            Self::First { .. } => None,
+        match &self.0 {
+            ClaimKind::Reuse { identity, .. } => Some(identity),
+            ClaimKind::First { .. } => None,
         }
+    }
+}
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let ClaimKind::First {
+            grant,
+            ticket,
+            signal,
+            expires,
+            ledger,
+        } = &mut self.0
+        else {
+            return;
+        };
+        let (Some(ticket), Some(signal), Some(ledger), Some(pending)) = (
+            ticket.take(),
+            signal.take(),
+            ledger.as_ref(),
+            grant.as_mut(),
+        ) else {
+            return;
+        };
+        if *expires <= Instant::now() || !pending.restore_handoff() {
+            return;
+        }
+        let restored = grant.take().unwrap();
+        let mut state = ledger.lock().unwrap();
+        state.pending_hls.remove(&ticket);
+        state.handoffs.insert(
+            ticket,
+            Handoff {
+                grant: restored,
+                expires: *expires,
+            },
+        );
+        drop(state);
+        // A waiter retries the ledger after the original claim is restored.
+        let _ = signal.send(true);
     }
 }
 struct TrackedCredit {
@@ -79,7 +122,7 @@ impl State {
     }
 }
 #[derive(Default)]
-pub(super) struct Registry(StdMutex<State>);
+pub(super) struct Registry(Arc<StdMutex<State>>);
 impl Registry {
     pub(super) fn insert(&self, ticket: String, mut grant: Grant, mbps: f64) {
         grant.release_capacity_reservation();
@@ -114,19 +157,21 @@ impl Registry {
                 let mut state = self.0.lock().unwrap();
                 state.prune();
                 if let Some(reusable) = state.reusable_hls.get(ticket) {
-                    return Some(Claim::Reuse {
+                    return Some(Claim(ClaimKind::Reuse {
                         identity: reusable.identity.clone(),
                         ticket: ticket.to_owned(),
-                    });
+                    }));
                 }
                 if let Some(handoff) = state.handoffs.remove(ticket) {
                     let (signal, wait) = watch::channel(false);
                     state.pending_hls.insert(ticket.to_owned(), wait);
-                    return Some(Claim::First {
-                        grant: handoff.grant,
+                    return Some(Claim(ClaimKind::First {
+                        grant: Some(handoff.grant),
                         ticket: Some(ticket.to_owned()),
                         signal: Some(signal),
-                    });
+                        expires: handoff.expires,
+                        ledger: Some(self.0.clone()),
+                    }));
                 }
                 state.pending_hls.get(ticket)?.clone()
             };
@@ -145,13 +190,14 @@ impl Registry {
         grant: &Grant,
         segmented: bool,
     ) -> Option<Arc<OutputCredit>> {
-        match claim {
-            Claim::First {
+        match &mut claim.0 {
+            ClaimKind::First {
                 grant: handoff,
                 ticket,
                 signal,
+                ..
             } => {
-                let credit = self.activate(handoff, grant, segmented);
+                let credit = self.activate(handoff.as_mut()?, grant, segmented);
                 if credit.is_some()
                     && let (Some(ticket), Some(signal), Some(identity)) =
                         (ticket.take(), signal.take(), grant.session_identity())
@@ -170,7 +216,7 @@ impl Registry {
                 }
                 credit
             }
-            Claim::Reuse { identity, ticket } => {
+            ClaimKind::Reuse { identity, ticket } => {
                 if grant.session_identity() != Some(identity) || grant.is_cancelled() {
                     return None;
                 }
@@ -348,6 +394,55 @@ mod tests {
             panic!("owned viewer denied")
         };
         grant
+    }
+    #[tokio::test]
+    async fn cancelled_first_hls_claim_restores_its_unactivated_handoff_for_a_waiter() {
+        let auth = PlaybackAuth::new(1);
+        let policy = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let registry = Arc::new(Registry::default());
+        registry.insert(
+            "ticket".into(),
+            viewer(&auth, policy.clone(), "viewer", false).await,
+            40.0,
+        );
+        let first = registry.claim_hls("ticket").await.unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "hls".into(),
+            token: "viewer".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(playback) = auth
+            .authorize_handoff(policy.clone(), request.clone(), first.grant().unwrap())
+            .await
+        else {
+            panic!("first claimant failed authorization")
+        };
+        drop(playback); // The response was cancelled before activating media.
+        let waiting = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.claim_hls("ticket").await })
+        };
+        tokio::task::yield_now().await;
+        drop(first);
+        let mut retry = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("waiting playlist request did not wake")
+            .unwrap()
+            .expect("cancelled request lost the reserved handoff");
+        assert!(retry.grant().is_some(), "retry did not own the handoff");
+        let AuthOutcome::Allowed(next) = auth
+            .authorize_handoff(policy, request, retry.grant().unwrap())
+            .await
+        else {
+            panic!("restored handoff no longer authorizes playback")
+        };
+        assert!(registry.activate_claim(&mut retry, &next, true).is_some());
     }
     #[tokio::test]
     async fn measured_output_does_not_discount_another_viewers_pending_bandwidth() {

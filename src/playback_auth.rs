@@ -415,6 +415,24 @@ impl Grant {
             }
         }
     }
+    pub(crate) fn restore_handoff(&mut self) -> bool {
+        if self.is_cancelled() {
+            return false;
+        }
+        let Some(entry) = &self.entry else {
+            return false;
+        };
+        let mut state = entry.state.lock().unwrap();
+        match GrantKind::from_u8(self.kind.load(Ordering::Relaxed)) {
+            GrantKind::Handoff => true,
+            GrantKind::ConsumedHandoff => {
+                state.add_grant(GrantKind::Handoff);
+                self.kind.store(GrantKind::Handoff as u8, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
+    }
     pub(crate) fn release_capacity_reservation(&mut self) {
         self.capacity_reservation = None;
     }
