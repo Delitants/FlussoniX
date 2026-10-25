@@ -138,6 +138,53 @@ fn quarantine_expiry_and_global_capacity_fail_closed() {
 }
 
 #[test]
+fn restart_quarantine_rejects_renewal_before_any_lease_lookup() {
+    let start = Instant::now();
+    let ledger = Ledger::new(start, 1, 1);
+    let req = request("alice", Uuid::new_v4(), Uuid::new_v4(), 1, 1);
+    assert!(matches!(
+        ledger.renew(
+            start + Duration::from_secs(10),
+            SystemTime::now(),
+            &req,
+            Uuid::nil()
+        ),
+        Err(Error::Quarantine)
+    ));
+    assert!(matches!(
+        ledger.renew(
+            start + Duration::from_secs(11),
+            SystemTime::now(),
+            &req,
+            Uuid::nil()
+        ),
+        Err(Error::Missing)
+    ));
+}
+
+#[test]
+fn malformed_unit_reservations_create_no_ledger_records() {
+    let start = Instant::now();
+    let ledger = Ledger::new(start, 10, 1);
+    let ready = start + Duration::from_secs(11);
+    let wall = SystemTime::now();
+    let valid = request("alice", Uuid::new_v4(), Uuid::new_v4(), 1, 1);
+    for (units, limit) in [(0, Some(1)), (1025, Some(1025)), (1, Some(0))] {
+        let malformed = LeaseRequest {
+            units,
+            limit,
+            ..valid.clone()
+        };
+        assert!(matches!(
+            ledger.acquire(ready, wall, &malformed),
+            Err(Error::Invalid)
+        ));
+    }
+    assert_eq!(ledger.active_leases(), 0);
+    assert_eq!(ledger.subscriber_records(), 0);
+}
+
+#[test]
 fn failed_extra_slot_does_not_discard_an_existing_committed_lease() {
     let start = Instant::now();
     let ledger = Ledger::new(start, 10, 1);

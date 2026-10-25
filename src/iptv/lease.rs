@@ -456,6 +456,9 @@ impl Ledger {
         req: &LeaseRequest,
         id: Uuid,
     ) -> Result<LeaseGrant, Error> {
+        if now < self.quarantine_until {
+            return Err(Error::Quarantine);
+        }
         let deadline = Self::deadline(now, wall, req.subscriber_expires_at, LEASE_TTL)?;
         let floor = self.revision_floor.read().unwrap();
         if req.revision != *floor {
