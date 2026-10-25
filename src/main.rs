@@ -352,6 +352,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::select! { _=auth_cancel.cancelled()=>break, _=interval.tick()=>auth_app.playback_auth.renew_due().await }
         }
     });
+    let iptv_probe = app.iptv_authority_client.clone().map(|client| {
+        let probe_cancel = cancel.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = probe_cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        tokio::select! {
+                            _ = probe_cancel.cancelled() => break,
+                            _ = client.probe() => {},
+                        }
+                    }
+                }
+            }
+        })
+    });
     let telemetry_app = app.clone();
     let telemetry_cancel = cancel.clone();
     let telemetry = tokio::spawn(async move {
@@ -397,6 +415,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     cancel.cancel();
     let _ = supervisor.await;
     let _ = authorization.await;
+    if let Some(task) = iptv_probe {
+        let _ = task.await;
+    }
     let _ = telemetry.await;
     let _ = memory_maintenance.await;
     let vendor_result = vendor_playback.await;

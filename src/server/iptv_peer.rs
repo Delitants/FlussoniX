@@ -91,6 +91,10 @@ struct ReleaseBody {
     operation: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatusBody {}
+
 async fn peer_body<T: DeserializeOwned>(app: &App, request: Request) -> PeerResult<(T, Slot<'_>)> {
     if !app.options.iptv_lease_authority {
         return Err((StatusCode::NOT_FOUND, "IPTV authority unavailable"));
@@ -205,6 +209,20 @@ fn grant_response(
         "ttl_ms":ttl_ms,
         "subscriber_expires_at_unix_ms":expires_at.and_then(|expiry| expiry.duration_since(UNIX_EPOCH).ok()).map(|since| since.as_millis().min(u128::from(u64::MAX)) as u64),
     }));
+    response
+        .headers_mut()
+        .insert("cache-control", "no-store".parse().unwrap());
+    response
+}
+
+pub(super) async fn status(State(app): State<Arc<App>>, request: Request) -> Response {
+    let (_, _slot): (StatusBody, _) = match peer_body(&app, request).await {
+        Ok(body) => body,
+        Err((status, message)) => return error(status, message),
+    };
+    let ready =
+        app.iptv.snapshot().enabled() && app.iptv_leases.ready_for_new_leases(Instant::now());
+    let mut response = json_response(json!({"ready": ready}));
     response
         .headers_mut()
         .insert("cache-control", "no-store".parse().unwrap());

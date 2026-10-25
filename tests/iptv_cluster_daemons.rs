@@ -170,6 +170,135 @@ fn group_rss_kib(pgid: u32) -> u64 {
 }
 
 #[tokio::test]
+async fn cdn_reports_authority_readiness_without_subscriber_traffic() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = App::new(
+        dir.path().join("authority-config.json"),
+        dir.path().join("authority-media"),
+        Options {
+            admin_password: "owned-admin".into(),
+            peer_key: PEER_KEY.into(),
+            role: "lb".into(),
+            iptv_lease_authority: true,
+            iptv_peer_allow_insecure_loopback: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    authority.iptv.set_enabled(true).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            router(authority.clone())
+                .layer(axum::middleware::map_response(
+                    |mut response: axum::response::Response| async move {
+                        response.headers_mut().insert(
+                            axum::http::header::CONNECTION,
+                            axum::http::HeaderValue::from_static("close"),
+                        );
+                        response
+                    },
+                ))
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .into_future(),
+    );
+    let mut cdn = Cdn::start(dir.path(), "cdn-readiness", &origin).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    async fn ready(client: &reqwest::Client, cdn: &Cdn) -> bool {
+        let response = client
+            .get(format!("{}/flussonix/api/v1/node", cdn.base))
+            .header("x-flussonix-peer", PEER_KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        response.json::<serde_json::Value>().await.unwrap()["iptv_cluster"]["ready"] == true
+    }
+
+    assert!(!ready(&client, &cdn).await);
+    let became_ready = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if ready(&client, &cdn).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    if became_ready.is_ok() {
+        authority.iptv.set_enabled(false).unwrap();
+    }
+    let became_unready = if became_ready.is_ok() {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if !ready(&client, &cdn).await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_ok()
+    } else {
+        false
+    };
+    if became_unready {
+        authority.iptv.set_enabled(true).unwrap();
+    }
+    let recovered = if became_unready {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if ready(&client, &cdn).await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_ok()
+    } else {
+        false
+    };
+    server.abort();
+    let _ = server.await;
+    let lost_authority = if recovered {
+        tokio::time::timeout(Duration::from_secs(16), async {
+            loop {
+                if !ready(&client, &cdn).await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_ok()
+    } else {
+        false
+    };
+    cdn.terminate().await;
+    assert!(
+        became_ready.is_ok(),
+        "CDN never reported its ready authority"
+    );
+    assert!(
+        became_unready,
+        "CDN kept reporting a disabled authority as ready"
+    );
+    assert!(
+        recovered,
+        "CDN did not recover when authority was re-enabled"
+    );
+    assert!(
+        lost_authority,
+        "CDN kept reporting a lost authority as ready"
+    );
+}
+
+#[tokio::test]
 async fn two_cdn_daemons_share_one_iptv_limit_during_hls_and_continuous_playback() {
     let dir = tempfile::tempdir().unwrap();
     let authority = App::new(

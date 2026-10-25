@@ -144,6 +144,16 @@ impl Ledger {
         now >= self.quarantine_until
     }
 
+    /// Whether a new distinct session can be admitted now. Retain the
+    /// quarantine-only check above for renewals and idempotent acquires.
+    pub fn ready_for_new_leases(&self, now: Instant) -> bool {
+        if !self.accepting_new_leases(now) {
+            return false;
+        }
+        self.sweep_under_pressure(now);
+        self.active_leases() < self.max_active
+    }
+
     pub fn sweep_count(&self) -> u64 {
         self.sweeps.load(Ordering::Relaxed)
     }

@@ -2,6 +2,10 @@ use axum::{body::Body, http::Request};
 use flussonix::server::router;
 use flussonix::server::{App, Options};
 use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 use tower::ServiceExt;
 
@@ -65,6 +69,7 @@ async fn authority_status_becomes_ready_after_restart_quarantine_and_reflects_ip
             peer_key: "owned-peer-key-123".into(),
             role: "lb".into(),
             iptv_lease_authority: true,
+            iptv_peer_allow_insecure_loopback: true,
             ..Options::default()
         },
     )
@@ -91,15 +96,54 @@ async fn authority_status_becomes_ready_after_restart_quarantine_and_reflects_ip
         .unwrap()
     }
 
+    async fn peer_status(app: &std::sync::Arc<App>, key: &str) -> axum::response::Response {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/flussonix/peer/v1/iptv/leases/status")
+            .header("x-flussonix-peer", key)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                18210,
+            ))));
+        router(app.clone()).oneshot(request).await.unwrap()
+    }
+
     let quarantined = status(&app).await;
     assert_eq!(quarantined["iptv_cluster"]["mode"], "authority");
     assert_eq!(quarantined["iptv_cluster"]["ready"], false);
+    assert_eq!(
+        peer_status(&app, "wrong-peer-key").await.status(),
+        axum::http::StatusCode::UNAUTHORIZED
+    );
+    let peer = peer_status(&app, "owned-peer-key-123").await;
+    assert_eq!(peer.status(), axum::http::StatusCode::OK);
+    let peer: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(peer.into_body(), 8192).await.unwrap())
+            .unwrap();
+    assert_eq!(peer["ready"], false);
 
     tokio::time::sleep(Duration::from_millis(11_050)).await;
     assert_eq!(status(&app).await["iptv_cluster"]["ready"], true);
+    let peer = peer_status(&app, "owned-peer-key-123").await;
+    assert_eq!(peer.status(), axum::http::StatusCode::OK);
+    let peer: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(peer.into_body(), 8192).await.unwrap())
+            .unwrap();
+    assert_eq!(peer["ready"], true);
 
     app.iptv.set_enabled(false).unwrap();
     assert_eq!(status(&app).await["iptv_cluster"]["ready"], false);
+    let peer = peer_status(&app, "owned-peer-key-123").await;
+    assert_eq!(peer.status(), axum::http::StatusCode::OK);
+    let peer: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(peer.into_body(), 8192).await.unwrap())
+            .unwrap();
+    assert_eq!(peer["ready"], false);
 }
 
 #[tokio::test]
@@ -144,6 +188,90 @@ async fn cdn_status_reports_missing_or_unusable_authority_without_secrets() {
         );
         assert!(!String::from_utf8_lossy(&bytes).contains("owned-peer-key-123"));
     }
+}
+
+#[tokio::test]
+async fn cdn_status_distinguishes_rejected_probe_from_authenticated_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let reject = Arc::new(AtomicBool::new(true));
+    let route_reject = reject.clone();
+    let service = axum::Router::new().route(
+        "/flussonix/peer/v1/iptv/leases/status",
+        axum::routing::post(move || {
+            let reject = route_reject.clone();
+            async move {
+                if reject.load(Ordering::Relaxed) {
+                    (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        axum::Json(serde_json::json!({})),
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(serde_json::json!({"ready":false})),
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(axum::serve(listener, service).into_future());
+    let app = App::new(
+        dir.path().join("config.json"),
+        dir.path().join("media"),
+        Options {
+            admin_password: "owned-admin-password".into(),
+            peer_key: "owned-peer-key-123".into(),
+            role: "cdn".into(),
+            iptv_authority: Some(url),
+            iptv_authority_allow_insecure_loopback: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let client = app.iptv_authority_client.as_ref().unwrap();
+    assert!(!client.probe().await);
+    let node = router(app.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/flussonix/api/v1/node")
+                .header("x-flussonix-peer", "owned-peer-key-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(node.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    let node: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        node["iptv_cluster"]["reason"],
+        "IPTV authority readiness could not be verified"
+    );
+    reject.store(false, Ordering::Relaxed);
+    assert!(!client.probe().await);
+    let node = router(app)
+        .oneshot(
+            Request::builder()
+                .uri("/flussonix/api/v1/node")
+                .header("x-flussonix-peer", "owned-peer-key-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(node.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    let node: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        node["iptv_cluster"]["reason"],
+        "IPTV authority is not accepting new leases"
+    );
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]

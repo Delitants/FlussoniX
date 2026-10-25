@@ -118,6 +118,37 @@ async fn outage_fails_closed_with_no_token_in_error() {
         .unwrap_err();
     assert_eq!(error, Error::Unavailable);
     assert!(!format!("{error:?}").contains("private-viewer-token"));
+    assert!(!client.probe().await);
+    assert!(!client.recently_ready());
+}
+
+#[tokio::test]
+async fn readiness_probe_clears_prior_success_when_authority_disappears() {
+    let app = Router::new().route(
+        "/flussonix/peer/v1/iptv/leases/status",
+        post(|| async {
+            (
+                [(axum::http::header::CONNECTION, "close")],
+                Json(json!({"ready": true})),
+            )
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(axum::serve(listener, app).into_future());
+    let client = AuthorityClient::new(
+        url::Url::parse(&format!("http://{address}/")).unwrap(),
+        "private-peer-key-123".into(),
+        None,
+        true,
+    )
+    .unwrap();
+    assert!(client.probe().await);
+    assert!(client.recently_ready());
+    server.abort();
+    let _ = server.await;
+    assert!(!client.probe().await);
+    assert!(!client.recently_ready());
 }
 
 #[tokio::test]
@@ -135,6 +166,7 @@ async fn untrusted_authority_certificate_fails_closed_but_explicit_ca_reaches_pe
         },
     )
     .unwrap();
+    app.iptv.set_enabled(true).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = url::Url::parse(&format!("https://{}/", listener.local_addr().unwrap())).unwrap();
     let cancel = CancellationToken::new();
@@ -146,13 +178,22 @@ async fn untrusted_authority_certificate_fails_closed_but_explicit_ca_reaches_pe
     ));
     let untrusted =
         AuthorityClient::new(url.clone(), "private-peer-key-123".into(), None, false).unwrap();
+    assert!(!untrusted.probe().await);
+    assert!(!untrusted.recently_ready());
     assert_eq!(
         untrusted.acquire(&input()).await.unwrap_err(),
         Error::Unavailable
     );
     let trusted =
         AuthorityClient::new(url, "private-peer-key-123".into(), Some(&cert.ca), false).unwrap();
+    assert!(!trusted.probe().await);
+    assert!(trusted.recently_reachable());
     assert_eq!(trusted.acquire(&input()).await.unwrap_err(), Error::Denied);
+    tokio::time::sleep(Duration::from_millis(11_050)).await;
+    assert!(trusted.probe().await);
+    assert!(trusted.recently_ready());
+    assert!(!untrusted.probe().await);
+    assert!(!untrusted.recently_ready());
     cancel.cancel();
     server.await.unwrap().unwrap();
 }

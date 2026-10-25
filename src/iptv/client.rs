@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     path::Path,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Semaphore;
@@ -52,6 +52,12 @@ struct WireGrant {
     subscriber_expires_at_unix_ms: Option<u64>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireStatus {
+    ready: bool,
+}
+
 pub struct AuthorityClient {
     origin: Url,
     key: String,
@@ -59,6 +65,8 @@ pub struct AuthorityClient {
     in_flight: Semaphore,
     started: Instant,
     last_reachable_ms: AtomicU64,
+    last_ready_ms: AtomicU64,
+    last_probe_refused: AtomicBool,
 }
 
 impl AuthorityClient {
@@ -105,6 +113,8 @@ impl AuthorityClient {
             in_flight: Semaphore::new(32),
             started: Instant::now(),
             last_reachable_ms: AtomicU64::new(0),
+            last_ready_ms: AtomicU64::new(0),
+            last_probe_refused: AtomicBool::new(false),
         })
     }
 
@@ -117,6 +127,43 @@ impl AuthorityClient {
                 .as_millis()
                 .saturating_sub(u128::from(last))
                 <= 15_000
+    }
+
+    pub fn recently_ready(&self) -> bool {
+        let last = self.last_ready_ms.load(Ordering::Relaxed);
+        last != 0
+            && self
+                .started
+                .elapsed()
+                .as_millis()
+                .saturating_sub(u128::from(last))
+                <= 12_000
+    }
+
+    pub fn last_probe_refused(&self) -> bool {
+        self.last_probe_refused.load(Ordering::Relaxed)
+    }
+
+    pub async fn probe(&self) -> bool {
+        let (ready, refused) = match self.send("status", &json!({})).await {
+            Ok((reqwest::StatusCode::OK, bytes, _)) => {
+                match serde_json::from_slice::<WireStatus>(&bytes) {
+                    Ok(status) => (status.ready, !status.ready),
+                    Err(_) => (false, false),
+                }
+            }
+            _ => (false, false),
+        };
+        self.last_probe_refused.store(refused, Ordering::Relaxed);
+        self.last_ready_ms.store(
+            if ready {
+                self.started.elapsed().as_millis().min(u64::MAX as u128) as u64 + 1
+            } else {
+                0
+            },
+            Ordering::Relaxed,
+        );
+        ready
     }
 
     fn body(input: &LeaseInput) -> Result<Value, Error> {

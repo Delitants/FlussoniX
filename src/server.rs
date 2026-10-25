@@ -679,17 +679,30 @@ impl App {
             json!({"mode":"local","configured":false,"ready":true})
         } else if self.options.iptv_lease_authority {
             let enabled = self.iptv.snapshot().enabled();
-            let ready = enabled && self.iptv_leases.accepting_new_leases(Instant::now());
+            let ready = enabled && self.iptv_leases.ready_for_new_leases(Instant::now());
             let reason = if ready {
                 None
             } else if !enabled {
                 Some("IPTV is disabled")
-            } else {
+            } else if !self.iptv_leases.accepting_new_leases(Instant::now()) {
                 Some("IPTV authority restart quarantine is active")
+            } else {
+                Some("IPTV authority lease capacity is full")
             };
             json!({"mode":"authority","configured":true,"ready":ready,"reason":reason})
         } else if let Some(client) = &self.iptv_authority_client {
-            json!({"mode":"client","configured":true,"ready":false,"connected":client.recently_reachable(),"reason":"Shared IPTV authority limits are under release qualification"})
+            let ready = client.recently_ready();
+            let connected = client.recently_reachable();
+            let reason = if ready {
+                None
+            } else if connected && client.last_probe_refused() {
+                Some("IPTV authority is not accepting new leases")
+            } else if connected {
+                Some("IPTV authority readiness could not be verified")
+            } else {
+                Some("IPTV authority has not been verified recently")
+            };
+            json!({"mode":"client","configured":true,"ready":ready,"connected":connected,"reason":reason})
         } else {
             json!({"mode":"missing_authority","configured":false,"ready":false,"reason":"IPTV authority is required for cluster session limits"})
         };
@@ -901,6 +914,7 @@ pub fn router(app: Arc<App>) -> Router {
     Router::new().route("/health",axum::routing::get(||async{axum::Json(json!({"status":"ok","service":"FlussoniX","version":env!("CARGO_PKG_VERSION")}))}))
  .route("/streamer/api/v3/{*tail}",axum::routing::any(management))
  .route("/tv/playlists/{subscriber}",axum::routing::get(iptv_playlist_http))
+ .route("/flussonix/peer/v1/iptv/leases/status",axum::routing::post(iptv_peer::status))
  .route("/flussonix/peer/v1/iptv/leases/acquire",axum::routing::post(iptv_peer::acquire))
  .route("/flussonix/peer/v1/iptv/leases/commit",axum::routing::post(iptv_peer::commit))
  .route("/flussonix/peer/v1/iptv/leases/renew",axum::routing::post(iptv_peer::renew))

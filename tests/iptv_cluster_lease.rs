@@ -138,6 +138,22 @@ fn quarantine_expiry_and_global_capacity_fail_closed() {
 }
 
 #[test]
+fn readiness_reflects_capacity_and_reclaims_expired_leases() {
+    let start = Instant::now();
+    let ledger = Ledger::new(start, 1, 1);
+    let ready = start + Duration::from_secs(11);
+    let wall = SystemTime::now();
+    assert!(!ledger.ready_for_new_leases(start));
+    assert!(ledger.ready_for_new_leases(ready));
+    let req = request("alice", Uuid::new_v4(), Uuid::new_v4(), 1, 1);
+    let grant = ledger.acquire(ready, wall, &req).unwrap();
+    assert!(!ledger.ready_for_new_leases(ready));
+    assert!(ledger.ready_for_new_leases(ready + Duration::from_secs(3)));
+    assert_eq!(ledger.active_leases(), 0);
+    assert!(!ledger.release(&req.subscriber, &req.session, grant.id));
+}
+
+#[test]
 fn restart_quarantine_rejects_renewal_before_any_lease_lookup() {
     let start = Instant::now();
     let ledger = Ledger::new(start, 1, 1);
