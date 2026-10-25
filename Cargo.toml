@@ -4,6 +4,7 @@ version = "0.10.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Independent live media server and cluster control plane"
+license = "Apache-2.0"
 
 [workspace]
 members = [".", "vendor/quinn-proto"]
