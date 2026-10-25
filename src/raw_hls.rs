@@ -140,68 +140,109 @@ pub async fn watch(
     discontinuity: bool,
     cancel: CancellationToken,
 ) -> Result<(), String> {
+    watch_inner(
+        dir,
+        generation,
+        epoch,
+        discontinuity,
+        cancel,
+        #[cfg(test)]
+        std::time::Duration::ZERO,
+    )
+    .await
+}
+
+async fn watch_inner(
+    dir: PathBuf,
+    generation: String,
+    epoch: u64,
+    discontinuity: bool,
+    cancel: CancellationToken,
+    #[cfg(test)] list_work_delay: std::time::Duration,
+) -> Result<(), String> {
     let prefix = format!("g{generation}_p");
     let mut last = Vec::new();
     let mut published_start = None::<u64>;
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
-    // A slow filesystem pass must not keep the high-frequency list tick ready
-    // forever and starve the lower-frequency disk-budget check.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut budget_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut next_budget = tokio::time::Instant::now();
     loop {
         tokio::select! {
             biased;
             _=cancel.cancelled()=>return Ok(()),
             _=tick.tick()=>{},
-            _=budget_tick.tick()=>check_generation_budget(&dir, &prefix).await?,
         }
-        let Ok(file) = tokio::fs::File::open(dir.join("passthrough.m3u8")).await else {
-            continue;
-        };
-        let mut raw = Vec::new();
-        if file.take(65537).read_to_end(&mut raw).await.is_err() || raw.len() > 65536 || raw == last
-        {
-            continue;
-        }
-        let Ok(value) = std::str::from_utf8(&raw) else {
-            continue;
-        };
-        let Some((text, start, files)) = normalize(value, &prefix, epoch, discontinuity) else {
-            continue;
-        };
-        // An invalid new list must not remove files still named by the last
-        // public list. The independent budget check bounds that backlog.
-        prune_before(
+        #[cfg(test)]
+        tokio::time::sleep(list_work_delay).await;
+        process_playlist(
             &dir,
             &prefix,
-            published_start.map_or(start, |old| old.min(start)),
+            epoch,
+            discontinuity,
             &cancel,
+            &mut last,
+            &mut published_start,
         )
         .await?;
-        let mut complete = true;
-        for name in files {
-            if !tokio::fs::metadata(dir.join(name))
-                .await
-                .is_ok_and(|m| m.is_file() && m.len() > 0 && m.len() <= 32 * 1024 * 1024)
-            {
-                complete = false;
-                break;
-            }
+        // Always inspect a due budget after the list pass, including a missing,
+        // unchanged, malformed, or incomplete list. A slow pass cannot starve it.
+        if tokio::time::Instant::now() >= next_budget {
+            check_generation_budget(&dir, &prefix).await?;
+            next_budget = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         }
-        if !complete {
-            continue;
-        }
-        // Only finalized, generation-scoped files enter an atomic public list.
-        tokio::fs::write(dir.join(".passthrough-index.tmp"), text)
-            .await
-            .map_err(|_| "cannot publish raw HLS list")?;
-        tokio::fs::rename(dir.join(".passthrough-index.tmp"), dir.join("index.m3u8"))
-            .await
-            .map_err(|_| "cannot publish raw HLS list")?;
-        last = raw;
-        published_start = Some(start);
-        prune_before(&dir, &prefix, start, &cancel).await?;
     }
+}
+
+async fn process_playlist(
+    dir: &Path,
+    prefix: &str,
+    epoch: u64,
+    discontinuity: bool,
+    cancel: &CancellationToken,
+    last: &mut Vec<u8>,
+    published_start: &mut Option<u64>,
+) -> Result<(), String> {
+    let Ok(file) = tokio::fs::File::open(dir.join("passthrough.m3u8")).await else {
+        return Ok(());
+    };
+    let mut raw = Vec::new();
+    if file.take(65537).read_to_end(&mut raw).await.is_err() || raw.len() > 65536 || raw == *last {
+        return Ok(());
+    }
+    let Ok(value) = std::str::from_utf8(&raw) else {
+        return Ok(());
+    };
+    let Some((text, start, files)) = normalize(value, prefix, epoch, discontinuity) else {
+        return Ok(());
+    };
+    // An invalid new list must not remove files still named by the last
+    // public list. The independent budget check bounds that backlog.
+    prune_before(
+        dir,
+        prefix,
+        published_start.map_or(start, |old| old.min(start)),
+        cancel,
+    )
+    .await?;
+    for name in files {
+        if !tokio::fs::metadata(dir.join(name))
+            .await
+            .is_ok_and(|m| m.is_file() && m.len() > 0 && m.len() <= 32 * 1024 * 1024)
+        {
+            return Ok(());
+        }
+    }
+    // Only finalized, generation-scoped files enter an atomic public list.
+    tokio::fs::write(dir.join(".passthrough-index.tmp"), text)
+        .await
+        .map_err(|_| "cannot publish raw HLS list")?;
+    tokio::fs::rename(dir.join(".passthrough-index.tmp"), dir.join("index.m3u8"))
+        .await
+        .map_err(|_| "cannot publish raw HLS list")?;
+    *last = raw;
+    *published_start = Some(start);
+    prune_before(dir, prefix, start, cancel).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -429,5 +470,79 @@ mod tests {
         assert!(published.contains("gowned_p0.ts"));
         assert!(path.join("gowned_p0.ts").exists());
         assert!(path.join("gowned_p1.ts").exists());
+    }
+
+    #[tokio::test]
+    async fn slow_playlist_checks_budget_after_a_segment_grows() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = dir.path().join("gowned_p0.ts");
+        let file = tokio::fs::File::create(&segment).await.unwrap();
+        file.set_len(1).await.unwrap();
+        let watcher = tokio::spawn(watch_inner(
+            dir.path().to_path_buf(),
+            "owned".into(),
+            0,
+            false,
+            CancellationToken::new(),
+            std::time::Duration::from_millis(150),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        file.set_len(64 * 1024 * 1024 + 1).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), watcher).await;
+        assert!(
+            matches!(result, Ok(Ok(Err(_)))),
+            "slow list work starved the due budget check"
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_published_playlist_still_checks_growing_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let segment = path.join("gowned_p0.ts");
+        let file = tokio::fs::File::create(&segment).await.unwrap();
+        file.set_len(1).await.unwrap();
+        tokio::fs::write(
+            path.join("passthrough.m3u8"),
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2,\ngowned_p0.ts\n",
+        )
+        .await
+        .unwrap();
+        let watcher = tokio::spawn(watch(
+            path.to_path_buf(),
+            "owned".into(),
+            0,
+            false,
+            CancellationToken::new(),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !path.join("index.m3u8").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        file.set_len(64 * 1024 * 1024 + 1).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), watcher).await;
+        assert!(
+            matches!(result, Ok(Ok(Err(_)))),
+            "unchanged list bypassed budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_budget_ignores_other_formats_and_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["gowned_p0.m4s", "gother_p0.ts"] {
+            let file = tokio::fs::File::create(dir.path().join(name))
+                .await
+                .unwrap();
+            file.set_len(65 * 1024 * 1024).await.unwrap();
+        }
+        assert!(
+            check_generation_budget(dir.path(), "gowned_p")
+                .await
+                .is_ok()
+        );
     }
 }
