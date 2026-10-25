@@ -27,7 +27,10 @@ pub use relay::{RelayCandidate, RelayFailure, RelayHop, RelayRoute};
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -63,6 +66,9 @@ struct State {
     revision: u64,
     preparations: HashMap<String, Arc<()>>,
     sources: HashMap<String, Arc<SourceAuthority>>,
+    // Keep a lineage across revision-only rebinding. Any explicit reinstall
+    // revokes original and inherited observations, even after a save.
+    source_validities: HashMap<String, Arc<AtomicBool>>,
 }
 /// Owns the exact configuration store and startup local identity. No Debug or
 /// serialization: internal preparations retain privileged source credentials.
@@ -98,6 +104,8 @@ pub struct PreparedSource {
 pub struct SourceHandle {
     stamp: Stamp,
     authority: Arc<SourceAuthority>,
+    source_validity: Arc<AtomicBool>,
+    config_lineage: Arc<()>,
 }
 /// Complete discovery bound to global config, identity and installed generation.
 pub struct CoordinatedInventory {
@@ -113,6 +121,12 @@ impl SourceHandle {
     // Process-local grouping only; retained handles prevent pointer reuse.
     pub(crate) fn generation_key(&self) -> usize {
         Arc::as_ptr(&self.authority) as usize
+    }
+    pub(crate) fn generation_token(&self) -> Arc<()> {
+        self.stamp.turn.clone()
+    }
+    pub(crate) fn source_validity(&self) -> Arc<AtomicBool> {
+        self.source_validity.clone()
     }
 }
 impl ModernSourceCoordinator {
@@ -130,6 +144,7 @@ impl ModernSourceCoordinator {
                 revision: config.revision(),
                 preparations: HashMap::new(),
                 sources: HashMap::new(),
+                source_validities: HashMap::new(),
             }),
             primary,
             config,
@@ -159,6 +174,10 @@ impl ModernSourceCoordinator {
             .map_err(|_| CoordinationFailure::Unavailable)?;
         if !Arc::ptr_eq(&self.config, config) {
             state.retired = true;
+            for validity in state.source_validities.values() {
+                validity.store(false, Ordering::Release);
+            }
+            state.source_validities.clear();
             state.sources.clear();
             state.preparations.clear();
         }
@@ -183,6 +202,10 @@ impl ModernSourceCoordinator {
         }
         let mut state = self.state()?;
         state.identity = Arc::new(LocalIdentity { ids });
+        for validity in state.source_validities.values() {
+            validity.store(false, Ordering::Release);
+        }
+        state.source_validities.clear();
         state.sources.clear();
         state.preparations.clear();
         Ok(())
@@ -204,6 +227,17 @@ impl ModernSourceCoordinator {
             let mut state = self.state()?;
             if state.revision != revision {
                 state.sources.clear();
+                state.source_validities.retain(|key, validity| {
+                    let present = root["sources"].as_array().is_some_and(|rows| {
+                        rows.iter().any(|row| {
+                            crate::config::item_key("sources", row) == Some(key.as_str())
+                        })
+                    });
+                    if !present {
+                        validity.store(false, Ordering::Release);
+                    }
+                    present
+                });
                 state.preparations.clear();
                 state.revision = revision;
             }
@@ -240,6 +274,23 @@ impl ModernSourceCoordinator {
     /// Install only the latest capture from this exact owner/config/identity.
     /// Successful installation always replaces the source generation, even equal.
     pub fn install(&self, prepared: PreparedSource) -> Result<SourceHandle, CoordinationFailure> {
+        self.install_inner(prepared, None)
+    }
+    /// The daemon may rebind a source after an unrelated save while retaining
+    /// its current negative observation. The predecessor must be from this
+    /// owner and the same unbroken configuration relationship.
+    pub(crate) fn rebind_unchanged(
+        &self,
+        prepared: PreparedSource,
+        predecessor: Option<&SourceHandle>,
+    ) -> Result<SourceHandle, CoordinationFailure> {
+        self.install_inner(prepared, predecessor)
+    }
+    fn install_inner(
+        &self,
+        prepared: PreparedSource,
+        predecessor: Option<&SourceHandle>,
+    ) -> Result<SourceHandle, CoordinationFailure> {
         self.config
             .at_revision(prepared.stamp.revision, |_| {
                 let mut state = self.state()?;
@@ -251,12 +302,43 @@ impl ModernSourceCoordinator {
                 {
                     return Err(CoordinationFailure::Stale);
                 }
+                let config_lineage = self
+                    .config
+                    .source_lineage(&prepared.stamp.key)
+                    .ok_or(CoordinationFailure::Stale)?;
+                let preserve = predecessor.is_some_and(|old| {
+                    Arc::ptr_eq(&old.stamp.owner, &prepared.stamp.owner)
+                        && Arc::ptr_eq(&old.stamp.identity, &prepared.stamp.identity)
+                        && old.stamp.key == prepared.stamp.key
+                        && old.stamp.revision < prepared.stamp.revision
+                        && Arc::ptr_eq(&old.config_lineage, &config_lineage)
+                        && old.source_validity.load(Ordering::Acquire)
+                        && !state.sources.contains_key(&prepared.stamp.key)
+                        && state
+                            .source_validities
+                            .get(&prepared.stamp.key)
+                            .is_some_and(|current| Arc::ptr_eq(current, &old.source_validity))
+                });
+                let source_validity = if preserve {
+                    predecessor.unwrap().source_validity.clone()
+                } else {
+                    let next = Arc::new(AtomicBool::new(true));
+                    if let Some(previous) = state
+                        .source_validities
+                        .insert(prepared.stamp.key.clone(), next.clone())
+                    {
+                        previous.store(false, Ordering::Release);
+                    }
+                    next
+                };
                 state
                     .sources
                     .insert(prepared.stamp.key.clone(), prepared.authority.clone());
                 Ok(SourceHandle {
                     stamp: prepared.stamp,
                     authority: prepared.authority,
+                    source_validity,
+                    config_lineage,
                 })
             })
             .ok_or(CoordinationFailure::Stale)?

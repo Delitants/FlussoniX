@@ -6,6 +6,23 @@ use flussonix::{
 };
 use serde_json::{Value, json};
 
+#[test]
+fn local_iptv_policy_is_distinct_from_http_callback_backends() {
+    let policies = PolicySet::new(&json!({"on_play":"iptv://"}), &json!({}), &json!([])).unwrap();
+    let expected =
+        flussonix::playback_auth::Policy::from_config(&json!({"on_play":"iptv://"}), &json!({}))
+            .unwrap();
+    assert_eq!(policies.for_groups(&json!([])).unwrap(), expected);
+    assert!(matches!(
+        PolicySet::new(
+            &json!({"on_play":"true"}),
+            &json!({}),
+            &json!([{"name":"bad","url":"iptv://"}])
+        ),
+        Err(PolicyFailure::Invalid)
+    ));
+}
+
 fn set(source: Value, groups: Value) -> PolicySet {
     PolicySet::new(&source, &groups, &json!([])).unwrap()
 }

@@ -85,11 +85,15 @@ async fn publication(preserve: bool) {
     let worker = publication.worker.clone();
     let mut rx = worker.wire.m4s.subscribe();
     let mut stdin = publication.stdin.take().unwrap();
+    let fed_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let written = fed_bytes.clone();
+    let began = std::time::Instant::now();
     let writer = tokio::spawn(async move {
         for b in ts.chunks(188 * 32) {
             if stdin.write_all(b).await.is_err() {
                 return;
             }
+            written.fetch_add(b.len(), std::sync::atomic::Ordering::Relaxed);
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
         let _ = stdin.shutdown().await;
@@ -123,7 +127,8 @@ async fn publication(preserve: bool) {
                     }
                 }
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
-                Ok(Err(e)) => panic!("native queue lost records: {e}"),
+                Ok(Err(e)) => panic!("native queue lost records: {e}; collected_frames={}; retained_records_and_bytes={:?}; fed_bytes={}; elapsed_ms={}; worker={}",
+                    frames.len(), worker.wire.m4s.retained(), fed_bytes.load(std::sync::atomic::Ordering::Relaxed), began.elapsed().as_millis(), worker.stats()),
                 Err(_) => {
                     if worker.is_closed() {
                         break;

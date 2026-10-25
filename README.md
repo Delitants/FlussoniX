@@ -10,9 +10,11 @@ FlussoniX does not require any official Flussonic components.
 - Manage streams, templates, server settings and cluster nodes through normal web forms.
 - Receive and deliver HLS, HTTP MPEG-TS, M4F/M4S, SRT, RTSP/RTSPS and RTP/SRTP using the supported profiles.
 - Use HTTPS and encrypted transports, viewer tokens and authorization callbacks, and upstream/publisher Basic authentication.
+- Manage local IPTV packages and subscribers, issue token-protected playlists and revoke viewers when access changes.
 - Transcode video and audio with the CPU or supported Intel/NVIDIA GPUs. The UI reports GPU readiness.
 - Preserve, convert or remove subtitles; supported conversion profiles produce HLS WebVTT.
 - Build a FlussoniX source/CDN cluster with LAN stream pulls and load balancing based on uplink, CPU and RAM.
+- Try [FXLink](docs/fxlink.md), an opt-in experimental native transport with loss recovery; locally tested, with cross-host and load qualification pending.
 
 Protocol, codec and API coverage is still incomplete. Mixed Flussonic clusters are under development; [mapped CDN routing](docs/vendor-cdn-placement.md) includes HTTP/RTSP redirects and HTTPS SRT lookup for compatible clients. Explicit Flussonic HTTP source profiles support playback and [equivalent-origin failover](docs/vendor-daemon-failover.md). See [compatibility](docs/compatibility.md) before planning a migration.
 
@@ -23,23 +25,36 @@ Use a test server and an available port. Install **FFmpeg and FFprobe** independ
 [Download a Linux preview](https://github.com/Delitants/FlussoniX/releases). Packaged previews may be older than the current source. Extract the package, open a terminal in its directory and set your credentials:
 
 ```bash
+umask 077
 export FLUSSONIX_ADMIN_USER=admin
 read -r -s -p "Choose an admin password: " FLUSSONIX_ADMIN_PASSWORD
 echo
 export FLUSSONIX_ADMIN_PASSWORD
 export FLUSSONIX_PEER_KEY="$(openssl rand -hex 32)"
+flussonix_data="$HOME/flussonix-data"
+mkdir -p "$flussonix_data"
+chmod 700 "$flussonix_data"
 ```
 
-Keep the peer key the same across nodes in a FlussoniX cluster. To start the downloaded package:
+Save your credentials and generated peer key securely. Reuse them after restarts;
+FlussoniX nodes in the same cluster use the same peer key. To start the downloaded package:
 
 ```bash
 ./bin/flussonix --listen 127.0.0.1:18210 \
-  --config runtime/config.json --media-dir runtime/media --web-dir web
+  --config "$flussonix_data/config.json" \
+  --media-dir "$flussonix_data/media" --web-dir "$PWD/web"
 ```
+
+For a verified download and persistent state across upgrades, follow the
+[installation and rollback guide](docs/installation.md). Keep your credentials
+and peer key for future restarts. For background operation, see the optional
+[systemd service guide](docs/service-installation.md).
 
 Open [the admin interface](http://127.0.0.1:18210/admin/) and sign in as `admin` with the password you chose. This address accepts connections from the same machine; use an SSH tunnel for remote access.
 
 In **Media → Streams**, add your input URL or use `testsrc://` for a test picture. Save the stream and open its player to check playback. Settings persist in the configuration file. Press **Ctrl+C** to stop the server and its workers.
+
+For subscriber playlists, set a public HTTP(S) origin at startup, then use **Config → IPTV** to create packages and subscribers. Their tokens live in a separate owner-only `iptv.json` beside `config.json`. See [IPTV transport support](docs/iptv-transport.md).
 
 ## Build from source
 
@@ -53,11 +68,12 @@ npm ci --prefix web
 npm run build --prefix web
 ```
 
-Set the credentials shown above, then run:
+Set the credentials and external state directory shown above, then run:
 
 ```bash
 ./target/release/flussonix --listen 127.0.0.1:18210 \
-  --config runtime/config.json --media-dir runtime/media --web-dir web/dist
+  --config "$flussonix_data/config.json" \
+  --media-dir "$flussonix_data/media" --web-dir "$PWD/web/dist"
 ```
 
 ## Documentation
@@ -66,5 +82,7 @@ Set the credentials shown above, then run:
 - [Cluster and load balancing](docs/cluster-loadbalancing.md)
 - [Supported native codecs](docs/native-codecs.md)
 - [GPU transcoding](docs/gpu-codec-controls.md)
+- [SRT input options](docs/srt-input.md)
+- [Build a preview archive](docs/packaging.md)
 
 The first production release depends on live Flussonic migration and cluster compatibility checks, authorization/failover validation and production-scale testing. There is no confirmed release date yet.

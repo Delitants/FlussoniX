@@ -1,13 +1,14 @@
 //! Viewer authorization is independent of worker ownership and cluster peer credentials.
+use crate::iptv::store::IptvStore;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -15,14 +16,22 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
     pub url: Option<String>,
+    kind: PolicyKind,
     keys: Vec<String>,
     max_sessions: Option<u64>,
     token_hash: Option<String>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PolicyKind {
+    Open,
+    Callback,
+    Iptv,
 }
 impl Policy {
     pub fn from_config(cfg: &Value, root: &Value) -> Result<Self, String> {
         let mut policy = Self {
             url: None,
+            kind: PolicyKind::Open,
             keys: ["name", "proto", "ip", "token"].map(str::to_owned).to_vec(),
             max_sessions: None,
             token_hash: cfg
@@ -46,6 +55,11 @@ impl Policy {
                     .any(|k| !["url", "session_keys", "max_sessions"].contains(&k.as_str()))
                 {
                     return Err("unsupported on_play field".into());
+                }
+                if obj.get("url").and_then(Value::as_str) == Some("iptv://")
+                    && (obj.contains_key("session_keys") || obj.contains_key("max_sessions"))
+                {
+                    return Err("IPTV on_play does not accept callback options".into());
                 }
                 if let Some(keys) = obj.get("session_keys") {
                     policy.keys = keys
@@ -79,6 +93,13 @@ impl Policy {
                     .and_then(Value::as_str)
                     .ok_or("on_play.url required")?
             };
+            if raw == "iptv://" {
+                policy.kind = PolicyKind::Iptv;
+                return Ok(policy);
+            }
+            if raw.starts_with("iptv://") {
+                return Err("IPTV on_play must be exactly iptv://".into());
+            }
             let url = if let Some(name) = raw.strip_prefix("auth://") {
                 crate::config::valid_name(name)?;
                 root["auth_backends"]
@@ -91,6 +112,7 @@ impl Policy {
             };
             validate_http(url)?;
             policy.url = Some(url.to_owned());
+            policy.kind = PolicyKind::Callback;
         }
         Ok(policy)
     }
@@ -145,6 +167,8 @@ pub struct ViewerRequest {
     pub user_agent: String,
     pub referer: String,
     pub host: String,
+    /// A finite media response sharing the protocol identity of a live signal.
+    pub finite_media: bool,
 }
 #[derive(Clone)]
 enum Decision {
@@ -163,6 +187,11 @@ struct State {
     created: Instant,
     last_seen: Instant,
     playback_seen: Option<Instant>,
+    continuous_live: usize,
+    control_live: usize,
+    segmented_live: usize,
+    segmented_control_live: usize,
+    handoff_live: usize,
     effective_max: Option<u64>,
     unique: bool,
     number: u64,
@@ -173,6 +202,48 @@ struct State {
     cancel: CancellationToken,
 }
 impl State {
+    fn capacity_units(&self, live: usize, per_connection: bool) -> usize {
+        if live == 0 {
+            return usize::from(
+                matches!(self.decision, Decision::Allow)
+                    && self
+                        .playback_seen
+                        .is_some_and(|seen| seen.elapsed() < Duration::from_secs(30)),
+            );
+        }
+        if !per_connection {
+            return 1;
+        }
+        // Unclaimed handoffs each hold a slot. Finite media shares a matching
+        // continuous signal's slot; ordinary controls remain independent.
+        let active = self
+            .control_live
+            .saturating_add(self.handoff_live)
+            .saturating_add(self.continuous_live);
+        active.saturating_add(usize::from(
+            active == 0 && (self.segmented_live > 0 || self.segmented_control_live > 0),
+        ))
+    }
+    fn add_grant(&mut self, kind: GrantKind) {
+        match kind {
+            GrantKind::Continuous => self.continuous_live += 1,
+            GrantKind::Segmented => self.segmented_live += 1,
+            GrantKind::Handoff => self.handoff_live += 1,
+            GrantKind::Control => self.control_live += 1,
+            GrantKind::SegmentedControl => self.segmented_control_live += 1,
+            GrantKind::ConsumedHandoff => {}
+        }
+    }
+    fn remove_grant(&mut self, kind: GrantKind) {
+        match kind {
+            GrantKind::Continuous => self.continuous_live -= 1,
+            GrantKind::Segmented => self.segmented_live -= 1,
+            GrantKind::Handoff => self.handoff_live -= 1,
+            GrantKind::Control => self.control_live -= 1,
+            GrantKind::SegmentedControl => self.segmented_control_live -= 1,
+            GrantKind::ConsumedHandoff => {}
+        }
+    }
     fn cancel_playback(&mut self) {
         self.cancel.cancel();
         self.playback_seen = None;
@@ -246,14 +317,43 @@ impl Entries {
             !sessions.is_empty()
         });
     }
+    /// Called under the cache lock, which also serializes new Arc/Weak owners.
+    fn prune(&mut self, now: Instant, capacity_pressure: bool) {
+        self.retain(|_, entry| {
+            // Renewal callbacks carry Arc ownership without an admission count.
+            if Arc::strong_count(entry) > 1
+                || entry.live.load(Ordering::Relaxed) > 0
+                || entry.admissions.load(Ordering::Relaxed) > 0
+            {
+                return true;
+            }
+            let state = entry.state.lock().unwrap();
+            if state.revoked_until.is_some_and(|until| until > now)
+                || state
+                    .playback_seen
+                    .is_some_and(|seen| now.duration_since(seen) < Duration::from_secs(30))
+            {
+                return true;
+            }
+            if capacity_pressure {
+                // Ordinary failed decisions may be checked early, but allowed
+                // sessions keep their normal reconnect/renewal semantics.
+                matches!(state.decision, Decision::Allow)
+            } else {
+                now.duration_since(state.last_seen) < Duration::from_secs(30)
+                    || (!matches!(state.decision, Decision::Allow) && state.next_check > now)
+            }
+        });
+    }
 }
 impl Entry {
-    fn occupied(&self) -> bool {
+    fn occupied_units(&self, node_capacity: bool) -> usize {
         let s = self.state.lock().unwrap();
-        self.live.load(Ordering::Relaxed) > 0
-            || (matches!(s.decision, Decision::Allow)
-                && s.playback_seen
-                    .is_some_and(|seen| seen.elapsed() < Duration::from_secs(30)))
+        let live = usize::try_from(self.live.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+        s.capacity_units(live, node_capacity || s.policy.kind == PolicyKind::Iptv)
+    }
+    fn occupied(&self) -> bool {
+        self.occupied_units(false) > 0
     }
 }
 // Keep in-flight policy requests in the cache; only admitted grants own capacity.
@@ -278,8 +378,82 @@ pub struct Grant {
     output_credit: Option<Arc<crate::admission_credit::OutputCredit>>,
     entry: Option<Arc<Entry>>,
     cancel: CancellationToken,
+    expires_at: Option<SystemTime>,
+    expiry_task: Option<tokio::task::JoinHandle<()>>,
+    kind: AtomicU8,
+    segmented_delivery: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum GrantKind {
+    Control,
+    Continuous,
+    Segmented,
+    Handoff,
+    SegmentedControl,
+    ConsumedHandoff,
+}
+impl GrantKind {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Continuous,
+            2 => Self::Segmented,
+            3 => Self::Handoff,
+            4 => Self::SegmentedControl,
+            5 => Self::ConsumedHandoff,
+            _ => Self::Control,
+        }
+    }
 }
 impl Grant {
+    fn expire_at(&mut self, expires_at: SystemTime) {
+        self.expires_at = Some(expires_at);
+        // A child token keeps this viewer's deadline separate from the
+        // entry's shared cancellation state and wakes token-only transports.
+        self.cancel = self.cancel.child_token();
+        let cancel = self.cancel.clone();
+        self.expiry_task = Some(tokio::spawn(async move {
+            loop {
+                let Ok(remaining) = expires_at.duration_since(SystemTime::now()) else {
+                    cancel.cancel();
+                    break;
+                };
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(remaining.min(Duration::from_secs(60))) => {}
+                }
+            }
+        }));
+    }
+    pub(crate) fn mark_handoff(&mut self) {
+        if let Some(entry) = &self.entry {
+            let mut s = entry.state.lock().unwrap();
+            let kind = GrantKind::from_u8(self.kind.load(Ordering::Relaxed));
+            if matches!(kind, GrantKind::Control | GrantKind::SegmentedControl) {
+                s.remove_grant(kind);
+                s.add_grant(GrantKind::Handoff);
+                self.kind.store(GrantKind::Handoff as u8, Ordering::Relaxed);
+            }
+        }
+    }
+    pub(crate) fn restore_handoff(&mut self) -> bool {
+        if self.is_cancelled() {
+            return false;
+        }
+        let Some(entry) = &self.entry else {
+            return false;
+        };
+        let mut state = entry.state.lock().unwrap();
+        match GrantKind::from_u8(self.kind.load(Ordering::Relaxed)) {
+            GrantKind::Handoff => true,
+            GrantKind::ConsumedHandoff => {
+                state.add_grant(GrantKind::Handoff);
+                self.kind.store(GrantKind::Handoff as u8, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
+    }
     pub(crate) fn release_capacity_reservation(&mut self) {
         self.capacity_reservation = None;
     }
@@ -296,7 +470,7 @@ impl Grant {
     }
     /// Read-only recovery permission from this original native viewer grant.
     pub(crate) fn recovery_activity(&self) -> Option<Instant> {
-        if self.cancel.is_cancelled() {
+        if self.is_cancelled() {
             return None;
         }
         let entry = self.entry.as_ref()?;
@@ -310,8 +484,19 @@ impl Grant {
     pub(crate) fn playback(&self) {
         if let Some(e) = &self.entry {
             let mut s = e.state.lock().unwrap();
-            if self.cancel.is_cancelled() {
+            if self.is_cancelled() {
                 return;
+            }
+            let previous = GrantKind::from_u8(self.kind.load(Ordering::Relaxed));
+            if matches!(previous, GrantKind::Control | GrantKind::SegmentedControl) {
+                let kind = if self.segmented_delivery {
+                    GrantKind::Segmented
+                } else {
+                    GrantKind::Continuous
+                };
+                s.remove_grant(previous);
+                s.add_grant(kind);
+                self.kind.store(kind as u8, Ordering::Relaxed);
             }
             let now = Instant::now();
             s.playback_seen = Some(now);
@@ -324,6 +509,10 @@ impl Grant {
             output_credit: None,
             capacity_reservation: None,
             cancel: CancellationToken::new(),
+            expires_at: None,
+            expiry_task: None,
+            kind: AtomicU8::new(GrantKind::Control as u8),
+            segmented_delivery: false,
         }
     }
     pub async fn cancelled(&self) {
@@ -334,17 +523,20 @@ impl Grant {
     }
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+            || self
+                .expires_at
+                .is_some_and(|expires_at| SystemTime::now() >= expires_at)
     }
     pub fn add_bytes(&self, bytes: usize) {
         if bytes > 0
-            && !self.cancel.is_cancelled()
+            && !self.is_cancelled()
             && let Some(credit) = &self.output_credit
         {
             credit.record(bytes);
         }
         if let Some(e) = &self.entry {
             let mut s = e.state.lock().unwrap();
-            if self.cancel.is_cancelled() {
+            if self.is_cancelled() {
                 return;
             }
             e.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
@@ -358,6 +550,9 @@ impl Grant {
 }
 impl Drop for Grant {
     fn drop(&mut self) {
+        if let Some(task) = self.expiry_task.take() {
+            task.abort();
+        }
         if let Some(e) = &self.entry {
             // A reservation represented by this live grant must return to the
             // pending count atomically with releasing its live occupancy.
@@ -365,6 +560,8 @@ impl Drop for Grant {
                 .capacity_reservation
                 .as_ref()
                 .map(|r| r.entries.lock().unwrap());
+            let mut s = e.state.lock().unwrap();
+            s.remove_grant(GrantKind::from_u8(self.kind.load(Ordering::Relaxed)));
             e.live.fetch_sub(1, Ordering::Relaxed);
         }
     }
@@ -375,6 +572,14 @@ pub enum AuthOutcome {
     Redirect(String),
 }
 pub struct PlaybackAuth {
+    iptv: Option<Arc<IptvStore>>,
+    #[cfg(test)]
+    iptv_lookup_gate: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     idle_memory: crate::idle_memory::Controller,
     authority: Mutex<HashMap<String, Authority>>,
     entries: Arc<Mutex<Entries>>,
@@ -384,7 +589,16 @@ pub struct PlaybackAuth {
 }
 impl PlaybackAuth {
     pub fn new(limit: usize) -> Self {
+        Self::build(limit, None)
+    }
+    pub fn with_iptv(limit: usize, store: Arc<IptvStore>) -> Self {
+        Self::build(limit, Some(store))
+    }
+    fn build(limit: usize, iptv: Option<Arc<IptvStore>>) -> Self {
         Self {
+            iptv,
+            #[cfg(test)]
+            iptv_lookup_gate: Mutex::new(None),
             idle_memory: crate::idle_memory::Controller::default(),
             authority: Mutex::new(HashMap::new()),
             entries: Arc::new(Mutex::new(Entries::default())),
@@ -441,14 +655,49 @@ impl PlaybackAuth {
         })
     }
     pub async fn authorize(&self, snapshot: PolicySnapshot, request: ViewerRequest) -> AuthOutcome {
-        self.authorize_inner(snapshot, request, true, None).await
+        self.authorize_inner(snapshot, request, true, None, None, None)
+            .await
+    }
+    pub(crate) async fn authorize_handoff(
+        &self,
+        snapshot: PolicySnapshot,
+        request: ViewerRequest,
+        handoff: &Grant,
+    ) -> AuthOutcome {
+        self.authorize_inner(snapshot, request, true, None, Some(handoff), None)
+            .await
+    }
+    pub(crate) async fn authorize_handoff_reuse(
+        &self,
+        snapshot: PolicySnapshot,
+        request: ViewerRequest,
+        identity: &str,
+    ) -> Option<AuthOutcome> {
+        let key = snapshot.policy.identity(&request);
+        if snapshot.name != request.name
+            || !self
+                .entries
+                .lock()
+                .unwrap()
+                .by_stream
+                .get(&request.name)
+                .and_then(|sessions| sessions.get(&key))
+                .is_some_and(|entry| entry.id == identity)
+        {
+            return None;
+        }
+        Some(
+            self.authorize_inner(snapshot, request, true, None, None, Some(identity))
+                .await,
+        )
     }
     pub(crate) async fn authorize_control(
         &self,
         snapshot: PolicySnapshot,
         request: ViewerRequest,
     ) -> AuthOutcome {
-        self.authorize_inner(snapshot, request, false, None).await
+        self.authorize_inner(snapshot, request, false, None, None, None)
+            .await
     }
     pub(crate) fn reserve_capacity(&self, additional: usize) -> Option<Arc<CapacityReservation>> {
         let mut entries = self.entries.lock().unwrap();
@@ -457,8 +706,7 @@ impl PlaybackAuth {
             .retain(|_, slot| slot.expires > Instant::now());
         if entries
             .values()
-            .filter(|e| e.occupied())
-            .count()
+            .fold(0usize, |sum, e| sum.saturating_add(e.occupied_units(true)))
             .saturating_add(
                 entries
                     .reserved
@@ -490,7 +738,7 @@ impl PlaybackAuth {
         request: ViewerRequest,
         reservation: Arc<CapacityReservation>,
     ) -> AuthOutcome {
-        self.authorize_inner(snapshot, request, false, Some(reservation))
+        self.authorize_inner(snapshot, request, false, Some(reservation), None, None)
             .await
     }
     async fn authorize_inner(
@@ -499,6 +747,8 @@ impl PlaybackAuth {
         request: ViewerRequest,
         playback: bool,
         reservation: Option<Arc<CapacityReservation>>,
+        handoff: Option<&Grant>,
+        reuse_identity: Option<&str>,
     ) -> AuthOutcome {
         if snapshot.name != request.name {
             return AuthOutcome::Denied;
@@ -510,6 +760,26 @@ impl PlaybackAuth {
         if !policy.accepts_token(&request.token) {
             return AuthOutcome::Denied;
         }
+        if policy.kind == PolicyKind::Iptv
+            && !self.iptv.as_ref().is_some_and(|store| {
+                store
+                    .snapshot()
+                    .authorize(&request.token, &request.name, SystemTime::now())
+                    .is_some()
+            })
+        {
+            return AuthOutcome::Denied;
+        }
+        #[cfg(test)]
+        if policy.kind == PolicyKind::Iptv {
+            let gate = self.iptv_lookup_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+        }
+        let iptv_request = (policy.kind == PolicyKind::Iptv).then(|| request.clone());
+        let segmented_delivery = request.proto == "hls" || request.finite_media;
         let identity = policy.identity(&request);
         let entry = {
             let authority = self.authority.lock().unwrap();
@@ -519,15 +789,20 @@ impl PlaybackAuth {
                 return AuthOutcome::Denied;
             }
             let mut all = self.entries.lock().unwrap();
-            all.retain(|_, e| {
-                let s = e.state.lock().unwrap();
-                e.live.load(Ordering::Relaxed) > 0
-                    || e.admissions.load(Ordering::Relaxed) > 0
-                    || s.last_seen.elapsed() < Duration::from_secs(30)
-                    || (!matches!(s.decision, Decision::Allow) && s.next_check > Instant::now())
-            });
-            if !all.contains_key(&request.name, &identity) && all.len() >= 20_000 {
+            all.prune(Instant::now(), false);
+            if reuse_identity.is_some_and(|expected| {
+                all.by_stream
+                    .get(&request.name)
+                    .and_then(|sessions| sessions.get(&identity))
+                    .is_none_or(|entry| entry.id != expected)
+            }) {
                 return AuthOutcome::Denied;
+            }
+            if !all.contains_key(&request.name, &identity) && all.len() >= 20_000 {
+                all.prune(Instant::now(), true);
+                if all.len() >= 20_000 {
+                    return AuthOutcome::Denied;
+                }
             }
             let entry = all
                 .by_stream
@@ -546,6 +821,11 @@ impl PlaybackAuth {
                             created: Instant::now(),
                             last_seen: Instant::now(),
                             playback_seen: None,
+                            continuous_live: 0,
+                            control_live: 0,
+                            segmented_live: 0,
+                            segmented_control_live: 0,
+                            handoff_live: 0,
                             effective_max: None,
                             unique: false,
                             number: 0,
@@ -575,7 +855,7 @@ impl PlaybackAuth {
             s.last_seen = Instant::now();
         }
         self.refresh(&entry).await;
-        let outcome = {
+        let admit = || {
             let authority = self.authority.lock().unwrap();
             if !authority.get(&snapshot.name).is_some_and(|p| {
                 p.revision == snapshot.revision && p.policy.as_ref() == Some(&policy)
@@ -607,16 +887,64 @@ impl PlaybackAuth {
                         .values()
                         .filter(|e| !Arc::ptr_eq(e, &entry))
                         .collect::<Vec<_>>();
-                    let already = entry.live.load(Ordering::Relaxed) > 0
-                        || s.playback_seen
-                            .is_some_and(|seen| seen.elapsed() < Duration::from_secs(30));
-                    let slots = others.iter().filter(|e| e.occupied()).count();
-                    let user_slots = others
+                    let live =
+                        usize::try_from(entry.live.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+                    let recent = s
+                        .playback_seen
+                        .is_some_and(|seen| seen.elapsed() < Duration::from_secs(30));
+                    let kind = if !playback {
+                        if segmented_delivery {
+                            GrantKind::SegmentedControl
+                        } else {
+                            GrantKind::Control
+                        }
+                    } else if segmented_delivery {
+                        GrantKind::Segmented
+                    } else {
+                        GrantKind::Continuous
+                    };
+                    let own_slots = s.capacity_units(live, true);
+                    let handoff_valid = handoff.is_some_and(|h| {
+                        h.entry.as_ref().is_some_and(|e| Arc::ptr_eq(e, &entry))
+                            && GrantKind::from_u8(h.kind.load(Ordering::Relaxed))
+                                == GrantKind::Handoff
+                            && !h.is_cancelled()
+                    });
+                    // A continuous output can consume an existing handoff or
+                    // finite-fragment group once. Further outputs are separate.
+                    let already = match kind {
+                        GrantKind::Continuous => {
+                            handoff_valid
+                                || (s.segmented_live > 0
+                                    && s.continuous_live == 0
+                                    && s.control_live == 0
+                                    && s.handoff_live == 0)
+                                || (live == 0 && recent)
+                        }
+                        GrantKind::Control => live == 0 && recent,
+                        _ => own_slots > 0 || recent,
+                    };
+                    let slots = others.iter().fold(own_slots, |sum, e| {
+                        sum.saturating_add(e.occupied_units(true))
+                    });
+                    let other_user_slots = others
                         .iter()
-                        .filter(|e| e.occupied() && e.state.lock().unwrap().user_id == s.user_id)
-                        .count();
-                    if !already && slots.saturating_add(pending) >= self.limit
-                        || !s.unique && s.effective_max.is_some_and(|n| user_slots as u64 >= n)
+                        .filter(|e| e.state.lock().unwrap().user_id == s.user_id)
+                        .fold(0usize, |sum, e| sum.saturating_add(e.occupied_units(false)));
+                    let exceeds_user_limit = s.effective_max.is_some_and(|max| {
+                        if policy.kind == PolicyKind::Iptv {
+                            other_user_slots
+                                .saturating_add(s.capacity_units(live, true))
+                                .saturating_add(usize::from(!already))
+                                as u64
+                                > max
+                        } else {
+                            other_user_slots as u64 >= max
+                        }
+                    });
+                    if handoff.is_some() && !handoff_valid
+                        || !already && slots.saturating_add(pending) >= self.limit
+                        || !s.unique && exceeds_user_limit
                     {
                         // Capacity is transient; do not poison the cached policy.
                         AuthOutcome::Denied
@@ -635,6 +963,14 @@ impl PlaybackAuth {
                         if playback {
                             s.playback_seen = Some(Instant::now());
                         }
+                        if handoff_valid {
+                            let handoff = handoff.expect("validated handoff");
+                            s.remove_grant(GrantKind::Handoff);
+                            handoff
+                                .kind
+                                .store(GrantKind::ConsumedHandoff as u8, Ordering::Relaxed);
+                        }
+                        s.add_grant(kind);
                         entry.live.fetch_add(1, Ordering::Relaxed);
                         if let Some(r) = &reservation {
                             all.reserved.get_mut(&r.id).unwrap().entry =
@@ -645,12 +981,44 @@ impl PlaybackAuth {
                             output_credit: None,
                             entry: Some(entry.clone()),
                             cancel: s.cancel.clone(),
+                            expires_at: None,
+                            expiry_task: None,
+                            kind: AtomicU8::new(kind as u8),
+                            segmented_delivery,
                         })
                     }
                 }
                 Decision::Redirect(url) => AuthOutcome::Redirect(url.clone()),
                 _ => AuthOutcome::Denied,
             }
+        };
+        let outcome = if let Some(iptv_request) = iptv_request {
+            let Some(store) = self.iptv.as_ref() else {
+                return AuthOutcome::Denied;
+            };
+            let current = store.snapshot();
+            store
+                .at_current(current.revision(), || {
+                    match current.authorize(
+                        &iptv_request.token,
+                        &iptv_request.name,
+                        SystemTime::now(),
+                    ) {
+                        Some(facts) => {
+                            let mut outcome = admit();
+                            if let (Some(expires_at), AuthOutcome::Allowed(grant)) =
+                                (facts.expires_at, &mut outcome)
+                            {
+                                grant.expire_at(expires_at);
+                            }
+                            outcome
+                        }
+                        None => AuthOutcome::Denied,
+                    }
+                })
+                .unwrap_or(AuthOutcome::Denied)
+        } else {
+            admit()
         };
         // Model preemption/cancellation before the caller receives the outcome.
         // Its already-constructed grant owns capacity through this boundary.
@@ -678,7 +1046,7 @@ impl PlaybackAuth {
         };
         // Background renewal can outlive a media worker. Only real callback
         // work holds this fence; an empty periodic sweep stays passive.
-        let _activity = if policy.url.is_some() {
+        let _activity = if policy.kind == PolicyKind::Callback {
             Some(self.idle_memory.activity().await)
         } else {
             None
@@ -688,8 +1056,27 @@ impl PlaybackAuth {
         let mut user_id = None;
         let mut max = policy.max_sessions;
         let mut unique = false;
+        let mut expiry_window = None;
         if !policy.accepts_token(&r.token) {
             decision = Decision::Deny;
+        } else if policy.kind == PolicyKind::Iptv {
+            match self.iptv.as_ref().and_then(|store| {
+                store
+                    .snapshot()
+                    .authorize(&r.token, &r.name, SystemTime::now())
+            }) {
+                Some(facts) => {
+                    user_id = Some(format!("{:x}", Sha256::digest(facts.subscriber.as_bytes())));
+                    max = facts.max_sessions.map(u64::from);
+                    expiry_window = facts
+                        .expires_at
+                        .and_then(|expiry| expiry.duration_since(SystemTime::now()).ok());
+                    if facts.expires_at.is_some() && expiry_window.is_none() {
+                        decision = Decision::Deny;
+                    }
+                }
+                None => decision = Decision::Deny,
+            }
         } else if let Some(url) = &policy.url {
             let Ok(_permit) = self.callbacks.try_acquire() else {
                 self.retry(entry, generation);
@@ -823,6 +1210,9 @@ impl PlaybackAuth {
         s.unique = unique;
         s.decision = decision;
         s.next_check = Instant::now() + Duration::from_secs(seconds);
+        if let Some(window) = expiry_window {
+            s.next_check = s.next_check.min(Instant::now() + window);
+        }
         if matches!(s.decision, Decision::Allow) {
             s.allowed_until = s.next_check;
         }
@@ -838,13 +1228,7 @@ impl PlaybackAuth {
         use futures_util::{StreamExt, stream};
         let mut due = {
             let mut all = self.entries.lock().unwrap();
-            all.retain(|_, e| {
-                let s = e.state.lock().unwrap();
-                e.live.load(Ordering::Relaxed) > 0
-                    || e.admissions.load(Ordering::Relaxed) > 0
-                    || s.last_seen.elapsed() < Duration::from_secs(30)
-                    || (!matches!(s.decision, Decision::Allow) && s.next_check > Instant::now())
-            });
+            all.prune(Instant::now(), false);
             all.values()
                 .filter_map(|e| {
                     let s = e.state.lock().unwrap();
@@ -888,6 +1272,22 @@ impl PlaybackAuth {
             .collect::<Vec<_>>();
         for name in names {
             self.publish(&name, policy_for(&name));
+        }
+    }
+    /// Called while IPTV publication holds the store write lock. The order is
+    /// store -> authority -> entries -> state, matching final admission.
+    pub fn invalidate_iptv(&self) {
+        let _authority = self.authority.lock().unwrap();
+        let entries = self.entries.lock().unwrap();
+        for entry in entries.values() {
+            let mut state = entry.state.lock().unwrap();
+            if state.policy.kind != PolicyKind::Iptv {
+                continue;
+            }
+            state.cancel_playback();
+            state.decision = Decision::Unknown;
+            state.next_check = Instant::now();
+            state.generation += 1;
         }
     }
     pub fn revoke(&self, id: &str) -> bool {
@@ -950,12 +1350,9 @@ impl PlaybackAuth {
         json!({"id":e.id,"name":s.request.name,"proto":s.request.proto,"ip":s.request.ip,"user_id":s.user_id,"duration":s.created.elapsed().as_secs(),"bytes":e.bytes.load(Ordering::Relaxed),"is_open":matches!(s.decision, Decision::Allow)})
     }
     pub fn active(&self) -> u64 {
-        self.entries
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|e| e.occupied())
-            .count() as u64
+        self.entries.lock().unwrap().values().fold(0u64, |sum, e| {
+            sum.saturating_add(e.occupied_units(true) as u64)
+        })
     }
     /// Live authorization holders, excluding cached decisions kept for reconnects.
     pub fn live_grants(&self) -> u64 {
@@ -1038,8 +1435,406 @@ impl PlaybackAuth {
 mod idle_memory_tests;
 
 #[cfg(test)]
+mod capacity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn expiring_grant_cancels_its_transport_token_without_canceling_parent() {
+        let mut grant = Grant::peer();
+        let parent = grant.cancellation_token();
+        grant.expire_at(SystemTime::now() + Duration::from_millis(50));
+        let transport = grant.cancellation_token();
+        tokio::time::timeout(Duration::from_secs(1), transport.cancelled())
+            .await
+            .expect("expiry must wake token-only transport watchers");
+        assert!(grant.is_cancelled());
+        assert!(
+            !parent.is_cancelled(),
+            "other viewers share the parent token"
+        );
+    }
+
+    #[tokio::test]
+    async fn iptv_limit_rejects_a_second_live_connection_with_the_same_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IptvStore::open(dir.path().join("iptv.json")).unwrap();
+        store.set_enabled(true).unwrap();
+        store
+            .put_package("basic", json!({"channels":["news"]}))
+            .unwrap();
+        store
+            .put_subscriber(
+                "alice",
+                json!({"token":"subscriber-token","packages":["basic"],"max_sessions":1}),
+            )
+            .unwrap();
+        let auth = PlaybackAuth::with_iptv(8, store);
+        let policy = Policy::from_config(&json!({"on_play":"iptv://"}), &json!({})).unwrap();
+        let snapshot = auth.publish("news", Some(policy)).unwrap();
+        let viewer = ViewerRequest {
+            name: "news".into(),
+            proto: "mpegts".into(),
+            ip: "192.0.2.10".into(),
+            token: "subscriber-token".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(first) = auth.authorize(snapshot.clone(), viewer.clone()).await
+        else {
+            panic!("first subscriber connection denied")
+        };
+        assert!(matches!(
+            auth.authorize(snapshot.clone(), viewer.clone()).await,
+            AuthOutcome::Denied
+        ));
+        drop(first);
+        assert!(matches!(
+            auth.authorize(snapshot, viewer).await,
+            AuthOutcome::Allowed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn iptv_connections_use_global_capacity_without_blocking_hls_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IptvStore::open(dir.path().join("iptv.json")).unwrap();
+        store.set_enabled(true).unwrap();
+        store
+            .put_package("basic", json!({"channels":["news"]}))
+            .unwrap();
+        store
+            .put_subscriber(
+                "alice",
+                json!({"token":"subscriber-token","packages":["basic"],"max_sessions":3}),
+            )
+            .unwrap();
+        let policy = Policy::from_config(&json!({"on_play":"iptv://"}), &json!({})).unwrap();
+        let viewer = |proto: &str| ViewerRequest {
+            name: "news".into(),
+            proto: proto.into(),
+            ip: "192.0.2.10".into(),
+            token: "subscriber-token".into(),
+            ..Default::default()
+        };
+
+        let auth = PlaybackAuth::with_iptv(1, store.clone());
+        let snapshot = auth.publish("news", Some(policy.clone())).unwrap();
+        let AuthOutcome::Allowed(first) = auth.authorize(snapshot.clone(), viewer("mpegts")).await
+        else {
+            panic!("first connection denied")
+        };
+        assert!(matches!(
+            auth.authorize(snapshot, viewer("mpegts")).await,
+            AuthOutcome::Denied
+        ));
+        drop(first);
+
+        let hls = PlaybackAuth::with_iptv(1, store);
+        let snapshot = hls.publish("news", Some(policy)).unwrap();
+        let AuthOutcome::Allowed(first_segment) =
+            hls.authorize(snapshot.clone(), viewer("hls")).await
+        else {
+            panic!("first HLS request denied")
+        };
+        assert!(matches!(
+            hls.authorize(snapshot, viewer("hls")).await,
+            AuthOutcome::Allowed(_)
+        ));
+        drop(first_segment);
+    }
+
+    #[tokio::test]
+    async fn global_limit_counts_matching_continuous_connections_for_open_streams() {
+        let auth = PlaybackAuth::new(1);
+        let policy = Policy::from_config(&json!({}), &json!({})).unwrap();
+        let snapshot = auth.publish("news", Some(policy)).unwrap();
+        let request = ViewerRequest {
+            name: "news".into(),
+            proto: "mpegts".into(),
+            ip: "192.0.2.10".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(first) = auth.authorize(snapshot.clone(), request.clone()).await
+        else {
+            panic!("first open connection denied")
+        };
+        assert!(matches!(
+            auth.authorize(snapshot, request).await,
+            AuthOutcome::Denied
+        ));
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn finite_m4f_fragments_share_a_signal_slot_but_two_signals_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IptvStore::open(dir.path().join("iptv.json")).unwrap();
+        store.set_enabled(true).unwrap();
+        store
+            .put_package("basic", json!({"channels":["news"]}))
+            .unwrap();
+        store
+            .put_subscriber(
+                "alice",
+                json!({"token":"subscriber-token","packages":["basic"],"max_sessions":1}),
+            )
+            .unwrap();
+        let auth = PlaybackAuth::with_iptv(1, store);
+        let policy = Policy::from_config(&json!({"on_play":"iptv://"}), &json!({})).unwrap();
+        let snapshot = auth.publish("news", Some(policy)).unwrap();
+        let fragment = ViewerRequest {
+            name: "news".into(),
+            proto: "m4f".into(),
+            token: "subscriber-token".into(),
+            finite_media: true,
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(first_fragment) =
+            auth.authorize(snapshot.clone(), fragment.clone()).await
+        else {
+            panic!("first finite M4F fragment denied")
+        };
+        let AuthOutcome::Allowed(second_fragment) =
+            auth.authorize(snapshot.clone(), fragment.clone()).await
+        else {
+            panic!("overlapping finite M4F fragment denied")
+        };
+        let signal = ViewerRequest {
+            finite_media: false,
+            ..fragment
+        };
+        let AuthOutcome::Allowed(first_signal) =
+            auth.authorize(snapshot.clone(), signal.clone()).await
+        else {
+            panic!("matching M4F signal denied")
+        };
+        assert_eq!(auth.active(), 1);
+        assert!(matches!(
+            auth.authorize(snapshot, signal).await,
+            AuthOutcome::Denied
+        ));
+        drop((first_fragment, second_fragment, first_signal));
+    }
+
+    #[tokio::test]
+    async fn two_matching_rtsp_control_grants_cannot_bypass_capacity_on_promotion() {
+        let auth = PlaybackAuth::new(1);
+        let policy = Policy::from_config(&json!({}), &json!({})).unwrap();
+        let snapshot = auth.publish("news", Some(policy)).unwrap();
+        let viewer = ViewerRequest {
+            name: "news".into(),
+            proto: "rtsp".into(),
+            ip: "192.0.2.10".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(first) = auth
+            .authorize_control(snapshot.clone(), viewer.clone())
+            .await
+        else {
+            panic!("first control admission denied")
+        };
+        assert!(matches!(
+            auth.authorize_control(snapshot.clone(), viewer.clone())
+                .await,
+            AuthOutcome::Denied
+        ));
+        first.playback();
+        assert_eq!(auth.active(), 1);
+        assert!(matches!(
+            auth.authorize_control(snapshot, viewer).await,
+            AuthOutcome::Denied
+        ));
+    }
+
+    #[tokio::test]
+    async fn unrelated_direct_output_cannot_share_an_unclaimed_handoff_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IptvStore::open(dir.path().join("iptv.json")).unwrap();
+        store.set_enabled(true).unwrap();
+        store
+            .put_package("basic", json!({"channels":["news"]}))
+            .unwrap();
+        store
+            .put_subscriber(
+                "alice",
+                json!({"token":"subscriber-token","packages":["basic"],"max_sessions":3}),
+            )
+            .unwrap();
+        let auth = PlaybackAuth::with_iptv(3, store);
+        let policy = Policy::from_config(&json!({"on_play":"iptv://"}), &json!({})).unwrap();
+        let snapshot = auth.publish("news", Some(policy)).unwrap();
+        let viewer = ViewerRequest {
+            name: "news".into(),
+            proto: "mpegts".into(),
+            token: "subscriber-token".into(),
+            ..Default::default()
+        };
+        let mut handoffs = Vec::new();
+        for _ in 0..2 {
+            let slot = auth.reserve_capacity(0).unwrap();
+            let AuthOutcome::Allowed(mut handoff) = auth
+                .authorize_reserved(snapshot.clone(), viewer.clone(), slot)
+                .await
+            else {
+                panic!("reserved control denied")
+            };
+            handoff.release_capacity_reservation();
+            handoff.mark_handoff();
+            handoffs.push(handoff);
+        }
+        let AuthOutcome::Allowed(direct) = auth.authorize(snapshot.clone(), viewer.clone()).await
+        else {
+            panic!("third independent slot denied")
+        };
+        assert_eq!(auth.active(), 3);
+        assert!(matches!(
+            auth.authorize(snapshot.clone(), viewer.clone()).await,
+            AuthOutcome::Denied
+        ));
+        let AuthOutcome::Allowed(claimed) =
+            auth.authorize_handoff(snapshot, viewer, &handoffs[0]).await
+        else {
+            panic!("claimed handoff lost its promised slot")
+        };
+        assert_eq!(auth.active(), 3);
+        drop((direct, claimed, handoffs));
+    }
+
+    #[tokio::test]
+    async fn hls_segments_share_a_matching_unclaimed_handoff_identity() {
+        let auth = PlaybackAuth::new(1);
+        let policy = Policy::from_config(&json!({}), &json!({})).unwrap();
+        let snapshot = auth.publish("news", Some(policy)).unwrap();
+        let viewer = ViewerRequest {
+            name: "news".into(),
+            proto: "hls".into(),
+            token: "viewer".into(),
+            ..Default::default()
+        };
+        let reservation = auth.reserve_capacity(0).unwrap();
+        let AuthOutcome::Allowed(mut handoff) = auth
+            .authorize_reserved(snapshot.clone(), viewer.clone(), reservation)
+            .await
+        else {
+            panic!("HLS control handoff denied")
+        };
+        handoff.release_capacity_reservation();
+        handoff.mark_handoff();
+        let AuthOutcome::Allowed(segment) = auth.authorize(snapshot.clone(), viewer.clone()).await
+        else {
+            panic!("same-identity HLS segment denied")
+        };
+        assert_eq!(auth.active(), 1);
+        let AuthOutcome::Allowed(claimed) =
+            auth.authorize_handoff(snapshot, viewer, &handoff).await
+        else {
+            panic!("HLS handoff lost its slot")
+        };
+        assert_eq!(auth.active(), 1);
+        drop((segment, claimed, handoff));
+    }
+
+    #[tokio::test]
+    async fn subscriber_edit_between_lookup_and_admission_cannot_publish_old_token() {
+        for edit in [
+            "token",
+            "package",
+            "subscriber",
+            "limit",
+            "disable",
+            "expiry",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = IptvStore::open(dir.path().join("iptv.json")).unwrap();
+            store.set_enabled(true).unwrap();
+            store
+                .put_package("basic", json!({"channels":["news","sports"]}))
+                .unwrap();
+            store
+                .put_subscriber(
+                    "alice",
+                    json!({"token":"old-token","packages":["basic"],"max_sessions":2}),
+                )
+                .unwrap();
+            let auth = Arc::new(PlaybackAuth::with_iptv(8, store.clone()));
+            let weak = Arc::downgrade(&auth);
+            store.set_on_change(Box::new(move || {
+                if let Some(auth) = weak.upgrade() {
+                    auth.invalidate_iptv();
+                }
+            }));
+            let policy = Policy::from_config(&json!({"on_play":"iptv://"}), &json!({})).unwrap();
+            let news = auth.publish("news", Some(policy.clone())).unwrap();
+            let sports = auth.publish("sports", Some(policy)).unwrap();
+            let viewer = |name: &str| ViewerRequest {
+                name: name.into(),
+                proto: "mpegts".into(),
+                token: "old-token".into(),
+                ..Default::default()
+            };
+            let held = if edit == "limit" {
+                let AuthOutcome::Allowed(grant) =
+                    auth.authorize(news.clone(), viewer("news")).await
+                else {
+                    panic!("initial grant");
+                };
+                Some(grant)
+            } else {
+                None
+            };
+            let (selected, request) = if edit == "limit" {
+                (sports, viewer("sports"))
+            } else {
+                (news, viewer("news"))
+            };
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            *auth.iptv_lookup_gate.lock().unwrap() = Some((entered_tx, release_rx));
+            let pending = tokio::spawn({
+                let auth = auth.clone();
+                async move { auth.authorize(selected, request).await }
+            });
+            entered_rx.await.unwrap();
+            match edit {
+                "token" => {
+                    store
+                        .put_subscriber("alice", json!({"token":"new-token"}))
+                        .unwrap();
+                }
+                "package" => {
+                    store.delete_package("basic").unwrap();
+                }
+                "subscriber" => {
+                    store.delete_subscriber("alice").unwrap();
+                }
+                "limit" => {
+                    store
+                        .put_subscriber("alice", json!({"max_sessions":1}))
+                        .unwrap();
+                }
+                "disable" => {
+                    store.set_enabled(false).unwrap();
+                }
+                "expiry" => {
+                    store
+                        .put_subscriber(
+                            "alice",
+                            json!({"flussonix_expires_at":"2000-01-01T00:00:00Z"}),
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            release_tx.send(()).unwrap();
+            assert!(
+                matches!(pending.await.unwrap(), AuthOutcome::Denied),
+                "{edit}"
+            );
+            drop(held);
+        }
+    }
 
     async fn candidate_fixture() -> (Arc<PlaybackAuth>, RecoveryDemand, Arc<Entry>, Arc<Entry>) {
         let auth = Arc::new(PlaybackAuth::new(128));

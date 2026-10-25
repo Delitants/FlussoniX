@@ -620,7 +620,9 @@ async fn unpolled_refresh_and_legacy_mode_rejection_never_reserve_or_send_reques
 #[tokio::test]
 async fn direct_self_refresh_revokes_old_lease_and_unknown_or_relayed_rows_stay_ineligible() {
     let s = Server::start().await;
-    let a = s.authority();
+    let mut config = s.source();
+    config["group_config"] = json!({"protected":{"on_play":"https://other.invalid/check"}});
+    let a = SourceAuthority::new_modern(&config, &json!([]), Duration::from_secs(3)).unwrap();
     let old = a
         .leased_modern_inventory(&local(), Duration::from_secs(30))
         .await
@@ -687,4 +689,43 @@ async fn invalid_source_edit_preserves_lease_and_remove_readd_never_revives_it()
         .unwrap();
     publish(&a, &new.candidate(NAME).unwrap()).unwrap();
     assert_eq!(s.paths.lock().unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn omitted_groups_uniform_modern_binding_still_expires_and_fences_policy_edits() {
+    let s = Server::start().await;
+    *s.rows.lock().unwrap() = json!([{"name":NAME,"named_by":"config"}]);
+    let a = s.authority();
+    let rows = a
+        .leased_modern_inventory(&local(), Duration::from_millis(200))
+        .await
+        .unwrap();
+    let candidate = rows.candidate(NAME).unwrap();
+    publish(&a, &candidate).unwrap();
+    tokio::time::sleep(Duration::from_millis(220)).await;
+    assert_eq!(publish(&a, &candidate), Err(LeaseFailure::Expired));
+    let rows = a
+        .leased_modern_inventory(&local(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    let candidate = rows.candidate(NAME).unwrap();
+    let mut config = s.source();
+    config["group_config"] = json!({"protected":{"on_play":"https://other.invalid/check"}});
+    a.replace(&config, &json!([])).unwrap();
+    assert_eq!(
+        publish(&a, &candidate),
+        Err(binding(ProjectionFailure::Stale))
+    );
+    let rows = a
+        .leased_modern_inventory(&local(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert!(matches!(
+        rows.candidate(NAME),
+        Err(LeaseFailure::Binding(BindingFailure::Projection(
+            ProjectionFailure::Ineligible(
+                flussonix::source_directory::flussonic::EligibilityFailure::UnknownGroups
+            )
+        )))
+    ));
 }

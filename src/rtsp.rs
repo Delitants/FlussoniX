@@ -11,19 +11,65 @@ use crate::{
 use protocol::{Event, Request, Transport};
 use std::{
     collections::{HashMap, VecDeque},
-    net::SocketAddr,
-    sync::{Arc, atomic::Ordering},
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex, atomic::Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncWriteExt, BufReader},
     net::TcpListener,
-    sync::{Semaphore, mpsc},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     task::{JoinHandle, JoinSet},
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 const PUBLIC: &str = "OPTIONS, DESCRIBE, SETUP, PLAY, ANNOUNCE, RECORD, GET_PARAMETER, TEARDOWN";
+const MAX_PREAUTH_CONNECTIONS: usize = 64;
+const MAX_PREAUTH_PER_IP: usize = 16;
+struct PreAuthGate {
+    slots: Arc<Semaphore>,
+    by_ip: Mutex<HashMap<IpAddr, usize>>,
+}
+impl PreAuthGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            slots: Arc::new(Semaphore::new(MAX_PREAUTH_CONNECTIONS)),
+            by_ip: Mutex::new(HashMap::new()),
+        })
+    }
+    fn acquire(self: &Arc<Self>, ip: IpAddr) -> Option<PreAuthLease> {
+        let permit = self.slots.clone().try_acquire_owned().ok()?;
+        let mut by_ip = self.by_ip.lock().unwrap_or_else(|e| e.into_inner());
+        let count = by_ip.entry(ip).or_default();
+        if *count >= MAX_PREAUTH_PER_IP {
+            return None;
+        }
+        *count += 1;
+        Some(PreAuthLease {
+            gate: self.clone(),
+            ip,
+            _permit: permit,
+            started: Instant::now(),
+        })
+    }
+}
+pub(super) struct PreAuthLease {
+    gate: Arc<PreAuthGate>,
+    ip: IpAddr,
+    _permit: OwnedSemaphorePermit,
+    started: Instant,
+}
+impl Drop for PreAuthLease {
+    fn drop(&mut self) {
+        let mut by_ip = self.gate.by_ip.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = by_ip.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                by_ip.remove(&self.ip);
+            }
+        }
+    }
+}
 struct ReaderTask(JoinHandle<()>);
 impl Drop for ReaderTask {
     fn drop(&mut self) {
@@ -47,12 +93,49 @@ struct Sender {
     ssrc: u32,
     packets: u32,
     octets: u32,
+    report_clock: Option<ReportClock>,
+}
+#[derive(Clone, Copy)]
+struct ReportEpoch {
+    instant: std::time::Instant,
+    ntp: u64,
+}
+impl ReportEpoch {
+    fn sample() -> Self {
+        let before = std::time::Instant::now();
+        let ntp = ntp_timestamp(SystemTime::now());
+        let after = std::time::Instant::now();
+        Self {
+            instant: before + (after - before) / 2,
+            ntp,
+        }
+    }
+}
+struct ReportClock {
+    ntp_origin: u64,
+    origin_ticks: u128,
+}
+impl ReportClock {
+    fn new(origin_ticks: u128, ntp_origin: u64) -> Self {
+        Self {
+            ntp_origin,
+            origin_ticks,
+        }
+    }
+    fn at(&self, ticks: u128, rate: u32) -> u64 {
+        let elapsed = ticks as i128 - self.origin_ticks as i128;
+        // One NTP tick is 2^-32 seconds. Derive every report from the same
+        // RTP origin so receiver rescaling cannot shift media by one tick.
+        (i128::from(self.ntp_origin) + (elapsed * (1i128 << 32)).div_euclid(i128::from(rate)))
+            as u64
+    }
 }
 struct Session {
     playback: Playback,
     url: url::Url,
     id: String,
     senders: HashMap<u32, Sender>,
+    report_epoch: Option<ReportEpoch>,
     playing: bool,
     initial: VecDeque<Packet>,
     pending: Option<Packet>,
@@ -122,10 +205,50 @@ async fn serve_connections(
     udp::Pacer::new(rate).map_err(std::io::Error::other)?;
     let udp = pool.map(|pool| UdpOptions { pool, rate });
     let permits = Arc::new(Semaphore::new(256));
+    let preauth = PreAuthGate::new();
     let mut clients = JoinSet::new();
     let result = loop {
-        tokio::select! {biased;_=cancel.cancelled()=>break Ok(()),Some(_)=clients.join_next(),if !clients.is_empty()=>{},accepted=listener.accept()=>{match accepted{Ok((socket,peer))=>{if let Ok(permit)=permits.clone().try_acquire_owned(){let app=app.clone();let cancel=cancel.clone();let udp=udp.clone();let tls=tls.clone();clients.spawn(async move{let _permit=permit;if socket.set_nodelay(true).is_err(){return;}
-        if let Some(tls)=tls{let accepted=tokio::select!{biased;_=cancel.cancelled()=>return,result=tokio::time::timeout(Duration::from_secs(8),tls.accept(socket))=>result};if let Ok(Ok(stream))=accepted{let _=connection(stream,peer,app,cancel,udp,true).await;}}else{let _=connection(socket,peer,app,cancel,udp,false).await;}});}},Err(e)=>break Err(e)}}}
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break Ok(()),
+            Some(_) = clients.join_next(), if !clients.is_empty() => {},
+            accepted = listener.accept() => {
+                let (socket, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => break Err(error),
+                };
+                let Ok(permit) = permits.clone().try_acquire_owned() else {
+                    continue;
+                };
+                let Some(preauth_lease) = preauth.acquire(peer.ip()) else {
+                    continue;
+                };
+                let app = app.clone();
+                let cancel = cancel.clone();
+                let udp = udp.clone();
+                let tls = tls.clone();
+                clients.spawn(async move {
+                    let _permit = permit;
+                    if socket.set_nodelay(true).is_err() {
+                        return;
+                    }
+                    if let Some(tls) = tls {
+                        let setup_deadline = (preauth_lease.started + Duration::from_secs(30))
+                            .min(Instant::now() + Duration::from_secs(8));
+                        let accepted = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return,
+                            result = tokio::time::timeout_at(setup_deadline, tls.accept(socket)) => result,
+                        };
+                        if let Ok(Ok(stream)) = accepted {
+                            let _ = connection(stream, peer, app, cancel, udp, true, preauth_lease).await;
+                        }
+                    } else {
+                        let _ = connection(socket, peer, app, cancel, udp, false, preauth_lease).await;
+                    }
+                });
+            },
+        }
     };
     cancel.cancel();
     let drain = async { while clients.join_next().await.is_some() {} };
@@ -153,7 +276,9 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
     cancel: CancellationToken,
     udp: Option<UdpOptions>,
     secure: bool,
+    preauth_lease: PreAuthLease,
 ) -> std::io::Result<()> {
+    let mut preauth_lease = Some(preauth_lease);
     let (read, mut write) = tokio::io::split(socket);
     let (tx, mut controls) = mpsc::channel(8);
     let _reader = ReaderTask(tokio::spawn(async move {
@@ -172,12 +297,15 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
     let mut reports = tokio::time::interval(Duration::from_secs(5));
     reports.tick().await;
     loop {
-        let deadline = last_control
+        let mut deadline = last_control
             + Duration::from_secs(if session.as_ref().is_some_and(|s| !s.senders.is_empty()) {
                 60
             } else {
                 30
             });
+        if let Some(lease) = &preauth_lease {
+            deadline = deadline.min(lease.started + Duration::from_secs(30));
+        }
         let due = match session
             .as_mut()
             .and_then(|s| s.pending.as_ref().zip(s.pacer.as_mut()))
@@ -263,11 +391,12 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
             Next::Feedback(false) => {}
             Next::Control(None) => break,
             Next::Control(Some(Err(error))) => {
-                let _ = bounded_write(
+                let _ = preauth_bounded_write(
                     &mut write,
                     &protocol::response(error.code, error.cseq.unwrap_or(0), &[], &[]),
                     &cancel,
                     session.as_ref(),
+                    preauth_lease.as_ref(),
                 )
                 .await;
                 break;
@@ -295,14 +424,30 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
                         &cancel,
                         secure,
                         udp.as_ref().map(|o| o.pool.clone()),
+                        &mut preauth_lease,
                     )
                     .await?;
                     break;
                 }
-                let reply = tokio::select! {biased;_=cancel.cancelled()=>break,reply=handle(&request,&mut session,&app,peer,udp.as_ref(),secure)=>reply};
+                let reply = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = async { tokio::time::sleep_until(preauth_lease.as_ref().unwrap().started + Duration::from_secs(30)).await }, if preauth_lease.is_some() => break,
+                    reply = handle(&request,&mut session,&app,peer,udp.as_ref(),secure) => reply
+                };
+                if session.is_some() {
+                    drop(preauth_lease.take());
+                }
                 let bytes =
                     protocol::response(reply.code, request.cseq, &reply.headers, &reply.body);
-                bounded_write(&mut write, &bytes, &cancel, session.as_ref()).await?;
+                preauth_bounded_write(
+                    &mut write,
+                    &bytes,
+                    &cancel,
+                    session.as_ref(),
+                    preauth_lease.as_ref(),
+                )
+                .await?;
                 if reply.close {
                     break;
                 }
@@ -347,24 +492,58 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
                 }
             }
             Next::Report => {
-                if let Some(s) = &session {
+                if let Some(s) = &mut session {
                     if s.playing {
+                        if s.report_epoch.is_none()
+                            && s.senders.values().any(|sender| sender.packets > 0)
+                        {
+                            s.report_epoch = Some(ReportEpoch::sample());
+                        }
+                        let sample = std::time::Instant::now();
                         for track in &s.playback.description.tracks {
-                            if let Some(sender) = s.senders.get(&track.id) {
-                                if sender.packets == 0 {
-                                    continue;
-                                }
-                                let stamp = s.playback.worker.wire.rtp.clock(track.id).unwrap_or(0);
-                                let body =
-                                    sender_report(track.ssrc, stamp, sender.packets, sender.octets);
-                                let bytes =
-                                    deliver(sender, &mut write, &body, true, &cancel, s).await?;
-                                app.rtsp_egress.fetch_add(bytes as u64, Ordering::Relaxed);
-                                s.playback.add_bytes(bytes);
-                                if matches!(sender.delivery, Delivery::Udp { .. }) {
-                                    app.rtsp_udp_egress
-                                        .fetch_add(bytes as u64, Ordering::Relaxed);
-                                }
+                            let ticks = s
+                                .playback
+                                .worker
+                                .wire
+                                .rtp
+                                .clock_at(track.id, sample)
+                                .unwrap_or(0);
+                            let stamp = ticks as u32;
+                            let Some(sender) = s.senders.get_mut(&track.id) else {
+                                continue;
+                            };
+                            let Some(epoch) = s.report_epoch else {
+                                continue;
+                            };
+                            let origin_ticks = s
+                                .playback
+                                .worker
+                                .wire
+                                .rtp
+                                .clock_at(track.id, epoch.instant)
+                                .unwrap_or(ticks);
+                            let clock = sender
+                                .report_clock
+                                .get_or_insert_with(|| ReportClock::new(origin_ticks, epoch.ntp));
+                            if sender.packets == 0 {
+                                continue;
+                            }
+                            let ntp = clock.at(ticks, track.clock);
+                            let body = sender_report_ntp(
+                                sender.ssrc,
+                                stamp,
+                                sender.packets,
+                                sender.octets,
+                                ntp,
+                            );
+                            let sender = s.senders.get(&track.id).unwrap();
+                            let bytes =
+                                deliver(sender, &mut write, &body, true, &cancel, s).await?;
+                            app.rtsp_egress.fetch_add(bytes as u64, Ordering::Relaxed);
+                            s.playback.add_bytes(bytes);
+                            if matches!(sender.delivery, Delivery::Udp { .. }) {
+                                app.rtsp_udp_egress
+                                    .fetch_add(bytes as u64, Ordering::Relaxed);
                             }
                         }
                     }
@@ -478,6 +657,23 @@ async fn bounded_write<W: tokio::io::AsyncWrite + Unpin>(
     }
     result
 }
+async fn preauth_bounded_write<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    cancel: &CancellationToken,
+    session: Option<&Session>,
+    lease: Option<&PreAuthLease>,
+) -> std::io::Result<()> {
+    if let Some(lease) = lease {
+        tokio::select! {
+            biased;
+            _=tokio::time::sleep_until(lease.started+Duration::from_secs(30))=>Err(std::io::ErrorKind::TimedOut.into()),
+            result=bounded_write(writer,bytes,cancel,session)=>result,
+        }
+    } else {
+        bounded_write(writer, bytes, cancel, session).await
+    }
+}
 fn location(uri: &str) -> Result<(url::Url, String), u16> {
     let url = url::Url::parse(uri).map_err(|_| 400u16)?;
     if !matches!(url.scheme(), "rtsp" | "rtsps")
@@ -578,6 +774,7 @@ async fn handle(
             user_agent: r.headers.get("user-agent").cloned().unwrap_or_default(),
             referer: r.headers.get("referer").cloned().unwrap_or_default(),
             host: url.host_str().unwrap().into(),
+            finite_media: false,
         };
         let playback = match app.rtsp_admit(viewer, &url, secure).await {
             Ok(crate::server::rtsp_access::Admission::Playback(p)) => p,
@@ -595,6 +792,7 @@ async fn handle(
             url,
             id: uuid::Uuid::new_v4().simple().to_string(),
             senders: HashMap::new(),
+            report_epoch: None,
             playing: false,
             initial: VecDeque::new(),
             pending: None,
@@ -726,6 +924,7 @@ async fn handle(
                 packets: 0,
                 octets: 0,
                 ssrc,
+                report_clock: None,
             },
         );
         let mut reply = Reply::code(200);
@@ -839,8 +1038,11 @@ fn valid_rtcp(body: &[u8]) -> bool {
     }
     !body.is_empty()
 }
-pub(crate) fn sender_report(ssrc: u32, stamp: u32, packets: u32, octets: u32) -> Vec<u8> {
-    sender_report_at(ssrc, stamp, packets, octets, SystemTime::now())
+fn ntp_timestamp(time: SystemTime) -> u64 {
+    let now = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let seconds = now.as_secs().wrapping_add(2208988800) as u32;
+    let fraction = ((now.subsec_nanos() as u64) << 32).div_euclid(1_000_000_000) as u32;
+    (u64::from(seconds) << 32) | u64::from(fraction)
 }
 pub(crate) fn sender_report_at(
     ssrc: u32,
@@ -849,16 +1051,11 @@ pub(crate) fn sender_report_at(
     octets: u32,
     time: SystemTime,
 ) -> Vec<u8> {
-    let now = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    sender_report_ntp(ssrc, stamp, packets, octets, ntp_timestamp(time))
+}
+fn sender_report_ntp(ssrc: u32, stamp: u32, packets: u32, octets: u32, ntp: u64) -> Vec<u8> {
     let mut b = vec![0x80, 200, 0, 6];
-    for value in [
-        ssrc,
-        now.as_secs().wrapping_add(2208988800) as u32,
-        ((now.subsec_nanos() as u64) << 32).div_euclid(1_000_000_000) as u32,
-        stamp,
-        packets,
-        octets,
-    ] {
+    for value in [ssrc, (ntp >> 32) as u32, ntp as u32, stamp, packets, octets] {
         b.extend(value.to_be_bytes());
     }
     let name = b"flussonix";
@@ -887,6 +1084,199 @@ fn live_range(value: &str) -> bool {
 }
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn expired_preauth_lease_interrupts_stalled_describe_admission() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            crate::server::Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.config
+            .put(
+                "streams",
+                "owned",
+                serde_json::json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+            )
+            .unwrap();
+        let held_startup = app.media.hold_startups_for_test().await;
+        let mut lease = PreAuthGate::new()
+            .acquire("127.0.0.1".parse().unwrap())
+            .unwrap();
+        lease.started = Instant::now() - Duration::from_secs(29);
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(connection(
+            server,
+            "127.0.0.1:12000".parse().unwrap(),
+            app.clone(),
+            CancellationToken::new(),
+            None,
+            false,
+            lease,
+        ));
+        client
+            .write_all(b"DESCRIBE rtsp://127.0.0.1/owned RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("expired pre-auth lease remained held inside media admission")
+            .unwrap()
+            .unwrap();
+        drop(held_startup);
+        app.media.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn expired_preauth_lease_interrupts_blocked_announce_reply() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            crate::server::Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut lease = PreAuthGate::new()
+            .acquire("127.0.0.1".parse().unwrap())
+            .unwrap();
+        lease.started = Instant::now() - Duration::from_secs(29);
+        let (mut client, server) = tokio::io::duplex(8);
+        let task = tokio::spawn(connection(
+            server,
+            "127.0.0.1:12001".parse().unwrap(),
+            app,
+            CancellationToken::new(),
+            None,
+            false,
+            lease,
+        ));
+        client
+            .write_all(b"ANNOUNCE rtsp://127.0.0.1/owned RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(1500), task)
+            .await
+            .expect("blocked ANNOUNCE response held the pre-auth lease past its deadline")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_preauth_lease_interrupts_blocked_options_reply() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            crate::server::Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut lease = PreAuthGate::new()
+            .acquire("127.0.0.1".parse().unwrap())
+            .unwrap();
+        lease.started = Instant::now() - Duration::from_secs(29);
+        let (mut client, server) = tokio::io::duplex(8);
+        let task = tokio::spawn(connection(
+            server,
+            "127.0.0.1:12002".parse().unwrap(),
+            app,
+            CancellationToken::new(),
+            None,
+            false,
+            lease,
+        ));
+        client
+            .write_all(b"OPTIONS rtsp://127.0.0.1/owned RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(1500), task)
+            .await
+            .expect("blocked OPTIONS response held the pre-auth lease past its deadline")
+            .unwrap()
+            .expect_err("blocked response should return the deadline error");
+    }
+
+    #[test]
+    fn sender_reports_keep_ntp_and_rtp_on_one_exact_media_clock() {
+        let start = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for rate in [48_000, 90_000] {
+            for first in [90_000, u32::MAX - 180_000] {
+                let clock = ReportClock::new(u128::from(first), ntp_timestamp(start));
+                let initial = clock.at(u128::from(first), rate);
+                let mut ticks = u128::from(first);
+                let mut elapsed = 0u64;
+                for step in [rate * 5, rate * 5, rate * 7, rate * 11] {
+                    ticks += u128::from(step);
+                    elapsed += u64::from(step);
+                    let ntp = clock.at(ticks, rate);
+                    let ntp_delta = ntp.wrapping_sub(initial);
+                    let decoded =
+                        ((u128::from(ntp_delta) * u128::from(rate) + (1 << 31)) >> 32) as u64;
+                    assert_eq!(decoded, elapsed, "{rate} Hz at RTP {ticks}");
+                    let report = sender_report_ntp(7, ticks as u32, 1, 100, ntp);
+                    assert_eq!(
+                        u32::from_be_bytes(report[16..20].try_into().unwrap()),
+                        ticks as u32
+                    );
+                    assert_eq!(
+                        u32::from_be_bytes(report[8..12].try_into().unwrap()),
+                        (ntp >> 32) as u32
+                    );
+                    assert_eq!(
+                        u32::from_be_bytes(report[12..16].try_into().unwrap()),
+                        ntp as u32
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sender_reports_share_one_epoch_across_tracks() {
+        let start = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let epoch = ReportEpoch {
+            instant: std::time::Instant::now(),
+            ntp: ntp_timestamp(start),
+        };
+        let video = ReportClock::new(90_000, epoch.ntp);
+        // A stalled sender loop must not make a second track use a later
+        // wall-clock origin for the same media instant.
+        std::thread::sleep(Duration::from_millis(20));
+        let audio = ReportClock::new(48_000, epoch.ntp);
+        assert_eq!(video.at(180_000, 90_000), audio.at(96_000, 48_000));
+    }
+
+    #[test]
+    fn sender_report_survives_delayed_track_start_beyond_signed_rtp_range() {
+        let start = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let origin = 90_000;
+        let clock = ReportClock::new(origin, ntp_timestamp(start));
+        let first = clock.at(origin, 90_000);
+        let delayed = origin + 7 * 60 * 60 * 90_000;
+        let next = clock.at(delayed, 90_000);
+        assert_eq!((next - first) >> 32, 7 * 60 * 60);
+    }
+
     #[test]
     fn live_ranges_accept_decimal_zero_but_not_seeks() {
         for v in ["npt=0-", "npt=0.000-", "npt=now-"] {

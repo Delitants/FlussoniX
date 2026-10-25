@@ -181,6 +181,93 @@ fn credentialed_input(src: &Source, scheme: &str, resource: &str, password: &str
 }
 
 #[tokio::test]
+async fn uncredentialed_plain_hls_inputs_decode_same_origin_media() {
+    use futures_util::FutureExt;
+    for scheme in ["hls", "http"] {
+        let src = source_with_basic(false, None, false, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "ffmpeg");
+        let result = std::panic::AssertUnwindSafe(async {
+            let address = src.url.strip_prefix("http://").unwrap();
+            let input = format!("{scheme}://{address}/owned/index.m3u8?token=owned-viewer");
+            engine
+                .ensure("plain-hls", &json!({"inputs":[{"url":input}]}))
+                .await
+                .unwrap();
+            decode(&delivered(&engine, "plain-hls").await).await;
+            assert!(src.hits.load(Ordering::SeqCst) > 0);
+        })
+        .catch_unwind()
+        .await;
+        engine.stop_all().await;
+        src.stop().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[tokio::test]
+async fn uncredentialed_plain_http_ts_inputs_decode_continuous_media() {
+    use futures_util::FutureExt;
+    for scheme in ["tshttp", "http"] {
+        let src = source_with_basic(false, None, false, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "ffmpeg");
+        let result = std::panic::AssertUnwindSafe(async {
+            let address = src.url.strip_prefix("http://").unwrap();
+            let input = format!("{scheme}://{address}/transport?token=owned-viewer");
+            let worker = engine
+                .ensure("plain-ts", &json!({"inputs":[{"url":input}]}))
+                .await
+                .unwrap();
+            #[cfg(target_os = "linux")]
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let pid = worker.pid();
+                    if pid != 0
+                        && let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline"))
+                    {
+                        assert!(
+                            !cmdline
+                                .windows(b"owned-viewer".len())
+                                .any(|w| w == b"owned-viewer"),
+                            "FFmpeg argv contains the upstream query secret"
+                        );
+                        let args: Vec<_> = cmdline.split(|b| *b == 0).collect();
+                        let input_arg = args
+                            .windows(2)
+                            .find(|pair| pair[0] == b"-i")
+                            .map(|pair| pair[1])
+                            .expect("FFmpeg input URL");
+                        assert_eq!(input_arg, b"pipe:0");
+                        assert!(
+                            !cmdline
+                                .windows(b"resource.bin".len())
+                                .any(|w| w == b"resource.bin"),
+                            "FFmpeg argv contains the private local proxy capability"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("FFmpeg process must start");
+            decode(&delivered(&engine, "plain-ts").await).await;
+            assert!(src.hits.load(Ordering::SeqCst) > 0);
+        })
+        .catch_unwind()
+        .await;
+        engine.stop_all().await;
+        src.stop().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[tokio::test]
 async fn basic_upstream_inputs_decode_all_native_http_families() {
     use futures_util::FutureExt;
     for scheme in [

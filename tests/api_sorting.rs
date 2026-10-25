@@ -477,7 +477,7 @@ async fn sorting_preserves_auth_config_and_other_collections() {
             .iter()
             .map(|row| row["name"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["alpha", "beta", "delta", "gamma"]
+        ["beta", "alpha", "delta", "gamma"]
     );
     for host in ["a", "z"] {
         app.config

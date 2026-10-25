@@ -192,6 +192,9 @@ impl Profile {
     pub(crate) fn full_copy(&self) -> bool {
         self.video == "copy" && self.audio == "copy"
     }
+    pub(crate) fn video_copy(&self) -> bool {
+        self.video == "copy"
+    }
     pub(crate) fn audio_copy(&self) -> bool {
         self.audio == "copy"
     }

@@ -19,3 +19,12 @@ fieldset{border:1px solid #e2e8f0;border-radius:6px;padding:16px;margin:0 0 20px
 .gpu-readiness{margin-bottom:18px}.gpu-readiness ul{padding-left:20px;line-height:1.8}.gpu-readiness li p{margin:4px 0 12px;font-size:12px}
 
 .vendor-policies,.vendor-policies fieldset{min-width:0}.vendor-policies{overflow-wrap:anywhere}.vendor-policies legend{max-width:100%}
+
+/* Sidebar labels and values share the full width, including long IPv6 listeners. */
+.config-layout aside dl{grid-template-columns:minmax(0,1fr);gap:6px}
+.config-layout aside dd+dt{margin-top:8px}
+
+.fxlink-input-row{flex-wrap:wrap}.fxlink-input-row>.field{flex:1 1 40%}.fxlink-input-row>.field:first-child{flex-basis:100%}
+
+.iptv-intro{margin-bottom:20px}.iptv-intro p:last-child{margin-bottom:0}.iptv-editor>label{margin-bottom:20px}.iptv-editor>label input{width:100%}.iptv-choices{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:260px;overflow:auto}.iptv-choices label{display:flex;flex-direction:row;align-items:center;gap:8px;overflow-wrap:anywhere;color:#34445b}.iptv-choices input{flex:none}.iptv-token{max-width:260px;overflow-wrap:anywhere}.iptv-page .actions{white-space:normal;min-width:180px}.iptv-page .panel-heading button{white-space:nowrap}@media(max-width:700px){.iptv-choices{grid-template-columns:1fr}.iptv-page .page-heading{align-items:flex-start}.iptv-page .heading-actions{flex-wrap:wrap}}
+.iptv-http-warning{border:1px solid #e9c881;background:#fff8e8;border-radius:4px;color:#79520c;padding:10px 12px;font-size:12px}

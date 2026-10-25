@@ -71,12 +71,10 @@ pub async fn serve(
     let listener = Listener::new(tcp, config).tap_io(|stream| {
         let _ = stream.get_ref().0.set_nodelay(true);
     });
-    axum::serve(
+    crate::http_transport::serve_listener(
         listener,
-        router(app)
-            .layer(axum::Extension(SecureHttp))
-            .into_make_service_with_connect_info::<SocketAddr>(),
+        router(app).layer(axum::Extension(SecureHttp)),
+        cancel,
     )
-    .with_graceful_shutdown(cancel.cancelled_owned())
     .await
 }

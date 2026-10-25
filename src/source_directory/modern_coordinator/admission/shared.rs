@@ -349,6 +349,7 @@ impl SharedInputs {
     pub(crate) fn install_idle(
         &self,
         prepared: super::super::PreparedSource,
+        predecessor: Option<&super::super::SourceHandle>,
     ) -> Result<super::super::SourceHandle, SharedFailure> {
         let registry = self.workers.lock().unwrap();
         if registry
@@ -360,7 +361,7 @@ impl SharedInputs {
             return Err(SharedFailure::Unavailable);
         }
         self.owner
-            .install(prepared)
+            .rebind_unchanged(prepared, predecessor)
             .map_err(|e| SharedFailure::Authority(AdmissionFailure::Coordination(e)))
     }
     pub fn new(owner: Arc<ModernSourceCoordinator>) -> Self {

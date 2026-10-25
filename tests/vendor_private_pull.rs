@@ -583,6 +583,7 @@ async fn subtitle_preserve_drop_and_hls_conversion_options_reach_both_protocols(
             ));
             let detected = Arc::new(AtomicU64::new(0));
             let hub = Arc::new(Hub::new());
+            let (_, mut live) = hub.m4s_subscribe();
             let cancel = Arc::new(CancellationToken::new());
             let owner = f.owner.clone();
             let (h, c, d, v) = (
@@ -640,9 +641,7 @@ async fn subtitle_preserve_drop_and_hls_conversion_options_reach_both_protocols(
             );
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
-                    if conversion.decoder.lock().unwrap().snapshot().len() == 2
-                        && hub.m4s.retained().0 > 0
-                    {
+                    if conversion.decoder.lock().unwrap().snapshot().len() == 2 {
                         break;
                     }
                     tokio::task::yield_now().await;
@@ -656,6 +655,50 @@ async fn subtitle_preserve_drop_and_hls_conversion_options_reach_both_protocols(
                 cues.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
                 ["AMERICA HELLO", "EUROPE GRÜSSE"]
             );
+            // Observe delivered media rather than requiring an unused output
+            // to retain history. Both native inputs must apply the same policy.
+            let delivered = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut decoder = flussonix::m4s::Decoder::default();
+                let mut delivered = vec![];
+                while delivered.len() < if preserve { 3 } else { 1 } {
+                    for event in decoder.push(&live.recv().await.unwrap()).unwrap() {
+                        match event {
+                            flussonix::m4s::Event::Frame {
+                                track_id,
+                                dts,
+                                pts_offset,
+                                key,
+                                body,
+                                ..
+                            } => delivered.push(Frame {
+                                track_id,
+                                dts,
+                                pts_offset,
+                                key,
+                                body,
+                            }),
+                            flussonix::m4s::Event::Gop { frames, .. } => delivered.extend(frames),
+                            _ => {}
+                        }
+                    }
+                }
+                delivered
+            })
+            .await
+            .unwrap();
+            let expected: Vec<_> = frames
+                .iter()
+                .filter(|frame| preserve || frame.track_id == 1)
+                .cloned()
+                .collect();
+            assert_eq!(delivered.len(), expected.len());
+            for (actual, expected) in delivered.iter().zip(&expected) {
+                assert_eq!(actual.track_id, expected.track_id);
+                assert_eq!(actual.dts, expected.dts);
+                assert_eq!(actual.pts_offset, expected.pts_offset);
+                assert_eq!(actual.key, expected.key);
+                assert_eq!(actual.body, expected.body);
+            }
             let wire = hub.m4s_subscribe().0;
             let mut decoder = flussonix::m4s::Decoder::default();
             let mut text = 0;

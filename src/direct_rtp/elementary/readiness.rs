@@ -143,19 +143,23 @@ mod tests {
     }
     #[test]
     fn owned_readiness_observes_pairs_without_claiming_free_ports() {
-        let first = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let p = first.local_addr().unwrap().port();
-        assert!(bound(&[p]).unwrap());
-        drop(first);
-        assert!(!bound(&[p]).unwrap());
-        // The decoder can bind immediately after every readiness observation;
-        // the observer never holds a probe socket while it starts.
+        // A wildcard reservation excludes another loopback owner, so a false
+        // observation is meaningful even when other media tests run in parallel.
+        // Once released, an unrelated owner may win the race; retry that port.
+        let mut observed = 0;
         for _ in 0..128 {
+            let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+            let p = reservation.local_addr().unwrap().port();
             assert!(!bound(&[p]).unwrap());
-            let decoder = std::net::UdpSocket::bind(("127.0.0.1", p)).unwrap();
+            drop(reservation);
+            let Ok(decoder) = std::net::UdpSocket::bind(("127.0.0.1", p)) else {
+                continue;
+            };
             assert!(bound(&[p]).unwrap());
             drop(decoder);
+            observed += 1;
         }
+        assert!(observed >= 100, "other owners claimed most fixture ports");
     }
     #[test]
     fn readiness_requires_every_loopback_port_and_rejects_wildcards() {

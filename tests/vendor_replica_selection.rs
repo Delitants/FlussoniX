@@ -35,6 +35,8 @@ const NAME: &str = "Music %2F HD";
 mod authorization;
 #[path = "vendor_replica_selection/boundaries.rs"]
 mod boundaries;
+#[path = "vendor_replica_selection/capacity.rs"]
+mod capacity;
 #[path = "vendor_replica_selection/fixture.rs"]
 mod fixture;
 use fixture::*;
@@ -149,6 +151,7 @@ fn viewer(token: &str) -> ViewerRequest {
         user_agent: String::new(),
         referer: String::new(),
         host: "owned".into(),
+        finite_media: false,
     }
 }
 

@@ -322,6 +322,14 @@ fn exact<const N: usize>(bytes: &[u8]) -> Result<[u8; N], String> {
 }
 
 pub fn encode_gop(gop: &PackedGop) -> Result<Bytes, String> {
+    // Fgop(8) + goph(64) + body header(8); the four-byte transport
+    // prefix is outside the existing 16 MiB record limit.
+    let packet_len = gop
+        .body
+        .len()
+        .checked_add(80)
+        .filter(|len| *len <= 16 * 1024 * 1024)
+        .ok_or("GOP exceeds M4S record limit")?;
     let header = [
         atom(b" utc", &gop.utc.to_be_bytes()),
         atom(b" dts", &gop.dts_ms.to_be_bytes()),
@@ -329,14 +337,14 @@ pub fn encode_gop(gop: &PackedGop) -> Result<Bytes, String> {
         atom(b" dur", &gop.duration_ms.to_be_bytes()),
     ]
     .concat();
-    let packet = atom(
-        b"Fgop",
-        &[atom(b"goph", &header), atom(b"body", &gop.body)].concat(),
-    );
-    if packet.len() > 16 * 1024 * 1024 {
-        return Err("GOP exceeds M4S record limit".into());
-    }
-    Ok(Bytes::from(
-        [(packet.len() as u32).to_be_bytes().to_vec(), packet].concat(),
-    ))
+    // Copy the already owned payload once into its final wire envelope.
+    let mut wire = Vec::with_capacity(packet_len + 4);
+    wire.extend_from_slice(&(packet_len as u32).to_be_bytes());
+    wire.extend_from_slice(&(packet_len as u32).to_be_bytes());
+    wire.extend_from_slice(b"Fgop");
+    wire.extend_from_slice(&atom(b"goph", &header));
+    wire.extend_from_slice(&((gop.body.len() + 8) as u32).to_be_bytes());
+    wire.extend_from_slice(b"body");
+    wire.extend_from_slice(&gop.body);
+    Ok(Bytes::from(wire))
 }

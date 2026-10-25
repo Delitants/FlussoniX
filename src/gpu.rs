@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{io::AsyncReadExt, process::Command, sync::OnceCell};
+use tokio::{io::AsyncReadExt, sync::OnceCell};
 
 #[derive(Clone, Serialize)]
 pub(crate) struct Readiness {
@@ -198,7 +198,7 @@ fn dependency_diagnostic(stderr: &[u8]) -> Option<&'static str> {
 }
 
 async fn check_profile(ffmpeg: &str, profile: &crate::transcoder::Profile) -> Probe {
-    let mut cmd = Command::new(ffmpeg);
+    let mut cmd = crate::child_process::command(ffmpeg);
     cmd.args([
         "-hide_banner",
         "-loglevel",

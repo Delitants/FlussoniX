@@ -102,6 +102,7 @@ pub(super) async fn lookup(State(app): State<Arc<App>>, request: Request) -> Res
             user_agent: header(request.headers(), "user-agent").unwrap_or("").into(),
             referer: header(request.headers(), "referer").unwrap_or("").into(),
             host: header(request.headers(), "host").unwrap_or("").into(),
+            finite_media: false,
         };
         app.srt_lookup(viewer, &q.streamid, q.encrypted).await
     }

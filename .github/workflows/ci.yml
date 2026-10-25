@@ -1,5 +1,8 @@
 name: check
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 permissions:
   contents: read
 jobs:
@@ -12,9 +15,15 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg libsrtp2-1 tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu fonts-dejavu-core
       - name: Verify vendor components are absent
         run: test ! -e /opt/flussonic
+      - name: Preview package and service regressions
+        run: python3 -m unittest discover -s tests -p 'test_*preview.py' -v
       - run: rustup show
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Patched QUIC regressions
+        run: |
+          cargo clippy --locked -p quinn-proto --no-default-features --features rustls-ring --all-targets -- -D warnings
+          cargo test --locked -p quinn-proto --no-default-features --features rustls-ring --lib -- --test-threads=1
       - name: Streaming boundary regressions
         run: |
           cargo test --locked --test subtitle_preservation raw_hls_window_is_bounded_and_replacement_does_not_reuse_sequences_or_files -- --exact --test-threads=1
@@ -50,8 +59,11 @@ jobs:
           export FLUSSONIX_CAPTION_FIXTURE_FILE="$PWD/.runtime/owned-captions.ts"
           export FLUSSONIX_ADMIN_USER=admin
           export FLUSSONIX_ADMIN_PASSWORD="$(openssl rand -hex 24)"
+          export FLUSSONIX_VIEW_USER=viewer
+          export FLUSSONIX_VIEW_PASSWORD="$(openssl rand -hex 24)"
           export FLUSSONIX_PEER_KEY="$(openssl rand -hex 32)"
           export FLUSSONIX_SRT_PLAY_PASSPHRASE="$(openssl rand -hex 24)"
+          export FLUSSONIX_IPTV_PUBLIC_ORIGIN=http://127.0.0.1:18210
           mkdir -p .runtime
           export FLUSSONIX_TEST_CA_FILE="$PWD/.runtime/ui-test-ca.pem"
           openssl req -x509 -newkey rsa:2048 -nodes -keyout .runtime/ui-test-ca.key -out "$FLUSSONIX_TEST_CA_FILE" -days 2 -subj '/CN=FlussoniX CI test CA' -addext 'basicConstraints=critical,CA:TRUE' > .runtime/ui-test-ca.log 2>&1

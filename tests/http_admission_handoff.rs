@@ -70,7 +70,11 @@ async fn clean_redirect_gap_does_not_release_promised_session_capacity() {
     )
     .await;
     assert_eq!(response.status(), 302);
-    assert_eq!(response.headers()["location"], "/owned/mpegts?token=viewer");
+    let location = response.headers()["location"].to_str().unwrap();
+    assert!(location.starts_with("/owned/mpegts?"));
+    assert!(location.contains("token=viewer"));
+    assert!(location.contains(&format!("flussonix_handoff={t}")));
+    assert!(!location.contains("flussonix_ticket"));
     assert_eq!(
         reserve(&app, 2.0).await.status(),
         503,
@@ -120,6 +124,21 @@ async fn direct_playback_cannot_steal_an_unredeemed_http_ticket_slot() {
 }
 
 #[tokio::test]
+async fn trusted_peer_redemption_keeps_a_plain_redirect_without_viewer_handoff() {
+    let (_dir, app) = setup(1, 1000.0).await;
+    let t = ticket(&app, 2.0).await;
+    let request = Request::get(format!("/owned/mpegts?flussonix_ticket={t}"))
+        .header("X-Flussonix-Peer", "owned-peer-secret")
+        .body(Body::empty())
+        .unwrap();
+    let response = router(app.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), 302);
+    let location = response.headers()["location"].to_str().unwrap();
+    assert_eq!(location, "/owned/mpegts");
+    assert_eq!(app.playback_auth.active(), 0);
+}
+
+#[tokio::test]
 async fn promised_viewer_still_starts_after_competing_direct_playback_is_denied() {
     use futures_util::{FutureExt, StreamExt};
     let (_dir, app) = setup(1, 1000.0).await;
@@ -145,6 +164,13 @@ async fn promised_viewer_still_starts_after_competing_direct_playback_is_denied(
         )
         .await;
         assert_eq!(redirect.status(), 302);
+        assert_eq!(
+            request(&app, "/owned/mpegts?token=viewer", None)
+                .await
+                .status(),
+            403,
+            "same-identity direct playback must not steal the handoff"
+        );
         assert_eq!(
             request(&app, "/owned/mpegts?token=other", None)
                 .await
@@ -288,11 +314,128 @@ async fn clean_hls_playlist_keeps_bandwidth_until_media_is_represented() {
         assert_eq!(response.status(), 200);
         let playlist = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         assert!(playlist.starts_with(b"#EXTM3U"));
+        assert!(
+            !String::from_utf8_lossy(&playlist).contains("flussonix_handoff"),
+            "one-time handoff marker leaked into HLS child requests"
+        );
         app.sample_metrics(); // A small manifest does not represent the admitted stream bitrate.
         assert_eq!(
             reserve(&app, 50.0).await.status(),
             503,
             "finite manifest response discarded the stream's bandwidth credit"
+        );
+    })
+    .catch_unwind()
+    .await;
+    app.media.stop_all().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn hls_handoff_playlist_can_refresh_without_spending_a_second_session() {
+    use futures_util::FutureExt;
+    let (_dir, app) = setup(1, 1000.0).await;
+    app.config
+        .put(
+            "streams",
+            "owned",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    let result = std::panic::AssertUnwindSafe(async {
+        let t = ticket(&app, 2.0).await;
+        let redirect = request(
+            &app,
+            &format!("/owned/index.m3u8?token=viewer&flussonix_ticket={t}"),
+            None,
+        )
+        .await;
+        assert_eq!(redirect.status(), 302);
+        let location = redirect.headers()["location"].to_str().unwrap().to_owned();
+        for _ in 0..2 {
+            let response = request(&app, &location, None).await;
+            assert_eq!(response.status(), 200);
+            let playlist = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            assert!(playlist.starts_with(b"#EXTM3U"));
+        }
+        assert_eq!(reserve(&app, 2.0).await.status(), 503);
+    })
+    .catch_unwind()
+    .await;
+    app.media.stop_all().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn concurrent_first_hls_handoff_gets_share_the_reserved_session() {
+    use futures_util::{FutureExt, future::join_all};
+    let (_dir, app) = setup(1, 1000.0).await;
+    app.config
+        .put(
+            "streams",
+            "owned",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    let result = std::panic::AssertUnwindSafe(async {
+        let t = ticket(&app, 2.0).await;
+        let redirect = request(
+            &app,
+            &format!("/owned/index.m3u8?token=viewer&flussonix_ticket={t}"),
+            None,
+        )
+        .await;
+        assert_eq!(redirect.status(), 302);
+        let location = redirect.headers()["location"].to_str().unwrap().to_owned();
+        let responses = join_all((0..6).map(|_| request(&app, &location, None))).await;
+        assert!(
+            responses
+                .into_iter()
+                .all(|response| response.status() == 200)
+        );
+        assert_eq!(reserve(&app, 2.0).await.status(), 503);
+    })
+    .catch_unwind()
+    .await;
+    app.media.stop_all().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn wrong_viewer_cannot_consume_capacity_with_a_reusable_hls_handoff() {
+    use futures_util::FutureExt;
+    let (_dir, app) = setup(2, 1000.0).await;
+    app.config
+        .put(
+            "streams",
+            "owned",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    let result = std::panic::AssertUnwindSafe(async {
+        let t = ticket(&app, 2.0).await;
+        let redirect = request(
+            &app,
+            &format!("/owned/index.m3u8?token=viewer&flussonix_ticket={t}"),
+            None,
+        )
+        .await;
+        assert_eq!(redirect.status(), 302);
+        let location = redirect.headers()["location"].to_str().unwrap().to_owned();
+        assert_eq!(request(&app, &location, None).await.status(), 200);
+        let wrong = location.replace("token=viewer", "token=intruder");
+        assert_ne!(wrong, location);
+        assert_eq!(request(&app, &wrong, None).await.status(), 503);
+        assert_eq!(
+            reserve(&app, 2.0).await.status(),
+            200,
+            "rejected marker spent a second viewer slot"
         );
     })
     .catch_unwind()
