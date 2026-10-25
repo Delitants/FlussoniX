@@ -161,6 +161,78 @@ async fn incomplete_http_headers_expire_before_routing() {
 }
 
 #[tokio::test]
+async fn incomplete_second_keepalive_request_releases_its_connection() {
+    use axum::routing::get;
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let stop = CancellationToken::new();
+    let server = tokio::spawn(serve_listener(
+        tcp,
+        Router::new().route("/", get(|| async { "ready" })),
+        stop,
+    ));
+    let stream = TcpStream::connect(address).await.unwrap();
+    assert_second_header_expires(stream).await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn incomplete_second_https_request_releases_its_connection() {
+    use axum::routing::get;
+    use tokio_rustls::rustls::pki_types::ServerName;
+    let cert = tls_fixture::Certificates::new();
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let stop = CancellationToken::new();
+    let server = tokio::spawn(serve_listener(
+        crate::http_tls::Listener::new(tcp, cert.server()),
+        Router::new().route("/", get(|| async { "ready" })),
+        stop,
+    ));
+    let socket = TcpStream::connect(address).await.unwrap();
+    let connector = tokio_rustls::TlsConnector::from(cert.client());
+    let stream = connector
+        .connect(ServerName::try_from("localhost").unwrap(), socket)
+        .await
+        .unwrap();
+    assert_second_header_expires(stream).await;
+    server.abort();
+    let _ = server.await;
+}
+
+async fn assert_second_header_expires<T: AsyncRead + AsyncWrite + Unpin>(mut stream: T) {
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: local\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !response.ends_with(b"ready") {
+            let mut bytes = [0; 1024];
+            let n = stream.read(&mut bytes).await.unwrap();
+            assert!(n > 0, "first response closed the keepalive connection");
+            response.extend_from_slice(&bytes[..n]);
+        }
+    })
+    .await
+    .unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: local")
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(7), async {
+        let mut tail = Vec::new();
+        stream.read_to_end(&mut tail).await
+    })
+    .await;
+    assert!(
+        matches!(result, Ok(Ok(_)) | Ok(Err(_))),
+        "incomplete second header retained its admission slot"
+    );
+}
+
+#[tokio::test]
 async fn incomplete_https_headers_expire_after_tls_handshake() {
     use axum::routing::get;
     use tokio_rustls::rustls::pki_types::ServerName;

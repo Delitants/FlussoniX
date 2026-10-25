@@ -1,11 +1,14 @@
 //! Connection-scoped interruption of cancelled native HTTP/1 TS delivery.
 use axum::{
     Router,
-    extract::{ConnectInfo, Request, connect_info::Connected},
+    body::Body,
+    extract::{ConnectInfo, Request},
     middleware::{Next, from_fn},
     response::Response,
-    serve::{IncomingStream, Listener},
+    serve::Listener,
 };
+use hyper::{body::Incoming, server::conn::http1, service::service_fn};
+use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{
     collections::HashMap,
     future::Future,
@@ -23,11 +26,12 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
     sync::{OwnedSemaphorePermit, Semaphore},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
     time::Sleep,
 };
 use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
+use tower::ServiceExt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reason {
@@ -306,14 +310,6 @@ where
         })
     }
 }
-impl<L: Listener<Addr = SocketAddr>> Connected<IncomingStream<'_, Guarded<L>>> for Peer
-where
-    L::Io: ResetSocket,
-{
-    fn connect_info(stream: IncomingStream<'_, Guarded<L>>) -> Self {
-        stream.remote_addr().clone()
-    }
-}
 async fn context(
     ConnectInfo(peer): ConnectInfo<Peer>,
     mut request: Request,
@@ -333,14 +329,41 @@ pub(crate) async fn serve_listener<L: Listener<Addr = SocketAddr>>(
 where
     L::Io: ResetSocket,
 {
-    axum::serve(
-        Guarded(listener, Admission::for_process()),
-        router
-            .layer(from_fn(context))
-            .into_make_service_with_connect_info::<Peer>(),
-    )
-    .with_graceful_shutdown(cancel.cancelled_owned())
-    .await
+    let mut listener = Guarded(listener, Admission::for_process());
+    let router = router.layer(from_fn(context));
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = connections.join_next(), if !connections.is_empty() => {},
+            (io, peer) = listener.accept() => {
+                let router = router.clone();
+                let shutdown = cancel.clone();
+                connections.spawn(async move {
+                    let service = service_fn(move |mut request: hyper::Request<Incoming>| {
+                        request.extensions_mut().insert(ConnectInfo(peer.clone()));
+                        let router = router.clone();
+                        async move { router.oneshot(request.map(Body::new)).await }
+                    });
+                    let mut builder = http1::Builder::new();
+                    builder.timer(TokioTimer::new());
+                    builder.header_read_timeout(Duration::from_secs(5));
+                    let connection = builder.serve_connection(TokioIo::new(io), service).with_upgrades();
+                    tokio::pin!(connection);
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            connection.as_mut().graceful_shutdown();
+                            let _ = connection.await;
+                        }
+                        _ = &mut connection => {},
+                    }
+                });
+            }
+        }
+    }
+    while connections.join_next().await.is_some() {}
+    Ok(())
 }
 pub async fn serve(
     tcp: TcpListener,
