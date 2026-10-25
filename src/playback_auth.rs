@@ -378,6 +378,8 @@ pub struct Grant {
     output_credit: Option<Arc<crate::admission_credit::OutputCredit>>,
     entry: Option<Arc<Entry>>,
     cancel: CancellationToken,
+    expires_at: Option<SystemTime>,
+    expiry_task: Option<tokio::task::JoinHandle<()>>,
     kind: AtomicU8,
     segmented_delivery: bool,
 }
@@ -404,6 +406,25 @@ impl GrantKind {
     }
 }
 impl Grant {
+    fn expire_at(&mut self, expires_at: SystemTime) {
+        self.expires_at = Some(expires_at);
+        // A child token keeps this viewer's deadline separate from the
+        // entry's shared cancellation state and wakes token-only transports.
+        self.cancel = self.cancel.child_token();
+        let cancel = self.cancel.clone();
+        self.expiry_task = Some(tokio::spawn(async move {
+            loop {
+                let Ok(remaining) = expires_at.duration_since(SystemTime::now()) else {
+                    cancel.cancel();
+                    break;
+                };
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(remaining.min(Duration::from_secs(60))) => {}
+                }
+            }
+        }));
+    }
     pub(crate) fn mark_handoff(&mut self) {
         if let Some(entry) = &self.entry {
             let mut s = entry.state.lock().unwrap();
@@ -449,7 +470,7 @@ impl Grant {
     }
     /// Read-only recovery permission from this original native viewer grant.
     pub(crate) fn recovery_activity(&self) -> Option<Instant> {
-        if self.cancel.is_cancelled() {
+        if self.is_cancelled() {
             return None;
         }
         let entry = self.entry.as_ref()?;
@@ -463,7 +484,7 @@ impl Grant {
     pub(crate) fn playback(&self) {
         if let Some(e) = &self.entry {
             let mut s = e.state.lock().unwrap();
-            if self.cancel.is_cancelled() {
+            if self.is_cancelled() {
                 return;
             }
             let previous = GrantKind::from_u8(self.kind.load(Ordering::Relaxed));
@@ -488,6 +509,8 @@ impl Grant {
             output_credit: None,
             capacity_reservation: None,
             cancel: CancellationToken::new(),
+            expires_at: None,
+            expiry_task: None,
             kind: AtomicU8::new(GrantKind::Control as u8),
             segmented_delivery: false,
         }
@@ -500,17 +523,20 @@ impl Grant {
     }
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+            || self
+                .expires_at
+                .is_some_and(|expires_at| SystemTime::now() >= expires_at)
     }
     pub fn add_bytes(&self, bytes: usize) {
         if bytes > 0
-            && !self.cancel.is_cancelled()
+            && !self.is_cancelled()
             && let Some(credit) = &self.output_credit
         {
             credit.record(bytes);
         }
         if let Some(e) = &self.entry {
             let mut s = e.state.lock().unwrap();
-            if self.cancel.is_cancelled() {
+            if self.is_cancelled() {
                 return;
             }
             e.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
@@ -524,6 +550,9 @@ impl Grant {
 }
 impl Drop for Grant {
     fn drop(&mut self) {
+        if let Some(task) = self.expiry_task.take() {
+            task.abort();
+        }
         if let Some(e) = &self.entry {
             // A reservation represented by this live grant must return to the
             // pending count atomically with releasing its live occupancy.
@@ -952,6 +981,8 @@ impl PlaybackAuth {
                             output_credit: None,
                             entry: Some(entry.clone()),
                             cancel: s.cancel.clone(),
+                            expires_at: None,
+                            expiry_task: None,
                             kind: AtomicU8::new(kind as u8),
                             segmented_delivery,
                         })
@@ -968,13 +999,21 @@ impl PlaybackAuth {
             let current = store.snapshot();
             store
                 .at_current(current.revision(), || {
-                    if current
-                        .authorize(&iptv_request.token, &iptv_request.name, SystemTime::now())
-                        .is_none()
-                    {
-                        AuthOutcome::Denied
-                    } else {
-                        admit()
+                    match current.authorize(
+                        &iptv_request.token,
+                        &iptv_request.name,
+                        SystemTime::now(),
+                    ) {
+                        Some(facts) => {
+                            let mut outcome = admit();
+                            if let (Some(expires_at), AuthOutcome::Allowed(grant)) =
+                                (facts.expires_at, &mut outcome)
+                            {
+                                grant.expire_at(expires_at);
+                            }
+                            outcome
+                        }
+                        None => AuthOutcome::Denied,
                     }
                 })
                 .unwrap_or(AuthOutcome::Denied)
@@ -1401,6 +1440,22 @@ mod capacity_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn expiring_grant_cancels_its_transport_token_without_canceling_parent() {
+        let mut grant = Grant::peer();
+        let parent = grant.cancellation_token();
+        grant.expire_at(SystemTime::now() + Duration::from_millis(50));
+        let transport = grant.cancellation_token();
+        tokio::time::timeout(Duration::from_secs(1), transport.cancelled())
+            .await
+            .expect("expiry must wake token-only transport watchers");
+        assert!(grant.is_cancelled());
+        assert!(
+            !parent.is_cancelled(),
+            "other viewers share the parent token"
+        );
+    }
 
     #[tokio::test]
     async fn iptv_limit_rejects_a_second_live_connection_with_the_same_identity() {

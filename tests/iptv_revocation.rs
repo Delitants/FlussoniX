@@ -87,6 +87,40 @@ async fn token_rotation_cancels_old_grant_and_requires_current_token() {
 }
 
 #[tokio::test]
+async fn absolute_expiry_stops_live_grant_without_periodic_renewal() {
+    let (_dir, store, auth) = setup();
+    let expiry = (chrono::Utc::now() + chrono::Duration::milliseconds(900))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    store
+        .put_subscriber("alice", json!({"flussonix_expires_at":expiry}))
+        .unwrap();
+    store
+        .put_subscriber(
+            "bob",
+            json!({"token":"other-token","packages":["basic"],"max_sessions":2}),
+        )
+        .unwrap();
+    let AuthOutcome::Allowed(live) = grant(&auth, "news", "old-token").await else {
+        panic!("subscriber was denied before expiry");
+    };
+    let AuthOutcome::Allowed(other) = grant(&auth, "news", "other-token").await else {
+        panic!("other subscriber was denied");
+    };
+    tokio::time::timeout(Duration::from_secs(3), live.cancelled())
+        .await
+        .expect("live grant must close at absolute subscriber expiry without a renewal sweep");
+    assert!(live.is_cancelled(), "expired grant must fence media output");
+    assert!(
+        !other.is_cancelled(),
+        "another subscriber must keep playing"
+    );
+    assert!(matches!(
+        grant(&auth, "news", "old-token").await,
+        AuthOutcome::Denied
+    ));
+}
+
+#[tokio::test]
 async fn package_and_subscriber_deletion_cancel_live_grants() {
     let (_dir, store, auth) = setup();
     let AuthOutcome::Allowed(first) = grant(&auth, "news", "old-token").await else {
@@ -319,6 +353,73 @@ async fn app_store_edit_closes_live_http_viewer_but_preserves_public_viewer() {
             .any(|row| row["name"] == "free" && row["is_open"] == true)
     );
     drop(public);
+    app.media.stop_all().await;
+}
+
+#[tokio::test]
+async fn natural_expiry_closes_live_http_ts_but_keeps_public_viewer() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = App::new(
+        dir.path().join("c.json"),
+        dir.path().join("media"),
+        Options {
+            admin_password: "admin-secret-123".into(),
+            peer_key: "peer-secret-1234".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for (name, protected) in [("news", true), ("free", false)] {
+        let mut cfg = json!({"inputs":[{"url":"testsrc://"}]});
+        if protected {
+            cfg["on_play"] = json!("iptv://");
+        }
+        app.config.put("streams", name, cfg).unwrap();
+    }
+    app.iptv.set_enabled(true).unwrap();
+    app.iptv
+        .put_package("basic", json!({"channels":["news"]}))
+        .unwrap();
+    let expiry = (chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339();
+    app.iptv
+        .put_subscriber(
+            "alice",
+            json!({"token":"subscriber-token","packages":["basic"],"flussonix_expires_at":expiry}),
+        )
+        .unwrap();
+    let request = |path: &str| Request::builder().uri(path).body(Body::empty()).unwrap();
+    let protected = router(app.clone())
+        .oneshot(request("/news/mpegts?token=subscriber-token"))
+        .await
+        .unwrap();
+    let public = router(app.clone())
+        .oneshot(request("/free/mpegts"))
+        .await
+        .unwrap();
+    assert_eq!(protected.status(), StatusCode::OK);
+    assert_eq!(public.status(), StatusCode::OK);
+    let mut protected = protected.into_body().into_data_stream();
+    let mut public = public.into_body().into_data_stream();
+    let first = tokio::time::timeout(Duration::from_secs(4), protected.next())
+        .await
+        .expect("protected stream should start before expiry")
+        .expect("protected body ended before expiry")
+        .unwrap();
+    assert!(!first.is_empty());
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), protected.next())
+            .await
+            .expect("expired HTTP body should close")
+            .is_none()
+    );
+    let public_bytes = tokio::time::timeout(Duration::from_secs(4), public.next())
+        .await
+        .expect("public viewer should continue")
+        .expect("public stream ended")
+        .unwrap();
+    assert!(!public_bytes.is_empty());
+    drop((protected, public));
     app.media.stop_all().await;
 }
 

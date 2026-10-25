@@ -142,6 +142,12 @@ pub(super) fn body(
                     Err(end) => break Err(end),
                 }
             };
+            // A ready backlog record can win before the deadline task is
+            // scheduled. Recheck the grant at the actual output boundary.
+            let result = match result {
+                Ok(_) if delivery.viewer.1.is_cancelled() => Err(End::AuthorizationRevoked),
+                other => other,
+            };
             match result {
                 Ok(bytes) => {
                     delivery.viewer.1.add_bytes(bytes.len());
