@@ -326,6 +326,37 @@ async fn iptv_name_sorted_pages_emit_reference_name_bounds() {
 }
 
 #[tokio::test]
+async fn iptv_sort_cannot_address_internal_page_position() {
+    let (_dir, app) = app();
+    enable(app.clone()).await;
+    for name in ["zeta", "alpha", "middle"] {
+        assert_eq!(
+            edit(
+                app.clone(),
+                Method::PUT,
+                &format!("iptv/packages/{name}"),
+                json!({"channels":[]}),
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    let (status, body) = edit(
+        app,
+        Method::GET,
+        "iptv/packages?sort=%24index&select=name",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["packages"],
+        json!([{"name":"alpha"},{"name":"middle"},{"name":"zeta"}])
+    );
+}
+
+#[tokio::test]
 async fn view_role_subscriber_sort_cursors_never_contain_tokens() {
     let (_dir, app) = app();
     enable(app.clone()).await;

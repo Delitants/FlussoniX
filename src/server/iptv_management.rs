@@ -153,6 +153,7 @@ fn collection(app: Arc<App>, kind: &str, role: Role, query: &HashMap<String, Str
         collection_rows(
             snapshot.document().packages.iter().collect(),
             |row| row.name.as_str(),
+            |_, _, _| None,
             kind,
             role,
             query,
@@ -161,6 +162,13 @@ fn collection(app: Arc<App>, kind: &str, role: Role, query: &HashMap<String, Str
         collection_rows(
             snapshot.document().subscribers.iter().collect(),
             |row| row.name.as_str(),
+            |row, field, role| match field {
+                "token" if role == Role::View => Some(json!("[redacted]")),
+                "token" => Some(json!(row.token)),
+                "max_sessions" => Some(json!(row.max_sessions)),
+                "flussonix_expires_at" => Some(json!(row.flussonix_expires_at)),
+                _ => None,
+            },
             kind,
             role,
             query,
@@ -171,6 +179,7 @@ fn collection(app: Arc<App>, kind: &str, role: Role, query: &HashMap<String, Str
 fn collection_rows<T: Serialize>(
     rows: Vec<&T>,
     name: impl Fn(&T) -> &str,
+    scalar: impl Fn(&T, &str, Role) -> Option<Value>,
     kind: &str,
     role: Role,
     query: &HashMap<String, String>,
@@ -183,21 +192,23 @@ fn collection_rows<T: Serialize>(
     }
     let count = rows.len();
     let sort = query.get("sort").map(String::as_str);
-    let compact = sort.is_none_or(|value| matches!(value, "name" | "-name"));
     let mut items = Vec::with_capacity(count);
     for (index, row) in rows.iter().enumerate() {
         let item = match sort {
             None => json!(index),
-            Some("name" | "-name") => json!({"name":name(row),"$index":index}),
-            Some(_) => match serde_json::to_value(row) {
-                Ok(mut value) => {
-                    if role == Role::View {
-                        redact_view_value(&mut value);
+            Some(expression) => {
+                let mut fields = serde_json::Map::new();
+                fields.insert("name".into(), json!(name(row)));
+                for part in expression.split(',') {
+                    let field = part.strip_prefix('-').unwrap_or(part);
+                    if field != "name"
+                        && let Some(value) = scalar(row, field, role)
+                    {
+                        fields.insert(field.to_owned(), value);
                     }
-                    value
                 }
-                Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "invalid IPTV row"),
-            },
+                Value::Object(fields)
+            }
         };
         items.push(item);
     }
@@ -217,22 +228,25 @@ fn collection_rows<T: Serialize>(
     if let Some(prev) = page.prev {
         body["prev"] = json!(prev);
     }
+    let by_name = sort.map(|_| {
+        rows.iter()
+            .map(|row| (name(row), *row))
+            .collect::<HashMap<_, _>>()
+    });
     let mut page_rows = Vec::with_capacity(page.items.len());
     for item in page.items {
-        let mut row = if compact {
-            let index = if sort.is_none() {
-                item.as_u64()
-            } else {
-                item["$index"].as_u64()
-            }
-            .and_then(|value| usize::try_from(value).ok())
-            .and_then(|index| rows.get(index));
-            match index.and_then(|row| serde_json::to_value(row).ok()) {
-                Some(row) => row,
-                None => return error(StatusCode::INTERNAL_SERVER_ERROR, "invalid IPTV row"),
-            }
+        let source = if sort.is_none() {
+            item.as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .and_then(|index| rows.get(index).copied())
         } else {
-            item
+            item["name"]
+                .as_str()
+                .and_then(|name| by_name.as_ref().and_then(|rows| rows.get(name).copied()))
+        };
+        let mut row = match source.and_then(|row| serde_json::to_value(row).ok()) {
+            Some(row) => row,
+            None => return error(StatusCode::INTERNAL_SERVER_ERROR, "invalid IPTV row"),
         };
         if role == Role::View {
             redact_view_value(&mut row);
@@ -291,11 +305,39 @@ mod tests {
         let response = collection_rows(
             rows.iter().collect(),
             |row| row.name.as_str(),
+            |_, _, _| None,
             "subscribers",
             Role::Edit,
             &query,
         );
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(serialized.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn scalar_sort_limit_one_does_not_serialize_the_entire_subscriber_catalog() {
+        for sort in ["max_sessions", "-flussonix_expires_at", "token"] {
+            let serialized = AtomicUsize::new(0);
+            let rows = (0..1_000)
+                .map(|index| CountedRow {
+                    name: format!("subscriber-{index:04}"),
+                    serialized: &serialized,
+                })
+                .collect::<Vec<_>>();
+            let query = HashMap::from([
+                ("limit".to_owned(), "1".to_owned()),
+                ("sort".to_owned(), sort.to_owned()),
+            ]);
+            let response = collection_rows(
+                rows.iter().collect(),
+                |row| row.name.as_str(),
+                |_, _, _| None,
+                "subscribers",
+                Role::View,
+                &query,
+            );
+            assert_eq!(response.status(), StatusCode::OK, "{sort}");
+            assert_eq!(serialized.load(Ordering::Relaxed), 1, "{sort}");
+        }
     }
 }
