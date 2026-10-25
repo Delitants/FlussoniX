@@ -334,6 +334,119 @@ async fn clean_hls_playlist_keeps_bandwidth_until_media_is_represented() {
 }
 
 #[tokio::test]
+async fn hls_handoff_playlist_can_refresh_without_spending_a_second_session() {
+    use futures_util::FutureExt;
+    let (_dir, app) = setup(1, 1000.0).await;
+    app.config
+        .put(
+            "streams",
+            "owned",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    let result = std::panic::AssertUnwindSafe(async {
+        let t = ticket(&app, 2.0).await;
+        let redirect = request(
+            &app,
+            &format!("/owned/index.m3u8?token=viewer&flussonix_ticket={t}"),
+            None,
+        )
+        .await;
+        assert_eq!(redirect.status(), 302);
+        let location = redirect.headers()["location"].to_str().unwrap().to_owned();
+        for _ in 0..2 {
+            let response = request(&app, &location, None).await;
+            assert_eq!(response.status(), 200);
+            let playlist = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            assert!(playlist.starts_with(b"#EXTM3U"));
+        }
+        assert_eq!(reserve(&app, 2.0).await.status(), 503);
+    })
+    .catch_unwind()
+    .await;
+    app.media.stop_all().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn concurrent_first_hls_handoff_gets_share_the_reserved_session() {
+    use futures_util::{FutureExt, future::join_all};
+    let (_dir, app) = setup(1, 1000.0).await;
+    app.config
+        .put(
+            "streams",
+            "owned",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    let result = std::panic::AssertUnwindSafe(async {
+        let t = ticket(&app, 2.0).await;
+        let redirect = request(
+            &app,
+            &format!("/owned/index.m3u8?token=viewer&flussonix_ticket={t}"),
+            None,
+        )
+        .await;
+        assert_eq!(redirect.status(), 302);
+        let location = redirect.headers()["location"].to_str().unwrap().to_owned();
+        let responses = join_all((0..6).map(|_| request(&app, &location, None))).await;
+        assert!(
+            responses
+                .into_iter()
+                .all(|response| response.status() == 200)
+        );
+        assert_eq!(reserve(&app, 2.0).await.status(), 503);
+    })
+    .catch_unwind()
+    .await;
+    app.media.stop_all().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn wrong_viewer_cannot_consume_capacity_with_a_reusable_hls_handoff() {
+    use futures_util::FutureExt;
+    let (_dir, app) = setup(2, 1000.0).await;
+    app.config
+        .put(
+            "streams",
+            "owned",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    let result = std::panic::AssertUnwindSafe(async {
+        let t = ticket(&app, 2.0).await;
+        let redirect = request(
+            &app,
+            &format!("/owned/index.m3u8?token=viewer&flussonix_ticket={t}"),
+            None,
+        )
+        .await;
+        assert_eq!(redirect.status(), 302);
+        let location = redirect.headers()["location"].to_str().unwrap().to_owned();
+        assert_eq!(request(&app, &location, None).await.status(), 200);
+        let wrong = location.replace("token=viewer", "token=intruder");
+        assert_ne!(wrong, location);
+        assert_eq!(request(&app, &wrong, None).await.status(), 503);
+        assert_eq!(
+            reserve(&app, 2.0).await.status(),
+            200,
+            "rejected marker spent a second viewer slot"
+        );
+    })
+    .catch_unwind()
+    .await;
+    app.media.stop_all().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
 async fn m4f_signals_and_finite_media_share_measured_bandwidth_credit() {
     use futures_util::{FutureExt, StreamExt};
     let (_dir, app) = setup(100, 100.0).await;

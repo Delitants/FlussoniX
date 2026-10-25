@@ -1934,8 +1934,15 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         );
     }
     let mut handoff = if let Some(ticket) = query.get("flussonix_handoff") {
-        match app.http_handoffs.claim(ticket) {
-            Some(grant) => Some(grant),
+        let claim = if file.ends_with(".m3u8") {
+            app.http_handoffs.claim_hls(ticket).await
+        } else {
+            app.http_handoffs
+                .claim(ticket)
+                .map(http_handoff::Claim::once)
+        };
+        match claim {
+            Some(claim) => Some(claim),
             None => {
                 return error(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1975,10 +1982,27 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         };
         // Validate protocol before authorization. A valid native HTTP ticket
         // owns a global slot; possession never bypasses viewer policy checks.
-        let outcome = if let Some(handoff) = handoff.as_ref() {
+        let outcome = if let Some(handoff) = handoff.as_ref().and_then(http_handoff::Claim::grant) {
             app.playback_auth
                 .authorize_handoff(resolved.policy, viewer, handoff)
                 .await
+        } else if let Some(identity) = handoff
+            .as_ref()
+            .and_then(http_handoff::Claim::reuse_identity)
+        {
+            match app
+                .playback_auth
+                .authorize_handoff_reuse(resolved.policy, viewer, identity)
+                .await
+            {
+                Some(outcome) => outcome,
+                None => {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "admission handoff belongs to another viewer",
+                    );
+                }
+            }
         } else if let Some(ticket) = query.get("flussonix_ticket") {
             let slot = {
                 let reservations = app.reservations.lock().await;
@@ -2020,6 +2044,16 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             }
         }
     };
+    if let Some(expected) = handoff
+        .as_ref()
+        .and_then(http_handoff::Claim::reuse_identity)
+        && grant.session_identity() != Some(expected)
+    {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admission handoff belongs to another viewer",
+        );
+    }
     if app.config.revision() != resolved.revision {
         // Re-resolve after a concurrent save. Unrelated metadata changes retain the grant,
         // while policy/source changes publish a new authority revision and cancel it.
@@ -2075,10 +2109,16 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     // M4F signals and timestamp media are one segmented output session.
     let segmented = !matches!(file, "mpegts" | "m4s");
     let credit = if let Some(ref mut claimed) = handoff {
-        app.http_handoffs.activate(claimed, &grant, segmented)
+        app.http_handoffs.activate_claim(claimed, &grant, segmented)
     } else {
         app.http_handoffs.take(&grant, segmented && file != "m4f")
     };
+    if handoff.is_some() && credit.is_none() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admission handoff invalid or expired",
+        );
+    }
     grant.set_output_credit(credit);
     drop(handoff);
     let signature = crate::media::media_signature(&cfg);

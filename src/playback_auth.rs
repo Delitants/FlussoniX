@@ -608,7 +608,7 @@ impl PlaybackAuth {
         })
     }
     pub async fn authorize(&self, snapshot: PolicySnapshot, request: ViewerRequest) -> AuthOutcome {
-        self.authorize_inner(snapshot, request, true, None, None)
+        self.authorize_inner(snapshot, request, true, None, None, None)
             .await
     }
     pub(crate) async fn authorize_handoff(
@@ -617,15 +617,39 @@ impl PlaybackAuth {
         request: ViewerRequest,
         handoff: &Grant,
     ) -> AuthOutcome {
-        self.authorize_inner(snapshot, request, true, None, Some(handoff))
+        self.authorize_inner(snapshot, request, true, None, Some(handoff), None)
             .await
+    }
+    pub(crate) async fn authorize_handoff_reuse(
+        &self,
+        snapshot: PolicySnapshot,
+        request: ViewerRequest,
+        identity: &str,
+    ) -> Option<AuthOutcome> {
+        let key = snapshot.policy.identity(&request);
+        if snapshot.name != request.name
+            || !self
+                .entries
+                .lock()
+                .unwrap()
+                .by_stream
+                .get(&request.name)
+                .and_then(|sessions| sessions.get(&key))
+                .is_some_and(|entry| entry.id == identity)
+        {
+            return None;
+        }
+        Some(
+            self.authorize_inner(snapshot, request, true, None, None, Some(identity))
+                .await,
+        )
     }
     pub(crate) async fn authorize_control(
         &self,
         snapshot: PolicySnapshot,
         request: ViewerRequest,
     ) -> AuthOutcome {
-        self.authorize_inner(snapshot, request, false, None, None)
+        self.authorize_inner(snapshot, request, false, None, None, None)
             .await
     }
     pub(crate) fn reserve_capacity(&self, additional: usize) -> Option<Arc<CapacityReservation>> {
@@ -667,7 +691,7 @@ impl PlaybackAuth {
         request: ViewerRequest,
         reservation: Arc<CapacityReservation>,
     ) -> AuthOutcome {
-        self.authorize_inner(snapshot, request, false, Some(reservation), None)
+        self.authorize_inner(snapshot, request, false, Some(reservation), None, None)
             .await
     }
     async fn authorize_inner(
@@ -677,6 +701,7 @@ impl PlaybackAuth {
         playback: bool,
         reservation: Option<Arc<CapacityReservation>>,
         handoff: Option<&Grant>,
+        reuse_identity: Option<&str>,
     ) -> AuthOutcome {
         if snapshot.name != request.name {
             return AuthOutcome::Denied;
@@ -718,6 +743,14 @@ impl PlaybackAuth {
             }
             let mut all = self.entries.lock().unwrap();
             all.prune(Instant::now(), false);
+            if reuse_identity.is_some_and(|expected| {
+                all.by_stream
+                    .get(&request.name)
+                    .and_then(|sessions| sessions.get(&identity))
+                    .is_none_or(|entry| entry.id != expected)
+            }) {
+                return AuthOutcome::Denied;
+            }
             if !all.contains_key(&request.name, &identity) && all.len() >= 20_000 {
                 all.prune(Instant::now(), true);
                 if all.len() >= 20_000 {

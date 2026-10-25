@@ -278,7 +278,7 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
     let origin = base.origin();
     let redirects = if key.is_some() {
         reqwest::redirect::Policy::none()
-    } else if scheme == "https" || authorization.is_some() {
+    } else {
         reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= 3
                 || attempt.url().origin() != origin
@@ -290,8 +290,6 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
                 attempt.follow()
             }
         })
-    } else {
-        reqwest::redirect::Policy::limited(3)
     };
     let mut client = reqwest::Client::builder()
         .no_proxy()

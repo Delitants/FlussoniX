@@ -2,6 +2,7 @@
 use super::*;
 use crate::admission_credit::OutputCredit;
 use std::sync::{Mutex as StdMutex, Weak};
+use tokio::sync::watch;
 struct Handoff {
     grant: Grant,
     expires: Instant,
@@ -10,6 +11,43 @@ struct Segmented {
     credit: Arc<OutputCredit>,
     cancel: tokio_util::sync::CancellationToken,
     expires: Instant,
+}
+struct Reusable {
+    identity: String,
+    cancel: tokio_util::sync::CancellationToken,
+    expires: Instant,
+}
+pub(super) enum Claim {
+    First {
+        grant: Grant,
+        ticket: Option<String>,
+        signal: Option<watch::Sender<bool>>,
+    },
+    Reuse {
+        identity: String,
+        ticket: String,
+    },
+}
+impl Claim {
+    pub(super) fn once(grant: Grant) -> Self {
+        Self::First {
+            grant,
+            ticket: None,
+            signal: None,
+        }
+    }
+    pub(super) fn grant(&self) -> Option<&Grant> {
+        match self {
+            Self::First { grant, .. } => Some(grant),
+            Self::Reuse { .. } => None,
+        }
+    }
+    pub(super) fn reuse_identity(&self) -> Option<&str> {
+        match self {
+            Self::Reuse { identity, .. } => Some(identity),
+            Self::First { .. } => None,
+        }
+    }
 }
 struct TrackedCredit {
     shared: bool,
@@ -21,6 +59,8 @@ struct TrackedCredit {
 #[derive(Default)]
 struct State {
     handoffs: HashMap<String, Handoff>,
+    pending_hls: HashMap<String, watch::Receiver<bool>>,
+    reusable_hls: HashMap<String, Reusable>,
     segmented: HashMap<String, Segmented>,
     credits: Vec<TrackedCredit>,
 }
@@ -28,6 +68,10 @@ impl State {
     fn prune(&mut self) {
         self.handoffs
             .retain(|_, h| h.expires > Instant::now() && !h.grant.is_cancelled());
+        self.pending_hls
+            .retain(|_, wait| wait.has_changed().is_ok());
+        self.reusable_hls
+            .retain(|_, h| h.expires > Instant::now() && !h.cancel.is_cancelled());
         self.segmented
             .retain(|_, s| s.expires > Instant::now() && !s.cancel.is_cancelled());
         self.credits
@@ -63,6 +107,86 @@ impl Registry {
         let mut state = self.0.lock().unwrap();
         state.prune();
         Some(state.handoffs.remove(ticket)?.grant)
+    }
+    pub(super) async fn claim_hls(&self, ticket: &str) -> Option<Claim> {
+        loop {
+            let mut wait = {
+                let mut state = self.0.lock().unwrap();
+                state.prune();
+                if let Some(reusable) = state.reusable_hls.get(ticket) {
+                    return Some(Claim::Reuse {
+                        identity: reusable.identity.clone(),
+                        ticket: ticket.to_owned(),
+                    });
+                }
+                if let Some(handoff) = state.handoffs.remove(ticket) {
+                    let (signal, wait) = watch::channel(false);
+                    state.pending_hls.insert(ticket.to_owned(), wait);
+                    return Some(Claim::First {
+                        grant: handoff.grant,
+                        ticket: Some(ticket.to_owned()),
+                        signal: Some(signal),
+                    });
+                }
+                state.pending_hls.get(ticket)?.clone()
+            };
+            if tokio::time::timeout(Duration::from_secs(5), wait.changed())
+                .await
+                .ok()?
+                .is_err()
+            {
+                return None;
+            }
+        }
+    }
+    pub(super) fn activate_claim(
+        &self,
+        claim: &mut Claim,
+        grant: &Grant,
+        segmented: bool,
+    ) -> Option<Arc<OutputCredit>> {
+        match claim {
+            Claim::First {
+                grant: handoff,
+                ticket,
+                signal,
+            } => {
+                let credit = self.activate(handoff, grant, segmented);
+                if credit.is_some()
+                    && let (Some(ticket), Some(signal), Some(identity)) =
+                        (ticket.take(), signal.take(), grant.session_identity())
+                {
+                    let mut state = self.0.lock().unwrap();
+                    state.pending_hls.remove(&ticket);
+                    state.reusable_hls.insert(
+                        ticket,
+                        Reusable {
+                            identity: identity.to_owned(),
+                            cancel: grant.cancellation_token(),
+                            expires: Instant::now() + Duration::from_secs(30),
+                        },
+                    );
+                    let _ = signal.send(true);
+                }
+                credit
+            }
+            Claim::Reuse { identity, ticket } => {
+                if grant.session_identity() != Some(identity) || grant.is_cancelled() {
+                    return None;
+                }
+                let credit = self.take(grant, true)?;
+                let mut state = self.0.lock().unwrap();
+                if let Some(reusable) = state.reusable_hls.get_mut(ticket) {
+                    if reusable.identity != *identity || reusable.cancel.is_cancelled() {
+                        return None;
+                    }
+                    reusable.expires = Instant::now() + Duration::from_secs(30);
+                    Some(credit)
+                } else {
+                    None
+                }
+            }
+        }
     }
     pub(super) fn activate(
         &self,
