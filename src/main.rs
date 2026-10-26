@@ -150,14 +150,24 @@ struct Args {
     ffmpeg: String,
     #[arg(long, env = "FLUSSONIX_ADMIN_USER", default_value = "admin")]
     admin_user: String,
-    #[arg(long, env = "FLUSSONIX_ADMIN_PASSWORD", hide_env_values = true)]
-    admin_password: String,
+    #[arg(
+        long,
+        env = "FLUSSONIX_ADMIN_PASSWORD",
+        hide_env_values = true,
+        required_unless_present_any = ["iptv_ha_init_empty", "iptv_ha_init_from"]
+    )]
+    admin_password: Option<String>,
     #[arg(long, env = "FLUSSONIX_VIEW_USER")]
     view_user: Option<String>,
     #[arg(long, env = "FLUSSONIX_VIEW_PASSWORD", hide_env_values = true)]
     view_password: Option<String>,
-    #[arg(long, env = "FLUSSONIX_PEER_KEY", hide_env_values = true)]
-    peer_key: String,
+    #[arg(
+        long,
+        env = "FLUSSONIX_PEER_KEY",
+        hide_env_values = true,
+        required_unless_present_any = ["iptv_ha_init_empty", "iptv_ha_init_from"]
+    )]
+    peer_key: Option<String>,
     #[arg(long, default_value = "standalone")]
     role: String,
     #[arg(long, default_value = "local")]
@@ -308,12 +318,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let options = Options {
         admin_user: a.admin_user,
-        admin_password: a.admin_password,
+        admin_password: a
+            .admin_password
+            .expect("clap requires daemon admin password"),
         admin_public_origin: a.admin_public_origin,
         allow_insecure_remote_management: a.allow_insecure_remote_management,
         view_user: a.view_user,
         view_password: a.view_password,
-        peer_key: a.peer_key,
+        peer_key: a.peer_key.expect("clap requires daemon peer key"),
         ffmpeg: a.ffmpeg,
         role: a.role,
         node_name: a.node_name,
@@ -581,6 +593,29 @@ mod tests {
             "/tmp/owned-ha.json",
         ];
         assert!(Args::try_parse_from(base.into_iter().chain(["--iptv-ha-init-empty"])).is_ok());
+        assert!(
+            Args::try_parse_from([
+                "flussonix",
+                "--iptv-lease-authority",
+                "--iptv-ha-db-config",
+                "/tmp/owned-ha.json",
+                "--iptv-ha-init-from",
+                "/tmp/private-import.json"
+            ])
+            .is_ok(),
+            "one-shot import must not require unused daemon credentials"
+        );
+        assert!(
+            Args::try_parse_from([
+                "flussonix",
+                "--iptv-lease-authority",
+                "--iptv-ha-db-config",
+                "/tmp/owned-ha.json",
+                "--iptv-ha-init-empty"
+            ])
+            .is_ok(),
+            "one-shot empty initialization must not require unused daemon credentials"
+        );
         assert!(
             Args::try_parse_from(
                 base.into_iter()

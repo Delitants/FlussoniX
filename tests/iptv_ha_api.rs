@@ -281,6 +281,139 @@ async fn ha_peer_wire_playlists_and_view_role_use_shared_catalog_and_ledger() {
 }
 
 #[tokio::test]
+async fn imported_standalone_subscriber_keeps_access_and_limits_across_authorities() {
+    let certs = tls_fixture::Certificates::new();
+    let Some(db) = iptv_postgres::PgServer::start(&certs) else {
+        return;
+    };
+    let ha = options(&certs, db.port());
+    let source = certs.dir.path().join("standalone-iptv.json");
+    let original = serde_json::json!({
+        "version":1,"enabled":true,
+        "packages":[{"name":"basic","channels":["news","sports"]}],
+        "subscribers":[{"name":"alice","token":"owned-import-token",
+            "packages":["basic"],"max_sessions":1}],
+    })
+    .to_string();
+    fs::write(&source, &original).unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+    let import = || {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_flussonix"));
+        for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLUSSONIX_")) {
+            command.env_remove(key);
+        }
+        command
+            .arg("--iptv-lease-authority")
+            .arg("--iptv-ha-db-config")
+            .arg(certs.dir.path().join("authority-db.json"))
+            .arg("--iptv-ha-init-from")
+            .arg(&source)
+            .output()
+            .unwrap()
+    };
+    let initialized = import();
+    assert!(
+        initialized.status.success(),
+        "one-shot import failed: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    assert_eq!(initialized.stdout, b"IPTV HA schema initialized\n");
+    let mut daemon_without_credentials =
+        std::process::Command::new(env!("CARGO_BIN_EXE_flussonix"));
+    for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLUSSONIX_")) {
+        daemon_without_credentials.env_remove(key);
+    }
+    let refused = daemon_without_credentials.output().unwrap();
+    assert!(
+        !refused.status.success(),
+        "daemon must still require credentials"
+    );
+    let error = String::from_utf8_lossy(&refused.stderr);
+    assert!(error.contains("--admin-password") && error.contains("--peer-key"));
+    assert_eq!(fs::read_to_string(&source).unwrap(), original);
+    let first = authority(&certs, ha.clone());
+    let catalog = management(first.clone(), Method::GET, "iptv", None).await;
+    assert_eq!(catalog.status(), StatusCode::OK);
+    assert_eq!(catalog.headers()["etag"], "\"0\"");
+    let playlist = router(first.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/tv/playlists/alice?token=owned-import-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(playlist.status(), StatusCode::OK);
+
+    let request = serde_json::json!({
+        "token":"owned-import-token","channel":"news",
+        "boot":uuid::Uuid::new_v4().to_string(),
+        "session":uuid::Uuid::new_v4().to_string(),
+        "operation":uuid::Uuid::new_v4().to_string(),"units":1,
+    });
+    let acquired = peer(first.clone(), "acquire", request.clone()).await;
+    assert_eq!(acquired.status(), StatusCode::OK);
+    let grant: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(acquired.into_body(), 4096)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(grant["revision"], 0);
+
+    // A later standalone-file edit cannot silently change the HA catalog.
+    let changed = original.replace("owned-import-token", "new-local-file-token");
+    fs::write(&source, changed).unwrap();
+    assert!(
+        !import().status.success(),
+        "import must refuse existing schema"
+    );
+    let second = authority(&certs, ha);
+    let mut competing = request.clone();
+    competing["channel"] = serde_json::json!("sports");
+    competing["session"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+    competing["operation"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+    assert_eq!(
+        peer(second.clone(), "acquire", competing.clone())
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let mut new_token = competing.clone();
+    new_token["token"] = serde_json::json!("new-local-file-token");
+    assert_eq!(
+        peer(second.clone(), "acquire", new_token).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    let mut committed = request.clone();
+    committed["lease_id"] = grant["lease_id"].clone();
+    assert_eq!(
+        peer(second.clone(), "commit", committed.clone())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        peer(first, "renew", committed).await.status(),
+        StatusCode::OK
+    );
+    let release = serde_json::json!({
+        "subscriber_id":grant["subscriber_id"],"boot":request["boot"],
+        "session":request["session"],"lease_id":grant["lease_id"],
+        "operation":request["operation"],
+    });
+    assert_eq!(
+        peer(second.clone(), "release", release).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        peer(second, "acquire", competing).await.status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
 async fn catalog_changes_immediately_revoke_old_tokens_and_playlist_access_on_other_authority() {
     let certs = tls_fixture::Certificates::new();
     let Some(db) = iptv_postgres::PgServer::start(&certs) else {
