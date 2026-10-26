@@ -98,6 +98,8 @@ impl Listener {
             .map_err(|_| "FXLink TLS 1.3 required")?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
         config.transport_config(transport_config());
+        // Viewer authorization and peer budgets are bound to the admitted IP.
+        config.migration(false);
         config
             .max_incoming(64)
             .incoming_buffer_size(64 * 1024)
@@ -765,6 +767,126 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[tokio::test]
+    async fn rebinding_requires_new_connection_and_subscription() {
+        let _serial = super::super::transport::test_lock().lock().await;
+        let before = global().used();
+        struct CountingFeed(AtomicU64);
+        impl Provider for CountingFeed {
+            fn subscribe(&self, _: Request, _: SocketAddr) -> BoxFuture<'_, Result<Source, u16>> {
+                Box::pin(async move {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Ok(Source {
+                        pending_records: None,
+                        records: Box::pin(futures_util::stream::pending::<Result<Bytes, String>>()),
+                        current: Arc::new(|| true),
+                        cancelled: CancellationToken::new(),
+                    })
+                })
+            }
+        }
+        async fn subscribe(
+            connection: &quinn::Connection,
+            settings: &Settings,
+        ) -> (quinn::SendStream, quinn::RecvStream) {
+            let (mut send, recv) = connection.open_bi().await.unwrap();
+            let id = send.id().index();
+            control::write(
+                &mut send,
+                &Control::Subscribe {
+                    version: 2,
+                    id,
+                    generation: 1,
+                    profile: control::profile(settings),
+                    name: "live".into(),
+                    peer_key: "owned-peer".into(),
+                    token: "owned-viewer".into(),
+                },
+            )
+            .await
+            .unwrap();
+            (send, recv)
+        }
+
+        let cert = test_tls::Certificates::new();
+        let settings = Settings::default();
+        let listener = Listener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            &cert.cert,
+            &cert.key,
+            settings.clone(),
+        )
+        .unwrap();
+        let remote = listener.address();
+        let provider = Arc::new(CountingFeed(AtomicU64::new(0)));
+        let stop = CancellationToken::new();
+        let serving = tokio::spawn(listener.serve(provider.clone(), stop.clone()));
+        let mut tls = (*cert.client()).clone();
+        tls.alpn_protocols = vec![b"fxlink/2".to_vec()];
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+        let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+        config.transport_config(super::super::transport::config());
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(config);
+        let connection = endpoint
+            .connect(remote, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (first_send, mut first_recv) = subscribe(&connection, &settings).await;
+        assert!(matches!(
+            control::read(&mut first_recv).await.unwrap(),
+            Control::Accepted
+        ));
+        assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        assert_ne!(socket.local_addr().unwrap(), endpoint.local_addr().unwrap());
+        endpoint.rebind(socket).unwrap();
+        let (second_send, mut second_recv) = subscribe(&connection, &settings).await;
+        let migrated =
+            tokio::time::timeout(Duration::from_millis(750), control::read(&mut second_recv)).await;
+        let count_after_rebind = provider.0.load(Ordering::SeqCst);
+
+        let replacement = endpoint
+            .connect(remote, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (fresh_send, mut fresh_recv) = subscribe(&replacement, &settings).await;
+        let fresh = tokio::time::timeout(Duration::from_secs(2), control::read(&mut fresh_recv))
+            .await
+            .unwrap()
+            .unwrap();
+        let count_after_fresh = provider.0.load(Ordering::SeqCst);
+        connection.close(0u32.into(), b"test complete");
+        replacement.close(0u32.into(), b"test complete");
+        drop((
+            first_send,
+            first_recv,
+            second_send,
+            second_recv,
+            fresh_send,
+            fresh_recv,
+        ));
+        endpoint.wait_idle().await;
+        stop.cancel();
+        serving.await.unwrap().unwrap();
+        assert_eq!(
+            global().used(),
+            before,
+            "rebind test leaked transport state"
+        );
+        assert!(!matches!(migrated, Ok(Ok(Control::Accepted))));
+        assert_eq!(
+            count_after_rebind, 1,
+            "old connection gained a new admission"
+        );
+        assert!(matches!(fresh, Control::Accepted));
+        assert_eq!(count_after_fresh, 2, "new connection was not re-admitted");
     }
     pub(super) static REPAIR_QUEUE_DELAY: AtomicU64 = AtomicU64::new(0);
     pub(super) async fn wait_repair_queue() {

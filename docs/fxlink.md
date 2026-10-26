@@ -84,6 +84,12 @@ rather than extending the buffer. Check stream statistics for RTT, loss, FEC
 recovery, expired records, and charged state. FXLink egress counts application
 datagram bytes accepted into QUIC, not physical NIC or IP overhead.
 
+An FXLink connection stays bound to the peer address admitted at setup. If a
+node's address or NAT port changes, it must reconnect and receive fresh peer
+and viewer authorization. The current QUIC idle timeout is 10 seconds, so an
+address change can interrupt playback longer than the 500–1,500 ms transport
+buffer. FEC and repair still handle packet loss on an unchanged address.
+
 Test the intended stream bitrate, RTT, loss pattern, competing streams, and
 viewer behavior on your own link before using FXLink for critical delivery.
 A healthy TLS connection or short FEC test does not establish sustained
