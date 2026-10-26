@@ -39,7 +39,11 @@ fn binaries() -> Option<(PathBuf, PathBuf)> {
             std::env::var("FLUSSONIX_TEST_PG_SHAREDIR")
                 .expect("FLUSSONIX_TEST_PG_SHAREDIR is required with the binary override"),
         );
-        assert!(bin.join("initdb").is_file() && bin.join("postgres").is_file());
+        assert!(
+            bin.join("initdb").is_file()
+                && bin.join("postgres").is_file()
+                && bin.join("psql").is_file()
+        );
         assert!(share.join("postgres.bki").is_file());
         return Some((bin, share));
     }
@@ -48,6 +52,7 @@ fn binaries() -> Option<(PathBuf, PathBuf)> {
         let share = PathBuf::from(format!("/usr/share/postgresql/{version}"));
         if bin.join("initdb").is_file()
             && bin.join("postgres").is_file()
+            && bin.join("psql").is_file()
             && share.join("postgres.bki").is_file()
         {
             return Some((bin, share));
@@ -84,6 +89,19 @@ fn chown_for_database(path: &Path) {
     let name = CString::new(path.as_os_str().as_bytes()).unwrap();
     // SAFETY: CString remains alive during this direct OS call.
     assert_eq!(unsafe { libc::chown(name.as_ptr(), uid, uid) }, 0);
+}
+
+fn accepts_authenticated_queries(bin: &Path, port: u16, home: &Path) -> bool {
+    owned_command(&bin.join("psql"))
+        .args(["-X", "-A", "-t", "-q", "-h", "127.0.0.1", "-p"])
+        .arg(port.to_string())
+        .args(["-U", "ha_test", "-d", "postgres", "-c", "SELECT 1"])
+        .env("HOME", home)
+        .env("PGPASSWORD", "owned-test-secret")
+        .env("PGSSLMODE", "require")
+        .env("PGCONNECT_TIMEOUT", "1")
+        .output()
+        .is_ok_and(|output| output.status.success() && output.stdout == b"1\n")
 }
 
 impl PgServer {
@@ -159,9 +177,8 @@ impl PgServer {
             port,
             fenced: false,
         };
-        let address = SocketAddr::from(([127, 0, 0, 1], port));
         let deadline = Instant::now() + Duration::from_secs(8);
-        while TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err() {
+        while !accepts_authenticated_queries(&bin, port, server.dir.path()) {
             if server.child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
                 let log =
                     fs::read_to_string(server.dir.path().join("postgres.log")).unwrap_or_default();
@@ -357,9 +374,8 @@ impl PgReplica {
             port,
             primary_port: primary.port,
         };
-        let address = SocketAddr::from(([127, 0, 0, 1], port));
         let deadline = Instant::now() + Duration::from_secs(8);
-        while TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err() {
+        while !accepts_authenticated_queries(&bin, port, replica.dir.path()) {
             if replica.child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
                 let log =
                     fs::read_to_string(replica.dir.path().join("postgres.log")).unwrap_or_default();
