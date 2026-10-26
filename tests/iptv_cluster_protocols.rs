@@ -216,6 +216,13 @@ async fn clustered_iptv_srt_stream_id_enforces_the_authority_subscriber_token() 
     assert!(accepted_status.success());
     assert!(accepted_file.metadata().unwrap().len() > 0);
     assert_eq!(owner.iptv_leases.active_leases(), 1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while owner.iptv_leases.active_leases() != 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("closed continuous SRT viewer kept the subscriber slot");
     stop.cancel();
     serving.await.unwrap().unwrap();
     edge.media.stop_all().await;

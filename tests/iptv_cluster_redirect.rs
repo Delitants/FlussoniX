@@ -3,7 +3,9 @@ use axum::{
     middleware::{self, Next},
 };
 use flussonix::{
-    http_tls, rtsp,
+    http_tls,
+    iptv::lease::SubscriberId,
+    rtsp,
     server::{App, Options, router},
     srt_playback,
 };
@@ -80,6 +82,7 @@ fn app(
 #[derive(Default)]
 struct ReleaseGate {
     armed: AtomicBool,
+    srt_phase: AtomicBool,
     entered: Notify,
     proceed: Notify,
 }
@@ -93,9 +96,29 @@ fn serve(app: Arc<App>, listener: TcpListener, gate: Arc<ReleaseGate>) -> JoinHa
                 .layer(middleware::from_fn(move |request: Request, next: Next| {
                     let gate = gate.clone();
                     async move {
-                        if request.uri().path().ends_with("/leases/release")
-                            && gate.armed.load(Ordering::SeqCst)
-                        {
+                        let (request, srt_release) =
+                            if request.uri().path().ends_with("/leases/release") {
+                                let (parts, body) = request.into_parts();
+                                let bytes = axum::body::to_bytes(body, 8192).await.unwrap();
+                                let subscriber = if gate.srt_phase.load(Ordering::SeqCst) {
+                                    "bob"
+                                } else {
+                                    "alice"
+                                };
+                                let target = serde_json::from_slice::<Value>(&bytes)
+                                    .ok()
+                                    .is_some_and(|value| {
+                                        value["subscriber_id"]
+                                            == SubscriberId::from_name(subscriber).as_hex()
+                                    });
+                                (
+                                    Request::from_parts(parts, axum::body::Body::from(bytes)),
+                                    target,
+                                )
+                            } else {
+                                (request, false)
+                            };
+                        if srt_release && gate.armed.load(Ordering::SeqCst) {
                             gate.entered.notify_one();
                             gate.proceed.notified().await;
                         }
@@ -288,6 +311,7 @@ async fn lb_redirect_does_not_hold_the_only_iptv_slot_needed_by_its_cdn() {
     );
     gate.proceed.notify_one();
     let (status, target) = pending.await.unwrap();
+    gate.armed.store(false, Ordering::SeqCst);
     assert_eq!(status, 302, "RTSP load balancer did not redirect");
     let target = url::Url::parse(target.as_deref().unwrap()).unwrap();
     assert_eq!(target.host_str(), Some("127.0.0.1"));
@@ -351,6 +375,8 @@ async fn lb_redirect_does_not_hold_the_only_iptv_slot_needed_by_its_cdn() {
     })
     .await
     .expect("SRT CDN never became eligible");
+    gate.srt_phase.store(true, Ordering::SeqCst);
+    gate.armed.store(true, Ordering::SeqCst);
     let lookup = tokio::spawn(async move {
         secure_client
             .get(format!("{tls_url}/flussonix/api/v1/srt-lookup"))

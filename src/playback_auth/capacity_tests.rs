@@ -111,6 +111,7 @@ fn seed(auth: &PlaybackAuth, snapshot: &PolicySnapshot, count: usize, decision: 
                     created: now,
                     last_seen: now,
                     playback_seen: None,
+                    segmented_seen: None,
                     continuous_live: 0,
                     control_live: 0,
                     segmented_live: 0,

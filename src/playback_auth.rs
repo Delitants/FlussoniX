@@ -191,6 +191,7 @@ struct State {
     created: Instant,
     last_seen: Instant,
     playback_seen: Option<Instant>,
+    segmented_seen: Option<Instant>,
     continuous_live: usize,
     control_live: usize,
     segmented_live: usize,
@@ -229,11 +230,14 @@ impl State {
     }
     fn capacity_units(&self, live: usize, per_connection: bool) -> usize {
         if live == 0 {
+            let recent = if self.policy.kind == PolicyKind::Iptv {
+                self.segmented_seen
+            } else {
+                self.playback_seen
+            };
             return usize::from(
                 matches!(self.decision, Decision::Allow)
-                    && self
-                        .playback_seen
-                        .is_some_and(|seen| seen.elapsed() < Duration::from_secs(30)),
+                    && recent.is_some_and(|seen| seen.elapsed() < Duration::from_secs(30)),
             );
         }
         if !per_connection {
@@ -272,6 +276,7 @@ impl State {
     fn cancel_playback(&mut self) {
         self.cancel.cancel();
         self.playback_seen = None;
+        self.segmented_seen = None;
         self.allowed_until = Instant::now();
     }
     fn recovery_activity(&self, current: Option<&Policy>, now: Instant) -> Option<Instant> {
@@ -567,6 +572,9 @@ impl Grant {
             }
             let now = Instant::now();
             s.playback_seen = Some(now);
+            if self.segmented_delivery {
+                s.segmented_seen = Some(now);
+            }
             s.last_seen = now;
         }
     }
@@ -615,6 +623,9 @@ impl Grant {
             s.last_seen = now;
             if s.playback_seen.is_some() {
                 s.playback_seen = Some(now);
+            }
+            if self.segmented_delivery && s.segmented_seen.is_some() {
+                s.segmented_seen = Some(now);
             }
         }
     }
@@ -1090,6 +1101,7 @@ impl PlaybackAuth {
                             created: Instant::now(),
                             last_seen: Instant::now(),
                             playback_seen: None,
+                            segmented_seen: None,
                             continuous_live: 0,
                             control_live: 0,
                             segmented_live: 0,
@@ -1207,7 +1219,11 @@ impl PlaybackAuth {
                             }
                         }
                         if playback && remote_units.is_none() {
-                            s.playback_seen = Some(Instant::now());
+                            let now = Instant::now();
+                            s.playback_seen = Some(now);
+                            if segmented_delivery {
+                                s.segmented_seen = Some(now);
+                            }
                         }
                         if handoff_valid {
                             let handoff = handoff.expect("validated handoff");
@@ -1308,7 +1324,11 @@ impl PlaybackAuth {
                         true
                     } else {
                         if playback {
-                            state.playback_seen = Some(Instant::now());
+                            let now = Instant::now();
+                            state.playback_seen = Some(now);
+                            if segmented_delivery {
+                                state.segmented_seen = Some(now);
+                            }
                         }
                         state.user_id = committed.subscriber.as_hex();
                         state.allowed_until = committed.deadline;
@@ -1770,6 +1790,9 @@ impl PlaybackAuth {
             s.last_seen = aged;
             if s.playback_seen.is_some() {
                 s.playback_seen = Some(aged);
+            }
+            if s.segmented_seen.is_some() {
+                s.segmented_seen = Some(aged);
             }
         }
     }
