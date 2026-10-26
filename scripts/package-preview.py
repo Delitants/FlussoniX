@@ -215,6 +215,7 @@ def package(args):
                'README.md': (installation, 0o644),
                'installation.md': (installation, 0o644),
                'iptv-transport.md': (read_regular(ROOT / 'docs/iptv-transport.md', 1024 * 1024), 0o644),
+               'iptv-ha.md': (read_regular(ROOT / 'docs/iptv-ha.md', 1024 * 1024), 0o644),
                'bin/flussonix-service': (read_regular(ROOT / 'scripts/service-preview.py', 1024 * 1024), 0o755),
                'service-installation.md': (read_regular(ROOT / 'docs/service-installation.md', 1024 * 1024), 0o644)}
     for name in ('LICENSE', 'NOTICE', 'vendor/quinn-proto/LICENSE-APACHE',

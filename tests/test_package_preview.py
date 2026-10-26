@@ -64,7 +64,7 @@ class PackagePreviewTests(unittest.TestCase):
                      for m in tar.getmembers() if m.isfile()}
             expected = {'bin/flussonix', 'web/index.html', 'web/assets/app.js',
                         'web/assets/app.css', 'README.md', 'installation.md',
-                        'iptv-transport.md', 'manifest.json', 'LICENSE', 'NOTICE',
+                        'iptv-transport.md', 'iptv-ha.md', 'manifest.json', 'LICENSE', 'NOTICE',
                         'vendor/quinn-proto/LICENSE-APACHE',
                         'vendor/quinn-proto/LICENSE-MIT',
                         'bin/flussonix-service', 'service-installation.md',
@@ -110,6 +110,20 @@ class PackagePreviewTests(unittest.TestCase):
                 for target in re.findall(r'\]\(([^)#]+\.md)(?:#[^)]*)?\)', guide):
                     self.assertIn((Path(name).parent / target).as_posix(), files,
                                   f'{name} links to missing {target}')
+
+    def test_archive_includes_current_ha_guide_and_offline_install_link(self):
+        archive = self.successful()
+        with tarfile.open(archive) as tar:
+            prefix = archive.name[:-7] + '/'
+            self.assertTrue(prefix + 'iptv-ha.md' in tar.getnames(),
+                            'HA guide missing from archive')
+            guide = tar.extractfile(prefix + 'iptv-ha.md').read()
+            self.assertEqual(guide, (ROOT / 'docs/iptv-ha.md').read_bytes())
+            self.assertIn(b'./bin/flussonix --iptv-lease-authority', guide)
+            self.assertIn(b'source checkout', guide)
+            for name in ('README.md', 'installation.md'):
+                installation = tar.extractfile(prefix + name).read().decode('utf-8')
+                self.assertIn('](iptv-ha.md)', installation)
 
     def test_archive_carries_own_and_vendored_license_texts(self):
         archive = self.successful()

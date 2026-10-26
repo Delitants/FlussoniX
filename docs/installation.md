@@ -88,7 +88,8 @@ location; back it up with the rest of your state. Session limits are local on a
 single standalone node. For a FlussoniX cluster, configure one shared IPTV
 authority on every viewer-serving node so the limit applies across those nodes;
 see [IPTV transport and authority setup](iptv-transport.md). Existing Flussonic
-viewers are outside this count.
+viewers are outside this count. The optional two-authority PostgreSQL profile
+has a separate [IPTV HA setup and recovery guide](iptv-ha.md).
 
 For an optional background service, follow [systemd installation](service-installation.md).
 
