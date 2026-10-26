@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import select
 import secrets
 import shutil
@@ -32,6 +33,7 @@ def arguments():
     parser.add_argument("--cluster-key-file", required=True, type=Path)
     parser.add_argument("--timeout", type=int, default=45)
     parser.add_argument("--topology", action="store_true", help="also qualify local LB to CDN placement")
+    parser.add_argument("--output", choices=("hls", "m4s", "m4f"), default="hls")
     args = parser.parse_args()
     source = urllib.parse.urlsplit(args.source)
     if (
@@ -49,6 +51,8 @@ def arguments():
         parser.error("timeout must be 10–120 seconds")
     if not args.stream or "?" in args.stream or "#" in args.stream:
         parser.error("stream must be a path without query or fragment")
+    if args.output != "hls" and not args.topology:
+        parser.error("native output qualification currently requires --topology")
     try:
         key_stat = args.cluster_key_file.stat()
     except OSError:
@@ -110,6 +114,91 @@ def inspect_media(root, media):
     )
     streams = json.loads(inspect.stdout).get("streams", []) if inspect.returncode == 0 else []
     return streams, bool(streams) and decode.returncode == 0
+
+
+def m4s_boxes(data):
+    boxes = []
+    while data:
+        if len(data) < 8:
+            raise RuntimeError("truncated M4S box")
+        size = int.from_bytes(data[:4], "big")
+        if size < 8 or size > len(data):
+            raise RuntimeError("invalid M4S box length")
+        boxes.append((data[4:8], data[8:size]))
+        data = data[size:]
+    return boxes
+
+
+def inspect_m4s_stream(response, deadline):
+    buffer = bytearray()
+    tracks = []
+    media_records = 0
+    received = 0
+    while time.monotonic() < deadline and received < 8_000_000:
+        chunk = response.read(4096)
+        if not chunk:
+            break
+        received += len(chunk)
+        buffer.extend(chunk)
+        while len(buffer) >= 4:
+            size = int.from_bytes(buffer[:4], "big")
+            if size < 8 or size > 16 * 1024 * 1024:
+                raise RuntimeError("invalid native M4S record length")
+            if len(buffer) < size + 4:
+                break
+            record = bytes(buffer[4:size + 4])
+            del buffer[:size + 4]
+            boxes = m4s_boxes(record)
+            if len(boxes) != 1:
+                raise RuntimeError("native M4S record has multiple boxes")
+            kind, body = boxes[0]
+            if kind == b"MDin":
+                tracks = []
+                for subkind, track in m4s_boxes(body):
+                    if subkind != b"trak":
+                        continue
+                    handlers = [data for field, data in m4s_boxes(track) if field == b"hdlr"]
+                    if len(handlers) != 1 or len(handlers[0]) < 16 or not handlers[0].endswith(b"\0"):
+                        raise RuntimeError("invalid native M4S track handler")
+                    tracks.append(handlers[0][12:-1].decode("ascii"))
+            elif kind == b"Fgop":
+                fields = dict(m4s_boxes(body))
+                if b"goph" not in fields or not fields.get(b"body"):
+                    raise RuntimeError("native M4S GOP is missing header or media")
+                media_records += 1
+            elif kind == b"FRam":
+                fields = dict(m4s_boxes(body))
+                if len(fields.get(b"fhdr", b"")) < 32 or not fields.get(b"body"):
+                    raise RuntimeError("native M4S frame is missing header or media")
+                media_records += 1
+            if tracks and media_records:
+                return tracks, media_records, received
+    raise RuntimeError("native M4S metadata and media did not arrive within the probe limit")
+
+
+def inspect_m4f_segment(media):
+    fields = dict(m4s_boxes(media))
+    if b"moov" not in fields or not fields.get(b"mdat"):
+        raise RuntimeError("native M4F segment lacks movie metadata or media")
+    tracks = []
+    for kind, body in m4s_boxes(fields[b"moov"]):
+        if kind != b"trak":
+            continue
+        handlers = [data for field, data in m4s_boxes(body) if field == b"hdlr"]
+        if len(handlers) != 1 or len(handlers[0]) < 16 or not handlers[0].endswith(b"\0"):
+            raise RuntimeError("native M4F track handler is invalid")
+        tracks.append(handlers[0][12:-1].decode("ascii"))
+    if not tracks:
+        raise RuntimeError("native M4F segment has no tracks")
+    return tracks
+
+
+def parse_m4f_announcement(line):
+    parts = line.split()
+    if len(parts) != 2 or not parts[0].isascii() or not parts[0].isdigit():
+        return None
+    match = re.fullmatch(r"(\d{4}/\d{2}/\d{2}/\d{2}/\d{2}/\d{2})-\d+", parts[1])
+    return match.group(1) if match else None
 
 
 def probe(args, root):
@@ -293,7 +382,8 @@ def topology_probe(args, root):
               "public_payload_url": cdn_root, "private_payload_url": cdn_root}],
         )
         path = urllib.parse.quote(args.stream, safe="/")
-        entry = f"{lb}/{path}/index.m3u8?token={viewer_token}"
+        suffix = args.output if args.output != "hls" else "index.m3u8"
+        entry = f"{lb}/{path}/{suffix}?token={viewer_token}"
         deadline = time.monotonic() + args.timeout
         statuses = []
         placement = None
@@ -315,44 +405,122 @@ def topology_probe(args, root):
         clean = urllib.parse.urljoin(placement, headers["location"])
         if not same_origin(clean, cdn) or "flussonix_ticket" in urllib.parse.parse_qs(urllib.parse.urlsplit(clean).query):
             raise RuntimeError("CDN clean playback URL is invalid")
-        media = None
-        while time.monotonic() < deadline and media is None:
-            status, _, body = get(clean)
-            if status == 200:
-                segments = [
-                    line for line in body.decode("utf-8", "replace").splitlines()
-                    if line and not line.startswith("#")
-                ]
-                if segments:
-                    segment = urllib.parse.urljoin(clean, segments[0])
-                    if not same_origin(segment, cdn):
-                        raise RuntimeError("CDN playlist escaped the owned endpoint")
-                    status, _, body = get(segment, 20_000_000)
-                    if status == 200 and body:
-                        media = body
-            time.sleep(0.25)
-        if media is None:
+        media_bytes = 0
+        native_records = 0
+        streams = []
+        media_ok = False
+        m4f_controls = []
+        m4f_announcements = 0
+        m4f_segments = []
+        m4f_lines = 0
+        m4f_line_shapes = []
+        if args.output == "m4s":
+            while time.monotonic() < deadline and not media_ok:
+                try:
+                    with opener.open(clean, timeout=12) as response:
+                        if response.status == 200:
+                            streams, native_records, media_bytes = inspect_m4s_stream(response, deadline)
+                            media_ok = bool(streams) and native_records > 0
+                except urllib.error.HTTPError as error:
+                    if error.code != 503:
+                        raise RuntimeError("CDN native playback failed") from None
+                time.sleep(0.25)
+        elif args.output == "m4f":
+            while time.monotonic() < deadline and not media_ok:
+                try:
+                    with opener.open(clean, timeout=20) as response:
+                        m4f_controls.append(response.status)
+                        if response.status == 200:
+                            while time.monotonic() < deadline:
+                                raw_line = response.readline(512)
+                                if not raw_line:
+                                    break
+                                m4f_lines += 1
+                                line_text = raw_line.decode("ascii", "replace").strip()
+                                line = line_text.split()
+                                if len(m4f_line_shapes) < 3:
+                                    m4f_line_shapes.append({"bytes": len(raw_line),
+                                                            "words": len(line),
+                                                            "first": "numeric" if line and line[0].isascii() and line[0].isdigit() else "other",
+                                                            "first_bytes": len(line[0]) if line else 0})
+                                # A native M4F relay preserves the upstream sequence; it need not start at 1.
+                                segment_time = parse_m4f_announcement(line_text)
+                                if segment_time is None:
+                                    continue
+                                m4f_announcements += 1
+                                segment = f"{cdn}/{path}/{segment_time}.m4f?token={viewer_token}"
+                                status, _, body = get(segment, 20_000_000)
+                                m4f_segments.append(status)
+                                if status == 200 and body:
+                                    streams = inspect_m4f_segment(body)
+                                    media_bytes = len(body)
+                                    native_records = 1
+                                    media_ok = True
+                                    break
+                except urllib.error.HTTPError as error:
+                    m4f_controls.append(error.code)
+                    if error.code != 503:
+                        raise RuntimeError("CDN native playback failed") from None
+                except TimeoutError:
+                    m4f_controls.append("timeout")
+                time.sleep(0.25)
+        else:
+            media = None
+            while time.monotonic() < deadline and media is None:
+                status, _, body = get(clean)
+                if status == 200:
+                    segments = [
+                        line for line in body.decode("utf-8", "replace").splitlines()
+                        if line and not line.startswith("#")
+                    ]
+                    if segments:
+                        segment = urllib.parse.urljoin(clean, segments[0])
+                        if not same_origin(segment, cdn):
+                            raise RuntimeError("CDN playlist escaped the owned endpoint")
+                        status, _, body = get(segment, 20_000_000)
+                        if status == 200 and body:
+                            media = body
+                time.sleep(0.25)
+            if media is not None:
+                media_bytes = len(media)
+                streams, media_ok = inspect_media(root, media)
+        if not media_ok:
             return {"result": "no-cdn-media", "scheme": urllib.parse.urlsplit(args.source).scheme,
-                    "lb_statuses": statuses[-5:]}, 2
-        streams, media_ok = inspect_media(root, media)
-        unauthorized_lb = get(f"{lb}/{path}/index.m3u8")[0]
-        unauthorized_cdn = get(f"{cdn}/{path}/index.m3u8")[0]
+                    "output": args.output, "lb_statuses": statuses[-5:],
+                    "m4f_controls": m4f_controls[-8:], "m4f_announcements": m4f_announcements,
+                    "m4f_segments": m4f_segments[-8:], "m4f_lines": m4f_lines,
+                    "m4f_line_shapes": m4f_line_shapes}, 2
+        unauthorized_lb = get(f"{lb}/{path}/{suffix}")[0]
+        unauthorized_cdn = get(f"{cdn}/{path}/{suffix}")[0]
         node_status, _, node_body = get(lb + "/flussonix/api/v1/node", headers={"x-flussonix-peer": peer_key})
         node = json.loads(node_body) if node_status == 200 else {}
         lb_streams = node.get("streams")
         passed = media_ok and unauthorized_lb == 403 and unauthorized_cdn == 403 and lb_streams == []
-        return {
+        summary = {
             "result": "placed-media" if passed else "topology-failed",
             "scheme": urllib.parse.urlsplit(args.source).scheme,
             "stream": args.stream,
+            "output": args.output,
             "lb_statuses": statuses[-5:],
-            "segment_bytes": len(media),
+            "media_bytes": media_bytes,
             "codecs": streams,
-            "decode_ok": media_ok,
+            "media_check": (
+                "m4s_records" if args.output == "m4s"
+                else "m4f_boxes" if args.output == "m4f"
+                else "ffmpeg_decode"
+            ),
+            "native_records": native_records,
             "unauthenticated_lb": unauthorized_lb,
             "unauthenticated_cdn": unauthorized_cdn,
             "lb_node_streams": len(lb_streams) if isinstance(lb_streams, list) else None,
-        }, 0 if passed else 2
+        }
+        if args.output == "m4f":
+            summary.update(m4f_controls=m4f_controls[-8:],
+                           m4f_announcements=m4f_announcements,
+                           m4f_segments=m4f_segments[-8:],
+                           m4f_lines=m4f_lines,
+                           m4f_line_shapes=m4f_line_shapes)
+        return summary, 0 if passed else 2
     finally:
         for daemon in reversed(children):
             try:

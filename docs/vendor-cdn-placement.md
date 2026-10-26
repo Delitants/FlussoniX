@@ -81,6 +81,17 @@ cdn4 test stream, both secure M4SS and M4FS source pulls delivered decoded
 1920×1080 H.264/AAC through this path. An invalid Cluster key prevented LB
 placement.
 
+Adding `--output m4s` follows the same guarded redirects and validates native
+M4S track metadata and a framed media record. Both secure source transports
+advertised H.264/AAC and delivered native media in the live loopback topology.
+The HLS mode performs strict FFmpeg decoding; the M4S mode checks wire framing
+and metadata, not independent elementary-stream decoding.
+Adding `--output m4f` checks a live control announcement and retrieves its
+timestamped M4F segment, including track metadata and a nonempty media box.
+M4SS and M4FS source pulls both passed. The M4FS relay preserves the origin's
+multi-digit announcement sequence; this check does not fully decode M4F sample
+tables or qualify every reference stream.
+
 This verifies one live source and two local FlussoniX nodes. It does not
 establish placement across production CDN hosts, private LAN routing, uplink
 saturation decisions, failover under loss, HEVC, or target-scale capacity.
