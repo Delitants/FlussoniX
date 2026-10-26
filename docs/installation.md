@@ -12,7 +12,12 @@ on the supplied binary's build.
 
 Install FFmpeg and FFprobe independently. CPU transcoding needs libx264 and AAC
 support. GPU transcoding and optional protocols need their corresponding system
-drivers or libraries; the UI reports GPU readiness.
+drivers or libraries; the UI reports GPU readiness. Native SRT playback and
+push require system libsrt 1.5 (Ubuntu 24.04: `libsrt1.5-gnutls`); direct SRTP
+requires `libsrtp2-1`. Use a binary that can load those libraries on the target
+host and verify the enabled listeners before serving viewers. A static musl
+test build ran on Ubuntu 24.04 but could not load its glibc libsrt; a compatible
+glibc build passed encrypted SRT playback on the same hosts.
 
 Download the preview archive and its matching `.sha256` file into the same
 directory. Set `package` to the downloaded filename without `.tar.gz`, then run:

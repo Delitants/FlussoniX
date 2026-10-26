@@ -16,7 +16,10 @@ python3 scripts/package-preview.py \
 For cross-compiled artifacts, pass the corresponding executable with `--binary`.
 The packager checks ELF64 x86_64/aarch64 headers; it does not establish libc, CPU
 or target-host compatibility. Run the extracted archive on its target host before
-publishing it.
+publishing it. For native SRT playback or push, include a listener startup and
+encrypted media check against the target host's system libsrt 1.5. A static
+musl test binary started on Ubuntu 24.04 but could not load the host's glibc
+libsrt; the tested glibc build loaded that library and delivered encrypted SRT.
 
 The output contains a `.tar.gz` and matching `.sha256` sidecar. The archive has
 `bin/flussonix`, `bin/flussonix-service`, `web`, installation guides, license
