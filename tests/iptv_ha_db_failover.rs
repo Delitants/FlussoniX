@@ -356,3 +356,112 @@ async fn primary_loss_during_unacknowledged_acquire_does_not_create_a_grant() {
     assert_eq!(counts.get::<_, i64>(0), 0);
     assert_eq!(counts.get::<_, i64>(1), 0);
 }
+
+#[tokio::test]
+async fn timed_out_acquire_rolls_back_before_pool_reuse_and_same_operation_retry() {
+    const BLOCKED_OPERATION_LOCK: i64 = 81_726_354;
+    let certs = tls_fixture::Certificates::new();
+    let Some(primary) = iptv_postgres::PgServer::start(&certs) else {
+        return;
+    };
+    let pool = pool(&certs, primary.port());
+    schema::initialize(&pool, None).await.unwrap();
+    let catalog = HaCatalog::new(pool.clone(), certs.dir.path().join("timeout-export.json"));
+    catalog.edit(0, CatalogEdit::Enable(true)).await.unwrap();
+
+    let sql = primary.local_client().await;
+    sql.batch_execute(
+        "CREATE FUNCTION fx_test_block_operation() RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN PERFORM pg_advisory_xact_lock(81726354); RETURN NEW; END $$;
+         CREATE TRIGGER fx_test_block_operation BEFORE INSERT ON fx_iptv_operations
+           FOR EACH ROW EXECUTE FUNCTION fx_test_block_operation()",
+    )
+    .await
+    .unwrap();
+    sql.query_one("SELECT pg_advisory_lock($1)", &[&BLOCKED_OPERATION_LOCK])
+        .await
+        .unwrap();
+
+    let req = request();
+    let pending = tokio::spawn({
+        let pool = pool.clone();
+        let req = req.clone();
+        async move { HaLedger::new(pool).acquire(&req, None).await }
+    });
+    let wait_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let blocked: i64 = sql
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'flussonix-iptv-ha' AND wait_event_type = 'Lock' AND wait_event = 'advisory'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if blocked > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < wait_deadline,
+            "acquire did not reach the held advisory lock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let timed_out = tokio::time::timeout(Duration::from_secs(4), pending)
+        .await
+        .expect("acquire must stop at its application deadline")
+        .unwrap();
+    assert_eq!(timed_out.err(), Some(HaError::Unavailable));
+
+    let unlocked: bool = sql
+        .query_one("SELECT pg_advisory_unlock($1)", &[&BLOCKED_OPERATION_LOCK])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(unlocked);
+    let connection = tokio::time::timeout(Duration::from_secs(3), pool.acquire())
+        .await
+        .expect("a canceled statement must not hold the pool slot")
+        .unwrap();
+    connection.query_one("SELECT 1", &[]).await.unwrap();
+    drop(connection);
+
+    let counts = sql
+        .query_one(
+            "SELECT (SELECT count(*) FROM fx_iptv_sessions), (SELECT count(*) FROM fx_iptv_operations), (SELECT active_sessions FROM fx_iptv_capacity)",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        counts.get::<_, i64>(0),
+        0,
+        "timed-out session was committed"
+    );
+    assert_eq!(
+        counts.get::<_, i64>(1),
+        0,
+        "timed-out operation was committed"
+    );
+    assert_eq!(
+        counts.get::<_, i32>(2),
+        0,
+        "timed-out capacity was committed"
+    );
+
+    let ledger = HaLedger::new(pool);
+    let grant = ledger.acquire(&req, None).await.unwrap();
+    ledger.commit(&req, Some(grant.id)).await.unwrap();
+    assert!(
+        ledger
+            .release(req.subscriber, req.session, grant.id, req.operation)
+            .await
+            .unwrap()
+    );
+    let active: i32 = sql
+        .query_one("SELECT active_sessions FROM fx_iptv_capacity", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(active, 0);
+}
