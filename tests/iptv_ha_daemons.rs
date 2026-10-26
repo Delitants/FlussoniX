@@ -8,6 +8,7 @@ use flussonix::iptv::ha::{
 };
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     fs,
     net::{IpAddr, Ipv4Addr},
     os::unix::{fs::PermissionsExt, process::CommandExt},
@@ -280,7 +281,13 @@ async fn two_real_authority_processes_sustain_competing_channels() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(60);
     assert!((5..=900).contains(&seconds));
-    let summary = run_sustained_daemon_load(seconds).await;
+    let catalog_subscribers: usize =
+        std::env::var("FLUSSONIX_IPTV_HA_DAEMON_LOAD_CATALOG_SUBSCRIBERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+    assert!(catalog_subscribers == 0 || catalog_subscribers == 30_000);
+    let summary = run_sustained_daemon_load(seconds, catalog_subscribers).await;
     assert!(summary.cycles >= 16, "all 16 viewers must complete a cycle");
     assert_eq!(summary.excess_grants, 0);
     assert_eq!(summary.missed_renewals, 0);
@@ -291,6 +298,8 @@ async fn two_real_authority_processes_sustain_competing_channels() {
     assert!(summary.renew_p99_ms < 2_000);
     assert!(summary.peak_authority_rss_kib.iter().all(|rss| *rss > 0));
     assert!(summary.peak_authority_fds.iter().all(|fds| *fds > 0));
+    assert!(summary.database_cpu_seconds > 0.0);
+    assert!(summary.catalog_bytes > 0);
 }
 
 struct LoadSummary {
@@ -304,6 +313,8 @@ struct LoadSummary {
     renew_p99_ms: u128,
     peak_authority_rss_kib: [u64; 2],
     peak_authority_fds: [usize; 2],
+    database_cpu_seconds: f64,
+    catalog_bytes: i32,
 }
 
 struct ProcessUsage {
@@ -313,10 +324,7 @@ struct ProcessUsage {
 }
 
 fn process_usage(pid: u32) -> ProcessUsage {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-    let after_name = stat.rsplit_once(") ").unwrap().1;
-    let fields: Vec<&str> = after_name.split_whitespace().collect();
-    let ticks: u64 = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
+    let ticks = process_cpu_ticks(pid).unwrap();
     // SAFETY: sysconf reads the Linux clock-tick constant without touching memory.
     let hertz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     assert!(hertz > 0);
@@ -338,12 +346,19 @@ fn process_usage(pid: u32) -> ProcessUsage {
     }
 }
 
+fn process_cpu_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_name = stat.rsplit_once(") ")?.1;
+    let fields: Vec<&str> = after_name.split_whitespace().collect();
+    Some(fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?)
+}
+
 fn percentile_ms(mut samples: Vec<Duration>, percentile: usize) -> u128 {
     samples.sort_unstable();
     samples[(samples.len() - 1) * percentile / 100].as_millis()
 }
 
-async fn run_sustained_daemon_load(seconds: u64) -> LoadSummary {
+async fn run_sustained_daemon_load(seconds: u64, catalog_subscribers: usize) -> LoadSummary {
     let certs = tls_fixture::Certificates::new();
     let database = iptv_postgres::PgServer::start(&certs)
         .expect("native PostgreSQL is required for real-daemon HA load gate");
@@ -388,6 +403,37 @@ async fn run_sustained_daemon_load(seconds: u64) -> LoadSummary {
             .unwrap()
             .revision;
     }
+
+    // Seed a valid, varied document before either authority starts. Direct SQL
+    // avoids 30,000 serial management edits while preserving the real read path.
+    let seed = database.local_client().await;
+    if catalog_subscribers > 0 {
+        let encoded: String = seed
+            .query_one("SELECT document FROM fx_iptv_catalog", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let mut document: Value = serde_json::from_str(&encoded).unwrap();
+        let subscribers = document["subscribers"].as_array_mut().unwrap();
+        for index in 0..catalog_subscribers {
+            subscribers.push(json!({
+                "name":format!("catalog-subscriber-{index:05}"),
+                "token":format!("{}{}",uuid::Uuid::new_v4().simple(),uuid::Uuid::new_v4().simple()),
+                "packages":["basic"],"max_sessions":1,
+            }));
+        }
+        let encoded = document.to_string();
+        assert!((4 * 1024 * 1024..8 * 1024 * 1024).contains(&encoded.len()));
+        seed.execute("UPDATE fx_iptv_catalog SET document=$1", &[&encoded])
+            .await
+            .unwrap();
+    }
+    let catalog_bytes: i32 = seed
+        .query_one("SELECT octet_length(document) FROM fx_iptv_catalog", &[])
+        .await
+        .unwrap()
+        .get(0);
+    drop(seed);
 
     let mut first =
         OwnedAuthority::start_tls(certs.dir.path(), "load-first", &config, &certs).await;
@@ -474,17 +520,28 @@ async fn run_sustained_daemon_load(seconds: u64) -> LoadSummary {
         let mut peak_connections = 0_i64;
         let mut peak_rss = [0_u64; 2];
         let mut peak_fds = [0_usize; 2];
+        let mut database_ticks = HashMap::<i32, (u64, u64)>::new();
         loop {
             let row = sql
                 .query_one(
                     "SELECT (SELECT active_sessions FROM fx_iptv_capacity),
-                        (SELECT count(*) FROM pg_stat_activity WHERE datname = current_database())",
+                        count(*), array_agg(pid)
+                     FROM pg_stat_activity WHERE datname = current_database()",
                     &[],
                 )
                 .await
                 .unwrap();
             peak_active = peak_active.max(row.get(0));
             peak_connections = peak_connections.max(row.get(1));
+            let backends: Vec<i32> = row.get(2);
+            for pid in backends {
+                if let Some(ticks) = process_cpu_ticks(pid as u32) {
+                    database_ticks
+                        .entry(pid)
+                        .and_modify(|observed| observed.1 = ticks)
+                        .or_insert((ticks, ticks));
+                }
+            }
             for (index, pid) in pids.into_iter().enumerate() {
                 let usage = process_usage(pid);
                 peak_rss[index] = peak_rss[index].max(usage.rss_kib);
@@ -495,7 +552,18 @@ async fn run_sustained_daemon_load(seconds: u64) -> LoadSummary {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        (peak_active, peak_connections, peak_rss, peak_fds, sql)
+        let database_cpu_ticks: u64 = database_ticks
+            .values()
+            .map(|(first, last)| last.saturating_sub(*first))
+            .sum();
+        (
+            peak_active,
+            peak_connections,
+            peak_rss,
+            peak_fds,
+            database_cpu_ticks,
+            sql,
+        )
     });
 
     let first_commits = Arc::new(tokio::sync::Barrier::new(VIEWERS + 1));
@@ -614,9 +682,19 @@ async fn run_sustained_daemon_load(seconds: u64) -> LoadSummary {
         missed_renewals += missed;
     }
     stop.store(true, Ordering::Relaxed);
-    let (observed_active, peak_db_connections, peak_authority_rss_kib, peak_authority_fds, sql) =
-        monitor.await.unwrap();
+    let (
+        observed_active,
+        peak_db_connections,
+        peak_authority_rss_kib,
+        peak_authority_fds,
+        database_cpu_ticks,
+        sql,
+    ) = monitor.await.unwrap();
     let peak_active = observed_active.max(committed_sessions);
+    // SAFETY: sysconf reads the Linux clock-tick constant without touching memory.
+    let hertz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    assert!(hertz > 0);
+    let database_cpu_seconds = database_cpu_ticks as f64 / hertz as f64;
     let row = sql
         .query_one(
             "SELECT (SELECT active_sessions FROM fx_iptv_capacity),
@@ -649,6 +727,8 @@ async fn run_sustained_daemon_load(seconds: u64) -> LoadSummary {
         renew_p99_ms,
         peak_authority_rss_kib,
         peak_authority_fds,
+        database_cpu_seconds,
+        catalog_bytes,
     };
     println!(
         "IPTV_HA_DAEMON_LOAD_RESULT {}",
@@ -660,6 +740,8 @@ async fn run_sustained_daemon_load(seconds: u64) -> LoadSummary {
             "peak_active":peak_active,"remaining_sessions":remaining,"session_rows":session_rows,
             "peak_database_connections":peak_db_connections,"wal_bytes":wal_bytes,
             "authority_cpu_seconds":cpu_seconds,
+            "database_backend_cpu_seconds":database_cpu_seconds,
+            "catalog_bytes":catalog_bytes,"catalog_subscribers":catalog_subscribers + VIEWERS,
             "peak_authority_rss_kib":peak_authority_rss_kib,
             "peak_authority_fds":peak_authority_fds,
         })
