@@ -23,6 +23,10 @@ rust: anstyle-query 1.1.5 (MIT OR Apache-2.0)
   third_party/licenses/rust/anstyle-query-1.1.5/LICENSE-APACHE
   third_party/licenses/rust/anstyle-query-1.1.5/LICENSE-MIT
 
+rust: async-trait 0.1.92 (MIT OR Apache-2.0)
+  third_party/licenses/rust/async-trait-0.1.92/LICENSE-APACHE
+  third_party/licenses/rust/async-trait-0.1.92/LICENSE-MIT
+
 rust: atomic-waker 1.1.2 (Apache-2.0 OR MIT)
   third_party/licenses/rust/atomic-waker-1.1.2/LICENSE-APACHE
   third_party/licenses/rust/atomic-waker-1.1.2/LICENSE-MIT
@@ -56,6 +60,15 @@ rust: bitflags 2.13.2 (MIT OR Apache-2.0)
 rust: block-buffer 0.10.4 (MIT OR Apache-2.0)
   third_party/licenses/rust/block-buffer-0.10.4/LICENSE-APACHE
   third_party/licenses/rust/block-buffer-0.10.4/LICENSE-MIT
+
+rust: block-buffer 0.12.1 (MIT OR Apache-2.0)
+  third_party/licenses/rust/block-buffer-0.12.1/LICENSE-APACHE
+  third_party/licenses/rust/block-buffer-0.12.1/LICENSE-MIT
+
+rust: byteorder 1.5.0 (Unlicense OR MIT)
+  third_party/licenses/rust/byteorder-1.5.0/COPYING
+  third_party/licenses/rust/byteorder-1.5.0/LICENSE-MIT
+  third_party/licenses/rust/byteorder-1.5.0/UNLICENSE
 
 rust: bytes 1.12.1 (MIT)
   third_party/licenses/rust/bytes-1.12.1/LICENSE
@@ -94,9 +107,21 @@ rust: clap_lex 1.1.1 (MIT OR Apache-2.0)
   third_party/licenses/rust/clap_lex-1.1.1/LICENSE-APACHE
   third_party/licenses/rust/clap_lex-1.1.1/LICENSE-MIT
 
+rust: cmov 0.5.4 (Apache-2.0 OR MIT)
+  third_party/licenses/rust/cmov-0.5.4/LICENSE-APACHE
+  third_party/licenses/rust/cmov-0.5.4/LICENSE-MIT
+
 rust: colorchoice 1.0.5 (MIT OR Apache-2.0)
   third_party/licenses/rust/colorchoice-1.0.5/LICENSE-APACHE
   third_party/licenses/rust/colorchoice-1.0.5/LICENSE-MIT
+
+rust: const-oid 0.10.2 (Apache-2.0 OR MIT)
+  third_party/licenses/rust/const-oid-0.10.2/LICENSE-APACHE
+  third_party/licenses/rust/const-oid-0.10.2/LICENSE-MIT
+
+rust: const-oid 0.9.6 (Apache-2.0 OR MIT)
+  third_party/licenses/rust/const-oid-0.9.6/LICENSE-APACHE
+  third_party/licenses/rust/const-oid-0.9.6/LICENSE-MIT
 
 rust: cpufeatures 0.2.17 (MIT OR Apache-2.0)
   third_party/licenses/rust/cpufeatures-0.2.17/LICENSE-APACHE
@@ -110,9 +135,29 @@ rust: crypto-common 0.1.7 (MIT OR Apache-2.0)
   third_party/licenses/rust/crypto-common-0.1.7/LICENSE-APACHE
   third_party/licenses/rust/crypto-common-0.1.7/LICENSE-MIT
 
+rust: crypto-common 0.2.2 (MIT OR Apache-2.0)
+  third_party/licenses/rust/crypto-common-0.2.2/LICENSE-APACHE
+  third_party/licenses/rust/crypto-common-0.2.2/LICENSE-MIT
+
+rust: ctutils 0.4.2 (Apache-2.0 OR MIT)
+  third_party/licenses/rust/ctutils-0.4.2/LICENSE-APACHE
+  third_party/licenses/rust/ctutils-0.4.2/LICENSE-MIT
+
+rust: der 0.7.10 (Apache-2.0 OR MIT)
+  third_party/licenses/rust/der-0.7.10/LICENSE-APACHE
+  third_party/licenses/rust/der-0.7.10/LICENSE-MIT
+
+rust: der_derive 0.7.3 (Apache-2.0 OR MIT)
+  third_party/licenses/rust/der_derive-0.7.3/LICENSE-APACHE
+  third_party/licenses/rust/der_derive-0.7.3/LICENSE-MIT
+
 rust: digest 0.10.7 (MIT OR Apache-2.0)
   third_party/licenses/rust/digest-0.10.7/LICENSE-APACHE
   third_party/licenses/rust/digest-0.10.7/LICENSE-MIT
+
+rust: digest 0.11.3 (MIT OR Apache-2.0)
+  third_party/licenses/rust/digest-0.11.3/LICENSE-APACHE
+  third_party/licenses/rust/digest-0.11.3/LICENSE-MIT
 
 rust: displaydoc 0.2.7 (MIT OR Apache-2.0)
   third_party/licenses/rust/displaydoc-0.2.7/LICENSE-APACHE
@@ -122,9 +167,16 @@ rust: errno 0.3.14 (MIT OR Apache-2.0)
   third_party/licenses/rust/errno-0.3.14/LICENSE-APACHE
   third_party/licenses/rust/errno-0.3.14/LICENSE-MIT
 
+rust: fallible-iterator 0.2.0 (MIT/Apache-2.0)
+  third_party/licenses/rust/fallible-iterator-0.2.0/LICENSE-APACHE
+  third_party/licenses/rust/fallible-iterator-0.2.0/LICENSE-MIT
+
 rust: find-msvc-tools 0.1.14 (MIT OR Apache-2.0)
   third_party/licenses/rust/find-msvc-tools-0.1.14/LICENSE-APACHE
   third_party/licenses/rust/find-msvc-tools-0.1.14/LICENSE-MIT
+
+rust: flagset 0.4.7 (Apache-2.0)
+  third_party/licenses/rust/flagset-0.4.7/LICENSE
 
 rust: form_urlencoded 1.2.2 (MIT OR Apache-2.0)
   third_party/licenses/rust/form_urlencoded-1.2.2/LICENSE-APACHE
@@ -173,6 +225,10 @@ rust: heck 0.5.0 (MIT OR Apache-2.0)
   third_party/licenses/rust/heck-0.5.0/LICENSE-APACHE
   third_party/licenses/rust/heck-0.5.0/LICENSE-MIT
 
+rust: hmac 0.13.0 (MIT OR Apache-2.0)
+  third_party/licenses/rust/hmac-0.13.0/LICENSE-APACHE
+  third_party/licenses/rust/hmac-0.13.0/LICENSE-MIT
+
 rust: http 1.5.0 (MIT OR Apache-2.0)
   third_party/licenses/rust/http-1.5.0/LICENSE-APACHE
   third_party/licenses/rust/http-1.5.0/LICENSE-MIT
@@ -193,6 +249,10 @@ rust: httparse 1.10.1 (MIT OR Apache-2.0)
 rust: httpdate 1.0.3 (MIT OR Apache-2.0)
   third_party/licenses/rust/httpdate-1.0.3/LICENSE-APACHE
   third_party/licenses/rust/httpdate-1.0.3/LICENSE-MIT
+
+rust: hybrid-array 0.4.15 (MIT OR Apache-2.0)
+  third_party/licenses/rust/hybrid-array-0.4.15/LICENSE-APACHE
+  third_party/licenses/rust/hybrid-array-0.4.15/LICENSE-MIT
 
 rust: hyper 1.11.1 (MIT)
   third_party/licenses/rust/hyper-1.11.1/LICENSE
@@ -297,6 +357,10 @@ rust: md-5 0.10.6 (MIT OR Apache-2.0)
   third_party/licenses/rust/md-5-0.10.6/LICENSE-APACHE
   third_party/licenses/rust/md-5-0.10.6/LICENSE-MIT
 
+rust: md-5 0.11.0 (MIT OR Apache-2.0)
+  third_party/licenses/rust/md-5-0.11.0/LICENSE-APACHE
+  third_party/licenses/rust/md-5-0.11.0/LICENSE-MIT
+
 rust: memchr 2.8.3 (Unlicense OR MIT)
   third_party/licenses/rust/memchr-2.8.3/COPYING
   third_party/licenses/rust/memchr-2.8.3/LICENSE-MIT
@@ -343,9 +407,23 @@ rust: percent-encoding 2.3.2 (MIT OR Apache-2.0)
   third_party/licenses/rust/percent-encoding-2.3.2/LICENSE-APACHE
   third_party/licenses/rust/percent-encoding-2.3.2/LICENSE-MIT
 
+rust: phf 0.13.1 (MIT)
+  third_party/licenses/rust/phf-0.13.1/LICENSE
+
+rust: phf_shared 0.13.1 (MIT)
+  third_party/licenses/rust/phf_shared-0.13.1/LICENSE
+
 rust: pin-project-lite 0.2.17 (Apache-2.0 OR MIT)
   third_party/licenses/rust/pin-project-lite-0.2.17/LICENSE-APACHE
   third_party/licenses/rust/pin-project-lite-0.2.17/LICENSE-MIT
+
+rust: postgres-protocol 0.6.12 (MIT OR Apache-2.0)
+  third_party/licenses/rust/postgres-protocol-0.6.12/LICENSE-APACHE
+  third_party/licenses/rust/postgres-protocol-0.6.12/LICENSE-MIT
+
+rust: postgres-types 0.2.14 (MIT OR Apache-2.0)
+  third_party/licenses/rust/postgres-types-0.2.14/LICENSE-APACHE
+  third_party/licenses/rust/postgres-types-0.2.14/LICENSE-MIT
 
 rust: potential_utf 0.1.6 (Unicode-3.0)
   third_party/licenses/rust/potential_utf-0.1.6/LICENSE
@@ -461,6 +539,10 @@ rust: sha2 0.10.9 (MIT OR Apache-2.0)
   third_party/licenses/rust/sha2-0.10.9/LICENSE-APACHE
   third_party/licenses/rust/sha2-0.10.9/LICENSE-MIT
 
+rust: sha2 0.11.0 (MIT OR Apache-2.0)
+  third_party/licenses/rust/sha2-0.11.0/LICENSE-APACHE
+  third_party/licenses/rust/sha2-0.11.0/LICENSE-MIT
+
 rust: sharded-slab 0.1.7 (MIT)
   third_party/licenses/rust/sharded-slab-0.1.7/LICENSE
 
@@ -471,6 +553,11 @@ rust: shlex 2.0.1 (MIT OR Apache-2.0)
 rust: signal-hook-registry 1.4.8 (MIT OR Apache-2.0)
   third_party/licenses/rust/signal-hook-registry-1.4.8/LICENSE-APACHE
   third_party/licenses/rust/signal-hook-registry-1.4.8/LICENSE-MIT
+
+rust: siphasher 1.0.4 (MIT OR Apache-2.0)
+  third_party/licenses/rust/siphasher-1.0.4/COPYING
+  third_party/licenses/rust/siphasher-1.0.4/LICENSE-APACHE
+  third_party/licenses/rust/siphasher-1.0.4/LICENSE-MIT
 
 rust: slab 0.4.12 (MIT)
   third_party/licenses/rust/slab-0.4.12/LICENSE
@@ -486,9 +573,17 @@ rust: socket2 0.6.5 (MIT OR Apache-2.0)
 rust: spin 0.9.9 (MIT)
   third_party/licenses/rust/spin-0.9.9/LICENSE
 
+rust: spki 0.7.3 (Apache-2.0 OR MIT)
+  third_party/licenses/rust/spki-0.7.3/LICENSE-APACHE
+  third_party/licenses/rust/spki-0.7.3/LICENSE-MIT
+
 rust: stable_deref_trait 1.2.1 (MIT OR Apache-2.0)
   third_party/licenses/rust/stable_deref_trait-1.2.1/LICENSE-APACHE
   third_party/licenses/rust/stable_deref_trait-1.2.1/LICENSE-MIT
+
+rust: stringprep 0.1.5 (MIT/Apache-2.0)
+  third_party/licenses/rust/stringprep-0.1.5/LICENSE-APACHE
+  third_party/licenses/rust/stringprep-0.1.5/LICENSE-MIT
 
 rust: strsim 0.11.1 (MIT)
   third_party/licenses/rust/strsim-0.11.1/LICENSE
@@ -535,6 +630,13 @@ rust: tokio 1.53.3 (MIT)
 
 rust: tokio-macros 2.7.2 (MIT)
   third_party/licenses/rust/tokio-macros-2.7.2/LICENSE
+
+rust: tokio-postgres 0.7.18 (MIT OR Apache-2.0)
+  third_party/licenses/rust/tokio-postgres-0.7.18/LICENSE-APACHE
+  third_party/licenses/rust/tokio-postgres-0.7.18/LICENSE-MIT
+
+rust: tokio-postgres-rustls 0.14.0 (MIT)
+  third_party/licenses/rust/tokio-postgres-rustls-0.14.0/LICENSE
 
 rust: tokio-rustls 0.26.6 (MIT OR Apache-2.0)
   third_party/licenses/rust/tokio-rustls-0.26.6/LICENSE-APACHE
@@ -586,10 +688,26 @@ rust: unicase 2.9.0 (MIT OR Apache-2.0)
   third_party/licenses/rust/unicase-2.9.0/LICENSE-APACHE
   third_party/licenses/rust/unicase-2.9.0/LICENSE-MIT
 
+rust: unicode-bidi 0.3.18 (MIT OR Apache-2.0)
+  third_party/licenses/rust/unicode-bidi-0.3.18/COPYRIGHT
+  third_party/licenses/rust/unicode-bidi-0.3.18/LICENSE-APACHE
+  third_party/licenses/rust/unicode-bidi-0.3.18/LICENSE-MIT
+
 rust: unicode-ident 1.0.26 ((MIT OR Apache-2.0) AND Unicode-3.0)
   third_party/licenses/rust/unicode-ident-1.0.26/LICENSE-APACHE
   third_party/licenses/rust/unicode-ident-1.0.26/LICENSE-MIT
   third_party/licenses/rust/unicode-ident-1.0.26/LICENSE-UNICODE
+
+rust: unicode-normalization 0.1.26 ((MIT OR Apache-2.0) AND Unicode-3.0)
+  third_party/licenses/rust/unicode-normalization-0.1.26/COPYRIGHT
+  third_party/licenses/rust/unicode-normalization-0.1.26/LICENSE-APACHE
+  third_party/licenses/rust/unicode-normalization-0.1.26/LICENSE-MIT
+  third_party/licenses/rust/unicode-normalization-0.1.26/LICENSE-UNICODE
+
+rust: unicode-properties 0.1.4 (MIT/Apache-2.0)
+  third_party/licenses/rust/unicode-properties-0.1.4/COPYRIGHT
+  third_party/licenses/rust/unicode-properties-0.1.4/LICENSE-APACHE
+  third_party/licenses/rust/unicode-properties-0.1.4/LICENSE-MIT
 
 rust: untrusted 0.9.0 (ISC)
   third_party/licenses/rust/untrusted-0.9.0/LICENSE.txt
@@ -621,8 +739,17 @@ rust: want 0.3.1 (MIT)
 rust: webpki-roots 1.0.10 (CDLA-Permissive-2.0)
   third_party/licenses/rust/webpki-roots-1.0.10/LICENSE
 
+rust: whoami 2.1.3 (Apache-2.0 OR BSL-1.0 OR MIT)
+  third_party/licenses/rust/whoami-2.1.3/LICENSE_APACHE
+  third_party/licenses/rust/whoami-2.1.3/LICENSE_BOOST
+  third_party/licenses/rust/whoami-2.1.3/LICENSE_MIT
+
 rust: writeable 0.6.4 (Unicode-3.0)
   third_party/licenses/rust/writeable-0.6.4/LICENSE
+
+rust: x509-cert 0.2.5 (Apache-2.0 OR MIT)
+  third_party/licenses/rust/x509-cert-0.2.5/LICENSE-APACHE
+  third_party/licenses/rust/x509-cert-0.2.5/LICENSE-MIT
 
 rust: yoke 0.8.3 (Unicode-3.0)
   third_party/licenses/rust/yoke-0.8.3/LICENSE

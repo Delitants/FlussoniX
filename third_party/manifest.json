@@ -1,8 +1,8 @@
 {
-  "cargo_lock_sha256": "b7035f14da16dd600792be8ee23f893c17a927ae4862e23e509d0b6b3f5d4920",
-  "cargo_manifest_sha256": "7fa8db2f404cefd881ea1491ebc3c9da77b280947ef73f6d6c2316f0aeba2758",
+  "cargo_lock_sha256": "c4e203f21afaa4cfe49b9a33403498395a8a9e053c3df625ec89590d371d3bdd",
+  "cargo_manifest_sha256": "dbb466d8d9949f982e72bec761cc299e42b82454221f711a199dd41d628ebf27",
   "format": 1,
-  "notices_sha256": "80c7b3dd0602d2a2be8f2c7e8151a0be4a687134b7cb3dbe948563ed665c944b",
+  "notices_sha256": "d0604800b78c70251831d0747533d7577d7ae18655ec9bc97b0ad62d0cc75f43",
   "packages": [
     {
       "declared_license": "MIT OR Apache-2.0",
@@ -103,6 +103,26 @@
       ],
       "name": "anstyle-query",
       "version": "1.1.5"
+    },
+    {
+      "declared_license": "MIT OR Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 9723,
+          "path": "licenses/rust/async-trait-0.1.92/LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1023,
+          "path": "licenses/rust/async-trait-0.1.92/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "async-trait",
+      "version": "0.1.92"
     },
     {
       "declared_license": "Apache-2.0 OR MIT",
@@ -271,6 +291,52 @@
       ],
       "name": "block-buffer",
       "version": "0.10.4"
+    },
+    {
+      "declared_license": "MIT OR Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 10849,
+          "path": "licenses/rust/block-buffer-0.12.1/LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1082,
+          "path": "licenses/rust/block-buffer-0.12.1/LICENSE-MIT",
+          "sha256": "98181e7249d0c01737645ec982499ce99a0f07eb8f7d625b8840d799d10dbc01",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "block-buffer",
+      "version": "0.12.1"
+    },
+    {
+      "declared_license": "Unlicense OR MIT",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 126,
+          "path": "licenses/rust/byteorder-1.5.0/COPYING",
+          "sha256": "01c266bced4a434da0051174d6bee16a4c82cf634e2679b6155d40d75012390f",
+          "upstream_path": "COPYING"
+        },
+        {
+          "bytes": 1081,
+          "path": "licenses/rust/byteorder-1.5.0/LICENSE-MIT",
+          "sha256": "0f96a83840e146e43c0ec96a22ec1f392e0680e6c1226e6f3ba87e0740af850f",
+          "upstream_path": "LICENSE-MIT"
+        },
+        {
+          "bytes": 1211,
+          "path": "licenses/rust/byteorder-1.5.0/UNLICENSE",
+          "sha256": "7e12e5df4bae12cb21581ba157ced20e1986a0508dd10d0e8a4ab9a4cf94e85c",
+          "upstream_path": "UNLICENSE"
+        }
+      ],
+      "name": "byteorder",
+      "version": "1.5.0"
     },
     {
       "declared_license": "MIT",
@@ -455,6 +521,26 @@
       "version": "1.1.1"
     },
     {
+      "declared_license": "Apache-2.0 OR MIT",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 11358,
+          "path": "licenses/rust/cmov-0.5.4/LICENSE-APACHE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1082,
+          "path": "licenses/rust/cmov-0.5.4/LICENSE-MIT",
+          "sha256": "70c9d40f1f9545c3f133b8a67206e89da850f6468eed072281bb3701514114a9",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "cmov",
+      "version": "0.5.4"
+    },
+    {
       "declared_license": "MIT OR Apache-2.0",
       "ecosystem": "rust",
       "files": [
@@ -473,6 +559,46 @@
       ],
       "name": "colorchoice",
       "version": "1.0.5"
+    },
+    {
+      "declared_license": "Apache-2.0 OR MIT",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 10849,
+          "path": "licenses/rust/const-oid-0.10.2/LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1082,
+          "path": "licenses/rust/const-oid-0.10.2/LICENSE-MIT",
+          "sha256": "73b9dc2e79c7308998dd30296e073aefaefb944a68fb89aa412c23c0edcabcaa",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "const-oid",
+      "version": "0.10.2"
+    },
+    {
+      "declared_license": "Apache-2.0 OR MIT",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 10849,
+          "path": "licenses/rust/const-oid-0.9.6/LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1082,
+          "path": "licenses/rust/const-oid-0.9.6/LICENSE-MIT",
+          "sha256": "bada9e7ed8dc00d63502053c455d7c8d7575dfb7e8277a2a832531844d900682",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "const-oid",
+      "version": "0.9.6"
     },
     {
       "declared_license": "MIT OR Apache-2.0",
@@ -540,6 +666,86 @@
       "files": [
         {
           "bytes": 10849,
+          "path": "licenses/rust/crypto-common-0.2.2/LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1070,
+          "path": "licenses/rust/crypto-common-0.2.2/LICENSE-MIT",
+          "sha256": "d2e7ec5355c96eeade56b09187ceb48a6a30299da3ce7531a66d3d11405ab963",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "crypto-common",
+      "version": "0.2.2"
+    },
+    {
+      "declared_license": "Apache-2.0 OR MIT",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 11358,
+          "path": "licenses/rust/ctutils-0.4.2/LICENSE-APACHE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1082,
+          "path": "licenses/rust/ctutils-0.4.2/LICENSE-MIT",
+          "sha256": "91585c36e4fb9ab4ca0d3dfac5d66d3c0c62cc51f640a0e1196542daf2267eae",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "ctutils",
+      "version": "0.4.2"
+    },
+    {
+      "declared_license": "Apache-2.0 OR MIT",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 10849,
+          "path": "licenses/rust/der-0.7.10/LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1082,
+          "path": "licenses/rust/der-0.7.10/LICENSE-MIT",
+          "sha256": "ad64fcb9589f162720f3cc5010ad76ca6ad3764e11861f9192c489df176bb71d",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "der",
+      "version": "0.7.10"
+    },
+    {
+      "declared_license": "Apache-2.0 OR MIT",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 10849,
+          "path": "licenses/rust/der_derive-0.7.3/LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1082,
+          "path": "licenses/rust/der_derive-0.7.3/LICENSE-MIT",
+          "sha256": "bada9e7ed8dc00d63502053c455d7c8d7575dfb7e8277a2a832531844d900682",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "der_derive",
+      "version": "0.7.3"
+    },
+    {
+      "declared_license": "MIT OR Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 10849,
           "path": "licenses/rust/digest-0.10.7/LICENSE-APACHE",
           "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
           "upstream_path": "LICENSE-APACHE"
@@ -553,6 +759,26 @@
       ],
       "name": "digest",
       "version": "0.10.7"
+    },
+    {
+      "declared_license": "MIT OR Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 10849,
+          "path": "licenses/rust/digest-0.11.3/LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1103,
+          "path": "licenses/rust/digest-0.11.3/LICENSE-MIT",
+          "sha256": "af59cea35d7f5e2777a713b8d155d65efa2c339eb43f3c14e868c6ac8506edad",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "digest",
+      "version": "0.11.3"
     },
     {
       "declared_license": "MIT OR Apache-2.0",
@@ -595,6 +821,26 @@
       "version": "0.3.14"
     },
     {
+      "declared_license": "MIT/Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 11358,
+          "path": "licenses/rust/fallible-iterator-0.2.0/LICENSE-APACHE",
+          "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1078,
+          "path": "licenses/rust/fallible-iterator-0.2.0/LICENSE-MIT",
+          "sha256": "0816e154b159ba255c563f7c8c7df5bbb8cc5fc96f5ab8cf9f4743b4f41fe7eb",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "fallible-iterator",
+      "version": "0.2.0"
+    },
+    {
       "declared_license": "MIT OR Apache-2.0",
       "ecosystem": "rust",
       "files": [
@@ -613,6 +859,20 @@
       ],
       "name": "find-msvc-tools",
       "version": "0.1.14"
+    },
+    {
+      "declared_license": "Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 11358,
+          "path": "licenses/rust/flagset-0.4.7/LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "upstream_path": "LICENSE"
+        }
+      ],
+      "name": "flagset",
+      "version": "0.4.7"
     },
     {
       "declared_license": "MIT OR Apache-2.0",
@@ -853,6 +1113,26 @@
       "ecosystem": "rust",
       "files": [
         {
+          "bytes": 10849,
+          "path": "licenses/rust/hmac-0.13.0/LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1057,
+          "path": "licenses/rust/hmac-0.13.0/LICENSE-MIT",
+          "sha256": "9e0dfd2dd4173a530e238cb6adb37aa78c34c6bc7444e0e10c1ab5d8881f63ba",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "hmac",
+      "version": "0.13.0"
+    },
+    {
+      "declared_license": "MIT OR Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
           "bytes": 10835,
           "path": "licenses/rust/http-1.5.0/LICENSE-APACHE",
           "sha256": "8bb1b50b0e5c9399ae33bd35fab2769010fa6c14e8860c729a52295d84896b7a",
@@ -949,6 +1229,26 @@
       ],
       "name": "httpdate",
       "version": "1.0.3"
+    },
+    {
+      "declared_license": "MIT OR Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 10849,
+          "path": "licenses/rust/hybrid-array-0.4.15/LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1082,
+          "path": "licenses/rust/hybrid-array-0.4.15/LICENSE-MIT",
+          "sha256": "70c9d40f1f9545c3f133b8a67206e89da850f6468eed072281bb3701514114a9",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "hybrid-array",
+      "version": "0.4.15"
     },
     {
       "declared_license": "MIT",
@@ -1453,6 +1753,26 @@
       "version": "0.10.6"
     },
     {
+      "declared_license": "MIT OR Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 10849,
+          "path": "licenses/rust/md-5-0.11.0/LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1196,
+          "path": "licenses/rust/md-5-0.11.0/LICENSE-MIT",
+          "sha256": "831e0f43ad0bf014c1c4fec5767aae470434c1d66d6e671be2d823e729063e25",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "md-5",
+      "version": "0.11.0"
+    },
+    {
       "declared_license": "Unlicense OR MIT",
       "ecosystem": "rust",
       "files": [
@@ -1681,6 +2001,34 @@
       "version": "2.3.2"
     },
     {
+      "declared_license": "MIT",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 1099,
+          "path": "licenses/rust/phf-0.13.1/LICENSE",
+          "sha256": "0ab4d106b6faac07fb6a051815fd1b4d862d730895e2d7d7358c2f13565e7a38",
+          "upstream_path": "LICENSE"
+        }
+      ],
+      "name": "phf",
+      "version": "0.13.1"
+    },
+    {
+      "declared_license": "MIT",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 1099,
+          "path": "licenses/rust/phf_shared-0.13.1/LICENSE",
+          "sha256": "0ab4d106b6faac07fb6a051815fd1b4d862d730895e2d7d7358c2f13565e7a38",
+          "upstream_path": "LICENSE"
+        }
+      ],
+      "name": "phf_shared",
+      "version": "0.13.1"
+    },
+    {
       "declared_license": "Apache-2.0 OR MIT",
       "ecosystem": "rust",
       "files": [
@@ -1699,6 +2047,46 @@
       ],
       "name": "pin-project-lite",
       "version": "0.2.17"
+    },
+    {
+      "declared_license": "MIT OR Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 10847,
+          "path": "licenses/rust/postgres-protocol-0.6.12/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1082,
+          "path": "licenses/rust/postgres-protocol-0.6.12/LICENSE-MIT",
+          "sha256": "4d033ae2577fa5055e26ed7e4aa3b885522f20570d18366bbc0178e0ddc19e0f",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "postgres-protocol",
+      "version": "0.6.12"
+    },
+    {
+      "declared_license": "MIT OR Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 10847,
+          "path": "licenses/rust/postgres-types-0.2.14/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1082,
+          "path": "licenses/rust/postgres-types-0.2.14/LICENSE-MIT",
+          "sha256": "4d033ae2577fa5055e26ed7e4aa3b885522f20570d18366bbc0178e0ddc19e0f",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "postgres-types",
+      "version": "0.2.14"
     },
     {
       "declared_license": "Unicode-3.0",
@@ -2277,6 +2665,26 @@
       "version": "0.10.9"
     },
     {
+      "declared_license": "MIT OR Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 10849,
+          "path": "licenses/rust/sha2-0.11.0/LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1196,
+          "path": "licenses/rust/sha2-0.11.0/LICENSE-MIT",
+          "sha256": "831e0f43ad0bf014c1c4fec5767aae470434c1d66d6e671be2d823e729063e25",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "sha2",
+      "version": "0.11.0"
+    },
+    {
       "declared_license": "MIT",
       "ecosystem": "rust",
       "files": [
@@ -2329,6 +2737,32 @@
       ],
       "name": "signal-hook-registry",
       "version": "1.4.8"
+    },
+    {
+      "declared_license": "MIT OR Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 281,
+          "path": "licenses/rust/siphasher-1.0.4/COPYING",
+          "sha256": "c962ee4d1d05ddc138b202b2540219ebc57893fcf97b364852094a9a94ce1365",
+          "upstream_path": "COPYING"
+        },
+        {
+          "bytes": 11358,
+          "path": "licenses/rust/siphasher-1.0.4/LICENSE-APACHE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1023,
+          "path": "licenses/rust/siphasher-1.0.4/LICENSE-MIT",
+          "sha256": "f9c4c77baa3828004ee54b8a4f2db2e88ed44a6237a493965bf551fac0fcb62d",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "siphasher",
+      "version": "1.0.4"
     },
     {
       "declared_license": "MIT",
@@ -2399,6 +2833,26 @@
       "version": "0.9.9"
     },
     {
+      "declared_license": "Apache-2.0 OR MIT",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 10849,
+          "path": "licenses/rust/spki-0.7.3/LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1082,
+          "path": "licenses/rust/spki-0.7.3/LICENSE-MIT",
+          "sha256": "c995204cc6bad2ed67dd41f7d89bb9f1a9d48e0edd745732b30640d7912089a4",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "spki",
+      "version": "0.7.3"
+    },
+    {
       "declared_license": "MIT OR Apache-2.0",
       "ecosystem": "rust",
       "files": [
@@ -2417,6 +2871,26 @@
       ],
       "name": "stable_deref_trait",
       "version": "1.2.1"
+    },
+    {
+      "declared_license": "MIT/Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 11358,
+          "path": "licenses/rust/stringprep-0.1.5/LICENSE-APACHE",
+          "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1074,
+          "path": "licenses/rust/stringprep-0.1.5/LICENSE-MIT",
+          "sha256": "a07450fd4496cb8b58466e6d529f1f502444eee4a235659337e9194d694739d6",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "stringprep",
+      "version": "0.1.5"
     },
     {
       "declared_license": "MIT",
@@ -2641,6 +3115,40 @@
       ],
       "name": "tokio-macros",
       "version": "2.7.2"
+    },
+    {
+      "declared_license": "MIT OR Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 10847,
+          "path": "licenses/rust/tokio-postgres-0.7.18/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1082,
+          "path": "licenses/rust/tokio-postgres-0.7.18/LICENSE-MIT",
+          "sha256": "4d033ae2577fa5055e26ed7e4aa3b885522f20570d18366bbc0178e0ddc19e0f",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "tokio-postgres",
+      "version": "0.7.18"
+    },
+    {
+      "declared_license": "MIT",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 1068,
+          "path": "licenses/rust/tokio-postgres-rustls-0.14.0/LICENSE",
+          "sha256": "66765d2624face69f976e3346c44e8c7fb2b2f4bce60182cf5a4c9fd83a79311",
+          "upstream_path": "LICENSE"
+        }
+      ],
+      "name": "tokio-postgres-rustls",
+      "version": "0.14.0"
     },
     {
       "declared_license": "MIT OR Apache-2.0",
@@ -2883,6 +3391,32 @@
       "version": "2.9.0"
     },
     {
+      "declared_license": "MIT OR Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 412,
+          "path": "licenses/rust/unicode-bidi-0.3.18/COPYRIGHT",
+          "sha256": "edb20b474f6cbd4f4db066b54a9e0f687d0009d309412a63431189b59b8e2a07",
+          "upstream_path": "COPYRIGHT"
+        },
+        {
+          "bytes": 10847,
+          "path": "licenses/rust/unicode-bidi-0.3.18/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1071,
+          "path": "licenses/rust/unicode-bidi-0.3.18/LICENSE-MIT",
+          "sha256": "7b63ecd5f1902af1b63729947373683c32745c16a10e8e6292e2e2dcd7e90ae0",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "unicode-bidi",
+      "version": "0.3.18"
+    },
+    {
       "declared_license": "(MIT OR Apache-2.0) AND Unicode-3.0",
       "ecosystem": "rust",
       "files": [
@@ -2907,6 +3441,64 @@
       ],
       "name": "unicode-ident",
       "version": "1.0.26"
+    },
+    {
+      "declared_license": "(MIT OR Apache-2.0) AND Unicode-3.0",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 321,
+          "path": "licenses/rust/unicode-normalization-0.1.26/COPYRIGHT",
+          "sha256": "23860c2a7b5d96b21569afedf033469bab9fe14a1b24a35068b8641c578ce24d",
+          "upstream_path": "COPYRIGHT"
+        },
+        {
+          "bytes": 10847,
+          "path": "licenses/rust/unicode-normalization-0.1.26/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1071,
+          "path": "licenses/rust/unicode-normalization-0.1.26/LICENSE-MIT",
+          "sha256": "7b63ecd5f1902af1b63729947373683c32745c16a10e8e6292e2e2dcd7e90ae0",
+          "upstream_path": "LICENSE-MIT"
+        },
+        {
+          "bytes": 1995,
+          "path": "licenses/rust/unicode-normalization-0.1.26/LICENSE-UNICODE",
+          "sha256": "f7db81051789b729fea528a63ec4c938fdcb93d9d61d97dc8cc2e9df6d47f2a1",
+          "upstream_path": "LICENSE-UNICODE"
+        }
+      ],
+      "name": "unicode-normalization",
+      "version": "0.1.26"
+    },
+    {
+      "declared_license": "MIT/Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 321,
+          "path": "licenses/rust/unicode-properties-0.1.4/COPYRIGHT",
+          "sha256": "23860c2a7b5d96b21569afedf033469bab9fe14a1b24a35068b8641c578ce24d",
+          "upstream_path": "COPYRIGHT"
+        },
+        {
+          "bytes": 10847,
+          "path": "licenses/rust/unicode-properties-0.1.4/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1071,
+          "path": "licenses/rust/unicode-properties-0.1.4/LICENSE-MIT",
+          "sha256": "7b63ecd5f1902af1b63729947373683c32745c16a10e8e6292e2e2dcd7e90ae0",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "unicode-properties",
+      "version": "0.1.4"
     },
     {
       "declared_license": "ISC",
@@ -3057,6 +3649,32 @@
       "version": "1.0.10"
     },
     {
+      "declared_license": "Apache-2.0 OR BSL-1.0 OR MIT",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 9723,
+          "path": "licenses/rust/whoami-2.1.3/LICENSE_APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+          "upstream_path": "LICENSE_APACHE"
+        },
+        {
+          "bytes": 1338,
+          "path": "licenses/rust/whoami-2.1.3/LICENSE_BOOST",
+          "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566",
+          "upstream_path": "LICENSE_BOOST"
+        },
+        {
+          "bytes": 1036,
+          "path": "licenses/rust/whoami-2.1.3/LICENSE_MIT",
+          "sha256": "508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1",
+          "upstream_path": "LICENSE_MIT"
+        }
+      ],
+      "name": "whoami",
+      "version": "2.1.3"
+    },
+    {
       "declared_license": "Unicode-3.0",
       "ecosystem": "rust",
       "files": [
@@ -3069,6 +3687,26 @@
       ],
       "name": "writeable",
       "version": "0.6.4"
+    },
+    {
+      "declared_license": "Apache-2.0 OR MIT",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 10849,
+          "path": "licenses/rust/x509-cert-0.2.5/LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "upstream_path": "LICENSE-APACHE"
+        },
+        {
+          "bytes": 1077,
+          "path": "licenses/rust/x509-cert-0.2.5/LICENSE-MIT",
+          "sha256": "90c503b61dee04e1449c323ec34c229dfb68d7adcb96c7e140ee55f70fce2d8e",
+          "upstream_path": "LICENSE-MIT"
+        }
+      ],
+      "name": "x509-cert",
+      "version": "0.2.5"
     },
     {
       "declared_license": "Unicode-3.0",
