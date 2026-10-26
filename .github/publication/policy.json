@@ -8,6 +8,7 @@
   "public_docs": [
     "docs/fxlink.md",
     "docs/installation.md",
+    "docs/iptv-ha.md",
     "docs/iptv-transport.md",
     "docs/licensing.md",
     "docs/packaging.md",
