@@ -101,17 +101,7 @@ impl HaCatalog {
         let snapshot = Arc::new(
             index_document(document, revision as u64).map_err(|_| HaError::UnsupportedSchema)?,
         );
-        let mut active = self.active.write().unwrap();
-        if let Some(previous) = active.as_ref() {
-            if previous.revision() > snapshot.revision() {
-                return Err(HaError::StaleRevision);
-            }
-            if previous.revision() == snapshot.revision() {
-                return Ok(previous.clone());
-            }
-        }
-        *active = Some(snapshot.clone());
-        Ok(snapshot)
+        install_loaded_snapshot(&self.active, snapshot)
     }
 
     pub async fn edit(
@@ -192,6 +182,23 @@ impl HaCatalog {
         self.export_healthy
             .store(matches!(result, Ok(Ok(()))), Ordering::Release);
     }
+}
+
+fn install_loaded_snapshot(
+    active: &RwLock<Option<Arc<IptvSnapshot>>>,
+    snapshot: Arc<IptvSnapshot>,
+) -> Result<Arc<IptvSnapshot>, HaError> {
+    let mut active = active.write().unwrap();
+    if let Some(previous) = active.as_ref() {
+        if previous.revision() > snapshot.revision() {
+            return Err(HaError::StaleRevision);
+        }
+        if previous.revision() == snapshot.revision() {
+            return Ok(previous.clone());
+        }
+    }
+    *active = Some(snapshot.clone());
+    Ok(snapshot)
 }
 
 fn schema_or_unavailable(error: tokio_postgres::Error) -> HaError {
@@ -291,5 +298,40 @@ fn apply_edit(document: &mut IptvDocument, edit: CatalogEdit) -> Result<Option<V
             }
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_install_tests {
+    use super::*;
+    use std::{sync::mpsc, thread};
+
+    fn snapshot(revision: u64) -> Arc<IptvSnapshot> {
+        Arc::new(index_document(IptvDocument::default(), revision).unwrap())
+    }
+
+    #[test]
+    fn parsed_older_revision_cannot_install_after_newer_concurrent_refresh() {
+        let active = Arc::new(RwLock::new(Some(snapshot(0))));
+        let (parsed_tx, parsed_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let older_active = active.clone();
+        let older = thread::spawn(move || {
+            let parsed_older = snapshot(1);
+            parsed_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            install_loaded_snapshot(&older_active, parsed_older)
+        });
+
+        parsed_rx.recv().unwrap();
+        let newer = snapshot(2);
+        let installed = install_loaded_snapshot(&active, newer.clone()).unwrap();
+        assert!(Arc::ptr_eq(&installed, &newer));
+        resume_tx.send(()).unwrap();
+        assert!(matches!(older.join().unwrap(), Err(HaError::StaleRevision)));
+        assert!(Arc::ptr_eq(
+            active.read().unwrap().as_ref().unwrap(),
+            &newer
+        ));
     }
 }

@@ -261,6 +261,17 @@ async fn cached_catalog_rejects_invalid_changed_revision_and_oversized_document(
 
     let client = db.local_client().await;
     client
+        .execute(
+            "UPDATE fx_iptv_catalog SET document = repeat('x', 67108865)",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        catalog.load_current().await,
+        Err(HaError::UnsupportedSchema)
+    ));
+    client
         .execute("UPDATE fx_iptv_catalog SET document = '{bad'", &[])
         .await
         .unwrap();
