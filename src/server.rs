@@ -6,7 +6,7 @@ use crate::{
         client::AuthorityClient,
         ha::{
             HaAuthority,
-            connection::{HaOptions, HaPool},
+            connection::{HaError, HaOptions, HaPool},
         },
         lease::Ledger,
         store::IptvStore,
@@ -741,7 +741,35 @@ impl App {
                 .unmeasured(window, metrics["http_egress_mbps"].as_f64());
         drop(reservations);
         let rtsp_publication = self.rtsp_publication.lock().unwrap().clone();
-        let iptv_cluster = if self.options.role == "standalone"
+        let iptv_cluster = if let Some(ha) = &self.iptv_ha {
+            let report = tokio::time::timeout(Duration::from_secs(2), async {
+                ha.pool.verify_startup().await?;
+                let snapshot = ha.catalog.load_current().await?;
+                let capacity = ha.ledger.capacity().await?;
+                Ok::<_, HaError>((snapshot, capacity))
+            })
+            .await;
+            match report {
+                Ok(Ok((snapshot, capacity))) => {
+                    let ready = snapshot.enabled() && capacity.available();
+                    let reason = if !snapshot.enabled() {
+                        Some("IPTV is disabled")
+                    } else if !capacity.available() {
+                        Some("IPTV authority lease capacity is full")
+                    } else {
+                        None
+                    };
+                    json!({"mode":"authority","backend":"postgresql","configured":true,
+                        "ready":ready,"database_ready":true,"reason":reason,
+                        "catalog_revision":snapshot.revision(),"capacity":capacity,
+                        "export_healthy":ha.catalog.export_healthy()})
+                }
+                _ => json!({"mode":"authority","backend":"postgresql","configured":true,
+                    "ready":false,"database_ready":false,"reason":"IPTV HA database unavailable",
+                    "catalog_revision":null,"capacity":null,
+                    "export_healthy":ha.catalog.export_healthy()}),
+            }
+        } else if self.options.role == "standalone"
             && !self.options.iptv_lease_authority
             && self.iptv_authority_client.is_none()
         {

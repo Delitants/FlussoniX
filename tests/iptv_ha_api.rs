@@ -94,6 +94,26 @@ async fn status(app: Arc<App>) -> axum::response::Response {
     router(app).oneshot(request).await.unwrap()
 }
 
+async fn node(app: Arc<App>) -> serde_json::Value {
+    let response = router(app)
+        .oneshot(
+            Request::builder()
+                .uri("/flussonix/api/v1/node")
+                .header("x-flussonix-peer", "owned-cluster-peer-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
 async fn peer(app: Arc<App>, action: &str, body: serde_json::Value) -> axum::response::Response {
     let mut request = Request::builder()
         .method(Method::POST)
@@ -448,4 +468,48 @@ async fn two_ha_admins_racing_the_same_revision_apply_only_one_edit() {
     let current = management(a, Method::GET, "iptv", None).await;
     assert_eq!(current.headers()["etag"], "\"1\"");
     assert_eq!(current.headers()["cache-control"], "no-store");
+}
+
+#[tokio::test]
+async fn ha_node_status_reports_database_capacity_revision_and_export_fault_without_secrets() {
+    let certs = tls_fixture::Certificates::new();
+    let Some(db) = iptv_postgres::PgServer::start(&certs) else {
+        return;
+    };
+    let ha = options(&certs, db.port());
+    let pool = Arc::new(HaPool::new(&ha).unwrap());
+    schema::initialize(&pool, None).await.unwrap();
+    let export_dir = certs.dir.path().join("export-is-a-directory");
+    fs::create_dir(&export_dir).unwrap();
+    let app = App::new(
+        certs.dir.path().join("authority-config.json"),
+        certs.dir.path().join("media"),
+        Options {
+            admin_password: "owned-admin".into(),
+            peer_key: "owned-cluster-peer-123".into(),
+            role: "lb".into(),
+            iptv_lease_authority: true,
+            iptv_peer_allow_insecure_loopback: true,
+            iptv_data: Some(export_dir),
+            iptv_ha: Some(ha),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        management(app.clone(), Method::PUT, "iptv", Some("\"0\""))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let report = node(app.clone()).await;
+    assert_eq!(report["iptv_cluster"]["mode"], "authority");
+    assert_eq!(report["iptv_cluster"]["backend"], "postgresql");
+    assert_eq!(report["iptv_cluster"]["ready"], true);
+    assert_eq!(report["iptv_cluster"]["catalog_revision"], 1);
+    assert_eq!(report["iptv_cluster"]["capacity"]["active_sessions"], 0);
+    assert_eq!(report["iptv_cluster"]["export_healthy"], false);
+    assert!(!report.to_string().contains("owned-test-secret"));
+    drop(db);
+    assert_eq!(node(app).await["iptv_cluster"]["ready"], false);
 }

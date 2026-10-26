@@ -2,6 +2,7 @@
 use super::connection::{DATABASE_TIMEOUT, HaError, HaPool};
 use crate::iptv::lease::{LeaseGrant, LeaseRequest, SessionKey, SubscriberId};
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use std::{
     future::Future,
     sync::Arc,
@@ -17,12 +18,30 @@ pub struct HaLedger {
     pool: Arc<HaPool>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct HaCapacity {
+    pub active_sessions: u32,
+    pub operation_count: u32,
+    pub max_sessions: u32,
+    pub max_operations: u32,
+}
+
+impl HaCapacity {
+    pub fn available(&self) -> bool {
+        self.active_sessions < self.max_sessions && self.operation_count < self.max_operations
+    }
+}
+
 impl HaLedger {
     pub fn new(pool: Arc<HaPool>) -> Self {
         Self { pool }
     }
 
     pub async fn ready(&self) -> Result<bool, HaError> {
+        Ok(self.capacity().await?.available())
+    }
+
+    pub async fn capacity(&self) -> Result<HaCapacity, HaError> {
         let connection = self.pool.acquire().await?;
         let row = tokio::time::timeout(
             DATABASE_TIMEOUT,
@@ -34,7 +53,17 @@ impl HaLedger {
         .await
         .map_err(|_| HaError::Unavailable)?
         .map_err(|_| HaError::Unavailable)?;
-        Ok(row.get::<_, i32>(0) < MAX_SESSIONS && row.get::<_, i32>(1) < MAX_OPERATIONS)
+        let active: i32 = row.try_get(0).map_err(|_| HaError::UnsupportedSchema)?;
+        let operations: i32 = row.try_get(1).map_err(|_| HaError::UnsupportedSchema)?;
+        if !(0..=MAX_SESSIONS).contains(&active) || !(0..=MAX_OPERATIONS).contains(&operations) {
+            return Err(HaError::UnsupportedSchema);
+        }
+        Ok(HaCapacity {
+            active_sessions: active as u32,
+            operation_count: operations as u32,
+            max_sessions: MAX_SESSIONS as u32,
+            max_operations: MAX_OPERATIONS as u32,
+        })
     }
 
     pub async fn acquire(

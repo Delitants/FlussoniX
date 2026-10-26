@@ -79,3 +79,29 @@ jobs:
             sleep 0.25
           done
           npm test --prefix web
+      - name: Verify IPTV HA admin against owned PostgreSQL authority
+        env:
+          FLUSSONIX_HA_UI_READY_FILE: ${{ runner.temp }}/flussonix-ha-ui-ready
+          FLUSSONIX_HA_UI_STOP_FILE: ${{ runner.temp }}/flussonix-ha-ui-stop
+        run: |
+          export FLUSSONIX_ADMIN_USER=admin
+          export FLUSSONIX_ADMIN_PASSWORD="$(openssl rand -hex 24)"
+          export FLUSSONIX_VIEW_USER=viewer
+          export FLUSSONIX_VIEW_PASSWORD="$(openssl rand -hex 24)"
+          rm -f "$FLUSSONIX_HA_UI_READY_FILE" "$FLUSSONIX_HA_UI_STOP_FILE"
+          cargo test --locked --test iptv_ha_browser_fixture launch_owned_ha_ui_server -- --ignored --exact --nocapture > .runtime/ha-ui.log 2>&1 &
+          flussonix_ha_ui_pid=$!
+          cleanup_ha_ui() {
+            touch "$FLUSSONIX_HA_UI_STOP_FILE"
+            if ! wait "$flussonix_ha_ui_pid"; then tail -n 40 .runtime/ha-ui.log; exit 1; fi
+            rm -f "$FLUSSONIX_HA_UI_READY_FILE" "$FLUSSONIX_HA_UI_STOP_FILE"
+          }
+          trap cleanup_ha_ui EXIT
+          for attempt in $(seq 1 120); do
+            if test -s "$FLUSSONIX_HA_UI_READY_FILE"; then break; fi
+            if ! kill -0 "$flussonix_ha_ui_pid" 2>/dev/null; then tail -n 40 .runtime/ha-ui.log; exit 1; fi
+            sleep 0.25
+          done
+          test -s "$FLUSSONIX_HA_UI_READY_FILE"
+          export FLUSSONIX_TEST_URL="$(cat "$FLUSSONIX_HA_UI_READY_FILE")"
+          npm test --prefix web -- --grep 'IPTV HA live'

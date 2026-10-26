@@ -1,17 +1,20 @@
 import React,{useEffect,useState} from 'react';
 
 type Request = (url:string,method?:string,body?:unknown)=>Promise<any>;
+type IptvRequest = (url:string,method?:string,body?:unknown,ifMatch?:string|null)=>Promise<{body:any;etag:string|null}>;
+type IptvError = Error & {status?:number;etag?:string|null};
 type Package = {name:string;channels:string[]};
 type Subscriber = {name:string;token:string;packages:string[];max_sessions?:number|null;flussonix_expires_at?:string|null};
 type Editor = {kind:'package'|'subscriber';original:string;name:string;selected:string[];limit:string;expires:string;token:string;rotate:boolean};
-type Cluster = {mode?:string;ready?:boolean;reason?:string};
+type Cluster = {mode?:string;backend?:string;ready?:boolean;reason?:string;database_ready?:boolean;catalog_revision?:number|null;export_healthy?:boolean;capacity?:{active_sessions:number;max_sessions:number;operation_count:number;max_operations:number}|null;origins?:{origin:string;reachable:boolean;ready:boolean;refused:boolean}[]};
 const api='/streamer/api/v3/iptv';
 const validName=(name:string)=>name.length>0&&new TextEncoder().encode(name).length<=256&&!name.split('/').some(part=>!part||part==='.'||part==='..')&&!/[\\?#\x00-\x1f\x7f]/.test(name);
 const itemPath=(name:string)=>encodeURIComponent(name);
 const utcField=(value?:string|null)=>value?.slice(0,16)||'';
 
-export function IptvPage({request,publicOrigin,managementRole,cluster,onBack}:{request:Request;publicOrigin?:string|null;managementRole?:string;cluster?:Cluster;onBack:()=>void}){
+export function IptvPage({request,iptvRequest,publicOrigin,managementRole,cluster,onBack}:{request:Request;iptvRequest:IptvRequest;publicOrigin?:string|null;managementRole?:string;cluster?:Cluster;onBack:()=>void}){
  const remote=cluster?.mode==='client'||cluster?.mode==='missing_authority';
+ const haMode=cluster?.backend==='postgresql';
  const canEdit=managementRole==='edit'&&!remote;
  const[enabled,setEnabled]=useState<boolean|null>(null);
  const[packages,setPackages]=useState<Package[]>([]),[subscribers,setSubscribers]=useState<Subscriber[]>([]),[channels,setChannels]=useState<string[]>([]);
@@ -19,13 +22,14 @@ export function IptvPage({request,publicOrigin,managementRole,cluster,onBack}:{r
  const[tab,setTab]=useState<'packages'|'subscribers'>('packages');
  const[editor,setEditor]=useState<Editor|null>(null),[shownToken,setShownToken]=useState<string|null>(null);
  const[error,setError]=useState(''),[formError,setFormError]=useState(''),[notice,setNotice]=useState(''),[busy,setBusy]=useState(false);
+ const[etag,setEtag]=useState<string|null>(null),[conflict,setConflict]=useState(false);
 
  async function refresh(){
   try{
-   const status=await request(api).then(()=>true).catch((cause:Error)=>{
-    if(cause.message.includes('IPTV is disabled'))return false;
-    throw cause;
-   });
+   let status=true,tag:string|null=null;
+   try{const root=await iptvRequest(api);tag=root.etag;}
+   catch(cause){const failure=cause as IptvError;if(failure.status!==404&&!failure.message.includes('IPTV is disabled'))throw failure;status=false;tag=failure.etag||null;}
+   setEtag(tag);
    setEnabled(status);
    const streams=await request('/streamer/api/v3/streams?limit=1000');
    setChannels((streams.streams||[]).map((row:{name:string})=>row.name).sort());
@@ -34,10 +38,15 @@ export function IptvPage({request,publicOrigin,managementRole,cluster,onBack}:{r
     setPackages(packPage.packages||[]);setPackageNext(packPage.next||null);
     setSubscribers(subPage.subscribers||[]);setSubscriberNext(subPage.next||null);
    }else{setPackages([]);setSubscribers([]);setPackageNext(null);setSubscriberNext(null);}
-   setError('');
-  }catch(cause){setError((cause as Error).message);}
+   setError('');return true;
+  }catch(cause){setError((cause as Error).message);return false;}
  }
  useEffect(()=>{if(!remote)void refresh()},[remote]);
+ async function refreshAfterConflict(){setBusy(true);if(await refresh()){setConflict(false);setFormError('');setNotice('Catalog refreshed. Review your edits, then save again.')}setBusy(false);}
+ function editError(cause:unknown,inEditor:boolean){const failure=cause as IptvError;if(haMode&&(failure.status===412||failure.status===428)){
+   setConflict(true);const message='Catalog changed on another authority. Your edits are kept. Refresh catalog to retry.';
+   if(inEditor)setFormError(message);else setError(message);
+  }else if(inEditor)setFormError(failure.message);else setError(failure.message);}
  async function more(kind:'packages'|'subscribers',cursor:string){
   try{const page=await request(`${api}/${kind}?limit=1000&cursor=${encodeURIComponent(cursor)}`);
    if(kind==='packages'){setPackages(previous=>[...previous,...page.packages]);setPackageNext(page.next||null)}
@@ -46,13 +55,14 @@ export function IptvPage({request,publicOrigin,managementRole,cluster,onBack}:{r
  }
  async function toggleModule(){
   setBusy(true);setError('');try{
-   await request(api,enabled?'DELETE':'PUT',enabled?undefined:{});
-   await refresh();setEditor(null);setShownToken(null);
+   if(haMode&&!etag)throw Error('Refresh the catalog before changing IPTV settings.');
+   await iptvRequest(api,enabled?'DELETE':'PUT',enabled?undefined:{},haMode?etag:null);
+   await refresh();setConflict(false);setEditor(null);setShownToken(null);
    setNotice(enabled?'IPTV disabled. Existing subscriber viewers have been revoked.':'IPTV enabled. Packages and subscribers are ready to configure.');
-  }catch(cause){setError((cause as Error).message)}finally{setBusy(false)}
+  }catch(cause){editError(cause,false)}finally{setBusy(false)}
  }
  function open(kind:'package'|'subscriber',row?:Package|Subscriber){
-  setFormError('');setNotice('');setShownToken(null);
+  setFormError('');setNotice('');setShownToken(null);setConflict(false);
   setEditor({kind,original:row?.name||'',name:row?.name||'',selected:row?(kind==='package'?(row as Package).channels:(row as Subscriber).packages):[],limit:kind==='subscriber'&&row&&'max_sessions'in row&&row.max_sessions?String(row.max_sessions):'',expires:kind==='subscriber'&&row&&'flussonix_expires_at'in row?utcField(row.flussonix_expires_at):'',token:'',rotate:false});
  }
  async function save(){
@@ -69,15 +79,16 @@ export function IptvPage({request,publicOrigin,managementRole,cluster,onBack}:{r
    else if(editor.rotate)body.token=null;
   }
   setBusy(true);setFormError('');try{
-   await request(`${api}/${editor.kind==='package'?'packages':'subscribers'}/${itemPath(editor.name)}`,'PUT',body);
-   setEditor(null);setShownToken(null);await refresh();
+   if(haMode&&!etag)throw Error('Refresh the catalog before saving.');
+   await iptvRequest(`${api}/${editor.kind==='package'?'packages':'subscribers'}/${itemPath(editor.name)}`,'PUT',body,haMode?etag:null);
+   setEditor(null);setShownToken(null);setConflict(false);await refresh();
    setNotice(editor.kind==='package'?'Package saved. Subscriber access updates immediately.':editor.original?'Subscriber saved. Changes to access close old viewers.':'Subscriber saved. A token was generated if none was entered; reveal or copy it deliberately.');
-  }catch(cause){setFormError((cause as Error).message)}finally{setBusy(false)}
+  }catch(cause){editError(cause,true)}finally{setBusy(false)}
  }
  async function remove(kind:'package'|'subscriber',name:string){
   if(!window.confirm(`Delete ${name}? Subscriber access and active viewers may change immediately.`))return;
-  setBusy(true);setError('');try{await request(`${api}/${kind==='package'?'packages':'subscribers'}/${itemPath(name)}`,'DELETE');await refresh();setShownToken(null);setNotice(`${kind==='package'?'Package':'Subscriber'} deleted. Affected viewers have been revoked.`)}
-  catch(cause){setError((cause as Error).message)}finally{setBusy(false)}
+  setBusy(true);setError('');try{if(haMode&&!etag)throw Error('Refresh the catalog before deleting.');await iptvRequest(`${api}/${kind==='package'?'packages':'subscribers'}/${itemPath(name)}`,'DELETE',undefined,haMode?etag:null);await refresh();setConflict(false);setShownToken(null);setNotice(`${kind==='package'?'Package':'Subscriber'} deleted. Affected viewers have been revoked.`)}
+  catch(cause){editError(cause,false)}finally{setBusy(false)}
  }
  async function copy(value:string,what:string){
   try{await navigator.clipboard.writeText(value);setNotice(`${what} copied to clipboard.`)}
@@ -88,12 +99,15 @@ export function IptvPage({request,publicOrigin,managementRole,cluster,onBack}:{r
  return <section className="iptv-page">
   <div className="page-heading"><div><div className="breadcrumb">System / Config / IPTV</div><h1>IPTV</h1></div><div className="heading-actions"><button onClick={onBack}>← Configuration</button>{canEdit&&enabled!==null&&<button className={enabled?'danger':'primary'} disabled={busy} onClick={toggleModule}>{enabled?'Disable IPTV':'Enable IPTV'}</button>}</div></div>
   {error&&<div className="error" role="alert">{error}</div>}{notice&&<div className="notice" role="status">{notice}</div>}
+  {conflict&&!editor&&<button disabled={busy} onClick={refreshAfterConflict}>Refresh catalog to retry</button>}
   {cluster&&cluster.ready===false&&<div className="error" role="alert">{cluster.reason||'IPTV cluster admission is unavailable.'}</div>}
-  <div className="panel padded iptv-intro"><h2>Subscriber access</h2><p>{remote?'Subscriber catalog and playlists are managed by the IPTV authority.':enabled===null?'Loading IPTV status…':enabled?'IPTV is enabled. Assign channels to packages, then packages to subscribers.':'IPTV is disabled. Enable it to manage packages and subscribers.'}</p><p className="muted">{cluster?.mode==='authority'?'Subscriber data is saved in an owner-only file on this authority. Session limits count FlussoniX nodes only.':remote?'This node does not use a local subscriber file for viewer access.':'Subscriber data and tokens are saved in a separate owner-only file. Limits apply separately on each node.'}</p>{!remote&&!publicOrigin&&<p className="muted">Set the IPTV public origin at startup to offer subscriber playlist links.</p>}{!remote&&publicOrigin?.startsWith('http://')&&<p className="iptv-http-warning" role="alert">This HTTP origin sends subscriber tokens without encryption. Use HTTPS for public or untrusted networks.</p>}</div>
+  {haMode&&<section className="panel padded iptv-ha-health" aria-label="IPTV HA health"><h2>Authority health</h2><div className="iptv-ha-metrics"><span>Database <b>{cluster?.database_ready?'Ready':'Unavailable'}</b></span><span>Catalog revision <b>{cluster?.catalog_revision??'—'}</b></span><span>Sessions <b>{cluster?.capacity?`${cluster.capacity.active_sessions} / ${cluster.capacity.max_sessions}`:'—'}</b></span><span>Lease records <b>{cluster?.capacity?`${cluster.capacity.operation_count} / ${cluster.capacity.max_operations}`:'—'}</b></span></div>{cluster?.export_healthy===false&&<p className="iptv-http-warning" role="alert">Local export needs attention. The database remains the authority.</p>}</section>}
+  {!!cluster?.origins?.length&&<section className="panel padded iptv-ha-health" aria-label="IPTV authority origins"><h2>Authority origins</h2>{cluster.origins.map(origin=><p key={origin.origin}><span className="mono">{origin.origin}</span> · {origin.ready?'Ready':origin.reachable?origin.refused?'Not accepting leases':'Reachable, not verified':'Unreachable'}</p>)}</section>}
+  <div className="panel padded iptv-intro"><h2>Subscriber access</h2><p>{remote?'Subscriber catalog and playlists are managed by the IPTV authority.':enabled===null?'Loading IPTV status…':enabled?'IPTV is enabled. Assign channels to packages, then packages to subscribers.':'IPTV is disabled. Enable it to manage packages and subscribers.'}</p><p className="muted">{haMode?'Subscriber data and session leases are stored in the shared database. Session limits count FlussoniX nodes only.':cluster?.mode==='authority'?'Subscriber data is saved in an owner-only file on this authority. Session limits count FlussoniX nodes only.':remote?'This node does not use a local subscriber file for viewer access.':'Subscriber data and tokens are saved in a separate owner-only file. Limits apply separately on each node.'}</p>{!remote&&!publicOrigin&&<p className="muted">Set the IPTV public origin at startup to offer subscriber playlist links.</p>}{!remote&&publicOrigin?.startsWith('http://')&&<p className="iptv-http-warning" role="alert">This HTTP origin sends subscriber tokens without encryption. Use HTTPS for public or untrusted networks.</p>}</div>
   {enabled&&<><div className="tabs"><button className={tab==='packages'?'selected':''} onClick={()=>{setShownToken(null);setTab('packages')}}>Packages</button><button className={tab==='subscribers'?'selected':''} onClick={()=>{setShownToken(null);setTab('subscribers')}}>Subscribers</button></div>
    {tab==='packages'?<section className="panel"><div className="panel-heading"><h2>Packages</h2>{canEdit&&<button className="primary" onClick={()=>open('package')}>Add package</button>}</div><div className="table-wrap"><table><thead><tr><th>Name</th><th>Channels</th>{canEdit&&<th>Actions</th>}</tr></thead><tbody>{packages.map(row=><tr key={row.name}><td className="mono">{row.name}</td><td>{row.channels.length?row.channels.join(', '):'No channels'}</td>{canEdit&&<td className="actions"><button onClick={()=>open('package',row)}>Edit</button><button className="danger" onClick={()=>remove('package',row.name)}>Delete</button></td>}</tr>)}</tbody></table>{!packages.length&&<p className="padded muted">No packages yet.</p>}</div>{packageNext&&<div className="editor-footer"><button onClick={()=>more('packages',packageNext)}>Load more packages</button></div>}</section>:
    <section className="panel"><div className="panel-heading"><h2>Subscribers</h2>{canEdit&&<button className="primary" onClick={()=>open('subscriber')}>Add subscriber</button>}</div><div className="table-wrap"><table><thead><tr><th>Name</th><th>Packages</th><th>Session limit</th><th>Expires (UTC)</th><th>Token</th><th>Actions</th></tr></thead><tbody>{subscribers.map(row=>{const secret=canEdit&&row.token!=='[redacted]';const url=playlist(row);return <tr key={row.name}><td className="mono">{row.name}</td><td>{row.packages.join(', ')||'None'}</td><td>{row.max_sessions??'No limit'}</td><td>{row.flussonix_expires_at||'Never'}</td><td className="mono iptv-token">{secret?(shownToken===row.name?row.token:'••••'):'[redacted]'}</td><td className="actions">{secret&&<><button onClick={()=>setShownToken(shownToken===row.name?null:row.name)}>{shownToken===row.name?'Hide token':'Reveal token'}</button><button onClick={()=>copy(row.token,'Token')}>Copy token</button></>}{url&&<button onClick={()=>copy(url,'Playlist link')}>Copy playlist link</button>}{canEdit&&<><button onClick={()=>open('subscriber',row)}>Edit</button><button className="danger" onClick={()=>remove('subscriber',row.name)}>Delete</button></>}</td></tr>})}</tbody></table>{!subscribers.length&&<p className="padded muted">No subscribers yet.</p>}</div>{subscriberNext&&<div className="editor-footer"><button onClick={()=>more('subscribers',subscriberNext)}>Load more subscribers</button></div>}</section>}
   </>}
-  {editor&&<div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="iptv-editor-title"><div className="panel-heading"><h2 id="iptv-editor-title">{editor.original?'Edit':'Add'} {editor.kind}</h2><button aria-label="Close editor" onClick={()=>setEditor(null)}>×</button></div><div className="padded iptv-editor"><label>{editor.kind==='package'?'Package name':'Subscriber name'}<input value={editor.name} disabled={!!editor.original} maxLength={256} onChange={event=>setEditor({...editor,name:event.target.value})}/></label><fieldset><legend>{editor.kind==='package'?'Channels':'Packages'}</legend><div className="iptv-choices">{choices.map(name=><label key={name}><input type="checkbox" checked={editor.selected.includes(name)} onChange={event=>setEditor({...editor,selected:event.target.checked?[...editor.selected,name]:editor.selected.filter(value=>value!==name)})}/>{name}</label>)}</div>{!choices.length&&<p className="muted">{editor.kind==='package'?'Create a stream first to choose channels.':'Create a package first.'}</p>}</fieldset>{editor.kind==='subscriber'&&<><div className="form-grid"><label>{cluster?.mode==='authority'?'Maximum sessions across FlussoniX nodes':'Maximum sessions on this node'}<input type="number" min="1" step="1" value={editor.limit} onChange={event=>setEditor({...editor,limit:event.target.value})}/></label><label>Expires at (UTC)<input type="datetime-local" value={editor.expires} onChange={event=>setEditor({...editor,expires:event.target.value})}/></label></div><p className="field-help">HLS players sharing a stream, IP address and token on one node may count as one session.</p><label>Subscriber token<input type="password" autoComplete="off" value={editor.token} placeholder={editor.original?'Leave blank to keep current token':'Leave blank to generate a token'} onChange={event=>setEditor({...editor,token:event.target.value,rotate:false})}/></label>{editor.original&&<button type="button" onClick={()=>setEditor({...editor,token:'',rotate:true})}>Generate new token on save</button>}<p className="field-help">{editor.rotate?'Saving will replace the current token and revoke its viewers.':'Tokens stay masked in the list until you reveal or copy them.'}</p></>}{formError&&<div className="error" role="alert">{formError}</div>}</div><div className="modal-actions"><button onClick={()=>setEditor(null)}>Cancel</button><button className="primary" disabled={busy} onClick={save}>{busy?'Saving…':`Save ${editor.kind}`}</button></div></section></div>}
+  {editor&&<div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="iptv-editor-title"><div className="panel-heading"><h2 id="iptv-editor-title">{editor.original?'Edit':'Add'} {editor.kind}</h2><button aria-label="Close editor" onClick={()=>setEditor(null)}>×</button></div><div className="padded iptv-editor"><label>{editor.kind==='package'?'Package name':'Subscriber name'}<input value={editor.name} disabled={!!editor.original} maxLength={256} onChange={event=>setEditor({...editor,name:event.target.value})}/></label><fieldset><legend>{editor.kind==='package'?'Channels':'Packages'}</legend><div className="iptv-choices">{choices.map(name=><label key={name}><input type="checkbox" checked={editor.selected.includes(name)} onChange={event=>setEditor({...editor,selected:event.target.checked?[...editor.selected,name]:editor.selected.filter(value=>value!==name)})}/>{name}</label>)}</div>{!choices.length&&<p className="muted">{editor.kind==='package'?'Create a stream first to choose channels.':'Create a package first.'}</p>}</fieldset>{editor.kind==='subscriber'&&<><div className="form-grid"><label>{cluster?.mode==='authority'?'Maximum sessions across FlussoniX nodes':'Maximum sessions on this node'}<input type="number" min="1" step="1" value={editor.limit} onChange={event=>setEditor({...editor,limit:event.target.value})}/></label><label>Expires at (UTC)<input type="datetime-local" value={editor.expires} onChange={event=>setEditor({...editor,expires:event.target.value})}/></label></div><p className="field-help">HLS players sharing a stream, IP address and token on one node may count as one session.</p><label>Subscriber token<input type="password" autoComplete="off" value={editor.token} placeholder={editor.original?'Leave blank to keep current token':'Leave blank to generate a token'} onChange={event=>setEditor({...editor,token:event.target.value,rotate:false})}/></label>{editor.original&&<button type="button" onClick={()=>setEditor({...editor,token:'',rotate:true})}>Generate new token on save</button>}<p className="field-help">{editor.rotate?'Saving will replace the current token and revoke its viewers.':'Tokens stay masked in the list until you reveal or copy them.'}</p></>}{formError&&<div className="error" role="alert">{formError}</div>}{conflict&&<button disabled={busy} onClick={refreshAfterConflict}>Refresh catalog to retry</button>}</div><div className="modal-actions"><button onClick={()=>{setEditor(null);setConflict(false)}}>Cancel</button><button className="primary" disabled={busy||conflict} onClick={save}>{busy?'Saving…':`Save ${editor.kind}`}</button></div></section></div>}
  </section>;
 }

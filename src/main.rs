@@ -340,6 +340,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let authority = app.iptv_ha.as_ref().expect("HA authority constructed");
         authority.catalog.load_current().await?;
         authority.ledger.ready().await?;
+        // The database is canonical; a failed local export is reported in node health.
+        let _ = authority.catalog.retry_export().await;
     }
     let listener = if a.https_only {
         None
