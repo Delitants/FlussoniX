@@ -2,6 +2,9 @@
   "schema": 1,
   "repository": "Delitants/FlussoniX",
   "baseline": "32d7a7bb6e07fe86ee824393e967ef0704ddb5a8",
+  "historical_public_guide_exceptions": {
+    "ee8dde620e4b454e12cf17a523125032d200ab95": ["docs/vendor-replica-discovery.md"]
+  },
   "public_docs": [
     "docs/fxlink.md",
     "docs/installation.md",

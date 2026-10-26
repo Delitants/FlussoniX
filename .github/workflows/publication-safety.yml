@@ -19,3 +19,5 @@ jobs:
           persist-credentials: false
       - name: Check source publication
         run: python3 .github/publication/guard.py history HEAD
+      - name: Test publication guard
+        run: python3 -m unittest discover -s .github/publication -p 'test_*.py' -v
