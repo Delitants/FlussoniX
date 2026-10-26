@@ -56,12 +56,19 @@ impl HaCatalog {
     }
 
     pub async fn load_current(&self) -> Result<Arc<IptvSnapshot>, HaError> {
+        let cached_revision = self
+            .active
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|snapshot| i64::try_from(snapshot.revision()).ok())
+            .unwrap_or(-1);
         let connection = self.pool.acquire().await?;
         let row = tokio::time::timeout(
             DATABASE_TIMEOUT,
             connection.query_opt(
-                "SELECT m.cluster_id,m.schema_version,m.epoch,c.revision,octet_length(c.document),CASE WHEN octet_length(c.document) <= $1 THEN c.document ELSE NULL END FROM fx_iptv_meta m CROSS JOIN fx_iptv_catalog c WHERE c.singleton = TRUE LIMIT 1",
-                &[&MAX_DOCUMENT_BYTES],
+                "SELECT m.cluster_id,m.schema_version,m.epoch,c.revision,octet_length(c.document),CASE WHEN c.revision = $1 THEN NULL WHEN octet_length(c.document) <= $2 THEN c.document ELSE NULL END FROM fx_iptv_meta m CROSS JOIN fx_iptv_catalog c WHERE c.singleton = TRUE LIMIT 1",
+                &[&cached_revision, &MAX_DOCUMENT_BYTES],
             ),
         )
         .await
@@ -95,13 +102,16 @@ impl HaCatalog {
             index_document(document, revision as u64).map_err(|_| HaError::UnsupportedSchema)?,
         );
         let mut active = self.active.write().unwrap();
-        if active
-            .as_ref()
-            .is_none_or(|previous| previous.revision() <= snapshot.revision())
-        {
-            *active = Some(snapshot.clone());
+        if let Some(previous) = active.as_ref() {
+            if previous.revision() > snapshot.revision() {
+                return Err(HaError::StaleRevision);
+            }
+            if previous.revision() == snapshot.revision() {
+                return Ok(previous.clone());
+            }
         }
-        Ok(active.as_ref().unwrap().clone())
+        *active = Some(snapshot.clone());
+        Ok(snapshot)
     }
 
     pub async fn edit(

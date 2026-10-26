@@ -5,7 +5,15 @@ use flussonix::iptv::ha::{
     connection::{HaError, HaOptions, HaPool},
     schema,
 };
-use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, time::Instant};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
 #[path = "support/counting_pg_proxy.rs"]
 mod counting_pg_proxy;
 #[path = "support/iptv_postgres.rs"]
@@ -238,6 +246,93 @@ async fn simultaneous_edits_conflict_and_stale_revision_fails_closed() {
         first.load_current().await,
         Err(HaError::StaleRevision)
     ));
+}
+
+#[tokio::test]
+async fn cached_catalog_rejects_invalid_changed_revision_and_oversized_document() {
+    let certs = tls_fixture::Certificates::new();
+    let Some(db) = iptv_postgres::PgServer::start(&certs) else {
+        return;
+    };
+    let pool = pool(&certs, db.port());
+    schema::initialize(&pool, None).await.unwrap();
+    let catalog = HaCatalog::new(pool, certs.dir.path().join("export.json"));
+    assert_eq!(catalog.load_current().await.unwrap().revision(), 0);
+
+    let client = db.local_client().await;
+    client
+        .execute("UPDATE fx_iptv_catalog SET document = '{bad'", &[])
+        .await
+        .unwrap();
+    assert_eq!(catalog.load_current().await.unwrap().revision(), 0);
+    client
+        .execute("UPDATE fx_iptv_catalog SET revision = 1", &[])
+        .await
+        .unwrap();
+    assert!(matches!(
+        catalog.load_current().await,
+        Err(HaError::UnsupportedSchema)
+    ));
+    client
+        .execute(
+            "UPDATE fx_iptv_catalog SET document = repeat('x', 67108865)",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        catalog.load_current().await,
+        Err(HaError::UnsupportedSchema)
+    ));
+}
+
+#[tokio::test]
+async fn concurrent_refresh_and_edit_never_regresses_active_revision() {
+    let certs = tls_fixture::Certificates::new();
+    let Some(db) = iptv_postgres::PgServer::start(&certs) else {
+        return;
+    };
+    let pool = pool(&certs, db.port());
+    schema::initialize(&pool, None).await.unwrap();
+    let catalog = Arc::new(HaCatalog::new(pool, certs.dir.path().join("export.json")));
+    assert_eq!(catalog.load_current().await.unwrap().revision(), 0);
+    let gate = Arc::new(tokio::sync::Barrier::new(17));
+    let edit_done = Arc::new(AtomicBool::new(false));
+    let mut reads = tokio::task::JoinSet::new();
+    for _ in 0..16 {
+        let catalog = catalog.clone();
+        let gate = gate.clone();
+        let edit_done = edit_done.clone();
+        reads.spawn(async move {
+            gate.wait().await;
+            let result = catalog.load_current().await;
+            (result, edit_done.load(Ordering::SeqCst))
+        });
+    }
+    gate.wait().await;
+    assert_eq!(
+        catalog
+            .edit(0, CatalogEdit::Enable(true))
+            .await
+            .unwrap()
+            .revision,
+        1
+    );
+    edit_done.store(true, Ordering::SeqCst);
+    while let Some(joined) = reads.join_next().await {
+        match joined.unwrap() {
+            (Ok(snapshot), after_edit) => {
+                if after_edit {
+                    assert_eq!(snapshot.revision(), 1);
+                }
+            }
+            (Err(HaError::StaleRevision), _) => {}
+            (Err(error), _) => panic!("unexpected concurrent catalog error: {error}"),
+        }
+    }
+    for _ in 0..16 {
+        assert_eq!(catalog.load_current().await.unwrap().revision(), 1);
+    }
 }
 
 #[tokio::test]
