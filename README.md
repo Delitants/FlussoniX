@@ -14,7 +14,7 @@ FlussoniX does not require any official Flussonic components.
 - Transcode video and audio with the CPU or supported Intel/NVIDIA GPUs. The UI reports GPU readiness.
 - Preserve, convert or remove subtitles; supported conversion profiles produce HLS WebVTT.
 - Build a FlussoniX source/CDN cluster with LAN stream pulls and load balancing based on uplink, CPU and RAM.
-- Try [FXLink](docs/fxlink.md), an opt-in experimental native transport with loss recovery; locally tested, with cross-host and load qualification pending.
+- Try [FXLink](docs/fxlink.md), an optional encrypted node-to-node transport. Two-host LAN playback has been checked; WAN loss and production capacity still need testing.
 
 Protocol, codec and API coverage is still incomplete. Mixed Flussonic clusters are under development; [mapped CDN routing](docs/vendor-cdn-placement.md) includes HTTP/RTSP redirects and HTTPS SRT lookup for compatible clients. Explicit Flussonic HTTP source profiles support playback and [equivalent-origin failover](docs/vendor-daemon-failover.md). See [compatibility](docs/compatibility.md) before planning a migration.
 

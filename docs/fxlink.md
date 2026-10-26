@@ -5,8 +5,10 @@ media pulls on long-haul links. It uses forward error correction (FEC) and
 bounded repair to recover some packet loss within a chosen buffer. It is
 separate from Flussonic-compatible M4S/M4SS; those URLs and protocols are
 unchanged. FXLink is not a Flussonic protocol and has not completed sustained
-WAN or production capacity qualification. A local two-stream, constrained-link
-test covers one limited fairness case; it is not a WAN capacity guarantee.
+WAN or production capacity qualification. A 15-minute two-stream private-LAN
+soak kept both HLS viewers active without imposed loss. A separate local
+two-stream, constrained-link test covers one limited fairness case. Neither
+establishes performance on a long-haul production link.
 
 ## Start a source listener
 
