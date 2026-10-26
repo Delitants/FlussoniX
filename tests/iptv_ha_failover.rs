@@ -37,6 +37,8 @@ use tower::ServiceExt;
 use uuid::Uuid;
 #[path = "support/iptv_postgres.rs"]
 mod iptv_postgres;
+#[path = "support/iptv_legacy_client.rs"]
+mod legacy_client;
 #[path = "support/tls.rs"]
 mod tls_fixture;
 
@@ -304,6 +306,80 @@ fn authority(certs: &tls_fixture::Certificates, db: HaOptions, name: &str) -> Ar
         },
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn pre_ha_single_origin_client_uses_unchanged_lease_wire() {
+    let certs = tls_fixture::Certificates::new();
+    let Some(db) = iptv_postgres::PgServer::start(&certs) else {
+        return;
+    };
+    let ha = database(&certs, db.port());
+    let pool = Arc::new(HaPool::new(&ha).unwrap());
+    schema::initialize(&pool, None).await.unwrap();
+    let catalog = HaCatalog::new(pool, certs.dir.path().join("export.json"));
+    catalog.edit(0, CatalogEdit::Enable(true)).await.unwrap();
+    catalog
+        .edit(
+            1,
+            CatalogEdit::PutPackage("basic".into(), json!({"channels":["news"]})),
+        )
+        .await
+        .unwrap();
+    catalog
+        .edit(
+            2,
+            CatalogEdit::PutSubscriber(
+                "alice".into(),
+                json!({"token":"owned-viewer-token","packages":["basic"],"max_sessions":1}),
+            ),
+        )
+        .await
+        .unwrap();
+    let (first_url, first_task) =
+        serve(&certs, router(authority(&certs, ha.clone(), "first"))).await;
+    let (second_url, second_task) = serve(&certs, router(authority(&certs, ha, "second"))).await;
+
+    let old = legacy_client::AuthorityClient::new(
+        first_url,
+        "owned-cluster-key-123".into(),
+        Some(&certs.ca),
+        false,
+    )
+    .unwrap();
+    let mut lease = legacy_client::LeaseInput {
+        token: "owned-viewer-token".into(),
+        channel: "news".into(),
+        session: SessionKey {
+            boot: Uuid::new_v4(),
+            local: Uuid::new_v4(),
+        },
+        operation: Uuid::new_v4(),
+        units: 1,
+        lease_id: None,
+    };
+    let grant = old.acquire(&lease).await.unwrap();
+    assert_eq!(
+        grant.subscriber.as_hex(),
+        flussonix::iptv::lease::SubscriberId::from_name("alice").as_hex()
+    );
+    assert_eq!(grant.revision, 3);
+    lease.lease_id = Some(grant.lease_id);
+    assert_eq!(old.commit(&lease).await.unwrap().lease_id, grant.lease_id);
+    assert_eq!(old.renew(&lease).await.unwrap().lease_id, grant.lease_id);
+
+    let other = AuthorityClient::new(
+        second_url,
+        "owned-cluster-key-123".into(),
+        Some(&certs.ca),
+        false,
+    )
+    .unwrap();
+    assert_eq!(other.acquire(&input()).await.unwrap_err(), Error::Limit);
+    old.release(&lease, &grant).await.unwrap();
+    assert!(other.acquire(&input()).await.is_ok());
+    first_task.abort();
+    second_task.abort();
 }
 
 #[tokio::test]
