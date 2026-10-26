@@ -97,7 +97,7 @@ impl HaLedger {
             lock_capacity_and_sweep(&tx).await?;
             let restored = tx.execute("UPDATE fx_iptv_sessions SET grant_id=prior_grant_id,state='committed',units=prior_units,revision=prior_revision,expires_at=prior_expires_at,prior_grant_id=NULL,prior_units=NULL,prior_revision=NULL,prior_expires_at=NULL WHERE session_key=$1 AND state='pending' AND expires_at<=clock_timestamp() AND prior_expires_at>clock_timestamp()", &[&session]).await.map_err(|_| HaError::Unavailable)?;
             let _ = restored;
-            let expired = tx.execute("DELETE FROM fx_iptv_sessions WHERE session_key=$1 AND expires_at<=clock_timestamp()", &[&session]).await.map_err(|_| HaError::Unavailable)?;
+            let expired = tx.execute("DELETE FROM fx_iptv_sessions WHERE session_key=$1 AND expires_at<=clock_timestamp() AND (state<>'pending' OR prior_expires_at IS NULL OR prior_expires_at<=clock_timestamp())", &[&session]).await.map_err(|_| HaError::Unavailable)?;
             if expired > 0 { tx.execute("UPDATE fx_iptv_capacity SET active_sessions=active_sessions-$1 WHERE singleton=TRUE", &[&(expired as i32)]).await.map_err(|_| HaError::Unavailable)?; }
             let prior_op = tx.query_opt("SELECT kind,session_key,subscriber,grant_id,units,revision,grant_expires_at,status FROM fx_iptv_operations WHERE operation_id=$1 FOR UPDATE", &[&req.operation]).await.map_err(|_| HaError::Unavailable)?;
             if let Some(row) = prior_op {
@@ -142,7 +142,7 @@ impl HaLedger {
             let db_now: DateTime<Utc> = row.get(0);
             let expires_at: DateTime<Utc> = row.get(1);
             if expires_at <= db_now { return Err(HaError::Expired); }
-            let occupied: i64 = tx.query_one("SELECT COALESCE(sum(GREATEST(units,COALESCE(prior_units,0))),0)::bigint FROM fx_iptv_sessions WHERE subscriber=$1 AND expires_at>clock_timestamp()", &[&subscriber]).await.map_err(|_| HaError::Unavailable)?.get(0);
+            let occupied: i64 = tx.query_one("SELECT COALESCE(sum(GREATEST(CASE WHEN expires_at>clock_timestamp() THEN units ELSE 0 END,CASE WHEN state='pending' AND prior_expires_at>clock_timestamp() THEN COALESCE(prior_units,0) ELSE 0 END)),0)::bigint FROM fx_iptv_sessions WHERE subscriber=$1 AND (expires_at>clock_timestamp() OR (state='pending' AND prior_expires_at>clock_timestamp()))", &[&subscriber]).await.map_err(|_| HaError::Unavailable)?.get(0);
             let old_occupied = existing.as_ref().map(|row| row.get::<_,i32>(2).max(row.get::<_,Option<i32>>(7).unwrap_or(0)) as i64).unwrap_or(0);
             let requested = (req.units as i64).max(old_occupied);
             if req.limit.is_some_and(|limit| occupied - old_occupied + requested > limit as i64) { return Err(HaError::Limit); }
@@ -402,9 +402,9 @@ async fn lock_capacity_and_sweep(tx: &Transaction<'_>) -> Result<(), HaError> {
     )
     .await
     .map_err(|_| HaError::Unavailable)?;
-    let restored = tx.execute("UPDATE fx_iptv_sessions SET grant_id=prior_grant_id,state='committed',units=prior_units,revision=prior_revision,expires_at=prior_expires_at,prior_grant_id=NULL,prior_units=NULL,prior_revision=NULL,prior_expires_at=NULL WHERE session_key IN (SELECT session_key FROM fx_iptv_sessions WHERE state='pending' AND expires_at<=clock_timestamp() AND prior_expires_at>clock_timestamp() LIMIT 128)", &[]).await.map_err(|_| HaError::Unavailable)?;
+    let restored = tx.execute("UPDATE fx_iptv_sessions SET grant_id=prior_grant_id,state='committed',units=prior_units,revision=prior_revision,expires_at=prior_expires_at,prior_grant_id=NULL,prior_units=NULL,prior_revision=NULL,prior_expires_at=NULL WHERE state='pending' AND expires_at<=clock_timestamp() AND prior_expires_at>clock_timestamp() AND session_key IN (SELECT session_key FROM fx_iptv_sessions WHERE state='pending' AND expires_at<=clock_timestamp() AND prior_expires_at>clock_timestamp() LIMIT 128)", &[]).await.map_err(|_| HaError::Unavailable)?;
     let _ = restored;
-    let expired = tx.execute("DELETE FROM fx_iptv_sessions WHERE session_key IN (SELECT session_key FROM fx_iptv_sessions WHERE expires_at<=clock_timestamp() LIMIT 128)", &[]).await.map_err(|_| HaError::Unavailable)?;
+    let expired = tx.execute("DELETE FROM fx_iptv_sessions WHERE expires_at<=clock_timestamp() AND (state<>'pending' OR prior_expires_at IS NULL OR prior_expires_at<=clock_timestamp()) AND session_key IN (SELECT session_key FROM fx_iptv_sessions WHERE expires_at<=clock_timestamp() AND (state<>'pending' OR prior_expires_at IS NULL OR prior_expires_at<=clock_timestamp()) LIMIT 128)", &[]).await.map_err(|_| HaError::Unavailable)?;
     if expired > 0 {
         tx.execute(
             "UPDATE fx_iptv_capacity SET active_sessions=active_sessions-$1 WHERE singleton=TRUE",

@@ -238,6 +238,98 @@ async fn expired_target_is_reclaimed_even_beyond_bounded_global_sweep() {
 }
 
 #[tokio::test]
+async fn bounded_sweep_preserves_and_counts_all_live_prior_grants() {
+    let certs = tls_fixture::Certificates::new();
+    let Some(db) = iptv_postgres::PgServer::start(&certs) else {
+        return;
+    };
+    let pool = pool(&certs, db.port());
+    schema::initialize(&pool, None).await.unwrap();
+    let ledger = HaLedger::new(pool);
+    let client = db.local_client().await;
+    let subscriber = SubscriberId::from_name("alice").as_hex();
+    client.execute("INSERT INTO fx_iptv_sessions(session_key,subscriber,grant_id,state,units,revision,operation_id,expires_at,prior_grant_id,prior_units,prior_revision,prior_expires_at) SELECT 'prior-'||n,$1,$2,'pending',1,0,$3,clock_timestamp()-interval '1 second',$4,1,0,clock_timestamp()+interval '30 seconds' FROM generate_series(1,300) n", &[&subscriber,&Uuid::new_v4(),&Uuid::new_v4(),&Uuid::new_v4()]).await.unwrap();
+    client
+        .execute("UPDATE fx_iptv_capacity SET active_sessions=300", &[])
+        .await
+        .unwrap();
+
+    // One admission restores only the first batch; the remaining prior grants
+    // must still occupy their subscriber slots and the global capacity.
+    let unrelated = request("bob", Uuid::new_v4(), Uuid::new_v4(), 1, 0);
+    ledger.acquire(&unrelated, None).await.unwrap();
+    let rows = client.query_one("SELECT count(*), count(*) FILTER (WHERE state='pending') FROM fx_iptv_sessions WHERE subscriber=$1", &[&subscriber]).await.unwrap();
+    assert_eq!(rows.get::<_, i64>(0), 300);
+    assert!(rows.get::<_, i64>(1) > 0);
+    let count: i32 = client
+        .query_one("SELECT active_sessions FROM fx_iptv_capacity", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 301);
+
+    let extra = request("alice", Uuid::new_v4(), Uuid::new_v4(), 300, 0);
+    assert_eq!(
+        ledger.acquire(&extra, None).await.err(),
+        Some(HaError::Limit)
+    );
+    let rows: i64 = client
+        .query_one(
+            "SELECT count(*) FROM fx_iptv_sessions WHERE subscriber=$1",
+            &[&subscriber],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 300);
+}
+
+#[tokio::test]
+async fn sweep_rechecks_prior_renewed_while_delete_waited_for_row_lock() {
+    let certs = tls_fixture::Certificates::new();
+    let Some(db) = iptv_postgres::PgServer::start(&certs) else {
+        return;
+    };
+    let pool = pool(&certs, db.port());
+    schema::initialize(&pool, None).await.unwrap();
+    let ledger = HaLedger::new(pool);
+    let mut owner = db.local_client().await;
+    owner.execute("INSERT INTO fx_iptv_sessions(session_key,subscriber,grant_id,state,units,revision,operation_id,expires_at,prior_grant_id,prior_units,prior_revision,prior_expires_at) VALUES('renewed-prior','alice',$1,'pending',1,0,$2,clock_timestamp()-interval '1 second',$3,1,0,clock_timestamp()+interval '1 second')", &[&Uuid::new_v4(),&Uuid::new_v4(),&Uuid::new_v4()]).await.unwrap();
+    owner
+        .execute("UPDATE fx_iptv_capacity SET active_sessions=1", &[])
+        .await
+        .unwrap();
+    let tx = owner.transaction().await.unwrap();
+    tx.execute("UPDATE fx_iptv_sessions SET prior_expires_at=clock_timestamp()+interval '30 seconds' WHERE session_key='renewed-prior'", &[]).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let unrelated = request("bob", Uuid::new_v4(), Uuid::new_v4(), 1, 0);
+    let admission = tokio::spawn(async move { ledger.acquire(&unrelated, None).await });
+    let monitor = db.local_client().await;
+    let mut blocked_on_delete = false;
+    for _ in 0..40 {
+        let blocked: i64 = monitor.query_one("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'DELETE FROM fx_iptv_sessions WHERE expires_at%'", &[]).await.unwrap().get(0);
+        if blocked > 0 {
+            blocked_on_delete = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    tx.commit().await.unwrap();
+    assert!(blocked_on_delete, "sweep did not wait on the renewing row");
+    admission.await.unwrap().unwrap();
+    let row = monitor.query_one("SELECT count(*), max(prior_expires_at) > clock_timestamp() FROM fx_iptv_sessions WHERE session_key='renewed-prior'", &[]).await.unwrap();
+    assert_eq!(row.get::<_, i64>(0), 1);
+    assert_eq!(row.get::<_, Option<bool>>(1), Some(true));
+    let count: i32 = monitor
+        .query_one("SELECT active_sessions FROM fx_iptv_capacity", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
 async fn database_capacity_and_subscriber_expiry_fail_closed() {
     let certs = tls_fixture::Certificates::new();
     let Some(db) = iptv_postgres::PgServer::start(&certs) else {
