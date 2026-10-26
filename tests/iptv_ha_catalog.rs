@@ -5,7 +5,9 @@ use flussonix::iptv::ha::{
     connection::{HaError, HaOptions, HaPool},
     schema,
 };
-use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, time::Instant};
+#[path = "support/counting_pg_proxy.rs"]
+mod counting_pg_proxy;
 #[path = "support/iptv_postgres.rs"]
 mod iptv_postgres;
 #[path = "support/tls.rs"]
@@ -31,6 +33,66 @@ fn pool(certs: &tls_fixture::Certificates, port: u16) -> Arc<HaPool> {
     .unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     Arc::new(HaPool::new(&HaOptions::load(&path).unwrap()).unwrap())
+}
+
+#[tokio::test]
+async fn unchanged_large_catalog_omits_document_from_postgres_response() {
+    let certs = tls_fixture::Certificates::new();
+    let Some(db) = iptv_postgres::PgServer::start(&certs) else {
+        return;
+    };
+    let direct = pool(&certs, db.port());
+    schema::initialize(&direct, None).await.unwrap();
+    let client = db.local_client().await;
+    let document = format!(
+        "{{\"version\":1,\"enabled\":false,\"packages\":[],\"subscribers\":[]}}{}",
+        " ".repeat(4 * 1024 * 1024)
+    );
+    client
+        .execute("UPDATE fx_iptv_catalog SET document = $1", &[&document])
+        .await
+        .unwrap();
+
+    let proxy = counting_pg_proxy::CountingPgProxy::start(db.port());
+    let catalog = HaCatalog::new(
+        pool(&certs, proxy.port()),
+        certs.dir.path().join("export.json"),
+    );
+    let started = Instant::now();
+    let first = catalog.load_current().await.unwrap();
+    let initial_ms = started.elapsed().as_millis();
+    let initial_bytes = proxy.server_bytes();
+    assert!(
+        initial_bytes > 4 * 1024 * 1024,
+        "initial response: {initial_bytes} bytes"
+    );
+    assert_eq!(first.revision(), 0);
+
+    let started = Instant::now();
+    let second = catalog.load_current().await.unwrap();
+    let unchanged_ms = started.elapsed().as_millis();
+    let unchanged_bytes = proxy.server_bytes() - initial_bytes;
+    eprintln!(
+        "IPTV TLS catalog: initial={initial_bytes} bytes/{initial_ms}ms unchanged={unchanged_bytes} bytes/{unchanged_ms}ms"
+    );
+    assert!(Arc::ptr_eq(&first, &second));
+    assert!(
+        unchanged_bytes < 128 * 1024,
+        "unchanged response repeated {unchanged_bytes} bytes"
+    );
+
+    let other = HaCatalog::new(direct, certs.dir.path().join("other.json"));
+    assert_eq!(
+        other
+            .edit(0, CatalogEdit::Enable(true))
+            .await
+            .unwrap()
+            .revision,
+        1
+    );
+    let refreshed = catalog.load_current().await.unwrap();
+    assert_eq!(refreshed.revision(), 1);
+    assert!(refreshed.enabled());
 }
 
 #[tokio::test]
