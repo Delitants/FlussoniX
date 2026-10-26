@@ -33,9 +33,7 @@ def count(items):
     return dict(sorted(collections.Counter(items).items()))
 
 
-def loopback_host(host):
-    if host == "localhost":
-        return True
+def literal_loopback_host(host):
     try:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
@@ -56,10 +54,10 @@ def main():
         parser.error("base_url must be an HTTP(S) origin without credentials")
     if args.max_pages < 1:
         parser.error("max-pages must be positive")
-    local_origin = loopback_host(parts.hostname)
+    local_origin = literal_loopback_host(parts.hostname)
     if parts.scheme == "http" and not local_origin:
         if not args.allow_insecure_http:
-            parser.error("remote HTTP requires --allow-insecure-http; use HTTPS when possible")
+            parser.error("HTTP host is not a literal loopback IP; use HTTPS or --allow-insecure-http")
         print("Warning: sending Basic management credentials over plaintext HTTP", file=sys.stderr)
     password = os.environ.get("FLUSSONIX_REFERENCE_PASSWORD")
     if password is None:

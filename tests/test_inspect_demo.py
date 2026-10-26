@@ -58,6 +58,42 @@ class InspectDemoTests(unittest.TestCase):
             self.assertNotIn("Reference server password", result.stderr)
             self.assertFalse(output.exists())
 
+    def test_localhost_name_requires_explicit_http_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "inventory.json"
+            environment = os.environ.copy()
+            environment.pop("FLUSSONIX_REFERENCE_PASSWORD", None)
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "http://localhost:8080", "--output", str(output)],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=5,
+            )
+            self.assertIn("--allow-insecure-http", result.stderr)
+            self.assertNotIn("Reference server password", result.stderr)
+            self.assertFalse(output.exists())
+
+    def test_explicit_http_override_warns_before_localhost_name_request(self):
+        origin = self.server()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "inventory.json"
+            environment = os.environ.copy()
+            environment.update({"FLUSSONIX_REFERENCE_PASSWORD": "synthetic-secret", "NO_PROXY": "localhost", "no_proxy": "localhost"})
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), f"http://localhost:{origin.server_port}",
+                 "--allow-insecure-http", "--output", str(output)],
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Warning: sending Basic management credentials", result.stderr)
+            self.assertEqual(len(origin.seen), 2)
+            self.assertTrue(output.exists())
+
     def test_loopback_http_never_forwards_basic_credentials_to_environment_proxy(self):
         origin = self.server()
         proxy = self.server(proxy=True)
