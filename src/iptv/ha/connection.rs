@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
 const MAX_CONNECTIONS: usize = 16;
-const DATABASE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const DATABASE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -123,20 +123,28 @@ fn valid_identifier(value: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HaError {
     InvalidConfig,
+    Invalid,
+    PreconditionFailed,
+    NotFound,
     Unavailable,
     UnsupportedSchema,
     WrongCluster,
     StaleEpoch,
+    StaleRevision,
 }
 
 impl std::fmt::Display for HaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
             Self::InvalidConfig => "invalid IPTV HA database configuration",
+            Self::Invalid => "invalid IPTV catalog edit",
+            Self::PreconditionFailed => "IPTV catalog revision changed",
+            Self::NotFound => "IPTV catalog item not found",
             Self::Unavailable => "IPTV HA database unavailable",
             Self::UnsupportedSchema => "unsupported IPTV HA database schema",
             Self::WrongCluster => "IPTV HA database cluster mismatch",
             Self::StaleEpoch => "IPTV HA database epoch moved backwards",
+            Self::StaleRevision => "IPTV HA catalog revision moved backwards",
         };
         f.write_str(message)
     }
@@ -254,6 +262,19 @@ impl HaPool {
         let version: i32 = row.try_get(1).map_err(|_| HaError::UnsupportedSchema)?;
         let epoch: i64 = row.try_get(2).map_err(|_| HaError::UnsupportedSchema)?;
         validate_metadata(self.cluster_id, &self.seen_epoch, &cluster, version, epoch)
+    }
+
+    pub fn cluster_id(&self) -> Uuid {
+        self.cluster_id
+    }
+
+    pub(crate) fn validate_metadata(
+        &self,
+        cluster: &str,
+        version: i32,
+        epoch: i64,
+    ) -> Result<(), HaError> {
+        validate_metadata(self.cluster_id, &self.seen_epoch, cluster, version, epoch)
     }
 }
 

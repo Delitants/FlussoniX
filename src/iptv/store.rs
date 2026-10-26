@@ -149,7 +149,7 @@ type ChangeHook = Box<dyn Fn(u64) + Send + Sync>;
 impl IptvStore {
     pub fn open(path: PathBuf) -> Result<Arc<Self>, String> {
         let document = read_document(&path)?.unwrap_or_default();
-        let snapshot = Arc::new(index(document, 0)?);
+        let snapshot = Arc::new(index_document(document, 0)?);
         Ok(Arc::new(Self {
             path,
             writer: Mutex::new(()),
@@ -194,7 +194,7 @@ impl IptvStore {
         let next_revision = current_revision
             .checked_add(1)
             .ok_or("IPTV revision exhausted")?;
-        let next = Arc::new(index(document, next_revision)?);
+        let next = Arc::new(index_document(document, next_revision)?);
         let bytes = serde_json::to_vec_pretty(&next.document).map_err(|_| "invalid IPTV data")?;
         if bytes.len() as u64 > MAX_FILE_BYTES {
             return Err("IPTV data exceeds 64 MiB".into());
@@ -337,7 +337,7 @@ impl IptvStore {
     }
 }
 
-fn validate_patch(patch: &Value, name: &str, fields: &[&str]) -> Result<(), String> {
+pub(crate) fn validate_patch(patch: &Value, name: &str, fields: &[&str]) -> Result<(), String> {
     let object = patch.as_object().ok_or("IPTV item must be an object")?;
     if object.keys().any(|key| !fields.contains(&key.as_str())) {
         return Err("unsupported IPTV item field".into());
@@ -348,7 +348,10 @@ fn validate_patch(patch: &Value, name: &str, fields: &[&str]) -> Result<(), Stri
     Ok(())
 }
 
-fn index(document: IptvDocument, revision: u64) -> Result<IptvSnapshot, String> {
+pub(crate) fn index_document(
+    document: IptvDocument,
+    revision: u64,
+) -> Result<IptvSnapshot, String> {
     if document.version != 1 {
         return Err("unsupported IPTV data version".into());
     }
@@ -447,7 +450,7 @@ fn parse_expiry(value: &str) -> Result<SystemTime, String> {
         .ok_or_else(|| "invalid IPTV subscriber expiry".into())
 }
 
-fn read_document(path: &Path) -> Result<Option<IptvDocument>, String> {
+pub(crate) fn read_document(path: &Path) -> Result<Option<IptvDocument>, String> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -486,7 +489,7 @@ fn read_document(path: &Path) -> Result<Option<IptvDocument>, String> {
     Ok(Some(document))
 }
 
-fn save_document(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn save_document(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

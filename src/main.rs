@@ -1,5 +1,6 @@
 use clap::Parser;
 use flussonix::iptv::ha::connection::HaOptions;
+use flussonix::iptv::ha::{connection::HaPool, schema};
 use flussonix::server::{App, Options};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
@@ -97,6 +98,20 @@ struct Args {
         requires = "iptv_lease_authority"
     )]
     iptv_ha_db_config: Option<PathBuf>,
+    /// Initialize an empty IPTV HA database once, without starting listeners.
+    #[arg(
+        long,
+        requires = "iptv_ha_db_config",
+        conflicts_with = "iptv_ha_init_from"
+    )]
+    iptv_ha_init_empty: bool,
+    /// Initialize an empty IPTV HA database from an owner-only IPTV export.
+    #[arg(
+        long,
+        requires = "iptv_ha_db_config",
+        conflicts_with = "iptv_ha_init_empty"
+    )]
+    iptv_ha_init_from: Option<PathBuf>,
     /// Permit peer lease RPC over plaintext from the actual loopback socket only.
     #[arg(
         long,
@@ -228,6 +243,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let a = Args::parse();
+    if a.iptv_ha_init_empty || a.iptv_ha_init_from.is_some() {
+        let options = HaOptions::load(
+            a.iptv_ha_db_config
+                .as_deref()
+                .expect("clap requires HA database config"),
+        )?;
+        let pool = HaPool::new(&options)?;
+        if a.iptv_ha_init_from
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err("IPTV HA import file must have an absolute path".into());
+        }
+        schema::initialize(&pool, a.iptv_ha_init_from.as_deref()).await?;
+        println!("IPTV HA schema initialized");
+        return Ok(());
+    }
     if a.allow_insecure_remote_management {
         eprintln!(
             "WARNING: insecure remote HTTP management is enabled; credentials may be exposed on the network"
@@ -536,6 +568,46 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ha_initialization_is_explicit_and_single_purpose() {
+        let base = [
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+            "--iptv-lease-authority",
+            "--iptv-ha-db-config",
+            "/tmp/owned-ha.json",
+        ];
+        assert!(Args::try_parse_from(base.into_iter().chain(["--iptv-ha-init-empty"])).is_ok());
+        assert!(
+            Args::try_parse_from(
+                base.into_iter()
+                    .chain(["--iptv-ha-init-from", "/tmp/private-import.json"])
+            )
+            .is_ok()
+        );
+        assert!(
+            Args::try_parse_from(base.into_iter().chain([
+                "--iptv-ha-init-empty",
+                "--iptv-ha-init-from",
+                "/tmp/private-import.json"
+            ]))
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "flussonix",
+                "--admin-password",
+                "owned-admin",
+                "--peer-key",
+                "owned-peer-key-123",
+                "--iptv-ha-init-empty"
+            ])
+            .is_err()
+        );
+    }
     #[test]
     fn ha_database_configuration_requires_explicit_authority_mode() {
         assert!(
