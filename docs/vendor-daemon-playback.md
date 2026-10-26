@@ -6,6 +6,19 @@ profiles through HTTP or HTTPS. Supported delivery paths are `index.m3u8`,
 The independent M4S/M4F private input and existing FFmpeg packaging are reused;
 no official Flussonic runtime components are used.
 
+For a bounded live source check, run `scripts/qualify-live-vendor.py` from a
+source checkout with `--binary`, `--source`, `--stream` and
+`--cluster-key-file` pointing to an owner-only key file. It starts an isolated
+loopback CDN with on-demand activation, requests one HLS segment through the
+selected private source transport using a random local viewer token, probes and
+decodes the media, then removes
+its process group and files. It does not edit the source server. Local checks
+against the authorized cdn4 test stream passed for both M4SS and M4FS input,
+delivering decoded 1920×1080 H.264/AAC HLS. A deliberately invalid Cluster
+key produced no media, and local requests without the random viewer token
+returned 403. This is single-stream
+interoperability evidence, not a mixed-cluster failover or capacity result.
+
 Configure a source as described in [saved profiles](vendor-source-selection.md).
 Omitted source kind remains native FlussoniX. CLI startup owns the vendor runtime
 automatically. Embedders using `App` must own and join
