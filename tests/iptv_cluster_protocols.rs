@@ -78,7 +78,7 @@ fn srt_receiver(address: SocketAddr, token: &str, file: &std::path::Path) -> Chi
                 "srt://{address}?mode=caller&latency=120000&connect_timeout=1000&timeout=10000000"
             ),
             "-t",
-            "1",
+            "2",
             "-map",
             "0",
             "-c",
@@ -209,13 +209,26 @@ async fn clustered_iptv_srt_stream_id_enforces_the_authority_subscriber_token() 
     assert_eq!(edge.media.count().await, 0);
     let accepted_file = dir.path().join("accepted.ts");
     let mut accepted = srt_receiver(address, "private-viewer-token", &accepted_file);
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            if owner.iptv_leases.active_leases() == 1 {
+                break;
+            }
+            assert!(
+                accepted.try_wait().unwrap().is_none(),
+                "authorized SRT viewer exited before holding its subscriber slot"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("authorized SRT viewer never held its subscriber slot");
     let accepted_status = tokio::time::timeout(Duration::from_secs(15), accepted.wait())
         .await
         .expect("authorized SRT viewer did not finish")
         .unwrap();
     assert!(accepted_status.success());
     assert!(accepted_file.metadata().unwrap().len() > 0);
-    assert_eq!(owner.iptv_leases.active_leases(), 1);
     tokio::time::timeout(Duration::from_secs(5), async {
         while owner.iptv_leases.active_leases() != 0 {
             tokio::time::sleep(Duration::from_millis(50)).await;
