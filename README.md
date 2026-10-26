@@ -54,7 +54,7 @@ Open [the admin interface](http://127.0.0.1:18210/admin/) and sign in as `admin`
 
 In **Media → Streams**, add your input URL or use `testsrc://` for a test picture. Save the stream and open its player to check playback. Settings persist in the configuration file. Press **Ctrl+C** to stop the server and its workers.
 
-For subscriber playlists, set a public HTTP(S) origin at startup, then use **Config → IPTV** to create packages and subscribers. Their tokens live in a separate owner-only `iptv.json` beside `config.json`. Session limits count viewers on the local node; to count viewers across FlussoniX nodes, configure each viewer-serving node to use the same IPTV authority. Viewers on existing Flussonic nodes are not counted. See [IPTV transport support](docs/iptv-transport.md).
+For subscriber playlists, set a public HTTP(S) origin at startup, then use **Config → IPTV** to create packages and subscribers. Their tokens live in a separate owner-only `iptv.json` beside `config.json`. Session limits count viewers on the local node; to count viewers across FlussoniX nodes, configure each viewer-serving node to use the same IPTV authority. An optional [two-authority PostgreSQL profile](docs/iptv-ha.md) is under release qualification. Viewers on existing Flussonic nodes are not counted. See [IPTV transport support](docs/iptv-transport.md).
 
 ## Build from source
 

@@ -43,6 +43,8 @@ jobs:
         run: |
           mkdir -p .runtime
           FLUSSONIX_NATIVE_AUDIO_FIXTURE_FILE="$PWD/.runtime/owned-native-audio.m4s" FLUSSONIX_NATIVE_FIXTURE_FILE="$PWD/.runtime/owned-native.m4s" FLUSSONIX_DVB_FIXTURE_FILE="$PWD/.runtime/owned-dvb.ts" FLUSSONIX_TELETEXT_FIXTURE_FILE="$PWD/.runtime/owned-teletext.ts" FLUSSONIX_708_FIXTURE_FILE="$PWD/.runtime/owned-708.ts" FLUSSONIX_CAPTION_FIXTURE_FILE="$PWD/.runtime/owned-captions.ts" cargo test --locked -- --test-threads=1
+      - name: IPTV HA two-authority load smoke gate
+        run: FLUSSONIX_IPTV_HA_LOAD_SECONDS=5 cargo test --locked --test iptv_ha_load -- --ignored --exact two_authorities_sustain_competing_channels_without_extra_grants --nocapture
       - uses: actions/setup-node@v7
         with:
           node-version: 22

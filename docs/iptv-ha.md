@@ -1,11 +1,27 @@
 # IPTV authority high availability
 
-The HA authority profile is being implemented and is not ready to serve viewers in this build. The startup flag remains gated until catalog and lease routing use the shared database. Existing standalone and single-authority IPTV deployments continue to use their current storage and lease behavior.
+This optional profile lets two FlussoniX IPTV authorities share a PostgreSQL catalog and lease ledger. Viewer nodes can configure both HTTPS authorities; a retry keeps the same operation ID, so an uncertain response cannot create another session. Standalone `iptv.json` installations continue to work as before. Session limits cover FlussoniX viewers only.
 
-An HA deployment uses two FlussoniX authority processes backed by one PostgreSQL catalog and lease ledger. PostgreSQL must use verified TLS, synchronous replication, and a qualified failover controller that fences the old primary before promoting a standby. A writable-primary check by FlussoniX alone cannot prove fencing. Asynchronous promotion may lose a recently acknowledged lease and cannot be used for strict `max_sessions`.
+## Prepare the database
 
-Use a dedicated database and runtime account with only `CONNECT` on that database, `USAGE` on its IPTV schema, and the table and sequence privileges required for catalog and lease transactions. Do not give the runtime account `SUPERUSER`, `CREATEDB`, `CREATEROLE`, schema ownership, or migration privileges. Run schema initialization and upgrades with a separate owner account after a backup. Database passwords belong in an owner-only credential file, not command-line arguments, server config or routine logs. Restrict database backups and local catalog exports because they contain subscriber tokens.
+Use a dedicated PostgreSQL database with verified TLS. The credential JSON is an absolute, owner-only (0600) file containing `cluster_id`, `host`, `port`, `database`, `user`, `password`, and the absolute `ca_pem` path. Keep the database password out of command-line arguments, `config.json`, logs and backups that are not access-controlled.
 
-The first release will document the exact schema grants, initialization and fenced failover procedure after the database-backed tests pass. Existing Flussonic viewers remain outside FlussoniX subscriber session counts.
+Initialize the schema once with a database owner account:
 
-For test-owned databases, use `--iptv-lease-authority --iptv-ha-db-config /absolute/private/db.json --iptv-ha-init-empty` to create an empty schema once, or replace `--iptv-ha-init-empty` with `--iptv-ha-init-from /absolute/private/iptv.json` for one explicit import. The input file must be owner-only and valid; initialization refuses an existing schema. The database credential JSON contains `cluster_id`, `host`, `port`, `database`, `user`, `password`, and an absolute `ca_pem` path. These commands exit after initialization and do not start listeners. Do not use them against an existing deployment database without a verified backup.
+```bash
+flussonix --iptv-lease-authority --iptv-ha-db-config /absolute/private/owner-db.json --iptv-ha-init-empty
+```
+
+To import a validated standalone IPTV file into an empty schema, replace `--iptv-ha-init-empty` with `--iptv-ha-init-from /absolute/private/iptv.json`. Initialization exits without starting listeners and refuses an existing schema. Regular startup never imports the standalone file. Back up the database and the input file before migration. The owner-only catalog export is a recovery aid; PostgreSQL remains canonical.
+
+Use a separate runtime account. After initialization, grant it `CONNECT` on this database, `USAGE` on its schema, `SELECT` on `fx_iptv_meta`, `SELECT, UPDATE` on `fx_iptv_catalog` and `fx_iptv_capacity`, and `SELECT, INSERT, UPDATE, DELETE` on `fx_iptv_sessions` and `fx_iptv_operations`. Do not grant schema ownership, migration privileges, `SUPERUSER`, `CREATEDB` or `CREATEROLE`. The current schema has no sequences. Keep the owner account out of the running service.
+
+## Fenced failover
+
+PostgreSQL replication and primary fencing are external deployment requirements. Set a synchronous standby and `synchronous_commit=remote_apply` for the primary. Before admitting viewers, verify the named standby appears with `sync_state=sync` in `pg_stat_replication`; record the primary's flushed WAL position and confirm the standby replayed it. A writable-primary check by FlussoniX proves neither replication nor fencing.
+
+On primary failure, stop viewer admission. Fence the old primary through the deployment's independent power, VM or network control and verify it cannot accept writes. **Do not promote a standby without that evidence.** Verify its replay position includes the last acknowledged WAL, then promote it with PostgreSQL's `pg_ctl promote` or `pg_promote`. Point both authorities at the new primary, have the database owner advance `fx_iptv_meta.epoch` by one, verify their readiness and restore a synchronous standby before reopening admission. A former primary must be rebuilt as a standby, never restarted as another writable primary. Do not treat an asynchronous standby or an unfenced primary as a safe way to preserve strict `max_sessions`.
+
+Keep backups outside the database host with owner-only access because they contain subscriber tokens. Use `pg_dump` with a verified TLS connection and a private password file, then test `pg_restore` into a separate empty database. For an unsupported future schema or a failed upgrade, stop authorities and restore the pre-upgrade backup into a new database; change the credential target only after validation. Do not downgrade tables in place. An older in-memory IPTV authority must not be put in the HA authority pool.
+
+Run the owned local release gate with `scripts/qualify-iptv-ha.sh`. It uses disposable PostgreSQL instances, two real loopback authority processes and a separate sustained two-authority router load test. It checks synchronous replay followed by old-primary fencing and standby promotion, then reports acquire/renew latency, renewals, session counts, CPU, RSS, database connections and WAL growth. The gate never edits an existing deployment database. Its fixture proof is not a substitute for qualifying the production fencing controller and database topology.
