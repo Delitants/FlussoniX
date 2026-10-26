@@ -131,6 +131,10 @@ pub enum HaError {
     WrongCluster,
     StaleEpoch,
     StaleRevision,
+    Limit,
+    Full,
+    Missing,
+    Expired,
 }
 
 impl std::fmt::Display for HaError {
@@ -145,6 +149,10 @@ impl std::fmt::Display for HaError {
             Self::WrongCluster => "IPTV HA database cluster mismatch",
             Self::StaleEpoch => "IPTV HA database epoch moved backwards",
             Self::StaleRevision => "IPTV HA catalog revision moved backwards",
+            Self::Limit => "IPTV subscriber session limit reached",
+            Self::Full => "IPTV HA lease capacity reached",
+            Self::Missing => "IPTV HA lease is no longer active",
+            Self::Expired => "IPTV subscriber access expired",
         };
         f.write_str(message)
     }

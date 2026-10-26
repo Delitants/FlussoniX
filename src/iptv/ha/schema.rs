@@ -39,9 +39,11 @@ pub async fn initialize(pool: &HaPool, import: Option<&Path>) -> Result<(), HaEr
                 "CREATE TABLE fx_iptv_meta (singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton), cluster_id TEXT NOT NULL, schema_version INTEGER NOT NULL, epoch BIGINT NOT NULL CHECK (epoch > 0));
                  CREATE TABLE fx_iptv_catalog (singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton), revision BIGINT NOT NULL CHECK (revision >= 0), document TEXT NOT NULL);
                  CREATE TABLE fx_iptv_capacity (singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton), active_sessions INTEGER NOT NULL DEFAULT 0 CHECK (active_sessions BETWEEN 0 AND 100000), operation_count INTEGER NOT NULL DEFAULT 0 CHECK (operation_count >= 0));
-                 CREATE TABLE fx_iptv_subscriber_guard (name TEXT PRIMARY KEY);
-                 CREATE TABLE fx_iptv_sessions (session_key TEXT PRIMARY KEY, subscriber TEXT NOT NULL, grant_id UUID NOT NULL, state TEXT NOT NULL, units INTEGER NOT NULL, expires_at TIMESTAMPTZ NOT NULL);
-                 CREATE TABLE fx_iptv_operations (operation_id UUID PRIMARY KEY, response TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL);",
+                 CREATE TABLE fx_iptv_sessions (session_key TEXT PRIMARY KEY, subscriber TEXT NOT NULL, grant_id UUID NOT NULL, state TEXT NOT NULL CHECK (state IN ('pending','committed')), units INTEGER NOT NULL CHECK (units BETWEEN 1 AND 1024), revision BIGINT NOT NULL, operation_id UUID NOT NULL, expires_at TIMESTAMPTZ NOT NULL, prior_grant_id UUID, prior_units INTEGER, prior_revision BIGINT, prior_expires_at TIMESTAMPTZ);
+                 CREATE INDEX fx_iptv_sessions_subscriber ON fx_iptv_sessions(subscriber);
+                 CREATE INDEX fx_iptv_sessions_expiry ON fx_iptv_sessions(expires_at);
+                 CREATE TABLE fx_iptv_operations (operation_id UUID PRIMARY KEY, kind TEXT NOT NULL, session_key TEXT NOT NULL, subscriber TEXT NOT NULL, grant_id UUID, units INTEGER, revision BIGINT, grant_expires_at TIMESTAMPTZ, status TEXT NOT NULL CHECK (status IN ('active','terminal')), result BOOLEAN NOT NULL, expires_at TIMESTAMPTZ NOT NULL);
+                 CREATE INDEX fx_iptv_operations_expiry ON fx_iptv_operations(expires_at);",
             )
             .await
             .map_err(|_| HaError::Unavailable)?;
