@@ -147,6 +147,17 @@ pub struct IptvStore {
 type ChangeHook = Box<dyn Fn(u64) + Send + Sync>;
 
 impl IptvStore {
+    pub(crate) fn inert(path: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            path,
+            writer: Mutex::new(()),
+            active: RwLock::new(Arc::new(
+                index_document(IptvDocument::default(), 0).expect("default IPTV document is valid"),
+            )),
+            on_change: Mutex::new(None),
+        })
+    }
+
     pub fn open(path: PathBuf) -> Result<Arc<Self>, String> {
         let document = read_document(&path)?.unwrap_or_default();
         let snapshot = Arc::new(index_document(document, 0)?);

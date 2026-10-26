@@ -338,7 +338,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = App::new(a.config, a.media_dir, options)?;
     if let Some(pool) = &app.iptv_ha_pool {
         pool.verify_startup().await?;
-        return Err("IPTV HA lease routing is not enabled in this build".into());
+        let authority = app.iptv_ha.as_ref().expect("HA authority constructed");
+        authority.catalog.load_current().await?;
+        authority.ledger.ready().await?;
     }
     if secondary_authority_configured {
         return Err("IPTV two-origin retry is not enabled in this build".into());

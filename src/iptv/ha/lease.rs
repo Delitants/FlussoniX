@@ -22,6 +22,21 @@ impl HaLedger {
         Self { pool }
     }
 
+    pub async fn ready(&self) -> Result<bool, HaError> {
+        let connection = self.pool.acquire().await?;
+        let row = tokio::time::timeout(
+            DATABASE_TIMEOUT,
+            connection.query_one(
+                "SELECT active_sessions,operation_count FROM fx_iptv_capacity WHERE singleton=TRUE",
+                &[],
+            ),
+        )
+        .await
+        .map_err(|_| HaError::Unavailable)?
+        .map_err(|_| HaError::Unavailable)?;
+        Ok(row.get::<_, i32>(0) < MAX_SESSIONS && row.get::<_, i32>(1) < MAX_OPERATIONS)
+    }
+
     pub async fn acquire(
         &self,
         req: &LeaseRequest,

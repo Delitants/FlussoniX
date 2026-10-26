@@ -1,7 +1,14 @@
 use super::*;
+use crate::iptv::{
+    ha::{HaAuthority, catalog::CatalogEdit, connection::HaError},
+    store::IptvSnapshot,
+};
 use serde::Serialize;
 
 pub(super) async fn dispatch(app: Arc<App>, request: Request, tail: &str, role: Role) -> Response {
+    if app.iptv_ha.is_some() {
+        return dispatch_ha(app, request, tail, role).await;
+    }
     let method = request.method().clone();
     let query = parse_query(request.uri().query());
     let suffix = tail.strip_prefix("iptv").unwrap_or("");
@@ -148,7 +155,15 @@ async fn mutate<T: Send + 'static>(
 }
 
 fn collection(app: Arc<App>, kind: &str, role: Role, query: &HashMap<String, String>) -> Response {
-    let snapshot = app.iptv.snapshot();
+    collection_for_snapshot(app.iptv.snapshot(), kind, role, query)
+}
+
+fn collection_for_snapshot(
+    snapshot: Arc<IptvSnapshot>,
+    kind: &str,
+    role: Role,
+    query: &HashMap<String, String>,
+) -> Response {
     if kind == "packages" {
         collection_rows(
             snapshot.document().packages.iter().collect(),
@@ -174,6 +189,233 @@ fn collection(app: Arc<App>, kind: &str, role: Role, query: &HashMap<String, Str
             query,
         )
     }
+}
+
+async fn dispatch_ha(app: Arc<App>, request: Request, tail: &str, role: Role) -> Response {
+    let ha = app.iptv_ha.as_ref().expect("HA selected");
+    let snapshot = match ha.catalog.load_current().await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return ha_error(HaError::Unavailable),
+    };
+    let revision = snapshot.revision();
+    let method = request.method().clone();
+    let suffix = tail.strip_prefix("iptv").unwrap_or("");
+    let query = parse_query(request.uri().query());
+    if method != axum::http::Method::GET {
+        let expected = match request.headers().get(axum::http::header::IF_MATCH) {
+            None => {
+                return ha_response(
+                    error(
+                        StatusCode::PRECONDITION_REQUIRED,
+                        "IPTV catalog revision required",
+                    ),
+                    revision,
+                );
+            }
+            Some(value) if value.to_str().ok() == Some(format!("\"{revision}\"").as_str()) => {
+                revision
+            }
+            Some(_) => {
+                return ha_response(
+                    error(
+                        StatusCode::PRECONDITION_FAILED,
+                        "IPTV catalog revision changed",
+                    ),
+                    revision,
+                );
+            }
+        };
+        if suffix.is_empty() {
+            return match method {
+                axum::http::Method::PUT => {
+                    let body = match read_json(request).await {
+                        Ok(body) => body,
+                        Err((status, message)) => {
+                            return ha_response(error(status, &message), revision);
+                        }
+                    };
+                    if body.as_object().is_none_or(|fields| !fields.is_empty()) {
+                        return ha_response(
+                            error(StatusCode::BAD_REQUEST, "unsupported IPTV root setting"),
+                            revision,
+                        );
+                    }
+                    match ha.catalog.edit(expected, CatalogEdit::Enable(true)).await {
+                        Ok(result) => ha_response(
+                            json_response(json!({"revision":result.revision})),
+                            result.revision,
+                        ),
+                        Err(error) => ha_edit_error(ha, error).await,
+                    }
+                }
+                axum::http::Method::DELETE => {
+                    match ha.catalog.edit(expected, CatalogEdit::Enable(false)).await {
+                        Ok(result) => {
+                            ha_response(StatusCode::NO_CONTENT.into_response(), result.revision)
+                        }
+                        Err(error) => ha_edit_error(ha, error).await,
+                    }
+                }
+                _ => ha_response(
+                    error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+                    revision,
+                ),
+            };
+        }
+        let Some(path) = suffix.strip_prefix('/') else {
+            return ha_response(
+                error(StatusCode::NOT_FOUND, "unknown IPTV operation"),
+                revision,
+            );
+        };
+        let Some((kind, name)) = path.split_once('/') else {
+            return ha_response(
+                error(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "IPTV collection is read only",
+                ),
+                revision,
+            );
+        };
+        if !matches!(kind, "packages" | "subscribers") || valid_name(name).is_err() {
+            return ha_response(
+                error(StatusCode::BAD_REQUEST, "invalid IPTV item name"),
+                revision,
+            );
+        }
+        let edit = match method {
+            axum::http::Method::PUT => {
+                let body = match read_json(request).await {
+                    Ok(body) => body,
+                    Err((status, message)) => {
+                        return ha_response(error(status, &message), revision);
+                    }
+                };
+                if kind == "packages" {
+                    CatalogEdit::PutPackage(name.into(), body)
+                } else {
+                    CatalogEdit::PutSubscriber(name.into(), body)
+                }
+            }
+            axum::http::Method::DELETE => {
+                if kind == "packages" {
+                    CatalogEdit::DeletePackage(name.into())
+                } else {
+                    CatalogEdit::DeleteSubscriber(name.into())
+                }
+            }
+            _ => {
+                return ha_response(
+                    error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+                    revision,
+                );
+            }
+        };
+        return match ha.catalog.edit(expected, edit).await {
+            Ok(result) => {
+                let response = match method {
+                    axum::http::Method::DELETE => StatusCode::NO_CONTENT.into_response(),
+                    _ => json_response(result.item.unwrap_or(Value::Null)),
+                };
+                ha_response(response, result.revision)
+            }
+            Err(error) => ha_edit_error(ha, error).await,
+        };
+    }
+    if suffix.is_empty() {
+        if snapshot.enabled() {
+            return ha_response(management_read_response(role, json!({})), revision);
+        }
+        return ha_response(error(StatusCode::NOT_FOUND, "IPTV is disabled"), revision);
+    }
+    if !snapshot.enabled() {
+        return ha_response(error(StatusCode::NOT_FOUND, "IPTV is disabled"), revision);
+    }
+    let Some(path) = suffix.strip_prefix('/') else {
+        return ha_response(
+            error(StatusCode::NOT_FOUND, "unknown IPTV operation"),
+            revision,
+        );
+    };
+    let (kind, name) = path
+        .split_once('/')
+        .map_or((path, None), |(kind, name)| (kind, Some(name)));
+    if !matches!(kind, "packages" | "subscribers") {
+        return ha_response(
+            error(StatusCode::NOT_FOUND, "unknown IPTV collection"),
+            revision,
+        );
+    }
+    match name {
+        None => ha_response(
+            collection_for_snapshot(snapshot, kind, role, &query),
+            revision,
+        ),
+        Some(name) => {
+            if valid_name(name).is_err() {
+                return ha_response(
+                    error(StatusCode::BAD_REQUEST, "invalid IPTV item name"),
+                    revision,
+                );
+            }
+            let item = if kind == "packages" {
+                snapshot
+                    .document()
+                    .packages
+                    .iter()
+                    .find(|row| row.name == name)
+                    .and_then(|row| serde_json::to_value(row).ok())
+            } else {
+                snapshot
+                    .document()
+                    .subscribers
+                    .iter()
+                    .find(|row| row.name == name)
+                    .and_then(|row| serde_json::to_value(row).ok())
+            };
+            ha_response(
+                match item {
+                    Some(row) => management_read_response(role, row),
+                    None => error(StatusCode::NOT_FOUND, "IPTV item not found"),
+                },
+                revision,
+            )
+        }
+    }
+}
+
+fn ha_response(mut response: Response, revision: u64) -> Response {
+    response
+        .headers_mut()
+        .insert("etag", format!("\"{revision}\"").parse().unwrap());
+    response
+        .headers_mut()
+        .insert("cache-control", "no-store".parse().unwrap());
+    with_revision(response, revision)
+}
+
+fn ha_error(kind: HaError) -> Response {
+    let status = match kind {
+        HaError::Invalid | HaError::InvalidConfig => StatusCode::BAD_REQUEST,
+        HaError::NotFound => StatusCode::NOT_FOUND,
+        HaError::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    let mut response = error(status, &kind.to_string());
+    response
+        .headers_mut()
+        .insert("cache-control", "no-store".parse().unwrap());
+    response
+}
+
+async fn ha_edit_error(ha: &HaAuthority, kind: HaError) -> Response {
+    if kind == HaError::PreconditionFailed {
+        return match ha.catalog.load_current().await {
+            Ok(snapshot) => ha_response(ha_error(kind), snapshot.revision()),
+            Err(error) => ha_error(error),
+        };
+    }
+    ha_error(kind)
 }
 
 fn collection_rows<T: Serialize>(

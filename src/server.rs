@@ -4,7 +4,10 @@ use crate::{
     config::{ConfigStore, KINDS, nested_validation_path, parse_text, valid_name},
     iptv::{
         client::AuthorityClient,
-        ha::connection::{HaOptions, HaPool},
+        ha::{
+            HaAuthority,
+            connection::{HaOptions, HaPool},
+        },
         lease::Ledger,
         store::IptvStore,
     },
@@ -131,6 +134,7 @@ pub struct App {
     pub iptv: Arc<IptvStore>,
     pub iptv_leases: Arc<Ledger>,
     pub iptv_ha_pool: Option<Arc<HaPool>>,
+    pub iptv_ha: Option<Arc<HaAuthority>>,
     pub iptv_authority_client: Option<Arc<AuthorityClient>>,
     node_name: String,
     modern_sources:
@@ -303,7 +307,11 @@ impl App {
                 .unwrap_or_else(|| Path::new("."))
                 .join("iptv.json")
         });
-        let iptv = IptvStore::open(iptv_path)?;
+        let iptv = if options.iptv_ha.is_some() {
+            IptvStore::inert(iptv_path.clone())
+        } else {
+            IptvStore::open(iptv_path.clone())?
+        };
         let iptv_ha_pool = options
             .iptv_ha
             .as_ref()
@@ -311,9 +319,9 @@ impl App {
             .transpose()
             .map_err(|error| error.to_string())?
             .map(Arc::new);
-        if iptv_ha_pool.is_some() {
-            return Err("IPTV HA catalog and lease routing is not enabled in this build".into());
-        }
+        let iptv_ha = iptv_ha_pool
+            .as_ref()
+            .map(|pool| Arc::new(HaAuthority::new(pool.clone(), iptv_path)));
         let iptv_authority_client = options
             .iptv_authority
             .as_ref()
@@ -370,6 +378,7 @@ impl App {
             iptv: iptv.clone(),
             iptv_leases: iptv_leases.clone(),
             iptv_ha_pool,
+            iptv_ha,
             iptv_authority_client,
             node_name: options.node_name.clone(),
             modern_sources,
@@ -984,7 +993,7 @@ async fn iptv_playlist_http(
             "IPTV catalog is managed by the authority",
         );
     }
-    iptv_playlist::get(app, request, &subscriber)
+    iptv_playlist::get(app, request, &subscriber).await
 }
 async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     let role = app

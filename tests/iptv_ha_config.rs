@@ -181,7 +181,7 @@ async fn ha_database_tls_accepts_matching_host_before_rejecting_incomplete_serve
 }
 
 #[test]
-fn incomplete_ha_authority_cannot_serve_the_standalone_lease_ledger() {
+fn ha_authority_does_not_load_or_serve_the_standalone_catalog() {
     let certs = tls_fixture::Certificates::new();
     let path = write_config(
         certs.dir.path(),
@@ -190,23 +190,25 @@ fn incomplete_ha_authority_cannot_serve_the_standalone_lease_ledger() {
         CLUSTER_ID,
         &certs.ca,
     );
+    let legacy = certs.dir.path().join("legacy-iptv.json");
+    fs::write(&legacy, "invalid legacy data").unwrap();
     let options = Options {
         admin_password: "owned-admin-password".into(),
         peer_key: "owned-peer-key-123".into(),
         role: "lb".into(),
         iptv_lease_authority: true,
         iptv_ha: Some(HaOptions::load(&path).unwrap()),
+        iptv_data: Some(legacy),
         ..Options::default()
     };
-    let result = App::new(
+    let app = App::new(
         certs.dir.path().join("config.json"),
         certs.dir.path().join("media"),
         options,
-    );
-    assert!(
-        result.is_err(),
-        "HA mode must not fall back to an in-memory lease ledger"
-    );
+    )
+    .unwrap();
+    assert!(app.iptv_ha.is_some());
+    assert!(!app.iptv.snapshot().enabled());
 }
 
 #[tokio::test]

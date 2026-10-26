@@ -1,8 +1,9 @@
 //! Private FlussoniX-to-FlussoniX subscriber lease authority.
 use super::*;
 use crate::iptv::{
+    ha::connection::HaError,
     lease::{Error as LeaseError, LeaseGrant, LeaseRequest, SessionKey, SubscriberId},
-    store::IptvGrantFacts,
+    store::{IptvGrantFacts, IptvSnapshot},
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use std::{
@@ -142,6 +143,15 @@ fn viewer_request(
     body: &AcquireBody,
     wall: SystemTime,
 ) -> PeerResult<(IptvGrantFacts, LeaseRequest)> {
+    let snapshot = app.iptv.snapshot();
+    viewer_request_from_snapshot(&snapshot, body, wall)
+}
+
+fn viewer_request_from_snapshot(
+    snapshot: &IptvSnapshot,
+    body: &AcquireBody,
+    wall: SystemTime,
+) -> PeerResult<(IptvGrantFacts, LeaseRequest)> {
     if body.token.is_empty() || body.token.len() > 4096 || valid_name(&body.channel).is_err() {
         return Err((StatusCode::BAD_REQUEST, "invalid IPTV lease request"));
     }
@@ -152,7 +162,6 @@ fn viewer_request(
     ) else {
         return Err((StatusCode::BAD_REQUEST, "invalid IPTV lease request"));
     };
-    let snapshot = app.iptv.snapshot();
     let Some(facts) = snapshot.authorize(&body.token, &body.channel, wall) else {
         return Err((StatusCode::FORBIDDEN, "IPTV subscriber access denied"));
     };
@@ -169,6 +178,29 @@ fn viewer_request(
             subscriber_expires_at: facts.expires_at,
         },
     ))
+}
+
+fn ha_lease_error(kind: HaError) -> Response {
+    let mut response = match kind {
+        HaError::Limit => error(StatusCode::CONFLICT, "IPTV session limit reached"),
+        HaError::Expired => error(StatusCode::FORBIDDEN, "IPTV subscriber access denied"),
+        HaError::Invalid => error(StatusCode::BAD_REQUEST, "invalid IPTV lease request"),
+        _ => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "IPTV authority unavailable",
+        ),
+    };
+    response
+        .headers_mut()
+        .insert("cache-control", "no-store".parse().unwrap());
+    response
+}
+
+fn ha_no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert("cache-control", "no-store".parse().unwrap());
+    response
 }
 
 fn lease_error(error_kind: LeaseError) -> Response {
@@ -216,10 +248,46 @@ fn grant_response(
 }
 
 pub(super) async fn status(State(app): State<Arc<App>>, request: Request) -> Response {
+    if app.iptv_ha.is_some() {
+        return ha_no_store(
+            tokio::time::timeout(READ_TIMEOUT, status_inner(app, request))
+                .await
+                .unwrap_or_else(|_| ha_lease_error(HaError::Unavailable)),
+        );
+    }
+    status_inner(app, request).await
+}
+
+async fn status_inner(app: Arc<App>, request: Request) -> Response {
     let (_, _slot): (StatusBody, _) = match peer_body(&app, request).await {
         Ok(body) => body,
-        Err((status, message)) => return error(status, message),
+        Err((status, message)) => {
+            let response = error(status, message);
+            return if app.iptv_ha.is_some() {
+                ha_no_store(response)
+            } else {
+                response
+            };
+        }
     };
+    if let Some(ha) = &app.iptv_ha {
+        let ready = ha.pool.verify_startup().await.is_ok()
+            && ha
+                .catalog
+                .load_current()
+                .await
+                .is_ok_and(|snapshot| snapshot.enabled())
+            && ha.ledger.ready().await.unwrap_or(false);
+        let mut response = json_response(json!({"ready": ready}));
+        response
+            .headers_mut()
+            .insert("cache-control", "no-store".parse().unwrap());
+        response.headers_mut().insert(
+            "x-flussonix-iptv-cluster-id",
+            ha.pool.cluster_id().to_string().parse().unwrap(),
+        );
+        return response;
+    }
     let ready =
         app.iptv.snapshot().enabled() && app.iptv_leases.ready_for_new_leases(Instant::now());
     let mut response = json_response(json!({"ready": ready}));
@@ -230,12 +298,47 @@ pub(super) async fn status(State(app): State<Arc<App>>, request: Request) -> Res
 }
 
 pub(super) async fn acquire(State(app): State<Arc<App>>, request: Request) -> Response {
+    if app.iptv_ha.is_some() {
+        return ha_no_store(
+            tokio::time::timeout(READ_TIMEOUT, acquire_inner(app, request))
+                .await
+                .unwrap_or_else(|_| ha_lease_error(HaError::Unavailable)),
+        );
+    }
+    acquire_inner(app, request).await
+}
+
+async fn acquire_inner(app: Arc<App>, request: Request) -> Response {
     let (body, _slot): (AcquireBody, _) = match peer_body(&app, request).await {
         Ok(body) => body,
         Err((status, message)) => return error(status, message),
     };
     if body.lease_id.is_some() {
         return error(StatusCode::BAD_REQUEST, "invalid IPTV lease request");
+    }
+    if let Some(ha) = &app.iptv_ha {
+        for attempt in 0..2 {
+            let snapshot = match ha.catalog.load_current().await {
+                Ok(snapshot) => snapshot,
+                Err(error) => return ha_lease_error(error),
+            };
+            let (facts, req) =
+                match viewer_request_from_snapshot(&snapshot, &body, SystemTime::now()) {
+                    Ok(request) => request,
+                    Err((status, message)) => return error(status, message),
+                };
+            let grant = match ha.ledger.acquire(&req, None).await {
+                Ok(grant) => grant,
+                Err(HaError::StaleRevision) if attempt == 0 => continue,
+                Err(error) => return ha_lease_error(error),
+            };
+            let response = grant_response(grant, req.subscriber, facts.expires_at);
+            if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+                let _ = ha.ledger.rollback(&req, grant.id).await;
+            }
+            return response;
+        }
+        return ha_lease_error(HaError::StaleRevision);
     }
     let wall = SystemTime::now();
     let (facts, req) = match viewer_request(&app, &body, wall) {
@@ -259,10 +362,24 @@ pub(super) async fn acquire(State(app): State<Arc<App>>, request: Request) -> Re
 }
 
 pub(super) async fn commit(State(app): State<Arc<App>>, request: Request) -> Response {
+    if app.iptv_ha.is_some() {
+        return ha_no_store(
+            tokio::time::timeout(READ_TIMEOUT, grant_action(app, request, true))
+                .await
+                .unwrap_or_else(|_| ha_lease_error(HaError::Unavailable)),
+        );
+    }
     grant_action(app, request, true).await
 }
 
 pub(super) async fn renew(State(app): State<Arc<App>>, request: Request) -> Response {
+    if app.iptv_ha.is_some() {
+        return ha_no_store(
+            tokio::time::timeout(READ_TIMEOUT, grant_action(app, request, false))
+                .await
+                .unwrap_or_else(|_| ha_lease_error(HaError::Unavailable)),
+        );
+    }
     grant_action(app, request, false).await
 }
 
@@ -278,6 +395,30 @@ async fn grant_action(app: Arc<App>, request: Request, commit: bool) -> Response
     else {
         return error(StatusCode::BAD_REQUEST, "invalid IPTV lease request");
     };
+    if let Some(ha) = &app.iptv_ha {
+        for attempt in 0..2 {
+            let snapshot = match ha.catalog.load_current().await {
+                Ok(snapshot) => snapshot,
+                Err(error) => return ha_lease_error(error),
+            };
+            let (facts, req) =
+                match viewer_request_from_snapshot(&snapshot, &body, SystemTime::now()) {
+                    Ok(request) => request,
+                    Err((status, message)) => return error(status, message),
+                };
+            let result = if commit {
+                ha.ledger.commit(&req, Some(id)).await
+            } else {
+                ha.ledger.renew(&req, Some(id)).await
+            };
+            match result {
+                Ok(grant) => return grant_response(grant, req.subscriber, facts.expires_at),
+                Err(HaError::StaleRevision) if attempt == 0 => continue,
+                Err(error) => return ha_lease_error(error),
+            }
+        }
+        return ha_lease_error(HaError::StaleRevision);
+    }
     let wall = SystemTime::now();
     let (facts, req) = match viewer_request(&app, &body, wall) {
         Ok(request) => request,
@@ -299,10 +440,24 @@ async fn grant_action(app: Arc<App>, request: Request, commit: bool) -> Response
 }
 
 pub(super) async fn release(State(app): State<Arc<App>>, request: Request) -> Response {
+    if app.iptv_ha.is_some() {
+        return ha_no_store(
+            tokio::time::timeout(READ_TIMEOUT, finish_action(app, request, false))
+                .await
+                .unwrap_or_else(|_| ha_lease_error(HaError::Unavailable)),
+        );
+    }
     finish_action(app, request, false).await
 }
 
 pub(super) async fn rollback(State(app): State<Arc<App>>, request: Request) -> Response {
+    if app.iptv_ha.is_some() {
+        return ha_no_store(
+            tokio::time::timeout(READ_TIMEOUT, finish_action(app, request, true))
+                .await
+                .unwrap_or_else(|_| ha_lease_error(HaError::Unavailable)),
+        );
+    }
     finish_action(app, request, true).await
 }
 
@@ -321,6 +476,27 @@ async fn finish_action(app: Arc<App>, request: Request, rollback: bool) -> Respo
         return error(StatusCode::BAD_REQUEST, "invalid IPTV lease request");
     };
     let session = SessionKey { boot, local };
+    if let Some(ha) = &app.iptv_ha {
+        let result = if rollback {
+            let req = LeaseRequest {
+                subscriber,
+                session,
+                operation,
+                units: 1,
+                limit: None,
+                revision: 0,
+                subscriber_expires_at: None,
+            };
+            ha.ledger.rollback(&req, id).await
+        } else {
+            ha.ledger.release(subscriber, session, id, operation).await
+        };
+        return match result {
+            Ok(true) => StatusCode::NO_CONTENT.into_response(),
+            Ok(false) => error(StatusCode::NOT_FOUND, "IPTV lease not found"),
+            Err(error) => ha_lease_error(error),
+        };
+    }
     let success = if rollback {
         let req = LeaseRequest {
             subscriber,

@@ -1,8 +1,19 @@
 use super::*;
 use std::{collections::BTreeSet, time::SystemTime};
 
-pub(super) fn get(app: Arc<App>, request: Request, subscriber_name: &str) -> Response {
-    let snapshot = app.iptv.snapshot();
+pub(super) async fn get(app: Arc<App>, request: Request, subscriber_name: &str) -> Response {
+    let snapshot = match &app.iptv_ha {
+        Some(ha) => match ha.catalog.load_current().await {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                return no_store(error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "IPTV catalog unavailable",
+                ));
+            }
+        },
+        None => app.iptv.snapshot(),
+    };
     if !snapshot.enabled() {
         return no_store(error(StatusCode::FORBIDDEN, "IPTV is disabled"));
     }
