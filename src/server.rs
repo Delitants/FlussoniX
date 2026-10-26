@@ -2,7 +2,12 @@ use crate::{
     auth::{Credentials, Role},
     cluster::{NodeLoad, TieRotation},
     config::{ConfigStore, KINDS, nested_validation_path, parse_text, valid_name},
-    iptv::{client::AuthorityClient, lease::Ledger, store::IptvStore},
+    iptv::{
+        client::AuthorityClient,
+        ha::connection::{HaOptions, HaPool},
+        lease::Ledger,
+        store::IptvStore,
+    },
     media::{Engine, Worker},
     playback_auth::{
         AuthOutcome, Grant, PlaybackAuth, Policy, PolicySnapshot, RecoveryDemand, ViewerRequest,
@@ -48,8 +53,11 @@ pub struct Options {
     pub iptv_public_origin: Option<url::Url>,
     pub iptv_data: Option<PathBuf>,
     pub iptv_lease_authority: bool,
+    pub iptv_ha: Option<HaOptions>,
     pub iptv_peer_allow_insecure_loopback: bool,
     pub iptv_authority: Option<url::Url>,
+    pub iptv_authority_secondary: Option<url::Url>,
+    pub iptv_authority_cluster_id: Option<uuid::Uuid>,
     pub iptv_authority_ca: Option<PathBuf>,
     pub iptv_authority_allow_insecure_loopback: bool,
     pub drain: bool,
@@ -75,8 +83,11 @@ impl Default for Options {
             iptv_public_origin: None,
             iptv_data: None,
             iptv_lease_authority: false,
+            iptv_ha: None,
             iptv_peer_allow_insecure_loopback: false,
             iptv_authority: None,
+            iptv_authority_secondary: None,
+            iptv_authority_cluster_id: None,
             iptv_authority_ca: None,
             iptv_authority_allow_insecure_loopback: false,
             drain: false,
@@ -119,6 +130,7 @@ pub struct App {
     pub config: Arc<ConfigStore>,
     pub iptv: Arc<IptvStore>,
     pub iptv_leases: Arc<Ledger>,
+    pub iptv_ha_pool: Option<Arc<HaPool>>,
     pub iptv_authority_client: Option<Arc<AuthorityClient>>,
     node_name: String,
     modern_sources:
@@ -192,6 +204,29 @@ impl App {
         }
         if options.iptv_peer_allow_insecure_loopback && !options.iptv_lease_authority {
             return Err("IPTV loopback peer exception requires IPTV lease authority".into());
+        }
+        if options.iptv_ha.is_some() && !options.iptv_lease_authority {
+            return Err("IPTV HA database requires lease authority mode".into());
+        }
+        if options.iptv_authority_secondary.is_some() != options.iptv_authority_cluster_id.is_some()
+        {
+            return Err("second IPTV authority requires a cluster ID".into());
+        }
+        if let Some(secondary) = &options.iptv_authority_secondary {
+            if options.iptv_authority.as_ref() == Some(secondary)
+                || secondary.scheme() != "https"
+                || secondary.host().is_none()
+                || !secondary.username().is_empty()
+                || secondary.password().is_some()
+                || secondary.path() != "/"
+                || secondary.query().is_some()
+                || secondary.fragment().is_some()
+            {
+                return Err(
+                    "second IPTV authority requires a distinct credential-free HTTPS origin".into(),
+                );
+            }
+            return Err("IPTV two-origin retry is not enabled in this build".into());
         }
         if let Some(url) = &options.iptv_authority {
             let literal_loopback = matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback())
@@ -269,6 +304,16 @@ impl App {
                 .join("iptv.json")
         });
         let iptv = IptvStore::open(iptv_path)?;
+        let iptv_ha_pool = options
+            .iptv_ha
+            .as_ref()
+            .map(HaPool::new)
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .map(Arc::new);
+        if iptv_ha_pool.is_some() {
+            return Err("IPTV HA catalog and lease routing is not enabled in this build".into());
+        }
         let iptv_authority_client = options
             .iptv_authority
             .as_ref()
@@ -324,6 +369,7 @@ impl App {
             config,
             iptv: iptv.clone(),
             iptv_leases: iptv_leases.clone(),
+            iptv_ha_pool,
             iptv_authority_client,
             node_name: options.node_name.clone(),
             modern_sources,

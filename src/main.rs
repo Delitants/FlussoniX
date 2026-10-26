@@ -1,4 +1,5 @@
 use clap::Parser;
+use flussonix::iptv::ha::connection::HaOptions;
 use flussonix::server::{App, Options};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
@@ -89,6 +90,13 @@ struct Args {
     /// Enable this node as the one IPTV lease authority.
     #[arg(long, env = "FLUSSONIX_IPTV_LEASE_AUTHORITY")]
     iptv_lease_authority: bool,
+    /// Owner-only PostgreSQL settings for the opt-in IPTV HA authority.
+    #[arg(
+        long,
+        env = "FLUSSONIX_IPTV_HA_DB_CONFIG",
+        requires = "iptv_lease_authority"
+    )]
+    iptv_ha_db_config: Option<PathBuf>,
     /// Permit peer lease RPC over plaintext from the actual loopback socket only.
     #[arg(
         long,
@@ -99,6 +107,16 @@ struct Args {
     /// Single FlussoniX IPTV authority origin for this viewer-serving node.
     #[arg(long, env = "FLUSSONIX_IPTV_AUTHORITY")]
     iptv_authority: Option<url::Url>,
+    /// Second HTTPS IPTV authority in the same HA cluster.
+    #[arg(long, env = "FLUSSONIX_IPTV_AUTHORITY_SECONDARY", requires_all = ["iptv_authority", "iptv_authority_cluster_id"])]
+    iptv_authority_secondary: Option<url::Url>,
+    /// Stable cluster UUID shared by both IPTV authorities.
+    #[arg(
+        long,
+        env = "FLUSSONIX_IPTV_AUTHORITY_CLUSTER_ID",
+        requires = "iptv_authority_secondary"
+    )]
+    iptv_authority_cluster_id: Option<uuid::Uuid>,
     /// Private CA PEM used to verify the IPTV authority certificate.
     #[arg(long, env = "FLUSSONIX_IPTV_AUTHORITY_CA", requires = "iptv_authority")]
     iptv_authority_ca: Option<PathBuf>,
@@ -216,6 +234,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     a.validate_iptv_authority_transport()?;
+    let iptv_ha = a
+        .iptv_ha_db_config
+        .as_deref()
+        .map(HaOptions::load)
+        .transpose()?;
     let fxlink_features = a.fxlink_features()?;
     let udp_rate = a.rtsp_udp_mbps.unwrap_or(100.0);
     let https_config = match (&a.https_cert, &a.https_key) {
@@ -251,6 +274,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?),
         None => None,
     };
+    let secondary_authority_configured = a.iptv_authority_secondary.is_some();
     let options = Options {
         admin_user: a.admin_user,
         admin_password: a.admin_password,
@@ -269,14 +293,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         iptv_data: a.iptv_data,
         iptv_public_origin: a.iptv_public_origin,
         iptv_lease_authority: a.iptv_lease_authority,
+        iptv_ha,
         iptv_peer_allow_insecure_loopback: a.iptv_peer_allow_insecure_loopback,
         iptv_authority: a.iptv_authority,
+        iptv_authority_secondary: a.iptv_authority_secondary,
+        iptv_authority_cluster_id: a.iptv_authority_cluster_id,
         iptv_authority_ca: a.iptv_authority_ca,
         iptv_authority_allow_insecure_loopback: a.iptv_authority_allow_insecure_loopback,
         drain: a.drain,
         fxlink_features,
     };
     let app = App::new(a.config, a.media_dir, options)?;
+    if let Some(pool) = &app.iptv_ha_pool {
+        pool.verify_startup().await?;
+        return Err("IPTV HA lease routing is not enabled in this build".into());
+    }
+    if secondary_authority_configured {
+        return Err("IPTV two-origin retry is not enabled in this build".into());
+    }
     let listener = if a.https_only {
         None
     } else {
@@ -502,6 +536,64 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ha_database_configuration_requires_explicit_authority_mode() {
+        assert!(
+            Args::try_parse_from([
+                "flussonix",
+                "--admin-password",
+                "owned-admin",
+                "--peer-key",
+                "owned-peer-key-123",
+                "--iptv-ha-db-config",
+                "/tmp/owned-ha.json"
+            ])
+            .is_err()
+        );
+        let parsed = Args::try_parse_from([
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+            "--iptv-lease-authority",
+            "--iptv-authority",
+            "https://authority.example/",
+            "--iptv-ha-db-config",
+            "/tmp/owned-ha.json",
+        ]);
+        assert!(parsed.is_ok(), "{}", parsed.err().unwrap());
+    }
+
+    #[test]
+    fn secondary_iptv_authority_requires_stable_cluster_identity() {
+        let base = [
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+            "--iptv-authority",
+            "https://a.example/",
+        ];
+        assert!(
+            Args::try_parse_from(
+                base.into_iter()
+                    .chain(["--iptv-authority-secondary", "https://b.example/"])
+            )
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from(base.into_iter().chain([
+                "--iptv-authority-secondary",
+                "https://b.example/",
+                "--iptv-authority-cluster-id",
+                "a3192376-6df5-4b76-a15c-43942fd3d466"
+            ]))
+            .is_ok()
+        );
+    }
+
     #[test]
     fn iptv_authority_requires_tls_or_explicit_loopback_exception() {
         let base = [

@@ -58,6 +58,65 @@ fn authority_rejects_credentials_paths_queries_fragments_and_http_ca() {
     );
 }
 
+#[test]
+fn secondary_authority_rejects_ambiguous_or_insecure_origins() {
+    for secondary in [
+        "https://authority.example/",
+        "https://user:secret@other.example/",
+        "https://other.example/path",
+        "https://other.example/?token=secret",
+        "https://other.example/#fragment",
+        "http://other.example/",
+        "http://127.0.0.1:18443/",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let options = Options {
+            admin_password: "owned-admin-password".into(),
+            peer_key: "owned-peer-key-123".into(),
+            role: "cdn".into(),
+            iptv_authority: Some(url::Url::parse("https://authority.example/").unwrap()),
+            iptv_authority_secondary: Some(url::Url::parse(secondary).unwrap()),
+            iptv_authority_cluster_id: Some(
+                uuid::Uuid::parse_str("a3192376-6df5-4b76-a15c-43942fd3d466").unwrap(),
+            ),
+            ..Options::default()
+        };
+        assert!(
+            App::new(
+                dir.path().join("config.json"),
+                dir.path().join("media"),
+                options
+            )
+            .is_err(),
+            "{secondary}"
+        );
+    }
+}
+
+#[test]
+fn configured_secondary_cannot_be_silently_ignored_before_failover_is_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = Options {
+        admin_password: "owned-admin-password".into(),
+        peer_key: "owned-peer-key-123".into(),
+        role: "cdn".into(),
+        iptv_authority: Some(url::Url::parse("https://a.example/").unwrap()),
+        iptv_authority_secondary: Some(url::Url::parse("https://b.example/").unwrap()),
+        iptv_authority_cluster_id: Some(
+            uuid::Uuid::parse_str("a3192376-6df5-4b76-a15c-43942fd3d466").unwrap(),
+        ),
+        ..Options::default()
+    };
+    assert!(
+        App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            options
+        )
+        .is_err()
+    );
+}
+
 #[tokio::test]
 async fn authority_status_becomes_ready_after_restart_quarantine_and_reflects_iptv_disable() {
     let dir = tempfile::tempdir().unwrap();
