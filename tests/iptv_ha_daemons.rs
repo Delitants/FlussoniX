@@ -1,6 +1,7 @@
 //! Two test-owned operating-system authority processes sharing one HA ledger.
 #![cfg(target_os = "linux")]
 
+use flussonix::config::ConfigStore;
 use flussonix::iptv::ha::{
     catalog::{CatalogEdit, HaCatalog},
     connection::{HaOptions, HaPool},
@@ -36,6 +37,93 @@ const VIEWERS: usize = 16;
 struct OwnedAuthority {
     child: Child,
     base: String,
+}
+
+struct OwnedViewer {
+    child: Child,
+    base: String,
+}
+
+impl OwnedViewer {
+    async fn start_pre_ha(root: &Path, binary: &Path, authority: &str, ca: &Path) -> Self {
+        let config = root.join("pre-ha-viewer-config.json");
+        ConfigStore::open(&config)
+            .unwrap()
+            .put(
+                "streams",
+                "news",
+                json!({"inputs":[{"url":"testsrc://"}],"on_play":"iptv://"}),
+            )
+            .unwrap();
+        let log = root.join("pre-ha-viewer-stderr.log");
+        let log_file = fs::File::create(&log).unwrap();
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut command = Command::new(binary);
+        for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLUSSONIX_")) {
+            command.env_remove(key);
+        }
+        command
+            .args([
+                "--listen",
+                "127.0.0.1:0",
+                "--role",
+                "cdn",
+                "--node-name",
+                "pre-ha-viewer",
+            ])
+            .arg("--config")
+            .arg(config)
+            .arg("--iptv-data")
+            .arg(root.join("pre-ha-viewer-iptv.json"))
+            .arg("--media-dir")
+            .arg(root.join("pre-ha-viewer-media"))
+            .args(["--iptv-authority", authority])
+            .arg("--iptv-authority-ca")
+            .arg(ca)
+            .env("FLUSSONIX_ADMIN_PASSWORD", "owned-admin")
+            .env("FLUSSONIX_PEER_KEY", PEER)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(log_file))
+            .kill_on_drop(true);
+        command.as_std_mut().process_group(0);
+        let mut child = command.spawn().unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let line = tokio::time::timeout(Duration::from_secs(8), lines.next_line())
+            .await
+            .expect("pre-HA viewer startup timed out")
+            .unwrap()
+            .unwrap_or_else(|| {
+                panic!(
+                    "pre-HA viewer exited: {}",
+                    fs::read_to_string(&log).unwrap_or_default()
+                )
+            });
+        let ready: Value = serde_json::from_str(&line).unwrap();
+        Self {
+            child,
+            base: format!("http://{}", ready["listen"].as_str().unwrap()),
+        }
+    }
+
+    async fn stop(&mut self) {
+        let pgid = self.child.id().expect("owned viewer already exited") as i32;
+        // SAFETY: this process group was created for this test child only.
+        assert_eq!(unsafe { libc::kill(-pgid, libc::SIGKILL) }, 0);
+        tokio::time::timeout(Duration::from_secs(5), self.child.wait())
+            .await
+            .expect("owned viewer did not stop")
+            .unwrap();
+    }
+}
+
+impl Drop for OwnedViewer {
+    fn drop(&mut self) {
+        if let Some(pid) = self.child.id() {
+            // SAFETY: the process group belongs only to this disposable viewer.
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        }
+    }
 }
 
 impl OwnedAuthority {
@@ -270,6 +358,125 @@ async fn two_real_authorities_share_grants_and_survive_one_process_loss() {
         lease(&client, &second, "acquire", replacement).await.0,
         reqwest::StatusCode::OK
     );
+    second.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires FLUSSONIX_TEST_PRE_HA_BINARY built from a pinned pre-HA commit"]
+async fn pre_ha_viewer_binary_plays_through_ha_authority_without_extra_grant() {
+    let legacy_binary = std::env::var("FLUSSONIX_TEST_PRE_HA_BINARY")
+        .expect("set FLUSSONIX_TEST_PRE_HA_BINARY to the pinned pre-HA binary");
+    let help = std::process::Command::new(&legacy_binary)
+        .arg("--help")
+        .output()
+        .expect("pre-HA viewer binary must be executable");
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("--iptv-authority"));
+    assert!(
+        !help.contains("--iptv-ha-db-config"),
+        "the rolling-upgrade fixture must use a pre-HA viewer binary"
+    );
+    let certs = tls_fixture::Certificates::new();
+    let database = iptv_postgres::PgServer::start(&certs)
+        .expect("native PostgreSQL is required for the rolling-upgrade gate");
+    let config = certs.dir.path().join("pre-ha-db.json");
+    fs::write(
+        &config,
+        json!({
+            "cluster_id":CLUSTER,"host":"127.0.0.1","port":database.port(),
+            "database":"postgres","user":"ha_test","password":"owned-test-secret",
+            "ca_pem":certs.ca,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let pool = Arc::new(HaPool::new(&HaOptions::load(&config).unwrap()).unwrap());
+    schema::initialize(&pool, None).await.unwrap();
+    let catalog = HaCatalog::new(pool, certs.dir.path().join("pre-ha-export.json"));
+    catalog.edit(0, CatalogEdit::Enable(true)).await.unwrap();
+    catalog
+        .edit(
+            1,
+            CatalogEdit::PutPackage("basic".into(), json!({"channels":["news"]})),
+        )
+        .await
+        .unwrap();
+    catalog
+        .edit(
+            2,
+            CatalogEdit::PutSubscriber(
+                "alice".into(),
+                json!({"token":"owned-daemon-token","packages":["basic"],"max_sessions":1}),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let mut first =
+        OwnedAuthority::start_tls(certs.dir.path(), "pre-ha-first", &config, &certs).await;
+    let mut second =
+        OwnedAuthority::start_tls(certs.dir.path(), "pre-ha-second", &config, &certs).await;
+    let mut viewer = OwnedViewer::start_pre_ha(
+        certs.dir.path(),
+        Path::new(&legacy_binary),
+        &first.base,
+        &certs.ca,
+    )
+    .await;
+    let media_client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let playlist_url = format!("{}/news/index.m3u8?token=owned-daemon-token", viewer.base);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let response = media_client.get(&playlist_url).send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let playlist = response.text().await.unwrap();
+            if let Some(segment) = playlist
+                .lines()
+                .find(|line| !line.is_empty() && !line.starts_with('#'))
+            {
+                let segment_url = url::Url::parse(&playlist_url)
+                    .unwrap()
+                    .join(segment)
+                    .unwrap();
+                let media = media_client.get(segment_url).send().await.unwrap();
+                if media.status() == reqwest::StatusCode::OK
+                    && !media.bytes().await.unwrap().is_empty()
+                {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("pre-HA viewer did not deliver HLS media through HA admission");
+
+    let probe = reqwest::Client::builder()
+        .no_proxy()
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(&fs::read(&certs.ca).unwrap()).unwrap(),
+        )
+        .build()
+        .unwrap();
+    let competing = json!({
+        "token":"owned-daemon-token","channel":"news",
+        "boot":uuid::Uuid::new_v4().to_string(),
+        "session":uuid::Uuid::new_v4().to_string(),
+        "operation":uuid::Uuid::new_v4().to_string(),"units":1,
+    });
+    assert_eq!(
+        lease(&probe, &second, "acquire", competing.clone()).await.0,
+        reqwest::StatusCode::CONFLICT
+    );
+    viewer.stop().await;
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    assert_eq!(
+        lease(&probe, &second, "acquire", competing).await.0,
+        reqwest::StatusCode::OK
+    );
+    first.stop().await;
     second.stop().await;
 }
 

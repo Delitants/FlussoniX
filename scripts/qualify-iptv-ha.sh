@@ -42,9 +42,20 @@ if [[ -z "$pg_bindir" ]] || ! pg_fixture_ready "$pg_bindir" "$pg_sharedir"; then
 fi
 export FLUSSONIX_TEST_PG_BINDIR=$pg_bindir FLUSSONIX_TEST_PG_SHAREDIR=$pg_sharedir
 
+if [[ -n "${FLUSSONIX_TEST_PRE_HA_BINARY:-}" ]] &&
+   { [[ "$FLUSSONIX_TEST_PRE_HA_BINARY" != /* ]] || [[ ! -x "$FLUSSONIX_TEST_PRE_HA_BINARY" ]]; }; then
+  printf '%s\n' 'FLUSSONIX_TEST_PRE_HA_BINARY must be an executable absolute path.' >&2
+  exit 2
+fi
+
 cargo test --locked --test iptv_ha_db_failover -- --test-threads=1
 cargo test --locked --test iptv_ha_daemons -- --test-threads=1
 cargo test --locked --test iptv_ha_load \
   -- --ignored --exact two_authorities_sustain_competing_channels_without_extra_grants --nocapture
 cargo test --locked --test iptv_ha_daemons \
   -- --ignored --exact two_real_authority_processes_sustain_competing_channels --nocapture
+if [[ -n "${FLUSSONIX_TEST_PRE_HA_BINARY:-}" ]]; then
+  cargo test --locked --test iptv_ha_daemons \
+    pre_ha_viewer_binary_plays_through_ha_authority_without_extra_grant \
+    -- --ignored --exact --nocapture
+fi
