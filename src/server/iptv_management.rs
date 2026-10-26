@@ -192,14 +192,18 @@ fn collection_rows<T: Serialize>(
     }
     let count = rows.len();
     let sort = query.get("sort").map(String::as_str);
+    let sort_fields = match sort.map(crate::api_sort::bounded_fields).transpose() {
+        Ok(fields) => fields,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
     let mut items = Vec::with_capacity(count);
     for (index, row) in rows.iter().enumerate() {
-        let item = match sort {
+        let item = match sort_fields.as_deref() {
             None => json!(index),
-            Some(expression) => {
+            Some(parts) => {
                 let mut fields = serde_json::Map::new();
                 fields.insert("name".into(), json!(name(row)));
-                for part in expression.split(',') {
+                for part in parts {
                     let field = part.strip_prefix('-').unwrap_or(part);
                     if field != "name"
                         && let Some(value) = scalar(row, field, role)
@@ -339,5 +343,50 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK, "{sort}");
             assert_eq!(serialized.load(Ordering::Relaxed), 1, "{sort}");
         }
+    }
+
+    #[test]
+    fn excessive_sort_fields_are_rejected_before_visiting_catalog_rows() {
+        let serialized = AtomicUsize::new(0);
+        let rows = (0..64)
+            .map(|index| CountedRow {
+                name: format!("subscriber-{index:04}"),
+                serialized: &serialized,
+            })
+            .collect::<Vec<_>>();
+        let query = HashMap::from([
+            ("limit".to_owned(), "1".to_owned()),
+            ("sort".to_owned(), vec!["missing"; 17].join(",")),
+        ]);
+        let response = collection_rows(
+            rows.iter().collect(),
+            |row| row.name.as_str(),
+            |_, _, _| None,
+            "subscribers",
+            Role::View,
+            &query,
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(serialized.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn oversized_sort_expression_is_rejected_before_visiting_catalog_rows() {
+        let serialized = AtomicUsize::new(0);
+        let rows = [CountedRow {
+            name: "subscriber-one".to_owned(),
+            serialized: &serialized,
+        }];
+        let query = HashMap::from([("sort".to_owned(), "x".repeat(8193))]);
+        let response = collection_rows(
+            rows.iter().collect(),
+            |row| row.name.as_str(),
+            |_, _, _| None,
+            "subscribers",
+            Role::View,
+            &query,
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(serialized.load(Ordering::Relaxed), 0);
     }
 }

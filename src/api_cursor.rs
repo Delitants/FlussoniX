@@ -111,6 +111,9 @@ pub(crate) fn paginate(
     kind: &str,
     query: &HashMap<String, String>,
 ) -> Result<Page, &'static str> {
+    if let Some(expression) = query.get("sort") {
+        crate::api_sort::bounded_fields(expression)?;
+    }
     let default_stream_order = kind == "streams" && !query.contains_key("sort");
     let sort = Sort::new(
         query
@@ -404,4 +407,17 @@ fn component(value: &str) -> Result<String, &'static str> {
         .decode_utf8()
         .map(|v| v.into_owned())
         .map_err(|_| INVALID)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn collection_rejects_excessive_sort_fields() {
+        let query = HashMap::from([("sort".to_owned(), vec!["missing"; 17].join(","))]);
+        let rows = vec![json!({"name":"one"}), json!({"name":"two"})];
+        assert!(paginate(rows, "streams", &query).is_err());
+    }
 }

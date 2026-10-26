@@ -389,6 +389,13 @@ async fn unsupported_paths_and_empty_duplicate_fields_have_deterministic_fallbac
     names(
         &app,
         "streams",
+        &"x".repeat(257),
+        &["alpha", "beta", "delta", "gamma"],
+    )
+    .await;
+    names(
+        &app,
+        "streams",
         "unknown,-position,position",
         &["delta", "gamma", "alpha", "beta"],
     )
