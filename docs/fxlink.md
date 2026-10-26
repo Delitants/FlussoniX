@@ -5,7 +5,8 @@ media pulls on long-haul links. It uses forward error correction (FEC) and
 bounded repair to recover some packet loss within a chosen buffer. It is
 separate from Flussonic-compatible M4S/M4SS; those URLs and protocols are
 unchanged. FXLink is not a Flussonic protocol and has not completed sustained
-WAN, competing-stream fairness, or production capacity qualification.
+WAN or production capacity qualification. A local two-stream, constrained-link
+test covers one limited fairness case; it is not a WAN capacity guarantee.
 
 ## Start a source listener
 
@@ -85,3 +86,13 @@ Test the intended stream bitrate, RTT, loss pattern, competing streams, and
 viewer behavior on your own link before using FXLink for critical delivery.
 A healthy TLS connection or short FEC test does not establish sustained
 playback under congestion.
+
+The local shared-connection qualification sends two independent 125-record/s
+sources through a 100 ms RTT UDP proxy, with 4,500 media bytes per record and
+a 500 ms FXLink buffer. At 15.5 Mb/s, both delivered 400 records in each of
+ten repeats, without proxy drops or expired records; the largest sampled
+delivery gap was 17 records. A shorter 12.5 Mb/s overload burst delivered 200
+records per source in each of ten repeats; its largest gap was 42 records.
+The longer 125-record/s load exceeds 12.5 Mb/s after transport overhead and
+cannot be sustained at that rate. These loopback results do not qualify WAN
+loss, long-running congestion, or a production link's usable capacity.
