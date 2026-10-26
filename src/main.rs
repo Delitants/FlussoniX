@@ -306,7 +306,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?),
         None => None,
     };
-    let secondary_authority_configured = a.iptv_authority_secondary.is_some();
     let options = Options {
         admin_user: a.admin_user,
         admin_password: a.admin_password,
@@ -341,9 +340,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let authority = app.iptv_ha.as_ref().expect("HA authority constructed");
         authority.catalog.load_current().await?;
         authority.ledger.ready().await?;
-    }
-    if secondary_authority_configured {
-        return Err("IPTV two-origin retry is not enabled in this build".into());
     }
     let listener = if a.https_only {
         None

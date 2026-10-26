@@ -1,6 +1,6 @@
 //! Bounded, authenticated client for the private IPTV lease authority.
 use crate::iptv::lease::{SessionKey, SubscriberId};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     path::Path,
@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 const MAX_RESPONSE: usize = 8 * 1024;
 const MAX_TTL_MS: u64 = 10_000;
+const HA_TOTAL_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -59,14 +60,80 @@ struct WireStatus {
 }
 
 pub struct AuthorityClient {
-    origin: Url,
+    primary: OriginState,
+    secondary: Option<OriginState>,
+    expected_cluster: Option<Uuid>,
     key: String,
     http: reqwest::Client,
     in_flight: Semaphore,
     started: Instant,
+}
+
+struct OriginState {
+    url: Url,
     last_reachable_ms: AtomicU64,
     last_ready_ms: AtomicU64,
     last_probe_refused: AtomicBool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OriginHealth {
+    pub origin: String,
+    pub reachable: bool,
+    pub ready: bool,
+    pub refused: bool,
+}
+
+impl OriginState {
+    fn new(url: Url) -> Self {
+        Self {
+            url,
+            last_reachable_ms: AtomicU64::new(0),
+            last_ready_ms: AtomicU64::new(0),
+            last_probe_refused: AtomicBool::new(false),
+        }
+    }
+
+    fn recent(last: &AtomicU64, started: Instant, window_ms: u128) -> bool {
+        let value = last.load(Ordering::Relaxed);
+        value != 0
+            && started
+                .elapsed()
+                .as_millis()
+                .saturating_sub(u128::from(value))
+                <= window_ms
+    }
+
+    fn health(&self, started: Instant) -> OriginHealth {
+        OriginHealth {
+            origin: self.url.to_string(),
+            reachable: Self::recent(&self.last_reachable_ms, started, 15_000),
+            ready: Self::recent(&self.last_ready_ms, started, 12_000),
+            refused: self.last_probe_refused.load(Ordering::Relaxed),
+        }
+    }
+}
+
+enum AttemptError {
+    Transport,
+    InvalidResponse,
+}
+
+fn validate_origin(origin: &Url, allow_loopback: bool) -> Result<(), String> {
+    let literal_loopback = matches!(origin.host(), Some(Host::Ipv4(ip)) if ip.is_loopback())
+        || matches!(origin.host(), Some(Host::Ipv6(ip)) if ip.is_loopback());
+    if origin.host().is_none()
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+        || !(origin.scheme() == "https"
+            || (origin.scheme() == "http" && literal_loopback && allow_loopback))
+    {
+        return Err("IPTV authority requires a credential-free HTTPS origin or explicit literal loopback HTTP".into());
+    }
+    Ok(())
 }
 
 impl AuthorityClient {
@@ -76,24 +143,38 @@ impl AuthorityClient {
         ca: Option<&Path>,
         allow_loopback: bool,
     ) -> Result<Self, String> {
-        let literal_loopback = matches!(origin.host(), Some(Host::Ipv4(ip)) if ip.is_loopback())
-            || matches!(origin.host(), Some(Host::Ipv6(ip)) if ip.is_loopback());
-        if origin.host().is_none()
-            || !origin.username().is_empty()
-            || origin.password().is_some()
-            || origin.path() != "/"
-            || origin.query().is_some()
-            || origin.fragment().is_some()
-            || !(origin.scheme() == "https"
-                || (origin.scheme() == "http" && literal_loopback && allow_loopback))
-        {
-            return Err("IPTV authority requires a credential-free HTTPS origin or explicit literal loopback HTTP".into());
-        }
-        if key.len() < 12 {
-            return Err("IPTV peer key must have at least 12 characters".into());
-        }
+        validate_origin(&origin, allow_loopback)?;
         if ca.is_some() && origin.scheme() != "https" {
             return Err("IPTV authority CA requires HTTPS".into());
+        }
+        Self::build(origin, None, None, key, ca)
+    }
+
+    pub fn new_with_secondary(
+        primary: Url,
+        secondary: Url,
+        expected_cluster: Uuid,
+        key: String,
+        ca: Option<&Path>,
+        _allow_loopback: bool,
+    ) -> Result<Self, String> {
+        validate_origin(&primary, false)?;
+        validate_origin(&secondary, false)?;
+        if primary == secondary || expected_cluster.is_nil() {
+            return Err("IPTV HA requires two distinct origins and a nonempty cluster ID".into());
+        }
+        Self::build(primary, Some(secondary), Some(expected_cluster), key, ca)
+    }
+
+    fn build(
+        primary: Url,
+        secondary: Option<Url>,
+        expected_cluster: Option<Uuid>,
+        key: String,
+        ca: Option<&Path>,
+    ) -> Result<Self, String> {
+        if key.len() < 12 {
+            return Err("IPTV peer key must have at least 12 characters".into());
         }
         let mut builder = reqwest::Client::builder()
             .no_proxy()
@@ -107,46 +188,57 @@ impl AuthorityClient {
             .build()
             .map_err(|_| "cannot build IPTV authority client")?;
         Ok(Self {
-            origin,
+            primary: OriginState::new(primary),
+            secondary: secondary.map(OriginState::new),
+            expected_cluster,
             key,
             http,
             in_flight: Semaphore::new(32),
             started: Instant::now(),
-            last_reachable_ms: AtomicU64::new(0),
-            last_ready_ms: AtomicU64::new(0),
-            last_probe_refused: AtomicBool::new(false),
         })
     }
 
+    pub fn origin_health(&self) -> Vec<OriginHealth> {
+        let mut health = vec![self.primary.health(self.started)];
+        if let Some(secondary) = &self.secondary {
+            health.push(secondary.health(self.started));
+        }
+        health
+    }
+
     pub fn recently_reachable(&self) -> bool {
-        let last = self.last_reachable_ms.load(Ordering::Relaxed);
-        last != 0
-            && self
-                .started
-                .elapsed()
-                .as_millis()
-                .saturating_sub(u128::from(last))
-                <= 15_000
+        self.origin_health().iter().any(|origin| origin.reachable)
     }
 
     pub fn recently_ready(&self) -> bool {
-        let last = self.last_ready_ms.load(Ordering::Relaxed);
-        last != 0
-            && self
-                .started
-                .elapsed()
-                .as_millis()
-                .saturating_sub(u128::from(last))
-                <= 12_000
+        self.origin_health().iter().any(|origin| origin.ready)
     }
 
     pub fn last_probe_refused(&self) -> bool {
-        self.last_probe_refused.load(Ordering::Relaxed)
+        self.origin_health().iter().any(|origin| origin.refused)
     }
 
     pub async fn probe(&self) -> bool {
-        let (ready, refused) = match self.send("status", &json!({})).await {
-            Ok((reqwest::StatusCode::OK, bytes, _)) => {
+        let primary = self.probe_one(&self.primary).await;
+        let secondary = match &self.secondary {
+            Some(origin) => self.probe_one(origin).await,
+            None => false,
+        };
+        primary || secondary
+    }
+
+    async fn probe_one(&self, origin: &OriginState) -> bool {
+        let response = if self.secondary.is_none() {
+            self.send("status", &json!({})).await.ok()
+        } else {
+            let _permit = match self.in_flight.try_acquire() {
+                Ok(permit) => permit,
+                Err(_) => return false,
+            };
+            self.once_at(origin, "status", &json!({})).await.ok()
+        };
+        let (ready, refused) = match response {
+            Some((reqwest::StatusCode::OK, bytes, _)) => {
                 match serde_json::from_slice::<WireStatus>(&bytes) {
                     Ok(status) => (status.ready, !status.ready),
                     Err(_) => (false, false),
@@ -154,8 +246,8 @@ impl AuthorityClient {
             }
             _ => (false, false),
         };
-        self.last_probe_refused.store(refused, Ordering::Relaxed);
-        self.last_ready_ms.store(
+        origin.last_probe_refused.store(refused, Ordering::Relaxed);
+        origin.last_ready_ms.store(
             if ready {
                 self.started.elapsed().as_millis().min(u64::MAX as u128) as u64 + 1
             } else {
@@ -183,15 +275,16 @@ impl AuthorityClient {
         }))
     }
 
-    async fn once(
+    async fn once_at(
         &self,
+        origin: &OriginState,
         action: &str,
         body: &Value,
-    ) -> Result<(reqwest::StatusCode, Vec<u8>, Instant), Error> {
-        let url = self
-            .origin
+    ) -> Result<(reqwest::StatusCode, Vec<u8>, Instant), AttemptError> {
+        let url = origin
+            .url
             .join(&format!("flussonix/peer/v1/iptv/leases/{action}"))
-            .map_err(|_| Error::Invalid)?;
+            .map_err(|_| AttemptError::InvalidResponse)?;
         let sent_at = Instant::now();
         let mut response = self
             .http
@@ -200,22 +293,36 @@ impl AuthorityClient {
             .json(body)
             .send()
             .await
-            .map_err(|_| Error::Unavailable)?;
+            .map_err(|_| AttemptError::Transport)?;
+        if let Some(cluster) = self.expected_cluster {
+            let marker = response
+                .headers()
+                .get("x-flussonix-iptv-cluster-id")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| Uuid::parse_str(value).ok());
+            if marker != Some(cluster) {
+                return Err(AttemptError::InvalidResponse);
+            }
+        }
         let status = response.status();
         if response
             .content_length()
             .is_some_and(|size| size > MAX_RESPONSE as u64)
         {
-            return Err(Error::Unavailable);
+            return Err(AttemptError::InvalidResponse);
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| Error::Unavailable)? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| AttemptError::Transport)?
+        {
             if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE {
-                return Err(Error::Unavailable);
+                return Err(AttemptError::InvalidResponse);
             }
             bytes.extend_from_slice(&chunk);
         }
-        self.last_reachable_ms.store(
+        origin.last_reachable_ms.store(
             self.started.elapsed().as_millis().min(u64::MAX as u128) as u64 + 1,
             Ordering::Relaxed,
         );
@@ -231,8 +338,37 @@ impl AuthorityClient {
             .in_flight
             .try_acquire()
             .map_err(|_| Error::Unavailable)?;
+        if let Some(secondary) = &self.secondary {
+            return tokio::time::timeout(HA_TOTAL_TIMEOUT, async {
+                let primary = self.once_at(&self.primary, action, body).await;
+                match primary {
+                    Ok((status, _, _)) if status == reqwest::StatusCode::FORBIDDEN => {
+                        Err(Error::Denied)
+                    }
+                    Ok((status, _, _)) if status == reqwest::StatusCode::UNAUTHORIZED => {
+                        Err(Error::Unavailable)
+                    }
+                    Ok((status, _, _)) if status == reqwest::StatusCode::CONFLICT => {
+                        Err(Error::Limit)
+                    }
+                    Ok((status, _, _)) if status == reqwest::StatusCode::BAD_REQUEST => {
+                        Err(Error::Invalid)
+                    }
+                    Ok((status, _, _)) if status == reqwest::StatusCode::SERVICE_UNAVAILABLE => {
+                        self.secondary_attempt(secondary, action, body).await
+                    }
+                    Err(AttemptError::Transport) => {
+                        self.secondary_attempt(secondary, action, body).await
+                    }
+                    Ok(result) => Ok(result),
+                    Err(AttemptError::InvalidResponse) => Err(Error::Unavailable),
+                }
+            })
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        }
         for attempt in 0..2 {
-            match self.once(action, body).await {
+            match self.once_at(&self.primary, action, body).await {
                 Ok((status, _, _)) if status == reqwest::StatusCode::FORBIDDEN => {
                     return Err(Error::Denied);
                 }
@@ -245,17 +381,32 @@ impl AuthorityClient {
                 Ok((status, _, _)) if status == reqwest::StatusCode::BAD_REQUEST => {
                     return Err(Error::Invalid);
                 }
-                Ok((status, _, _)) if status.is_server_error() && attempt == 0 => {
-                    continue;
-                }
+                Ok((status, _, _)) if status.is_server_error() && attempt == 0 => continue,
                 Ok(result) => return Ok(result),
-                Err(Error::Unavailable) if attempt == 0 => continue,
-                Err(error) => return Err(error),
+                Err(AttemptError::Transport) if attempt == 0 => continue,
+                Err(_) => return Err(Error::Unavailable),
             }
         }
         Err(Error::Unavailable)
     }
 
+    async fn secondary_attempt(
+        &self,
+        secondary: &OriginState,
+        action: &str,
+        body: &Value,
+    ) -> Result<(reqwest::StatusCode, Vec<u8>, Instant), Error> {
+        match self.once_at(secondary, action, body).await {
+            Ok((status, _, _)) if status == reqwest::StatusCode::FORBIDDEN => Err(Error::Denied),
+            Ok((status, _, _)) if status == reqwest::StatusCode::UNAUTHORIZED => {
+                Err(Error::Unavailable)
+            }
+            Ok((status, _, _)) if status == reqwest::StatusCode::CONFLICT => Err(Error::Limit),
+            Ok((status, _, _)) if status == reqwest::StatusCode::BAD_REQUEST => Err(Error::Invalid),
+            Ok(result) => Ok(result),
+            Err(_) => Err(Error::Unavailable),
+        }
+    }
     async fn grant(&self, action: &str, input: &LeaseInput) -> Result<LeaseReply, Error> {
         if action != "acquire" && input.lease_id.is_none() {
             return Err(Error::Invalid);

@@ -93,8 +93,8 @@ fn secondary_authority_rejects_ambiguous_or_insecure_origins() {
     }
 }
 
-#[test]
-fn configured_secondary_cannot_be_silently_ignored_before_failover_is_ready() {
+#[tokio::test]
+async fn configured_secondary_creates_a_two_origin_client() {
     let dir = tempfile::tempdir().unwrap();
     let options = Options {
         admin_password: "owned-admin-password".into(),
@@ -107,14 +107,36 @@ fn configured_secondary_cannot_be_silently_ignored_before_failover_is_ready() {
         ),
         ..Options::default()
     };
-    assert!(
-        App::new(
-            dir.path().join("config.json"),
-            dir.path().join("media"),
-            options
-        )
-        .is_err()
+    let app = App::new(
+        dir.path().join("config.json"),
+        dir.path().join("media"),
+        options,
+    )
+    .unwrap();
+    assert_eq!(
+        app.iptv_authority_client
+            .as_ref()
+            .unwrap()
+            .origin_health()
+            .len(),
+        2
     );
+    let response = router(app)
+        .oneshot(
+            Request::builder()
+                .uri("/flussonix/api/v1/node")
+                .header("x-flussonix-peer", "owned-peer-key-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let node: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(node["iptv_cluster"]["origins"].as_array().unwrap().len(), 2);
+    assert_eq!(node["iptv_cluster"]["origins"][0]["ready"], false);
 }
 
 #[tokio::test]

@@ -196,10 +196,14 @@ fn ha_lease_error(kind: HaError) -> Response {
     response
 }
 
-fn ha_no_store(mut response: Response) -> Response {
+fn ha_no_store(mut response: Response, cluster: Uuid) -> Response {
     response
         .headers_mut()
         .insert("cache-control", "no-store".parse().unwrap());
+    response.headers_mut().insert(
+        "x-flussonix-iptv-cluster-id",
+        cluster.to_string().parse().unwrap(),
+    );
     response
 }
 
@@ -248,11 +252,12 @@ fn grant_response(
 }
 
 pub(super) async fn status(State(app): State<Arc<App>>, request: Request) -> Response {
-    if app.iptv_ha.is_some() {
+    if let Some(ha) = &app.iptv_ha {
         return ha_no_store(
-            tokio::time::timeout(READ_TIMEOUT, status_inner(app, request))
+            tokio::time::timeout(READ_TIMEOUT, status_inner(app.clone(), request))
                 .await
                 .unwrap_or_else(|_| ha_lease_error(HaError::Unavailable)),
+            ha.pool.cluster_id(),
         );
     }
     status_inner(app, request).await
@@ -263,8 +268,8 @@ async fn status_inner(app: Arc<App>, request: Request) -> Response {
         Ok(body) => body,
         Err((status, message)) => {
             let response = error(status, message);
-            return if app.iptv_ha.is_some() {
-                ha_no_store(response)
+            return if let Some(ha) = &app.iptv_ha {
+                ha_no_store(response, ha.pool.cluster_id())
             } else {
                 response
             };
@@ -298,11 +303,12 @@ async fn status_inner(app: Arc<App>, request: Request) -> Response {
 }
 
 pub(super) async fn acquire(State(app): State<Arc<App>>, request: Request) -> Response {
-    if app.iptv_ha.is_some() {
+    if let Some(ha) = &app.iptv_ha {
         return ha_no_store(
-            tokio::time::timeout(READ_TIMEOUT, acquire_inner(app, request))
+            tokio::time::timeout(READ_TIMEOUT, acquire_inner(app.clone(), request))
                 .await
                 .unwrap_or_else(|_| ha_lease_error(HaError::Unavailable)),
+            ha.pool.cluster_id(),
         );
     }
     acquire_inner(app, request).await
@@ -362,22 +368,24 @@ async fn acquire_inner(app: Arc<App>, request: Request) -> Response {
 }
 
 pub(super) async fn commit(State(app): State<Arc<App>>, request: Request) -> Response {
-    if app.iptv_ha.is_some() {
+    if let Some(ha) = &app.iptv_ha {
         return ha_no_store(
-            tokio::time::timeout(READ_TIMEOUT, grant_action(app, request, true))
+            tokio::time::timeout(READ_TIMEOUT, grant_action(app.clone(), request, true))
                 .await
                 .unwrap_or_else(|_| ha_lease_error(HaError::Unavailable)),
+            ha.pool.cluster_id(),
         );
     }
     grant_action(app, request, true).await
 }
 
 pub(super) async fn renew(State(app): State<Arc<App>>, request: Request) -> Response {
-    if app.iptv_ha.is_some() {
+    if let Some(ha) = &app.iptv_ha {
         return ha_no_store(
-            tokio::time::timeout(READ_TIMEOUT, grant_action(app, request, false))
+            tokio::time::timeout(READ_TIMEOUT, grant_action(app.clone(), request, false))
                 .await
                 .unwrap_or_else(|_| ha_lease_error(HaError::Unavailable)),
+            ha.pool.cluster_id(),
         );
     }
     grant_action(app, request, false).await
@@ -440,22 +448,24 @@ async fn grant_action(app: Arc<App>, request: Request, commit: bool) -> Response
 }
 
 pub(super) async fn release(State(app): State<Arc<App>>, request: Request) -> Response {
-    if app.iptv_ha.is_some() {
+    if let Some(ha) = &app.iptv_ha {
         return ha_no_store(
-            tokio::time::timeout(READ_TIMEOUT, finish_action(app, request, false))
+            tokio::time::timeout(READ_TIMEOUT, finish_action(app.clone(), request, false))
                 .await
                 .unwrap_or_else(|_| ha_lease_error(HaError::Unavailable)),
+            ha.pool.cluster_id(),
         );
     }
     finish_action(app, request, false).await
 }
 
 pub(super) async fn rollback(State(app): State<Arc<App>>, request: Request) -> Response {
-    if app.iptv_ha.is_some() {
+    if let Some(ha) = &app.iptv_ha {
         return ha_no_store(
-            tokio::time::timeout(READ_TIMEOUT, finish_action(app, request, true))
+            tokio::time::timeout(READ_TIMEOUT, finish_action(app.clone(), request, true))
                 .await
                 .unwrap_or_else(|_| ha_lease_error(HaError::Unavailable)),
+            ha.pool.cluster_id(),
         );
     }
     finish_action(app, request, true).await

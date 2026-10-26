@@ -230,7 +230,6 @@ impl App {
                     "second IPTV authority requires a distinct credential-free HTTPS origin".into(),
                 );
             }
-            return Err("IPTV two-origin retry is not enabled in this build".into());
         }
         if let Some(url) = &options.iptv_authority {
             let literal_loopback = matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback())
@@ -326,12 +325,25 @@ impl App {
             .iptv_authority
             .as_ref()
             .map(|origin| {
-                AuthorityClient::new(
-                    origin.clone(),
-                    options.peer_key.clone(),
-                    options.iptv_authority_ca.as_deref(),
-                    options.iptv_authority_allow_insecure_loopback,
-                )
+                match (
+                    &options.iptv_authority_secondary,
+                    options.iptv_authority_cluster_id,
+                ) {
+                    (Some(secondary), Some(cluster)) => AuthorityClient::new_with_secondary(
+                        origin.clone(),
+                        secondary.clone(),
+                        cluster,
+                        options.peer_key.clone(),
+                        options.iptv_authority_ca.as_deref(),
+                        options.iptv_authority_allow_insecure_loopback,
+                    ),
+                    _ => AuthorityClient::new(
+                        origin.clone(),
+                        options.peer_key.clone(),
+                        options.iptv_authority_ca.as_deref(),
+                        options.iptv_authority_allow_insecure_loopback,
+                    ),
+                }
                 .map(Arc::new)
             })
             .transpose()?;
@@ -759,7 +771,7 @@ impl App {
             } else {
                 Some("IPTV authority has not been verified recently")
             };
-            json!({"mode":"client","configured":true,"ready":ready,"connected":connected,"reason":reason})
+            json!({"mode":"client","configured":true,"ready":ready,"connected":connected,"reason":reason,"origins":client.origin_health()})
         } else {
             json!({"mode":"missing_authority","configured":false,"ready":false,"reason":"IPTV authority is required for cluster session limits"})
         };
