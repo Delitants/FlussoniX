@@ -68,6 +68,23 @@ CDN/standalone SRT playback uses the guarded listener. [Equivalent-origin failov
 [RTSP/RTSPS playback](vendor-daemon-playback.md) are supported separately. Configure equivalent intended viewer
 policies on LB and CDN; this increment does not infer equivalence between them.
 
+### Bounded live topology check
+
+From a source checkout, `scripts/qualify-live-vendor.py --topology` accepts the
+same `--binary`, `--source`, `--stream` and owner-only `--cluster-key-file`
+arguments as its single-node mode. It starts an isolated loopback LB and CDN,
+uses on-demand source activation and a random local viewer token, follows the
+LB placement and CDN ticket redirects, decodes one HLS segment, checks denial
+without the viewer token at both nodes, and confirms the LB has no media stream.
+It stops both process groups and deletes their files. Against the authorized
+cdn4 test stream, both secure M4SS and M4FS source pulls delivered decoded
+1920×1080 H.264/AAC through this path. An invalid Cluster key prevented LB
+placement.
+
+This verifies one live source and two local FlussoniX nodes. It does not
+establish placement across production CDN hosts, private LAN routing, uplink
+saturation decisions, failover under loss, HEVC, or target-scale capacity.
+
 ## Flussonic CDN destinations
 
 In **Cluster → CDN peers**, choose **Flussonic**, enter its management URL,
