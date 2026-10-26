@@ -17,6 +17,7 @@ test('IPTV forms create packages and subscribers without JSON fields',async({pag
  await page.getByLabel('Subscriber name',{exact:true}).fill(subscriber);await page.getByLabel(pack,{exact:true}).check();
  await page.getByLabel('Maximum sessions on this node',{exact:true}).fill('2');await page.getByLabel('Expires at (UTC)',{exact:true}).fill('2099-01-01T00:00');
  await expect(page.getByRole('dialog').locator('textarea')).toHaveCount(0);await page.getByRole('button',{name:'Save subscriber',exact:true}).click();
+ await expect(page.getByRole('dialog')).toHaveCount(0);
  const saved=await(await request.get('/streamer/api/v3/iptv/subscribers/'+subscriber,{headers})).json();
  expect(saved.packages).toEqual([pack]);expect(saved.max_sessions).toBe(2);expect(saved.flussonix_expires_at).toBe('2099-01-01T00:00:00Z');expect(saved.token.length).toBeGreaterThanOrEqual(32);
  const row=page.getByRole('row').filter({has:page.getByRole('cell',{name:subscriber,exact:true})});await expect(row).toContainText('••••');await expect(row).not.toContainText(saved.token);
