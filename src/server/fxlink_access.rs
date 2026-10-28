@@ -744,6 +744,7 @@ mod tests {
         use futures_util::FutureExt;
         use std::panic::AssertUnwindSafe;
         use tokio_util::sync::CancellationToken;
+        let _serial = crate::fxlink::test_lock().lock().await;
         let dir = tempfile::tempdir().unwrap();
         let origin = app(&dir.path().join("origin"));
         configure(&origin);

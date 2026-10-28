@@ -2,9 +2,13 @@
   "schema": 1,
   "repository": "Delitants/FlussoniX",
   "baseline": "32d7a7bb6e07fe86ee824393e967ef0704ddb5a8",
+  "historical_public_guide_exceptions": {
+    "ee8dde620e4b454e12cf17a523125032d200ab95": ["docs/vendor-replica-discovery.md"]
+  },
   "public_docs": [
     "docs/fxlink.md",
     "docs/installation.md",
+    "docs/iptv-ha.md",
     "docs/iptv-transport.md",
     "docs/licensing.md",
     "docs/packaging.md",
@@ -15,6 +19,13 @@
     "vendor/quinn-proto/FLUSSONIX_PATCH.md"
   ],
   "public_data": [
+    "THIRD_PARTY_NOTICES.txt",
+    "third_party/manifest.json",
+    "third_party/licenses/rust/*/LICENSE*",
+    "third_party/licenses/rust/*/COPYRIGHT*",
+    "third_party/licenses/rust/*/COPYING*",
+    "third_party/licenses/rust/*/UNLICENSE*",
+    "third_party/licenses/web/*/LICENSE*",
     "vendor/quinn-proto/.cargo_vcs_info.json"
   ],
   "release_assets": [

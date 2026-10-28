@@ -14,6 +14,10 @@ impl Track {
         Codec::parse(&self.codec)
     }
 }
+fn input_codec(name: &str) -> Result<(&str, Codec), String> {
+    let canonical = if name == "mp2a" { "m2a" } else { name };
+    Ok((canonical, Codec::parse(canonical)?))
+}
 pub fn validate_tracks(tracks: &[Track]) -> Result<(), String> {
     if tracks.is_empty() || tracks.len() > 16 {
         return Err("invalid native track count".into());
@@ -42,10 +46,9 @@ pub(crate) fn decode_track(fields: &[BoxView<'_>]) -> Result<Track, String> {
     if h.len() < 16 || h.last() != Some(&0) {
         return Err("invalid native track handler".into());
     }
-    let codec = std::str::from_utf8(&h[12..h.len() - 1])
-        .map_err(|_| "invalid native codec name")?
-        .to_owned();
-    let kind = Codec::parse(&codec)?;
+    let (codec, kind) = input_codec(
+        std::str::from_utf8(&h[12..h.len() - 1]).map_err(|_| "invalid native codec name")?,
+    )?;
     if &h[8..12] != kind.handler() {
         return Err("native handler/codec kind mismatch".into());
     }
@@ -57,7 +60,7 @@ pub(crate) fn decode_track(fields: &[BoxView<'_>]) -> Result<Track, String> {
     }
     Ok(Track {
         id: u32::from_be_bytes(h[4..8].try_into().unwrap()),
-        codec,
+        codec: codec.to_owned(),
         config: config.to_vec(),
     })
 }
@@ -148,9 +151,10 @@ impl Decoder {
                     let codec = if name == b"subt" {
                         Codec::Subtitle
                     } else {
-                        Codec::parse(
+                        input_codec(
                             std::str::from_utf8(name).map_err(|_| "invalid native frame codec")?,
                         )?
+                        .1
                     };
                     if h[4] != codec.content_type() || !matches!(h[5], 2 | 3) {
                         return Err("native frame codec/kind mismatch".into());

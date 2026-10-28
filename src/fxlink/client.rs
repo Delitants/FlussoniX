@@ -582,7 +582,11 @@ async fn receive_subscription(
             activate_geometry(&state,geometry,&budget,&settings);
         }
         let hint_ingress=state.geometry.lock().unwrap().clone();
-        *state.telemetry.geometry.lock().unwrap()=hint_ingress.clone();
+        *state.telemetry.geometry.lock().unwrap()=hint_ingress.clone().map(GeometryTelemetry::Live);
+        if !state.current() {
+            state.telemetry.finalize_geometry();
+            return Err("FXLink retired".into());
+        }
         state.admitted.store(true,Ordering::Release);
         state.telemetry.protocol_version.store(u64::from(version),Ordering::Relaxed);
         let _ = ready.take().unwrap().send(Ok(()));

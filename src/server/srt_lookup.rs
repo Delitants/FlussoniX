@@ -159,17 +159,19 @@ impl App {
         let result = self
             .srt_place(&viewer, streamid, encrypted, &grant, resolved.revision)
             .await;
-        self.config
+        let result = self
+            .config
             .at_revision(resolved.revision, |_| {
                 if grant.is_cancelled() {
                     return Err(403);
                 }
-                if result.is_ok() {
-                    grant.playback();
-                }
                 result
             })
-            .ok_or(503u16)?
+            .ok_or(503u16)?;
+        if result.is_ok() && !self.playback_auth.release_redirect_lease(&grant).await {
+            return Err(503);
+        }
+        result
     }
     pub(crate) async fn srt_place(
         &self,

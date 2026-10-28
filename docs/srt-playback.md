@@ -4,6 +4,10 @@ Add an opt-in global playback listener on an explicitly chosen unused UDP
 address. A caller selects a stream with `#!::r=NAME,m=request,u=TOKEN` in
 its SRT Stream ID. `m` can be omitted on this playback-only listener;
 publishing is rejected. The `u` value is the existing viewer token.
+The SRT Stream ID handshake is not encrypted by the media passphrase. A
+reusable IPTV subscriber token in `u` is visible to a network-path observer;
+limit direct IPTV-token SRT playback to trusted networks until a ticket-based
+profile is available. See [IPTV transport support](iptv-transport.md).
 Names or viewer tokens containing commas cannot currently be represented in
 this selection format; Output does not yet warn about that limitation.
 This follows the documented [global playback](https://flussonic.com/doc/fms/play/srt/)

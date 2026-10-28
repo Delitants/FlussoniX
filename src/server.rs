@@ -2,7 +2,15 @@ use crate::{
     auth::{Credentials, Role},
     cluster::{NodeLoad, TieRotation},
     config::{ConfigStore, KINDS, nested_validation_path, parse_text, valid_name},
-    iptv::store::IptvStore,
+    iptv::{
+        client::AuthorityClient,
+        ha::{
+            HaAuthority,
+            connection::{HaError, HaOptions, HaPool},
+        },
+        lease::Ledger,
+        store::IptvStore,
+    },
     media::{Engine, Worker},
     playback_auth::{
         AuthOutcome, Grant, PlaybackAuth, Policy, PolicySnapshot, RecoveryDemand, ViewerRequest,
@@ -34,6 +42,7 @@ pub struct Options {
     pub admin_user: String,
     pub admin_password: String,
     pub admin_public_origin: Option<url::Url>,
+    pub allow_insecure_remote_management: bool,
     pub view_user: Option<String>,
     pub view_password: Option<String>,
     pub peer_key: String,
@@ -46,6 +55,14 @@ pub struct Options {
     pub web_dir: PathBuf,
     pub iptv_public_origin: Option<url::Url>,
     pub iptv_data: Option<PathBuf>,
+    pub iptv_lease_authority: bool,
+    pub iptv_ha: Option<HaOptions>,
+    pub iptv_peer_allow_insecure_loopback: bool,
+    pub iptv_authority: Option<url::Url>,
+    pub iptv_authority_secondary: Option<url::Url>,
+    pub iptv_authority_cluster_id: Option<uuid::Uuid>,
+    pub iptv_authority_ca: Option<PathBuf>,
+    pub iptv_authority_allow_insecure_loopback: bool,
     pub drain: bool,
     pub fxlink_features: crate::fxlink::Features,
 }
@@ -55,6 +72,7 @@ impl Default for Options {
             admin_user: "admin".into(),
             admin_password: String::new(),
             admin_public_origin: None,
+            allow_insecure_remote_management: false,
             view_user: None,
             view_password: None,
             peer_key: String::new(),
@@ -67,6 +85,14 @@ impl Default for Options {
             web_dir: "web/dist".into(),
             iptv_public_origin: None,
             iptv_data: None,
+            iptv_lease_authority: false,
+            iptv_ha: None,
+            iptv_peer_allow_insecure_loopback: false,
+            iptv_authority: None,
+            iptv_authority_secondary: None,
+            iptv_authority_cluster_id: None,
+            iptv_authority_ca: None,
+            iptv_authority_allow_insecure_loopback: false,
             drain: false,
             fxlink_features: crate::fxlink::Features::default(),
         }
@@ -106,6 +132,10 @@ pub struct App {
     rtsp_publication: std::sync::Mutex<Value>,
     pub config: Arc<ConfigStore>,
     pub iptv: Arc<IptvStore>,
+    pub iptv_leases: Arc<Ledger>,
+    pub iptv_ha_pool: Option<Arc<HaPool>>,
+    pub iptv_ha: Option<Arc<HaAuthority>>,
+    pub iptv_authority_client: Option<Arc<AuthorityClient>>,
     node_name: String,
     modern_sources:
         Option<Arc<crate::source_directory::modern_coordinator::ModernSourceCoordinator>>,
@@ -133,9 +163,14 @@ pub struct App {
     source_activation: Mutex<source_activation::State>,
     source_activation_refresh: Mutex<()>,
     pub(crate) publishers: Arc<tokio::sync::Semaphore>,
+    iptv_peer_admission: iptv_peer::Admission,
     source_lookups: Mutex<HashMap<String, origin_resolution::Ticket>>,
 }
 impl App {
+    fn owns_iptv_catalog(&self) -> bool {
+        self.options.iptv_lease_authority
+            || (self.options.role == "standalone" && self.options.iptv_authority.is_none())
+    }
     /// Caller owns/joins this one-shot driver; stopping it retires shared inputs.
     pub async fn run_vendor_playback(
         &self,
@@ -170,6 +205,58 @@ impl App {
     ) -> Result<Arc<Self>, String> {
         if options.admin_password.is_empty() || options.peer_key.len() < 12 {
             return Err("admin password required; peer key must be at least 12 characters".into());
+        }
+        if options.iptv_peer_allow_insecure_loopback && !options.iptv_lease_authority {
+            return Err("IPTV loopback peer exception requires IPTV lease authority".into());
+        }
+        if options.iptv_ha.is_some() && !options.iptv_lease_authority {
+            return Err("IPTV HA database requires lease authority mode".into());
+        }
+        if options.iptv_authority_secondary.is_some() != options.iptv_authority_cluster_id.is_some()
+        {
+            return Err("second IPTV authority requires a cluster ID".into());
+        }
+        if let Some(secondary) = &options.iptv_authority_secondary {
+            if options.iptv_authority.as_ref() == Some(secondary)
+                || secondary.scheme() != "https"
+                || secondary.host().is_none()
+                || !secondary.username().is_empty()
+                || secondary.password().is_some()
+                || secondary.path() != "/"
+                || secondary.query().is_some()
+                || secondary.fragment().is_some()
+            {
+                return Err(
+                    "second IPTV authority requires a distinct credential-free HTTPS origin".into(),
+                );
+            }
+        }
+        if let Some(url) = &options.iptv_authority {
+            let literal_loopback = matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback())
+                || matches!(url.host(), Some(url::Host::Ipv6(ip)) if ip.is_loopback());
+            if url.host().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.path() != "/"
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || !(url.scheme() == "https"
+                    || (url.scheme() == "http"
+                        && literal_loopback
+                        && options.iptv_authority_allow_insecure_loopback))
+            {
+                return Err("IPTV authority requires a credential-free HTTPS origin or explicit literal loopback HTTP".into());
+            }
+            if let Some(ca) = options.iptv_authority_ca.as_deref() {
+                if url.scheme() != "https" {
+                    return Err("IPTV authority CA requires HTTPS".into());
+                }
+                crate::tls_input::client(Some(ca))?;
+            }
+        } else if options.iptv_authority_ca.is_some()
+            || options.iptv_authority_allow_insecure_loopback
+        {
+            return Err("IPTV authority options require an authority URL".into());
         }
         if options.admin_public_origin.as_ref().is_some_and(|origin| {
             origin.scheme() != "https"
@@ -219,7 +306,49 @@ impl App {
                 .unwrap_or_else(|| Path::new("."))
                 .join("iptv.json")
         });
-        let iptv = IptvStore::open(iptv_path)?;
+        let iptv = if options.iptv_ha.is_some() {
+            IptvStore::inert(iptv_path.clone())
+        } else {
+            IptvStore::open(iptv_path.clone())?
+        };
+        let iptv_ha_pool = options
+            .iptv_ha
+            .as_ref()
+            .map(HaPool::new)
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .map(Arc::new);
+        let iptv_ha = iptv_ha_pool
+            .as_ref()
+            .map(|pool| Arc::new(HaAuthority::new(pool.clone(), iptv_path)));
+        let iptv_authority_client = options
+            .iptv_authority
+            .as_ref()
+            .map(|origin| {
+                match (
+                    &options.iptv_authority_secondary,
+                    options.iptv_authority_cluster_id,
+                ) {
+                    (Some(secondary), Some(cluster)) => AuthorityClient::new_with_secondary(
+                        origin.clone(),
+                        secondary.clone(),
+                        cluster,
+                        options.peer_key.clone(),
+                        options.iptv_authority_ca.as_deref(),
+                        options.iptv_authority_allow_insecure_loopback,
+                    ),
+                    _ => AuthorityClient::new(
+                        origin.clone(),
+                        options.peer_key.clone(),
+                        options.iptv_authority_ca.as_deref(),
+                        options.iptv_authority_allow_insecure_loopback,
+                    ),
+                }
+                .map(Arc::new)
+            })
+            .transpose()?;
+        let started = Instant::now();
+        let iptv_leases = Arc::new(Ledger::new(started, 100_000, iptv.revision()));
         let config = Arc::new(ConfigStore::open(config_path)?);
         let modern_sources =
             crate::source_directory::modern_coordinator::ModernSourceCoordinator::new(
@@ -231,10 +360,18 @@ impl App {
         let vendor_playback = modern_sources
             .as_ref()
             .map(|owner| crate::vendor_playback::Runtime::new(owner.clone()));
-        let playback_auth = Arc::new(PlaybackAuth::with_iptv(
-            options.client_limit as usize,
-            iptv.clone(),
-        ));
+        let playback_auth = Arc::new(
+            if options.role == "standalone"
+                && options.iptv_authority.is_none()
+                && !options.iptv_lease_authority
+            {
+                PlaybackAuth::with_iptv(options.client_limit as usize, iptv.clone())
+            } else if let Some(client) = &iptv_authority_client {
+                PlaybackAuth::with_remote_iptv(options.client_limit as usize, client.clone())
+            } else {
+                PlaybackAuth::new(options.client_limit as usize)
+            },
+        );
         let app = Arc::new(Self {
             http_delivery: std::sync::Mutex::new(
                 json!({"http":null,"https":null,"https_only":false}),
@@ -251,6 +388,10 @@ impl App {
             )),
             config,
             iptv: iptv.clone(),
+            iptv_leases: iptv_leases.clone(),
+            iptv_ha_pool,
+            iptv_ha,
+            iptv_authority_client,
             node_name: options.node_name.clone(),
             modern_sources,
             vendor_playback,
@@ -276,16 +417,18 @@ impl App {
             srt_egress: Arc::new(AtomicU64::new(0)),
             srt_connections: AtomicU64::new(0),
             telemetry: crate::telemetry::Sampler::new(&options.uplink_interface)?,
-            started: Instant::now(),
+            started,
             mirrors: fxlink_access::Mirrors::default(),
             source_queries: tokio::sync::Semaphore::new(64),
             source_activation: Mutex::new(source_activation::State::default()),
             source_activation_refresh: Mutex::new(()),
             publishers: Arc::new(tokio::sync::Semaphore::new(64)),
+            iptv_peer_admission: iptv_peer::Admission::new(),
             source_lookups: Mutex::new(HashMap::new()),
         });
         let weak = Arc::downgrade(&app.playback_auth);
-        app.iptv.set_on_change(Box::new(move || {
+        app.iptv.set_on_change(Box::new(move |revision| {
+            iptv_leases.observe_revision(revision);
             if let Some(auth) = weak.upgrade() {
                 auth.invalidate_iptv();
             }
@@ -598,7 +741,69 @@ impl App {
                 .unmeasured(window, metrics["http_egress_mbps"].as_f64());
         drop(reservations);
         let rtsp_publication = self.rtsp_publication.lock().unwrap().clone();
-        let node = json!({"rtsp_publication":rtsp_publication,"name":self.node_name,"role":self.options.role,"uptime":self.started.elapsed().as_secs(),"reserved_mbps":reserved_mbps,"uplink_mbps":self.options.uplink_mbps,"active":self.active().await,"reserved":reserved,"limit":self.options.client_limit,"drain":self.options.drain,"http_delivery":self.http_delivery.lock().unwrap().clone(),"iptv_public_origin":self.options.iptv_public_origin.as_ref().map(url::Url::as_str)});
+        let iptv_cluster = if let Some(ha) = &self.iptv_ha {
+            let report = tokio::time::timeout(Duration::from_secs(2), async {
+                ha.pool.verify_startup().await?;
+                let snapshot = ha.catalog.load_current().await?;
+                let capacity = ha.ledger.capacity().await?;
+                Ok::<_, HaError>((snapshot, capacity))
+            })
+            .await;
+            match report {
+                Ok(Ok((snapshot, capacity))) => {
+                    let ready = snapshot.enabled() && capacity.available();
+                    let reason = if !snapshot.enabled() {
+                        Some("IPTV is disabled")
+                    } else if !capacity.available() {
+                        Some("IPTV authority lease capacity is full")
+                    } else {
+                        None
+                    };
+                    json!({"mode":"authority","backend":"postgresql","configured":true,
+                        "ready":ready,"database_ready":true,"reason":reason,
+                        "catalog_revision":snapshot.revision(),"capacity":capacity,
+                        "export_healthy":ha.catalog.export_healthy()})
+                }
+                _ => json!({"mode":"authority","backend":"postgresql","configured":true,
+                    "ready":false,"database_ready":false,"reason":"IPTV HA database unavailable",
+                    "catalog_revision":null,"capacity":null,
+                    "export_healthy":ha.catalog.export_healthy()}),
+            }
+        } else if self.options.role == "standalone"
+            && !self.options.iptv_lease_authority
+            && self.iptv_authority_client.is_none()
+        {
+            json!({"mode":"local","configured":false,"ready":true})
+        } else if self.options.iptv_lease_authority {
+            let enabled = self.iptv.snapshot().enabled();
+            let ready = enabled && self.iptv_leases.ready_for_new_leases(Instant::now());
+            let reason = if ready {
+                None
+            } else if !enabled {
+                Some("IPTV is disabled")
+            } else if !self.iptv_leases.accepting_new_leases(Instant::now()) {
+                Some("IPTV authority restart quarantine is active")
+            } else {
+                Some("IPTV authority lease capacity is full")
+            };
+            json!({"mode":"authority","configured":true,"ready":ready,"reason":reason})
+        } else if let Some(client) = &self.iptv_authority_client {
+            let ready = client.recently_ready();
+            let connected = client.recently_reachable();
+            let reason = if ready {
+                None
+            } else if connected && client.last_probe_refused() {
+                Some("IPTV authority is not accepting new leases")
+            } else if connected {
+                Some("IPTV authority readiness could not be verified")
+            } else {
+                Some("IPTV authority has not been verified recently")
+            };
+            json!({"mode":"client","configured":true,"ready":ready,"connected":connected,"reason":reason,"origins":client.origin_health()})
+        } else {
+            json!({"mode":"missing_authority","configured":false,"ready":false,"reason":"IPTV authority is required for cluster session limits"})
+        };
+        let node = json!({"rtsp_publication":rtsp_publication,"name":self.node_name,"role":self.options.role,"uptime":self.started.elapsed().as_secs(),"reserved_mbps":reserved_mbps,"uplink_mbps":self.options.uplink_mbps,"active":self.active().await,"reserved":reserved,"limit":self.options.client_limit,"drain":self.options.drain,"http_delivery":self.http_delivery.lock().unwrap().clone(),"iptv_public_origin":self.options.iptv_public_origin.as_ref().map(url::Url::as_str),"iptv_cluster":iptv_cluster});
         metrics
             .as_object_mut()
             .unwrap()
@@ -806,6 +1011,12 @@ pub fn router(app: Arc<App>) -> Router {
     Router::new().route("/health",axum::routing::get(||async{axum::Json(json!({"status":"ok","service":"FlussoniX","version":env!("CARGO_PKG_VERSION")}))}))
  .route("/streamer/api/v3/{*tail}",axum::routing::any(management))
  .route("/tv/playlists/{subscriber}",axum::routing::get(iptv_playlist_http))
+ .route("/flussonix/peer/v1/iptv/leases/status",axum::routing::post(iptv_peer::status))
+ .route("/flussonix/peer/v1/iptv/leases/acquire",axum::routing::post(iptv_peer::acquire))
+ .route("/flussonix/peer/v1/iptv/leases/commit",axum::routing::post(iptv_peer::commit))
+ .route("/flussonix/peer/v1/iptv/leases/renew",axum::routing::post(iptv_peer::renew))
+ .route("/flussonix/peer/v1/iptv/leases/release",axum::routing::post(iptv_peer::release))
+ .route("/flussonix/peer/v1/iptv/leases/rollback",axum::routing::post(iptv_peer::rollback))
  .route("/flussonix/api/v1/srt-lookup",axum::routing::any(srt_lookup::lookup))
  .route("/flussonix/api/v1/{*tail}",axum::routing::any(native))
  .nest_service("/admin",tower_http::services::ServeDir::new(&app.options.web_dir).append_index_html_on_directories(true))
@@ -816,7 +1027,13 @@ async fn iptv_playlist_http(
     axum::extract::Path(subscriber): axum::extract::Path<String>,
     request: Request,
 ) -> Response {
-    iptv_playlist::get(app, request, &subscriber)
+    if !app.owns_iptv_catalog() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "IPTV catalog is managed by the authority",
+        );
+    }
+    iptv_playlist::get(app, request, &subscriber).await
 }
 async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     let role = app
@@ -849,6 +1066,12 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     let resource = parts.next().unwrap_or("");
     let name = parts.next();
     if resource == "iptv" {
+        if !app.owns_iptv_catalog() {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "IPTV catalog is managed by the authority",
+            );
+        }
         return iptv_management::dispatch(app, request, &tail, role).await;
     }
     if resource == "config" {
@@ -1607,10 +1830,18 @@ async fn balance(
     revision: u64,
 ) -> Response {
     let work = balance_inner(app, name, path, query, secure, grant, revision);
-    tokio::select! { biased;
+    let response = tokio::select! { biased;
         _=grant.cancelled()=>error(StatusCode::FORBIDDEN,"playback policy changed"),
         result=tokio::time::timeout(Duration::from_secs(8),work)=>result.unwrap_or_else(|_|error(StatusCode::SERVICE_UNAVAILABLE,"placement deadline exceeded")),
+    };
+    if response.status().is_redirection() && !app.playback_auth.release_redirect_lease(grant).await
+    {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "IPTV redirect lease release failed",
+        );
     }
+    response
 }
 async fn balance_inner(
     app: &Arc<App>,
@@ -2456,6 +2687,7 @@ mod continuous_session_tests {
 }
 
 mod iptv_management;
+mod iptv_peer;
 mod iptv_playlist;
 mod native_ts_body;
 #[path = "origin_resolution.rs"]

@@ -2,6 +2,320 @@ use super::*;
 use std::sync::atomic::AtomicUsize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+struct SyntheticPeer<L> {
+    listener: L,
+    address: SocketAddr,
+}
+
+impl<L> SyntheticPeer<L> {
+    fn remote(listener: L) -> Self {
+        Self {
+            listener,
+            address: "198.51.100.7:40000".parse().unwrap(),
+        }
+    }
+}
+
+impl<L: Listener<Addr = SocketAddr>> Listener for SyntheticPeer<L> {
+    type Io = L::Io;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        let (io, _) = self.listener.accept().await;
+        (io, self.address)
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
+}
+
+#[tokio::test]
+async fn remote_plaintext_denies_management_before_routing_but_preserves_media_and_peer_paths() {
+    use axum::routing::any;
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let stop = CancellationToken::new();
+    let server = tokio::spawn(serve_listener(
+        SyntheticPeer::remote(tcp),
+        Router::new().fallback(any(|| async { "routed" })),
+        stop,
+        TransportPolicy::default(),
+    ));
+    let client = reqwest::Client::new();
+    let base = format!("http://{address}");
+    for path in [
+        "/admin",
+        "/admin/",
+        "/admin/assets/main.js",
+        "/streamer/api/v3/config",
+        "/flussonix/api/v1/node",
+    ] {
+        let response = client
+            .get(format!("{base}{path}"))
+            .header("Authorization", "Basic YWRtaW46c2VjcmV0")
+            .header("Host", "localhost")
+            .header("Forwarded", "for=127.0.0.1;proto=https")
+            .header("X-Forwarded-Proto", "https")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN, "{path}");
+        assert!(response.headers().get("www-authenticate").is_none());
+        assert_eq!(response.headers()["cache-control"], "no-store");
+    }
+    for path in [
+        "/health",
+        "/live/index.m3u8",
+        "/live/mpegts",
+        "/live/m4f",
+        "/live/m4s",
+        "/flussonix/api/v1/admit",
+    ] {
+        let response = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
+        assert_eq!(response.text().await.unwrap(), "routed");
+    }
+    let publish = client
+        .post(format!("{base}/live/mpegts"))
+        .header("Authorization", "Basic cHVibGlzaGVyOnNlY3JldA==")
+        .body("fixture")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(publish.status(), reqwest::StatusCode::OK);
+    let peer_basic = client
+        .get(format!("{base}/flussonix/api/v1/admit"))
+        .header("Authorization", "Basic cGVlcjpzZWNyZXQ=")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(peer_basic.status(), reqwest::StatusCode::FORBIDDEN);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn remote_plaintext_rejects_credential_paths_while_local_tls_and_override_allow_them() {
+    use axum::routing::any;
+    use tokio_rustls::rustls::pki_types::ServerName;
+
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let stop = CancellationToken::new();
+    let server = tokio::spawn(serve_listener(
+        SyntheticPeer::remote(tcp),
+        Router::new().fallback(any(|| async { "routed" })),
+        stop,
+        TransportPolicy::default(),
+    ));
+    let client = reqwest::Client::new();
+    let base = format!("http://{address}");
+    for (method, path, authorization) in [
+        (reqwest::Method::GET, "/admin/", None),
+        (reqwest::Method::PUT, "/streamer/api/v3/config", None),
+        (
+            reqwest::Method::GET,
+            "/flussonix/api/v1/node",
+            Some("Bearer owned"),
+        ),
+    ] {
+        let mut request = client.request(method, format!("{base}{path}"));
+        if let Some(value) = authorization {
+            request = request.header("Authorization", value);
+        }
+        assert_eq!(
+            request.send().await.unwrap().status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "{path}"
+        );
+    }
+    assert_eq!(
+        client
+            .get(format!("{base}/flussonix/api/v1/admit"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK,
+    );
+    server.abort();
+    let _ = server.await;
+
+    for (remote, policy) in [
+        (false, TransportPolicy::default()),
+        (
+            true,
+            TransportPolicy {
+                allow_insecure_remote_management: true,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        let stop = CancellationToken::new();
+        let router = Router::new().fallback(any(|| async { "routed" }));
+        let server = if remote {
+            tokio::spawn(serve_listener(
+                SyntheticPeer::remote(tcp),
+                router,
+                stop,
+                policy,
+            ))
+        } else {
+            tokio::spawn(serve_listener(tcp, router, stop, policy))
+        };
+        let response = client
+            .get(format!("http://{address}/admin/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        server.abort();
+        let _ = server.await;
+    }
+
+    let cert = tls_fixture::Certificates::new();
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let stop = CancellationToken::new();
+    let server = tokio::spawn(serve_listener(
+        SyntheticPeer::remote(crate::http_tls::Listener::new(tcp, cert.server())),
+        Router::new().fallback(any(|| async { "routed" })),
+        stop,
+        TransportPolicy {
+            secure: true,
+            ..Default::default()
+        },
+    ));
+    let socket = TcpStream::connect(address).await.unwrap();
+    let connector = tokio_rustls::TlsConnector::from(cert.client());
+    let mut stream = connector
+        .connect(ServerName::try_from("localhost").unwrap(), socket)
+        .await
+        .unwrap();
+    stream
+        .write_all(b"GET /admin/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn ipv4_mapped_peer_uses_embedded_ipv4_address_for_management_boundary() {
+    use axum::routing::any;
+    let client = reqwest::Client::new();
+    for (peer, expected) in [
+        ("[::ffff:127.0.0.1]:40000", reqwest::StatusCode::OK),
+        (
+            "[::ffff:198.51.100.7]:40000",
+            reqwest::StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        let stop = CancellationToken::new();
+        let server = tokio::spawn(serve_listener(
+            SyntheticPeer {
+                listener: tcp,
+                address: peer.parse().unwrap(),
+            },
+            Router::new().fallback(any(|| async { "routed" })),
+            stop,
+            TransportPolicy::default(),
+        ));
+        for path in ["/admin/", "/streamer/api/v3/config"] {
+            let response = client
+                .get(format!("http://{address}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{peer} {path}");
+        }
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn remote_plaintext_guard_wraps_the_real_management_router() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = crate::server::App::new(
+        dir.path().join("config.json"),
+        dir.path().join("media"),
+        crate::server::Options {
+            admin_password: "owned-admin-secret".into(),
+            peer_key: "owned-peer-secret".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let server = tokio::spawn(serve_listener(
+        SyntheticPeer::remote(tcp),
+        crate::server::router(app),
+        CancellationToken::new(),
+        TransportPolicy::default(),
+    ));
+    let client = reqwest::Client::new();
+    let base = format!("http://{address}");
+    assert_eq!(
+        client
+            .get(format!("{base}/health"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/admin/"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/streamer/api/v3/config"))
+            .header("Authorization", "Basic YWRtaW46b3duZWQtYWRtaW4tc2VjcmV0")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/flussonix/api/v1/node"))
+            .header("Authorization", "Basic YWRtaW46b3duZWQtYWRtaW4tc2VjcmV0")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/flussonix/api/v1/node"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    server.abort();
+    let _ = server.await;
+}
+
 #[tokio::test]
 async fn stale_watch_cannot_abort_reused_or_unrelated_connection() {
     let control = Control::default();
@@ -142,6 +456,7 @@ async fn incomplete_http_headers_expire_before_routing() {
         tcp,
         Router::new().route("/", get(|| async { "ready" })),
         stop,
+        TransportPolicy::default(),
     ));
     let mut stream = TcpStream::connect(address).await.unwrap();
     stream
@@ -170,6 +485,7 @@ async fn incomplete_second_keepalive_request_releases_its_connection() {
         tcp,
         Router::new().route("/", get(|| async { "ready" })),
         stop,
+        TransportPolicy::default(),
     ));
     let stream = TcpStream::connect(address).await.unwrap();
     assert_second_header_expires(stream).await;
@@ -189,6 +505,10 @@ async fn incomplete_second_https_request_releases_its_connection() {
         crate::http_tls::Listener::new(tcp, cert.server()),
         Router::new().route("/", get(|| async { "ready" })),
         stop,
+        TransportPolicy {
+            secure: true,
+            ..Default::default()
+        },
     ));
     let socket = TcpStream::connect(address).await.unwrap();
     let connector = tokio_rustls::TlsConnector::from(cert.client());
@@ -244,6 +564,10 @@ async fn incomplete_https_headers_expire_after_tls_handshake() {
         crate::http_tls::Listener::new(tcp, cert.server()),
         Router::new().route("/", get(|| async { "ready" })),
         stop,
+        TransportPolicy {
+            secure: true,
+            ..Default::default()
+        },
     ));
     let socket = TcpStream::connect(address).await.unwrap();
     let connector = tokio_rustls::TlsConnector::from(cert.client());
@@ -353,9 +677,18 @@ async fn completed_http_and_https_bodies_keep_the_same_connection_after_late_can
                 crate::http_tls::Listener::new(tcp, cert.server()),
                 router,
                 stop,
+                TransportPolicy {
+                    secure: true,
+                    ..Default::default()
+                },
             ))
         } else {
-            tokio::spawn(serve_listener(tcp, router, stop))
+            tokio::spawn(serve_listener(
+                tcp,
+                router,
+                stop,
+                TransportPolicy::default(),
+            ))
         };
         let outcome = std::panic::AssertUnwindSafe(async {
             let mut builder = reqwest::Client::builder()

@@ -9,8 +9,10 @@ import base64
 import collections
 import datetime
 import getpass
+import ipaddress
 import json
 import os
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,23 +33,41 @@ def count(items):
     return dict(sorted(collections.Counter(items).items()))
 
 
+def literal_loopback_host(host):
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base_url")
     parser.add_argument("--username", default="flussonic")
     parser.add_argument("--max-pages", type=int, default=20)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--allow-insecure-http", action="store_true",
+                        help="permit Basic credentials over remote plaintext HTTP")
     args = parser.parse_args()
     parts = urllib.parse.urlsplit(args.base_url)
     if parts.scheme not in ("http", "https") or not parts.netloc or parts.username or parts.password or parts.query or parts.fragment or parts.path not in ("", "/"):
         parser.error("base_url must be an HTTP(S) origin without credentials")
     if args.max_pages < 1:
         parser.error("max-pages must be positive")
+    local_origin = literal_loopback_host(parts.hostname)
+    if parts.scheme == "http" and not local_origin:
+        if not args.allow_insecure_http:
+            parser.error("HTTP host is not a literal loopback IP; use HTTPS or --allow-insecure-http")
+        print("Warning: sending Basic management credentials over plaintext HTTP", file=sys.stderr)
     password = os.environ.get("FLUSSONIX_REFERENCE_PASSWORD")
     if password is None:
         password = getpass.getpass("Reference server password: ")
     authorization = "Basic " + base64.b64encode((args.username + ":" + password).encode()).decode()
-    opener = urllib.request.build_opener(NoRedirect())
+    handlers = [NoRedirect()]
+    if local_origin:
+        # A configured HTTP_PROXY must not receive local Basic credentials.
+        handlers.append(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(*handlers)
     reads = []
 
     def get(path, query):

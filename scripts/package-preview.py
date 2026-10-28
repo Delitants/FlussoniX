@@ -113,6 +113,83 @@ def web_payload(directory):
     return payload
 
 
+def read_notice_bundle(root, arch=None):
+    """Load a checked-in third-party bundle bound to both dependency locks."""
+    directory = root / 'third_party'
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError('third-party notice bundle is missing or linked')
+    manifest_bytes = read_regular(directory / 'manifest.json', 1024 * 1024)
+    manifest = json.loads(manifest_bytes)
+    if manifest.get('format') != 1 or not isinstance(manifest.get('packages'), list):
+        raise ValueError('invalid third-party notice manifest')
+    if not 1 <= len(manifest['packages']) <= 512:
+        raise ValueError('third-party package inventory is empty or too large')
+    targets = manifest.get('targets')
+    if (not isinstance(targets, list) or not targets or len(targets) > 8 or
+            any(not isinstance(target, str) for target in targets)):
+        raise ValueError('invalid third-party notice architecture scope')
+    if arch is not None and f'{arch}-unknown-linux-gnu' not in targets:
+        raise ValueError('third-party notice bundle does not cover binary architecture')
+    for label, path in [('Cargo.lock', root / 'Cargo.lock'),
+                        ('web/package-lock.json', root / 'web/package-lock.json'),
+                        ('Cargo.toml', root / 'Cargo.toml'),
+                        ('web/package.json', root / 'web/package.json'),
+                        ('vendor/quinn-proto/Cargo.toml', root / 'vendor/quinn-proto/Cargo.toml')]:
+        field = {'Cargo.lock': 'cargo_lock_sha256',
+                 'web/package-lock.json': 'web_lock_sha256',
+                 'Cargo.toml': 'cargo_manifest_sha256',
+                 'web/package.json': 'web_manifest_sha256',
+                 'vendor/quinn-proto/Cargo.toml': 'vendor_quinn_manifest_sha256'}[label]
+        if manifest.get(field) != hashlib.sha256(read_regular(path, 4 * 1024 * 1024)).hexdigest():
+            raise ValueError(f'third-party notice bundle is stale for {label}')
+    notices = read_regular(root / 'THIRD_PARTY_NOTICES.txt', 1024 * 1024)
+    if manifest.get('notices_sha256') != hashlib.sha256(notices).hexdigest():
+        raise ValueError('third-party notice index hash differs from manifest')
+    payload = {'THIRD_PARTY_NOTICES.txt': (notices, 0o644),
+               'third_party/manifest.json': (manifest_bytes, 0o644)}
+    names = set()
+    total = 0
+    for package in manifest['packages']:
+        if not isinstance(package, dict) or package.get('ecosystem') not in ('rust', 'web'):
+            raise ValueError('invalid third-party package entry')
+        for field in ('name', 'version', 'declared_license'):
+            value = package.get(field)
+            if not isinstance(value, str) or not 1 <= len(value) <= 256:
+                raise ValueError('invalid third-party package metadata')
+        files = package.get('files')
+        if not isinstance(files, list) or not 1 <= len(files) <= 32:
+            raise ValueError('third-party package is missing license/notice files')
+        for entry in files:
+            if not isinstance(entry, dict) or not isinstance(entry.get('path'), str):
+                raise ValueError('invalid third-party license path')
+            relative = Path(entry['path'])
+            if (relative.is_absolute() or relative.as_posix() != entry['path'] or
+                    len(relative.parts) < 4 or
+                    relative.parts[0] != 'licenses' or
+                    relative.parts[1] != package['ecosystem'] or
+                    any(part in ('', '.', '..') or not re.fullmatch(r'[A-Za-z0-9_. -]+', part)
+                        for part in relative.parts) or
+                    entry['path'] in names):
+                raise ValueError('unsafe or duplicate third-party license path')
+            names.add(entry['path'])
+            source = directory / relative
+            if source.is_symlink() or any(parent.is_symlink() for parent in source.parents if parent != directory):
+                raise ValueError('linked third-party license file')
+            data = read_regular(source, 1024 * 1024)
+            if entry.get('bytes') != len(data) or entry.get('sha256') != hashlib.sha256(data).hexdigest():
+                raise ValueError('third-party license file differs from manifest')
+            total += len(data)
+            if total > 16 * 1024 * 1024 or len(names) > 1024:
+                raise ValueError('third-party notice bundle exceeds size limit')
+            payload['third_party/' + entry['path']] = (data, 0o644)
+    for path in directory.rglob('*'):
+        if path.is_symlink():
+            raise ValueError('linked third-party notice path')
+        if path.is_file() and path.relative_to(directory).as_posix() not in names | {'manifest.json'}:
+            raise ValueError('unlisted third-party notice file')
+    return payload
+
+
 def package(args):
     if not re.fullmatch(r'[0-9a-f]{40}', args.revision):
         raise ValueError('revision must be a full lowercase 40-character source commit')
@@ -133,10 +210,18 @@ def package(args):
     arch = architecture(binary)
     if args.output_dir.resolve().is_relative_to(args.web_dir.resolve()):
         raise ValueError('output directory must be outside the built UI')
+    installation = read_regular(ROOT / 'docs/installation.md', 1024 * 1024)
     payload = {'bin/flussonix': (binary, 0o755),
-               'README.md': (read_regular(ROOT / 'docs/installation.md', 1024 * 1024), 0o644),
+               'README.md': (installation, 0o644),
+               'installation.md': (installation, 0o644),
+               'iptv-transport.md': (read_regular(ROOT / 'docs/iptv-transport.md', 1024 * 1024), 0o644),
+               'iptv-ha.md': (read_regular(ROOT / 'docs/iptv-ha.md', 1024 * 1024), 0o644),
                'bin/flussonix-service': (read_regular(ROOT / 'scripts/service-preview.py', 1024 * 1024), 0o755),
                'service-installation.md': (read_regular(ROOT / 'docs/service-installation.md', 1024 * 1024), 0o644)}
+    for name in ('LICENSE', 'NOTICE', 'vendor/quinn-proto/LICENSE-APACHE',
+                 'vendor/quinn-proto/LICENSE-MIT'):
+        payload[name] = (read_regular(ROOT / name, 1024 * 1024), 0o644)
+    payload.update(read_notice_bundle(ROOT, arch))
     payload.update(web_payload(args.web_dir))
     manifest = {'format': 1, 'name': 'FlussoniX', 'version': version,
                 'source_revision': args.revision, 'source_date_epoch': epoch,

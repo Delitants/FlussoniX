@@ -5,7 +5,10 @@ media pulls on long-haul links. It uses forward error correction (FEC) and
 bounded repair to recover some packet loss within a chosen buffer. It is
 separate from Flussonic-compatible M4S/M4SS; those URLs and protocols are
 unchanged. FXLink is not a Flussonic protocol and has not completed sustained
-WAN, competing-stream fairness, or production capacity qualification.
+WAN or production capacity qualification. A 15-minute two-stream private-LAN
+soak kept both HLS viewers active without imposed loss. A separate local
+two-stream, constrained-link test covers one limited fairness case. Neither
+establishes performance on a long-haul production link.
 
 ## Start a source listener
 
@@ -81,7 +84,23 @@ rather than extending the buffer. Check stream statistics for RTT, loss, FEC
 recovery, expired records, and charged state. FXLink egress counts application
 datagram bytes accepted into QUIC, not physical NIC or IP overhead.
 
+An FXLink connection stays bound to the peer address admitted at setup. If a
+node's address or NAT port changes, it must reconnect and receive fresh peer
+and viewer authorization. The current QUIC idle timeout is 10 seconds, so an
+address change can interrupt playback longer than the 500–1,500 ms transport
+buffer. FEC and repair still handle packet loss on an unchanged address.
+
 Test the intended stream bitrate, RTT, loss pattern, competing streams, and
 viewer behavior on your own link before using FXLink for critical delivery.
 A healthy TLS connection or short FEC test does not establish sustained
 playback under congestion.
+
+The local shared-connection qualification sends two independent 125-record/s
+sources through a 100 ms RTT UDP proxy, with 4,500 media bytes per record and
+a 500 ms FXLink buffer. At 15.5 Mb/s, both delivered 400 records in each of
+ten repeats, without proxy drops or expired records; the largest sampled
+delivery gap was 17 records. A shorter 12.5 Mb/s overload burst delivered 200
+records per source in each of ten repeats; its largest gap was 42 records.
+The longer 125-record/s load exceeds 12.5 Mb/s after transport overhead and
+cannot be sustained at that rate. These loopback results do not qualify WAN
+loss, long-running congestion, or a production link's usable capacity.

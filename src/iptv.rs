@@ -1,3 +1,6 @@
+pub mod client;
+pub mod ha;
+pub mod lease;
 pub mod store;
 
 use serde_json::Value;

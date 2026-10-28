@@ -1,4 +1,6 @@
 use clap::Parser;
+use flussonix::iptv::ha::connection::HaOptions;
+use flussonix::iptv::ha::{connection::HaPool, schema};
 use flussonix::server::{App, Options};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
@@ -17,6 +19,9 @@ struct Args {
     /// Disable plaintext HTTP binding; requires an HTTPS listener.
     #[arg(long, requires = "https_listen")]
     https_only: bool,
+    /// Permit management credentials over remote plaintext HTTP (unsafe).
+    #[arg(long, env = "FLUSSONIX_ALLOW_INSECURE_REMOTE_MANAGEMENT")]
+    allow_insecure_remote_management: bool,
     /// Public HTTPS origin when a trusted reverse proxy terminates TLS for the admin UI.
     #[arg(long, env = "FLUSSONIX_ADMIN_PUBLIC_ORIGIN")]
     admin_public_origin: Option<url::Url>,
@@ -83,6 +88,60 @@ struct Args {
     /// Public HTTP(S) origin used in subscriber playlists.
     #[arg(long, env = "FLUSSONIX_IPTV_PUBLIC_ORIGIN")]
     iptv_public_origin: Option<url::Url>,
+    /// Enable this node as the one IPTV lease authority.
+    #[arg(long, env = "FLUSSONIX_IPTV_LEASE_AUTHORITY")]
+    iptv_lease_authority: bool,
+    /// Owner-only PostgreSQL settings for the opt-in IPTV HA authority.
+    #[arg(
+        long,
+        env = "FLUSSONIX_IPTV_HA_DB_CONFIG",
+        requires = "iptv_lease_authority"
+    )]
+    iptv_ha_db_config: Option<PathBuf>,
+    /// Initialize an empty IPTV HA database once, without starting listeners.
+    #[arg(
+        long,
+        requires = "iptv_ha_db_config",
+        conflicts_with = "iptv_ha_init_from"
+    )]
+    iptv_ha_init_empty: bool,
+    /// Initialize an empty IPTV HA database from an owner-only IPTV export.
+    #[arg(
+        long,
+        requires = "iptv_ha_db_config",
+        conflicts_with = "iptv_ha_init_empty"
+    )]
+    iptv_ha_init_from: Option<PathBuf>,
+    /// Permit peer lease RPC over plaintext from the actual loopback socket only.
+    #[arg(
+        long,
+        env = "FLUSSONIX_IPTV_PEER_ALLOW_INSECURE_LOOPBACK",
+        requires = "iptv_lease_authority"
+    )]
+    iptv_peer_allow_insecure_loopback: bool,
+    /// Single FlussoniX IPTV authority origin for this viewer-serving node.
+    #[arg(long, env = "FLUSSONIX_IPTV_AUTHORITY")]
+    iptv_authority: Option<url::Url>,
+    /// Second HTTPS IPTV authority in the same HA cluster.
+    #[arg(long, env = "FLUSSONIX_IPTV_AUTHORITY_SECONDARY", requires_all = ["iptv_authority", "iptv_authority_cluster_id"])]
+    iptv_authority_secondary: Option<url::Url>,
+    /// Stable cluster UUID shared by both IPTV authorities.
+    #[arg(
+        long,
+        env = "FLUSSONIX_IPTV_AUTHORITY_CLUSTER_ID",
+        requires = "iptv_authority_secondary"
+    )]
+    iptv_authority_cluster_id: Option<uuid::Uuid>,
+    /// Private CA PEM used to verify the IPTV authority certificate.
+    #[arg(long, env = "FLUSSONIX_IPTV_AUTHORITY_CA", requires = "iptv_authority")]
+    iptv_authority_ca: Option<PathBuf>,
+    /// Allow the IPTV authority client to use literal loopback plaintext for tests.
+    #[arg(
+        long,
+        env = "FLUSSONIX_IPTV_AUTHORITY_ALLOW_INSECURE_LOOPBACK",
+        requires = "iptv_authority"
+    )]
+    iptv_authority_allow_insecure_loopback: bool,
     #[arg(long, default_value = "runtime/media")]
     media_dir: PathBuf,
     #[arg(long, default_value = "web/dist")]
@@ -91,14 +150,24 @@ struct Args {
     ffmpeg: String,
     #[arg(long, env = "FLUSSONIX_ADMIN_USER", default_value = "admin")]
     admin_user: String,
-    #[arg(long, env = "FLUSSONIX_ADMIN_PASSWORD", hide_env_values = true)]
-    admin_password: String,
+    #[arg(
+        long,
+        env = "FLUSSONIX_ADMIN_PASSWORD",
+        hide_env_values = true,
+        required_unless_present_any = ["iptv_ha_init_empty", "iptv_ha_init_from"]
+    )]
+    admin_password: Option<String>,
     #[arg(long, env = "FLUSSONIX_VIEW_USER")]
     view_user: Option<String>,
     #[arg(long, env = "FLUSSONIX_VIEW_PASSWORD", hide_env_values = true)]
     view_password: Option<String>,
-    #[arg(long, env = "FLUSSONIX_PEER_KEY", hide_env_values = true)]
-    peer_key: String,
+    #[arg(
+        long,
+        env = "FLUSSONIX_PEER_KEY",
+        hide_env_values = true,
+        required_unless_present_any = ["iptv_ha_init_empty", "iptv_ha_init_from"]
+    )]
+    peer_key: Option<String>,
     #[arg(long, default_value = "standalone")]
     role: String,
     #[arg(long, default_value = "local")]
@@ -130,6 +199,29 @@ fn bind_tcp_listener(address: SocketAddr) -> std::io::Result<tokio::net::TcpList
 }
 
 impl Args {
+    fn validate_iptv_authority_transport(&self) -> Result<(), String> {
+        if self.iptv_lease_authority && self.iptv_authority.is_none() {
+            return Err(
+                "IPTV lease authority requires --iptv-authority for viewer admission".into(),
+            );
+        }
+        if self.iptv_lease_authority
+            && self.https_listen.is_none()
+            && !self.iptv_peer_allow_insecure_loopback
+        {
+            return Err(
+                "IPTV lease authority requires HTTPS or explicit loopback test mode".into(),
+            );
+        }
+        if self.iptv_peer_allow_insecure_loopback
+            && !self.https_only
+            && !self.listen.ip().is_loopback()
+        {
+            return Err("IPTV insecure peer test mode requires a loopback HTTP listener".into());
+        }
+        Ok(())
+    }
+
     fn fxlink_features(&self) -> Result<flussonix::fxlink::Features, String> {
         if self.fxlink_repair_parity && !self.fxlink_trimmed_records {
             return Err("FXLink parity repair requires --fxlink-trimmed-records".into());
@@ -161,6 +253,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let a = Args::parse();
+    if a.iptv_ha_init_empty || a.iptv_ha_init_from.is_some() {
+        let options = HaOptions::load(
+            a.iptv_ha_db_config
+                .as_deref()
+                .expect("clap requires HA database config"),
+        )?;
+        let pool = HaPool::new(&options)?;
+        if a.iptv_ha_init_from
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err("IPTV HA import file must have an absolute path".into());
+        }
+        schema::initialize(&pool, a.iptv_ha_init_from.as_deref()).await?;
+        println!("IPTV HA schema initialized");
+        return Ok(());
+    }
+    if a.allow_insecure_remote_management {
+        eprintln!(
+            "WARNING: insecure remote HTTP management is enabled; credentials may be exposed on the network"
+        );
+    }
+    a.validate_iptv_authority_transport()?;
+    let iptv_ha = a
+        .iptv_ha_db_config
+        .as_deref()
+        .map(HaOptions::load)
+        .transpose()?;
     let fxlink_features = a.fxlink_features()?;
     let udp_rate = a.rtsp_udp_mbps.unwrap_or(100.0);
     let https_config = match (&a.https_cert, &a.https_key) {
@@ -198,11 +318,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let options = Options {
         admin_user: a.admin_user,
-        admin_password: a.admin_password,
+        admin_password: a
+            .admin_password
+            .expect("clap requires daemon admin password"),
         admin_public_origin: a.admin_public_origin,
+        allow_insecure_remote_management: a.allow_insecure_remote_management,
         view_user: a.view_user,
         view_password: a.view_password,
-        peer_key: a.peer_key,
+        peer_key: a.peer_key.expect("clap requires daemon peer key"),
         ffmpeg: a.ffmpeg,
         role: a.role,
         node_name: a.node_name,
@@ -212,10 +335,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         web_dir: a.web_dir,
         iptv_data: a.iptv_data,
         iptv_public_origin: a.iptv_public_origin,
+        iptv_lease_authority: a.iptv_lease_authority,
+        iptv_ha,
+        iptv_peer_allow_insecure_loopback: a.iptv_peer_allow_insecure_loopback,
+        iptv_authority: a.iptv_authority,
+        iptv_authority_secondary: a.iptv_authority_secondary,
+        iptv_authority_cluster_id: a.iptv_authority_cluster_id,
+        iptv_authority_ca: a.iptv_authority_ca,
+        iptv_authority_allow_insecure_loopback: a.iptv_authority_allow_insecure_loopback,
         drain: a.drain,
         fxlink_features,
     };
     let app = App::new(a.config, a.media_dir, options)?;
+    if let Some(pool) = &app.iptv_ha_pool {
+        pool.verify_startup().await?;
+        let authority = app.iptv_ha.as_ref().expect("HA authority constructed");
+        authority.catalog.load_current().await?;
+        authority.ledger.ready().await?;
+        // The database is canonical; a failed local export is reported in node health.
+        let _ = authority.catalog.retry_export().await;
+    }
     let listener = if a.https_only {
         None
     } else {
@@ -305,6 +444,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::select! { _=auth_cancel.cancelled()=>break, _=interval.tick()=>auth_app.playback_auth.renew_due().await }
         }
     });
+    let iptv_probe = app.iptv_authority_client.clone().map(|client| {
+        let probe_cancel = cancel.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = probe_cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        tokio::select! {
+                            _ = probe_cancel.cancelled() => break,
+                            _ = client.probe() => {},
+                        }
+                    }
+                }
+            }
+        })
+    });
     let telemetry_app = app.clone();
     let telemetry_cancel = cancel.clone();
     let telemetry = tokio::spawn(async move {
@@ -350,6 +507,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     cancel.cancel();
     let _ = supervisor.await;
     let _ = authorization.await;
+    if let Some(task) = iptv_probe {
+        let _ = task.await;
+    }
     let _ = telemetry.await;
     let _ = memory_maintenance.await;
     let vendor_result = vendor_playback.await;
@@ -420,6 +580,224 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ha_initialization_is_explicit_and_single_purpose() {
+        let base = [
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+            "--iptv-lease-authority",
+            "--iptv-ha-db-config",
+            "/tmp/owned-ha.json",
+        ];
+        assert!(Args::try_parse_from(base.into_iter().chain(["--iptv-ha-init-empty"])).is_ok());
+        assert!(
+            Args::try_parse_from([
+                "flussonix",
+                "--iptv-lease-authority",
+                "--iptv-ha-db-config",
+                "/tmp/owned-ha.json",
+                "--iptv-ha-init-from",
+                "/tmp/private-import.json"
+            ])
+            .is_ok(),
+            "one-shot import must not require unused daemon credentials"
+        );
+        assert!(
+            Args::try_parse_from([
+                "flussonix",
+                "--iptv-lease-authority",
+                "--iptv-ha-db-config",
+                "/tmp/owned-ha.json",
+                "--iptv-ha-init-empty"
+            ])
+            .is_ok(),
+            "one-shot empty initialization must not require unused daemon credentials"
+        );
+        assert!(
+            Args::try_parse_from(
+                base.into_iter()
+                    .chain(["--iptv-ha-init-from", "/tmp/private-import.json"])
+            )
+            .is_ok()
+        );
+        assert!(
+            Args::try_parse_from(base.into_iter().chain([
+                "--iptv-ha-init-empty",
+                "--iptv-ha-init-from",
+                "/tmp/private-import.json"
+            ]))
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "flussonix",
+                "--admin-password",
+                "owned-admin",
+                "--peer-key",
+                "owned-peer-key-123",
+                "--iptv-ha-init-empty"
+            ])
+            .is_err()
+        );
+    }
+    #[test]
+    fn ha_database_configuration_requires_explicit_authority_mode() {
+        assert!(
+            Args::try_parse_from([
+                "flussonix",
+                "--admin-password",
+                "owned-admin",
+                "--peer-key",
+                "owned-peer-key-123",
+                "--iptv-ha-db-config",
+                "/tmp/owned-ha.json"
+            ])
+            .is_err()
+        );
+        let parsed = Args::try_parse_from([
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+            "--iptv-lease-authority",
+            "--iptv-authority",
+            "https://authority.example/",
+            "--iptv-ha-db-config",
+            "/tmp/owned-ha.json",
+        ]);
+        assert!(parsed.is_ok(), "{}", parsed.err().unwrap());
+    }
+
+    #[test]
+    fn secondary_iptv_authority_requires_stable_cluster_identity() {
+        let base = [
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+            "--iptv-authority",
+            "https://a.example/",
+        ];
+        assert!(
+            Args::try_parse_from(
+                base.into_iter()
+                    .chain(["--iptv-authority-secondary", "https://b.example/"])
+            )
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from(base.into_iter().chain([
+                "--iptv-authority-secondary",
+                "https://b.example/",
+                "--iptv-authority-cluster-id",
+                "a3192376-6df5-4b76-a15c-43942fd3d466"
+            ]))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn iptv_authority_requires_tls_or_explicit_loopback_exception() {
+        let base = [
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+            "--iptv-lease-authority",
+            "--iptv-authority",
+            "https://authority.example/",
+        ];
+        assert!(
+            Args::try_parse_from(base)
+                .unwrap()
+                .validate_iptv_authority_transport()
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from(base.into_iter().chain([
+                "--https-listen",
+                "127.0.0.1:18443",
+                "--https-cert",
+                "cert.pem",
+                "--https-key",
+                "key.pem"
+            ]))
+            .unwrap()
+            .validate_iptv_authority_transport()
+            .is_ok()
+        );
+        assert!(
+            Args::try_parse_from(
+                base.into_iter()
+                    .chain(["--iptv-peer-allow-insecure-loopback"])
+            )
+            .unwrap()
+            .validate_iptv_authority_transport()
+            .is_ok()
+        );
+        assert!(
+            Args::try_parse_from(base.into_iter().chain([
+                "--iptv-peer-allow-insecure-loopback",
+                "--listen",
+                "0.0.0.0:18210"
+            ]))
+            .unwrap()
+            .validate_iptv_authority_transport()
+            .is_err()
+        );
+    }
+    #[test]
+    fn lease_authority_requires_its_own_viewer_authority_client_in_every_role() {
+        let base = [
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+            "--role",
+            "lb",
+            "--iptv-lease-authority",
+            "--iptv-peer-allow-insecure-loopback",
+        ];
+        let missing = Args::try_parse_from(base).unwrap();
+        assert!(
+            missing
+                .validate_iptv_authority_transport()
+                .unwrap_err()
+                .contains("--iptv-authority")
+        );
+        let configured = Args::try_parse_from(base.into_iter().chain([
+            "--iptv-authority",
+            "http://127.0.0.1:18443/",
+            "--iptv-authority-allow-insecure-loopback",
+        ]))
+        .unwrap();
+        assert!(configured.validate_iptv_authority_transport().is_ok());
+        for role in ["standalone", "source", "cdn"] {
+            let missing = Args::try_parse_from([
+                "flussonix",
+                "--admin-password",
+                "owned-admin",
+                "--peer-key",
+                "owned-peer-key-123",
+                "--role",
+                role,
+                "--iptv-lease-authority",
+                "--iptv-peer-allow-insecure-loopback",
+            ])
+            .unwrap();
+            assert!(
+                missing.validate_iptv_authority_transport().is_err(),
+                "{role} authority must not start without its viewer client"
+            );
+        }
+    }
     #[test]
     fn fxlink_geometry_startup_matrix() {
         const TEST: &str = "tests::fxlink_geometry_startup_matrix";
@@ -770,5 +1148,24 @@ mod tests {
         assert!(args(&["--fxlink-listen", "127.0.0.1:0"]).is_err());
         assert!(args(&["--fxlink-cert", "cert.pem"]).is_err());
         assert!(args(&["--fxlink-key", "key.pem"]).is_err());
+    }
+
+    #[test]
+    fn remote_http_management_override_is_opt_in() {
+        let base = [
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+        ];
+        let plain = Args::try_parse_from(base).unwrap();
+        assert!(!plain.allow_insecure_remote_management);
+        let explicit = Args::try_parse_from(
+            base.into_iter()
+                .chain(["--allow-insecure-remote-management"]),
+        )
+        .unwrap();
+        assert!(explicit.allow_insecure_remote_management);
     }
 }

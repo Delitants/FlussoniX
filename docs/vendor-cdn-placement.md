@@ -12,6 +12,13 @@ the independent vendor catalog; it needs no local stream rows and never pulls
 private media or transcodes. The CDN resolves its own vendor source, viewer
 policy and optional processing template.
 
+Choose actual Flussonic origins as source servers. A stream reported as
+`named_by: remote` belongs to a relay and is not an eligible origin; selecting
+that relay fails placement closed, even if another member of its failover group
+is an origin. Group only independent origins that carry the same content. In
+the authorized test cluster, cdn4 reports the test stream as `config` while
+cdn5 reports it as `remote`, so cdn4 is the source server and cdn5 is a CDN.
+
 Existing deployments with local LB stream metadata still work. Local rows,
 including disabled rows, take precedence over discovered vendor names. Vendor
 namespace exclusions, overlapping-prefix rejection and current source/group
@@ -67,6 +74,70 @@ CDN/standalone SRT playback uses the guarded listener. [Equivalent-origin failov
 [static activation](vendor-static-activation.md) and CDN/standalone
 [RTSP/RTSPS playback](vendor-daemon-playback.md) are supported separately. Configure equivalent intended viewer
 policies on LB and CDN; this increment does not infer equivalence between them.
+
+### Bounded live topology check
+
+From a source checkout, `scripts/qualify-live-vendor.py --topology` accepts the
+same `--binary`, `--source`, `--stream` and owner-only `--cluster-key-file`
+arguments as its single-node mode. It starts an isolated loopback LB and CDN,
+uses on-demand source activation and a random local viewer token, follows the
+LB placement and CDN ticket redirects, decodes one HLS segment, checks denial
+without the viewer token at both nodes, and confirms the LB has no media stream.
+It stops both process groups and deletes their files. Against the authorized
+cdn4 test stream, both secure M4SS and M4FS source pulls delivered decoded
+1920×1080 H.264/AAC through this path. An invalid Cluster key prevented LB
+placement.
+
+Adding `--output m4s` follows the same guarded redirects and validates native
+M4S track metadata and a framed media record. Both secure source transports
+advertised H.264/AAC and delivered native media in the live loopback topology.
+The HLS mode performs strict FFmpeg decoding; the M4S mode checks wire framing
+and metadata, not independent elementary-stream decoding.
+Adding `--output m4f` checks a live control announcement and retrieves its
+timestamped M4F segment, including track metadata and a nonempty media box.
+M4SS and M4FS source pulls both passed. The M4FS relay preserves the origin's
+multi-digit announcement sequence; this check does not fully decode M4F sample
+tables or qualify every reference stream.
+
+This verifies one live source and two local FlussoniX nodes. It does not
+establish placement across production CDN hosts, private LAN routing, uplink
+saturation decisions, failover under loss, HEVC, or target-scale capacity.
+
+A bounded cross-host check also ran the current FlussoniX CDN binary on an
+isolated port at cdn5, with a local FlussoniX LB and the live M4SS source at
+cdn4. The LB placed the viewer on cdn5; cdn5 served a 1.43 MB HLS segment that
+FFmpeg decoded, and both nodes returned 403 without the viewer token. The
+viewer and LB management path used an SSH tunnel because the Linux test host
+cannot connect directly to the isolated CDN port; cdn5 reached its cdn4 source
+directly. The disposable daemon, tunnel and files were removed afterward.
+
+A second bounded check ran the current FlussoniX binary on isolated port
+`28210` on both authorized CDN hosts: cdn4 as LB and cdn5 as CDN. The LB
+queried and admitted the CDN over their direct private-LAN route, then placed
+the viewer there with a single-use ticket. cdn5 pulled the live M4SS source
+from cdn4 and served a 1.56 MB HLS segment that FFmpeg decoded. The observed
+HTTP sequence was 302 placement, 302 ticket redemption, 200 playlist and 200
+segment. Both nodes returned 403 without the viewer token, and the LB reported
+zero local media streams. The private HTTP peer route required the explicit
+per-peer `flussonix_allow_insecure_peer_http` setting; without it the default
+peer-key transport guard rejected placement. Only the disposable config used
+that exception. The viewer reached each isolated listener through an SSH
+tunnel because the Linux test host cannot connect directly to those ports.
+Both daemons, tunnels and temporary files were removed and port `28210` was
+verified free on each host afterward.
+
+A third bounded check used a temporary one-day CA and a certificate matching
+cdn5's private IP. The remote cdn4 LB queried and admitted cdn5 through
+`https://172.16.0.8:28213/` with `flussonix_tls_ca` and no plain-HTTP peer
+exception. The viewer reached cdn5 through a verified HTTPS SSH tunnel. Its
+untrusted-certificate control failed verification; with the test CA, the
+placement/ticket/playlist/segment sequence returned 302/302/200/200 and a
+1.56 MB segment that FFmpeg decoded. Both nodes denied tokenless playback with
+403, and the LB again reported zero local media streams. The temporary
+certificate, private key, daemons, tunnels and files were removed afterward;
+the original services remained active and the isolated ports were free.
+Direct public viewer delivery, sustained load and failover remain unqualified
+by these bounded checks.
 
 ## Flussonic CDN destinations
 

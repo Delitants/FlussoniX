@@ -15,8 +15,9 @@ test('IPTV forms create packages and subscribers without JSON fields',async({pag
  await page.getByRole('button',{name:'Save package',exact:true}).click();await expect(page.getByRole('cell',{name:pack,exact:true})).toBeVisible();
  await page.getByRole('button',{name:'Subscribers',exact:true}).click();await page.getByRole('button',{name:'Add subscriber',exact:true}).click();
  await page.getByLabel('Subscriber name',{exact:true}).fill(subscriber);await page.getByLabel(pack,{exact:true}).check();
- await page.getByLabel('Maximum sessions per node',{exact:true}).fill('2');await page.getByLabel('Expires at (UTC)',{exact:true}).fill('2099-01-01T00:00');
+ await page.getByLabel('Maximum sessions on this node',{exact:true}).fill('2');await page.getByLabel('Expires at (UTC)',{exact:true}).fill('2099-01-01T00:00');
  await expect(page.getByRole('dialog').locator('textarea')).toHaveCount(0);await page.getByRole('button',{name:'Save subscriber',exact:true}).click();
+ await expect(page.getByRole('dialog')).toHaveCount(0);
  const saved=await(await request.get('/streamer/api/v3/iptv/subscribers/'+subscriber,{headers})).json();
  expect(saved.packages).toEqual([pack]);expect(saved.max_sessions).toBe(2);expect(saved.flussonix_expires_at).toBe('2099-01-01T00:00:00Z');expect(saved.token.length).toBeGreaterThanOrEqual(32);
  const row=page.getByRole('row').filter({has:page.getByRole('cell',{name:subscriber,exact:true})});await expect(row).toContainText('••••');await expect(row).not.toContainText(saved.token);
@@ -34,6 +35,76 @@ test('IPTV forms create packages and subscribers without JSON fields',async({pag
  const rotated=await(await request.get('/streamer/api/v3/iptv/subscribers/'+subscriber,{headers})).json();expect(rotated.token).not.toBe(saved.token);
  page.once('dialog',dialog=>dialog.accept());await row.getByRole('button',{name:'Delete',exact:true}).click();await expect(row).toHaveCount(0);await expect(page.getByRole('status')).toContainText('viewers');
 });
+test('IPTV HA keeps unsaved package fields after a revision conflict',async({page})=>{
+ await page.route('**/flussonix/api/v1/node',async route=>{
+  const response=await route.fetch();const node=await response.json();
+  node.iptv_cluster={mode:'authority',backend:'postgresql',ready:true,database_ready:true,catalog_revision:1,
+   capacity:{active_sessions:0,max_sessions:100000,operation_count:0,max_operations:200000},export_healthy:false};
+  await route.fulfill({response,json:node});
+ });
+ let revision=1,attempts=0;const headersSeen:string[]=[];let packages:{name:string;channels:string[]}[]=[];
+ await page.route('**/streamer/api/v3/iptv**',async route=>{
+  const request=route.request(),url=new URL(request.url()),method=request.method();
+  const etag=`"${revision}"`;const base='/streamer/api/v3/iptv';
+  if(url.pathname===base&&method==='GET')return route.fulfill({status:200,headers:{etag},json:{}});
+  if(url.pathname===base+'/packages'&&method==='GET')return route.fulfill({status:200,headers:{etag},json:{packages}});
+  if(url.pathname===base+'/subscribers'&&method==='GET')return route.fulfill({status:200,headers:{etag},json:{subscribers:[]}});
+  if(url.pathname.startsWith(base+'/packages/')&&method==='PUT'){
+   headersSeen.push(request.headers()['if-match']||'');attempts++;
+   if(attempts===1){revision=2;return route.fulfill({status:412,headers:{etag:'"2"'},json:{errors:[{message:'IPTV catalog revision changed'}]}})}
+   if(request.headers()['if-match']!==`"${revision}"`)return route.fulfill({status:428,json:{errors:[{message:'IPTV catalog revision required'}]}});
+   const name=decodeURIComponent(url.pathname.slice((base+'/packages/').length));const body=request.postDataJSON();
+   packages=[{name,channels:body.channels}];revision++;
+   return route.fulfill({status:200,headers:{etag:`"${revision}"`},json:packages[0]});
+  }
+  return route.fulfill({status:404,json:{errors:[{message:'unknown IPTV request'}]}});
+ });
+ await page.getByRole('button',{name:'Config',exact:true}).click();await page.getByRole('button',{name:'IPTV',exact:true}).click();
+ await expect(page.getByText('Local export needs attention')).toBeVisible();
+ await page.getByRole('button',{name:'Add package',exact:true}).click();await page.getByLabel('Package name',{exact:true}).fill('kept-package');
+ await page.getByRole('button',{name:'Save package',exact:true}).click();
+ await expect(page.getByRole('dialog')).toBeVisible();await expect(page.getByLabel('Package name',{exact:true})).toHaveValue('kept-package');
+ await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Catalog changed');
+ await page.getByRole('button',{name:'Refresh catalog to retry',exact:true}).click();
+ await page.getByRole('button',{name:'Save package',exact:true}).click();
+ await expect(page.getByRole('dialog')).toHaveCount(0);await expect(page.getByRole('cell',{name:'kept-package',exact:true})).toBeVisible();
+ expect(headersSeen).toEqual(['"1"','"2"']);
+});
+test('IPTV HA live authority protects a concurrent editor and masks view-role tokens',async({page,request,browser})=>{
+ test.skip(!process.env.FLUSSONIX_HA_UI_READY_FILE,'Separate owned PostgreSQL authority fixture is not running');
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const root=await request.get('/streamer/api/v3/iptv',{headers});expect(root.status()).toBe(404);
+ expect(root.headers()['etag']).toBe('"0"');
+ const enable=await request.put('/streamer/api/v3/iptv',{headers:{...headers,'If-Match':'"0"'},data:{}});expect(enable.ok()).toBeTruthy();
+ const channel='ha-ui-channel-'+Date.now(),pack='ha-ui-package-'+Date.now(),subscriber='ha-ui-subscriber-'+Date.now();
+ expect((await request.put('/streamer/api/v3/streams/'+channel,{headers,data:{$reset:true,static:false,inputs:[{url:'testsrc://'}]}})).ok()).toBeTruthy();
+ const created=await request.put('/streamer/api/v3/iptv/packages/'+pack,{headers:{...headers,'If-Match':'"1"'},data:{channels:[]}});
+ expect(created.ok()).toBeTruthy();expect(created.headers()['etag']).toBe('"2"');
+ await page.getByRole('button',{name:'Config',exact:true}).click();await page.getByRole('button',{name:'IPTV',exact:true}).click();
+ await expect(page.getByRole('region',{name:'IPTV HA health'})).toContainText('Catalog revision');
+ const row=page.getByRole('row').filter({has:page.getByRole('cell',{name:pack,exact:true})});
+ await row.getByRole('button',{name:'Edit',exact:true}).click();await page.getByLabel(channel,{exact:true}).check();
+ const other=await request.put('/streamer/api/v3/iptv/packages/'+pack,{headers:{...headers,'If-Match':'"2"'},data:{channels:[]}});
+ expect(other.ok()).toBeTruthy();expect(other.headers()['etag']).toBe('"3"');
+ await page.getByRole('button',{name:'Save package',exact:true}).click();
+ await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Catalog changed');
+ await expect(page.getByLabel(channel,{exact:true})).toBeChecked();
+ await page.getByRole('button',{name:'Refresh catalog to retry',exact:true}).click();
+ await page.getByRole('button',{name:'Save package',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+ const saved=await request.get('/streamer/api/v3/iptv/packages/'+pack,{headers});expect((await saved.json()).channels).toEqual([channel]);
+ const member=await request.put('/streamer/api/v3/iptv/subscribers/'+subscriber,{headers:{...headers,'If-Match':'"4"'},data:{packages:[pack],token:'ha-ui-owned-secret-token'}});
+ expect(member.ok()).toBeTruthy();
+ const view=await browser.newPage();try{
+  await view.goto('/admin/');await view.getByLabel('Username').fill(process.env.FLUSSONIX_VIEW_USER||'viewer');
+  await view.getByLabel('Password',{exact:true}).fill(process.env.FLUSSONIX_VIEW_PASSWORD!);
+  await view.getByRole('button',{name:'Sign in',exact:true}).click();
+  await view.getByRole('button',{name:'Config',exact:true}).click();await view.getByRole('button',{name:'IPTV',exact:true}).click();
+  await view.getByRole('button',{name:'Subscribers',exact:true}).click();
+  const viewerRow=view.getByRole('row').filter({has:view.getByRole('cell',{name:subscriber,exact:true})});
+  await expect(viewerRow).toContainText('[redacted]');await expect(viewerRow).not.toContainText('ha-ui-owned-secret-token');
+  await expect(viewerRow.getByRole('button',{name:'Reveal token',exact:true})).toHaveCount(0);
+ }finally{await view.close();}
+});
 test('stream editor offers the built-in IPTV viewer policy',async({page,request})=>{
  const name='ui-iptv-policy-'+Date.now();
  await page.getByRole('button',{name:'Add stream',exact:true}).click();await page.getByLabel('Stream name',{exact:true}).fill(name);
@@ -47,7 +118,7 @@ test('IPTV subscriber fields validate inline and disabling explains viewer revoc
  await request.put('/streamer/api/v3/iptv',{headers,data:{}});
  await page.getByRole('button',{name:'Config',exact:true}).click();await page.getByRole('button',{name:'IPTV',exact:true}).click();
  await page.getByRole('button',{name:'Subscribers',exact:true}).click();await page.getByRole('button',{name:'Add subscriber',exact:true}).click();
- await page.getByLabel('Subscriber name',{exact:true}).fill('ui-invalid-'+Date.now());await page.getByLabel('Maximum sessions per node',{exact:true}).fill('0');
+ await page.getByLabel('Subscriber name',{exact:true}).fill('ui-invalid-'+Date.now());await page.getByLabel('Maximum sessions on this node',{exact:true}).fill('0');
  await page.getByRole('button',{name:'Save subscriber',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('positive');
  await page.getByRole('button',{name:'Cancel',exact:true}).click();
  await page.getByRole('button',{name:'Disable IPTV',exact:true}).click();await expect(page.getByRole('status')).toContainText('viewers');
@@ -82,6 +153,30 @@ test('IPTV remains reachable from mobile Configuration',async({page})=>{
  test.setTimeout(12000);
  await page.setViewportSize({width:375,height:800});await page.getByRole('button',{name:'Config',exact:true}).click();
  await page.getByRole('button',{name:'IPTV',exact:true}).click();await expect(page.getByRole('heading',{name:'IPTV',exact:true})).toBeVisible();
+});
+test('IPTV screen warns when a CDN lacks cluster authority',async({page})=>{
+ await page.route('**/flussonix/api/v1/node',async route=>{
+  const response=await route.fetch();const node=await response.json();
+  node.iptv_cluster={mode:'missing_authority',configured:false,ready:false,reason:'IPTV authority is required for cluster session limits'};
+  await route.fulfill({response,json:node});
+ });
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await page.getByRole('button',{name:'IPTV',exact:true}).click();
+ await expect(page.getByRole('alert')).toContainText('authority is required');
+ await expect(page.getByRole('button',{name:'Enable IPTV',exact:true})).toHaveCount(0);
+});
+test('IPTV HA client shows each authority state without local catalog edits',async({page})=>{
+ await page.route('**/flussonix/api/v1/node',async route=>{
+  const response=await route.fetch();const node=await response.json();
+  node.iptv_cluster={mode:'client',configured:true,ready:true,connected:true,origins:[
+   {origin:'https://authority-one.example/',reachable:false,ready:false,refused:false},
+   {origin:'https://authority-two.example/',reachable:true,ready:true,refused:false}
+  ]};await route.fulfill({response,json:node});
+ });
+ await page.getByRole('button',{name:'Config',exact:true}).click();await page.getByRole('button',{name:'IPTV',exact:true}).click();
+ await expect(page.getByRole('region',{name:'IPTV authority origins'})).toContainText('authority-one.example');
+ await expect(page.getByRole('region',{name:'IPTV authority origins'})).toContainText('authority-two.example');
+ await expect(page.getByRole('button',{name:'Add package',exact:true})).toHaveCount(0);
 });
 test('status strip reports the running server version and follows node status updates',async({page,request})=>{
  const health=await(await request.get('/health')).json();

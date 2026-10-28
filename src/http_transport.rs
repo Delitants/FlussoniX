@@ -2,9 +2,10 @@
 use axum::{
     Router,
     body::Body,
-    extract::{ConnectInfo, Request},
-    middleware::{Next, from_fn},
-    response::Response,
+    extract::{ConnectInfo, Request, State},
+    http::{StatusCode, header},
+    middleware::{Next, from_fn_with_state},
+    response::{IntoResponse, Response},
     serve::Listener,
 };
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
@@ -275,6 +276,21 @@ impl Admission {
     }
 }
 struct Guarded<L>(L, Arc<Admission>);
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TransportPolicy {
+    pub secure: bool,
+    pub allow_insecure_remote_management: bool,
+}
+
+fn remote_management_request(request: &Request) -> bool {
+    let path = request.uri().path();
+    path == "/admin"
+        || path.starts_with("/admin/")
+        || path == "/streamer/api/v3"
+        || path.starts_with("/streamer/api/v3/")
+        || ((path == "/flussonix/api/v1" || path.starts_with("/flussonix/api/v1/"))
+            && request.headers().contains_key(header::AUTHORIZATION))
+}
 impl<L: Listener<Addr = SocketAddr>> Listener for Guarded<L>
 where
     L::Io: ResetSocket,
@@ -311,26 +327,49 @@ where
     }
 }
 async fn context(
+    State(policy): State<TransportPolicy>,
     ConnectInfo(peer): ConnectInfo<Peer>,
     mut request: Request,
     next: Next,
 ) -> Response {
     peer.control.first_request.store(true, Ordering::Release);
+    if !policy.secure
+        && !policy.allow_insecure_remote_management
+        && !is_loopback_peer(peer.address.ip())
+        && remote_management_request(&request)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CACHE_CONTROL, "no-store")],
+            "Remote management requires HTTPS or a local tunnel",
+        )
+            .into_response();
+    }
     request.extensions_mut().insert(ConnectInfo(peer.address));
     request.extensions_mut().insert(peer.control);
     next.run(request).await
+}
+
+fn is_loopback_peer(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(ipv4) => ipv4.is_loopback(),
+        IpAddr::V6(ipv6) => {
+            ipv6.is_loopback() || ipv6.to_ipv4_mapped().is_some_and(|ipv4| ipv4.is_loopback())
+        }
+    }
 }
 // Existing public TLS Listener and its handshake bounds remain unchanged.
 pub(crate) async fn serve_listener<L: Listener<Addr = SocketAddr>>(
     listener: L,
     router: Router,
     cancel: CancellationToken,
+    policy: TransportPolicy,
 ) -> io::Result<()>
 where
     L::Io: ResetSocket,
 {
     let mut listener = Guarded(listener, Admission::for_process());
-    let router = router.layer(from_fn(context));
+    let router = router.layer(from_fn_with_state(policy, context));
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
@@ -370,7 +409,11 @@ pub async fn serve(
     app: Arc<crate::server::App>,
     cancel: CancellationToken,
 ) -> io::Result<()> {
-    serve_listener(tcp, crate::server::router(app), cancel).await
+    let policy = TransportPolicy {
+        secure: false,
+        allow_insecure_remote_management: app.options.allow_insecure_remote_management,
+    };
+    serve_listener(tcp, crate::server::router(app), cancel, policy).await
 }
 
 #[cfg(test)]

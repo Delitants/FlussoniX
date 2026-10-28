@@ -31,7 +31,7 @@ fn ports() -> (u16, Vec<UdpSocket>) {
     }
     panic!("owned RTP ports unavailable")
 }
-async fn decode(path: &Path, video: Option<&str>, audio: &[&str]) {
+pub async fn decode(path: &Path, video: Option<&str>, audio: &[&str]) {
     let probe = tokio::time::timeout(
         Duration::from_secs(30),
         Command::new("/usr/bin/ffprobe")
@@ -94,6 +94,65 @@ async fn decode(path: &Path, video: Option<&str>, audio: &[&str]) {
         path.display(),
         String::from_utf8_lossy(&decoded.stderr)
     );
+    if video.is_some() {
+        // The owned source is fixed at 25 fps. A clean decode and a minimum
+        // frame count alone can miss a long run of absent pictures.
+        let timing = tokio::time::timeout(
+            Duration::from_secs(30),
+            Command::new("/usr/bin/ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_frames",
+                    "-show_entries",
+                    "frame=best_effort_timestamp_time",
+                    "-of",
+                    "json",
+                ])
+                .arg(path)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("Video timing probe stalled: {}", path.display()))
+        .unwrap();
+        assert!(
+            timing.status.success() && timing.stderr.is_empty(),
+            "Video timing probe {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&timing.stderr)
+        );
+        let data: Value = serde_json::from_slice(&timing.stdout).unwrap();
+        let frames = data["frames"].as_array().unwrap();
+        assert!(
+            frames.len() >= 20,
+            "Video frames {}: {data}",
+            path.display()
+        );
+        let timestamps: Vec<f64> = frames
+            .iter()
+            .map(|frame| {
+                frame["best_effort_timestamp_time"]
+                    .as_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        for pair in timestamps.windows(2) {
+            let delta = pair[1] - pair[0];
+            assert!(
+                delta > 0.0 && delta <= 0.06,
+                "video picture gap in {}: {:.3} s between {:.3} and {:.3}",
+                path.display(),
+                delta,
+                pair[0],
+                pair[1]
+            );
+        }
+    }
 }
 pub async fn qualify(
     video: Option<&str>,

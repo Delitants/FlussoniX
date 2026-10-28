@@ -2,6 +2,7 @@
 use super::*;
 use crate::fxlink::{Listener, Provider, Request, Source};
 use futures_util::future::{BoxFuture, join_all};
+use std::collections::BTreeMap;
 use std::sync::{
     Mutex as StdMutex,
     atomic::{AtomicU64, AtomicUsize},
@@ -60,6 +61,91 @@ impl Drop for DumpOnFailure {
 }
 const RECORDS: usize = 400;
 const PERIOD: Duration = Duration::from_millis(8);
+const SHAPED_BPS: u64 = 15_500_000;
+const OVERLOADED_BPS: u64 = 12_500_000;
+const ONE_WAY_DELAY: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Default)]
+struct LinkReport {
+    received: [usize; 2],
+    forwarded: [usize; 2],
+    bytes: [usize; 2],
+    peak_queue_bytes: usize,
+    peak_downlink_backlog: Duration,
+}
+
+async fn shaped_link(
+    socket: tokio::net::UdpSocket,
+    remote: SocketAddr,
+    bits_per_second: u64,
+    stop: CancellationToken,
+) -> LinkReport {
+    let mut report = LinkReport::default();
+    let mut pending = BTreeMap::<(tokio::time::Instant, u64), (Bytes, SocketAddr, usize)>::new();
+    let mut client = None;
+    let mut serial = 0u64;
+    let mut queued_bytes = 0usize;
+    let mut downlink_end = tokio::time::Instant::now();
+    let mut draining = false;
+    let mut quiet_at = tokio::time::Instant::now();
+    let mut drain_deadline = tokio::time::Instant::now();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let due = pending
+            .first_key_value()
+            .map(|(key, _)| key.0)
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(1));
+        tokio::select! {
+            _ = stop.cancelled(), if !draining => {
+                draining = true;
+                quiet_at = tokio::time::Instant::now() + Duration::from_millis(150);
+                drain_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            }
+            _ = tokio::time::sleep_until(quiet_at), if draining && pending.is_empty() => break,
+            _ = tokio::time::sleep_until(drain_deadline), if draining => panic!("owned shaped link did not drain"),
+            _ = tokio::time::sleep_until(due), if !pending.is_empty() => {
+                let (_, (packet, destination, direction)) = pending.pop_first().unwrap();
+                queued_bytes -= packet.len();
+                socket.send_to(&packet, destination).await.unwrap();
+                report.forwarded[direction] += 1;
+            }
+            packet = socket.recv_from(&mut buffer) => {
+                let (len, from) = packet.unwrap();
+                let (destination, direction) = if from == remote {
+                    (client.expect("origin replied before a client request"), 1)
+                } else {
+                    assert!(client.is_none_or(|known| known == from), "unexpected second link client");
+                    client = Some(from);
+                    (remote, 0)
+                };
+                report.received[direction] += 1;
+                report.bytes[direction] += len;
+                let now = tokio::time::Instant::now();
+                let due = if direction == 1 {
+                    let nanos = (len as u128 * 8 * 1_000_000_000).div_ceil(bits_per_second as u128);
+                    downlink_end = downlink_end.max(now) + Duration::from_nanos(nanos as u64);
+                    report.peak_downlink_backlog = report.peak_downlink_backlog.max(downlink_end - now);
+                    downlink_end + ONE_WAY_DELAY
+                } else {
+                    now + ONE_WAY_DELAY
+                };
+                serial += 1;
+                queued_bytes += len;
+                report.peak_queue_bytes = report.peak_queue_bytes.max(queued_bytes);
+                assert!(pending.len() < 4096 && queued_bytes <= 8 << 20, "owned shaped link exceeded its queue bound");
+                pending.insert((due, serial), (Bytes::copy_from_slice(&buffer[..len]), destination, direction));
+                if draining {
+                    quiet_at = now + Duration::from_millis(150);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        report.received, report.forwarded,
+        "shaped link silently discarded datagrams"
+    );
+    report
+}
 fn record(stream: usize, sequence: usize) -> Bytes {
     let mut bytes = vec![stream as u8 + 0x40; 4500];
     bytes[..4].copy_from_slice(&4496u32.to_be_bytes());
@@ -102,16 +188,57 @@ impl Provider for Feed {
 }
 #[tokio::test]
 async fn fixed_clock_multishard_source_keeps_125_records_per_second() {
-    paced(1).await;
+    paced(1, None, RECORDS).await;
 }
 #[tokio::test]
 async fn shared_connection_keeps_two_independent_125_record_sources() {
-    paced(2).await;
+    paced(2, None, RECORDS).await;
+}
+#[tokio::test]
+async fn healthy_v9_source_releases_geometry_state() {
+    let _serial = test_lock().lock().await;
+    paced_locked(
+        1,
+        None,
+        RECORDS,
+        crate::fxlink::Features {
+            trimmed_records: true,
+            repair_parity: true,
+            bootstrap_repair: true,
+            geometry_hints: true,
+        },
+    )
+    .await;
 }
 
-async fn paced(streams: usize) {
+#[tokio::test]
+async fn two_sources_share_a_constrained_100ms_link_without_starvation() {
+    paced(2, Some(SHAPED_BPS), RECORDS).await;
+}
+
+#[tokio::test]
+async fn two_sources_share_a_short_overloaded_100ms_link_without_starvation() {
+    paced(2, Some(OVERLOADED_BPS), 200).await;
+}
+
+async fn paced(streams: usize, shaped_bps: Option<u64>, records: usize) {
     assert!((1..=2).contains(&streams));
     let _serial = test_lock().lock().await;
+    paced_locked(
+        streams,
+        shaped_bps,
+        records,
+        crate::fxlink::Features::default(),
+    )
+    .await;
+}
+
+async fn paced_locked(
+    streams: usize,
+    shaped_bps: Option<u64>,
+    records: usize,
+    features: crate::fxlink::Features,
+) {
     let baseline = global().used();
     let permits = fec_slots().available_permits();
     let settings = Settings {
@@ -119,21 +246,33 @@ async fn paced(streams: usize) {
         ..Default::default()
     };
     let cert = test_tls::Certificates::new();
-    let listener = Listener::bind(
+    let listener = Listener::bind_with_features(
         "127.0.0.1:0".parse().unwrap(),
         &cert.cert,
         &cert.key,
         settings.clone(),
+        features,
     )
     .unwrap();
-    let address = listener.address();
+    let remote = listener.address();
+    let (address, link) = if let Some(bits_per_second) = shaped_bps {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(shaped_link(socket, remote, bits_per_second, cancel.clone()));
+        (address, Some((cancel, task)))
+    } else {
+        (remote, None)
+    };
     let mut channels = HashMap::new();
     let mut senders = Vec::new();
     let polled: Vec<_> = (0..streams)
         .map(|_| Arc::new(AtomicUsize::new(0)))
         .collect();
     for index in 0..streams {
-        let (tx, rx) = mpsc::channel(16);
+        // The shaped 100 ms RTT needs startup flight room. Stay below the
+        // production native fan-out's 256-record bound.
+        let (tx, rx) = mpsc::channel(if shaped_bps.is_some() { 64 } else { 16 });
         channels.insert(index.to_string(), rx);
         senders.push(tx);
     }
@@ -145,7 +284,7 @@ async fn paced(streams: usize) {
         }),
         stop.clone(),
     ));
-    let pool = ClientPool::default();
+    let pool = ClientPool::with_features(features);
     let mut subscriptions = Vec::new();
     for index in 0..streams {
         subscriptions.push(
@@ -179,7 +318,7 @@ async fn paced(streams: usize) {
             let count = received[index].clone();
             let stop = work_stop.clone();
             tokio::spawn(async move {
-                for sequence in 0..RECORDS {
+                for sequence in 0..records {
                     let value = tokio::select! { biased;
                         _ = stop.cancelled() => return Err("fixture stopped".to_owned()),
                         value = sub.recv() => value?,
@@ -207,11 +346,13 @@ async fn paced(streams: usize) {
     let _dump_on_failure = DumpOnFailure(history.clone());
     let source_polled = polled.clone();
     let source_received = received.clone();
+    let max_received_gap = Arc::new(AtomicUsize::new(0));
+    let observed_gap = max_received_gap.clone();
     let producer = tokio::spawn(async move {
         let start = tokio::time::Instant::now();
         let mut admitted = [0usize; 2];
         let outcome = async {
-            for sequence in 0..RECORDS {
+            for sequence in 0..records {
                 let scheduled = start + PERIOD * sequence as u32;
                 tokio::select! { biased;
                     _ = producer_stop.cancelled() => return Err("source fixture stopped".to_owned()),
@@ -225,6 +366,9 @@ async fn paced(streams: usize) {
                     for stream in 0..streams {
                         polled_before[stream]=source_polled[stream].load(Ordering::Acquire);
                         received_before[stream]=source_received[stream].load(Ordering::Acquire);
+                    }
+                    if streams == 2 {
+                        observed_gap.fetch_max(received_before[0].abs_diff(received_before[1]), Ordering::Relaxed);
                     }
                     let attempt_ns=start.elapsed().as_nanos();
                     let result=tx.try_send(Ok(record(index, sequence)));
@@ -253,7 +397,7 @@ async fn paced(streams: usize) {
         tokio::time::timeout(Duration::from_secs(2), async {
             while received
                 .iter()
-                .any(|n| n.load(Ordering::Acquire) != RECORDS)
+                .any(|n| n.load(Ordering::Acquire) != records)
             {
                 if states.iter().any(|s| !s.current()) {
                     return Err("active source retired before complete delivery".to_owned());
@@ -271,8 +415,9 @@ async fn paced(streams: usize) {
     }
     .await;
     eprintln!(
-        "streams={streams} result={outcome:?} source_clock_max_late_ms={} polled={:?} received={:?}",
+        "streams={streams} result={outcome:?} source_clock_max_late_ms={} max_received_gap={} polled={:?} received={:?}",
         max_late.load(Ordering::Relaxed),
+        max_received_gap.load(Ordering::Relaxed),
         polled
             .iter()
             .map(|n| n.load(Ordering::Acquire))
@@ -296,6 +441,15 @@ async fn paced(streams: usize) {
     pool.close().await;
     stop.cancel();
     server.await.unwrap().unwrap();
+    let link_report = if let Some((cancel, task)) = link {
+        cancel.cancel();
+        Some(task.await.unwrap())
+    } else {
+        None
+    };
+    if let Some(report) = &link_report {
+        eprintln!("constrained_link={report:?}");
+    }
     for telemetry in &stats {
         assert_eq!(telemetry.snapshot()["state_bytes"], 0);
     }
@@ -307,11 +461,42 @@ async fn paced(streams: usize) {
     );
     production.expect("owned producer must shut down");
     outcome.expect("fixed-rate source must fit bounded input queues");
+    if let Some(report) = link_report {
+        // An oversubscribed burst can accumulate one link-buffer interval of
+        // skew; keep both sources within the 500 ms media deadline. The
+        // sustainable case has enough capacity for a tighter progress bound.
+        let max_gap = if shaped_bps == Some(OVERLOADED_BPS) {
+            50
+        } else {
+            32
+        };
+        assert!(
+            max_received_gap.load(Ordering::Relaxed) <= max_gap,
+            "one stream fell too far behind its peer on the shared link"
+        );
+        assert!(
+            report.bytes[1] > 2_000_000,
+            "link did not carry both media streams"
+        );
+        assert!(
+            report.peak_downlink_backlog >= Duration::from_millis(50),
+            "link never experienced meaningful shared queueing"
+        );
+    }
     for telemetry in stats {
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot["expired_records"], 0);
         assert_eq!(snapshot["queue_dropped_shards"], 0);
         assert!(snapshot["received_parity_bytes"].as_u64().unwrap() > 0);
+        if features.geometry_hints {
+            assert_eq!(snapshot["protocol_version"], 9);
+            assert!(
+                snapshot["geometry_hints"]["received_frames"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+        }
     }
 }
 
@@ -403,8 +588,9 @@ async fn enabled_service_trace_partitions_real_subscription_and_finishes() {
             m.target() == "flussonix::fxlink::service_timing"
         }),
     ));
+    let _serial = test_lock().lock().await;
     let _guard = tracing::subscriber::set_default(subscriber);
-    paced(1).await;
+    paced_locked(1, None, RECORDS, crate::fxlink::Features::default()).await;
     let rows = rows.lock().unwrap();
     let mut previous = 0;
     let mut finals = 0;

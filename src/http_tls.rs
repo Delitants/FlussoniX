@@ -71,10 +71,15 @@ pub async fn serve(
     let listener = Listener::new(tcp, config).tap_io(|stream| {
         let _ = stream.get_ref().0.set_nodelay(true);
     });
+    let policy = crate::http_transport::TransportPolicy {
+        secure: true,
+        allow_insecure_remote_management: app.options.allow_insecure_remote_management,
+    };
     crate::http_transport::serve_listener(
         listener,
         router(app).layer(axum::Extension(SecureHttp)),
         cancel,
+        policy,
     )
     .await
 }

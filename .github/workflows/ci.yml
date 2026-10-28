@@ -8,15 +8,22 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-24.04
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y ffmpeg libsrtp2-1 tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu fonts-dejavu-core
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg libsrtp2-1 tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu fonts-dejavu-core postgresql-16
       - name: Verify vendor components are absent
         run: test ! -e /opt/flussonic
-      - name: Preview package and service regressions
-        run: python3 -m unittest discover -s tests -p 'test_*preview.py' -v
+      - name: Preview package, service and credential regressions
+        run: |
+          python3 -m unittest discover -s tests -p 'test_*preview.py' -v
+          python3 -m unittest discover -s tests -p 'test_generate_notices.py' -v
+          python3 -m unittest discover -s tests -p 'test_inspect_demo.py' -v
       - run: rustup show
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -40,6 +47,10 @@ jobs:
         run: |
           mkdir -p .runtime
           FLUSSONIX_NATIVE_AUDIO_FIXTURE_FILE="$PWD/.runtime/owned-native-audio.m4s" FLUSSONIX_NATIVE_FIXTURE_FILE="$PWD/.runtime/owned-native.m4s" FLUSSONIX_DVB_FIXTURE_FILE="$PWD/.runtime/owned-dvb.ts" FLUSSONIX_TELETEXT_FIXTURE_FILE="$PWD/.runtime/owned-teletext.ts" FLUSSONIX_708_FIXTURE_FILE="$PWD/.runtime/owned-708.ts" FLUSSONIX_CAPTION_FIXTURE_FILE="$PWD/.runtime/owned-captions.ts" cargo test --locked -- --test-threads=1
+      - name: IPTV HA two-authority load smoke gate
+        run: FLUSSONIX_IPTV_HA_LOAD_SECONDS=5 cargo test --locked --test iptv_ha_load -- --ignored --exact two_authorities_sustain_competing_channels_without_extra_grants --nocapture
+      - name: IPTV HA real-daemon load smoke gate
+        run: FLUSSONIX_IPTV_HA_DAEMON_LOAD_SECONDS=5 cargo test --locked --test iptv_ha_daemons two_real_authority_processes_sustain_competing_channels -- --ignored --exact --nocapture
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -76,3 +87,29 @@ jobs:
             sleep 0.25
           done
           npm test --prefix web
+      - name: Verify IPTV HA admin against owned PostgreSQL authority
+        env:
+          FLUSSONIX_HA_UI_READY_FILE: ${{ runner.temp }}/flussonix-ha-ui-ready
+          FLUSSONIX_HA_UI_STOP_FILE: ${{ runner.temp }}/flussonix-ha-ui-stop
+        run: |
+          export FLUSSONIX_ADMIN_USER=admin
+          export FLUSSONIX_ADMIN_PASSWORD="$(openssl rand -hex 24)"
+          export FLUSSONIX_VIEW_USER=viewer
+          export FLUSSONIX_VIEW_PASSWORD="$(openssl rand -hex 24)"
+          rm -f "$FLUSSONIX_HA_UI_READY_FILE" "$FLUSSONIX_HA_UI_STOP_FILE"
+          cargo test --locked --test iptv_ha_browser_fixture launch_owned_ha_ui_server -- --ignored --exact --nocapture > .runtime/ha-ui.log 2>&1 &
+          flussonix_ha_ui_pid=$!
+          cleanup_ha_ui() {
+            touch "$FLUSSONIX_HA_UI_STOP_FILE"
+            if ! wait "$flussonix_ha_ui_pid"; then tail -n 40 .runtime/ha-ui.log; exit 1; fi
+            rm -f "$FLUSSONIX_HA_UI_READY_FILE" "$FLUSSONIX_HA_UI_STOP_FILE"
+          }
+          trap cleanup_ha_ui EXIT
+          for attempt in $(seq 1 120); do
+            if test -s "$FLUSSONIX_HA_UI_READY_FILE"; then break; fi
+            if ! kill -0 "$flussonix_ha_ui_pid" 2>/dev/null; then tail -n 40 .runtime/ha-ui.log; exit 1; fi
+            sleep 0.25
+          done
+          test -s "$FLUSSONIX_HA_UI_READY_FILE"
+          export FLUSSONIX_TEST_URL="$(cat "$FLUSSONIX_HA_UI_READY_FILE")"
+          npm test --prefix web -- --grep 'IPTV HA live'

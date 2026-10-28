@@ -12,6 +12,7 @@ DOC_TYPES={'.md','.rst','.txt','.json','.csv','.pdf','.html','.xml'}
 REPORT=re.compile(r'(?:^|[-_ .])(?:test[-_ ]?(?:reports?|results)|implementation[-_ ]?(?:plans?|notes)|planning|qualification|verification[-_ ]?report|development[-_ ]?(?:notes|evidence)|host[-_ ]?matrix)(?:[-_ .]|$)',re.I)
 INTERNAL=re.compile(r'(?im)(?:/Users/[^\s/]+/|\b\d+\s+(?:(?:unit|integration|native)\s+)?tests?\s+(?:passed|failed|skipped)\b|^\s*(?:#+\s*)?(?:implementation plan|test results|test report|verification report|acceptance evidence|qualification results|post-signing checks|source commit|reviewed source|build log)\b)')
 USER_DOCS={'readme.md','readme.txt','readme','install.md','install.txt','recovery.md','known-limits.md','changelog.md'}
+PUBLIC_GUIDE_TYPES={'.md','.rst','.txt','.html'}
 PACKAGE_DATA={'package.json','package-lock.json','composer.json','composer.lock','tsconfig.json','Cargo.lock'}
 CODE_TYPES={'.go','.c','.h','.cc','.cpp','.cxx','.hpp','.swift','.py','.sh','.js','.ts','.php','.rs','.java','.m','.mm','.lua','.pl','.rb','.erl','.ex','.sql','.s','.asm'}
 MAX_TEXT=1048576
@@ -28,17 +29,57 @@ def private_error(name):
 def text_errors(name,text):
  return [name+': keep planning, test details and local paths out of public help/notes'] if INTERNAL.search(text) else []
 
+def public_guide(name):
+ return pathlib.PurePosixPath(name).suffix.casefold() in PUBLIC_GUIDE_TYPES
+
+def artifact_path_value(step):
+ lines=step.splitlines()
+ for i,line in enumerate(lines):
+  if not re.fullmatch(r'with:\s*(?:#.*)?',line.strip()):continue
+  with_indent=len(line)-len(line.lstrip())
+  for j in range(i+1,len(lines)):
+   current=lines[j]
+   if not current.strip() or current.lstrip().startswith('#'):continue
+   indent=len(current)-len(current.lstrip())
+   if indent<=with_indent:break
+   match=re.match(r'\s+path:\s*(.*)$',current)
+   if not match:continue
+   value=match[1].strip()
+   if not re.fullmatch(r'[|>](?:[1-9][+-]?|[+-][1-9]?)?(?:\s+#.*)?',value):return value
+   path_indent=indent
+   values=[]
+   for following in lines[j+1:]:
+    if following.strip() and len(following)-len(following.lstrip())<=path_indent:break
+    if following.strip() and not following.lstrip().startswith('!'):values.append(following.strip())
+   return '\n'.join(values)
+ return None
+
 def workflow_errors(name,text):
  errors=[]
- starts=list(re.finditer(r'(?m)^( +)- (?:name|uses|run|id|if):',text))
+ if re.search(r'\\(?:x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})',text):
+  errors.append(name+': escaped YAML scalars could hide an upload action or path')
+ for action in re.finditer(r'(?m)^\s*(?:-\s*)?uses\s*:\s*([^\n]*)',text):
+  value=action[1].strip()
+  if value.startswith('*') or '\\' in value or '${{' in value:
+   errors.append(name+': workflow action must be a concrete literal')
+ starts=list(re.finditer(r'(?m)^( +)-(?=\s|$)',text))
+ recognized=[]
  for i,match in enumerate(starts):
   end=next((m.start() for m in starts[i+1:] if len(m[1])<=len(match[1])),len(text))
   step=text[match.start():end]
-  if not re.search(r'uses:\s*[^\n]*upload-artifact@',step):continue
-  visible='\n'.join(line for line in step.splitlines() if not line.strip().startswith('!'))
-  private_paths=any(re.search(r"(?:^|[/\s:'\"])"+re.escape(part)+r'(?:/|$)',visible,re.I) for part in PRIVATE_DIRS)
+  if not re.search(r'(?m)^\s*(?:-\s*)?uses:\s*[^\n]*upload-artifact@',step):continue
+  recognized.append((match.start(),end))
+  visible=artifact_path_value(step)
+  if visible is None:
+   errors.append(name+': upload-artifact path must be explicit');continue
+  if '\\' in visible or '${{' in visible or re.match(r'\s*[*&]',visible):
+   errors.append(name+': upload-artifact path must be a concrete path');continue
+  private_paths=any(re.search(r"(?:^|[/\s:'\"])"+re.escape(part)+r"""(?=/|\s|['",\]}]|$)""",visible,re.I) for part in PRIVATE_DIRS)
   if private_paths or re.search(r'(?i)(?:evidence|coverage[-_ ]?report|(?:qa|test)[-_ /](?:results?|reports?|logs?)|work/qa|\.log\b|junit[^\n]*\.xml)',visible):
    errors.append(name+': internal QA/test reports must stay local')
+ for mention in re.finditer(r'upload-artifact@',text):
+  if not any(start<=mention.start()<end for start,end in recognized):
+   errors.append(name+': upload-artifact action must use an explicit step and path')
  return errors
 
 def git(repo,*args):return subprocess.check_output(['git','-C',str(repo),*args],stderr=subprocess.PIPE)
@@ -66,7 +107,11 @@ def changed_errors(repo,policy,revision,index=False):
     errors.append(name+': new document/data path needs public-policy approval');continue
   if name.startswith('.github/workflows/') and p.suffix.casefold() in {'.yml','.yaml'}:
    errors+=workflow_errors(name,git(repo,'show',(':' if index else revision+':')+name).decode('utf-8'))
-  if p.name.casefold() in USER_DOCS and p.suffix.casefold()!='.json':
+  historical_exception=not index and name in policy.get('historical_public_guide_exceptions',{}).get(revision,[])
+  scan_public_guide=public_guide(name) and not historical_exception
+  if index and scan_public_guide and exists_at(repo,'HEAD',name):
+   scan_public_guide=git(repo,'show',':'+name)!=git(repo,'show','HEAD:'+name)
+  if (p.name.casefold() in USER_DOCS and p.suffix.casefold()!='.json') or scan_public_guide:
    value=git(repo,'show',(':' if index else revision+':')+name)
    if len(value)>MAX_TEXT:errors.append(name+': help file exceeds size limit')
    else:errors+=text_errors(name,value.decode('utf-8'))
@@ -80,7 +125,8 @@ def history_errors(repo,policy,revision):
   if subprocess.run(['git','-C',str(repo),'merge-base','--is-ancestor',base,revision],capture_output=True).returncode:
    return ['Update/rebase from the protected public baseline before publishing.']
   errors=[]
-  for commit in git(repo,'rev-list',revision,'^'+base).decode().splitlines():errors += [commit[:12]+' '+e for e in changed_errors(repo,policy,commit)]
+  for commit in git(repo,'rev-list',revision,'^'+base).decode().splitlines():
+   errors += [commit[:12]+' '+e for e in changed_errors(repo,policy,commit)]
   return errors
  except (OSError,ValueError,UnicodeError,subprocess.CalledProcessError) as e:return ['Cannot verify source: '+str(e)]
 
@@ -89,7 +135,7 @@ def archive_errors(path):
  def entry(name,size,reader):
   error=private_error(name+'__directory__.c' if name.endswith('/') else name)
   if error:errors.append(name+': '+error)
-  elif pathlib.PurePosixPath(name).name.casefold() in USER_DOCS and reader:
+  elif reader and (pathlib.PurePosixPath(name).name.casefold() in USER_DOCS or pathlib.PurePosixPath(name).suffix.casefold() in PUBLIC_GUIDE_TYPES):
    if size>MAX_TEXT:errors.append(name+': help exceeds size limit')
    else:errors.extend(text_errors(name,reader().decode('utf-8')))
  try:

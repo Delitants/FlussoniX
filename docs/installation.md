@@ -12,7 +12,12 @@ on the supplied binary's build.
 
 Install FFmpeg and FFprobe independently. CPU transcoding needs libx264 and AAC
 support. GPU transcoding and optional protocols need their corresponding system
-drivers or libraries; the UI reports GPU readiness.
+drivers or libraries; the UI reports GPU readiness. Native SRT playback and
+push require system libsrt 1.5 (Ubuntu 24.04: `libsrt1.5-gnutls`); direct SRTP
+requires `libsrtp2-1`. Use a binary that can load those libraries on the target
+host and verify the enabled listeners before serving viewers. A static musl
+test build ran on Ubuntu 24.04 but could not load its glibc libsrt; a compatible
+glibc build passed encrypted SRT playback on the same hosts.
 
 Download the preview archive and its matching `.sha256` file into the same
 directory. Set `package` to the downloaded filename without `.tar.gz`, then run:
@@ -59,7 +64,15 @@ export FLUSSONIX_PEER_KEY
 Choose a different port if 18210 is occupied. Open
 [the admin interface](http://127.0.0.1:18210/admin/) and sign in with your saved
 credentials. This listener is local to the host; use an SSH tunnel for remote
-access. The login page is public; management data requires authentication.
+access. For a public listener, configure built-in HTTPS with `--https-listen`,
+`--https-cert`, and `--https-key` for the UI and API:
+remote plaintext HTTP still serves media, but denies the admin page and
+management credentials. The login page is public on safe origins; management
+data requires authentication. An explicit
+`--allow-insecure-remote-management` override reopens remote HTTP management
+for legacy API clients and prints a startup warning. The shipped UI still
+refuses remote HTTP login, and API clients must use HTTPS to keep credentials
+confidential.
 
 In **Media → Streams**, add `testsrc://`, save and open its player. Then check
 your own input. Press **Ctrl+C** to stop the server and its media workers.
@@ -71,8 +84,12 @@ the stream's **Built-in IPTV subscribers** viewer policy. Playlist links appear
 only when the public origin is set. Subscriber tokens are stored in
 `$flussonix_data/iptv.json` by default, separately from `config.json`, with
 owner-only permissions. `--iptv-data /absolute/path/iptv.json` selects another
-location; back it up with the rest of your state. Session limits apply per node,
-not across a cluster.
+location; back it up with the rest of your state. Session limits are local on a
+single standalone node. For a FlussoniX cluster, configure one shared IPTV
+authority on every viewer-serving node so the limit applies across those nodes;
+see [IPTV transport and authority setup](iptv-transport.md). Existing Flussonic
+viewers are outside this count. The optional two-authority PostgreSQL profile
+has a separate [IPTV HA setup and recovery guide](iptv-ha.md).
 
 For an optional background service, follow [systemd installation](service-installation.md).
 

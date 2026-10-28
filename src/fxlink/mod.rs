@@ -74,6 +74,8 @@ mod service_trace;
 mod transport;
 pub use client::{ClientPool, Subscription};
 pub use listener::Listener;
+#[cfg(test)]
+pub(crate) use transport::test_lock;
 pub use transport::{Provider, RecordStream, Request, Source, Telemetry};
 
 #[cfg(test)]
