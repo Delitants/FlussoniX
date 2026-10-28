@@ -103,8 +103,22 @@ FFmpeg decoded, and both nodes returned 403 without the viewer token. The
 viewer and LB management path used an SSH tunnel because the Linux test host
 cannot connect directly to the isolated CDN port; cdn5 reached its cdn4 source
 directly. The disposable daemon, tunnel and files were removed afterward.
-Direct public CDN delivery, two remote FlussoniX nodes, sustained load and
-failover remain unqualified by this check.
+
+A second bounded check ran the current FlussoniX binary on isolated port
+`28210` on both authorized CDN hosts: cdn4 as LB and cdn5 as CDN. The LB
+queried and admitted the CDN over their direct private-LAN route, then placed
+the viewer there with a single-use ticket. cdn5 pulled the live M4SS source
+from cdn4 and served a 1.56 MB HLS segment that FFmpeg decoded. The observed
+HTTP sequence was 302 placement, 302 ticket redemption, 200 playlist and 200
+segment. Both nodes returned 403 without the viewer token, and the LB reported
+zero local media streams. The private HTTP peer route required the explicit
+per-peer `flussonix_allow_insecure_peer_http` setting; without it the default
+peer-key transport guard rejected placement. Only the disposable config used
+that exception. The viewer reached each isolated listener through an SSH
+tunnel because the Linux test host cannot connect directly to those ports.
+Both daemons, tunnels and temporary files were removed and port `28210` was
+verified free on each host afterward. Direct public viewer delivery, sustained
+load and failover remain unqualified by these bounded checks.
 
 ## Flussonic CDN destinations
 
