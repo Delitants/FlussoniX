@@ -260,3 +260,52 @@ async fn ha_database_rejects_wrong_cluster_and_replayed_primary_epoch() {
         HaError::StaleEpoch
     );
 }
+
+#[tokio::test]
+async fn ha_real_postgres_reports_tls_and_rejects_an_unrelated_ca() {
+    let certs = tls_fixture::Certificates::new();
+    let Some(postgres) = iptv_postgres::PgServer::start(&certs) else {
+        eprintln!("native PostgreSQL test binaries unavailable; set FLUSSONIX_TEST_PG_BINDIR");
+        return;
+    };
+    let path = write_config(
+        certs.dir.path(),
+        "verified-real-db.json",
+        0o600,
+        CLUSTER_ID,
+        &certs.ca,
+    );
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    document["host"] = "127.0.0.1".into();
+    document["port"] = postgres.port().into();
+    document["database"] = "postgres".into();
+    document["user"] = "ha_test".into();
+    document["password"] = "owned-test-secret".into();
+    fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+    let pool = HaPool::new(&HaOptions::load(&path).unwrap()).unwrap();
+    let client = pool.acquire().await.unwrap();
+    let row = client
+        .query_one(
+            "SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        row.get::<_, bool>(0),
+        "authority database connection must use TLS"
+    );
+    assert!(row.get::<_, String>(1).starts_with("TLSv"));
+    drop(client);
+
+    let unrelated = tls_fixture::Certificates::new();
+    document["ca_pem"] = unrelated.ca.to_str().unwrap().into();
+    fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let untrusted = HaPool::new(&HaOptions::load(&path).unwrap()).unwrap();
+    assert!(matches!(
+        untrusted.acquire().await,
+        Err(HaError::Unavailable)
+    ));
+}
