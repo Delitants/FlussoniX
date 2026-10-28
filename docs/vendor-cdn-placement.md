@@ -12,6 +12,13 @@ the independent vendor catalog; it needs no local stream rows and never pulls
 private media or transcodes. The CDN resolves its own vendor source, viewer
 policy and optional processing template.
 
+Choose actual Flussonic origins as source servers. A stream reported as
+`named_by: remote` belongs to a relay and is not an eligible origin; selecting
+that relay fails placement closed, even if another member of its failover group
+is an origin. Group only independent origins that carry the same content. In
+the authorized test cluster, cdn4 reports the test stream as `config` while
+cdn5 reports it as `remote`, so cdn4 is the source server and cdn5 is a CDN.
+
 Existing deployments with local LB stream metadata still work. Local rows,
 including disabled rows, take precedence over discovered vendor names. Vendor
 namespace exclusions, overlapping-prefix rejection and current source/group
