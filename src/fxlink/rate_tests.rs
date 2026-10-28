@@ -194,6 +194,16 @@ async fn fixed_clock_multishard_source_keeps_125_records_per_second() {
 async fn shared_connection_keeps_two_independent_125_record_sources() {
     paced(2, None, RECORDS).await;
 }
+#[tokio::test]
+async fn healthy_v9_source_releases_geometry_state() {
+    let _serial = test_lock().lock().await;
+    paced_locked(1, None, RECORDS, crate::fxlink::Features {
+        trimmed_records: true,
+        repair_parity: true,
+        bootstrap_repair: true,
+        geometry_hints: true,
+    }).await;
+}
 
 #[tokio::test]
 async fn two_sources_share_a_constrained_100ms_link_without_starvation() {
@@ -208,10 +218,10 @@ async fn two_sources_share_a_short_overloaded_100ms_link_without_starvation() {
 async fn paced(streams: usize, shaped_bps: Option<u64>, records: usize) {
     assert!((1..=2).contains(&streams));
     let _serial = test_lock().lock().await;
-    paced_locked(streams, shaped_bps, records).await;
+    paced_locked(streams, shaped_bps, records, crate::fxlink::Features::default()).await;
 }
 
-async fn paced_locked(streams: usize, shaped_bps: Option<u64>, records: usize) {
+async fn paced_locked(streams: usize, shaped_bps: Option<u64>, records: usize, features: crate::fxlink::Features) {
     let baseline = global().used();
     let permits = fec_slots().available_permits();
     let settings = Settings {
@@ -219,11 +229,12 @@ async fn paced_locked(streams: usize, shaped_bps: Option<u64>, records: usize) {
         ..Default::default()
     };
     let cert = test_tls::Certificates::new();
-    let listener = Listener::bind(
+    let listener = Listener::bind_with_features(
         "127.0.0.1:0".parse().unwrap(),
         &cert.cert,
         &cert.key,
         settings.clone(),
+        features,
     )
     .unwrap();
     let remote = listener.address();
@@ -256,7 +267,7 @@ async fn paced_locked(streams: usize, shaped_bps: Option<u64>, records: usize) {
         }),
         stop.clone(),
     ));
-    let pool = ClientPool::default();
+    let pool = ClientPool::with_features(features);
     let mut subscriptions = Vec::new();
     for index in 0..streams {
         subscriptions.push(
@@ -460,6 +471,10 @@ async fn paced_locked(streams: usize, shaped_bps: Option<u64>, records: usize) {
         assert_eq!(snapshot["expired_records"], 0);
         assert_eq!(snapshot["queue_dropped_shards"], 0);
         assert!(snapshot["received_parity_bytes"].as_u64().unwrap() > 0);
+        if features.geometry_hints {
+            assert_eq!(snapshot["protocol_version"], 9);
+            assert!(snapshot["geometry_hints"]["received_frames"].as_u64().unwrap() > 0);
+        }
     }
 }
 
@@ -553,7 +568,7 @@ async fn enabled_service_trace_partitions_real_subscription_and_finishes() {
     ));
     let _serial = test_lock().lock().await;
     let _guard = tracing::subscriber::set_default(subscriber);
-    paced_locked(1, None, RECORDS).await;
+    paced_locked(1, None, RECORDS, crate::fxlink::Features::default()).await;
     let rows = rows.lock().unwrap();
     let mut previous = 0;
     let mut finals = 0;

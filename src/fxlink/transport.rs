@@ -207,6 +207,7 @@ impl State {
         if let Some(geometry) = geometry {
             geometry.disable();
         }
+        self.telemetry.finalize_geometry();
         self.telemetry.active.store(false, Ordering::Release);
         self.queue.lock().unwrap().clear();
         self.notify.notify_waiters();
@@ -219,9 +220,14 @@ impl Drop for Retire {
     }
 }
 
+pub(crate) enum GeometryTelemetry {
+    Live(Arc<super::geometry::receive::Ingress>),
+    Final(serde_json::Value),
+}
+
 #[derive(Default)]
 pub struct Telemetry {
-    pub(crate) geometry: Mutex<Option<Arc<super::geometry::receive::Ingress>>>,
+    pub(crate) geometry: Mutex<Option<GeometryTelemetry>>,
     pub(crate) stats: Mutex<Stats>,
     pub(crate) budget: Mutex<Option<Budget>>,
     pub(crate) active: AtomicBool,
@@ -236,10 +242,21 @@ pub struct Telemetry {
     pub(crate) queue_dropped: AtomicU64,
 }
 impl Telemetry {
+    pub(crate) fn finalize_geometry(&self) {
+        let mut geometry = self.geometry.lock().unwrap();
+        if let Some(GeometryTelemetry::Live(ingress)) = geometry.as_ref() {
+            *geometry = Some(GeometryTelemetry::Final(ingress.diagnostics()));
+        }
+    }
+
     pub fn snapshot(&self) -> serde_json::Value {
         let s = self.stats.lock().unwrap();
         let read = |a: &AtomicU64| a.load(Ordering::Relaxed);
-        serde_json::json!({"geometry_hints":self.geometry.lock().unwrap().as_ref().map(|ingress|ingress.diagnostics()),"active":self.active.load(Ordering::Acquire),"rtt_ms":read(&self.rtt),"state_bytes":self.budget.lock().unwrap().as_ref().map_or(0,Budget::used),"protocol_version":read(&self.protocol_version),"trimmed_shards":s.trimmed_shards,"received_shards":s.received_shards,"duplicate_shards":s.duplicate_shards,"original_lost_shards":s.original_lost_shards,"fec_recovered_shards":s.fec_recovered_shards,"expired_records":s.expired_records,"late_shards":s.late_shards,"unprotected_blocks":s.unprotected_blocks,"received_data_bytes":read(&self.data),"received_parity_bytes":read(&self.parity),"sender_original_data_bytes":read(&self.sent_data),"sender_parity_bytes":read(&self.sent_parity),"sender_repair_bytes":read(&self.sent_repair),"repair_requested_shards":read(&self.requested),"queue_dropped_shards":read(&self.queue_dropped)})
+        let geometry_hints = self.geometry.lock().unwrap().as_ref().map(|geometry| match geometry {
+            GeometryTelemetry::Live(ingress) => ingress.diagnostics(),
+            GeometryTelemetry::Final(final_counts) => final_counts.clone(),
+        });
+        serde_json::json!({"geometry_hints":geometry_hints,"active":self.active.load(Ordering::Acquire),"rtt_ms":read(&self.rtt),"state_bytes":self.budget.lock().unwrap().as_ref().map_or(0,Budget::used),"protocol_version":read(&self.protocol_version),"trimmed_shards":s.trimmed_shards,"received_shards":s.received_shards,"duplicate_shards":s.duplicate_shards,"original_lost_shards":s.original_lost_shards,"fec_recovered_shards":s.fec_recovered_shards,"expired_records":s.expired_records,"late_shards":s.late_shards,"unprotected_blocks":s.unprotected_blocks,"received_data_bytes":read(&self.data),"received_parity_bytes":read(&self.parity),"sender_original_data_bytes":read(&self.sent_data),"sender_parity_bytes":read(&self.sent_parity),"sender_repair_bytes":read(&self.sent_repair),"repair_requested_shards":read(&self.requested),"queue_dropped_shards":read(&self.queue_dropped)})
     }
 }
 #[cfg(test)]
