@@ -96,6 +96,16 @@ This verifies one live source and two local FlussoniX nodes. It does not
 establish placement across production CDN hosts, private LAN routing, uplink
 saturation decisions, failover under loss, HEVC, or target-scale capacity.
 
+A bounded cross-host check also ran the current FlussoniX CDN binary on an
+isolated port at cdn5, with a local FlussoniX LB and the live M4SS source at
+cdn4. The LB placed the viewer on cdn5; cdn5 served a 1.43 MB HLS segment that
+FFmpeg decoded, and both nodes returned 403 without the viewer token. The
+viewer and LB management path used an SSH tunnel because the Linux test host
+cannot connect directly to the isolated CDN port; cdn5 reached its cdn4 source
+directly. The disposable daemon, tunnel and files were removed afterward.
+Direct public CDN delivery, two remote FlussoniX nodes, sustained load and
+failover remain unqualified by this check.
+
 ## Flussonic CDN destinations
 
 In **Cluster → CDN peers**, choose **Flussonic**, enter its management URL,
