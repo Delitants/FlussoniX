@@ -117,8 +117,20 @@ peer-key transport guard rejected placement. Only the disposable config used
 that exception. The viewer reached each isolated listener through an SSH
 tunnel because the Linux test host cannot connect directly to those ports.
 Both daemons, tunnels and temporary files were removed and port `28210` was
-verified free on each host afterward. Direct public viewer delivery, sustained
-load and failover remain unqualified by these bounded checks.
+verified free on each host afterward.
+
+A third bounded check used a temporary one-day CA and a certificate matching
+cdn5's private IP. The remote cdn4 LB queried and admitted cdn5 through
+`https://172.16.0.8:28213/` with `flussonix_tls_ca` and no plain-HTTP peer
+exception. The viewer reached cdn5 through a verified HTTPS SSH tunnel. Its
+untrusted-certificate control failed verification; with the test CA, the
+placement/ticket/playlist/segment sequence returned 302/302/200/200 and a
+1.56 MB segment that FFmpeg decoded. Both nodes denied tokenless playback with
+403, and the LB again reported zero local media streams. The temporary
+certificate, private key, daemons, tunnels and files were removed afterward;
+the original services remained active and the isolated ports were free.
+Direct public viewer delivery, sustained load and failover remain unqualified
+by these bounded checks.
 
 ## Flussonic CDN destinations
 
