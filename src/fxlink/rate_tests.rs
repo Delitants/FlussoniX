@@ -197,12 +197,18 @@ async fn shared_connection_keeps_two_independent_125_record_sources() {
 #[tokio::test]
 async fn healthy_v9_source_releases_geometry_state() {
     let _serial = test_lock().lock().await;
-    paced_locked(1, None, RECORDS, crate::fxlink::Features {
-        trimmed_records: true,
-        repair_parity: true,
-        bootstrap_repair: true,
-        geometry_hints: true,
-    }).await;
+    paced_locked(
+        1,
+        None,
+        RECORDS,
+        crate::fxlink::Features {
+            trimmed_records: true,
+            repair_parity: true,
+            bootstrap_repair: true,
+            geometry_hints: true,
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -218,10 +224,21 @@ async fn two_sources_share_a_short_overloaded_100ms_link_without_starvation() {
 async fn paced(streams: usize, shaped_bps: Option<u64>, records: usize) {
     assert!((1..=2).contains(&streams));
     let _serial = test_lock().lock().await;
-    paced_locked(streams, shaped_bps, records, crate::fxlink::Features::default()).await;
+    paced_locked(
+        streams,
+        shaped_bps,
+        records,
+        crate::fxlink::Features::default(),
+    )
+    .await;
 }
 
-async fn paced_locked(streams: usize, shaped_bps: Option<u64>, records: usize, features: crate::fxlink::Features) {
+async fn paced_locked(
+    streams: usize,
+    shaped_bps: Option<u64>,
+    records: usize,
+    features: crate::fxlink::Features,
+) {
     let baseline = global().used();
     let permits = fec_slots().available_permits();
     let settings = Settings {
@@ -473,7 +490,12 @@ async fn paced_locked(streams: usize, shaped_bps: Option<u64>, records: usize, f
         assert!(snapshot["received_parity_bytes"].as_u64().unwrap() > 0);
         if features.geometry_hints {
             assert_eq!(snapshot["protocol_version"], 9);
-            assert!(snapshot["geometry_hints"]["received_frames"].as_u64().unwrap() > 0);
+            assert!(
+                snapshot["geometry_hints"]["received_frames"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
         }
     }
 }

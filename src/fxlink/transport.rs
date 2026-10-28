@@ -252,10 +252,15 @@ impl Telemetry {
     pub fn snapshot(&self) -> serde_json::Value {
         let s = self.stats.lock().unwrap();
         let read = |a: &AtomicU64| a.load(Ordering::Relaxed);
-        let geometry_hints = self.geometry.lock().unwrap().as_ref().map(|geometry| match geometry {
-            GeometryTelemetry::Live(ingress) => ingress.diagnostics(),
-            GeometryTelemetry::Final(final_counts) => final_counts.clone(),
-        });
+        let geometry_hints =
+            self.geometry
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|geometry| match geometry {
+                    GeometryTelemetry::Live(ingress) => ingress.diagnostics(),
+                    GeometryTelemetry::Final(final_counts) => final_counts.clone(),
+                });
         serde_json::json!({"geometry_hints":geometry_hints,"active":self.active.load(Ordering::Acquire),"rtt_ms":read(&self.rtt),"state_bytes":self.budget.lock().unwrap().as_ref().map_or(0,Budget::used),"protocol_version":read(&self.protocol_version),"trimmed_shards":s.trimmed_shards,"received_shards":s.received_shards,"duplicate_shards":s.duplicate_shards,"original_lost_shards":s.original_lost_shards,"fec_recovered_shards":s.fec_recovered_shards,"expired_records":s.expired_records,"late_shards":s.late_shards,"unprotected_blocks":s.unprotected_blocks,"received_data_bytes":read(&self.data),"received_parity_bytes":read(&self.parity),"sender_original_data_bytes":read(&self.sent_data),"sender_parity_bytes":read(&self.sent_parity),"sender_repair_bytes":read(&self.sent_repair),"repair_requested_shards":read(&self.requested),"queue_dropped_shards":read(&self.queue_dropped)})
     }
 }
