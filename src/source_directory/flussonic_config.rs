@@ -20,6 +20,7 @@ pub use modern::{
     ModernBoundCandidate, ModernBoundInventory, ModernLeasedCandidate, ModernLeasedInventory,
 };
 use serde_json::{Map, Value, json};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -27,6 +28,7 @@ use std::time::Duration;
 const MAX_PROFILE_BYTES: usize = 1024 * 1024;
 const MAX_GROUP_BYTES: usize = 16 * 1024;
 const MAX_GROUPS: usize = 128;
+const MAX_PIN_MEMBERSHIPS: usize = 64;
 const MAX_PATTERNS: usize = 1024;
 
 /// Remove validated local selection/processing metadata and derived transport.
@@ -94,6 +96,7 @@ enum Inventory {
 struct Profile {
     source: Value,
     policies: PolicySet,
+    group_pins: HashMap<String, Vec<String>>,
     uniform: std::sync::OnceLock<Result<Option<Policy>, PolicyFailure>>,
     inventory: Inventory,
     media: MediaOrigin,
@@ -120,6 +123,7 @@ impl Profile {
                 "on_play",
                 "flussonix_token_sha256",
                 "group_config",
+                "flussonix_group_pins",
                 "api_url",
                 "private_payload_url",
                 "flussonix_tls_ca",
@@ -175,6 +179,38 @@ impl Profile {
                 groups.insert(name.clone(), project_policy(group));
             }
         }
+        let mut group_pins = HashMap::new();
+        if let Some(value) = source.get("flussonix_group_pins") {
+            let configured = value.as_object().ok_or(ProjectionFailure::Invalid)?;
+            if configured.len() > MAX_GROUPS {
+                return Err(ProjectionFailure::Limit);
+            }
+            for (stream, value) in configured {
+                if stream.contains('*') || crate::config::valid_name(stream).is_err() {
+                    return Err(ProjectionFailure::Invalid);
+                }
+                let names = value.as_array().ok_or(ProjectionFailure::Invalid)?;
+                if names.is_empty() || names.len() > MAX_PIN_MEMBERSHIPS {
+                    return Err(ProjectionFailure::Limit);
+                }
+                let mut seen = HashSet::new();
+                let mut pin = Vec::with_capacity(names.len());
+                for name in names {
+                    let name = name.as_str().ok_or(ProjectionFailure::Invalid)?;
+                    if name.contains('*')
+                        || crate::config::valid_name(name).is_err()
+                        || !groups.contains_key(name)
+                    {
+                        return Err(ProjectionFailure::Invalid);
+                    }
+                    if !seen.insert(name) {
+                        return Err(ProjectionFailure::Invalid);
+                    }
+                    pin.push(name.to_owned());
+                }
+                group_pins.insert(stream.clone(), pin);
+            }
+        }
         let api = optional_text(source, "api_url")?.unwrap_or(&default_root);
         let private = optional_text(source, "private_payload_url")?.unwrap_or(api);
         let key = source["cluster_key"]
@@ -203,6 +239,7 @@ impl Profile {
         Ok(Self {
             source: source.clone(),
             policies,
+            group_pins,
             uniform: std::sync::OnceLock::new(),
             inventory,
             media,
@@ -400,7 +437,7 @@ impl SourceSnapshot {
             Err(error) => return Err(ProjectionFailure::Ineligible(error)),
             Ok(_) => return Err(ProjectionFailure::Invalid),
         }
-        if row.groups.is_none() {
+        if row.groups.is_none() && !self.profile.group_pins.contains_key(&row.name) {
             return Err(ProjectionFailure::Ineligible(
                 super::flussonic::EligibilityFailure::UnknownGroups,
             ));
@@ -422,10 +459,19 @@ impl SourceSnapshot {
         if !super::allows(&self.profile.source, &row.name) {
             return Err(ProjectionFailure::Excluded);
         }
-        let policy = if let Some(groups) = &row.groups {
+        let policy = if let Some(pin) = self.profile.group_pins.get(&row.name) {
+            if let Some(groups) = &row.groups {
+                let remote: HashSet<_> = groups.iter().collect();
+                let approved: HashSet<_> = pin.iter().collect();
+                if remote.len() != groups.len() || remote != approved {
+                    return Err(ProjectionFailure::Ineligible(
+                        super::flussonic::EligibilityFailure::UnknownGroups,
+                    ));
+                }
+            }
             self.profile
                 .policies
-                .for_groups(&json!(groups))
+                .for_groups(&json!(pin))
                 .map_err(ProjectionFailure::Policy)?
         } else {
             // Every possible subset of configured groups must produce the
@@ -507,4 +553,52 @@ fn optional_text<'a>(source: &'a Value, field: &str) -> Result<Option<&'a str>, 
                 .ok_or(ProjectionFailure::Invalid)
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod group_pin_tests {
+    use super::*;
+    use crate::source_directory::flussonic::StreamProvenance;
+
+    #[test]
+    fn relay_omitted_membership_requires_an_exact_local_pin() {
+        let source = json!({
+            "url":"m4s://origin.invalid",
+            "cluster_key":"owned-cluster-key",
+            "on_play":"true",
+            "group_config":{"paid":{"flussonix_token_sha256":"a".repeat(64)}},
+            "flussonix_group_pins":{"music":["paid"]}
+        });
+        let authority =
+            SourceAuthority::new_modern(&source, &json!([]), Duration::from_secs(3)).unwrap();
+        let row = InventoryStream {
+            name: "music".into(),
+            is_static: true,
+            disabled: false,
+            named_by: Some(StreamProvenance::Remote),
+            groups: None,
+        };
+        let candidate = authority.snapshot().unwrap().relay_candidate(&row).unwrap();
+        authority
+            .at_current(&candidate, |view| {
+                assert_eq!(
+                    view.policy,
+                    &Policy::from_config(
+                        &json!({"flussonix_token_sha256":"a".repeat(64)}),
+                        &json!({})
+                    )
+                    .unwrap()
+                );
+            })
+            .unwrap();
+        let mut mismatched = row;
+        mismatched.groups = Some(vec![]);
+        assert!(
+            authority
+                .snapshot()
+                .unwrap()
+                .relay_candidate(&mismatched)
+                .is_err()
+        );
+    }
 }
