@@ -18,6 +18,18 @@ SPEC.loader.exec_module(guard)
 
 
 class PublicationGuardTests(unittest.TestCase):
+    def test_explicit_public_guide_survives_report_filename_filter(self):
+        policy = {"public_docs": ["docs/qualification.md"]}
+        self.assertIsNone(guard.private_error("docs/qualification.md", policy))
+        self.assertEqual(
+            "internal planning/report file",
+            guard.private_error("docs/qualification-results.md", policy),
+        )
+        self.assertEqual(
+            "internal planning/report file",
+            guard.private_error("docs/qualification.md"),
+        )
+
     def test_upload_artifact_rejects_private_directory_before_another_setting(self):
         workflow = """jobs:
   verify:

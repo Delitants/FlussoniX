@@ -17,13 +17,14 @@ PACKAGE_DATA={'package.json','package-lock.json','composer.json','composer.lock'
 CODE_TYPES={'.go','.c','.h','.cc','.cpp','.cxx','.hpp','.swift','.py','.sh','.js','.ts','.php','.rs','.java','.m','.mm','.lua','.pl','.rb','.erl','.ex','.sql','.s','.asm'}
 MAX_TEXT=1048576
 
-def private_error(name):
+def private_error(name,policy=None):
  p=pathlib.PurePosixPath(name)
  if not name or not p.parts or p.is_absolute() or '..' in p.parts or '\\' in name:return 'unsafe path'
  parts=[x.removeprefix('._').casefold() for x in p.parts]
  if any(x in PRIVATE_DIRS and not (x=='internal' and (p.suffix.casefold() in CODE_TYPES or parts[-1]=='openapi.json')) for x in parts):return 'local-only directory'
  if parts[-1] in PRIVATE_FILES or p.suffix.casefold()=='.log':return 'local-only report/log'
- if p.suffix.casefold() in DOC_TYPES|{'.zip','.gz','.xz','.tar','.tgz'} and REPORT.search(parts[-1]):return 'internal planning/report file'
+ if p.suffix.casefold() in DOC_TYPES|{'.zip','.gz','.xz','.tar','.tgz'} and REPORT.search(parts[-1]):
+  if not policy or name not in policy.get('public_docs',[]):return 'internal planning/report file'
  return None
 
 def text_errors(name,text):
@@ -96,7 +97,7 @@ def changed_errors(repo,policy,revision,index=False):
  errors=[]
  for name in sorted(names):
   if not index and not exists_at(repo,revision,name):continue
-  error=private_error(name)
+  error=private_error(name,policy)
   if error:errors.append(name+': '+error);continue
   p=pathlib.PurePosixPath(name)
   if p.suffix.casefold() in DOC_TYPES and name not in CONTROL_FILES and p.name not in PACKAGE_DATA:
