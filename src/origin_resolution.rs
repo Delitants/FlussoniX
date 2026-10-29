@@ -8,6 +8,33 @@ enum OriginState {
     Denied,
     Unresolved,
 }
+fn project_native_origin(c: &Value) -> Result<Value, ()> {
+    let source = c.as_object().ok_or(())?;
+    Ok(Value::Object(
+        crate::source_directory::NATIVE_DISCOVERY_FIELDS
+            .iter()
+            .filter_map(|field| {
+                source
+                    .get(*field)
+                    .cloned()
+                    .map(|value| ((*field).into(), value))
+            })
+            .collect(),
+    ))
+}
+fn native_callback_approved(policy: &Policy, root: &Value) -> bool {
+    policy.url.as_deref().is_none_or(|url| {
+        root["auth_backends"].as_array().is_some_and(|backends| {
+            backends
+                .iter()
+                .any(|backend| backend["url"].as_str() == Some(url))
+        })
+    })
+}
+pub(super) fn approved_mirror_policy(config: &Value, root: &Value) -> Option<Policy> {
+    let policy = Policy::from_config(config, root).ok()?;
+    native_callback_approved(&policy, root).then_some(policy)
+}
 #[derive(Clone)]
 pub(super) struct Ticket {
     id: uuid::Uuid,
@@ -180,16 +207,17 @@ impl App {
         &self,
         source: &Value,
         name: &str,
-        mut c: Value,
+        c: Value,
         root: &Value,
     ) -> Result<Value, ()> {
+        let mut c = project_native_origin(&c)?;
         if c["name"].as_str() != Some(name) || c.get("disabled").is_some_and(|v| !v.is_boolean()) {
             return Err(());
         }
         if let Some(id) = c.get("flussonix_content_id") {
             crate::config::valid_identity(id).map_err(|_| ())?;
         }
-        Policy::from_config(&c, root).map_err(|_| ())?;
+        approved_mirror_policy(&c, root).ok_or(())?;
         let api = source["api_url"].as_str().ok_or(())?;
         let private = source["private_payload_url"].as_str().unwrap_or(api);
         let transport = source["flussonix_transport"].as_str().unwrap_or("hls");
@@ -209,6 +237,12 @@ impl App {
                 .join("/");
             format!("{}/{encoded}", endpoint.trim_end_matches('/'))
         } else {
+            let media_url = url::Url::parse(private).map_err(|_| ())?;
+            crate::peer_transport::require(
+                &media_url,
+                source["flussonix_allow_insecure_peer_http"] == true,
+            )
+            .map_err(|_| ())?;
             crate::cluster::source_input_url(private, name, transport).map_err(|_| ())?
         };
         c["inputs"] = json!([{"url":input}]);
@@ -227,18 +261,14 @@ impl App {
                 c["inputs"][0]["flussonix_tls_ca"] = ca.clone();
             }
         }
-        c.as_object_mut().ok_or(())?.remove("transcoder");
-        // Output destinations belong to local configuration, never source discovery.
-        c.as_object_mut().ok_or(())?.remove("pushes");
         c["static"] = json!(false);
         c["flussonix_peer_key"] = json!(
             source["cluster_key"]
                 .as_str()
                 .unwrap_or(&self.options.peer_key)
         );
-        if let Some(allow) = source.get("flussonix_allow_insecure_peer_http") {
-            c["flussonix_allow_insecure_peer_http"] = allow.clone();
-        }
+        c["flussonix_allow_insecure_peer_http"] =
+            json!(source["flussonix_allow_insecure_peer_http"] == true);
         Ok(c)
     }
     fn publish_claimed(
@@ -260,7 +290,7 @@ impl App {
         revision: u64,
     ) -> Option<Resolved> {
         let policy = if m.known && !m.denied && m.config["disabled"] != true {
-            Policy::from_config(&m.config, root).ok()
+            approved_mirror_policy(&m.config, root)
         } else {
             None
         };
@@ -599,6 +629,235 @@ impl App {
 
 #[cfg(test)]
 mod cache_tests {
+    #[tokio::test]
+    async fn revoked_callback_backend_cancels_cached_mirror_and_cannot_republish() {
+        use super::*;
+        let d = tempfile::tempdir().unwrap();
+        let app = App::new(
+            d.path().join("config.json"),
+            d.path().join("media"),
+            Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let callback = format!("http://{}/approved", listener.local_addr().unwrap());
+        let auth_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/approved",
+                    axum::routing::get(|| async { axum::http::StatusCode::OK }),
+                ),
+            )
+            .await
+            .unwrap()
+        });
+        app.config
+            .put("sources", "origin", json!({"api_url":"http://127.0.0.1:9"}))
+            .unwrap();
+        app.config
+            .put("auth_backends", "billing", json!({"url":callback}))
+            .unwrap();
+        let root = app.config.snapshot();
+        let mirror = Mirror {
+            when: Instant::now(),
+            source: root["sources"][0].clone(),
+            config: json!({"name":"owned","static":false,"inputs":[{"url":"testsrc://"}],"on_play":callback}),
+            available: true,
+            denied: false,
+            known: true,
+            activation_only: false,
+            serial: 1,
+            switches: 0,
+        };
+        let snapshot = app
+            .publish_resolved("owned", &mirror, &root, app.config.revision())
+            .unwrap()
+            .policy;
+        app.mirrors
+            .lock()
+            .await
+            .insert("owned".into(), mirror.clone());
+        // A grant from the approved backend must be cancelled as soon as the
+        // local administrator replaces its URL, before another discovery call.
+        let AuthOutcome::Allowed(grant) = app
+            .playback_auth
+            .authorize(
+                snapshot,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "hls".into(),
+                    token: "viewer-secret".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("approved callback should authorize")
+        };
+        app.config
+            .put(
+                "auth_backends",
+                "billing",
+                json!({"url":"http://127.0.0.1:9/replaced"}),
+            )
+            .unwrap();
+        app.invalidate_sessions().await;
+        assert!(
+            grant.is_cancelled(),
+            "the active viewer retained the removed callback"
+        );
+        let changed = app.config.snapshot();
+        assert!(
+            app.publish_resolved("owned", &mirror, &changed, app.config.revision())
+                .is_none(),
+            "a cached mirror restored a callback after its local approval changed"
+        );
+        let unavailable = Mirror {
+            available: false,
+            ..mirror.clone()
+        };
+        assert!(
+            app.publish_resolved("owned", &unavailable, &changed, app.config.revision())
+                .is_none(),
+            "an unavailable upstream restored the revoked callback policy"
+        );
+        app.config.delete("auth_backends", "billing").unwrap();
+        app.invalidate_sessions().await;
+        assert!(
+            app.publish_resolved(
+                "owned",
+                &mirror,
+                &app.config.snapshot(),
+                app.config.revision()
+            )
+            .is_none(),
+            "deleting the backend must also reject the cached mirror"
+        );
+        auth_task.abort();
+    }
+
+    #[test]
+    fn discovered_callback_requires_exact_local_backend() {
+        let d = tempfile::tempdir().unwrap();
+        let app = super::App::new(
+            d.path().join("config.json"),
+            d.path().join("media"),
+            super::Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let source = serde_json::json!({"api_url":"http://127.0.0.1:19990"});
+        let callback = "https://billing.example/on_play?tenant=one";
+        let raw = serde_json::json!({"name":"owned","on_play":callback});
+        assert!(
+            app.normalize_origin(&source, "owned", raw.clone(), &app.config.snapshot())
+                .is_err()
+        );
+        let wrong = serde_json::json!({"auth_backends":[{"name":"billing","url":"https://billing.example/on_play?tenant=two"}]});
+        assert!(
+            app.normalize_origin(&source, "owned", raw.clone(), &wrong)
+                .is_err()
+        );
+        let approved = serde_json::json!({"auth_backends":[{"name":"billing","url":callback}]});
+        assert!(
+            app.normalize_origin(&source, "owned", raw, &approved)
+                .is_ok()
+        );
+        let object = serde_json::json!({"name":"owned","on_play":{"url":callback,"session_keys":["name","proto","token"],"max_sessions":2}});
+        let normalized = app
+            .normalize_origin(&source, "owned", object, &approved)
+            .unwrap();
+        assert_eq!(normalized["on_play"]["max_sessions"], 2);
+        for raw in [
+            serde_json::json!({"name":"owned","on_play":"iptv://"}),
+            serde_json::json!({"name":"owned"}),
+        ] {
+            assert!(
+                app.normalize_origin(&source, "owned", raw, &app.config.snapshot())
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn discovered_origin_cannot_install_local_outputs_or_http_opt_in() {
+        let d = tempfile::tempdir().unwrap();
+        let app = super::App::new(
+            d.path().join("config.json"),
+            d.path().join("media"),
+            super::Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let raw = serde_json::json!({
+            "name":"owned",
+            "flussonix_rtp_outputs":[{"url":"rtp://198.51.100.10:5000"}],
+            "pushes":[{"url":"srt://receiver:9000"}],
+            "transcoder":{"video":"h264"},
+            "flussonix_allow_insecure_peer_http":true
+        });
+        let normalized = app
+            .normalize_origin(
+                &serde_json::json!({"api_url":"http://127.0.0.1:19990"}),
+                "owned",
+                raw,
+                &app.config.snapshot(),
+            )
+            .unwrap();
+        for field in ["flussonix_rtp_outputs", "pushes", "transcoder"] {
+            assert!(normalized.get(field).is_none(), "remote {field} survived");
+        }
+        assert_eq!(normalized["flussonix_allow_insecure_peer_http"], false);
+    }
+
+    #[test]
+    fn local_peer_http_opt_in_controls_private_media_url() {
+        let d = tempfile::tempdir().unwrap();
+        let app = super::App::new(
+            d.path().join("config.json"),
+            d.path().join("media"),
+            super::Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let source = serde_json::json!({
+            "api_url":"https://source.example",
+            "private_payload_url":"http://media.example"
+        });
+        let remote = serde_json::json!({"name":"owned","flussonix_allow_insecure_peer_http":true});
+        assert!(
+            app.normalize_origin(&source, "owned", remote.clone(), &app.config.snapshot())
+                .is_err()
+        );
+        let allowed = app
+            .normalize_origin(
+                &serde_json::json!({
+                    "api_url":"https://source.example",
+                    "private_payload_url":"http://media.example",
+                    "flussonix_allow_insecure_peer_http":true
+                }),
+                "owned",
+                remote,
+                &app.config.snapshot(),
+            )
+            .unwrap();
+        assert_eq!(allowed["flussonix_allow_insecure_peer_http"], true);
+    }
+
     #[test]
     fn discovered_origin_pushes_are_never_activated_on_a_cdn() {
         let d = tempfile::tempdir().unwrap();

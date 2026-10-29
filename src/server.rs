@@ -661,19 +661,18 @@ impl App {
                 current
             });
             self.playback_auth.invalidate(|name| {
-                let cfg = crate::config::effective(root, name).or_else(|| {
-                    if crate::vendor_playback::reserved(root, name) {
-                        return None;
-                    }
-                    mirrors
-                        .get(name)
-                        .filter(|m| m.known && !m.denied)
-                        .map(|m| m.config.clone())
-                })?;
-                if cfg["disabled"] == true {
+                if let Some(cfg) = crate::config::effective(root, name) {
+                    return (cfg["disabled"] != true)
+                        .then(|| Policy::from_config(&cfg, root).ok())
+                        .flatten();
+                }
+                if crate::vendor_playback::reserved(root, name) {
                     return None;
                 }
-                Policy::from_config(&cfg, root).ok()
+                mirrors
+                    .get(name)
+                    .filter(|m| m.known && !m.denied && m.config["disabled"] != true)
+                    .and_then(|m| origin_resolution::approved_mirror_policy(&m.config, root))
             });
         });
     }
@@ -1551,23 +1550,11 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
                     }
                     // Discovery conveys playback policy and identity, never publisher
                     // credentials, source inputs or raw saved configuration.
-                    let fields = [
-                        "name",
-                        "title",
-                        "comment",
-                        "position",
-                        "disabled",
-                        "flussonix_content_id",
-                        "flussonix_input_timeout",
-                        "flussonix_subtitle_tracks",
-                        "flussonix_hls_captions",
-                        "flussonix_hls_subtitles",
-                        "on_play",
-                        "flussonix_token_sha256",
-                    ];
-                    let discovery = fields
-                        .into_iter()
-                        .filter_map(|key| c.get(key).cloned().map(|value| (key.to_owned(), value)))
+                    let discovery = crate::source_directory::NATIVE_DISCOVERY_FIELDS
+                        .iter()
+                        .filter_map(|key| {
+                            c.get(key).cloned().map(|value| ((*key).to_owned(), value))
+                        })
                         .collect();
                     json_response(Value::Object(discovery))
                 }
@@ -2042,7 +2029,11 @@ async fn media_request(State(app): State<Arc<App>>, request: Request) -> Respons
     let mut response = if request.method() == "OPTIONS" {
         StatusCode::NO_CONTENT.into_response()
     } else if request.method() == "POST" {
-        publication::receive(app, request).await
+        if browser_management_write_allowed(&request, app.options.admin_public_origin.as_ref()) {
+            publication::receive(app, request).await
+        } else {
+            error(StatusCode::FORBIDDEN, "cross-origin publication request")
+        }
     } else {
         serve_media_request(app, request).await
     };

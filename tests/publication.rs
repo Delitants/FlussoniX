@@ -98,6 +98,89 @@ async fn until(mut check: impl AsyncFnMut() -> bool) {
     .expect("condition deadline");
 }
 #[tokio::test]
+async fn cross_origin_basic_publication_is_rejected_before_worker_start() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let d = tempfile::tempdir().unwrap();
+    let a = app(d.path());
+    a.config
+        .put(
+            "streams",
+            "owned",
+            json!({"inputs":[{"url":"publish://"}],"password":"owned-publisher"}),
+        )
+        .unwrap();
+    let basic = format!("Basic {}", STANDARD.encode("publisher:owned-publisher"));
+    for (origin, site) in [
+        (Some("https://evil.example"), None),
+        (None, Some("cross-site")),
+        (Some("not-a-url"), None),
+    ] {
+        let mut request = post("/owned/mpegts", Body::empty());
+        request
+            .headers_mut()
+            .insert("host", "127.0.0.1:18210".parse().unwrap());
+        request
+            .headers_mut()
+            .insert("authorization", basic.parse().unwrap());
+        request
+            .headers_mut()
+            .insert("content-type", "text/plain".parse().unwrap());
+        if let Some(origin) = origin {
+            request
+                .headers_mut()
+                .insert("origin", origin.parse().unwrap());
+        }
+        if let Some(site) = site {
+            request
+                .headers_mut()
+                .insert("sec-fetch-site", site.parse().unwrap());
+        }
+        let response = router(a.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), 403, "origin {origin:?}, site {site:?}");
+        assert_eq!(a.media.count().await, 0);
+    }
+    let mut same_origin = post("/owned/mpegts", Body::empty());
+    same_origin
+        .headers_mut()
+        .insert("host", "127.0.0.1:18210".parse().unwrap());
+    same_origin
+        .headers_mut()
+        .insert("origin", "http://127.0.0.1:18210".parse().unwrap());
+    same_origin
+        .headers_mut()
+        .insert("authorization", basic.parse().unwrap());
+    same_origin
+        .headers_mut()
+        .insert("content-type", "text/plain".parse().unwrap());
+    assert_eq!(
+        router(a.clone())
+            .oneshot(same_origin)
+            .await
+            .unwrap()
+            .status(),
+        415
+    );
+    assert_eq!(
+        router(a.clone())
+            .oneshot(post("/owned/mpegts", Body::empty()))
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    for method in ["GET", "OPTIONS"] {
+        let request = Request::builder()
+            .method(method)
+            .uri("/owned/index.m3u8")
+            .header("origin", "https://evil.example")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(a.clone()).oneshot(request).await.unwrap();
+        assert_ne!(response.status(), 403, "{method} playback route");
+    }
+    a.media.stop_all().await;
+}
+#[tokio::test]
 async fn denied_publications_never_poll_body_or_start_workers() {
     let d = tempfile::tempdir().unwrap();
     let a = app(d.path());

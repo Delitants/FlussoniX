@@ -373,6 +373,19 @@ test('changing authorization mode preserves the existing session limits and iden
  const result=await (await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(result.on_play.max_sessions).toBe(3);expect(result.on_play.session_keys).toEqual(['name','proto','token','token']);
 });
 
+test('token-bound callback session is required before saving a stream',async({page})=>{
+ await page.getByRole('button',{name:'Add stream',exact:true}).click();
+ await page.getByLabel('Stream name',{exact:true}).fill('ui-token-bound-callback');
+ await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');
+ await page.getByLabel('Authorization policy',{exact:true}).selectOption('url');
+ await page.getByLabel('Callback URL',{exact:true}).fill('https://auth.example/check');
+ const identity=page.locator('details.form-details').filter({hasText:'Session identity'});
+ await identity.locator('summary').click();
+ await identity.getByRole('button',{name:'Remove',exact:true}).last().click();
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ await expect(page.getByRole('dialog').getByRole('alert')).toContainText('callback session_keys must include token');
+});
+
 test('media timeout forms preserve template inheritance and explicit overrides',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
  const template='ui-recovery-template',name='ui-recovery-timeout';
