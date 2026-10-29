@@ -264,6 +264,7 @@ async fn split_origins_preserve_literal_names_filters_and_local_policy() {
     config["except"] = json!(["blocked"]);
     config["only"] = json!([]);
     config["group_config"] = json!({"paid":{"on_play":"https://billing.invalid/check"}});
+    config["flussonix_group_pins"] = json!({name:["paid"]});
     let a = modern(&config);
     let list = a.modern_inventory(&local()).await.unwrap();
     for n in ["outside", "region/blocked"] {
@@ -502,10 +503,11 @@ async fn modern_candidates_enforce_origin_membership_and_group_policy() {
         {"name":"provenance","groups":[]},
         {"name":"membership","named_by":"config"},
         {"name":"conflict","named_by":"user","groups":["a","b"]},
-        {"name":"ondemand","named_by":"user","groups":[],"static":false}]);
+        {"name":"ondemand","named_by":"user","groups":["a"],"static":false}]);
     let (server, _) = fixture(rows, None).await;
     let mut config = source(&server.url.replacen("http", "m4s", 1));
     config["group_config"] = json!({"a":{"on_play":"https://a.invalid/check"},"b":{"on_play":"https://b.invalid/check"}});
+    config["flussonix_group_pins"] = json!({"conflict":["a","b"],"ondemand":["a"]});
     let a = modern(&config);
     let list = a.modern_inventory(&local()).await.unwrap();
     for (name, why) in [
@@ -513,7 +515,6 @@ async fn modern_candidates_enforce_origin_membership_and_group_policy() {
         ("relay", EligibilityFailure::Relayed),
         ("external", EligibilityFailure::External),
         ("provenance", EligibilityFailure::UnknownProvenance),
-        ("membership", EligibilityFailure::UnknownGroups),
     ] {
         assert_eq!(
             list.candidate(name).err(),
@@ -522,6 +523,12 @@ async fn modern_candidates_enforce_origin_membership_and_group_policy() {
             )))
         );
     }
+    assert_eq!(
+        list.candidate("membership").err(),
+        Some(BindingFailure::Projection(
+            ProjectionFailure::MissingGroupPin
+        ))
+    );
     assert_eq!(
         list.candidate("conflict").err(),
         Some(BindingFailure::Projection(ProjectionFailure::Policy(
@@ -896,9 +903,9 @@ async fn omitted_groups_modern_binding_rejects_nonuniform_policy_and_nonlocal_or
         let list = authority.modern_inventory(&local()).await.unwrap();
         assert_eq!(
             list.candidate("news").err(),
-            Some(BindingFailure::Projection(ProjectionFailure::Ineligible(
-                EligibilityFailure::UnknownGroups
-            )))
+            Some(BindingFailure::Projection(
+                ProjectionFailure::MissingGroupPin
+            ))
         );
     }
     let config = source(&server.url.replacen("http", "m4s", 1));
@@ -966,9 +973,9 @@ async fn omitted_groups_policy_change_invalidates_old_binding_and_rejects_new_lo
             .unwrap()
             .candidate("news")
             .err(),
-        Some(BindingFailure::Projection(ProjectionFailure::Ineligible(
-            EligibilityFailure::UnknownGroups
-        )))
+        Some(BindingFailure::Projection(
+            ProjectionFailure::MissingGroupPin
+        ))
     );
     drop(server);
 }
