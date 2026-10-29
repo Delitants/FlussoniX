@@ -142,8 +142,10 @@ impl HaLedger {
             let db_now: DateTime<Utc> = row.get(0);
             let expires_at: DateTime<Utc> = row.get(1);
             if expires_at <= db_now { return Err(HaError::Expired); }
-            let occupied: i64 = tx.query_one("SELECT COALESCE(sum(GREATEST(CASE WHEN expires_at>clock_timestamp() THEN units ELSE 0 END,CASE WHEN state='pending' AND prior_expires_at>clock_timestamp() THEN COALESCE(prior_units,0) ELSE 0 END)),0)::bigint FROM fx_iptv_sessions WHERE subscriber=$1 AND (expires_at>clock_timestamp() OR (state='pending' AND prior_expires_at>clock_timestamp()))", &[&subscriber]).await.map_err(|_| HaError::Unavailable)?.get(0);
-            let old_occupied = existing.as_ref().map(|row| row.get::<_,i32>(2).max(row.get::<_,Option<i32>>(7).unwrap_or(0)) as i64).unwrap_or(0);
+            let occupied: i64 = tx.query_one("SELECT COALESCE(sum(GREATEST(CASE WHEN expires_at>$2 THEN units ELSE 0 END,CASE WHEN state='pending' AND prior_expires_at>$2 THEN COALESCE(prior_units,0) ELSE 0 END)),0)::bigint FROM fx_iptv_sessions WHERE subscriber=$1 AND (expires_at>$2 OR (state='pending' AND prior_expires_at>$2))", &[&subscriber,&db_now]).await.map_err(|_| HaError::Unavailable)?.get(0);
+            // Existing rows are committed here. Subtract their units only when
+            // the same snapshot used by `occupied` included them.
+            let old_occupied = existing.as_ref().map(|row| if row.get::<_,DateTime<Utc>>(4) > db_now { row.get::<_,i32>(2) as i64 } else { 0 }).unwrap_or(0);
             let requested = (req.units as i64).max(old_occupied);
             if req.limit.is_some_and(|limit| occupied - old_occupied + requested > limit as i64) { return Err(HaError::Limit); }
             let capacity = tx.query_one("SELECT active_sessions,operation_count FROM fx_iptv_capacity WHERE singleton=TRUE", &[]).await.map_err(|_| HaError::Unavailable)?;

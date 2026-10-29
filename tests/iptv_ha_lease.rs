@@ -200,6 +200,60 @@ async fn pending_replacement_reserves_larger_units_then_rollback_restores_prior_
     assert!(ledger.acquire(&second, None).await.is_ok());
 }
 
+// Break caught: a just-expired old grant is subtracted from a later occupancy
+// snapshot even though it no longer contributes to that snapshot.
+#[tokio::test]
+async fn replacement_cannot_subtract_an_old_grant_that_expired_after_cleanup() {
+    let certs = tls_fixture::Certificates::new();
+    let Some(db) = iptv_postgres::PgServer::start(&certs) else {
+        return;
+    };
+    let pool = pool(&certs, db.port());
+    schema::initialize(&pool, None).await.unwrap();
+    let ledger = HaLedger::new(pool);
+    let first = request("alice", Uuid::new_v4(), Uuid::new_v4(), 2, 0);
+    let second = request("alice", Uuid::new_v4(), Uuid::new_v4(), 2, 0);
+    let first_grant = ledger.acquire(&first, None).await.unwrap();
+    ledger.commit(&first, Some(first_grant.id)).await.unwrap();
+    let second_grant = ledger.acquire(&second, None).await.unwrap();
+    ledger.commit(&second, Some(second_grant.id)).await.unwrap();
+
+    let replacement = LeaseRequest {
+        operation: Uuid::new_v4(),
+        units: 2,
+        ..first
+    };
+    let mut blocker = db.local_client().await;
+    blocker.execute("INSERT INTO fx_iptv_operations(operation_id,kind,session_key,subscriber,status,result,expires_at) VALUES($1,'release','test-blocker','test-blocker','terminal',FALSE,clock_timestamp()+interval '1 hour')", &[&replacement.operation]).await.unwrap();
+    let tx = blocker.transaction().await.unwrap();
+    tx.execute(
+        "DELETE FROM fx_iptv_operations WHERE operation_id=$1",
+        &[&replacement.operation],
+    )
+    .await
+    .unwrap();
+    let admission = tokio::spawn(async move { ledger.acquire(&replacement, None).await });
+    let monitor = db.local_client().await;
+    let mut blocked = false;
+    for _ in 0..40 {
+        let waiting: i64 = monitor.query_one("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'SELECT kind,session_key,subscriber,grant_id,units,revision,grant_expires_at,status FROM fx_iptv_operations%'", &[]).await.unwrap().get(0);
+        if waiting > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        blocked,
+        "replacement did not reach the post-cleanup operation lookup"
+    );
+    // This write models the old grant expiring only after the admission's
+    // targeted cleanup, while the other committed unit remains live.
+    monitor.execute("UPDATE fx_iptv_sessions SET expires_at=clock_timestamp()-interval '1 second' WHERE grant_id=$1", &[&first_grant.id]).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(admission.await.unwrap(), Err(HaError::Limit));
+}
+
 #[tokio::test]
 async fn expired_target_is_reclaimed_even_beyond_bounded_global_sweep() {
     let certs = tls_fixture::Certificates::new();
