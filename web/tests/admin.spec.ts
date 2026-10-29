@@ -270,6 +270,20 @@ test('SRT playback URL uses an IPv6 endpoint and token placeholder without saved
  await page.addStyleTag({content:':root{font-family:"DejaVu Sans",sans-serif}'});
  await page.setViewportSize({width:393,height:852});await expect(playback).toBeVisible();expect(await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth)).toBe(false);
 });
+
+test('saved SRT input summary hides query and fragment credentials',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-srt-secret-summary-'+Date.now().toString(36);
+ const url='srt://127.0.0.1:19990?streamid=owned-query-secret#passphrase=owned-fragment-secret-123';
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,disabled:true,static:false,inputs:[{url}]}})).ok()).toBeTruthy();
+ try{
+  await page.reload();await page.getByLabel('Username').fill(process.env.FLUSSONIX_ADMIN_USER||'admin');await page.getByLabel('Password',{exact:true}).fill(process.env.FLUSSONIX_ADMIN_PASSWORD!);await page.getByRole('button',{name:'Sign in',exact:true}).click();
+  await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Input',exact:true}).click();
+  await expect(page.locator('body')).toContainText('srt://127.0.0.1:19990');
+  await expect(page.locator('body')).not.toContainText('owned-query-secret');
+  await expect(page.locator('body')).not.toContainText('owned-fragment-secret-123');
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});}
+});
 test('create owned stream and show persisted operational state',async({page})=>{await page.getByRole('button',{name:'Add stream'}).click();await page.getByLabel('Stream name',{exact:true}).fill('ui-test');await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('heading',{name:'ui-test',exact:true})).toBeVisible();await page.getByRole('button',{name:'← Streams'}).click();await expect(page.getByRole('button',{name:'ui-test',exact:true})).toBeVisible();await page.screenshot({path:'../.runtime/screenshots/streams.png',fullPage:true});});
 test('configuration edits can be validated without applying',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};

@@ -260,7 +260,7 @@ function valueText(key:string,v:any,inherited=false):React.ReactNode {
  if(key==='uptime')return v+'s';if(typeof v==='boolean')return v?'Enabled':'Disabled';
  return typeof v==='object'?'Configured':String(v??'—');
 }
-function safeURL(raw:string):string {if(!raw)return 'Not configured';try{const u=new URL(raw);if(u.username||u.password){u.username='hidden';u.password='hidden'}const keys:string[]=[];u.searchParams.forEach((_,k)=>keys.push(k));for(const k of keys)if(/token|key|password|secret/i.test(k))u.searchParams.set(k,'hidden');return u.toString()}catch{return raw}}
+function safeURL(raw:string):string {if(!raw)return 'Not configured';try{const u=new URL(raw);if(u.username||u.password){u.username='hidden';u.password='hidden'}const keys:string[]=[];u.searchParams.forEach((_,k)=>keys.push(k));for(const k of keys)u.searchParams.set(k,'hidden');if(u.hash)u.hash='#hidden';return u.toString()}catch{return 'Invalid URL (details hidden)'}}
 export function SettingsSummary({value,empty='No explicit overrides. Template and server defaults apply.'}:{value:Item,empty?:string}) {
  const entries=Object.entries(value).filter(([k])=>!['stats','config_on_disk','$reset','flussonix_peer_key'].includes(k));
  return entries.length?<dl className="settings-summary">{entries.map(([k,v])=><React.Fragment key={k}><dt>{labels[k]||k.replaceAll('_',' ')}</dt><dd>{valueText(k,v,!!value.template)}</dd></React.Fragment>)}</dl>:<p className="muted">{empty}</p>;
