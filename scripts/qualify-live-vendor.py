@@ -419,11 +419,24 @@ def topology_probe(args, root):
         clean = urllib.parse.urljoin(placement, headers["location"])
         if not same_origin(clean, cdn) or "flussonix_ticket" in urllib.parse.parse_qs(urllib.parse.urlsplit(clean).query):
             raise RuntimeError("CDN clean playback URL is invalid")
+
+        def worker_snapshot():
+            try:
+                node_status, _, node_body = get(
+                    cdn + "/flussonix/api/v1/node",
+                    headers={"x-flussonix-peer": peer_key},
+                )
+                return (cdn_worker_snapshot(json.loads(node_body), args.stream)
+                        if node_status == 200 else {"node_status": node_status})
+            except (OSError, ValueError, RuntimeError, KeyError):
+                return {"node_status": "unavailable"}
+
         media_bytes = 0
         native_records = 0
         streams = []
         media_ok = False
         m4f_controls = []
+        m4f_events = []
         m4f_announcements = 0
         m4f_segments = []
         m4f_lines = 0
@@ -441,14 +454,24 @@ def topology_probe(args, root):
                 time.sleep(0.25)
         elif args.output == "m4f":
             while time.monotonic() < deadline and not media_ok:
+                event = None
                 try:
                     with opener.open(clean, timeout=20) as response:
                         m4f_controls.append(response.status)
                         if response.status == 200:
+                            control_started = time.monotonic()
+                            event = {"first_line_ms": None, "outcome": "deadline", "lines": 0,
+                                     "duration_ms": None}
+                            m4f_events.append(event)
                             while time.monotonic() < deadline:
                                 raw_line = response.readline(512)
                                 if not raw_line:
+                                    event["outcome"] = "eof"
+                                    event["worker"] = worker_snapshot()
                                     break
+                                if event["first_line_ms"] is None:
+                                    event["first_line_ms"] = round((time.monotonic() - control_started) * 1000)
+                                event["lines"] += 1
                                 m4f_lines += 1
                                 line_text = raw_line.decode("ascii", "replace").strip()
                                 line = line_text.split()
@@ -463,20 +486,28 @@ def topology_probe(args, root):
                                     continue
                                 m4f_announcements += 1
                                 segment = f"{cdn}/{path}/{segment_time}.m4f?token={viewer_token}"
+                                event["outcome"] = "segment_request"
                                 status, _, body = get(segment, 20_000_000)
                                 m4f_segments.append(status)
+                                event["outcome"] = "segment_status"
                                 if status == 200 and body:
                                     streams = inspect_m4f_segment(body)
                                     media_bytes = len(body)
                                     native_records = 1
                                     media_ok = True
+                                    event["outcome"] = "media"
                                     break
+                            event["duration_ms"] = round((time.monotonic() - control_started) * 1000)
                 except urllib.error.HTTPError as error:
                     m4f_controls.append(error.code)
                     if error.code != 503:
                         raise RuntimeError("CDN native playback failed") from None
                 except TimeoutError:
                     m4f_controls.append("timeout")
+                    if event is not None:
+                        event["outcome"] = ("segment_timeout" if event["outcome"] == "segment_request"
+                                            else "read_timeout")
+                        event["duration_ms"] = round((time.monotonic() - control_started) * 1000)
                 time.sleep(0.25)
         else:
             media = None
@@ -499,20 +530,13 @@ def topology_probe(args, root):
                 media_bytes = len(media)
                 streams, media_ok = inspect_media(root, media)
         if not media_ok:
-            try:
-                node_status, _, node_body = get(
-                    cdn + "/flussonix/api/v1/node",
-                    headers={"x-flussonix-peer": peer_key},
-                )
-                worker = (cdn_worker_snapshot(json.loads(node_body), args.stream)
-                          if node_status == 200 else {"node_status": node_status})
-            except (OSError, ValueError, RuntimeError, KeyError):
-                worker = {"node_status": "unavailable"}
+            worker = worker_snapshot()
             return {"result": "no-cdn-media", "scheme": urllib.parse.urlsplit(args.source).scheme,
                     "output": args.output, "lb_statuses": statuses[-5:],
                     "m4f_controls": m4f_controls[-8:], "m4f_announcements": m4f_announcements,
                     "m4f_segments": m4f_segments[-8:], "m4f_lines": m4f_lines,
-                    "m4f_line_shapes": m4f_line_shapes, "cdn_worker": worker}, 2
+                    "m4f_line_shapes": m4f_line_shapes, "m4f_events": m4f_events[-8:],
+                    "cdn_worker": worker}, 2
         unauthorized_lb = get(f"{lb}/{path}/{suffix}")[0]
         unauthorized_cdn = get(f"{cdn}/{path}/{suffix}")[0]
         node_status, _, node_body = get(lb + "/flussonix/api/v1/node", headers={"x-flussonix-peer": peer_key})
@@ -542,7 +566,8 @@ def topology_probe(args, root):
                            m4f_announcements=m4f_announcements,
                            m4f_segments=m4f_segments[-8:],
                            m4f_lines=m4f_lines,
-                           m4f_line_shapes=m4f_line_shapes)
+                           m4f_line_shapes=m4f_line_shapes,
+                           m4f_events=m4f_events[-8:])
         return summary, 0 if passed else 2
     finally:
         for daemon in reversed(children):

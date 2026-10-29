@@ -1,5 +1,17 @@
 # Preview qualification
 
+## Current M4FS to M4F playback gate (2026-10-29)
+
+Six bounded, authenticated, read-only controls against the authorized cdn4
+Flussonic source each returned an announcement in 0.76–1.13 seconds. Twenty
+isolated local LB/CDN pulls from that source all delivered and fetched M4F
+media; nineteen controls had the first line already buffered and one received it
+after 1.22 seconds. An earlier twenty-attempt series still needed a second HTTP
+200 control once because the first returned no announcement. The new live probe
+records bounded first-line, EOF/timeout and worker-status details on that case.
+The intermittent local empty-control failure remains an open release gate; the
+direct source sample does not prove the source never stalls.
+
 ## Local Flussonic group approval gate
 
 Owned projection, config, replica, CDN, load-balancer and browser tests cover exact per-stream group pins, forged public-group claims, omitted memberships, pin edits that retire viewers, and view-role redaction. Static inventory status counts missing and mismatched pins without policy values or credentials. These tests use independent fixtures; live mixed-vendor playback and the full exact-head CI workflow remain separate release gates. M4S/M4SS/M4F/M4FS wire behavior is unchanged.
