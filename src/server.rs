@@ -2389,14 +2389,27 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     }
     if file == "m4s" || file == "m4f" {
         let deadline = Instant::now() + Duration::from_secs(8);
+        let has_payload = || {
+            if file == "m4f" {
+                worker.wire.has_m4f_segment()
+            } else {
+                worker.wire.has_info()
+            }
+        };
         while !grant.is_cancelled()
-            && !worker.wire.has_info()
+            && !has_payload()
             && worker.alive.load(Ordering::Relaxed)
             && Instant::now() < deadline
         {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        if !worker.wire.has_info() {
+        if !has_payload() {
+            if file == "m4f" && worker.wire.has_info() {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "M4F segment not available yet",
+                );
+            }
             return error(
                 StatusCode::NOT_IMPLEMENTED,
                 "wire outputs require H.264/AAC media",

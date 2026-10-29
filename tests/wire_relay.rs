@@ -22,6 +22,35 @@ fn frame(key: bool, dts: u64) -> Frame {
         body: vec![0, 0, 0, 1, if key { 101 } else { 65 }],
     }
 }
+#[test]
+fn m4f_readiness_waits_for_a_cached_announcement_after_track_metadata() {
+    let hub = Hub::new();
+    hub.info(tracks()).unwrap();
+    assert!(hub.has_info());
+    assert!(!hub.has_m4f_segment());
+    assert!(hub.signal_subscribe().0.is_empty());
+
+    let body = Bytes::from(pack(&tracks(), &[frame(true, 900000000)], 3600).unwrap());
+    let signal = Bytes::from_static(b"17 2026/10/01/08/09/10-00040\n");
+    hub.relay_segment(
+        Segment {
+            name: "2026/10/01/08/09/10.m4f".into(),
+            signal: signal.clone(),
+            bytes: body.clone(),
+        },
+        tracks(),
+        PackedGop {
+            utc: 1700000000,
+            dts_ms: 10000000.0,
+            sequence: 17,
+            duration_ms: 40.0,
+            body,
+        },
+    )
+    .unwrap();
+    assert!(hub.has_m4f_segment());
+    assert_eq!(hub.signal_subscribe().0, vec![signal]);
+}
 #[tokio::test]
 async fn queue_caps_bytes_and_records_and_reports_lag() {
     let q = Channel::new(4, 10);
