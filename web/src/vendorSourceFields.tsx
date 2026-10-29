@@ -2,10 +2,11 @@ import React,{useState} from 'react';
 import {Field,SettingsSummary,sourceEndpoint,type Item} from './forms';
 import {GPUReadiness} from './gpuReadiness';
 
-const policyFields=['on_play','flussonix_token_sha256','group_config'];
+const policyFields=['on_play','flussonix_token_sha256','group_config','flussonix_group_pins'];
 const supported=new Set(['url','api_url','private_payload_url','cluster_key','prefix','only','except','flussonix_tls_ca','flussonix_media_tls_ca','flussonix_source_kind','flussonix_transport','flussonix_output_template','flussonix_source_group','flussonix_content_id',...policyFields]);
 const owns=(v:Item,k:string)=>Object.hasOwn(v,k);
 const validName=(name:string)=>!!name&&new TextEncoder().encode(name).length<=256&&!name.split('/').some(p=>!p||p==='.'||p==='..')&&!/[\\?#\x00-\x1f\x7f-\x9f]/.test(name);
+const validExactName=(name:string)=>validName(name)&&!name.includes('*');
 const httpURL=(raw:string)=>{try{const u=new URL(raw);return ['http:','https:'].includes(u.protocol)&&!!u.hostname;}catch{return false}};
 const transport=(v:Item)=>v.url?.startsWith('m4s:')||v.url?.startsWith('m4ss:')?'m4s':'m4f';
 export function unsupportedVendorFields(value:Item):string[]{
@@ -35,6 +36,15 @@ export function vendorSourceError(value:Item):string|undefined {
    if(!validName(name))return 'Group names must be valid stream-style names of at most 256 UTF-8 bytes.';
    if(!policy||typeof policy!=='object'||Array.isArray(policy)||Object.keys(policy).some(k=>!['name','on_play','flussonix_token_sha256'].includes(k))||owns(policy,'name')&&policy.name!==name)return 'Group overrides may contain only viewer policies.';
    const error=policyError(policy,`Group ${name}`);if(error)return error;
+  }
+ }
+ if(value.flussonix_group_pins!==undefined){
+  const pins=value.flussonix_group_pins;
+  if(!pins||typeof pins!=='object'||Array.isArray(pins)||Object.keys(pins).length>128)return 'Use at most 128 exact stream group pins.';
+  for(const [stream,members] of Object.entries(pins)){
+   if(!validExactName(stream))return 'Pinned streams require exact valid names without wildcards.';
+   if(!Array.isArray(members)||members.length<1||members.length>64)return `Pin for ${stream} needs at least one configured group and at most 64 groups.`;
+   if(members.some(group=>typeof group!=='string'||!owns(value.group_config||{},group))||new Set(members).size!==members.length)return `Pin for ${stream} must use unique configured groups.`;
   }
  }
 }
@@ -68,8 +78,10 @@ function PolicyFields({value,onChange,backends,label,group=false}:{value:Item,on
 }
 export function VendorSourcePolicies({value,onChange,backends,templates,capabilities}:{value:Item,onChange:(v:Item)=>void,backends:Item[],templates:Item[],capabilities:Item}) {
  const [name,setName]=useState('');const [error,setError]=useState('');
- const groups:Item=value.group_config||{};const unsupported=unsupportedVendorFields(value);
+ const [pinName,setPinName]=useState('');const [pinError,setPinError]=useState('');
+ const groups:Item=value.group_config||{};const pins:Item=value.flussonix_group_pins||{};const unsupported=unsupportedVendorFields(value);
  const setGroups=(next:Item)=>{const source={...value};if(Object.keys(next).length)source.group_config=next;else delete source.group_config;onChange(source)};
+ const setPins=(next:Item)=>{const source={...value};if(Object.keys(next).length)source.flussonix_group_pins=next;else delete source.flussonix_group_pins;onChange(source)};
  const selected=templates.find(t=>t.name===value.flussonix_output_template);
  const processing=Object.fromEntries(['transcoder','flussonix_input_timeout','flussonix_subtitle_tracks','flussonix_hls_subtitles','flussonix_hls_captions'].filter(k=>selected&&owns(selected,k)).map(k=>[k,selected![k]]));
  return <>
@@ -84,6 +96,10 @@ export function VendorSourcePolicies({value,onChange,backends,templates,capabili
   <fieldset className="vendor-policies"><legend>Group policy overrides</legend><p className="muted">Match upstream group names without renaming streams. Unset fields inherit source policy; conflicting policies from matching groups deny playback.</p>
    {Object.entries(groups).map(([group,policy])=><fieldset key={group}><legend>Group {group}</legend><PolicyFields value={policy} onChange={next=>setGroups({...groups,[group]:next})} backends={backends} label={`Group ${group}`} group/><button type="button" aria-label={`Remove group ${group}`} onClick={()=>{const next={...groups};delete next[group];setGroups(next)}}>Remove group</button></fieldset>)}
    <div className="input-row"><Field label="New group name"><input maxLength={256} value={name} onChange={e=>{setName(e.target.value);setError('')}}/></Field><button type="button" disabled={Object.keys(groups).length>=128} onClick={()=>{if(!validName(name)){setError('Enter a valid group name.');return;}if(owns(groups,name)){setError('That group already has an override.');return;}setGroups({...groups,[name]:{}});setName('');setError('')}}>Add group override</button></div>{error&&<p className="error" role="status">{error}</p>}
+  </fieldset>
+  <fieldset className="vendor-policies"><legend>Approved stream groups</legend><p className="muted">When group policies differ, approve each stream's exact playback name here, including any source prefix. A missing pin or a different group claim from the source makes that stream unavailable. Pins choose the local viewer policy; the source cannot change it.</p>
+   {Object.entries(pins).map(([stream,members])=><fieldset key={stream}><legend>Stream {stream}</legend><div className="form-grid">{Object.keys(groups).map(group=><label key={group} className="check-row"><input type="checkbox" checked={Array.isArray(members)&&members.includes(group)} aria-label={`Group ${group} for ${stream}`} onChange={e=>{const next=e.target.checked?[...members,group]:members.filter((item:string)=>item!==group);setPins({...pins,[stream]:next})}}/>{group}</label>)}</div><button type="button" aria-label={`Remove pin for ${stream}`} onClick={()=>{const next={...pins};delete next[stream];setPins(next)}}>Remove stream pin</button></fieldset>)}
+   <div className="input-row"><Field label="New pinned stream"><input maxLength={256} value={pinName} onChange={e=>{setPinName(e.target.value);setPinError('')}}/></Field><button type="button" disabled={Object.keys(pins).length>=128} onClick={()=>{if(!validExactName(pinName)){setPinError('Enter an exact stream name without wildcards.');return}if(owns(pins,pinName)){setPinError('That stream already has a pin.');return}const first=Object.keys(groups)[0];if(!first){setPinError('Configure a group override first.');return}setPins({...pins,[pinName]:[first]});setPinName('');setPinError('')}}>Add stream pin</button></div>{pinError&&<p className="error" role="status">{pinError}</p>}
   </fieldset>
  </>;
 }

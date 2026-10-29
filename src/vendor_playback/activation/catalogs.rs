@@ -1,5 +1,9 @@
 //! Four owned catalog jobs; complete inventories only, no I/O under publication locks.
 use super::*;
+use crate::source_directory::{
+    flussonic_config::{BindingFailure, LeaseFailure, ProjectionFailure},
+    modern_coordinator::CoordinationFailure,
+};
 use crate::vendor_playback::replicas::Probe;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{future::Future, pin::Pin};
@@ -21,18 +25,27 @@ impl Runtime {
                 return;
             }
         };
-        let names = rows
-            .names()
-            .filter_map(|name| {
-                let candidate = rows.candidate(name).ok()?;
-                self.owner
-                    .publish(&candidate, |v, _| {
+        let mut missing_group_pins = 0usize;
+        let mut mismatched_group_pins = 0usize;
+        let mut names = BTreeSet::new();
+        for name in rows.names() {
+            match rows.candidate(name) {
+                Ok(candidate) => {
+                    if let Ok(Some(selected)) = self.owner.publish(&candidate, |v, _| {
                         v.selected_static.then(|| name.to_owned())
-                    })
-                    .ok()
-                    .flatten()
-            })
-            .collect::<BTreeSet<_>>();
+                    }) {
+                        names.insert(selected);
+                    }
+                }
+                Err(CoordinationFailure::Lease(LeaseFailure::Binding(
+                    BindingFailure::Projection(ProjectionFailure::MissingGroupPin),
+                ))) => missing_group_pins += 1,
+                Err(CoordinationFailure::Lease(LeaseFailure::Binding(
+                    BindingFailure::Projection(ProjectionFailure::GroupPinMismatch),
+                ))) => mismatched_group_pins += 1,
+                Err(_) => {}
+            }
+        }
         // The whole inventory, including zero matches, must still be current.
         let _ = self.owner.at_inventory_current(&rows, || {
             let mut state = self.activation.lock().unwrap();
@@ -50,11 +63,15 @@ impl Runtime {
             };
             if used.saturating_add(names.len()) > 10000 {
                 c.names.clear();
+                c.missing_group_pins = 0;
+                c.mismatched_group_pins = 0;
                 c.expires = None;
                 c.error = Some("capacity");
                 return;
             }
             c.names = names;
+            c.missing_group_pins = missing_group_pins;
+            c.mismatched_group_pins = mismatched_group_pins;
             c.expires = Some(rows.expires_at());
             c.error = None;
         });
@@ -100,6 +117,8 @@ impl Runtime {
                     for key in &keys {
                         state.catalogs.entry(key.clone()).or_insert(Catalog {
                             names: BTreeSet::new(),
+                            missing_group_pins: 0,
+                            mismatched_group_pins: 0,
                             expires: None,
                             next_poll: Instant::now(),
                             error: None,

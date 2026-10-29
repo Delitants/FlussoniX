@@ -59,6 +59,45 @@ fn vendor_type_and_local_source_and_group_policies_persist_and_prepare() {
     )
     .unwrap();
 }
+
+#[test]
+fn vendor_replicas_require_identical_local_group_pins() {
+    let (_dir, store) = store();
+    let source = |url: &str, pins: Value| {
+        json!({
+            "url": url,
+            "flussonix_source_kind": "flussonic",
+            "cluster_key": "owned-vendor-private-key",
+            "flussonix_source_group": "music-replicas",
+            "flussonix_content_id": "music-v1",
+            "on_play": "true",
+            "group_config": {"public":{"on_play":"true"},"other":{"on_play":"true"}},
+            "flussonix_group_pins": pins
+        })
+    };
+    let first = "m4s://first.invalid";
+    let second = "m4s://second.invalid";
+    store
+        .put(
+            "sources",
+            first,
+            source(first, json!({"music":["public","other"]})),
+        )
+        .unwrap();
+    assert!(
+        store
+            .put("sources", second, source(second, json!({})))
+            .is_err(),
+        "replicas accepted different local pin maps"
+    );
+    store
+        .put(
+            "sources",
+            second,
+            source(second, json!({"music":["other","public"]})),
+        )
+        .unwrap();
+}
 #[test]
 fn missing_viewer_policy_is_not_implicitly_public_or_replaced_by_peer_key() {
     let (_d, s) = store();
@@ -126,6 +165,7 @@ fn vendor_fields_are_source_only_and_never_enable_native_or_peer_policies() {
         json!({"on_play":"true"}),
         json!({"flussonix_token_sha256":"a".repeat(64)}),
         json!({"group_config":{}}),
+        json!({"flussonix_group_pins":{}}),
     ] {
         assert!(
             s.put(
@@ -363,7 +403,13 @@ async fn persisted_vendor_policy_controls_actual_app_authorizer_without_manual_i
         "missing local viewer policy became public"
     );
     let token_hash = |text: &str| format!("{:x}", Sha256::digest(text.as_bytes()));
-    app.config.put("sources",&key,json!({"on_play":"true","flussonix_token_sha256":token_hash("source-token"),"group_config":{"protected":{"flussonix_token_sha256":token_hash("group-token")}}})).unwrap();
+    app.config
+        .put(
+            "sources",
+            &key,
+            json!({"on_play":"true","flussonix_token_sha256":token_hash("source-token")}),
+        )
+        .unwrap();
     let rows = c
         .inventory(&install(), Duration::from_secs(5))
         .await
@@ -392,6 +438,7 @@ async fn persisted_vendor_policy_controls_actual_app_authorizer_without_manual_i
     c.admitted_current(&a).unwrap();
     drop(a);
     *groups.lock().unwrap() = json!(["protected"]);
+    app.config.put("sources",&key,json!({"group_config":{"protected":{"flussonix_token_sha256":token_hash("group-token")}},"flussonix_group_pins":{"owned":["protected"]}})).unwrap();
     let rows = c
         .inventory(&install(), Duration::from_secs(5))
         .await
@@ -421,26 +468,10 @@ async fn persisted_vendor_policy_controls_actual_app_authorizer_without_manual_i
         .inventory(&install(), Duration::from_secs(5))
         .await
         .unwrap();
-    assert!(matches!(
-        c.admit(
-            rows.candidate("owned").unwrap(),
-            &app.playback_auth,
-            request("wrong-token")
-        )
-        .await
-        .unwrap(),
-        AdmissionOutcome::Denied
-    ));
-    assert!(matches!(
-        c.admit(
-            rows.candidate("owned").unwrap(),
-            &app.playback_auth,
-            request("source-token")
-        )
-        .await
-        .unwrap(),
-        AdmissionOutcome::Allowed(_)
-    ));
+    assert!(
+        rows.candidate("owned").is_err(),
+        "a mismatched remote group weakened the local pin"
+    );
     app.config
         .put(
             "sources",
@@ -460,7 +491,7 @@ async fn persisted_vendor_policy_controls_actual_app_authorizer_without_manual_i
         .put(
             "sources",
             &key,
-            json!({"on_play":"true","flussonix_token_sha256":token_hash("source-token")}),
+            json!({"on_play":"true","flussonix_token_sha256":token_hash("source-token"),"group_config":null,"flussonix_group_pins":null}),
         )
         .unwrap();
     *groups.lock().unwrap() = json!([]);
@@ -524,7 +555,10 @@ async fn public_crud_persists_vendor_fields_and_dry_run_errors_are_atomic() {
             .unwrap();
         router(app.clone()).oneshot(r)
     };
-    let response = send("PUT", &path, source(), false).await.unwrap();
+    let mut configured = source();
+    configured["group_config"] = json!({"paid":{"flussonix_token_sha256":"a".repeat(64)}});
+    configured["flussonix_group_pins"] = json!({"region/owned":["paid"]});
+    let response = send("PUT", &path, configured.clone(), false).await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(
         app.config.snapshot()["sources"]
@@ -532,7 +566,7 @@ async fn public_crud_persists_vendor_fields_and_dry_run_errors_are_atomic() {
             .unwrap()
             .is_empty()
     );
-    let response = send("PUT", &path, source(), true).await.unwrap();
+    let response = send("PUT", &path, configured, true).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let response = send("GET", &path, Value::Null, false).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -542,6 +576,11 @@ async fn public_crud_persists_vendor_fields_and_dry_run_errors_are_atomic() {
     let viewed: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(viewed["on_play"], "[redacted]");
     assert_eq!(viewed["cluster_key"], "[redacted]");
+    assert_eq!(
+        viewed["flussonix_group_pins"],
+        json!({"region/owned":["paid"]})
+    );
+    assert!(!viewed.to_string().contains(&"a".repeat(64)));
     let response = send("GET", &path, Value::Null, true).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(response.into_body(), 100000)

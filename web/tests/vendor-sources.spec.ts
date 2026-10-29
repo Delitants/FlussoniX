@@ -47,11 +47,60 @@ test('vendor source callback and group overrides persist and Config staging does
  await page.getByRole('button',{name:'Save & apply',exact:true}).click();await expect(page.locator('.notice[role=status]')).toContainText('saved and applied');saved=await(await request.get(uri,{headers:headers()})).json();expect(saved.group_config.free.on_play).toBeUndefined();expect(saved.group_config.free.flussonix_token_sha256).toBe('b'.repeat(64));await expect(page.locator('textarea')).toHaveCount(0);
 });
 
+test('vendor source group pins use labeled controls and reject duplicate or unknown streams',async({page,request})=>{
+ await page.getByRole('button',{name:'Add source',exact:true}).click();
+ await page.getByLabel('Source type',{exact:true}).selectOption('flussonic');
+ await page.getByLabel('Source address',{exact:true}).fill(source);
+ await page.getByLabel('Cluster key',{exact:true}).fill('owned-vendor-private-key');
+ await page.getByLabel('Viewer policy',{exact:true}).selectOption('allow');
+ await page.getByLabel('New group name',{exact:true}).fill('paid');
+ await page.getByRole('button',{name:'Add group override',exact:true}).click();
+ await page.getByLabel('Group paid token SHA256',{exact:true}).fill('a'.repeat(64));
+ await page.getByLabel('New pinned stream',{exact:true}).fill('region/owned');
+ await page.getByRole('button',{name:'Add stream pin',exact:true}).click();
+ await expect(page.getByLabel('Group paid for region/owned',{exact:true})).toBeChecked();
+ await page.getByLabel('New pinned stream',{exact:true}).fill('region/owned');
+ await page.getByRole('button',{name:'Add stream pin',exact:true}).click();
+ await expect(page.getByText('That stream already has a pin.',{exact:true})).toBeVisible();
+ await page.getByLabel('New pinned stream',{exact:true}).fill('region/*');
+ await page.getByRole('button',{name:'Add stream pin',exact:true}).click();
+ await expect(page.getByText('Enter an exact stream name without wildcards.',{exact:true})).toBeVisible();
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ await expect(row(page)).toBeVisible();
+ let saved=await(await request.get(uri,{headers:headers()})).json();
+ expect(saved.flussonix_group_pins).toEqual({'region/owned':['paid']});
+ await edit(page);
+ await expect(page.getByLabel('Group paid for region/owned',{exact:true})).toBeChecked();
+ await page.getByLabel('Group paid for region/owned',{exact:true}).uncheck();
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ await expect(page.getByRole('dialog').getByRole('alert')).toContainText('at least one configured group');
+ await page.getByLabel('Group paid for region/owned',{exact:true}).check();
+ await page.getByRole('button',{name:'Remove pin for region/owned',exact:true}).click();
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ saved=await(await request.get(uri,{headers:headers()})).json();
+ expect(saved.flussonix_group_pins).toBeUndefined();
+ await expect(page.locator('textarea')).toHaveCount(0);
+});
+
+test('vendor source pins remain visible to view role without group policy secrets',async({page,request,browser})=>{
+ test.skip(!process.env.FLUSSONIX_VIEW_PASSWORD,'Owned fixture has no view-role account');
+ expect((await request.put(uri,{headers:headers(),data:{flussonix_source_kind:'flussonic',cluster_key:'owned-vendor-private-key',on_play:'true',group_config:{paid:{flussonix_token_sha256:'b'.repeat(64)}},flussonix_group_pins:{'region/owned':['paid']}}})).ok()).toBeTruthy();
+ const viewHeaders={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_VIEW_USER||'viewer')+':'+process.env.FLUSSONIX_VIEW_PASSWORD).toString('base64')};
+ const viewed=await(await request.get(uri,{headers:viewHeaders})).json();
+ expect(viewed.flussonix_group_pins).toEqual({'region/owned':['paid']});
+ expect(JSON.stringify(viewed)).not.toContain('b'.repeat(64));
+ expect(viewed.cluster_key).toBe('[redacted]');
+ const view=await browser.newPage();try{
+  await view.goto('/admin/');await view.getByLabel('Username').fill(process.env.FLUSSONIX_VIEW_USER||'viewer');await view.getByLabel('Password',{exact:true}).fill(process.env.FLUSSONIX_VIEW_PASSWORD!);await view.getByRole('button',{name:'Sign in',exact:true}).click();
+  await sources(view);const viewerRow=view.getByRole('row').filter({has:view.getByRole('cell',{name:'m4ss://[redacted]',exact:true})});await expect(viewerRow).toBeVisible();await expect(viewerRow).not.toContainText('b'.repeat(64));await expect(view.locator('body')).not.toContainText('owned-vendor-private-key');
+ }finally{await view.close()}
+});
+
 test('switching a protected vendor source to native requires explicitly clearing viewer policies',async({page,request})=>{
- expect((await request.put(uri,{headers:headers(),data:{flussonix_source_kind:'flussonic',cluster_key:'owned-vendor-private-key',on_play:'true',flussonix_token_sha256:'a'.repeat(64),group_config:{free:{on_play:'true'}}}})).ok()).toBeTruthy();
+ expect((await request.put(uri,{headers:headers(),data:{flussonix_source_kind:'flussonic',cluster_key:'owned-vendor-private-key',on_play:'true',flussonix_token_sha256:'a'.repeat(64),group_config:{free:{on_play:'true'}},flussonix_group_pins:{'region/owned':['free']}}})).ok()).toBeTruthy();
  await expect(row(page)).toBeVisible();await edit(page);await page.getByLabel('Source type',{exact:true}).selectOption('native');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Clear vendor viewer policies');
  expect((await(await request.get(uri,{headers:headers()})).json()).flussonix_token_sha256).toBe('a'.repeat(64));
- await page.getByRole('button',{name:'Clear vendor viewer policies',exact:true}).click();await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);const saved=await(await request.get(uri,{headers:headers()})).json();expect(saved.flussonix_source_kind).toBe('native');expect(saved.on_play).toBeUndefined();expect(saved.group_config).toBeUndefined();expect(saved.flussonix_token_sha256).toBeUndefined();expect(saved.cluster_key).toBe('owned-vendor-private-key');
+ await page.getByRole('button',{name:'Clear vendor viewer policies',exact:true}).click();await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);const saved=await(await request.get(uri,{headers:headers()})).json();expect(saved.flussonix_source_kind).toBe('native');expect(saved.on_play).toBeUndefined();expect(saved.group_config).toBeUndefined();expect(saved.flussonix_group_pins).toBeUndefined();expect(saved.flussonix_token_sha256).toBeUndefined();expect(saved.cluster_key).toBe('owned-vendor-private-key');
 });
 
 test('native settings are retained until explicitly removed for vendor conversion',async({page,request})=>{

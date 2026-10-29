@@ -16,6 +16,8 @@ pub(super) struct State {
 }
 struct Catalog {
     names: BTreeSet<String>,
+    missing_group_pins: usize,
+    mismatched_group_pins: usize,
     expires: Option<Instant>,
     next_poll: Instant,
     error: Option<&'static str>,
@@ -344,7 +346,7 @@ impl Runtime {
                 return serde_json::json!({"wanted_streams":0,"active_streams":0,"capacity_limited":false,"sources":[]});
             }
             (
-                serde_json::json!({"wanted_streams":state.demands.len(),"active_streams":0,"capacity_limited":state.capacity,"sources":state.catalogs.iter().map(|(key,c)|serde_json::json!({"source":key,"inventory_streams":c.names.len(),"lease_valid":c.expires.is_some_and(|t|t>Instant::now()),"last_error":c.error})).collect::<Vec<_>>()}),
+                serde_json::json!({"wanted_streams":state.demands.len(),"active_streams":0,"capacity_limited":state.capacity,"sources":state.catalogs.iter().map(|(key,c)|{let valid=c.expires.is_some_and(|t|t>Instant::now());serde_json::json!({"source":key,"inventory_streams":c.names.len(),"missing_group_pins":if valid{c.missing_group_pins}else{0},"mismatched_group_pins":if valid{c.mismatched_group_pins}else{0},"lease_valid":valid,"last_error":c.error})}).collect::<Vec<_>>()}),
                 state
                     .demands
                     .values()

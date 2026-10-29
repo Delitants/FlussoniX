@@ -1,5 +1,9 @@
 # Preview qualification
 
+## Local Flussonic group approval gate
+
+Owned projection, config, replica, CDN, load-balancer and browser tests cover exact per-stream group pins, forged public-group claims, omitted memberships, pin edits that retire viewers, and view-role redaction. Static inventory status counts missing and mismatched pins without policy values or credentials. These tests use independent fixtures; live mixed-vendor playback and the full exact-head CI workflow remain separate release gates. M4S/M4SS/M4F/M4FS wire behavior is unchanged.
+
 This milestone is an executable subset of the product design, not complete Flussonic parity. Baseline reference: installed Flussonic 26.04.1. The native cluster uses FlussoniX peer authentication and source discovery; a mixed Flussonic cluster is not qualified.
 
 ## Evidence

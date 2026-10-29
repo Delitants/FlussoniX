@@ -195,7 +195,7 @@ async fn vendor_lb_callback_redirect_precedes_peer_rpcs() {
 #[tokio::test]
 async fn vendor_lb_group_policy_and_peer_header_cannot_bypass_viewer_guard() {
     use sha2::{Digest, Sha256};
-    let f=Fixture::variant(json!({"on_play":"true","group_config":{"paid":{"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"paid-viewer"))}}}),"m4s","lb").await;
+    let f=Fixture::variant(json!({"on_play":"true","group_config":{"paid":{"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"paid-viewer"))}},"flussonix_group_pins":{"owned":["paid"]}}),"m4s","lb").await;
     (*f.remote.lock().unwrap())[0]["groups"] = json!(["paid"]);
     let peer = Peer::new().await;
     peer.configure(&f);
@@ -219,6 +219,61 @@ async fn vendor_lb_group_policy_and_peer_header_cannot_bypass_viewer_guard() {
     assert_eq!(f.media_calls(), 0);
     assert_eq!(f.app.media.count().await, 0);
     assert_eq!(f.app.playback_auth.active(), 1);
+    peer.stop().await;
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn vendor_lb_rejects_forged_public_group_before_redirect() {
+    use sha2::{Digest, Sha256};
+    let f = Fixture::variant(
+        json!({"on_play":"true","group_config":{"paid":{"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"paid-viewer"))}},"flussonix_group_pins":{"owned":["paid"]}}),
+        "m4s",
+        "lb",
+    )
+    .await;
+    let peer = Peer::new().await;
+    peer.configure(&f);
+    let response = f.get("/owned/m4s?token=paid-viewer").await;
+    assert_ne!(response.status(), StatusCode::FOUND);
+    assert!(peer.calls.lock().unwrap().is_empty());
+    assert_eq!(f.media_calls(), 0);
+    assert_eq!(f.app.playback_auth.active(), 0);
+    peer.stop().await;
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn vendor_lb_pin_edit_rejects_stale_group_before_cdn_handoff() {
+    use sha2::{Digest, Sha256};
+    let f = Fixture::variant(
+        json!({"on_play":"true","group_config":{"paid":{"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"paid-viewer"))},"public":{"on_play":"true"}},"flussonix_group_pins":{"owned":["paid"]}}),
+        "m4s",
+        "lb",
+    )
+    .await;
+    (*f.remote.lock().unwrap())[0]["groups"] = json!(["paid"]);
+    let peer = Peer::new().await;
+    peer.configure(&f);
+    assert_eq!(
+        f.get("/owned/m4s?token=paid-viewer").await.status(),
+        StatusCode::FOUND
+    );
+    let admitted = peer.calls.lock().unwrap().len();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_group_pins":{"owned":["public"]}}),
+        )
+        .unwrap();
+    assert_ne!(
+        f.get("/owned/m4s?token=paid-viewer").await.status(),
+        StatusCode::FOUND
+    );
+    assert_eq!(peer.calls.lock().unwrap().len(), admitted);
+    assert_eq!(f.media_calls(), 0);
     peer.stop().await;
     f.stop().await;
 }
