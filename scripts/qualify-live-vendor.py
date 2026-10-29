@@ -201,6 +201,20 @@ def parse_m4f_announcement(line):
     return match.group(1) if match else None
 
 
+def cdn_worker_snapshot(node, stream):
+    """Return only operational fields for one owned CDN worker, never its config."""
+    for item in node.get("streams", []) if isinstance(node, dict) else []:
+        if not isinstance(item, dict) or item.get("name") != stream:
+            continue
+        stats = item.get("stats")
+        stats = stats if isinstance(stats, dict) else {}
+        return {"ready": item.get("ready") if isinstance(item.get("ready"), bool) else None,
+                **{field: stats.get(field) for field in (
+                    "status", "bytes_in", "restart_count", "retry_in_ms",
+                    "media_age_ms", "last_error")}}
+    return {"present": False}
+
+
 def probe(args, root):
     cluster_key = args.cluster_key_file.read_text(encoding="utf-8").strip()
     if not cluster_key:
@@ -485,11 +499,20 @@ def topology_probe(args, root):
                 media_bytes = len(media)
                 streams, media_ok = inspect_media(root, media)
         if not media_ok:
+            try:
+                node_status, _, node_body = get(
+                    cdn + "/flussonix/api/v1/node",
+                    headers={"x-flussonix-peer": peer_key},
+                )
+                worker = (cdn_worker_snapshot(json.loads(node_body), args.stream)
+                          if node_status == 200 else {"node_status": node_status})
+            except (OSError, ValueError, RuntimeError, KeyError):
+                worker = {"node_status": "unavailable"}
             return {"result": "no-cdn-media", "scheme": urllib.parse.urlsplit(args.source).scheme,
                     "output": args.output, "lb_statuses": statuses[-5:],
                     "m4f_controls": m4f_controls[-8:], "m4f_announcements": m4f_announcements,
                     "m4f_segments": m4f_segments[-8:], "m4f_lines": m4f_lines,
-                    "m4f_line_shapes": m4f_line_shapes}, 2
+                    "m4f_line_shapes": m4f_line_shapes, "cdn_worker": worker}, 2
         unauthorized_lb = get(f"{lb}/{path}/{suffix}")[0]
         unauthorized_cdn = get(f"{cdn}/{path}/{suffix}")[0]
         node_status, _, node_body = get(lb + "/flussonix/api/v1/node", headers={"x-flussonix-peer": peer_key})
