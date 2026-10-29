@@ -71,14 +71,18 @@ fn vendor_replicas_require_identical_local_group_pins() {
             "flussonix_source_group": "music-replicas",
             "flussonix_content_id": "music-v1",
             "on_play": "true",
-            "group_config": {"public":{"on_play":"true"}},
+            "group_config": {"public":{"on_play":"true"},"other":{"on_play":"true"}},
             "flussonix_group_pins": pins
         })
     };
     let first = "m4s://first.invalid";
     let second = "m4s://second.invalid";
     store
-        .put("sources", first, source(first, json!({"music":["public"]})))
+        .put(
+            "sources",
+            first,
+            source(first, json!({"music":["public","other"]})),
+        )
         .unwrap();
     assert!(
         store
@@ -86,6 +90,13 @@ fn vendor_replicas_require_identical_local_group_pins() {
             .is_err(),
         "replicas accepted different local pin maps"
     );
+    store
+        .put(
+            "sources",
+            second,
+            source(second, json!({"music":["other","public"]})),
+        )
+        .unwrap();
 }
 #[test]
 fn missing_viewer_policy_is_not_implicitly_public_or_replaced_by_peer_key() {
@@ -154,6 +165,7 @@ fn vendor_fields_are_source_only_and_never_enable_native_or_peer_policies() {
         json!({"on_play":"true"}),
         json!({"flussonix_token_sha256":"a".repeat(64)}),
         json!({"group_config":{}}),
+        json!({"flussonix_group_pins":{}}),
     ] {
         assert!(
             s.put(

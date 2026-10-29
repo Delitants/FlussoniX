@@ -427,6 +427,47 @@ fn native_content_identity_and_replica_groups_are_validated_and_inherited() {
 }
 
 #[test]
+fn vendor_group_pin_edits_validate_atomically() {
+    use serde_json::json;
+    let d = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(d.path().join("config.json")).unwrap();
+    let source = "m4s://owned-origin.invalid";
+    store
+        .put(
+            "sources",
+            source,
+            json!({
+                "flussonix_source_kind":"flussonic",
+                "cluster_key":"owned-cluster-key",
+                "on_play":"true",
+                "group_config":{"paid":{"flussonix_token_sha256":"a".repeat(64)}},
+                "flussonix_group_pins":{"region/news":["paid"]}
+            }),
+        )
+        .unwrap();
+    let before = store.snapshot();
+    let revision = store.revision();
+    for pins in [
+        json!([]),
+        json!({"region/*":["paid"]}),
+        json!({"region/news":[]}),
+        json!({"region/news":["unknown"]}),
+        json!({"region/news":["paid","paid"]}),
+        json!({"region/news":vec!["paid";65]}),
+    ] {
+        assert!(
+            store
+                .put("sources", source, json!({"flussonix_group_pins":pins}))
+                .is_err()
+        );
+        assert_eq!(store.snapshot(), before);
+        assert_eq!(store.revision(), revision);
+    }
+    let reopened = ConfigStore::open(d.path().join("config.json")).unwrap();
+    assert_eq!(reopened.snapshot(), before);
+}
+
+#[test]
 fn rtsp_udp_input_option_is_validated_inherited_and_persisted() {
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("c.json");
