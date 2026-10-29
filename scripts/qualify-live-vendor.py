@@ -215,6 +215,77 @@ def cdn_worker_snapshot(node, stream):
     return {"present": False}
 
 
+def private_input_failure(log):
+    """Read only fixed, credential-free failure fields from the owned CDN log."""
+    try:
+        with log.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 65_536))
+            lines = stream.read(65_536).decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    fields = {
+        "phase": set(("control_request", "control_response", "control_read", "signal_decode",
+                      "segment_request", "segment_response", "segment_read", "segment_decode",
+                      "m4s_decode", "bridge_metadata", "bridge_frame", "output_write", "relay")),
+        "failure": {"Invalid", "Transient", "Rejected", "Local", "Revoked"},
+        "last_private_ack": {"true", "false"},
+        "metadata_sent": {"true", "false"},
+    }
+    for line in reversed(lines):
+        if ("flussonix::private_input" not in line
+                or "private media input failed" not in line
+                or not re.search(r'\bprotocol=(?:"m4f"|m4f)(?:\s|$)', line)):
+            continue
+        result = {}
+        for name, allowed in fields.items():
+            match = re.search(r'\b' + name + r'=(?:"([^"]+)"|([A-Za-z_]+))', line)
+            value = (match.group(1) or match.group(2)) if match else None
+            if value not in allowed:
+                break
+            result[name] = value
+        else:
+            status = re.search(r'\blast_http_status=(\d{1,3})(?:\s|$)', line)
+            if status and int(status.group(1)) <= 599:
+                result["last_http_status"] = int(status.group(1))
+                for name in ("last_private_ack", "metadata_sent"):
+                    result[name] = result[name] == "true"
+                return result
+    return None
+
+
+def worker_lifecycle_events(log):
+    """Expose only fixed source/packager stop codes from the owned CDN log."""
+    try:
+        with log.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 65_536))
+            lines = stream.read(65_536).decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+    events = []
+    for line in lines:
+        if "flussonix::worker_lifecycle" not in line:
+            continue
+        if "shared input stopped before worker cancellation" in line:
+            reason = re.search(r'\breason=(Authority|Closed|Input|Unavailable|Mismatch|Limit|Lagged)(?=\(|\s|$)', line)
+            if reason:
+                events.append({"event": "shared_input_stopped", "reason": reason.group(1)})
+        elif "packager stdout closed before worker cancellation" in line:
+            count = re.search(r'\bbytes_in=(\d{1,20})(?:\s|$)', line)
+            if count and int(count.group(1)) <= 2**64 - 1:
+                events.append({"event": "packager_stdout_closed", "bytes_in": int(count.group(1))})
+        elif "worker failure recorded" in line:
+            site = re.search(r'\bsite=(\d{1,4})(?:\s|$)', line)
+            reason = re.search(r'\breason=(?:"([^"]+)"|([A-Za-z_]+))', line)
+            value = (reason.group(1) or reason.group(2)) if reason else None
+            if site and value in {"input_closed", "startup_timeout", "input_stalled",
+                                  "packaging_failed", "wire_decode_failed"}:
+                events.append({"event": "worker_failure", "site": int(site.group(1)),
+                               "reason": value})
+    return events[-8:]
+
+
 def probe(args, root):
     cluster_key = args.cluster_key_file.read_text(encoding="utf-8").strip()
     if not cluster_key:
@@ -344,6 +415,8 @@ def topology_probe(args, root):
         logs.append(log)
         env = {key: value for key, value in os.environ.items() if not key.startswith("FLUSSONIX_")}
         env.update(FLUSSONIX_ADMIN_PASSWORD="owned-vendor-probe-admin", FLUSSONIX_PEER_KEY=peer_key)
+        if args.output == "m4f":
+            env["RUST_LOG"] = "warn,flussonix::private_input=debug,flussonix::worker_lifecycle=debug"
         daemon = subprocess.Popen(
             [
                 str(args.binary),
@@ -419,11 +492,24 @@ def topology_probe(args, root):
         clean = urllib.parse.urljoin(placement, headers["location"])
         if not same_origin(clean, cdn) or "flussonix_ticket" in urllib.parse.parse_qs(urllib.parse.urlsplit(clean).query):
             raise RuntimeError("CDN clean playback URL is invalid")
+
+        def worker_snapshot():
+            try:
+                node_status, _, node_body = get(
+                    cdn + "/flussonix/api/v1/node",
+                    headers={"x-flussonix-peer": peer_key},
+                )
+                return (cdn_worker_snapshot(json.loads(node_body), args.stream)
+                        if node_status == 200 else {"node_status": node_status})
+            except (OSError, ValueError, RuntimeError, KeyError):
+                return {"node_status": "unavailable"}
+
         media_bytes = 0
         native_records = 0
         streams = []
         media_ok = False
         m4f_controls = []
+        m4f_events = []
         m4f_announcements = 0
         m4f_segments = []
         m4f_lines = 0
@@ -441,14 +527,30 @@ def topology_probe(args, root):
                 time.sleep(0.25)
         elif args.output == "m4f":
             while time.monotonic() < deadline and not media_ok:
+                event = None
                 try:
                     with opener.open(clean, timeout=20) as response:
                         m4f_controls.append(response.status)
                         if response.status == 200:
+                            control_started = time.monotonic()
+                            event = {"first_line_ms": None, "outcome": "deadline", "lines": 0,
+                                     "duration_ms": None}
+                            m4f_events.append(event)
                             while time.monotonic() < deadline:
                                 raw_line = response.readline(512)
                                 if not raw_line:
+                                    event["outcome"] = "eof"
+                                    event["worker"] = worker_snapshot()
+                                    source_failure = private_input_failure(root / "owned-vendor-cdn.log")
+                                    if source_failure is not None:
+                                        event["source_failure"] = source_failure
+                                    lifecycle = worker_lifecycle_events(root / "owned-vendor-cdn.log")
+                                    if lifecycle:
+                                        event["lifecycle"] = lifecycle
                                     break
+                                if event["first_line_ms"] is None:
+                                    event["first_line_ms"] = round((time.monotonic() - control_started) * 1000)
+                                event["lines"] += 1
                                 m4f_lines += 1
                                 line_text = raw_line.decode("ascii", "replace").strip()
                                 line = line_text.split()
@@ -463,20 +565,28 @@ def topology_probe(args, root):
                                     continue
                                 m4f_announcements += 1
                                 segment = f"{cdn}/{path}/{segment_time}.m4f?token={viewer_token}"
+                                event["outcome"] = "segment_request"
                                 status, _, body = get(segment, 20_000_000)
                                 m4f_segments.append(status)
+                                event["outcome"] = "segment_status"
                                 if status == 200 and body:
                                     streams = inspect_m4f_segment(body)
                                     media_bytes = len(body)
                                     native_records = 1
                                     media_ok = True
+                                    event["outcome"] = "media"
                                     break
+                            event["duration_ms"] = round((time.monotonic() - control_started) * 1000)
                 except urllib.error.HTTPError as error:
                     m4f_controls.append(error.code)
                     if error.code != 503:
                         raise RuntimeError("CDN native playback failed") from None
                 except TimeoutError:
                     m4f_controls.append("timeout")
+                    if event is not None:
+                        event["outcome"] = ("segment_timeout" if event["outcome"] == "segment_request"
+                                            else "read_timeout")
+                        event["duration_ms"] = round((time.monotonic() - control_started) * 1000)
                 time.sleep(0.25)
         else:
             media = None
@@ -499,20 +609,13 @@ def topology_probe(args, root):
                 media_bytes = len(media)
                 streams, media_ok = inspect_media(root, media)
         if not media_ok:
-            try:
-                node_status, _, node_body = get(
-                    cdn + "/flussonix/api/v1/node",
-                    headers={"x-flussonix-peer": peer_key},
-                )
-                worker = (cdn_worker_snapshot(json.loads(node_body), args.stream)
-                          if node_status == 200 else {"node_status": node_status})
-            except (OSError, ValueError, RuntimeError, KeyError):
-                worker = {"node_status": "unavailable"}
+            worker = worker_snapshot()
             return {"result": "no-cdn-media", "scheme": urllib.parse.urlsplit(args.source).scheme,
                     "output": args.output, "lb_statuses": statuses[-5:],
                     "m4f_controls": m4f_controls[-8:], "m4f_announcements": m4f_announcements,
                     "m4f_segments": m4f_segments[-8:], "m4f_lines": m4f_lines,
-                    "m4f_line_shapes": m4f_line_shapes, "cdn_worker": worker}, 2
+                    "m4f_line_shapes": m4f_line_shapes, "m4f_events": m4f_events[-8:],
+                    "cdn_worker": worker}, 2
         unauthorized_lb = get(f"{lb}/{path}/{suffix}")[0]
         unauthorized_cdn = get(f"{cdn}/{path}/{suffix}")[0]
         node_status, _, node_body = get(lb + "/flussonix/api/v1/node", headers={"x-flussonix-peer": peer_key})
@@ -542,7 +645,8 @@ def topology_probe(args, root):
                            m4f_announcements=m4f_announcements,
                            m4f_segments=m4f_segments[-8:],
                            m4f_lines=m4f_lines,
-                           m4f_line_shapes=m4f_line_shapes)
+                           m4f_line_shapes=m4f_line_shapes,
+                           m4f_events=m4f_events[-8:])
         return summary, 0 if passed else 2
     finally:
         for daemon in reversed(children):
