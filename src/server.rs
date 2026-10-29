@@ -2417,8 +2417,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
                 } else {
                     tokio::select! {biased; _=guard.1.cancelled()=>return None,_=guard.0.closed()=>return None,result=rx.recv()=> match result { Ok(bytes)=>bytes, Err(_)=>return None } }
                 };
-                guard.1.add_bytes(bytes.len());
-                egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                let bytes = wire_output_chunk(bytes, &guard, &egress)?;
                 Some((
                     Ok::<Bytes, std::io::Error>(bytes),
                     (boot, rx, guard, egress),
@@ -2521,6 +2520,73 @@ impl Drop for ViewerGuard {
     fn drop(&mut self) {
         self.0.viewers.fetch_sub(1, Ordering::Relaxed);
         self.0.touch();
+    }
+}
+
+fn wire_output_chunk(bytes: Bytes, viewer: &ViewerGuard, egress: &AtomicU64) -> Option<Bytes> {
+    // A queued frame can become ready while revocation or worker shutdown is
+    // being published. Check again at the actual HTTP output boundary.
+    if viewer.1.is_cancelled() || viewer.0.is_closed() {
+        return None;
+    }
+    viewer.1.add_bytes(bytes.len());
+    egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    Some(bytes)
+}
+
+#[cfg(test)]
+mod wire_delivery_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn queued_wire_chunk_is_discarded_when_viewer_or_worker_stops_before_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "/usr/bin/ffmpeg");
+        let worker = engine
+            .ensure("owned", &json!({"inputs":[{"url":"testsrc://"}]}))
+            .await
+            .unwrap();
+        let egress = AtomicU64::new(0);
+        let grant = Grant::peer();
+        let cancel = grant.cancellation_token();
+        worker.viewers.fetch_add(1, Ordering::Relaxed);
+        let viewer = ViewerGuard(worker.clone(), grant);
+
+        assert_eq!(
+            wire_output_chunk(Bytes::from_static(b"first"), &viewer, &egress),
+            Some(Bytes::from_static(b"first"))
+        );
+        cancel.cancel();
+        assert_eq!(
+            wire_output_chunk(Bytes::from_static(b"queued"), &viewer, &egress),
+            None,
+            "a ready chunk must not outlive its viewer grant"
+        );
+        assert_eq!(egress.load(Ordering::Relaxed), 5);
+
+        let other = Grant::peer();
+        worker.viewers.fetch_add(1, Ordering::Relaxed);
+        let other = ViewerGuard(worker.clone(), other);
+        assert_eq!(
+            wire_output_chunk(Bytes::from_static(b"other"), &other, &egress),
+            Some(Bytes::from_static(b"other")),
+            "revoking one viewer must not stop another viewer's media"
+        );
+        assert_eq!(egress.load(Ordering::Relaxed), 10);
+        drop(other);
+        drop(viewer);
+        let grant = Grant::peer();
+        worker.viewers.fetch_add(1, Ordering::Relaxed);
+        let viewer = ViewerGuard(worker.clone(), grant);
+        worker.cancellation_token().cancel();
+        assert_eq!(
+            wire_output_chunk(Bytes::from_static(b"queued"), &viewer, &egress),
+            None,
+            "a ready chunk must not outlive its worker"
+        );
+        assert_eq!(egress.load(Ordering::Relaxed), 10);
+        drop(viewer);
+        engine.stop_all().await;
     }
 }
 pub fn rewrite_playlist(text: &str, query: &str) -> String {
