@@ -1241,6 +1241,18 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     if method != "GET" {
         return error(StatusCode::METHOD_NOT_ALLOWED, "collection is read only");
     }
+    let selection = if matches!(kind, "streams" | "templates" | "peers" | "sources") {
+        match query
+            .get("select")
+            .map(|select| crate::api_select::Selection::new(select))
+            .transpose()
+        {
+            Ok(selection) => selection,
+            Err(reason) => return error(StatusCode::BAD_REQUEST, reason),
+        }
+    } else {
+        None
+    };
     let root = app.config.snapshot();
     let mut items = root[kind].as_array().cloned().unwrap_or_default();
     if kind == "streams" {
@@ -1303,10 +1315,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     if let Some(prev) = prev {
         result["prev"] = json!(prev);
     }
-    if matches!(kind, "streams" | "templates" | "peers" | "sources")
-        && let Some(select) = query.get("select")
-    {
-        let selection = crate::api_select::Selection::new(select);
+    if let Some(selection) = selection.as_ref() {
         for row in &mut page {
             *row = selection.project(row, kind == "streams");
         }

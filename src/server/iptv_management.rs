@@ -426,6 +426,14 @@ fn collection_rows<T: Serialize>(
     role: Role,
     query: &HashMap<String, String>,
 ) -> Response {
+    let selection = match query
+        .get("select")
+        .map(|select| crate::api_select::Selection::new(select))
+        .transpose()
+    {
+        Ok(selection) => selection,
+        Err(reason) => return error(StatusCode::BAD_REQUEST, reason),
+    };
     if query
         .get("limit")
         .is_some_and(|raw| raw.parse::<usize>().is_err())
@@ -499,8 +507,7 @@ fn collection_rows<T: Serialize>(
         }
         page_rows.push(row);
     }
-    if let Some(select) = query.get("select") {
-        let selection = crate::api_select::Selection::new(select);
+    if let Some(selection) = selection.as_ref() {
         for row in &mut page_rows {
             *row = selection.project(row, true);
         }

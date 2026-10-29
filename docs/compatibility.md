@@ -65,6 +65,9 @@ selected `config_on_disk` objects also retain their `name`, matching the
 reference schema's required identity fields. Wildcards and JSON
 path syntax are not supported. Overlapping parent/child selectors resolve in
 query order: a later parent selects the whole value; a later child narrows it.
+Collection selectors accept at most 16 KiB of decoded text and 256 comma-separated
+fields; larger requests return HTTP 400 before selector compilation. The same
+limit applies to IPTV package and subscriber collection selection.
 
 The contract is grounded in the installed 26.04.1 schema, read-only inspection
 of its collection selector, and the public
