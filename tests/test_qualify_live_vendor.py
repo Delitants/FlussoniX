@@ -27,5 +27,36 @@ class M4fAnnouncementTests(unittest.TestCase):
                 self.assertIsNone(PROBE.parse_m4f_announcement(line))
 
 
+class WorkerSnapshotTests(unittest.TestCase):
+    def test_snapshot_exposes_only_requested_worker_and_bounded_status_fields(self):
+        node = {
+            "secret": "cluster-secret",
+            "streams": [
+                {"name": "other", "stats": {"bytes_in": 999}},
+                {"name": "requested", "ready": True, "secret": "viewer-token",
+                 "stats": {"status": "running", "bytes_in": 1880,
+                           "restart_count": 2, "retry_in_ms": None,
+                           "media_age_ms": 450, "last_error": "input_closed",
+                           "secret": "private-url"}},
+            ],
+        }
+        snapshot = PROBE.cdn_worker_snapshot(node, "requested")
+        self.assertEqual(snapshot, {
+            "ready": True,
+            "status": "running",
+            "bytes_in": 1880,
+            "restart_count": 2,
+            "retry_in_ms": None,
+            "media_age_ms": 450,
+            "last_error": "input_closed",
+        })
+        self.assertNotIn("secret", repr(snapshot))
+        self.assertNotIn("999", repr(snapshot))
+
+    def test_missing_worker_returns_bounded_absence(self):
+        self.assertEqual(PROBE.cdn_worker_snapshot({"streams": []}, "requested"),
+                         {"present": False})
+
+
 if __name__ == "__main__":
     unittest.main()
