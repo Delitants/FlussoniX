@@ -128,7 +128,11 @@ impl Worker {
     pub fn idle_seconds(&self) -> u64 {
         self.last_access.lock().unwrap().elapsed().as_secs()
     }
+    #[track_caller]
     fn failed(&self, reason: &'static str) {
+        tracing::debug!(target: "flussonix::worker_lifecycle",
+            site = std::panic::Location::caller().line(), reason,
+            "worker failure recorded");
         self.recovery.lock().unwrap().fail(reason);
     }
     pub fn stats(&self) -> Value {
@@ -1181,7 +1185,11 @@ impl Engine {
                 tasks.push(tokio::spawn(async move {
                     let result =
                         tokio::select! {biased;_=c.cancelled()=>return,result=input.run()=>result};
-                    if result.is_err() && !c.is_cancelled() {
+                    if let Err(reason) = result
+                        && !c.is_cancelled()
+                    {
+                        tracing::debug!(target: "flussonix::worker_lifecycle", ?reason,
+                            "shared input stopped before worker cancellation");
                         source_worker.failed("input_closed");
                         c.cancel();
                     }
@@ -1471,6 +1479,9 @@ impl Engine {
                     };
                     match read {
                         Ok(Ok(0)) => {
+                            tracing::debug!(target: "flussonix::worker_lifecycle",
+                                bytes_in = w.bytes.load(Ordering::Relaxed),
+                                "packager stdout closed before worker cancellation");
                             let result=if let Some(output)=&mut native_output {tokio::select!{biased;_=cancel.cancelled()=>break,result=output.finish(&w.wire)=>result}}
                             else if let Some(receiver)=av_done.take() {
                                 tokio::select! {biased;_=cancel.cancelled()=>break,r=tokio::time::timeout(timeout,receiver)=>match r {Ok(Ok(result))=>result,_=>Err("wire_decode_failed")}}

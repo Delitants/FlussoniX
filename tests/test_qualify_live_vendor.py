@@ -2,6 +2,7 @@
 
 import importlib.util
 from pathlib import Path
+import tempfile
 import unittest
 
 
@@ -56,6 +57,69 @@ class WorkerSnapshotTests(unittest.TestCase):
     def test_missing_worker_returns_bounded_absence(self):
         self.assertEqual(PROBE.cdn_worker_snapshot({"streams": []}, "requested"),
                          {"present": False})
+
+
+class PrivateInputSnapshotTests(unittest.TestCase):
+    def test_only_allowlisted_m4f_failure_fields_leave_the_private_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "daemon.log"
+            log.write_text(
+                'WARN flussonix::private_input: private media input failed '
+                'protocol="m4f" phase="segment_response" failure=Transient '
+                'last_http_status=404 last_private_ack=true metadata_sent=true '
+                'cluster_key=secret token=secret\n', encoding="utf-8")
+            snapshot = PROBE.private_input_failure(log)
+        self.assertEqual(snapshot, {
+            "phase": "segment_response", "failure": "Transient",
+            "last_http_status": 404, "last_private_ack": True,
+            "metadata_sent": True,
+        })
+        self.assertNotIn("secret", repr(snapshot))
+
+    def test_unrelated_or_malformed_log_lines_are_not_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "daemon.log"
+            log.write_text(
+                'WARN other: private media input failed protocol="m4f" '
+                'phase="control_read" failure=Transient last_http_status=200 '
+                'last_private_ack=true metadata_sent=false\n'
+                'WARN flussonix::private_input: private media input failed '
+                'protocol="m4s" phase="control_read" failure=Transient '
+                'last_http_status=200 last_private_ack=true metadata_sent=false\n'
+                'WARN flussonix::private_input: private media input failed '
+                'protocol="m4f" phase="unknown" failure=Transient '
+                'last_http_status=200 last_private_ack=true metadata_sent=false\n',
+                encoding="utf-8")
+            self.assertIsNone(PROBE.private_input_failure(log))
+
+
+class WorkerLifecycleSnapshotTests(unittest.TestCase):
+    def test_only_fixed_lifecycle_codes_and_classes_leave_the_private_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "daemon.log"
+            log.write_text(
+                'DEBUG flussonix::worker_lifecycle: shared input stopped before worker cancellation '
+                'reason=Authority(Coordination(Lease(Expired))) cluster_key=secret\n'
+                'DEBUG flussonix::worker_lifecycle: packager stdout closed before worker cancellation '
+                'bytes_in=0 token=secret\n'
+                'DEBUG flussonix::worker_lifecycle: worker failure recorded '
+                'site=1479 reason=input_closed token=secret\n', encoding="utf-8")
+            snapshot = PROBE.worker_lifecycle_events(log)
+        self.assertEqual(snapshot, [
+            {"event": "shared_input_stopped", "reason": "Authority"},
+            {"event": "packager_stdout_closed", "bytes_in": 0},
+            {"event": "worker_failure", "site": 1479, "reason": "input_closed"},
+        ])
+        self.assertNotIn("secret", repr(snapshot))
+
+    def test_unrelated_lifecycle_lines_are_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "daemon.log"
+            log.write_text(
+                'DEBUG other: shared input stopped before worker cancellation reason=Input\n'
+                'DEBUG flussonix::worker_lifecycle: shared input stopped before worker cancellation '
+                'reason=CredentialLeak\n', encoding="utf-8")
+            self.assertEqual(PROBE.worker_lifecycle_events(log), [])
 
 
 if __name__ == "__main__":

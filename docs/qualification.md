@@ -9,6 +9,13 @@ media; nineteen controls had the first line already buffered and one received it
 after 1.22 seconds. An earlier twenty-attempt series still needed a second HTTP
 200 control once because the first returned no announcement. The new live probe
 records bounded first-line, EOF/timeout and worker-status details on that case.
+Later bounded series captured an empty 200 ending in EOF after 2.76 seconds;
+the CDN worker was retrying `input_closed` with zero packaged bytes, and the
+next control succeeded. Another series ended with four empty 200 controls and
+no media in 47 seconds. Its owned CDN log had no private-input failure or
+packager warning. Debug-only worker call-site markers now distinguish the
+remaining silent local shutdown paths; twenty-five subsequent isolated pulls
+passed without reproducing the failure.
 The intermittent local empty-control failure remains an open release gate; the
 direct source sample does not prove the source never stalls.
 
