@@ -1454,6 +1454,22 @@ async fn m4f_control_stays_unavailable_until_the_first_segment_is_cached() {
     let f = Fixture::variant(json!({"on_play":"true"}), "m4f", "standalone").await;
     f.first_signal_delay
         .store(30_000, std::sync::atomic::Ordering::SeqCst);
+    f.app
+        .config
+        .put(
+            "templates",
+            "short-m4f",
+            json!({"flussonix_input_timeout":10}),
+        )
+        .unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"short-m4f"}),
+        )
+        .unwrap();
     let started = std::time::Instant::now();
     let status = f.get("/owned/m4f").await.status();
     let elapsed = started.elapsed();
@@ -1462,6 +1478,57 @@ async fn m4f_control_stays_unavailable_until_the_first_segment_is_cached() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(elapsed >= Duration::from_secs(8));
     assert_eq!(stats["bytes_in"], 0);
+}
+
+#[tokio::test]
+async fn m4f_control_waits_for_a_segment_within_the_worker_startup_allowance() {
+    use http_body_util::BodyExt;
+    let f = Fixture::variant(json!({"on_play":"true"}), "m4f", "standalone").await;
+    f.first_signal_delay
+        .store(9_000, std::sync::atomic::Ordering::SeqCst);
+    f.app
+        .config
+        .put(
+            "templates",
+            "slow-m4f",
+            json!({"flussonix_input_timeout":20}),
+        )
+        .unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"slow-m4f"}),
+        )
+        .unwrap();
+    let started = std::time::Instant::now();
+    let response = f.get("/owned/m4f").await;
+    let elapsed = started.elapsed();
+    let status = response.status();
+    let mut body = response.into_body();
+    let signal = if status == StatusCode::OK {
+        tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap()
+    } else {
+        Default::default()
+    };
+    let segment = if status == StatusCode::OK {
+        f.get("/owned/2026/10/13/00/00/00.m4f").await.status()
+    } else {
+        status
+    };
+    drop(body);
+    f.stop().await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(elapsed >= Duration::from_secs(9));
+    assert!(String::from_utf8_lossy(&signal).contains("2026/10/13/00/00/00"));
+    assert_eq!(segment, StatusCode::OK);
 }
 
 #[tokio::test]

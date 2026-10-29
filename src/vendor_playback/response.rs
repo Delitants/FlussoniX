@@ -193,6 +193,11 @@ impl Runtime {
         if matches!(file, "mpegts" | "m4s" | "m4f") {
             if file != "mpegts" {
                 let deadline = Instant::now() + Duration::from_secs(8);
+                let deadline = if file == "m4f" {
+                    deadline.max(playback.startup_deadline())
+                } else {
+                    deadline
+                };
                 let worker = playback.worker();
                 let ready = || {
                     if file == "m4f" {
