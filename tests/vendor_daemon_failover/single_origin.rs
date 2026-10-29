@@ -1,5 +1,65 @@
 use super::*;
 
+async fn source_activation_status(f: &fixture::Fixture) -> Value {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use tower::ServiceExt;
+    let reply = flussonix::server::router(f.app.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/flussonix/api/v1/node")
+                .header(
+                    "Authorization",
+                    format!("Basic {}", STANDARD.encode("admin:owned-admin")),
+                )
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), StatusCode::OK);
+    serde_json::from_slice(
+        &axum::body::to_bytes(reply.into_body(), 100_000)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn static_catalog_reports_missing_and_mismatched_group_pins_without_policy_secrets() {
+    for (pin, field) in [
+        (None, "missing_group_pins"),
+        (Some(json!({"owned":["paid"]})), "mismatched_group_pins"),
+    ] {
+        let mut patch = json!({"group_config":{"public":{"on_play":"true"},"paid":{"flussonix_token_sha256":"a".repeat(64)}}});
+        if let Some(pin) = pin {
+            patch["flussonix_group_pins"] = pin;
+        }
+        let f = fixture::Fixture::configured(
+            "standalone",
+            patch,
+            Some(json!([{"name":"owned","named_by":"config","static":true,"groups":["public"]}])),
+            false,
+        )
+        .await;
+        let status = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let node = source_activation_status(&f).await;
+                let row = &node["vendor_source_activation"]["sources"][0];
+                if row[field] == 1 {
+                    break node;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("group pin diagnostic never appeared");
+        assert!(!status.to_string().contains(&"a".repeat(64)));
+        assert_eq!(f.origins[0].private_calls.load(Ordering::SeqCst), 0);
+        f.stop().await;
+    }
+}
+
 #[tokio::test]
 async fn single_origin_warm_segment_loss_recovers_without_another_viewer_request() {
     for no_dvr in [true, false] {

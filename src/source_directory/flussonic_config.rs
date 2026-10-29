@@ -80,6 +80,8 @@ pub enum ProjectionFailure {
     Excluded,
     Removed,
     Stale,
+    MissingGroupPin,
+    GroupPinMismatch,
     Ineligible(EligibilityFailure),
     Policy(PolicyFailure),
 }
@@ -464,9 +466,7 @@ impl SourceSnapshot {
                 let remote: HashSet<_> = groups.iter().collect();
                 let approved: HashSet<_> = pin.iter().collect();
                 if remote.len() != groups.len() || remote != approved {
-                    return Err(ProjectionFailure::Ineligible(
-                        super::flussonic::EligibilityFailure::UnknownGroups,
-                    ));
+                    return Err(ProjectionFailure::GroupPinMismatch);
                 }
             }
             self.profile
@@ -476,14 +476,23 @@ impl SourceSnapshot {
         } else {
             // Every possible subset of configured groups must produce the
             // same explicit local policy. Unknown memberships never become [].
-            self.profile
+            let uniform = self
+                .profile
                 .uniform
                 .get_or_init(|| self.profile.policies.uniform())
-                .clone()
-                .map_err(ProjectionFailure::Policy)?
-                .ok_or(ProjectionFailure::Ineligible(
-                    super::flussonic::EligibilityFailure::UnknownGroups,
-                ))?
+                .clone();
+            match uniform {
+                Ok(Some(policy)) => policy,
+                Ok(None) => return Err(ProjectionFailure::MissingGroupPin),
+                Err(PolicyFailure::Unresolved)
+                    if self.profile.source["group_config"]
+                        .as_object()
+                        .is_some_and(|groups| !groups.is_empty()) =>
+                {
+                    return Err(ProjectionFailure::MissingGroupPin);
+                }
+                Err(error) => return Err(ProjectionFailure::Policy(error)),
+            }
         };
         let selected_static = kind == CandidateKind::Static
             && super::selected_static(&self.profile.source, &row.name);

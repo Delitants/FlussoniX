@@ -555,7 +555,10 @@ async fn public_crud_persists_vendor_fields_and_dry_run_errors_are_atomic() {
             .unwrap();
         router(app.clone()).oneshot(r)
     };
-    let response = send("PUT", &path, source(), false).await.unwrap();
+    let mut configured = source();
+    configured["group_config"] = json!({"paid":{"flussonix_token_sha256":"a".repeat(64)}});
+    configured["flussonix_group_pins"] = json!({"region/owned":["paid"]});
+    let response = send("PUT", &path, configured.clone(), false).await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(
         app.config.snapshot()["sources"]
@@ -563,7 +566,7 @@ async fn public_crud_persists_vendor_fields_and_dry_run_errors_are_atomic() {
             .unwrap()
             .is_empty()
     );
-    let response = send("PUT", &path, source(), true).await.unwrap();
+    let response = send("PUT", &path, configured, true).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let response = send("GET", &path, Value::Null, false).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -573,6 +576,11 @@ async fn public_crud_persists_vendor_fields_and_dry_run_errors_are_atomic() {
     let viewed: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(viewed["on_play"], "[redacted]");
     assert_eq!(viewed["cluster_key"], "[redacted]");
+    assert_eq!(
+        viewed["flussonix_group_pins"],
+        json!({"region/owned":["paid"]})
+    );
+    assert!(!viewed.to_string().contains(&"a".repeat(64)));
     let response = send("GET", &path, Value::Null, true).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(response.into_body(), 100000)

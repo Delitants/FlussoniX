@@ -396,13 +396,22 @@ fn unresolved_policy_and_conflicting_groups_cannot_bind_candidates() {
         Some(Failure::Policy(PolicyFailure::Unresolved))
     );
     config["group_config"] = json!({"public":{"on_play":"true"},"protected":{"on_play":"https://billing.invalid/check"}});
+    let unpinned = authority(&config);
+    assert_eq!(
+        unpinned
+            .snapshot()
+            .unwrap()
+            .candidate(&row("news", &["public"]))
+            .err(),
+        Some(Failure::MissingGroupPin)
+    );
     config["flussonix_group_pins"] = json!({"news":["protected"]});
     let a = authority(&config);
     let s = a.snapshot().unwrap();
     for groups in [["public", "protected"], ["protected", "public"]] {
         assert_eq!(
             s.candidate(&row("news", &groups)).err(),
-            Some(Failure::Ineligible(EligibilityFailure::UnknownGroups))
+            Some(Failure::GroupPinMismatch)
         );
     }
     let c = s.candidate(&row("news", &["protected"])).unwrap();

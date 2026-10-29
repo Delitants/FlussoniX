@@ -20,6 +20,8 @@ pub(super) fn authoritative(error: CoordinationFailure) -> bool {
                         | ProjectionFailure::Unsupported
                         | ProjectionFailure::Limit
                         | ProjectionFailure::Excluded
+                        | ProjectionFailure::MissingGroupPin
+                        | ProjectionFailure::GroupPinMismatch
                         | ProjectionFailure::Ineligible(_)
                         | ProjectionFailure::Policy(_)
                 )
