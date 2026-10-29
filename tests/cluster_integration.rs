@@ -182,7 +182,17 @@ async fn check_source_cdn_balancer(transport: &str) {
             )
             .await
             .unwrap();
-        let (initial, _) = edge.wire.signal_subscribe();
+        let initial = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (initial, _) = edge.wire.signal_subscribe();
+                if !initial.is_empty() {
+                    break initial;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("restarted M4F worker must produce a segment");
         let line = String::from_utf8_lossy(initial.last().unwrap());
         let stamp = line
             .split_whitespace()
@@ -215,6 +225,14 @@ async fn check_source_cdn_balancer(transport: &str) {
         assert_eq!(r.unwrap().status(), 200)
     }
     assert_eq!(cdn.media.count().await, 1);
+    let playlist = client
+        .get(&canonical)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     let segment = playlist
         .lines()
         .find(|l| !l.starts_with('#') && !l.is_empty())
@@ -418,7 +436,99 @@ async fn named_source_auth_policy_is_portable_and_cannot_use_a_different_edge_ba
             .await
             .unwrap()
             .status(),
+        404,
+        "a source callback requires an exact local Auth backend match"
+    );
+    cdn.config
+        .put("auth_backends", "billing", json!({"url":auth_url}))
+        .unwrap();
+    cdn.reconcile().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = client
+                .get(format!("{cdn_url}/owned/index.m3u8"))
+                .send()
+                .await
+                .unwrap()
+                .status();
+            if status == 200 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("approved callback must become available after denial cache expires");
+    let backend_url = format!("{cdn_url}/streamer/api/v3/auth_backends/billing");
+    assert_eq!(
+        client
+            .put(&backend_url)
+            .basic_auth("admin", Some("management-secret"))
+            .json(&json!({"url":"http://127.0.0.1:1/replaced"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
         200
+    );
+    assert_eq!(
+        client
+            .get(format!("{cdn_url}/owned/index.m3u8?token=after-change"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404,
+        "changing the approved URL must reject the cached mirror"
+    );
+    assert_eq!(
+        client
+            .put(&backend_url)
+            .basic_auth("admin", Some("management-secret"))
+            .json(&json!({"url":auth_url}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if client
+                .get(format!("{cdn_url}/owned/index.m3u8?token=after-restore"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                == 200
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("restoring the exact local callback should restore playback");
+    source_task.abort();
+    assert_eq!(
+        client
+            .delete(&backend_url)
+            .basic_auth("admin", Some("management-secret"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    assert_eq!(
+        client
+            .get(format!("{cdn_url}/owned/index.m3u8?token=after-delete"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404,
+        "an unavailable origin must not revive a deleted local callback approval"
     );
     for app in [&source, &cdn] {
         app.media.stop_all().await;

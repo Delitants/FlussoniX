@@ -661,19 +661,18 @@ impl App {
                 current
             });
             self.playback_auth.invalidate(|name| {
-                let cfg = crate::config::effective(root, name).or_else(|| {
-                    if crate::vendor_playback::reserved(root, name) {
-                        return None;
-                    }
-                    mirrors
-                        .get(name)
-                        .filter(|m| m.known && !m.denied)
-                        .map(|m| m.config.clone())
-                })?;
-                if cfg["disabled"] == true {
+                if let Some(cfg) = crate::config::effective(root, name) {
+                    return (cfg["disabled"] != true)
+                        .then(|| Policy::from_config(&cfg, root).ok())
+                        .flatten();
+                }
+                if crate::vendor_playback::reserved(root, name) {
                     return None;
                 }
-                Policy::from_config(&cfg, root).ok()
+                mirrors
+                    .get(name)
+                    .filter(|m| m.known && !m.denied && m.config["disabled"] != true)
+                    .and_then(|m| origin_resolution::approved_mirror_policy(&m.config, root))
             });
         });
     }
@@ -1524,7 +1523,7 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
         let (gpu_profiles, vaapi_profiles) =
             tokio::join!(app.media.gpu_capabilities(), app.media.vaapi_capabilities());
         return json_response(
-            json!({"fxlink":app.fxlink.lock().unwrap().0.clone(),"rtsp_publication":app.rtsp_publication.lock().unwrap().clone(),"api":"Flussonic v3 subset","input":["fxlink (verified QUIC TLS, original native records, FEC)","hls","hlss","tshttp","tshttps","rtsp","rtsp-udp (unicast RTP/RTCP)","rtsp2 (RTSP/1.0 camera input, AAC audio default)","rtsps (verified TLS, interleaved TCP)","srt","rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","publish:// (HTTP MPEG-TS; RTSP TCP / opt-in unicast UDP; RTSPS TLS TCP receive; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","srt (caller push / global listener playback, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","http / https / tshttp / tshttps (native continuous MPEG-TS POST push, optional Basic; verified HTTPS TLS)","rtsp (TCP or unicast UDP publish push; TCP / opt-in unicast UDP playback; H264/HEVC/AAC-LC/MP2/MP3)","rtsps (verified TLS TCP publish push; opt-in TLS TCP playback; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["SDP negotiation","DTLS-SRTP / automatic key negotiation","rtsp Basic / Digest viewer auth","dvr","push protocols beyond SRT/RTSP/RTSPS/HTTP MPEG-TS","srt publication policy / per-stream playback listeners"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA / VAAPI H.264 / HEVC; profile readiness check, no software fallback","gpu_profiles":gpu_profiles,"vaapi_profiles":vaapi_profiles},"direct_srtp":{"available":crate::direct_rtp::crypto::availability(),"profile":"AES_CM_128_HMAC_SHA1_80","library":"independent system libsrtp2"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP/RTSP/RTSPS redirects"}),
+            json!({"fxlink":app.fxlink.lock().unwrap().0.clone(),"rtsp_publication":app.rtsp_publication.lock().unwrap().clone(),"api":"Flussonic v3 subset","input":["fxlink (verified QUIC TLS, original native records, FEC)","hls","hlss","tshttp","tshttps","rtsp","rtsp-udp (unicast RTP/RTCP)","rtsp2 (RTSP/1.0 camera input, AAC audio default)","rtsps (verified TLS, interleaved TCP)","srt","rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","publish:// (HTTP MPEG-TS; RTSP TCP / opt-in unicast UDP; RTSPS TLS TCP receive; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/HEVC video, AAC/Layer II/MP3 audio; frames and packed GOPs)","m4f (H.264/HEVC video, AAC/Layer II/MP3 audio; bounded segments)","testsrc"],"output":["rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","srt (caller push / global listener playback, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","http / https / tshttp / tshttps (native continuous MPEG-TS POST push, optional Basic; verified HTTPS TLS)","rtsp (TCP or unicast UDP publish push; TCP / opt-in unicast UDP playback; H264/HEVC/AAC-LC/MP2/MP3)","rtsps (verified TLS TCP publish push; opt-in TLS TCP playback; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/HEVC video, AAC/Layer II/MP3 audio; frames and packed GOPs)","m4f (H.264/HEVC video, AAC/Layer II/MP3 audio; bounded segments)"],"unimplemented":["SDP negotiation","DTLS-SRTP / automatic key negotiation","rtsp Basic / Digest viewer auth","dvr","push protocols beyond SRT/RTSP/RTSPS/HTTP MPEG-TS","srt publication policy / per-stream playback listeners"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA / VAAPI H.264 / HEVC; profile readiness check, no software fallback","gpu_profiles":gpu_profiles,"vaapi_profiles":vaapi_profiles},"direct_srtp":{"available":crate::direct_rtp::crypto::availability(),"profile":"AES_CM_128_HMAC_SHA1_80","library":"independent system libsrtp2"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP/RTSP/RTSPS redirects"}),
         );
     }
     if let Some(name) = tail.strip_prefix("stream/") {
@@ -1551,23 +1550,11 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
                     }
                     // Discovery conveys playback policy and identity, never publisher
                     // credentials, source inputs or raw saved configuration.
-                    let fields = [
-                        "name",
-                        "title",
-                        "comment",
-                        "position",
-                        "disabled",
-                        "flussonix_content_id",
-                        "flussonix_input_timeout",
-                        "flussonix_subtitle_tracks",
-                        "flussonix_hls_captions",
-                        "flussonix_hls_subtitles",
-                        "on_play",
-                        "flussonix_token_sha256",
-                    ];
-                    let discovery = fields
-                        .into_iter()
-                        .filter_map(|key| c.get(key).cloned().map(|value| (key.to_owned(), value)))
+                    let discovery = crate::source_directory::NATIVE_DISCOVERY_FIELDS
+                        .iter()
+                        .filter_map(|key| {
+                            c.get(key).cloned().map(|value| ((*key).to_owned(), value))
+                        })
                         .collect();
                     json_response(Value::Object(discovery))
                 }
@@ -2042,7 +2029,11 @@ async fn media_request(State(app): State<Arc<App>>, request: Request) -> Respons
     let mut response = if request.method() == "OPTIONS" {
         StatusCode::NO_CONTENT.into_response()
     } else if request.method() == "POST" {
-        publication::receive(app, request).await
+        if browser_management_write_allowed(&request, app.options.admin_public_origin.as_ref()) {
+            publication::receive(app, request).await
+        } else {
+            error(StatusCode::FORBIDDEN, "cross-origin publication request")
+        }
     } else {
         serve_media_request(app, request).await
     };

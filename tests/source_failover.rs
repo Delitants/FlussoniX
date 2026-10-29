@@ -525,6 +525,10 @@ async fn delayed_authorization_uses_the_new_origin_without_replacing_its_worker(
     let release = Arc::new(tokio::sync::Notify::new());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let callback = format!("http://{}/auth", listener.local_addr().unwrap());
+    cdn.app
+        .config
+        .put("auth_backends", "delayed", json!({"url":callback}))
+        .unwrap();
     let (e, r) = (entered.clone(), release.clone());
     let backend = tokio::spawn(async move {
         axum::serve(

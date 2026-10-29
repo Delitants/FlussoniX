@@ -108,6 +108,32 @@ async fn media(app: &Arc<App>, path: &str) -> axum::response::Response {
         .unwrap()
 }
 #[tokio::test]
+async fn token_free_callback_config_is_rejected_before_persistence() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let (_d, app, _backend, task, _) = setup().await;
+    let previous = app.config.effective("owned").unwrap();
+    let payload =
+        json!({"on_play":{"url":"https://auth.example/check","session_keys":["name","proto"]}});
+    let response = router(app.clone())
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/streamer/api/v3/streams/owned")
+                .header(
+                    "authorization",
+                    format!("Basic {}", STANDARD.encode("admin:edit-secret")),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(app.config.effective("owned").unwrap(), previous);
+    task.abort();
+}
+#[tokio::test]
 async fn callback_has_required_fields_uuid_and_actual_protocol() {
     let (_d, app, b, task, _) = setup().await;
     let response = media(&app, "/owned/mpegts?token=one&customer=demo").await;

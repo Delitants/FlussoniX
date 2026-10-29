@@ -4,6 +4,20 @@ use std::time::Duration;
 pub mod flussonic;
 pub mod flussonic_config;
 pub mod flussonic_policy;
+pub(crate) const NATIVE_DISCOVERY_FIELDS: &[&str] = &[
+    "name",
+    "title",
+    "comment",
+    "position",
+    "disabled",
+    "flussonix_content_id",
+    "flussonix_input_timeout",
+    "flussonix_subtitle_tracks",
+    "flussonix_hls_captions",
+    "flussonix_hls_subtitles",
+    "on_play",
+    "flussonix_token_sha256",
+];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LookupFailure {
     Unavailable,

@@ -1829,6 +1829,16 @@ async fn callback_redirect_precedes_placement_and_internal_ticket_stays_out_of_c
             .config
             .put("streams", "region/owned", cfg.clone())
             .unwrap();
+        for node in [&lab.cdn, &lab.lb] {
+            node.app
+                .config
+                .put(
+                    "auth_backends",
+                    "owned",
+                    json!({"url":format!("{}/owned-auth", lab.cdn.http)}),
+                )
+                .unwrap();
+        }
         cfg["on_play"] = json!(format!("{}/owned-auth", lab.lb.http));
         lab.lb
             .app

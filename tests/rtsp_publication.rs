@@ -1851,6 +1851,22 @@ async fn capabilities_describe_disabled_publication_listeners_without_assumed_po
     assert_eq!(j["rtsp_publication"]["enabled"], false);
     assert_eq!(j["rtsp_publication"]["rtsp"], serde_json::Value::Null);
     assert_eq!(j["rtsp_publication"]["rtsps"], serde_json::Value::Null);
+    for direction in ["input", "output"] {
+        let advertised = j[direction].as_array().unwrap();
+        for codec in ["m4s", "m4f"] {
+            assert!(
+                advertised.iter().any(|entry| {
+                    entry.as_str().is_some_and(|entry| {
+                        entry.starts_with(codec)
+                            && entry.contains("HEVC")
+                            && entry.contains("Layer II")
+                            && entry.contains("MP3")
+                    })
+                }),
+                "{direction} must advertise {codec} HEVC and MPEG audio support"
+            );
+        }
+    }
     l.end().await;
 }
 #[tokio::test]

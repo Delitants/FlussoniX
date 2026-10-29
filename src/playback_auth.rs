@@ -115,6 +115,9 @@ impl Policy {
                 raw
             };
             validate_http(url)?;
+            if !policy.keys.iter().any(|key| key == "token") {
+                return Err("callback session_keys must include token".into());
+            }
             policy.url = Some(url.to_owned());
             policy.kind = PolicyKind::Callback;
         }
@@ -1808,6 +1811,22 @@ mod capacity_tests;
 mod tests {
     use super::*;
 
+    #[test]
+    fn callback_session_keys_require_token() {
+        let root = json!({});
+        let missing =
+            json!({"on_play":{"url":"https://auth.example/check","session_keys":["name","proto"]}});
+        assert_eq!(
+            Policy::from_config(&missing, &root).unwrap_err(),
+            "callback session_keys must include token"
+        );
+        assert!(
+            Policy::from_config(&json!({"on_play":"https://auth.example/check"}), &root).is_ok()
+        );
+        assert!(Policy::from_config(&json!({"on_play":{"url":"https://auth.example/check","session_keys":["proto","name","token","token"]}}), &root).is_ok());
+        assert!(Policy::from_config(&json!({"on_play":"iptv://"}), &root).is_ok());
+    }
+
     #[tokio::test]
     async fn remote_grant_checks_its_monotonic_deadline_even_if_watcher_is_delayed() {
         let auth = PlaybackAuth::new(2);
@@ -3152,18 +3171,19 @@ mod tests {
     #[test]
     fn session_key_order_is_distinct_even_when_values_are_equal() {
         let a = Policy::from_config(
-            &json!({"on_play":{"url":"https://auth.example/play","session_keys":["name","proto"]}}),
+            &json!({"on_play":{"url":"https://auth.example/play","session_keys":["name","proto","token"]}}),
             &json!({}),
         )
         .unwrap();
         let b = Policy::from_config(
-            &json!({"on_play":{"url":"https://auth.example/play","session_keys":["proto","name"]}}),
+            &json!({"on_play":{"url":"https://auth.example/play","session_keys":["proto","name","token"]}}),
             &json!({}),
         )
         .unwrap();
         let r = ViewerRequest {
             name: "hls".into(),
             proto: "hls".into(),
+            token: "hls".into(),
             ..Default::default()
         };
         assert_ne!(a.identity(&r), b.identity(&r));
