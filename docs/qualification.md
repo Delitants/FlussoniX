@@ -2,22 +2,26 @@
 
 ## Current M4FS to M4F playback gate (2026-10-29)
 
-Six bounded, authenticated, read-only controls against the authorized cdn4
-Flussonic source each returned an announcement in 0.76–1.13 seconds. Twenty
-isolated local LB/CDN pulls from that source all delivered and fetched M4F
-media; nineteen controls had the first line already buffered and one received it
-after 1.22 seconds. An earlier twenty-attempt series still needed a second HTTP
-200 control once because the first returned no announcement. The new live probe
-records bounded first-line, EOF/timeout and worker-status details on that case.
-Later bounded series captured an empty 200 ending in EOF after 2.76 seconds;
-the CDN worker was retrying `input_closed` with zero packaged bytes, and the
-next control succeeded. Another series ended with four empty 200 controls and
-no media in 47 seconds. Its owned CDN log had no private-input failure or
-packager warning. Debug-only worker call-site markers now distinguish the
-remaining silent local shutdown paths; twenty-five subsequent isolated pulls
-passed without reproducing the failure.
-The intermittent local empty-control failure remains an open release gate; the
-direct source sample does not prove the source never stalls.
+The explicit Flussonic-source route previously sent HTTP 200 before its first
+M4F segment existed. An eight-second HTTP readiness limit could then drop the
+only source viewer before a slower segment arrived; repeated requests restarted
+the worker instead of letting that startup finish. Two read-only local LB/CDN
+series against the authorized cdn4 source captured 45-second no-media periods
+with repeated empty controls or 503s and alternating `starting` and
+`retrying/input_closed` workers with zero bytes. Separate direct authenticated
+cdn4 controls returned announcements, so those samples did not establish an
+origin outage.
+
+The explicit-source route now waits for a cached M4F segment through the
+worker's configured startup deadline and returns 503 if none arrives. Daemon
+regressions demonstrated both prior failures before the fix and pass afterward:
+no segment never yields a successful control, while a segment arriving after
+eight seconds but within the worker allowance succeeds on the first request.
+Thirty isolated local LB/CDN starts on the updated binary all delivered and
+fetched M4F media; no empty control or 45-second restart loop appeared. The
+probe retains only bounded worker and allowlisted failure data when media is
+absent. Full exact-head CI and longer mixed-vendor qualification remain release
+gates; thirty successful starts do not prove the source never stalls.
 
 ## Local Flussonic group approval gate
 
