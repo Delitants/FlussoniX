@@ -286,6 +286,16 @@ def worker_lifecycle_events(log):
     return events[-8:]
 
 
+def m4f_no_media_diagnostics(log, worker_samples):
+    """Return bounded, credential-free evidence when no M4F media was placed."""
+    result = {"cdn_worker_samples": worker_samples[-8:],
+              "lifecycle": worker_lifecycle_events(log)}
+    source_failure = private_input_failure(log)
+    if source_failure is not None:
+        result["source_failure"] = source_failure
+    return result
+
+
 def probe(args, root):
     cluster_key = args.cluster_key_file.read_text(encoding="utf-8").strip()
     if not cluster_key:
@@ -510,6 +520,7 @@ def topology_probe(args, root):
         media_ok = False
         m4f_controls = []
         m4f_events = []
+        m4f_worker_samples = []
         m4f_announcements = 0
         m4f_segments = []
         m4f_lines = 0
@@ -581,6 +592,7 @@ def topology_probe(args, root):
                     m4f_controls.append(error.code)
                     if error.code != 503:
                         raise RuntimeError("CDN native playback failed") from None
+                    m4f_worker_samples = (m4f_worker_samples + [worker_snapshot()])[-8:]
                 except TimeoutError:
                     m4f_controls.append("timeout")
                     if event is not None:
@@ -615,7 +627,9 @@ def topology_probe(args, root):
                     "m4f_controls": m4f_controls[-8:], "m4f_announcements": m4f_announcements,
                     "m4f_segments": m4f_segments[-8:], "m4f_lines": m4f_lines,
                     "m4f_line_shapes": m4f_line_shapes, "m4f_events": m4f_events[-8:],
-                    "cdn_worker": worker}, 2
+                    "cdn_worker": worker,
+                    **(m4f_no_media_diagnostics(root / "owned-vendor-cdn.log", m4f_worker_samples)
+                       if args.output == "m4f" else {})}, 2
         unauthorized_lb = get(f"{lb}/{path}/{suffix}")[0]
         unauthorized_cdn = get(f"{cdn}/{path}/{suffix}")[0]
         node_status, _, node_body = get(lb + "/flussonix/api/v1/node", headers={"x-flussonix-peer": peer_key})
