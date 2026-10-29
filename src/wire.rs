@@ -301,6 +301,9 @@ impl Hub {
     pub fn has_info(&self) -> bool {
         self.state.lock().unwrap().info.is_some()
     }
+    pub fn has_m4f_segment(&self) -> bool {
+        !self.state.lock().unwrap().segments.is_empty()
+    }
     pub fn m4s_subscribe(&self) -> (Vec<Bytes>, Receiver) {
         let s = self.state.lock().unwrap();
         (s.bootstrap.clone(), self.m4s.subscribe())
