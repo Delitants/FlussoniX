@@ -29,6 +29,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 type Feed = mpsc::UnboundedSender<Result<Bytes, io::Error>>;
+const DENIED_TOKEN: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 struct Remote {
     id: String,
     rows: Value,
@@ -53,7 +54,7 @@ impl Drop for Fixture {
     }
 }
 fn row(name: &str) -> Value {
-    json!({"name":name,"groups":[],"named_by":"config","static":true})
+    json!({"name":name,"groups":["same"],"named_by":"config","static":true})
 }
 impl Fixture {
     async fn start() -> Self {
@@ -116,7 +117,11 @@ impl Fixture {
             .put(
                 "sources",
                 &key,
-                json!({"url":key,"cluster_key":"owned-private-key"}),
+                json!({"url":key,"flussonix_source_kind":"flussonic",
+                       "cluster_key":"owned-private-key","on_play":"true",
+                       "group_config":{"same":{"on_play":"true"},
+                                       "deny":{"on_play":"true","flussonix_token_sha256":DENIED_TOKEN}},
+                       "flussonix_group_pins":{"one":["same"],"two":["same"]}}),
             )
             .unwrap();
         let owner = Arc::new(ModernSourceCoordinator::new(config.clone(), "local").unwrap());
@@ -208,7 +213,15 @@ impl Fixture {
     }
 }
 fn install(owner: &ModernSourceCoordinator, key: &str) -> SourceHandle {
-    owner.install(owner.capture(key).unwrap().with_policy(&json!({"on_play":"true"}),&json!({"same":{"on_play":"true"},"deny":{"on_play":"true","flussonix_token_sha256":"0000000000000000000000000000000000000000000000000000000000000000"}})).unwrap().prepare(Duration::from_secs(3)).unwrap()).unwrap()
+    owner
+        .install(
+            owner
+                .capture(key)
+                .unwrap()
+                .prepare(Duration::from_secs(3))
+                .unwrap(),
+        )
+        .unwrap()
 }
 fn info() -> Bytes {
     Bytes::from(
@@ -337,7 +350,7 @@ async fn renewal_retires_removed_or_changed_routes_without_stopping_equivalent_r
                     remote.rows = json!([first, row("two")]);
                 }
                 "groups" => {
-                    first.as_object_mut().unwrap().remove("groups");
+                    first["groups"] = json!([]);
                     remote.rows = json!([first, row("two")]);
                 }
                 "id" => remote.id = "different-origin".into(),
