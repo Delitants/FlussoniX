@@ -2564,6 +2564,16 @@ mod wire_delivery_tests {
         );
         assert_eq!(egress.load(Ordering::Relaxed), 5);
 
+        let other = Grant::peer();
+        worker.viewers.fetch_add(1, Ordering::Relaxed);
+        let other = ViewerGuard(worker.clone(), other);
+        assert_eq!(
+            wire_output_chunk(Bytes::from_static(b"other"), &other, &egress),
+            Some(Bytes::from_static(b"other")),
+            "revoking one viewer must not stop another viewer's media"
+        );
+        assert_eq!(egress.load(Ordering::Relaxed), 10);
+        drop(other);
         drop(viewer);
         let grant = Grant::peer();
         worker.viewers.fetch_add(1, Ordering::Relaxed);
@@ -2574,7 +2584,7 @@ mod wire_delivery_tests {
             None,
             "a ready chunk must not outlive its worker"
         );
-        assert_eq!(egress.load(Ordering::Relaxed), 5);
+        assert_eq!(egress.load(Ordering::Relaxed), 10);
         drop(viewer);
         engine.stop_all().await;
     }
