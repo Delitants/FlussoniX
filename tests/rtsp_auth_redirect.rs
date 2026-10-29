@@ -482,7 +482,7 @@ async fn viewer_token_denial_precedes_callback_routing() {
             .put(
                 "templates",
                 "routing",
-                json!({"on_play":{"url":lab.callback,"session_keys":["name","proto"]}}),
+                json!({"on_play":{"url":lab.callback,"session_keys":["name","proto","token"]}}),
             )
             .unwrap();
         lab.app
@@ -667,7 +667,7 @@ async fn independent_client_follows_callback_to_authorized_decoded_media() {
 }
 
 #[tokio::test]
-async fn token_free_http_session_identity_cannot_bypass_or_poison_builtin_token_checks() {
+async fn token_scoped_http_session_identity_cannot_bypass_or_poison_builtin_token_checks() {
     use sha2::{Digest, Sha256};
     let mut lab = Lab::new().await;
     let result = std::panic::AssertUnwindSafe(async {
@@ -679,7 +679,7 @@ async fn token_free_http_session_identity_cannot_bypass_or_poison_builtin_token_
                 "nested/owned",
                 json!({
                     "static":false,"inputs":[{"url":"testsrc://"}],
-                    "on_play":{"url":lab.callback,"session_keys":["name","proto"]},
+                    "on_play":{"url":lab.callback,"session_keys":["name","proto","token"]},
                     "flussonix_token_sha256":format!("{:x}",Sha256::digest(b"known"))
                 }),
             )
