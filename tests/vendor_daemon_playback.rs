@@ -556,6 +556,48 @@ async fn processing_template_edit_revokes_old_body_and_replaces_profile_and_cach
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
     }
 }
+
+#[tokio::test]
+async fn vendor_group_pin_edit_retires_existing_cdn_viewer() {
+    use http_body_util::BodyExt;
+    use sha2::{Digest, Sha256};
+    let f = Fixture::new(json!({
+        "on_play":"true",
+        "group_config":{
+            "paid":{"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"paid-viewer"))},
+            "public":{"on_play":"true"}
+        },
+        "flussonix_group_pins":{"owned":["paid"]}
+    }))
+    .await;
+    (*f.remote.lock().unwrap())[0]["groups"] = json!(["paid"]);
+    assert_eq!(
+        f.get("/owned/m4s?token=wrong").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    let live = f.get("/owned/m4s?token=paid-viewer").await;
+    assert_eq!(live.status(), StatusCode::OK);
+    let mut old = live.into_body();
+    assert!(old.frame().await.is_some());
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_group_pins":{"owned":["public"]}}),
+        )
+        .unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(2), async {
+        while old.frame().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    let after = f.get("/owned/m4s?token=paid-viewer").await;
+    assert_ne!(after.status(), StatusCode::OK);
+    drop(old);
+    f.stop().await;
+    assert!(closed, "an old paid viewer survived a local pin edit");
+}
 #[tokio::test]
 async fn processing_templates_are_isolated_between_distinct_vendor_sources() {
     let a = Fixture::new(json!({"on_play":"true"})).await;

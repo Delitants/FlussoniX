@@ -156,8 +156,10 @@ async fn single_origin_group_specific_policy_is_preserved_during_recovery() {
     let f = fixture::Fixture::configured(
         "standalone",
         json!({"only":[],
-        "group_config":{"paid":{"flussonix_token_sha256":"a".repeat(64)}}}),
-        Some(json!([{"name":"owned","named_by":"config","static":true,"groups":[]}])),
+        "group_config":{"public":{"on_play":"true"},
+                        "paid":{"flussonix_token_sha256":"a".repeat(64)}},
+        "flussonix_group_pins":{"owned":["public"]}}),
+        Some(json!([{"name":"owned","named_by":"config","static":true,"groups":["public"]}])),
         false,
     )
     .await;
@@ -175,7 +177,7 @@ async fn single_origin_group_specific_policy_is_preserved_during_recovery() {
         calls, before,
         "a different catalog policy reused the original permission"
     );
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
