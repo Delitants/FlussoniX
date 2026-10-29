@@ -58,7 +58,8 @@ test('vendor source group pins use labeled controls and reject duplicate or unkn
  await page.getByLabel('Group paid token SHA256',{exact:true}).fill('a'.repeat(64));
  await page.getByLabel('New pinned stream',{exact:true}).fill('region/owned');
  await page.getByRole('button',{name:'Add stream pin',exact:true}).click();
- await expect(page.getByLabel('Group paid for region/owned',{exact:true})).toBeChecked();
+ await expect(page.getByLabel('Group paid for region/owned',{exact:true})).not.toBeChecked();
+ await page.getByLabel('Group paid for region/owned',{exact:true}).check();
  await page.getByLabel('New pinned stream',{exact:true}).fill('region/owned');
  await page.getByRole('button',{name:'Add stream pin',exact:true}).click();
  await expect(page.getByText('That stream already has a pin.',{exact:true})).toBeVisible();
@@ -80,6 +81,26 @@ test('vendor source group pins use labeled controls and reject duplicate or unkn
  saved=await(await request.get(uri,{headers:headers()})).json();
  expect(saved.flussonix_group_pins).toBeUndefined();
  await expect(page.locator('textarea')).toHaveCount(0);
+});
+
+test('new vendor stream pin requires an explicit group choice',async({page})=>{
+ await page.getByRole('button',{name:'Add source',exact:true}).click();
+ await page.getByLabel('Source type',{exact:true}).selectOption('flussonic');
+ await page.getByLabel('Source address',{exact:true}).fill(source);
+ await page.getByLabel('Cluster key',{exact:true}).fill('owned-vendor-private-key');
+ await page.getByLabel('Viewer policy',{exact:true}).selectOption('allow');
+ await page.getByLabel('New group name',{exact:true}).fill('public');
+ await page.getByRole('button',{name:'Add group override',exact:true}).click();
+ await page.getByLabel('Group public policy',{exact:true}).selectOption('allow');
+ await page.getByLabel('New group name',{exact:true}).fill('paid');
+ await page.getByRole('button',{name:'Add group override',exact:true}).click();
+ await page.getByLabel('Group paid token SHA256',{exact:true}).fill('a'.repeat(64));
+ await page.getByLabel('New pinned stream',{exact:true}).fill('region/owned');
+ await page.getByRole('button',{name:'Add stream pin',exact:true}).click();
+ await expect(page.getByLabel('Group public for region/owned',{exact:true})).not.toBeChecked();
+ await expect(page.getByLabel('Group paid for region/owned',{exact:true})).not.toBeChecked();
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ await expect(page.getByRole('dialog').getByRole('alert')).toContainText('at least one configured group');
 });
 
 test('vendor source pins remain visible to view role without group policy secrets',async({page,request,browser})=>{

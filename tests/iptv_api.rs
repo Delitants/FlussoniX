@@ -86,6 +86,27 @@ async fn enable(app: Arc<App>) {
 }
 
 #[tokio::test]
+async fn iptv_collection_select_uses_the_same_field_budget() {
+    let (_dir, app) = app();
+    enable(app.clone()).await;
+    let fields = (0..257)
+        .map(|index| format!("unknown{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let (status, _) = call(
+        app,
+        Method::GET,
+        &format!("iptv/packages?select={fields}"),
+        Value::Null,
+        Some("viewer:view-password"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn module_enable_disable_and_reenable_preserve_subscriber_data() {
     let (_dir, app) = app();
     assert_eq!(

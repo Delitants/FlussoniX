@@ -316,3 +316,47 @@ async fn selecting_disk_configuration_retains_its_required_stream_identity() {
         assert_eq!(body["streams"], expected, "select={select}");
     }
 }
+
+#[tokio::test]
+async fn collection_select_rejects_excessive_fields_or_bytes_after_authentication() {
+    let (_dir, app) = fixture();
+    let fields = (0..256)
+        .map(|index| format!("unknown{index}"))
+        .collect::<Vec<_>>();
+    let within_limit = format!("/streamer/api/v3/streams?select={}", fields.join(","));
+    assert_eq!(
+        selected(&app, &within_limit).await["streams"],
+        json!([{"name":"alpha"},{"name":"beta"},{"name":"gamma"}])
+    );
+
+    let too_many = format!("{within_limit},unknown256");
+    assert_eq!(
+        get(&app, &too_many, Some("viewer:view-secret")).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(get(&app, &too_many, None).await.0, StatusCode::UNAUTHORIZED);
+    let encoded_comma = too_many.replacen(",unknown256", "%2Cunknown256", 1);
+    assert_eq!(
+        get(&app, &encoded_comma, Some("viewer:view-secret"))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+
+    let max_length = format!(
+        "/streamer/api/v3/templates?select={}",
+        "x".repeat(16 * 1024)
+    );
+    assert_eq!(
+        get(&app, &max_length, Some("viewer:view-secret")).await.0,
+        StatusCode::OK
+    );
+    let too_long = format!(
+        "/streamer/api/v3/templates?select={}",
+        "x".repeat(16 * 1024 + 1)
+    );
+    assert_eq!(
+        get(&app, &too_long, Some("viewer:view-secret")).await.0,
+        StatusCode::BAD_REQUEST
+    );
+}
