@@ -41,8 +41,10 @@ struct Fixture {
     remote: Arc<Mutex<Value>>,
     segment: Arc<Mutex<Vec<u8>>>,
     duration: Arc<std::sync::atomic::AtomicU64>,
+    control_second: Arc<std::sync::atomic::AtomicU64>,
     first_signal_delay: Arc<std::sync::atomic::AtomicU64>,
     control_epoch: Arc<Mutex<CancellationToken>>,
+    control_close_invalid: Arc<std::sync::atomic::AtomicBool>,
     first_media_delay: Arc<std::sync::atomic::AtomicU64>,
     page_delay: Arc<std::sync::atomic::AtomicU64>,
     page_limits: Arc<Mutex<Vec<usize>>>,
@@ -71,10 +73,14 @@ impl Fixture {
         let payload = segment.clone();
         let duration = Arc::new(std::sync::atomic::AtomicU64::new(4000));
         let control_duration = duration.clone();
+        let control_second = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let signal_second = control_second.clone();
         let first_signal_delay = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let signal_delay = first_signal_delay.clone();
         let control_epoch = Arc::new(Mutex::new(CancellationToken::new()));
         let epoch = control_epoch.clone();
+        let control_close_invalid = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let invalid_control = control_close_invalid.clone();
         let page_delay = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let delayed = page_delay.clone();
         let page_limits = Arc::new(Mutex::new(Vec::new()));
@@ -84,23 +90,24 @@ impl Fixture {
         let first_media_delay = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let media_delay = first_media_delay.clone();
         let service=Router::new().fallback(get(move |OriginalUri(uri):OriginalUri,h:HeaderMap|{
-            record.lock().unwrap().push((uri.path().to_owned(),h.clone()));let rows=rows.clone();let held=held.clone();let payload=payload.clone();let control_duration=control_duration.clone();let signal_delay=signal_delay.clone();let epoch=epoch.clone();let delayed=delayed.clone();let limits=limits.clone();let snapshots=snapshots.clone();let media_delay=media_delay.clone();
+            record.lock().unwrap().push((uri.path().to_owned(),h.clone()));let rows=rows.clone();let held=held.clone();let payload=payload.clone();let control_duration=control_duration.clone();let signal_second=signal_second.clone();let signal_delay=signal_delay.clone();let epoch=epoch.clone();let invalid_control=invalid_control.clone();let delayed=delayed.clone();let limits=limits.clone();let snapshots=snapshots.clone();let media_delay=media_delay.clone();
             async move {
                 assert!(!h.contains_key("x-flussonix-peer"),"native credentials reached vendor");
                 if uri.path()=="/owned/m4f" {
                     assert!(h.contains_key("cluster-auth-key"));assert!(!h.contains_key("authorization"));
                     let millis=control_duration.load(std::sync::atomic::Ordering::SeqCst);
+                    let second=signal_second.load(std::sync::atomic::Ordering::SeqCst);
                     let delay=signal_delay.load(std::sync::atomic::Ordering::SeqCst);
                     let closed=epoch.lock().unwrap().clone();
-                    let body=futures_util::stream::unfold(false,move |sent|{let closed=closed.clone();async move{
-                        if sent {closed.cancelled().await;return None;}
+                    let body=futures_util::stream::unfold(false,move |sent|{let closed=closed.clone();let invalid_control=invalid_control.clone();async move{
+                        if sent {closed.cancelled().await;if invalid_control.swap(false,std::sync::atomic::Ordering::SeqCst){return Some((Ok::<_,std::io::Error>(bytes::Bytes::from_static(b"bad\n")),true));}return None;}
                         tokio::time::sleep(Duration::from_millis(delay)).await;
-                        Some((Ok::<_,std::io::Error>(bytes::Bytes::from(format!("1 2026/10/13/00/00/00-{millis}\n"))),true))
+                        Some((Ok::<_,std::io::Error>(bytes::Bytes::from(format!("1 2026/10/13/00/00/{second:02}-{millis}\n"))),true))
                     }
                     });
                     return Response::new(Body::from_stream(body));
                 }
-                if uri.path()=="/owned/2026/10/13/00/00/00.m4f" {
+                if uri.path().starts_with("/owned/2026/10/13/00/00/") && uri.path().ends_with(".m4f") {
                     assert!(h.contains_key("cluster-auth-key"));assert!(!h.contains_key("authorization"));
                     return Response::new(Body::from(payload.lock().unwrap().clone()));
                 }
@@ -184,8 +191,10 @@ impl Fixture {
             remote,
             segment,
             duration,
+            control_second,
             first_signal_delay,
             control_epoch,
+            control_close_invalid,
             first_media_delay,
             page_delay,
             page_limits,
@@ -1366,7 +1375,7 @@ async fn processing_template_preserve_with_transcoding_fails_explicitly_for_nati
     assert_eq!(stats["last_error"], "native_subtitle_transcode_unsupported");
 }
 #[tokio::test]
-async fn processing_template_conversion_restarts_with_fresh_state_in_the_same_config_revision() {
+async fn processing_template_conversion_restarts_after_invalid_control_with_fresh_state() {
     use http_body_util::BodyExt;
     let f = Fixture::variant(json!({"on_play":"true"}), "m4f", "standalone").await;
     *f.segment.lock().unwrap() = text_segment();
@@ -1409,6 +1418,10 @@ async fn processing_template_conversion_restarts_with_fresh_state_in_the_same_co
         }
     }
     *f.segment.lock().unwrap() = flussonix::m4f::pack(&tracks, &frames, 900000).unwrap();
+    // A malformed control frame requires supervised replacement. Clean EOF
+    // intentionally keeps the worker and skips this already-published GOP.
+    f.control_close_invalid
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let closed = std::mem::replace(
         &mut *f.control_epoch.lock().unwrap(),
         CancellationToken::new(),
@@ -1448,6 +1461,160 @@ async fn processing_template_conversion_restarts_with_fresh_state_in_the_same_co
     assert!(String::from_utf8_lossy(&old_text).contains("AMERICA HELLO"));
     assert!(String::from_utf8_lossy(&text).contains("NEW INPUT GENERATION"));
     assert!(!String::from_utf8_lossy(&text).contains("AMERICA HELLO"));
+}
+
+#[tokio::test]
+async fn clean_m4f_eof_keeps_daemon_packager_and_delivers_new_timestamp_once() {
+    use http_body_util::BodyExt;
+    let f = Fixture::variant(json!({"on_play":"true"}), "m4f", "cdn").await;
+    let manifest = f.get("/owned/index.m3u8").await;
+    assert_eq!(manifest.status(), StatusCode::OK);
+    let live = f.get("/owned/m4s").await;
+    assert_eq!(live.status(), StatusCode::OK);
+    let mut body = live.into_body();
+    let _ = native_info(&mut body).await;
+    let pid = f.app.media.stats("owned").await["pid"].as_u64().unwrap();
+    let (controls, segments, catalog) = {
+        let before = f.calls.lock().unwrap();
+        (
+            before.iter().filter(|(p, _)| p == "/owned/m4f").count(),
+            before.iter().filter(|(p, _)| p.ends_with(".m4f")).count(),
+            before
+                .iter()
+                .filter(|(p, _)| p.contains("/streamer/api/"))
+                .count(),
+        )
+    };
+    let closed = std::mem::replace(
+        &mut *f.control_epoch.lock().unwrap(),
+        CancellationToken::new(),
+    );
+    closed.cancel();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (new_controls, new_catalog) = {
+                let calls = f.calls.lock().unwrap();
+                (
+                    calls.iter().filter(|(p, _)| p == "/owned/m4f").count(),
+                    calls
+                        .iter()
+                        .filter(|(p, _)| p.contains("/streamer/api/"))
+                        .count(),
+                )
+            };
+            if new_controls > controls && new_catalog > catalog {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("clean EOF did not renew catalog and reopen M4F control");
+    assert_eq!(f.app.media.stats("owned").await["pid"].as_u64(), Some(pid));
+    assert_eq!(
+        f.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p.ends_with(".m4f"))
+            .count(),
+        segments,
+        "replayed segment was fetched again"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while body.frame().await.is_some() {}
+        })
+        .await
+        .is_err(),
+        "existing native viewer unexpectedly ended"
+    );
+    let (tracks, mut frames) = flussonix::m4f::unpack(&multitrack_segment()).unwrap();
+    for frame in &mut frames {
+        frame.dts += 360_000;
+    }
+    *f.segment.lock().unwrap() = flussonix::m4f::pack(&tracks, &frames, 360_000).unwrap();
+    f.control_second
+        .store(4, std::sync::atomic::Ordering::SeqCst);
+    let closed = std::mem::replace(
+        &mut *f.control_epoch.lock().unwrap(),
+        CancellationToken::new(),
+    );
+    closed.cancel();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let fetched = {
+                let calls = f.calls.lock().unwrap();
+                calls
+                    .iter()
+                    .any(|(path, _)| path == "/owned/2026/10/13/00/00/04.m4f")
+            };
+            if fetched {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("new M4F timestamp was not fetched after the second clean EOF");
+    let fresh = f.get("/owned/m4s").await;
+    assert_eq!(fresh.status(), StatusCode::OK);
+    let mut fresh_body = fresh.into_body();
+    let mut decoder = flussonix::m4s::Decoder::default();
+    let mut seen = std::collections::HashSet::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let data = fresh_body
+                .frame()
+                .await
+                .expect("native viewer ended before the new timestamp")
+                .unwrap()
+                .into_data()
+                .unwrap();
+            for event in decoder.push(&data).unwrap() {
+                let media = match event {
+                    flussonix::m4s::Event::Frame { track_id, dts, .. } => vec![(track_id, dts)],
+                    flussonix::m4s::Event::Gop { frames, .. } => frames
+                        .into_iter()
+                        .map(|frame| (frame.track_id, frame.dts))
+                        .collect(),
+                    _ => vec![],
+                };
+                for (track_id, dts) in media {
+                    assert!(
+                        seen.insert((track_id, dts)),
+                        "duplicate native media timestamp"
+                    );
+                    if dts >= 450_000 {
+                        return;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("new timestamp did not reach native playback");
+    assert_eq!(f.app.media.stats("owned").await["pid"].as_u64(), Some(pid));
+    {
+        let calls = f.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(path, _)| path == "/owned/2026/10/13/00/00/00.m4f")
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(path, _)| path == "/owned/2026/10/13/00/00/04.m4f")
+                .count(),
+            1
+        );
+    }
+    drop(fresh_body);
+    drop(body);
+    f.stop().await;
 }
 #[tokio::test]
 async fn m4f_control_stays_unavailable_until_the_first_segment_is_cached() {

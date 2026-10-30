@@ -672,8 +672,15 @@ async fn eof_waits_for_scheduled_then_observes_again() {
     release.send(()).unwrap();
     assert_eq!(scheduled.await.unwrap().unwrap().renewed, 1);
     assert_eq!(eof.await.unwrap().unwrap().renewed, 1);
-    let after = f.calls.lock().unwrap();
-    assert_eq!(after.iter().filter(|p| p.ends_with("/streams")).count(), 3);
+    assert_eq!(
+        f.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.ends_with("/streams"))
+            .count(),
+        3
+    );
     registry.shutdown();
     joined(worker).await;
 }

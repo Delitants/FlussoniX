@@ -43,6 +43,7 @@ impl MediaInput {
         let mut options = options;
         options.failure = Some(&slot);
         options.diagnostic = Some(&diagnostic);
+        options.classify_clean_eof = true;
         super::consume_guarded_session(
             &self.requests,
             output,
@@ -50,7 +51,6 @@ impl MediaInput {
             metadata,
             options,
             Some(state),
-            true,
             Some(authority),
         )
         .await
@@ -328,7 +328,7 @@ mod tests {
             config: vec![],
         };
         let segment = crate::m4f::pack(
-            &[track.clone()],
+            std::slice::from_ref(&track),
             &[Frame {
                 track_id: 1,
                 dts: 90_000,

@@ -223,6 +223,7 @@ pub(crate) struct PullOptions<'a> {
     pub conversion: Option<&'a crate::caption_hls::State>,
     pub failure: Option<&'a std::sync::atomic::AtomicU8>,
     pub diagnostic: Option<&'a Diagnostics>,
+    pub classify_clean_eof: bool,
 }
 pub(crate) async fn pull_ready_with_options<W: AsyncWrite + Unpin>(
     input: &str,
@@ -398,7 +399,6 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
         metadata,
         subtitles,
         Some(&mut session),
-        false,
         authority,
     )
     .await
@@ -411,7 +411,6 @@ async fn consume_guarded_session<W: AsyncWrite + Unpin>(
     mut metadata: Option<oneshot::Sender<Vec<Track>>>,
     subtitles: PullOptions<'_>,
     session: Option<&mut m4f_session::M4fSession>,
-    classify_clean_eof: bool,
     authority: Authority<'_>,
 ) -> Result<(), String> {
     let mut fallback = m4f_session::M4fSession::default();
@@ -493,13 +492,13 @@ async fn consume_guarded_session<W: AsyncWrite + Unpin>(
             .await
             .map_err(|_| transient("source timed out"))?
             .ok_or_else(|| {
-                if classify_clean_eof && is_m4f && !signals.pending.is_empty() {
+                if subtitles.classify_clean_eof && is_m4f && !signals.pending.is_empty() {
                     flussonic::failure::record(
                         subtitles.failure,
                         flussonic::InputFailure::Invalid,
                         "incomplete M4F signal",
                     )
-                } else if classify_clean_eof
+                } else if subtitles.classify_clean_eof
                     && is_m4f
                     && session.accepted_segments > 0
                     && !session.tracks.is_empty()
@@ -607,6 +606,7 @@ async fn consume_guarded_session<W: AsyncWrite + Unpin>(
                     }
                 }
                 let source_start = frames.iter().map(|f| f.dts).min();
+                let media_start = m4f_session::M4fSession::media_start(&new, &frames);
                 let source_tracks = new.clone();
                 let (body, new, frames) = if !preserve && new.iter().any(|t| t.codec == "subtitle")
                 {
@@ -618,6 +618,14 @@ async fn consume_guarded_session<W: AsyncWrite + Unpin>(
                 };
                 if frames.is_empty() {
                     return Err("empty M4F segment".into());
+                }
+                if let Err(kind) = session.check_served_timeline(&n, media_start) {
+                    return Err(flussonic::failure::record(
+                        subtitles.failure,
+                        kind,
+                        "M4F source media timeline changed",
+                    )
+                    .into());
                 }
                 configs(
                     stdin,
@@ -660,7 +668,7 @@ async fn consume_guarded_session<W: AsyncWrite + Unpin>(
                 for f in &frames {
                     write_frame(stdin, &mut session.muxer, f, subtitles.diagnostic).await?;
                 }
-                session.published(&n);
+                session.published(&n, media_start);
             }
         } else {
             Diagnostics::phase(subtitles.diagnostic, Phase::M4sDecode);

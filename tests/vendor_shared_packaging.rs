@@ -1006,6 +1006,63 @@ async fn m4f_backward_timeline_retires_worker() {
     rejected_m4f_timeline_closes_worker("08", "04").await;
 }
 
+#[tokio::test]
+async fn m4f_reopened_contiguous_notice_with_far_future_body_retires_before_relay() {
+    let mut f = Fixture::start(true).await;
+    let registry = SharedInputs::new(f.owner.clone());
+    let rows = f.inventory(Duration::from_secs(20)).await;
+    let attachment = attach(&f, f.admitted(&rows, "one").await, &registry);
+    let viewer = attachment.viewer;
+    let mut signals = viewer.subscribe_m4f().unwrap();
+    let mut task = tokio::spawn(async move { attachment.input.unwrap().run().await });
+    let control = f.connection().await;
+    control
+        .feed
+        .send(Ok(Bytes::from_static(b"1 2026/10/13/00/00/00-4000\n")))
+        .unwrap();
+    let segment = f.connection().await;
+    segment
+        .feed
+        .send(Ok(Bytes::from(
+            m4f::pack(&[audio()], &[frame()], 360_000).unwrap(),
+        )))
+        .unwrap();
+    drop(segment.feed);
+    tokio::time::timeout(Duration::from_secs(2), signals.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(control.feed);
+    let reopened = f.connection().await;
+    reopened
+        .feed
+        .send(Ok(Bytes::from_static(b"2 2026/10/13/00/00/04-4000\n")))
+        .unwrap();
+    let segment = f.connection().await;
+    let mut far_future = frame();
+    far_future.dts = 900_000;
+    segment
+        .feed
+        .send(Ok(Bytes::from(
+            m4f::pack(&[audio()], &[far_future], 360_000).unwrap(),
+        )))
+        .unwrap();
+    drop(segment.feed);
+    match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
+        Ok(result) => assert!(result.unwrap().is_err()),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            panic!("served media gap kept the old worker alive");
+        }
+    }
+    assert!(viewer.current().is_err());
+    assert!(
+        signals.recv().await.is_err(),
+        "gap media reached the native hub"
+    );
+}
+
 async fn m4f_reopened_track_change(changed_av: bool) {
     let mut f = Fixture::start(true).await;
     let registry = SharedInputs::new(f.owner.clone());

@@ -1,5 +1,5 @@
 //! State retained by one private M4F input across control sessions.
-use crate::{m4_ingest::Notification, m4s::Track, worker_ts::Muxer};
+use crate::{m4_ingest::Notification, m4f::Frame, m4s::Track, worker_ts::Muxer};
 use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,6 +23,7 @@ pub(crate) struct M4fSession {
     pub(super) skipped_startup_segment: Option<String>,
     pub(super) accepted_segments: u64,
     last_published: Option<Published>,
+    last_media_anchor: Option<(u32, u64)>,
     replay_check: bool,
 }
 impl M4fSession {
@@ -58,11 +59,48 @@ impl M4fSession {
         Ok(ReplayDecision::Publish)
     }
 
-    pub(super) fn published(&mut self, notification: &Notification) {
+    pub(super) fn media_start(tracks: &[Track], frames: &[Frame]) -> Option<u64> {
+        frames
+            .iter()
+            .filter(|frame| {
+                tracks
+                    .iter()
+                    .any(|track| track.id == frame.track_id && track.codec != "subtitle")
+            })
+            .map(|frame| frame.dts)
+            .min()
+    }
+
+    pub(super) fn check_served_timeline(
+        &self,
+        notification: &Notification,
+        media_start: Option<u64>,
+    ) -> Result<(), crate::m4_ingest::flussonic::InputFailure> {
+        if self.replay_check {
+            if let (Some((prior_utc, prior_dts)), Some(current_dts)) =
+                (self.last_media_anchor, media_start)
+            {
+                let expected_offset =
+                    u64::from(notification.utc.saturating_sub(prior_utc)).saturating_mul(90_000);
+                let deadline = prior_dts
+                    .saturating_add(expected_offset)
+                    .saturating_add(90_000);
+                if current_dts > deadline {
+                    return Err(crate::m4_ingest::flussonic::InputFailure::ContinuityGap);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn published(&mut self, notification: &Notification, media_start: Option<u64>) {
         self.last_published = Some(Published {
             utc: notification.utc,
             duration_ms: notification.duration_ms,
         });
+        if let Some(dts) = media_start {
+            self.last_media_anchor = Some((notification.utc, dts));
+        }
         self.replay_check = false;
         self.accepted_segments = self.accepted_segments.saturating_add(1);
         self.seen.push_back(notification.name.clone());
@@ -92,7 +130,7 @@ mod tests {
     #[test]
     fn replayed_names_skip_and_first_novel_gop_must_cover_cadence() {
         let mut session = M4fSession::default();
-        session.published(&notice(0));
+        session.published(&notice(0), None);
         session.reconnect();
         assert_eq!(
             session.classify_notification(&notice(0)),
@@ -106,7 +144,7 @@ mod tests {
             session.classify_notification(&notice(8)),
             Err(crate::m4_ingest::flussonic::InputFailure::ContinuityGap)
         );
-        session.published(&notice(4));
+        session.published(&notice(4), None);
         assert_eq!(
             session.classify_notification(&notice(8)),
             Ok(ReplayDecision::Publish)
@@ -121,10 +159,29 @@ mod tests {
     #[test]
     fn unknown_backward_timestamp_is_not_treated_as_replay() {
         let mut session = M4fSession::default();
-        session.published(&notice(8));
+        session.published(&notice(8), None);
         session.reconnect();
         assert_eq!(
             session.classify_notification(&notice(4)),
+            Err(crate::m4_ingest::flussonic::InputFailure::ContinuityGap)
+        );
+    }
+
+    #[test]
+    fn first_served_media_after_reconnect_must_cover_the_prior_gop_cadence() {
+        let mut session = M4fSession::default();
+        session.published(&notice(0), Some(90_000));
+        session.reconnect();
+        assert_eq!(
+            session.classify_notification(&notice(4)),
+            Ok(ReplayDecision::Publish)
+        );
+        assert_eq!(
+            session.check_served_timeline(&notice(4), Some(450_000)),
+            Ok(())
+        );
+        assert_eq!(
+            session.check_served_timeline(&notice(4), Some(900_000)),
             Err(crate::m4_ingest::flussonic::InputFailure::ContinuityGap)
         );
     }

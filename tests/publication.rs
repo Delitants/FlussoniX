@@ -1057,12 +1057,16 @@ async fn publication_is_an_authenticated_private_native_cluster_source() {
     use sha2::{Digest, Sha256};
     let d = tempfile::tempdir().unwrap();
     let a = app(d.path());
+    // Build the paced fixture before starting the readiness deadline. Its
+    // first use runs FFmpeg synchronously and can exceed eight seconds under
+    // a parallel full-suite load before the publisher sends any bytes.
+    let media = synthetic_transport().clone();
     a.config.put("streams","owned",json!({"inputs":[{"url":"publish://"}],"password":"publisher","flussonix_token_sha256":format!("{:x}",Sha256::digest(b"viewer"))})).unwrap();
     let (source, server) = auth_backend(router(a.clone())).await;
     let (tx, t) = upload(a.clone(), "/owned/mpegts?password=publisher").await;
     let sending = tx.clone();
     let producer = tokio::spawn(async move {
-        for piece in synthetic_transport().chunks(65537) {
+        for piece in media.chunks(65537) {
             if sending
                 .send(Ok(bytes::Bytes::copy_from_slice(piece)))
                 .await
@@ -1073,7 +1077,17 @@ async fn publication_is_an_authenticated_private_native_cluster_source() {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     });
-    until(async || a.media.ready("owned").await).await;
+    let source_ready = tokio::time::timeout(Duration::from_secs(20), async {
+        while !a.media.ready("owned").await {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        source_ready.is_ok(),
+        "source startup: {}",
+        a.media.stats("owned").await
+    );
     let client = reqwest::Client::new();
     assert_eq!(
         client
