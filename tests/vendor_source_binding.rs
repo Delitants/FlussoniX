@@ -237,6 +237,7 @@ async fn explicit_origins_keep_literal_names_and_local_policy() {
     config["except"] = json!(["blocked"]);
     config["only"] = json!([]);
     config["group_config"] = json!({"paid":{"on_play":"https://billing.invalid/check"}});
+    config["flussonix_group_pins"] = json!({name:["paid"]});
     let a = SourceAuthority::new(&config, &json!([])).unwrap();
     let list = a.inventory().await.unwrap();
     assert_eq!(
