@@ -193,11 +193,27 @@ impl Runtime {
         if matches!(file, "mpegts" | "m4s" | "m4f") {
             if file != "mpegts" {
                 let deadline = Instant::now() + Duration::from_secs(8);
-                while playback.current().is_ok()
-                    && Instant::now() < deadline
-                    && playback.stats()["bytes_in"].as_u64().unwrap_or(0) == 0
-                {
+                let deadline = if file == "m4f" {
+                    deadline.max(playback.startup_deadline())
+                } else {
+                    deadline
+                };
+                let worker = playback.worker();
+                let ready = || {
+                    if file == "m4f" {
+                        worker.wire.has_m4f_segment()
+                    } else {
+                        worker.bytes.load(std::sync::atomic::Ordering::Relaxed) > 0
+                    }
+                };
+                while playback.current().is_ok() && Instant::now() < deadline && !ready() {
                     tokio::select! {biased;_=self.closed.cancelled()=>return error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),_=tokio::time::sleep(Duration::from_millis(25))=>{}}
+                }
+                if file == "m4f" && !ready() {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "M4F segment not available yet",
+                    );
                 }
             }
             let subscription = match file {

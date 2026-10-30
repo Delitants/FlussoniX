@@ -59,6 +59,28 @@ class WorkerSnapshotTests(unittest.TestCase):
                          {"present": False})
 
 
+class NoMediaDiagnosticsTests(unittest.TestCase):
+    def test_failed_m4f_probe_retains_bounded_worker_history_and_safe_stop_codes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "daemon.log"
+            log.write_text(
+                'WARN flussonix::private_input: private media input failed '
+                'protocol="m4f" phase="control_read" failure=Transient '
+                'last_http_status=200 last_private_ack=true metadata_sent=false '
+                'cluster_key=secret\n'
+                'DEBUG flussonix::worker_lifecycle: worker failure recorded '
+                'site=1193 reason=input_closed token=secret\n', encoding="utf-8")
+            samples = [{"status": "starting", "bytes_in": n} for n in range(10)]
+            result = PROBE.m4f_no_media_diagnostics(log, samples)
+        self.assertEqual([row["bytes_in"] for row in result["cdn_worker_samples"]],
+                         list(range(2, 10)))
+        self.assertEqual(result["source_failure"]["phase"], "control_read")
+        self.assertEqual(result["lifecycle"], [
+            {"event": "worker_failure", "site": 1193, "reason": "input_closed"}
+        ])
+        self.assertNotIn("secret", repr(result))
+
+
 class PrivateInputSnapshotTests(unittest.TestCase):
     def test_only_allowlisted_m4f_failure_fields_leave_the_private_log(self):
         with tempfile.TemporaryDirectory() as directory:
