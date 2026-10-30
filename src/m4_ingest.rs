@@ -505,6 +505,7 @@ async fn consume_guarded_session<W: AsyncWrite + Unpin>(
                     && !session.tracks.is_empty()
                     && session.muxer.is_some()
                 {
+                    session.reconnect();
                     flussonic::failure::record(
                         subtitles.failure,
                         flussonic::InputFailure::CleanControlEof,
@@ -520,10 +521,17 @@ async fn consume_guarded_session<W: AsyncWrite + Unpin>(
             Diagnostics::phase(subtitles.diagnostic, Phase::SignalDecode);
             for n in signals.push(&bytes)? {
                 check_authority(authority)?;
-                if session.seen.contains(&n.name)
-                    || session.skipped_startup_segment.as_ref() == Some(&n.name)
-                {
-                    continue;
+                match session.classify_notification(&n) {
+                    Ok(m4f_session::ReplayDecision::Skip) => continue,
+                    Ok(m4f_session::ReplayDecision::Publish) => {}
+                    Err(kind) => {
+                        return Err(flussonic::failure::record(
+                            subtitles.failure,
+                            kind,
+                            "M4F source timeline changed",
+                        )
+                        .into());
+                    }
                 }
                 let mut url = requests.base.clone();
                 url.set_path(&format!("{}/{}", requests.base.path(), n.name));
@@ -642,7 +650,7 @@ async fn consume_guarded_session<W: AsyncWrite + Unpin>(
                     hub.relay_segment(
                         Segment {
                             name: n.name.clone(),
-                            signal: n.wire,
+                            signal: n.wire.clone(),
                             bytes: body,
                         },
                         new.clone(),
@@ -652,11 +660,7 @@ async fn consume_guarded_session<W: AsyncWrite + Unpin>(
                 for f in &frames {
                     write_frame(stdin, &mut session.muxer, f, subtitles.diagnostic).await?;
                 }
-                session.accepted_segments = session.accepted_segments.saturating_add(1);
-                session.seen.push_back(n.name);
-                if session.seen.len() > 16 {
-                    session.seen.pop_front();
-                }
+                session.published(&n);
             }
         } else {
             Diagnostics::phase(subtitles.diagnostic, Phase::M4sDecode);

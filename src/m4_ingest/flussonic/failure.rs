@@ -15,6 +15,7 @@ pub enum InputFailure {
     Local,
     Revoked,
     CleanControlEof,
+    ContinuityGap,
 }
 pub(in crate::m4_ingest) fn record(
     slot: Option<&AtomicU8>,
@@ -33,6 +34,7 @@ pub(super) fn read(slot: &AtomicU8) -> InputFailure {
         3 => InputFailure::Local,
         4 => InputFailure::Revoked,
         5 => InputFailure::CleanControlEof,
+        6 => InputFailure::ContinuityGap,
         _ => InputFailure::Invalid,
     }
 }

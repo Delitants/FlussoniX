@@ -18,7 +18,7 @@ use flussonix::{
     playback_auth::{PlaybackAuth, ViewerRequest},
     source_directory::modern_coordinator::{
         AdmissionOutcome, AdmittedCandidate, CoordinatedInventory, ModernSourceCoordinator,
-        SharedInputOptions, SharedInputs, SourceHandle,
+        SharedInputOptions, SharedInputs, SharedSubscription, SourceHandle,
     },
     wire,
 };
@@ -845,6 +845,16 @@ async fn clean_m4f_eof_keeps_packager_pid_and_reopens_with_fresh_session() {
     assert_eq!(playback.pid(), pid);
     reopened
         .feed
+        .send(Ok(Bytes::from_static(b"1 2026/10/13/00/00/00-4000\n")))
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), f.connections.recv())
+            .await
+            .is_err(),
+        "replayed GOP was fetched again"
+    );
+    reopened
+        .feed
         .send(Ok(Bytes::from_static(b"2 2026/10/13/00/00/04-4000\n")))
         .unwrap();
     let segment = f.connection().await;
@@ -918,6 +928,260 @@ async fn rapid_m4f_eofs_retire_old_generation_to_supervision() {
     );
     assert!(viewer.current().is_err());
     assert_eq!(f.media_calls(), 6);
+}
+
+async fn rejected_m4f_timeline_closes_worker(first: &str, next: &str) {
+    let mut f = Fixture::start(true).await;
+    let registry = SharedInputs::new(f.owner.clone());
+    let rows = f.inventory(Duration::from_secs(20)).await;
+    let attachment = attach(&f, f.admitted(&rows, "one").await, &registry);
+    let viewer = attachment.viewer;
+    let mut signals = viewer.subscribe_m4f().unwrap();
+    let task = tokio::spawn(async move { attachment.input.unwrap().run().await });
+    let control = f.connection().await;
+    control
+        .feed
+        .send(Ok(Bytes::from(format!(
+            "1 2026/10/13/00/00/{first}-4000\n"
+        ))))
+        .unwrap();
+    let segment = f.connection().await;
+    segment
+        .feed
+        .send(Ok(Bytes::from(
+            m4f::pack(&[audio()], &[frame()], 360_000).unwrap(),
+        )))
+        .unwrap();
+    drop(segment.feed);
+    tokio::time::timeout(Duration::from_secs(2), signals.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(control.feed);
+    let reopened = f.connection().await;
+    reopened
+        .feed
+        .send(Ok(Bytes::from(format!("2 2026/10/13/00/00/{next}-4000\n"))))
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    assert!(viewer.current().is_err());
+    assert_eq!(f.media_calls(), 3, "invalid timeline fetched media");
+}
+
+#[tokio::test]
+async fn m4f_replay_gap_retires_worker() {
+    rejected_m4f_timeline_closes_worker("00", "12").await;
+}
+
+#[tokio::test]
+async fn m4f_backward_timeline_retires_worker() {
+    rejected_m4f_timeline_closes_worker("08", "04").await;
+}
+
+async fn m4f_reopened_track_change(changed_av: bool) {
+    let mut f = Fixture::start(true).await;
+    let registry = SharedInputs::new(f.owner.clone());
+    let rows = f.inventory(Duration::from_secs(20)).await;
+    let attachment = attach(&f, f.admitted(&rows, "one").await, &registry);
+    let viewer = attachment.viewer;
+    let mut signals = viewer.subscribe_m4f().unwrap();
+    let task = tokio::spawn(async move { attachment.input.unwrap().run().await });
+    let control = f.connection().await;
+    control
+        .feed
+        .send(Ok(Bytes::from_static(b"1 2026/10/13/00/00/00-4000\n")))
+        .unwrap();
+    let segment = f.connection().await;
+    segment
+        .feed
+        .send(Ok(Bytes::from(
+            m4f::pack(&[audio()], &[frame()], 360_000).unwrap(),
+        )))
+        .unwrap();
+    drop(segment.feed);
+    tokio::time::timeout(Duration::from_secs(2), signals.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(control.feed);
+    let reopened = f.connection().await;
+    reopened
+        .feed
+        .send(Ok(Bytes::from_static(b"2 2026/10/13/00/00/04-4000\n")))
+        .unwrap();
+    let segment = f.connection().await;
+    let mut next_frame = frame();
+    next_frame.dts = 450_000;
+    let tracks = if changed_av {
+        next_frame.body = include_bytes!("fixtures/codecs/mp2.bin").to_vec();
+        vec![Track {
+            id: 1,
+            codec: "m2a".into(),
+            config: vec![],
+        }]
+    } else {
+        vec![
+            audio(),
+            Track {
+                id: 7,
+                codec: "subtitle".into(),
+                config: vec![],
+            },
+        ]
+    };
+    segment
+        .feed
+        .send(Ok(Bytes::from(
+            m4f::pack(&tracks, &[next_frame], 360_000).unwrap(),
+        )))
+        .unwrap();
+    drop(segment.feed);
+    if changed_av {
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(viewer.current().is_err());
+    } else {
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), signals.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"2 2026/10/13/00/00/04-4000\n")
+        );
+        viewer.current().unwrap();
+        registry.shutdown();
+        assert!(task.await.unwrap().is_err());
+    }
+    assert_eq!(f.media_calls(), 4);
+}
+
+#[tokio::test]
+async fn m4f_changed_av_metadata_retires_worker() {
+    m4f_reopened_track_change(true).await;
+}
+
+#[tokio::test]
+async fn m4f_sparse_subtitles_continue() {
+    m4f_reopened_track_change(false).await;
+}
+
+async fn collect_audio_ts(
+    subscription: &mut SharedSubscription,
+    data: &mut Vec<u8>,
+    audio_starts: usize,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let starts = data
+                .chunks_exact(188)
+                .filter(|packet| {
+                    packet[0] == 0x47
+                        && (((packet[1] & 0x1f) as u16) << 8 | packet[2] as u16) == 256
+                        && packet[1] & 0x40 != 0
+                })
+                .count();
+            if starts >= audio_starts {
+                break;
+            }
+            data.extend_from_slice(&subscription.recv().await.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn m4f_replay_skips_duplicates_before_fetch_and_preserves_ts_continuity() {
+    let mut f = Fixture::start(true).await;
+    let registry = SharedInputs::new(f.owner.clone());
+    let rows = f.inventory(Duration::from_secs(20)).await;
+    let attachment = attach(&f, f.admitted(&rows, "one").await, &registry);
+    let viewer = attachment.viewer;
+    let mut ts = viewer.subscribe_ts().unwrap();
+    let task = tokio::spawn(async move { attachment.input.unwrap().run().await });
+    let control = f.connection().await;
+    control
+        .feed
+        .send(Ok(Bytes::from_static(b"1 2026/10/13/00/00/00-4000\n")))
+        .unwrap();
+    let segment = f.connection().await;
+    let first = (0..64)
+        .map(|i| Frame {
+            dts: 90_000 + i * 2_351,
+            ..frame()
+        })
+        .collect::<Vec<_>>();
+    segment
+        .feed
+        .send(Ok(Bytes::from(
+            m4f::pack(&[audio()], &first, 360_000).unwrap(),
+        )))
+        .unwrap();
+    drop(segment.feed);
+    let mut output = Vec::new();
+    collect_audio_ts(&mut ts, &mut output, 64).await;
+    drop(control.feed);
+    let reopened = f.connection().await;
+    reopened
+        .feed
+        .send(Ok(Bytes::from_static(b"1 2026/10/13/00/00/00-4000\n")))
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), f.connections.recv())
+            .await
+            .is_err(),
+        "replayed GOP caused an upstream fetch"
+    );
+    reopened
+        .feed
+        .send(Ok(Bytes::from_static(b"2 2026/10/13/00/00/04-4000\n")))
+        .unwrap();
+    let segment = f.connection().await;
+    let second = (64..128)
+        .map(|i| Frame {
+            dts: 90_000 + i * 2_351,
+            ..frame()
+        })
+        .collect::<Vec<_>>();
+    segment
+        .feed
+        .send(Ok(Bytes::from(
+            m4f::pack(&[audio()], &second, 360_000).unwrap(),
+        )))
+        .unwrap();
+    drop(segment.feed);
+    collect_audio_ts(&mut ts, &mut output, 128).await;
+    assert_eq!(f.media_calls(), 4);
+    let mut previous = None;
+    for packet in output.chunks_exact(188) {
+        assert_eq!(packet[0], 0x47);
+        let pid = ((packet[1] as u16 & 0x1f) << 8) | packet[2] as u16;
+        if pid == 256 && packet[3] & 0x10 != 0 {
+            let counter = packet[3] & 0x0f;
+            if let Some(old) = previous {
+                assert_eq!(counter, (old + 1) & 0x0f);
+            }
+            previous = Some(counter);
+        }
+    }
+    assert!(previous.is_some());
+    registry.shutdown();
+    assert!(task.await.unwrap().is_err());
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("replayed.ts");
+    std::fs::write(&file, output).unwrap();
+    decode(&file).await;
 }
 
 // Losing the first viewer must not cancel its startup-owner handoff for a peer.
