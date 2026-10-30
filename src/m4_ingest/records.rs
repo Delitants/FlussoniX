@@ -229,6 +229,7 @@ async fn consume_active<W: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use std::{
+        collections::VecDeque,
         pin::Pin,
         sync::{
             Arc,

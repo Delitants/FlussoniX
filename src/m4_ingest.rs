@@ -2,6 +2,7 @@
 pub(crate) mod authority;
 mod bootstrap;
 pub mod flussonic;
+pub(crate) mod m4f_session;
 pub(crate) mod records;
 use crate::{
     m4s::{Decoder, Event, PackedGop, Track},
@@ -13,7 +14,6 @@ use bytes::{Bytes, BytesMut};
 use flussonic::diagnostic::{Diagnostics, Phase};
 use futures_util::StreamExt;
 use std::{
-    collections::VecDeque,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -386,10 +386,36 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
     requests: &Requests,
     output: &mut W,
     hub: Option<&Hub>,
-    mut metadata: Option<oneshot::Sender<Vec<Track>>>,
+    metadata: Option<oneshot::Sender<Vec<Track>>>,
     subtitles: PullOptions<'_>,
     authority: Authority<'_>,
 ) -> Result<(), String> {
+    let mut session = m4f_session::M4fSession::default();
+    consume_guarded_session(
+        requests,
+        output,
+        hub,
+        metadata,
+        subtitles,
+        Some(&mut session),
+        false,
+        authority,
+    )
+    .await
+}
+
+async fn consume_guarded_session<W: AsyncWrite + Unpin>(
+    requests: &Requests,
+    output: &mut W,
+    hub: Option<&Hub>,
+    mut metadata: Option<oneshot::Sender<Vec<Track>>>,
+    subtitles: PullOptions<'_>,
+    session: Option<&mut m4f_session::M4fSession>,
+    classify_clean_eof: bool,
+    authority: Authority<'_>,
+) -> Result<(), String> {
+    let mut fallback = m4f_session::M4fSession::default();
+    let session = session.unwrap_or(&mut fallback);
     check_authority(authority)?;
     let mut writer = flussonic::failure::Writer {
         output,
@@ -461,24 +487,42 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
     let mut stream = response.bytes_stream();
     let mut decoder = Decoder::default();
     let mut signals = Signals::default();
-    let mut tracks = Vec::new();
-    let mut declared = None;
-    let mut muxer = None;
-    let mut seen: VecDeque<String> = VecDeque::new();
-    let mut skipped_startup_segment = None;
     loop {
         Diagnostics::phase(subtitles.diagnostic, Phase::ControlRead);
         let bytes = tokio::time::timeout(Duration::from_secs(15), stream.next())
             .await
             .map_err(|_| transient("source timed out"))?
-            .ok_or_else(|| transient("source closed"))?
+            .ok_or_else(|| {
+                if classify_clean_eof && is_m4f && !signals.pending.is_empty() {
+                    flussonic::failure::record(
+                        subtitles.failure,
+                        flussonic::InputFailure::Invalid,
+                        "incomplete M4F signal",
+                    )
+                } else if classify_clean_eof
+                    && is_m4f
+                    && session.accepted_segments > 0
+                    && !session.tracks.is_empty()
+                    && session.muxer.is_some()
+                {
+                    flussonic::failure::record(
+                        subtitles.failure,
+                        flussonic::InputFailure::CleanControlEof,
+                        "source closed",
+                    )
+                } else {
+                    transient("source closed")
+                }
+            })?
             .map_err(|_| transient("transport failed"))?;
         check_authority(authority)?;
         if is_m4f {
             Diagnostics::phase(subtitles.diagnostic, Phase::SignalDecode);
             for n in signals.push(&bytes)? {
                 check_authority(authority)?;
-                if seen.contains(&n.name) || skipped_startup_segment.as_ref() == Some(&n.name) {
+                if session.seen.contains(&n.name)
+                    || session.skipped_startup_segment.as_ref() == Some(&n.name)
+                {
                     continue;
                 }
                 let mut url = requests.base.clone();
@@ -515,8 +559,8 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                     // Before any metadata, allow one distinct missing object and
                     // keep the existing control session for the next GOP. Worker
                     // startup/cancellation deadlines still own this entire wait.
-                    if tracks.is_empty() && skipped_startup_segment.is_none() {
-                        skipped_startup_segment = Some(n.name);
+                    if session.tracks.is_empty() && session.skipped_startup_segment.is_none() {
+                        session.skipped_startup_segment = Some(n.name);
                         tracing::debug!(
                             target: "flussonix::private_input",
                             protocol = "m4f",
@@ -569,9 +613,9 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                 }
                 configs(
                     stdin,
-                    &mut tracks,
-                    &mut declared,
-                    &mut muxer,
+                    &mut session.tracks,
+                    &mut session.declared,
+                    &mut session.muxer,
                     source_tracks,
                     &mut metadata,
                     policy,
@@ -581,7 +625,8 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                     // A paced bridge can block within this GOP. Validate all
                     // samples before exposing the original native relay object.
                     Diagnostics::phase(subtitles.diagnostic, Phase::BridgeFrame);
-                    muxer
+                    session
+                        .muxer
                         .as_ref()
                         .ok_or("native frame before metadata")?
                         .validate_frames(&frames)?;
@@ -605,11 +650,12 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                     )?;
                 }
                 for f in &frames {
-                    write_frame(stdin, &mut muxer, f, subtitles.diagnostic).await?;
+                    write_frame(stdin, &mut session.muxer, f, subtitles.diagnostic).await?;
                 }
-                seen.push_back(n.name);
-                if seen.len() > 16 {
-                    seen.pop_front();
+                session.accepted_segments = session.accepted_segments.saturating_add(1);
+                session.seen.push_back(n.name);
+                if session.seen.len() > 16 {
+                    session.seen.pop_front();
                 }
             }
         } else {
@@ -617,9 +663,9 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
             records::events(
                 stdin,
                 records::State {
-                    tracks: &mut tracks,
-                    declared: &mut declared,
-                    muxer: &mut muxer,
+                    tracks: &mut session.tracks,
+                    declared: &mut session.declared,
+                    muxer: &mut session.muxer,
                     metadata: &mut metadata,
                 },
                 hub,
