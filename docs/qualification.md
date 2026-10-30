@@ -27,6 +27,18 @@ does not establish gapless delivery, a sustained post-change source/CDN
 timestamp match, or production capacity. Exact-head CI and those release gates
 remain open.
 
+Two subsequent five-minute read-only comparisons used the exact PR candidate
+against the authorized origin and an isolated local CDN. The first observed 53
+matching timestamps in a 276.7-second common observation window, with three
+CDN-only timestamps at its leading edge and three source-only timestamps at its
+trailing edge. A second run aligned the actual media timestamp ranges: 32
+matched, but three source-only timestamps remained. That run also saw five CDN
+HTTP 503 responses and one origin HTTP 403; the collector did not establish
+which condition caused the missing CDN announcements. These comparisons count
+control announcements, not successful fetches of every segment. The sustained
+source/CDN parity gate remains open. Both temporary daemons, their packaging
+children, and their owner-only configuration and logs were removed afterward.
+
 ## Current M4FS to M4F playback gate (2026-10-29)
 
 The explicit Flussonic-source route previously sent HTTP 200 before its first
