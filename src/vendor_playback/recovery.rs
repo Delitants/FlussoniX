@@ -10,7 +10,7 @@ use crate::{
 };
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{future::Future, pin::Pin};
-fn group_retry_delay(group: &Group, name: &str, streak: u32) -> Duration {
+pub(super) fn group_retry_delay(group: &Group, name: &str, streak: u32) -> Duration {
     if !group.keys.is_empty()
         && group
             .keys
