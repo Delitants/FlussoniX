@@ -24,8 +24,13 @@ requests. Its temporary daemons and files were removed.
 
 This check shows recovery and compatible media after a live source outage; it
 does not establish gapless delivery, a sustained post-change source/CDN
-timestamp match, or production capacity. Exact-head CI and those release gates
-remain open.
+timestamp match, or production capacity. The exact PR17 head `4cb0f18` passed
+[full verification](https://github.com/Delitants/FlussoniX/actions/runs/40985266390)
+and publication-safety CI on 2026-10-30. A diff-scoped security review of the
+four changed source files found no candidate vulnerabilities; it was not a
+whole-repository audit. The 35 local package and service-preview regression
+tests passed on the same runtime source. Source/CDN continuity and production
+capacity remain open release gates.
 
 Two subsequent five-minute read-only comparisons used the exact PR candidate
 against the authorized origin and an isolated local CDN. The first observed 53
