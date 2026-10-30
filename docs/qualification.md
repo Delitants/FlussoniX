@@ -38,6 +38,24 @@ which condition caused the missing CDN announcements. These comparisons count
 control announcements, not successful fetches of every segment. The sustained
 source/CDN parity gate remains open. Both temporary daemons, their packaging
 children, and their owner-only configuration and logs were removed afterward.
+The direct-origin collector in those two comparisons omitted the M4F
+`x-playback-session-id` header, so its one 403 cannot be attributed to the
+server implementation and those comparisons are superseded for parity claims.
+
+A corrected read-only collector sent the same private M4F session and
+`X-Supported` headers as FlussoniX, required `cluster-auth: yes`, and fetched
+every source segment with the same session. In a 45-second run, the origin
+served all ten announced segments while the CDN announced seven; three
+source-available timestamps were absent around two CDN control reconnections. A 90-second
+repeat had no aligned gaps and its worker remained healthy. In a five-minute
+repeat, the origin served all 51 announced segments. The CDN matched 46
+timestamps in the aligned range but omitted four source-available timestamps.
+Worker-state sampling recorded `input_closed` and a replacement worker at the
+first gap, followed by several failed startup attempts during a later source
+outage. The local diagnostic log held no additional detail. This establishes
+a real continuity deficit during private input closure; it does not prove that
+every missing segment has the same cause or that a replacement can recover it.
+The temporary CDN, packager, owner-only probe files and logs were removed.
 
 ## Current M4FS to M4F playback gate (2026-10-29)
 
