@@ -144,7 +144,7 @@ impl Runtime {
             && d.group.as_ref().is_some_and(|g| Arc::ptr_eq(g, group))
         {
             d.mode = mode;
-            d.next_attempt = Instant::now() + crate::recovery::retry_delay(d.streak);
+            d.next_attempt = Instant::now() + private_retry_delay(&d.key, name, d.streak);
         }
     }
     pub(super) fn reset_static_mode(&self, name: &str, group: &Arc<Group>) {
@@ -240,7 +240,7 @@ impl Runtime {
             else {
                 return false;
             };
-            d.next_attempt = Instant::now() + crate::recovery::retry_delay(d.streak);
+            d.next_attempt = Instant::now() + private_retry_delay(&d.key, name, d.streak);
             d.streak = d.streak.saturating_add(1);
         }
         // Serialize static and foreground/recovery selection through the same gate.

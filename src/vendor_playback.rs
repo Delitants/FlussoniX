@@ -43,6 +43,20 @@ const GROUP_SELECTION_BUDGET: Duration = Duration::from_secs(16);
 const RECOVERY_JOB_BUDGET: Duration = Duration::from_secs(20);
 pub(crate) const SRT_ADMISSION_BUDGET: Duration = Duration::from_secs(20);
 
+// Live M4F windows are short: a long exponential pause after the origin comes
+// back can lose segments that were still available to a direct viewer. Spread
+// repeat probes across names so a recovering catalog does not reconnect at once.
+fn private_retry_delay(source: &str, name: &str, streak: u32) -> Duration {
+    let delay = crate::recovery::retry_delay(streak);
+    if !source.starts_with("m4f://") && !source.starts_with("m4fs://") {
+        return delay;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hash);
+    delay.min(Duration::from_secs(2)) + Duration::from_millis(hash.finish() % 500)
+}
+
 pub(crate) enum Selection {
     Native,
     Vendor { key: String, revision: u64 },

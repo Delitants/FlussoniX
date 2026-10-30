@@ -1,5 +1,32 @@
 # Preview qualification
 
+## Bounded vendor M4F recovery after an origin outage (2026-10-29)
+
+A paired five-minute read-only run against the authorized cdn4 source found
+three source-only M4F timestamps in the common window after HTTP 503s. The
+source itself also stalled, but the CDN's longer retry pause added avoidable
+loss as it recovered. A same-worker control-EOF experiment was withdrawn:
+owned removal and revocation tests showed that reopening control before a new
+catalog check could bypass source authority.
+
+M4F-only vendor sources with current static or viewer demand now cap scheduled
+recovery delay at two seconds plus under 500 ms of per-stream spread. Existing
+source selection, inventory refresh, permission fences and eight-job limit
+still run before a replacement worker starts. M4S and mixed-protocol groups
+retain their prior schedule. The new owned single-origin regression observes
+three consecutive HTTP 503 control attempts, restores the origin, and requires
+new worker media within six seconds. It failed with the old delay and passes
+with this policy. The full focused vendor suite and all-target warnings-denied
+Clippy pass locally. A separate isolated LB/CDN read-only probe on the updated
+binary observed five local 503 controls followed by one successful M4F control,
+one fetched 3.8 MB H.264/AAC segment, and 403 for unauthenticated LB/CDN
+requests. Its temporary daemons and files were removed.
+
+This check shows recovery and compatible media after a live source outage; it
+does not establish gapless delivery, a sustained post-change source/CDN
+timestamp match, or production capacity. Exact-head CI and those release gates
+remain open.
+
 ## Current M4FS to M4F playback gate (2026-10-29)
 
 The explicit Flussonic-source route previously sent HTTP 200 before its first
