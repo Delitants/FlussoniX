@@ -36,6 +36,7 @@ struct Connection {
     feed: Feed,
 }
 struct InventoryControl {
+    id: String,
     status: StatusCode,
     streams: serde_json::Value,
     hold: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
@@ -46,6 +47,7 @@ struct Fixture {
     owner: Arc<ModernSourceCoordinator>,
     auth: Arc<PlaybackAuth>,
     handle: SourceHandle,
+    key: String,
     headers: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     connections: mpsc::UnboundedReceiver<Connection>,
     calls: Arc<Mutex<Vec<String>>>,
@@ -60,6 +62,9 @@ impl Drop for Fixture {
 }
 impl Fixture {
     async fn start(m4f: bool) -> Self {
+        Self::start_with_group_pin(m4f, false).await
+    }
+    async fn start_with_group_pin(m4f: bool, pinned: bool) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let root = format!("http://{}", listener.local_addr().unwrap());
         let key = root.replacen("http", if m4f { "m4f" } else { "m4s" }, 1);
@@ -67,8 +72,9 @@ impl Fixture {
         let media_sessions = Arc::new(Mutex::new(vec![]));
         let headers: Arc<Mutex<Option<oneshot::Receiver<()>>>> = Arc::new(Mutex::new(None));
         let remote = Arc::new(Mutex::new(InventoryControl {
+            id: "owned-origin".into(),
             status: StatusCode::OK,
-            streams: json!([{"name":NAME,"groups":[],"named_by":"config","static":true}]),
+            streams: json!([{"name":NAME,"groups":if pinned {vec!["same"]}else{vec![]},"named_by":"config","static":true}]),
             hold: None,
         }));
         let control = remote.clone();
@@ -111,12 +117,13 @@ impl Fixture {
                     assert!(header.contains_key("authorization"));
                     assert!(!header.contains_key("cluster-auth-key"));
                     let (value, status, pause) = if uri.path().ends_with("/config") {
-                        (json!({"stats":{"id":"owned-origin"}}), StatusCode::OK, None)
+                        let control = control.lock().unwrap();
+                        (json!({"stats":{"id":control.id}}), StatusCode::OK, None)
                     } else {
                         assert_eq!(uri.path(), "/streamer/api/v3/streams");
                         let mut control = control.lock().unwrap();
                         (
-                            json!({"server_id":"owned-origin","streams":control.streams}),
+                            json!({"server_id":control.id,"streams":control.streams}),
                             control.status,
                             control.hold.take(),
                         )
@@ -139,21 +146,36 @@ impl Fixture {
         });
         let dir = tempfile::tempdir().unwrap();
         let config = Arc::new(ConfigStore::open(dir.path().join("config.json")).unwrap());
-        config
-            .put(
-                "sources",
-                &key,
-                json!({"url":key,"cluster_key":"owned-private-key"}),
-            )
-            .unwrap();
+        let source = if pinned {
+            json!({"url":key,"cluster_key":"owned-private-key","on_play":"true",
+                "flussonix_source_kind":"flussonic",
+                "group_config":{"same":{"on_play":"true"}},
+                "flussonix_group_pins":{(NAME):["same"]}})
+        } else {
+            json!({"url":key,"cluster_key":"owned-private-key"})
+        };
+        config.put("sources", &key, source).unwrap();
         let owner = Arc::new(ModernSourceCoordinator::new(config.clone(), "owned-local").unwrap());
-        let handle = install(&owner, &key);
+        let handle = if pinned {
+            owner
+                .install(
+                    owner
+                        .capture(&key)
+                        .unwrap()
+                        .prepare(Duration::from_secs(3))
+                        .unwrap(),
+                )
+                .unwrap()
+        } else {
+            install(&owner, &key)
+        };
         Self {
             _dir: dir,
             config,
             owner,
             auth: Arc::new(PlaybackAuth::new(16)),
             handle,
+            key,
             headers,
             connections,
             calls,
@@ -1182,6 +1204,198 @@ async fn m4f_replay_skips_duplicates_before_fetch_and_preserves_ts_continuity() 
     let file = dir.path().join("replayed.ts");
     std::fs::write(&file, output).unwrap();
     decode(&file).await;
+}
+
+#[tokio::test]
+async fn m4f_eof_authority_rejections_close_old_worker_before_reopen() {
+    for mode in [
+        "removed",
+        "disabled",
+        "identity",
+        "groups",
+        "relationship",
+        "source-config",
+        "processing",
+        "config-revision",
+        "last-viewer",
+        "expired-demand",
+    ] {
+        let mut f = Fixture::start_with_group_pin(true, mode == "groups").await;
+        let registry = SharedInputs::new(f.owner.clone());
+        let rows = f
+            .inventory(if mode == "expired-demand" {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(20)
+            })
+            .await;
+        let attachment = attach(&f, f.admitted(&rows, "one").await, &registry);
+        let viewer = attachment.viewer;
+        let mut signals = viewer.subscribe_m4f().unwrap();
+        let task = tokio::spawn(async move { attachment.input.unwrap().run().await });
+        let control = f.connection().await;
+        control
+            .feed
+            .send(Ok(Bytes::from_static(b"1 2026/10/13/00/00/00-4000\n")))
+            .unwrap();
+        let segment = f.connection().await;
+        segment
+            .feed
+            .send(Ok(Bytes::from(
+                m4f::pack(&[audio()], &[frame()], 360_000).unwrap(),
+            )))
+            .unwrap();
+        drop(segment.feed);
+        tokio::time::timeout(Duration::from_secs(2), signals.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (started_tx, started) = oneshot::channel();
+        let (release, held) = oneshot::channel();
+        {
+            let mut remote = f.remote.lock().unwrap();
+            remote.hold = Some((started_tx, held));
+            match mode {
+                "removed" => remote.streams = json!([]),
+                "disabled" => {
+                    remote.streams =
+                        json!([{"name":NAME,"groups":[],"named_by":"config","static":false}]);
+                }
+                "identity" => remote.id = "different-origin".into(),
+                "groups" => {
+                    remote.streams =
+                        json!([{"name":NAME,"groups":["other"],"named_by":"config","static":true}]);
+                }
+                "relationship" => {
+                    remote.streams =
+                        json!([{"name":NAME,"groups":[],"named_by":"remote","static":true}]);
+                }
+                _ => {}
+            }
+        }
+        drop(control.feed);
+        tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .unwrap()
+            .unwrap();
+        match mode {
+            "source-config" => {
+                f.config
+                    .put(
+                        "sources",
+                        &f.key,
+                        json!({"url":f.key,"cluster_key":"changed-private-key"}),
+                    )
+                    .unwrap();
+            }
+            "processing" => {
+                f.config
+                    .put(
+                        "templates",
+                        NAME,
+                        json!({"flussonix_hls_subtitles":"passthrough"}),
+                    )
+                    .unwrap();
+            }
+            "config-revision" => {
+                f.config
+                    .put("templates", "changed", json!({"static":false}))
+                    .unwrap();
+            }
+            "last-viewer" => {
+                let id = f.auth.snapshots()[0]["id"].as_str().unwrap().to_owned();
+                assert!(f.auth.revoke(&id));
+            }
+            "expired-demand" => tokio::time::sleep(Duration::from_millis(600)).await,
+            _ => {}
+        }
+        let _ = release.send(());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap_or_else(|_| panic!("{mode}: worker did not close"))
+                .unwrap()
+                .is_err(),
+            "{mode}"
+        );
+        assert!(viewer.current().is_err(), "{mode}");
+        assert_eq!(f.media_calls(), 2, "{mode}: stale control reopened");
+    }
+}
+
+#[tokio::test]
+async fn m4f_eof_rechecks_surviving_viewer_without_reviving_revoked_grant() {
+    let mut f = Fixture::start(true).await;
+    let registry = SharedInputs::new(f.owner.clone());
+    let rows = f.inventory(Duration::from_secs(20)).await;
+    let first = attach(&f, f.admitted(&rows, "first").await, &registry);
+    let first_id = f.auth.snapshots()[0]["id"].as_str().unwrap().to_owned();
+    let second = attach(&f, f.admitted(&rows, "second").await, &registry);
+    assert!(second.input.is_none());
+    let first_viewer = first.viewer;
+    let second_viewer = second.viewer;
+    let mut first_signals = first_viewer.subscribe_m4f().unwrap();
+    let mut second_signals = second_viewer.subscribe_m4f().unwrap();
+    let task = tokio::spawn(async move { first.input.unwrap().run().await });
+    let control = f.connection().await;
+    control
+        .feed
+        .send(Ok(Bytes::from_static(b"1 2026/10/13/00/00/00-4000\n")))
+        .unwrap();
+    let segment = f.connection().await;
+    segment
+        .feed
+        .send(Ok(Bytes::from(
+            m4f::pack(&[audio()], &[frame()], 360_000).unwrap(),
+        )))
+        .unwrap();
+    drop(segment.feed);
+    tokio::time::timeout(Duration::from_secs(2), first_signals.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), second_signals.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let (started_tx, started) = oneshot::channel();
+    let (release, held) = oneshot::channel();
+    f.remote.lock().unwrap().hold = Some((started_tx, held));
+    drop(control.feed);
+    tokio::time::timeout(Duration::from_secs(2), started)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(f.auth.revoke(&first_id));
+    assert!(first_viewer.current().is_err());
+    second_viewer.current().unwrap();
+    release.send(()).unwrap();
+    let reopened = f.connection().await;
+    reopened
+        .feed
+        .send(Ok(Bytes::from_static(b"2 2026/10/13/00/00/04-4000\n")))
+        .unwrap();
+    let segment = f.connection().await;
+    let mut next = frame();
+    next.dts = 450_000;
+    segment
+        .feed
+        .send(Ok(Bytes::from(
+            m4f::pack(&[audio()], &[next], 360_000).unwrap(),
+        )))
+        .unwrap();
+    drop(segment.feed);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), second_signals.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        Bytes::from_static(b"2 2026/10/13/00/00/04-4000\n")
+    );
+    assert!(first_signals.recv().await.is_err());
+    second_viewer.current().unwrap();
+    registry.shutdown();
+    assert!(task.await.unwrap().is_err());
 }
 
 // Losing the first viewer must not cancel its startup-owner handoff for a peer.
