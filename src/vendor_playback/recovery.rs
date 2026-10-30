@@ -10,6 +10,18 @@ use crate::{
 };
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{future::Future, pin::Pin};
+pub(super) fn group_retry_delay(group: &Group, name: &str, streak: u32) -> Duration {
+    if !group.keys.is_empty()
+        && group
+            .keys
+            .iter()
+            .all(|key| key.starts_with("m4f://") || key.starts_with("m4fs://"))
+    {
+        private_retry_delay(&group.keys[0], name, streak)
+    } else {
+        crate::recovery::retry_delay(streak)
+    }
+}
 #[derive(Default)]
 pub(super) struct State {
     pub entries: HashMap<String, Entry>,
@@ -189,7 +201,7 @@ impl Runtime {
             && Arc::ptr_eq(&entry.group, group)
         {
             entry.mode = mode;
-            entry.next_attempt = Instant::now() + crate::recovery::retry_delay(entry.streak);
+            entry.next_attempt = Instant::now() + group_retry_delay(group, name, entry.streak);
         }
     }
     async fn recover_one(&self, app: &App, name: &str, group: Arc<Group>) {
@@ -231,7 +243,7 @@ impl Runtime {
             else {
                 return;
             };
-            entry.next_attempt = Instant::now() + crate::recovery::retry_delay(entry.streak);
+            entry.next_attempt = Instant::now() + group_retry_delay(&group, name, entry.streak);
             entry.streak = entry.streak.saturating_add(1);
             (anchor, entry.settings.clone())
         };

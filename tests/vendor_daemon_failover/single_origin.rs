@@ -105,6 +105,48 @@ async fn single_origin_warm_segment_loss_recovers_without_another_viewer_request
     }
 }
 
+#[tokio::test]
+async fn single_origin_m4f_recovers_promptly_after_repeated_503s() {
+    let f = fixture::Fixture::single_m4f().await;
+    let _ = f.playlist().await;
+    let old_pid = f.app.media.stats("owned").await["pid"].as_u64().unwrap();
+    let before = f.origins[0].private_calls.load(Ordering::SeqCst);
+    *f.origins[0].media.lock().unwrap() = StatusCode::SERVICE_UNAVAILABLE;
+    f.origins[0].close_media();
+    tokio::time::timeout(Duration::from_secs(12), async {
+        while f.origins[0].private_calls.load(Ordering::SeqCst) < before + 3 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("mock origin did not receive three rejected recovery attempts");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    *f.origins[0].media.lock().unwrap() = StatusCode::OK;
+    let restored_at = f.origins[0].private_calls.load(Ordering::SeqCst);
+    let recovered = tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let stats = f.app.media.stats("owned").await;
+            if f.origins[0].private_calls.load(Ordering::SeqCst) > restored_at
+                && stats["pid"]
+                    .as_u64()
+                    .is_some_and(|pid| pid != old_pid && pid > 0)
+                && stats["bytes_in"].as_u64().unwrap_or(0) > 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    let stats = f.app.media.stats("owned").await;
+    let calls = f.origins[0].private_calls.load(Ordering::SeqCst);
+    f.stop().await;
+    assert!(
+        recovered.is_ok(),
+        "healthy M4F origin remained in recovery backoff: calls={calls}, restored_at={restored_at}, stats={stats}"
+    );
+}
+
 async fn decode_hls(f: &fixture::Fixture) -> std::process::Output {
     use http_body_util::BodyExt;
     let playlist = f.playlist().await;

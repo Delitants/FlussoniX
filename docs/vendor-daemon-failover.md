@@ -75,7 +75,12 @@ selection bound covers the selected origin and two waves of alternatives for
 up to eight members in an otherwise uncontended group. Network results still
 publish in declared rotation order; selected denial/removal is checked first.
 Recovery owns at most eight concurrent jobs, each bounded by twenty seconds,
-with retries backing off from one to thirty seconds. Vendor SRT admission has a
+with retries backing off from one to thirty seconds. M4F-only vendor sources
+with active static or viewer demand use a two-second maximum plus a stable
+per-stream spread of less than 500 ms, because a longer pause can outlive the
+origin's short live-segment window. M4S and mixed-protocol groups keep the
+original schedule. The 256-stream cap and eight-job limit still bound probe
+load. Vendor SRT admission has a
 twenty-second bound; native admission and later transport timers are unchanged.
 Contention may exhaust these deadlines; no stale lease or authority is extended.
 There are at most 256 recovery streams and 20,000 retained native session anchors;

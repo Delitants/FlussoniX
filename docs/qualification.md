@@ -1,5 +1,62 @@
 # Preview qualification
 
+## Bounded vendor M4F recovery after an origin outage (2026-10-29)
+
+A paired five-minute read-only run against the authorized cdn4 source found
+three source-only M4F timestamps in the common window after HTTP 503s. The
+source itself also stalled, but the CDN's longer retry pause added avoidable
+loss as it recovered. A same-worker control-EOF experiment was withdrawn:
+owned removal and revocation tests showed that reopening control before a new
+catalog check could bypass source authority.
+
+M4F-only vendor sources with current static or viewer demand now cap scheduled
+recovery delay at two seconds plus under 500 ms of per-stream spread. Existing
+source selection, inventory refresh, permission fences and eight-job limit
+still run before a replacement worker starts. M4S and mixed-protocol groups
+retain their prior schedule. The new owned single-origin regression observes
+three consecutive HTTP 503 control attempts, restores the origin, and requires
+new worker media within six seconds. It failed with the old delay and passes
+with this policy. The full focused vendor suite and all-target warnings-denied
+Clippy pass locally. A separate isolated LB/CDN read-only probe on the updated
+binary observed five local 503 controls followed by one successful M4F control,
+one fetched 3.8 MB H.264/AAC segment, and 403 for unauthenticated LB/CDN
+requests. Its temporary daemons and files were removed.
+
+This check shows recovery and compatible media after a live source outage; it
+does not establish gapless delivery, a sustained post-change source/CDN
+timestamp match, or production capacity. Exact-head CI and those release gates
+remain open.
+
+Two subsequent five-minute read-only comparisons used the exact PR candidate
+against the authorized origin and an isolated local CDN. The first observed 53
+matching timestamps in a 276.7-second common observation window, with three
+CDN-only timestamps at its leading edge and three source-only timestamps at its
+trailing edge. A second run aligned the actual media timestamp ranges: 32
+matched, but three source-only timestamps remained. That run also saw five CDN
+HTTP 503 responses and one origin HTTP 403; the collector did not establish
+which condition caused the missing CDN announcements. These comparisons count
+control announcements, not successful fetches of every segment. The sustained
+source/CDN parity gate remains open. Both temporary daemons, their packaging
+children, and their owner-only configuration and logs were removed afterward.
+The direct-origin collector in those two comparisons omitted the M4F
+`x-playback-session-id` header, so its one 403 cannot be attributed to the
+server implementation and those comparisons are superseded for parity claims.
+
+A corrected read-only collector sent the same private M4F session and
+`X-Supported` headers as FlussoniX, required `cluster-auth: yes`, and fetched
+every source segment with the same session. In a 45-second run, the origin
+served all ten announced segments while the CDN announced seven; three
+source-available timestamps were absent around two CDN control reconnections. A 90-second
+repeat had no aligned gaps and its worker remained healthy. In a five-minute
+repeat, the origin served all 51 announced segments. The CDN matched 46
+timestamps in the aligned range but omitted four source-available timestamps.
+Worker-state sampling recorded `input_closed` and a replacement worker at the
+first gap, followed by several failed startup attempts during a later source
+outage. The local diagnostic log held no additional detail. This establishes
+a real continuity deficit during private input closure; it does not prove that
+every missing segment has the same cause or that a replacement can recover it.
+The temporary CDN, packager, owner-only probe files and logs were removed.
+
 ## Current M4FS to M4F playback gate (2026-10-29)
 
 The explicit Flussonic-source route previously sent HTTP 200 before its first

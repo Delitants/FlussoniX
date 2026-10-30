@@ -3,6 +3,62 @@ use super::*;
 use crate::{server::Options, vendor_playback::recovery::failure_retirement_tests::origin};
 use serde_json::json;
 use std::sync::atomic::Ordering;
+
+#[test]
+fn static_mixed_transport_group_keeps_original_retry_delay() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = App::new(
+        dir.path().join("config.json"),
+        dir.path().join("media"),
+        Options {
+            admin_password: "owned-admin".into(),
+            peer_key: "owned-native-peer".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let m4f = "m4f://127.0.0.1:30001";
+    let m4s = "m4s://127.0.0.1:30002";
+    for key in [m4f, m4s] {
+        app.config
+            .put(
+                "sources",
+                key,
+                json!({"flussonix_source_kind":"flussonic","cluster_key":"owned-test-key","on_play":"true","flussonix_source_group":"mixed","flussonix_content_id":"music","only":["owned"]}),
+            )
+            .unwrap();
+    }
+    let runtime = Runtime::new(Arc::new(
+        ModernSourceCoordinator::new(app.config.clone(), "owned-jobs").unwrap(),
+    ));
+    let group = runtime
+        .group_for(&app, m4f, app.config.revision())
+        .unwrap()
+        .unwrap();
+    runtime.activation.lock().unwrap().demands.insert(
+        "owned".into(),
+        Demand {
+            revision: app.config.revision(),
+            epoch: Arc::new(()),
+            key: m4f.into(),
+            group: Some(group.clone()),
+            settings: json!({}),
+            control: None,
+            playback: None,
+            mode: Mode::Normal,
+            next_attempt: Instant::now(),
+            streak: 5,
+        },
+    );
+    runtime.process_static_failure("owned", &group, Mode::Rotate);
+    let remaining = runtime.activation.lock().unwrap().demands["owned"]
+        .next_attempt
+        .saturating_duration_since(Instant::now());
+    assert!(
+        remaining >= Duration::from_secs(29),
+        "mixed group retried in {remaining:?}"
+    );
+}
 // The synchronous registry hold deliberately forces a publication race; the
 // catalog driver runs on another worker and does not acquire this registry.
 #[allow(clippy::await_holding_lock)]

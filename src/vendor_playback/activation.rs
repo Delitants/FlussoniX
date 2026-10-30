@@ -41,6 +41,12 @@ impl Drop for Demand {
         }
     }
 }
+fn demand_retry_delay(demand: &Demand, name: &str) -> Duration {
+    demand.group.as_ref().map_or_else(
+        || private_retry_delay(&demand.key, name, demand.streak),
+        |group| recovery::group_retry_delay(group, name, demand.streak),
+    )
+}
 impl Runtime {
     /// Only config/fact checks here. Final source and selected-route fences are
     /// acquired by activate/attach, outside the static-state lock.
@@ -144,7 +150,7 @@ impl Runtime {
             && d.group.as_ref().is_some_and(|g| Arc::ptr_eq(g, group))
         {
             d.mode = mode;
-            d.next_attempt = Instant::now() + crate::recovery::retry_delay(d.streak);
+            d.next_attempt = Instant::now() + demand_retry_delay(d, name);
         }
     }
     pub(super) fn reset_static_mode(&self, name: &str, group: &Arc<Group>) {
@@ -240,7 +246,7 @@ impl Runtime {
             else {
                 return false;
             };
-            d.next_attempt = Instant::now() + crate::recovery::retry_delay(d.streak);
+            d.next_attempt = Instant::now() + demand_retry_delay(d, name);
             d.streak = d.streak.saturating_add(1);
         }
         // Serialize static and foreground/recovery selection through the same gate.
