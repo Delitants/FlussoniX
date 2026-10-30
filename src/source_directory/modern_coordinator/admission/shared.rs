@@ -730,49 +730,112 @@ impl SharedInput {
             required,
         };
         let (tx, mut metadata) = oneshot::channel();
-        let pull = self.input.pull_guarded_classified(
-            &mut output,
-            Some(&worker.hub),
-            tx,
-            crate::m4_ingest::PullOptions {
-                preserve: worker.options.preserve_subtitles,
-                detected: Some(&worker.detected),
-                conversion: worker.options.conversion.as_deref(),
-                ..Default::default()
-            },
-            &authority,
-        );
-        tokio::pin!(pull);
+        let mut sender = Some(tx);
+        let mut m4f = crate::m4_ingest::m4f_session::M4fSession::default();
+        let mut rapid_eofs = VecDeque::new();
+        let mut last_eof_segments = 0;
+        let mut last_eof_at = None;
         let mut metadata_pending = true;
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tokio::select! { biased;
-                _=worker.cancel.cancelled()=>return Err(SharedFailure::Closed),
-                _=worker.changed.notified()=>worker.current()?,
-                _=tick.tick()=>worker.current()?,
-                tracks = &mut metadata, if metadata_pending => {
-                    metadata_pending = false;
-                    if let Ok(tracks) = tracks {
-                        worker.current()?;
-                        worker.at_source_route(|_| {
-                            let commit=|| {
-                                if worker.active_viewer().is_none(){return Err(AdmissionFailure::Revoked);}
-                                *worker.tracks.lock().unwrap()=Some(tracks);
-                                worker.metadata_ready.notify_waiters();Ok(())
-                            };
-                            match &worker.scope {Some(scope)=>scope.accept_private(commit),None=>commit()}
-                        })?;
+            let result = {
+                let metadata_sender = sender.take();
+                let pull = async {
+                    let options = crate::m4_ingest::PullOptions {
+                        preserve: worker.options.preserve_subtitles,
+                        detected: Some(&worker.detected),
+                        conversion: worker.options.conversion.as_deref(),
+                        ..Default::default()
+                    };
+                    if worker.transport == crate::m4_ingest::flussonic::Transport::M4f {
+                        self.input
+                            .pull_m4f_session_guarded(
+                                &mut output,
+                                Some(&worker.hub),
+                                &mut m4f,
+                                metadata_sender,
+                                options,
+                                &authority,
+                            )
+                            .await
+                    } else {
+                        self.input
+                            .pull_guarded_classified(
+                                &mut output,
+                                Some(&worker.hub),
+                                metadata_sender.expect("M4S worker never reopens in place"),
+                                options,
+                                &authority,
+                            )
+                            .await
                     }
-                },
-                result = &mut pull => {
-                    worker.current()?;
-                    if let Err(kind)=result {
-                        worker.input_failed(kind,false)?;
+                };
+                tokio::pin!(pull);
+                let result = loop {
+                    tokio::select! { biased;
+                        _=worker.cancel.cancelled()=>return Err(SharedFailure::Closed),
+                        _=worker.changed.notified()=>worker.current()?,
+                        _=tick.tick()=>worker.current()?,
+                        tracks = &mut metadata, if metadata_pending => {
+                            metadata_pending = false;
+                            if let Ok(tracks) = tracks {
+                                worker.current()?;
+                                worker.at_source_route(|_| {
+                                    let commit=|| {
+                                        if worker.active_viewer().is_none(){return Err(AdmissionFailure::Revoked);}
+                                        *worker.tracks.lock().unwrap()=Some(tracks);
+                                        worker.metadata_ready.notify_waiters();Ok(())
+                                    };
+                                    match &worker.scope {Some(scope)=>scope.accept_private(commit),None=>commit()}
+                                })?;
+                            }
+                        }
+                        result = &mut pull => break result,
+                    }
+                };
+                result
+            };
+            worker.current()?;
+            match result {
+                Err(crate::m4_ingest::flussonic::InputFailure::CleanControlEof)
+                    if worker.transport == crate::m4_ingest::flussonic::Transport::M4f =>
+                {
+                    let now = std::time::Instant::now();
+                    if last_eof_at.is_some_and(|previous| {
+                        now.duration_since(previous) >= Duration::from_secs(30)
+                    }) && m4f.accepted_segments() > last_eof_segments
+                    {
+                        rapid_eofs.clear();
+                    }
+                    if rapid_eofs.len() >= 4 {
+                        worker.input_failed(
+                            crate::m4_ingest::flussonic::InputFailure::Transient,
+                            false,
+                        )?;
                         return Err(SharedFailure::Input);
                     }
-                    return Ok(());
+                    rapid_eofs.push_back(now);
+                    last_eof_at = Some(now);
+                    last_eof_segments = m4f.accepted_segments();
+                    let renewal = worker.renewal.upgrade().ok_or(SharedFailure::Closed)?;
+                    let refresh = renewal.renew_after_eof(&worker.handle, Duration::from_secs(3));
+                    tokio::pin!(refresh);
+                    loop {
+                        tokio::select! { biased;
+                            _=worker.cancel.cancelled()=>return Err(SharedFailure::Closed),
+                            _=worker.changed.notified()=>worker.current()?,
+                            _=tick.tick()=>worker.current()?,
+                            result=&mut refresh=>{result?; break;}
+                        }
+                    }
+                    worker.current()?;
                 }
+                Err(kind) => {
+                    worker.input_failed(kind, false)?;
+                    return Err(SharedFailure::Input);
+                }
+                Ok(()) => return Ok(()),
             }
         }
     }

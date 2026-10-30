@@ -11,3 +11,8 @@ pub(crate) struct M4fSession {
     pub(super) skipped_startup_segment: Option<String>,
     pub(super) accepted_segments: u64,
 }
+impl M4fSession {
+    pub(crate) fn accepted_segments(&self) -> u64 {
+        self.accepted_segments
+    }
+}

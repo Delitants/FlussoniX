@@ -62,7 +62,7 @@ impl RenewalContext {
         self.renew_inner(handle, lifetime).await
     }
 
-    async fn renew_after_eof(
+    pub(super) async fn renew_after_eof(
         &self,
         handle: &SourceHandle,
         lifetime: Duration,
