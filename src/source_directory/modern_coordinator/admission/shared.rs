@@ -55,7 +55,8 @@ pub struct SharedInputs {
     owner: Arc<ModernSourceCoordinator>,
     id: Arc<()>,
     failures: Mutex<HashMap<String, FailureSlot>>,
-    workers: Mutex<Registry>,
+    workers: Arc<Mutex<Registry>>,
+    renewal: Arc<renewal::RenewalContext>,
 }
 struct Registry {
     workers: HashMap<String, Weak<Worker>>,
@@ -65,6 +66,7 @@ struct Worker {
     id: Uuid,
     registry: Arc<()>,
     owner: Arc<ModernSourceCoordinator>,
+    renewal: Weak<renewal::RenewalContext>,
     handle: super::super::SourceHandle,
     route: Mutex<super::super::CoordinatedCandidate>,
     scope: Option<super::super::ReplicaRoute>,
@@ -365,14 +367,17 @@ impl SharedInputs {
             .map_err(|e| SharedFailure::Authority(AdmissionFailure::Coordination(e)))
     }
     pub fn new(owner: Arc<ModernSourceCoordinator>) -> Self {
+        let workers = Arc::new(Mutex::new(Registry {
+            workers: HashMap::new(),
+            epoch: Arc::new(()),
+        }));
+        let renewal = Arc::new(renewal::RenewalContext::new(owner.clone(), workers.clone()));
         Self {
             owner,
             id: Arc::new(()),
             failures: Mutex::new(HashMap::new()),
-            workers: Mutex::new(Registry {
-                workers: HashMap::new(),
-                epoch: Arc::new(()),
-            }),
+            workers,
+            renewal,
         }
     }
     /// Consume opaque replica admission with its selected-route fence intact.
@@ -520,6 +525,7 @@ impl SharedInputs {
                             id: Uuid::new_v4(),
                             registry: self.id.clone(),
                             owner: self.owner.clone(),
+                            renewal: Arc::downgrade(&self.renewal),
                             handle: admission.candidate().handle.clone(),
                             route: Mutex::new(copy_route(admission.candidate())),
                             scope: admission.selection().cloned(),

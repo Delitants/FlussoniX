@@ -416,7 +416,7 @@ async fn failed_cancelled_or_late_renewal_never_extends_the_published_deadline()
 }
 
 #[tokio::test]
-async fn newer_attempt_wins_and_an_older_pending_response_cannot_roll_back() {
+async fn scheduled_renewals_serialize_and_observe_after_prior_commit() {
     let mut f = Fixture::start().await;
     let registry = SharedInputs::new(f.owner.clone());
     let rows = f.inventory(Duration::from_secs(3)).await;
@@ -425,12 +425,26 @@ async fn newer_attempt_wins_and_an_older_pending_response_cannot_roll_back() {
     let old = registry.renew(&f.handle, Duration::from_secs(3));
     tokio::pin!(old);
     tokio::select! {r=&mut old=>panic!("early {}",r.is_ok()),_=started=>{}}
-    let next = registry
-        .renew(&f.handle, Duration::from_secs(3))
-        .await
-        .unwrap();
+    let before = f.calls.lock().unwrap().len();
+    let next = registry.renew(&f.handle, Duration::from_secs(3));
+    tokio::pin!(next);
+    tokio::select! {
+        result = &mut next => panic!("overlapping observation: {}", result.is_ok()),
+        _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+    }
+    assert_eq!(f.calls.lock().unwrap().len(), before);
     release.send(()).unwrap();
-    assert!(old.await.is_err());
+    assert_eq!(old.await.unwrap().renewed, 1);
+    let next = next.await.unwrap();
+    assert_eq!(
+        f.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.ends_with("/streams"))
+            .count(),
+        3
+    );
     v.current().unwrap();
     let a = registry
         .attach(
@@ -539,15 +553,18 @@ async fn proposed_deadline_and_newer_failed_attempt_cannot_restore_older_refresh
     tokio::pin!(older);
     tokio::select! {r=&mut older=>panic!("early {}",r.is_ok()),_=started=>{}}
     f.remote.lock().unwrap().status = StatusCode::FORBIDDEN;
-    assert!(
-        registry
-            .renew(&f.handle, Duration::from_secs(3))
-            .await
-            .is_err()
-    );
+    let before = f.calls.lock().unwrap().len();
+    let newer = registry.renew(&f.handle, Duration::from_secs(3));
+    tokio::pin!(newer);
+    tokio::select! {
+        result = &mut newer => panic!("overlapping observation: {}", result.is_ok()),
+        _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+    }
+    assert_eq!(f.calls.lock().unwrap().len(), before);
     v.current().unwrap();
     release.send(()).unwrap();
-    assert!(older.await.is_err());
+    assert_eq!(older.await.unwrap().renewed, 1);
+    assert!(newer.await.is_err());
     v.current().unwrap();
     f.remote.lock().unwrap().status = StatusCode::OK;
     assert_eq!(
@@ -625,4 +642,71 @@ async fn renewal_never_revives_a_stale_unstarted_worker_beside_a_fresh_route() {
         registry.shutdown();
         drop((a.input, b.input));
     }
+}
+
+#[tokio::test]
+async fn eof_waits_for_scheduled_then_observes_again() {
+    let mut f = Fixture::start().await;
+    let registry = Arc::new(SharedInputs::new(f.owner.clone()));
+    let rows = f.inventory(Duration::from_secs(3)).await;
+    let (_viewer, worker, _feed) = f.run(&registry, &rows, "one").await;
+    let (started, release) = f.hold();
+    let first_registry = registry.clone();
+    let first_handle = f.handle.clone();
+    let scheduled = tokio::spawn(async move {
+        first_registry
+            .renew(&first_handle, Duration::from_secs(3))
+            .await
+    });
+    started.await.unwrap();
+    let before = f.calls.lock().unwrap().len();
+    let eof_registry = registry.clone();
+    let eof_handle = f.handle.clone();
+    let eof = tokio::spawn(async move {
+        eof_registry
+            .renew_after_eof(&eof_handle, Duration::from_secs(3))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(f.calls.lock().unwrap().len(), before);
+    release.send(()).unwrap();
+    assert_eq!(scheduled.await.unwrap().unwrap().renewed, 1);
+    assert_eq!(eof.await.unwrap().unwrap().renewed, 1);
+    let after = f.calls.lock().unwrap();
+    assert_eq!(after.iter().filter(|p| p.ends_with("/streams")).count(), 3);
+    registry.shutdown();
+    joined(worker).await;
+}
+
+#[tokio::test]
+async fn eof_renewal_capacity_and_timeout_are_bounded() {
+    let mut f = Fixture::start().await;
+    let registry = Arc::new(SharedInputs::new(f.owner.clone()));
+    let rows = f.inventory(Duration::from_millis(350)).await;
+    let (_viewer, worker, _feed) = f.run(&registry, &rows, "one").await;
+    let (started, _release) = f.hold();
+    let mut attempts = Vec::new();
+    for _ in 0..5 {
+        let registry = registry.clone();
+        let handle = f.handle.clone();
+        attempts.push(tokio::spawn(async move {
+            registry
+                .renew_after_eof(&handle, Duration::from_secs(3))
+                .await
+        }));
+    }
+    started.await.unwrap();
+    let before = f.calls.lock().unwrap().len();
+    for attempt in attempts {
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), attempt)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+    }
+    assert_eq!(f.calls.lock().unwrap().len(), before);
+    registry.shutdown();
+    joined(worker).await;
 }
