@@ -1111,9 +1111,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     }
     if resource == "config" {
         if name == Some("stats") && method == "GET" {
-            let mut node = app.node().await;
-            node["management_role"] = json!(if role == Role::View { "view" } else { "edit" });
-            return management_read_response(role, node);
+            return management_read_response(role, app.config_stats().await);
         }
         if name.is_some() {
             return error(StatusCode::NOT_FOUND, "unknown config operation");
