@@ -159,6 +159,7 @@ pub struct App {
     pub(crate) srt_connections: AtomicU64,
     telemetry: crate::telemetry::Sampler,
     pub started: Instant,
+    started_at_epoch_secs: u64,
     mirrors: fxlink_access::Mirrors,
     source_queries: tokio::sync::Semaphore,
     source_activation: Mutex<source_activation::State>,
@@ -349,6 +350,10 @@ impl App {
             })
             .transpose()?;
         let started = Instant::now();
+        let started_at_epoch_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let iptv_leases = Arc::new(Ledger::new(started, 100_000, iptv.revision()));
         let config = Arc::new(ConfigStore::open(config_path)?);
         let node_id = crate::node_identity::load_or_create(config_path)?;
@@ -421,6 +426,7 @@ impl App {
             srt_connections: AtomicU64::new(0),
             telemetry: crate::telemetry::Sampler::new(&options.uplink_interface)?,
             started,
+            started_at_epoch_secs,
             mirrors: fxlink_access::Mirrors::default(),
             source_queries: tokio::sync::Semaphore::new(64),
             source_activation: Mutex::new(source_activation::State::default()),
@@ -727,14 +733,27 @@ impl App {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        let online_streams = tokio::time::timeout(Duration::from_millis(250), async {
+            let mut ready = 0_u64;
+            for (name, _) in self.media.workers().await {
+                if self.media.ready(&name).await {
+                    ready += 1;
+                }
+            }
+            ready
+        })
+        .await
+        .ok();
         json!({
             "id":self.node_id.to_string(),
             "now":now,
+            "started_at":self.started_at_epoch_secs,
             "streamer_status":"running",
             "server_version":env!("CARGO_PKG_VERSION"),
             "hostname":self.node_name,
             "uptime":self.started.elapsed().as_secs(),
             "total_streams":self.config.read(|root|root["streams"].as_array().map_or(0,Vec::len)),
+            "online_streams":online_streams,
             "total_clients":self.active().await,
             "total_bandwidth":(self.options.uplink_mbps*1_000_000.0).round() as u64,
             "output_kbit":output_kbit,
@@ -1122,6 +1141,23 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
                 Some("true") => true,
                 Some(_) => return error(StatusCode::BAD_REQUEST, "full must be true or false"),
             };
+            let openmetrics = match query.get("format").map(String::as_str) {
+                Some("openmetrics") => true,
+                Some(_) => return error(StatusCode::BAD_REQUEST, "unsupported config format"),
+                None => header(request.headers(), "accept")
+                    .is_some_and(config_metrics::accepts_openmetrics),
+            };
+            if openmetrics {
+                let stats = app.config_stats().await;
+                return (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/openmetrics-text",
+                    )],
+                    config_metrics::render(app.node_id, &stats),
+                )
+                    .into_response();
+            }
             let mut result = if full {
                 app.config.snapshot()
             } else {
@@ -2811,6 +2847,7 @@ mod continuous_session_tests {
     }
 }
 
+mod config_metrics;
 mod iptv_management;
 mod iptv_peer;
 mod iptv_playlist;

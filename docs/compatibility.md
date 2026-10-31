@@ -21,8 +21,15 @@ FlussoniX-only diagnostics remain under `/flussonix/api/v1/node`. The UUID is st
 unique per installation. The Config and Cluster screens request `full=true`
 and write only saved collections, so changing counters cannot create an edit
 conflict. Invalid `full` values return HTTP 400. Flussonic-only root options,
-text/plain Config serialization, and OpenMetrics formatting remain unsupported;
-clients requiring those representations must not assume parity.
+and text/plain Config serialization remain unsupported. `GET /config` accepts
+`Accept: application/openmetrics-text` or `?format=openmetrics` for a measured
+server-metrics subset: startup time (Unix seconds), CPU and RAM use (percent),
+ready streams, local active clients, and output bitrate (kbit/s). Unavailable
+measurements are omitted, not reported as zero. Input bitrate, scheduler,
+partition, GPU, and full vendor OpenMetrics parity remain open. `/config/stats`
+still returns JSON even with an OpenMetrics Accept header. For mixed JSON and
+OpenMetrics Accept lists, the first recognized type wins, matching the observed
+reference behavior.
 
 | Area | Reference operations |
 |---|---|
