@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -35,16 +36,38 @@ def arguments():
     parser.add_argument("--topology", action="store_true", help="also qualify local LB to CDN placement")
     parser.add_argument("--output", choices=("hls", "m4s", "m4f"), default="hls")
     args = parser.parse_args()
-    source = urllib.parse.urlsplit(args.source)
+    source_error = "source must be a server-root M4S/M4SS/M4F/M4FS URL without credentials, stream path, query or fragment"
     if (
-        source.scheme not in {"m4s", "m4ss", "m4f", "m4fs"}
+        len(args.source) > 4096
+        or any(not 0x21 <= ord(char) <= 0x7e for char in args.source)
+        or any(char in args.source for char in "@?#\\%")
+    ):
+        parser.error(source_error)
+    try:
+        source = urllib.parse.urlsplit(args.source)
+        source_port = source.port
+    except ValueError:
+        parser.error(source_error)
+    if source.netloc.startswith("["):
+        try:
+            ipaddress.IPv6Address(source.hostname or "")
+        except ValueError:
+            parser.error(source_error)
+    elif not re.fullmatch(r"[A-Za-z0-9_.-]+", source.hostname or ""):
+        parser.error(source_error)
+    if (
+        not args.source.startswith(("m4s://", "m4ss://", "m4f://", "m4fs://"))
+        or source.scheme not in {"m4s", "m4ss", "m4f", "m4fs"}
         or not source.hostname
         or source.username
         or source.password
+        or source.path not in ("", "/")
+        or source.netloc.endswith(":")
+        or source_port == 0
         or source.query
         or source.fragment
     ):
-        parser.error("source must be an M4S/M4SS/M4F/M4FS URL without credentials or query")
+        parser.error(source_error)
     if not args.binary.is_absolute() or not os.access(args.binary, os.X_OK):
         parser.error("binary must be an executable absolute path")
     if args.timeout < 10 or args.timeout > 120:
