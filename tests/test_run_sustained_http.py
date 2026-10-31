@@ -1,10 +1,15 @@
 """Safety and diagnostic contracts for the owned sustained HTTP runner."""
 
 import importlib.util
+import os
 from pathlib import Path
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 
@@ -74,6 +79,90 @@ class SustainedHttpRunnerTests(unittest.TestCase):
                              '{"state":"completed"}')
             self.assertEqual(sorted(p.name for p in Path(directory).iterdir()),
                              ["checkpoint.json"])
+
+    def test_slow_trickle_cannot_hold_viewer_past_deadline(self):
+        runner = load_runner()
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listener.settimeout(2)
+        server_stop = threading.Event()
+
+        def serve():
+            try:
+                connection, _ = listener.accept()
+                with connection:
+                    connection.recv(4096)
+                    connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n")
+                    while not server_stop.wait(0.05):
+                        connection.sendall(b"G")
+            except (OSError, TimeoutError):
+                pass
+
+        server = threading.Thread(target=serve, daemon=True)
+        server.start()
+        stop = threading.Event()
+        started = time.monotonic()
+        viewers = {"soak_a:1": runner.new_viewer_record()}
+        reader = threading.Thread(
+            target=runner.viewer,
+            args=("soak_a", 1, listener.getsockname()[1], started,
+                  started + 0.35, stop, viewers, threading.Lock()),
+            daemon=True,
+        )
+        reader.start()
+        reader.join(timeout=1.5)
+        held_past_deadline = reader.is_alive()
+        stop.set()
+        server_stop.set()
+        listener.close()
+        reader.join(timeout=2)
+        server.join(timeout=2)
+        self.assertFalse(held_past_deadline)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux process groups")
+    def test_cleanup_reaps_descendant_after_daemon_leader_exits(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as directory:
+            child_path = Path(directory) / "child.pid"
+            code = (
+                "import os,sys,time; p=os.fork(); "
+                "open(sys.argv[1],'w').write(str(p)) if p else time.sleep(30)"
+            )
+            leader = subprocess.Popen([sys.executable, "-c", code, str(child_path)],
+                                      start_new_session=True)
+            try:
+                leader.wait(timeout=5)
+                child_pid = int(child_path.read_text())
+                (Path(directory) / "cgroup.procs").write_text(
+                    f"{os.getpid()}\n{child_pid}\n", encoding="utf-8")
+                runner.terminate_owned_scope(Path(directory), grace_seconds=0.2)
+                for _ in range(30):
+                    stat_path = Path(f"/proc/{child_pid}/stat")
+                    if not stat_path.exists() or stat_path.read_text().split(") ", 1)[1][0] == "Z":
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail("orphaned child remained running")
+            finally:
+                if child_path.exists():
+                    try:
+                        os.kill(int(child_path.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_log_drain_discards_bytes_after_limit(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "daemon.log"
+            read_fd, write_fd = os.pipe()
+            os.write(write_fd, b"x" * 4096)
+            os.close(write_fd)
+            status = {"truncated": False}
+            with os.fdopen(read_fd, "rb") as source, path.open("wb") as output:
+                runner.drain_log(source, output, 1024, status)
+            self.assertEqual(path.stat().st_size, 1024)
+            self.assertTrue(status["truncated"])
 
 
 if __name__ == "__main__":

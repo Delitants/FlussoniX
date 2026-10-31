@@ -27,6 +27,7 @@ GAP_BOUNDS_MS = (250, 500, 1000, 1500, 3000, 10000)
 MEDIA_CAP = 512 * 1024 * 1024
 MIN_FREE = 20 * 1024 * 1024 * 1024
 GAP_EVENT_LIMIT = 32
+MAX_DAEMON_LOG_BYTES = 1024 * 1024
 
 
 def free_port():
@@ -53,6 +54,62 @@ def children_of(pid):
     return seen
 
 
+def live_scope_members(path, owner_pid):
+    members = set()
+    for value in (path / 'cgroup.procs').read_text().split():
+        pid = int(value)
+        if pid == owner_pid:
+            continue
+        try:
+            details = Path(f'/proc/{pid}/stat').read_text()
+            if details[details.rfind(')') + 2] != 'Z':
+                members.add(pid)
+        except FileNotFoundError:
+            continue
+    return members
+
+
+def terminate_owned_scope(path, owner_pid=None, grace_seconds=8):
+    owner_pid = os.getpid() if owner_pid is None else owner_pid
+    for action, seconds in ((signal.SIGTERM, grace_seconds), (signal.SIGKILL, 2)):
+        deadline = time.monotonic() + seconds
+        while True:
+            members = live_scope_members(path, owner_pid)
+            if not members:
+                return
+            for pid in members:
+                try:
+                    descriptor = os.pidfd_open(pid)
+                    try:
+                        signal.pidfd_send_signal(descriptor, action)
+                    finally:
+                        os.close(descriptor)
+                except ProcessLookupError:
+                    continue
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+    if live_scope_members(path, owner_pid):
+        raise RuntimeError('owned scope descendants survived cleanup')
+
+
+def drain_log(source, output, limit, status):
+    written = 0
+    try:
+        while data := os.read(source.fileno(), 16 * 1024):
+            available = max(0, limit - written)
+            if len(data) > available:
+                status['truncated'] = True
+            if available and not status.get('write_error'):
+                try:
+                    output.write(data[:available])
+                    written += min(len(data), available)
+                except OSError:
+                    status['write_error'] = True
+    except OSError:
+        status['read_error'] = True
+
+
 def cgroup():
     for line in Path('/proc/self/cgroup').read_text().splitlines():
         if line.startswith('0::'):
@@ -65,6 +122,8 @@ def cgroup():
                         or memory_limit == 'max' or int(memory_limit) > 1024 * 1024 * 1024
                         or pid_limit == 'max' or int(pid_limit) > 512):
                     raise RuntimeError('owned cgroup must limit CPU, memory and processes')
+                if live_scope_members(path, os.getpid()):
+                    raise RuntimeError('dedicated test cgroup required')
                 return path
     raise RuntimeError('bounded cgroup-v2 resource accounting unavailable')
 
@@ -178,7 +237,7 @@ def viewer(stream, index, port, started, deadline, stop, state, guard):
             with guard:
                 record['active'] = True
             while not stop.is_set() and time.monotonic() < until:
-                chunk = response.read(188 * 64)
+                chunk = response.read1(188 * 64)
                 if not chunk:
                     raise RuntimeError('premature EOF')
                 now = time.monotonic()
@@ -186,6 +245,8 @@ def viewer(stream, index, port, started, deadline, stop, state, guard):
                 aligned = len(media) // 188 * 188
                 errors = sum(media[offset] != 0x47 for offset in range(0, aligned, 188))
                 remainder = media[aligned:]
+                if aligned == 0:
+                    continue
                 with guard:
                     record['bytes'] += aligned
                     record['sync_errors'] += errors
@@ -203,7 +264,7 @@ def viewer(stream, index, port, started, deadline, stop, state, guard):
                         gap_ms = round((now - last_media) * 1000, 2)
                         record['media_gap_max_ms'] = max(record['media_gap_max_ms'], gap_ms)
                         record_gap(record, 'media', gap_ms, now - started)
-                    record['last_media_elapsed'] = round(deadline - now, 2)
+                    record['last_media_elapsed'] = round(now - started, 2)
                 first = False
                 last_media = now
         except (OSError, http.client.HTTPException, RuntimeError) as exc:
@@ -279,15 +340,24 @@ def main():
                                                    'latencies_ms': []},
               'state': 'starting'}
     process = None
+    log_thread = None
+    log_status = {'truncated': False, 'write_error': False}
     log_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    with os.fdopen(os.open(state_dir / 'daemon.log', log_flags, 0o600), 'wb') as log:
+    with os.fdopen(os.open(state_dir / 'daemon.log', log_flags, 0o600), 'wb', buffering=0) as log:
         try:
             process = subprocess.Popen([
                 str(binary), '--listen', f'127.0.0.1:{port}',
                 '--config', str(state_dir / 'config.json'),
                 '--media-dir', str(media_dir), '--ffmpeg', str(ffmpeg)],
-                cwd=state_dir, env=env, stdout=log, stderr=subprocess.STDOUT,
+                cwd=state_dir, env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 start_new_session=True)
+            log_thread = threading.Thread(
+                target=drain_log,
+                args=(process.stdout, log, MAX_DAEMON_LOG_BYTES, log_status),
+                daemon=True,
+            )
+            log_thread.start()
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             for _ in range(100):
                 if stop.is_set():
@@ -333,18 +403,16 @@ def main():
                         if process.poll() is not None:
                             raise RuntimeError(f'daemon exited {process.returncode}')
                         elapsed = now - started
-                        check_period = 60 if args.duration < 300 else 300
-                        if len(report['samples']) % max(1, check_period // args.sample_seconds) == 0:
-                            scan_started = time.monotonic()
-                            last_media_bytes = directory_bytes(media_dir)
-                            report['last_media_scan_ms'] = round(
-                                (time.monotonic() - scan_started) * 1000, 2)
-                            if last_media_bytes > MEDIA_CAP:
-                                raise RuntimeError('media directory exceeded 512 MiB cap')
-                            if shutil.disk_usage('/').free < MIN_FREE:
-                                raise RuntimeError('root free space fell below 20 GiB')
-                            if shutil.disk_usage(state_dir).free < 1024 * 1024 * 1024:
-                                raise RuntimeError('state filesystem free space fell below 1 GiB')
+                        scan_started = time.monotonic()
+                        last_media_bytes = directory_bytes(media_dir)
+                        report['last_media_scan_ms'] = round(
+                            (time.monotonic() - scan_started) * 1000, 2)
+                        if last_media_bytes > MEDIA_CAP:
+                            raise RuntimeError('media directory exceeded 512 MiB cap')
+                        if shutil.disk_usage('/').free < MIN_FREE:
+                            raise RuntimeError('root free space fell below 20 GiB')
+                        if shutil.disk_usage(state_dir).free < 1024 * 1024 * 1024:
+                            raise RuntimeError('state filesystem free space fell below 1 GiB')
                         sample = cgroup_sample(group, elapsed, process.pid, last_media_bytes)
                         with guard:
                             sample['viewer_bytes'] = sum(value['bytes'] for value in viewer_state.values())
@@ -378,21 +446,33 @@ def main():
             report['harness_error'] = f'{type(exc).__name__}: {exc}'
         finally:
             stop.set()
-            if process is not None and process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=8)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait(timeout=8)
+            try:
+                terminate_owned_scope(group)
+                if process is not None:
+                    process.wait(timeout=2)
+                if log_thread is not None:
+                    log_thread.join(timeout=5)
+                    if log_thread.is_alive():
+                        raise RuntimeError('daemon log drain did not stop')
+            except Exception as exc:
+                report['state'] = 'failed'
+                report['harness_error'] = f'cleanup: {type(exc).__name__}: {exc}'
+            report['daemon_log_truncated'] = log_status['truncated']
+            if log_status['truncated'] or log_status['write_error'] or log_status.get('read_error'):
+                report['state'] = 'failed'
+                report['harness_error'] = 'daemon log cap or I/O failure'
             with guard:
                 report['viewers'] = json.loads(json.dumps(viewer_state))
             report['end_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            try:
+                if media_dir.exists():
+                    shutil.rmtree(media_dir)
+                (state_dir / 'config.json').unlink(missing_ok=True)
+                (state_dir / 'checkpoint.json').unlink(missing_ok=True)
+            except OSError as exc:
+                report['state'] = 'failed'
+                report['harness_error'] = f'file cleanup: {type(exc).__name__}'
             save(state_dir / 'report.json', report)
-            if media_dir.exists():
-                shutil.rmtree(media_dir)
-            (state_dir / 'config.json').unlink(missing_ok=True)
-            (state_dir / 'checkpoint.json').unlink(missing_ok=True)
     print(json.dumps({'state': report['state'],
                       'elapsed_seconds': report.get('elapsed_seconds'),
                       'samples': len(report['samples'])}), flush=True)

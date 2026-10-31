@@ -24,10 +24,11 @@ python3 scripts/assess-sustained-http.py \
 ```
 
 The state directory must not exist beforehand. The runner hashes the supplied
-binary, records bounded timestamps for media gaps over three seconds, and
-removes its owned daemon, media and config on exit. It leaves the private
-report and log for diagnosis; the supplied binary is never removed. The
-assessor's passing memory threshold remains 512 MiB, below the scope limit.
+binary, records bounded timestamps for media gaps over three seconds, checks
+media disk use at each sample, and caps the private daemon log at 1 MiB. It
+stops its owned cgroup children and removes media and config on exit. It leaves
+the private report and log for diagnosis; the supplied binary is never removed.
+The assessor's passing memory threshold remains 512 MiB, below the scope limit.
 
 Two ongoing owned runs have no viewer, TS sync, metadata or OOM errors so far,
 but each has already recorded a steady-media gap beyond three seconds. They
