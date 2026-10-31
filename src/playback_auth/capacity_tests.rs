@@ -121,10 +121,12 @@ fn seed(auth: &PlaybackAuth, snapshot: &PolicySnapshot, count: usize, decision: 
                     unique: false,
                     number: 0,
                     generation: 0,
+                    lane_serial: 0,
                     user_id: "owned".into(),
                     available: true,
                     revoked_until: None,
                     cancel: CancellationToken::new(),
+                    callback_lanes: HashMap::new(),
                 }),
                 flight: AsyncMutex::new(()),
                 remote: AsyncMutex::new(RemoteState::default()),
@@ -385,7 +387,7 @@ async fn capacity_pressure_during_background_callback_preserves_revocation_fence
     }
     let renewal = tokio::spawn({
         let auth = auth.clone();
-        async move { auth.refresh(&entry).await }
+        async move { auth.refresh(&entry, None).await }
     });
     tokio::time::timeout(Duration::from_secs(2), backend.entered.notified())
         .await
@@ -407,6 +409,181 @@ async fn capacity_pressure_during_background_callback_preserves_revocation_fence
         "late approval restored an explicitly revoked identity"
     );
     assert_eq!(backend.requests.lock().unwrap().len(), 2);
+    backend.close().await;
+}
+
+#[tokio::test]
+async fn global_lane_pressure_cannot_evict_an_in_flight_callback() {
+    let backend = Backend::new().await;
+    let mut auth = PlaybackAuth::new(32);
+    auth.callback_lane_limit = 1;
+    let auth = Arc::new(auth);
+    let p = policy(&auth, &backend);
+    let pending = tokio::spawn({
+        let auth = auth.clone();
+        let p = p.clone();
+        async move { auth.authorize_control(p, request("seed-0")).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), backend.entered.notified())
+        .await
+        .unwrap();
+    assert!(matches!(
+        auth.authorize_control(p, request("fresh")).await,
+        AuthOutcome::Denied
+    ));
+    assert_eq!(backend.requests.lock().unwrap().len(), 1);
+    backend.release.add_permits(1);
+    assert!(matches!(pending.await.unwrap(), AuthOutcome::Allowed(_)));
+    backend.close().await;
+}
+
+#[tokio::test]
+async fn concurrent_distinct_callback_lanes_do_not_invalidate_one_another() {
+    let backend = Backend::new().await;
+    let auth = Arc::new(PlaybackAuth::new(8));
+    let p = policy(&auth, &backend);
+    let with_query = |query: &str| ViewerRequest {
+        qs: query.into(),
+        ..request("seed-0")
+    };
+    let first = tokio::spawn({
+        let auth = auth.clone();
+        let p = p.clone();
+        let viewer = with_query("first");
+        async move { auth.authorize_control(p, viewer).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), backend.entered.notified())
+        .await
+        .unwrap();
+    let second = tokio::spawn({
+        let auth = auth.clone();
+        let p = p.clone();
+        let viewer = with_query("second");
+        async move { auth.authorize_control(p, viewer).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if cached(&auth, &p, "seed-0")
+                .state
+                .lock()
+                .unwrap()
+                .callback_lanes
+                .len()
+                == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    backend.release.add_permits(2);
+    assert!(matches!(first.await.unwrap(), AuthOutcome::Allowed(_)));
+    assert!(matches!(second.await.unwrap(), AuthOutcome::Allowed(_)));
+    assert_eq!(backend.requests.lock().unwrap().len(), 2);
+    backend.close().await;
+}
+
+#[tokio::test]
+async fn force_reauth_during_callback_blocks_old_cached_allow_from_new_admission() {
+    let backend = Backend::new().await;
+    let auth = Arc::new(PlaybackAuth::new(8));
+    let p = policy(&auth, &backend);
+    let first = tokio::spawn({
+        let auth = auth.clone();
+        let p = p.clone();
+        async move { auth.authorize_control(p, request("seed-0")).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), backend.entered.notified())
+        .await
+        .unwrap();
+    backend.release.add_permits(1);
+    let AuthOutcome::Allowed(live) = first.await.unwrap() else {
+        panic!("initial callback should allow")
+    };
+    assert_eq!(auth.force_reauth("owned"), 1);
+    let overlapping = tokio::spawn({
+        let auth = auth.clone();
+        let p = p.clone();
+        async move { auth.authorize_control(p, request("seed-0")).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), backend.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(auth.force_reauth("owned"), 1);
+    backend.release.add_permits(1);
+    assert!(matches!(overlapping.await.unwrap(), AuthOutcome::Denied));
+    assert!(!live.is_cancelled());
+    assert_eq!(backend.requests.lock().unwrap().len(), 2);
+    backend.close().await;
+}
+
+#[tokio::test]
+async fn force_reauth_renews_recent_playback_after_an_old_admission_ends() {
+    let backend = Backend::new().await;
+    let auth = PlaybackAuth::new(8);
+    let p = policy(&auth, &backend);
+    let AuthOutcome::Allowed(grant) = auth.authorize_control(p.clone(), request("recent")).await
+    else {
+        panic!("initial callback should allow")
+    };
+    grant.playback();
+    grant.add_bytes(1);
+    drop(grant);
+    let entry = cached(&auth, &p, "recent");
+    {
+        let mut state = entry.state.lock().unwrap();
+        let old_admission = Instant::now() - Duration::from_secs(31);
+        state.last_seen = old_admission;
+        for lane in state.callback_lanes.values_mut() {
+            lane.last_seen = old_admission;
+        }
+    }
+    assert_eq!(auth.active(), 1);
+    backend.status.store(403, Ordering::Relaxed);
+    assert_eq!(auth.force_reauth("owned"), 1);
+    auth.renew_due().await;
+    assert_eq!(backend.requests.lock().unwrap().len(), 2);
+    assert_eq!(auth.active(), 0);
+    backend.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replaced_callback_lane_cannot_admit_an_older_pending_request() {
+    let backend = Backend::new().await;
+    let auth = Arc::new(PlaybackAuth::new(8));
+    let p = policy(&auth, &backend);
+    let pending = tokio::spawn({
+        let auth = auth.clone();
+        let p = p.clone();
+        async move { auth.authorize_control(p, request("seed-0")).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), backend.entered.notified())
+        .await
+        .unwrap();
+
+    // Pause final admission after the callback, then simulate a replacement
+    // decision with the same fingerprint and a newer lane generation.
+    let admission_gate = auth.authority.lock().unwrap();
+    backend.release.add_permits(1);
+    let entry = cached(&auth, &p, "seed-0");
+    let key = p.policy.callback_identity(&request("seed-0"));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let mut state = entry.state.lock().unwrap();
+        let lane = state.callback_lanes.get_mut(&key).unwrap();
+        if matches!(lane.decision, Decision::Allow) {
+            lane.generation += 1;
+            lane.pending = 0;
+            break;
+        }
+        drop(state);
+        assert!(Instant::now() < deadline, "callback did not complete");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(admission_gate);
+    assert!(matches!(pending.await.unwrap(), AuthOutcome::Denied));
     backend.close().await;
 }
 

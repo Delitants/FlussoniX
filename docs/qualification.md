@@ -1,5 +1,32 @@
 # Preview qualification
 
+## Callback decision isolation (2026-10-31)
+
+The `on_play` callback decision now follows the exact request fields sent to
+the callback, even when configured `session_keys` group different requests into
+one session. A changed query, IP, user agent, referer or host requires a fresh
+callback decision. A denied changed request does not close an already
+authorized MPEG-TS viewer on another decision lane. Account changes, forced
+reauthorization, revocation and in-flight callbacks are fenced per lane or
+session as appropriate. A real HTTP socket test confirms that a cold denial
+starts no media worker and leaves the unchanged authorized viewer playing.
+
+The decision cache is limited to 16 lanes per session and 50,000 per server
+instance. Under pressure it reclaims only idle lanes, in bounded batches; if
+all lanes are in use it denies a new context. A full-scan miss has a 100 ms
+retry cooldown. The focused playback-auth library run passed 50 tests, the
+integration run passed 37, and the viewer-worker run passed eight. Format,
+diff checks and all-target warnings-denied Clippy passed. A full serial Rust
+run passed 2,708 tests across 189 result targets, with 36 intentional hardware
+or extended-load skips and zero failures. It includes the vendor LB case that
+reauthorizes a recent redirected viewer after its handoff grant is gone; the
+first full run exposed a missed refresh there, which was fixed and then passed
+in the complete rerun. A follow-on regression found that renewal also needed
+to select recent playback after a long-lived admission ended. Its focused
+RED/GREEN test and all-target Clippy passed; a final full-suite rerun and
+GitHub CI are pending. Existing M4S/M4SS transport behavior is unchanged. The
+independent exact-head soak remains a release gate.
+
 ## Authority-checked M4F control reconnect (2026-10-30)
 
 An owned local origin now closes an established M4F control stream after a
