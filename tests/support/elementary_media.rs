@@ -2,6 +2,7 @@
 use flussonix::media::Engine;
 use serde_json::{Value, json};
 use std::{net::UdpSocket, path::Path, time::Duration};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 #[path = "decoder_readiness.rs"]
 mod decoder_readiness;
@@ -153,6 +154,29 @@ pub async fn decode(path: &Path, video: Option<&str>, audio: &[&str]) {
             );
         }
     }
+}
+
+pub fn start_worker_recording(
+    mut receiver: flussonix::media_queue::Receiver,
+    file: std::fs::File,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // The media fixture uses a current-thread Tokio runtime. A blocking
+        // filesystem write here could delay the RTP receive and relay tasks.
+        let mut file = tokio::fs::File::from_std(file);
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                data = receiver.recv() => match data {
+                    Ok(data) => file.write_all(&data).await.unwrap(),
+                    Err(error) => panic!("Shared MPEG-TS recording failed: {error}"),
+                },
+            }
+        }
+        file.flush().await.unwrap();
+    })
 }
 pub async fn qualify(
     video: Option<&str>,
@@ -394,15 +418,9 @@ pub async fn qualify(
     }
     stage("worker_sdp_startup");
     let record_cancel = tokio_util::sync::CancellationToken::new();
-    let mut ts = worker.subscribe();
-    let mut record = std::fs::File::create(d.path().join("worker.ts")).unwrap();
-    let c = record_cancel.clone();
-    let recording = tokio::spawn(async move {
-        use std::io::Write;
-        loop {
-            tokio::select! {biased;_=c.cancelled()=>break,data=ts.recv()=>match data {Ok(data)=>record.write_all(&data).unwrap(),Err(error)=>panic!("Shared MPEG-TS recording failed: {error}")}}
-        }
-    });
+    let ts = worker.subscribe();
+    let record = std::fs::File::create(d.path().join("worker.ts")).unwrap();
+    let recording = start_worker_recording(ts, record, record_cancel.clone());
     let text = tokio::time::timeout(Duration::from_secs(12), async {
         loop {
             if let Ok(s) = engine.rtp_sdp("owned", 0, &cfg).await {
