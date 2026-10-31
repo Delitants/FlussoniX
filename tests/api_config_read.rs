@@ -5,7 +5,11 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use flussonix::server::{App, Options, router};
 use serde_json::{Value, json};
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tower::ServiceExt;
 
 fn app(state: &Path) -> Arc<App> {
@@ -72,7 +76,7 @@ async fn config_openmetrics_negotiates_without_config_leak() {
     for (path, accept, credentials) in [
         (
             "/streamer/api/v3/config",
-            "application/json, application/openmetrics-text; version=1.0.0",
+            "application/openmetrics-text; version=1.0.0, application/json",
             "admin:test-secret",
         ),
         (
@@ -130,6 +134,29 @@ async fn config_openmetrics_negotiates_without_config_leak() {
         .oneshot(
             Request::builder()
                 .uri("/streamer/api/v3/config")
+                .header("Accept", "application/json, application/openmetrics-text")
+                .header(
+                    "Authorization",
+                    format!("Basic {}", STANDARD.encode("admin:test-secret")),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 100_000)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["server_id"], id);
+
+    let response = router(app.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/streamer/api/v3/config")
                 .header(
                     "Accept",
                     "application/openmetrics-text;q=0, application/json",
@@ -143,7 +170,10 @@ async fn config_openmetrics_negotiates_without_config_leak() {
         )
         .await
         .unwrap();
-    assert_eq!(response.headers()["content-type"], "application/json");
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/openmetrics-text"
+    );
 
     let response = router(app.clone())
         .oneshot(
@@ -194,6 +224,49 @@ async fn config_openmetrics_negotiates_without_config_leak() {
     )
     .unwrap();
     assert_eq!(body["id"], id);
+}
+
+#[tokio::test]
+async fn config_stats_started_at_is_stable_and_online_count_tracks_ready_worker() {
+    use futures_util::FutureExt;
+
+    let state = tempfile::tempdir().unwrap();
+    let app = app(state.path());
+    let result = std::panic::AssertUnwindSafe(async {
+        let before = get(app.clone(), "/streamer/api/v3/config/stats").await.1;
+        let started = before["started_at"].as_u64().expect("startup seconds");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(started <= now && now - started < 10);
+        assert_eq!(before["online_streams"], 0);
+
+        app.media
+            .ensure("music", &json!({"inputs":[{"url":"testsrc://"}]}))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !app.media.ready("music").await {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("owned test source became ready");
+
+        let online = get(app.clone(), "/streamer/api/v3/config/stats").await.1;
+        assert_eq!(online["started_at"], started);
+        assert_eq!(online["online_streams"], 1);
+        app.media.stop("music").await;
+        let stopped = get(app.clone(), "/streamer/api/v3/config/stats").await.1;
+        assert_eq!(stopped["online_streams"], 0);
+    })
+    .catch_unwind()
+    .await;
+    app.media.stop_all().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[tokio::test]

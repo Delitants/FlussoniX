@@ -1,5 +1,21 @@
 # Preview qualification
 
+## Config OpenMetrics subset (2026-10-31)
+
+Read-only comparison with the installed 26.04.1 reference identified its
+OpenMetrics Config GET response and confirmed that Config stats remains JSON.
+FlussoniX now negotiates `application/openmetrics-text` from the Accept header
+or `?format=openmetrics`, emits gauge samples under the stable `server_id`, and
+ends the body with `# EOF`. The supported families are `server_started_at`,
+`server_cpu_usage`, `server_memory_usage`, `server_online_streams`,
+`server_total_clients`, and `server_output_bitrate`. CPU/RAM/output samples
+are omitted when telemetry is unavailable; online-stream observation is bounded
+and omitted if it cannot complete promptly. A renderer regression was red on the
+missing families then green, and a real synthetic-worker regression verifies
+startup stability and ready-stream transitions. Complete reference metric
+coverage, text/plain Config serialization, exact-head CI and full release
+qualification remain open.
+
 ## Config stats response shape (2026-10-31)
 
 Read-only comparison with the installed 26.04.1 reference showed that
