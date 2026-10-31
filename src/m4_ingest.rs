@@ -608,14 +608,14 @@ async fn consume_guarded_session<W: AsyncWrite + Unpin>(
                 let source_start = frames.iter().map(|f| f.dts).min();
                 let media_start = m4f_session::M4fSession::media_start(&new, &frames);
                 let source_tracks = new.clone();
-                let (body, new, frames) = if !preserve && new.iter().any(|t| t.codec == "subtitle")
-                {
-                    let filtered = crate::native_subtitles::segment(&body)?;
-                    let (new, frames) = crate::m4f::unpack(&filtered)?;
-                    (filtered, new, frames)
-                } else {
-                    (body, new, frames)
-                };
+                let (body, new, mut frames) =
+                    if !preserve && new.iter().any(|t| t.codec == "subtitle") {
+                        let filtered = crate::native_subtitles::segment(&body)?;
+                        let (new, frames) = crate::m4f::unpack(&filtered)?;
+                        (filtered, new, frames)
+                    } else {
+                        (body, new, frames)
+                    };
                 if frames.is_empty() {
                     return Err("empty M4F segment".into());
                 }
@@ -637,15 +637,17 @@ async fn consume_guarded_session<W: AsyncWrite + Unpin>(
                     policy,
                 )
                 .await?;
+                // Only worker-bound samples are retimed. `body`, the native
+                // relay object, still contains the source's original clocks.
+                Diagnostics::phase(subtitles.diagnostic, Phase::BridgeFrame);
+                session
+                    .muxer
+                    .as_ref()
+                    .ok_or("native frame before metadata")?
+                    .retime_video_boundary(&mut frames)?;
                 if let Some(hub) = hub {
                     // A paced bridge can block within this GOP. Validate all
                     // samples before exposing the original native relay object.
-                    Diagnostics::phase(subtitles.diagnostic, Phase::BridgeFrame);
-                    session
-                        .muxer
-                        .as_ref()
-                        .ok_or("native frame before metadata")?
-                        .validate_frames(&frames)?;
                     Diagnostics::phase(subtitles.diagnostic, Phase::Relay);
                     check_authority(authority)?;
                     let gop = PackedGop {
