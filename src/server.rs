@@ -1122,6 +1122,23 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
                 Some("true") => true,
                 Some(_) => return error(StatusCode::BAD_REQUEST, "full must be true or false"),
             };
+            let openmetrics = match query.get("format").map(String::as_str) {
+                Some("openmetrics") => true,
+                Some(_) => return error(StatusCode::BAD_REQUEST, "unsupported config format"),
+                None => header(request.headers(), "accept")
+                    .is_some_and(config_metrics::accepts_openmetrics),
+            };
+            if openmetrics {
+                let stats = app.config_stats().await;
+                return (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/openmetrics-text",
+                    )],
+                    config_metrics::render(app.node_id, &stats),
+                )
+                    .into_response();
+            }
             let mut result = if full {
                 app.config.snapshot()
             } else {
@@ -2811,6 +2828,7 @@ mod continuous_session_tests {
     }
 }
 
+mod config_metrics;
 mod iptv_management;
 mod iptv_peer;
 mod iptv_playlist;

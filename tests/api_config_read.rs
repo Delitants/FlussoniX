@@ -44,6 +44,159 @@ async fn get(app: Arc<App>, path: &str) -> (StatusCode, Value) {
 }
 
 #[tokio::test]
+async fn config_openmetrics_negotiates_without_config_leak() {
+    let state = tempfile::tempdir().unwrap();
+    let app = App::new(
+        state.path().join("config.json"),
+        state.path().join("media"),
+        Options {
+            admin_user: "admin".into(),
+            admin_password: "test-secret".into(),
+            view_user: Some("viewer".into()),
+            view_password: Some("view-secret".into()),
+            peer_key: "test-peer-secret-1234".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    app.config
+        .replace(
+            json!({"streams":[{"name":"saved-secret-marker","inputs":[{"url":"testsrc://"}]}]}),
+        )
+        .unwrap();
+    let id = get(app.clone(), "/streamer/api/v3/config").await.1["server_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    for (path, accept, credentials) in [
+        (
+            "/streamer/api/v3/config",
+            "application/json, application/openmetrics-text; version=1.0.0",
+            "admin:test-secret",
+        ),
+        (
+            "/streamer/api/v3/config?full=true",
+            "application/openmetrics-text",
+            "viewer:view-secret",
+        ),
+        (
+            "/streamer/api/v3/config?format=openmetrics",
+            "application/json",
+            "admin:test-secret",
+        ),
+    ] {
+        let response = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("Accept", accept)
+                    .header(
+                        "Authorization",
+                        format!("Basic {}", STANDARD.encode(credentials)),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/openmetrics-text",
+            "{path}"
+        );
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 100_000)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            body.contains("# TYPE server_total_clients gauge\n"),
+            "{path}"
+        );
+        assert!(
+            body.contains(&format!("server_total_clients{{server_id=\"{id}\"}} 0\n")),
+            "{path}"
+        );
+        assert!(body.ends_with("# EOF\n"), "{path}");
+        assert!(!body.contains("saved-secret-marker"), "{path}");
+        assert!(!body.contains("testsrc://"), "{path}");
+    }
+
+    let response = router(app.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/streamer/api/v3/config")
+                .header(
+                    "Accept",
+                    "application/openmetrics-text;q=0, application/json",
+                )
+                .header(
+                    "Authorization",
+                    format!("Basic {}", STANDARD.encode("admin:test-secret")),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["content-type"], "application/json");
+
+    let response = router(app.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/streamer/api/v3/config?format=unknown")
+                .header(
+                    "Authorization",
+                    format!("Basic {}", STANDARD.encode("admin:test-secret")),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = router(app.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/streamer/api/v3/config")
+                .header("Accept", "application/openmetrics-text")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = router(app)
+        .oneshot(
+            Request::builder()
+                .uri("/streamer/api/v3/config/stats")
+                .header("Accept", "application/openmetrics-text")
+                .header(
+                    "Authorization",
+                    format!("Basic {}", STANDARD.encode("admin:test-secret")),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 100_000)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["id"], id);
+}
+
+#[tokio::test]
 async fn config_default_is_compact_and_full_is_explicit() {
     let state = tempfile::tempdir().unwrap();
     let app = app(state.path());
