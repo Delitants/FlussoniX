@@ -181,14 +181,29 @@ mod receive_buffer_tests {
         let default_capacity = raw_receive_buffer(&default_pair.rtp);
         assert_eq!(raw_receive_buffer(&default_pair.rtcp), default_capacity);
 
+        let host_limit: u64 = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let requested = (u32::try_from(default_capacity).unwrap() / 2)
+            .saturating_add(16_384)
+            .max(65_536);
+        if u64::from(requested) > host_limit || requested > 33_554_432 {
+            // This host cannot raise a receive buffer above its default.
+            return;
+        }
+
         let port = available_pair();
         let cfg = Settings::parse(&json!({
             "url": format!("rtp://127.0.0.1:{port}"),
-            "flussonix_rtp": {"receive_buffer_bytes": 65536}
+            "flussonix_rtp": {"receive_buffer_bytes": requested}
         }))
         .unwrap();
         let pair = Pair::receive(&cfg).unwrap();
-        assert_eq!(raw_receive_buffer(&pair.rtp), 131072);
+        let observed = raw_receive_buffer(&pair.rtp);
+        assert!(observed > default_capacity);
+        assert_eq!(observed as u64, u64::from(requested) * 2);
         assert_eq!(raw_receive_buffer(&pair.rtcp), default_capacity);
     }
 
