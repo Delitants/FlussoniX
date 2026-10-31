@@ -92,7 +92,7 @@ async fn view_management_reads_hide_inherited_and_nested_credentials() {
     ];
     let edit = get(
         app.clone(),
-        "/streamer/api/v3/config",
+        "/streamer/api/v3/config?full=true",
         "admin:edit-password",
     )
     .await;
@@ -105,6 +105,7 @@ async fn view_management_reads_hide_inherited_and_nested_credentials() {
 
     for path in [
         "/streamer/api/v3/config",
+        "/streamer/api/v3/config?full=true",
         "/streamer/api/v3/streams/music",
         "/streamer/api/v3/streams",
         "/streamer/api/v3/streams?select=name,password,config_on_disk.password,inputs.url,pushes.passphrase",

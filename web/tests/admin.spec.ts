@@ -296,8 +296,26 @@ test('configuration edits can be validated without applying',async({page,request
  expect((await request.get('/streamer/api/v3/streams/staged-stream',{headers})).ok()).toBeTruthy();
  await expect(page.locator('textarea')).toHaveCount(0);
 });
+test('Config edits use full saved state while runtime stats change',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-config-full-'+Date.now().toString(36),reads:string[]=[];
+ page.on('request',r=>{const url=new URL(r.url());if(r.method()==='GET'&&url.pathname==='/streamer/api/v3/config')reads.push(url.search);});
+ try{
+  await page.getByRole('button',{name:'Config',exact:true}).click();
+  await page.getByRole('button',{name:'Add stream',exact:true}).click();
+  await page.getByLabel('Stream name',{exact:true}).fill(name);
+  await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');
+  await page.getByRole('button',{name:'Stage changes',exact:true}).click();
+  await page.waitForTimeout(1200);
+  await page.getByRole('button',{name:'Save & apply',exact:true}).click();
+  await expect(page.locator('.notice[role=status]')).toContainText('saved and applied');
+  expect(reads.length).toBeGreaterThan(1);
+  expect(reads.every(query=>new URLSearchParams(query).get('full')==='true')).toBeTruthy();
+  expect((await request.get('/streamer/api/v3/streams/'+name,{headers})).ok()).toBeTruthy();
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});}
+});
 test('Config displays validation details returned by the server',async({page})=>{
- await page.route('**/streamer/api/v3/config',async route=>{
+ await page.route('**/streamer/api/v3/config*',async route=>{
   if(route.request().method()==='POST')await route.fulfill({status:400,contentType:'application/json',body:JSON.stringify({error:'unknown_key',detail:'server option unsupported_feature is not implemented',path:['server_config','unsupported_feature'],config:{unsupported_feature:true}})});
   else await route.continue();
  });
@@ -645,7 +663,7 @@ test('reopening a saved source uses acknowledged settings while refresh is delay
   await page.getByRole('button',{name:'Cluster',exact:true}).click();await page.getByRole('button',{name:'Source servers',exact:true}).click();
   const edit=()=>page.getByRole('row').filter({has:page.getByRole('cell',{name,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
   await edit();await page.getByLabel('Source transport',{exact:true}).selectOption('mpegts');
-  await page.route('**/streamer/api/v3/config',async route=>{const response=await route.fetch();if(delay)await new Promise<void>(resolve=>releases.push(resolve));await route.fulfill({response});});
+  await page.route('**/streamer/api/v3/config*',async route=>{const response=await route.fetch();if(delay)await new Promise<void>(resolve=>releases.push(resolve));await route.fulfill({response});});
   delay=true;await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
   const saved=await(await request.get(`/streamer/api/v3/cluster/sources/${name}`,{headers})).json();expect(saved.flussonix_transport).toBe('mpegts');
   await edit();await expect(page.getByLabel('Source transport',{exact:true})).toHaveValue('mpegts');

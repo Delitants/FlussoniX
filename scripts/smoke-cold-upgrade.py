@@ -17,6 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -193,8 +194,19 @@ def smoke(previous, current, media=False):
         with lab.daemon(current, 'current-first'):
             lab.saved_config()
             lab.subscriber(create=True)
+            _, compact = lab.request('/streamer/api/v3/config', authenticated=True)
+            node_id = compact['server_id']
+            require(str(uuid.UUID(node_id)) == node_id and compact['stats']['id'] == node_id,
+                    'current server identity is not a stable UUID')
+            require('streams' not in compact, 'default config unexpectedly includes collections')
+            _, full = lab.request('/streamer/api/v3/config?full=true', authenticated=True)
+            require(full['server_id'] == node_id and full['streams'][0]['name'] == 'upgrade_smoke',
+                    'full config omitted saved collections or changed identity')
             if media:
                 lab.media_probe()
+        identity = lab.state / 'config.json.node-id'
+        identity_bytes = identity.read_bytes()
+        require(identity.stat().st_mode & 0o077 == 0, 'node identity is not owner-only')
         iptv = lab.state / 'iptv.json'
         iptv_bytes = iptv.read_bytes()
         require((lab.state / 'config.json').read_bytes() == config,
@@ -209,14 +221,19 @@ def smoke(previous, current, media=False):
         require((lab.state / 'config.json').read_bytes() == config,
                 'rollback changed saved configuration')
         require(iptv.read_bytes() == iptv_bytes, 'rollback changed IPTV data')
+        require(identity.read_bytes() == identity_bytes, 'rollback changed node identity')
         with lab.daemon(current, 'current-return'):
             lab.saved_config()
             lab.subscriber()
+            _, compact = lab.request('/streamer/api/v3/config', authenticated=True)
+            require(compact['server_id'] == node_id and compact['stats']['id'] == node_id,
+                    'return to current changed node identity')
             if media:
                 lab.media_probe()
         require((lab.state / 'config.json').read_bytes() == config,
                 'return to current changed saved configuration')
         require(iptv.read_bytes() == iptv_bytes, 'return to current changed IPTV data')
+        require(identity.read_bytes() == identity_bytes, 'return to current changed node identity file')
     print('cold upgrade and rollback passed; temporary state and daemons removed')
 
 

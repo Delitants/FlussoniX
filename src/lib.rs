@@ -14,6 +14,7 @@ pub mod m4f;
 pub mod m4s;
 pub mod media;
 mod media_rate;
+mod node_identity;
 mod peer_transport;
 pub mod playback_auth;
 mod push;
