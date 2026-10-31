@@ -220,7 +220,7 @@ async fn text_config_semantic_error_keeps_existing_path_contract() {
     assert!(!path.exists());
 }
 #[tokio::test]
-async fn node_status_reports_the_running_server_version_to_management_roles() {
+async fn status_endpoints_report_the_running_server_version_to_management_roles() {
     let d = tempfile::tempdir().unwrap();
     let app = App::new(
         d.path().join("config.json"),
@@ -271,16 +271,20 @@ async fn node_status_reports_the_running_server_version_to_management_roles() {
                         .unwrap(),
                 )
                 .unwrap();
-                assert_eq!(status["version"], health["version"], "{endpoint}");
-                assert_eq!(
-                    status["management_role"],
-                    if credentials == Some("viewer:view-secret") {
-                        "view"
-                    } else {
-                        "edit"
-                    },
-                    "{endpoint}"
-                );
+                if endpoint == "/flussonix/api/v1/node" {
+                    assert_eq!(status["version"], health["version"]);
+                    assert_eq!(
+                        status["management_role"],
+                        if credentials == Some("viewer:view-secret") {
+                            "view"
+                        } else {
+                            "edit"
+                        }
+                    );
+                } else {
+                    assert_eq!(status["server_version"], health["version"]);
+                    assert!(status.get("management_role").is_none());
+                }
             }
         }
     }

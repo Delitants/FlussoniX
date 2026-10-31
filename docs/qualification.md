@@ -1,5 +1,16 @@
 # Preview qualification
 
+## Config stats response shape (2026-10-31)
+
+Read-only comparison with the installed 26.04.1 reference showed that
+`GET /streamer/api/v3/config/stats` returns a top-level server-stats object.
+FlussoniX previously returned its native node diagnostics there. The endpoint
+now uses the same stats projection as JSON Config GET; native-only fields remain
+on `/flussonix/api/v1/node`. A new response-shape regression failed on the old
+handler and passes after the change. Focused API, Config, viewer-redaction, IPTV
+and idle-memory runs passed 33 tests. Broader CI and complete vendor stats-field
+parity remain open.
+
 ## Config JSON read compatibility (2026-10-31)
 
 An installed-schema and read-only demo comparison found that default

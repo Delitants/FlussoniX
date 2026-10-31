@@ -207,7 +207,7 @@ async fn missing_public_origin_returns_clear_error_and_status_advertises_configu
     let response = router(app)
         .oneshot(
             Request::builder()
-                .uri("/streamer/api/v3/config/stats")
+                .uri("/flussonix/api/v1/node")
                 .header(
                     "Authorization",
                     format!("Basic {}", STANDARD.encode("admin:local-admin-secret")),
