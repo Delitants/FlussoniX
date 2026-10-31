@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import select
 import shutil
 import signal
 import socket
@@ -166,6 +167,98 @@ def api(opener, port, password, path, method='GET', body=None):
         return response.status, round((time.monotonic() - started) * 1000, 2)
 
 
+def source_stats(opener, port, password, stream):
+    if stream not in STREAMS:
+        raise ValueError('source observation is limited to owned streams')
+    # The ordinary urllib timeout is an idle timeout: a byte-by-byte response
+    # can otherwise hold the observer (and final report snapshot) indefinitely.
+    del opener
+    deadline = time.monotonic() + 1
+    auth = base64.b64encode(f'admin:{password}'.encode()).decode()
+    request = (f'GET /streamer/api/v3/streams/{stream} HTTP/1.0\r\n'
+               f'Host: 127.0.0.1\r\nAuthorization: Basic {auth}\r\n'
+               'Connection: close\r\n\r\n').encode()
+    with socket.create_connection(('127.0.0.1', port), timeout=1) as connection:
+        connection.setblocking(False)
+        sent = 0
+        while sent < len(request):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('source stats deadline exceeded')
+            _, writable, _ = select.select([], [connection], [], remaining)
+            if not writable:
+                raise TimeoutError('source stats deadline exceeded')
+            try:
+                sent += connection.send(request[sent:])
+            except BlockingIOError:
+                continue
+        raw = bytearray()
+        header_end = None
+        content_length = None
+        while True:
+            if header_end is not None and content_length is not None \
+                    and len(raw) - header_end >= content_length:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('source stats deadline exceeded')
+            readable, _, _ = select.select([connection], [], [], remaining)
+            if not readable:
+                raise TimeoutError('source stats deadline exceeded')
+            try:
+                chunk = connection.recv(16 * 1024)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                if header_end is None or (content_length is not None
+                                           and len(raw) - header_end < content_length):
+                    raise RuntimeError('source stats response truncated')
+                break
+            raw.extend(chunk)
+            if header_end is None:
+                header_start = raw.find(b'\r\n\r\n')
+                if header_start >= 0:
+                    header_end = header_start + 4
+                    if header_end > 16 * 1024:
+                        raise RuntimeError('source stats headers exceed limit')
+                    lines = bytes(raw[:header_start]).split(b'\r\n')
+                    if not re.fullmatch(rb'HTTP/1\.[01] 200(?: .*)?', lines[0]):
+                        raise RuntimeError('source stats response invalid')
+                    headers = {}
+                    for line in lines[1:]:
+                        name, separator, value = line.partition(b':')
+                        if not separator:
+                            raise RuntimeError('source stats headers invalid')
+                        name = name.strip().lower()
+                        if name in headers:
+                            raise RuntimeError('source stats duplicate header')
+                        headers[name] = value.strip()
+                    if b'transfer-encoding' in headers:
+                        raise RuntimeError('source stats transfer encoding unsupported')
+                    if b'content-length' in headers:
+                        value = headers[b'content-length']
+                        if not value.isdigit():
+                            raise RuntimeError('source stats length invalid')
+                        content_length = int(value)
+                        if content_length > 1_000_000:
+                            raise RuntimeError('source stats response exceeds 1 MiB')
+                elif len(raw) > 16 * 1024:
+                    raise RuntimeError('source stats headers exceed limit')
+            if header_end is not None and len(raw) - header_end > 1_000_000:
+                raise RuntimeError('source stats response exceeds 1 MiB')
+        payload = bytes(raw[header_end:header_end + content_length]
+                        if content_length is not None else raw[header_end:])
+    try:
+        data = json.loads(payload)
+        stats = data['stats']
+        age, received = stats['media_age_ms'], stats['bytes_in']
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ValueError('source stats payload invalid') from exc
+    if type(age) is not int or type(received) is not int or age < 0 or received < 0:
+        raise ValueError('source stats counters invalid')
+    return age, received
+
+
 def warm_stream(stream, port, stop):
     until = time.monotonic() + 30
     while time.monotonic() < until and not stop.is_set():
@@ -200,6 +293,128 @@ def new_viewer_record():
         'first_media_gap_over_3000_ms': None,
         'last_media_gap_over_3000_ms': None,
     }
+
+
+def new_source_record():
+    return {
+        'samples': 0, 'errors': 0, 'max_age_ms': 0,
+        'max_poll_interval_ms': 0, 'last_poll_elapsed': None,
+        'last_success_elapsed': None,
+        'poll_gaps_over_750_ms_count': 0, 'first_poll_gap': None,
+        'last_poll_gap': None, 'poll_gaps': [],
+        'error_gaps_count': 0, 'first_error_gap': None,
+        'last_error_gap': None, 'error_gaps': [], 'open_error_gap': None,
+        'stalls_over_1000_ms_count': 0, 'first_stall': None,
+        'last_stall': None, 'stalls': [], 'open_stall': None,
+    }
+
+
+def _record_source_poll(record, elapsed):
+    if record['last_poll_elapsed'] is not None:
+        interval = round((elapsed - record['last_poll_elapsed']) * 1000)
+        record['max_poll_interval_ms'] = max(record['max_poll_interval_ms'], interval)
+        if interval > 750:
+            gap = {'start_elapsed_seconds': record['last_poll_elapsed'],
+                   'end_elapsed_seconds': round(elapsed, 2),
+                   'interval_ms': interval}
+            record['poll_gaps_over_750_ms_count'] += 1
+            if record['first_poll_gap'] is None:
+                record['first_poll_gap'] = gap
+            record['last_poll_gap'] = gap
+            record['poll_gaps'].append(gap)
+            if len(record['poll_gaps']) > GAP_EVENT_LIMIT:
+                del record['poll_gaps'][0]
+    record['last_poll_elapsed'] = round(elapsed, 2)
+
+
+def record_source_sample(record, elapsed, age_ms, bytes_in):
+    _record_source_poll(record, elapsed)
+    if record['open_error_gap'] is not None:
+        gap = record['open_error_gap']
+        gap['end_elapsed_seconds'] = round(elapsed, 2)
+        if record['error_gaps_count'] == 1:
+            record['first_error_gap'] = dict(gap)
+        record['last_error_gap'] = dict(gap)
+        record['error_gaps'].append(dict(gap))
+        if len(record['error_gaps']) > GAP_EVENT_LIMIT:
+            del record['error_gaps'][0]
+        record['open_error_gap'] = None
+    record['last_success_elapsed'] = round(elapsed, 2)
+    record['samples'] += 1
+    record['max_age_ms'] = max(record['max_age_ms'], age_ms)
+    if age_ms > 1000:
+        if record['open_stall'] is None:
+            record['open_stall'] = {
+                'start_elapsed_seconds': round(elapsed, 2),
+                'max_age_ms': age_ms, 'bytes_in_at_start': bytes_in,
+                'bytes_in_at_end': bytes_in, 'observation_errors': 0,
+            }
+            record['stalls_over_1000_ms_count'] += 1
+        else:
+            episode = record['open_stall']
+            episode['max_age_ms'] = max(episode['max_age_ms'], age_ms)
+            episode['bytes_in_at_end'] = bytes_in
+        if record['stalls_over_1000_ms_count'] == 1:
+            record['first_stall'] = dict(record['open_stall'])
+        record['last_stall'] = dict(record['open_stall'])
+    elif record['open_stall'] is not None:
+        episode = record['open_stall']
+        episode['end_elapsed_seconds'] = round(elapsed, 2)
+        episode['bytes_in_at_end'] = bytes_in
+        if record['stalls_over_1000_ms_count'] == 1:
+            record['first_stall'] = dict(episode)
+        record['last_stall'] = dict(episode)
+        record['stalls'].append(dict(episode))
+        if len(record['stalls']) > GAP_EVENT_LIMIT:
+            del record['stalls'][0]
+        record['open_stall'] = None
+
+
+def record_source_error(record, elapsed):
+    _record_source_poll(record, elapsed)
+    record['errors'] += 1
+    if record['open_error_gap'] is None:
+        prior = record['last_success_elapsed']
+        record['open_error_gap'] = {
+            'start_elapsed_seconds': prior if prior is not None else 0.0,
+            'first_error_elapsed_seconds': round(elapsed, 2),
+            'last_error_elapsed_seconds': round(elapsed, 2),
+            'errors': 1, 'had_prior_sample': prior is not None,
+        }
+        record['error_gaps_count'] += 1
+    else:
+        record['open_error_gap']['last_error_elapsed_seconds'] = round(elapsed, 2)
+        record['open_error_gap']['errors'] += 1
+    if record['error_gaps_count'] == 1:
+        record['first_error_gap'] = dict(record['open_error_gap'])
+    record['last_error_gap'] = dict(record['open_error_gap'])
+    if record['open_stall'] is not None:
+        record['open_stall']['observation_errors'] += 1
+        if record['stalls_over_1000_ms_count'] == 1:
+            record['first_stall'] = dict(record['open_stall'])
+        record['last_stall'] = dict(record['open_stall'])
+
+
+def observe_source(port, password, started, deadline, stop, state, guard):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    while not stop.is_set() and time.monotonic() < deadline:
+        cycle = time.monotonic()
+        for stream in STREAMS:
+            if stop.is_set() or time.monotonic() >= deadline:
+                break
+            try:
+                age_ms, bytes_in = source_stats(opener, port, password, stream)
+            except (OSError, RuntimeError, ValueError):
+                with guard:
+                    record_source_error(state[stream], time.monotonic() - started)
+            else:
+                with guard:
+                    record_source_sample(state[stream], time.monotonic() - started,
+                                         age_ms, bytes_in)
+        remaining = min(0.5 - (time.monotonic() - cycle),
+                        deadline - time.monotonic())
+        if remaining > 0:
+            stop.wait(remaining)
 
 
 def record_gap(record, kind, gap_ms, elapsed):
@@ -301,6 +516,8 @@ def main():
     parser.add_argument('--binary', required=True, type=Path)
     parser.add_argument('--revision', required=True)
     parser.add_argument('--ffmpeg', default='/usr/bin/ffmpeg', type=Path)
+    parser.add_argument('--observe-source', action='store_true',
+                        help='record bounded source-age evidence alongside viewer gaps')
     args = parser.parse_args()
     if not re.fullmatch(r'[0-9a-f]{40}', args.revision):
         parser.error('revision must be a full lowercase Git SHA-1')
@@ -331,6 +548,8 @@ def main():
     signal.signal(signal.SIGINT, lambda _signum, _frame: stop.set())
     viewer_state = {f'{stream}:{index}': new_viewer_record()
         for stream in STREAMS for index in range(VIEWERS_PER_STREAM)}
+    source_state = ({stream: new_source_record() for stream in STREAMS}
+                    if args.observe_source else None)
     report = {'revision': args.revision[:7], 'binary_sha256': binary_sha256,
               'duration_seconds': args.duration,
               'sample_seconds': args.sample_seconds, 'streams': len(STREAMS),
@@ -341,6 +560,7 @@ def main():
               'state': 'starting'}
     process = None
     log_thread = None
+    source_thread = None
     log_status = {'truncated': False, 'write_error': False}
     log_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     with os.fdopen(os.open(state_dir / 'daemon.log', log_flags, 0o600), 'wb', buffering=0) as log:
@@ -387,7 +607,15 @@ def main():
             deadline = started + args.duration
             report['state'] = 'running'
             report['listen'] = f'127.0.0.1:{port}'
+            if source_state is not None:
+                report['source_observation'] = json.loads(json.dumps(source_state))
             save(state_dir / 'checkpoint.json', report)
+            if source_state is not None:
+                source_thread = threading.Thread(
+                    target=observe_source,
+                    args=(port, password, started, deadline, stop, source_state, guard),
+                    daemon=True)
+                source_thread.start()
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(viewer_state)) as pool:
                 futures = [pool.submit(viewer, stream, index, port, started, deadline,
                                        stop, viewer_state, guard)
@@ -402,6 +630,9 @@ def main():
                             continue
                         if process.poll() is not None:
                             raise RuntimeError(f'daemon exited {process.returncode}')
+                        if source_thread is not None and not source_thread.is_alive() \
+                                and time.monotonic() < deadline:
+                            raise RuntimeError('source observer stopped unexpectedly')
                         elapsed = now - started
                         scan_started = time.monotonic()
                         last_media_bytes = directory_bytes(media_dir)
@@ -418,6 +649,8 @@ def main():
                             sample['viewer_bytes'] = sum(value['bytes'] for value in viewer_state.values())
                             sample['active_viewers'] = sum(value['active'] for value in viewer_state.values())
                             report['viewers'] = json.loads(json.dumps(viewer_state))
+                            if source_state is not None:
+                                report['source_observation'] = json.loads(json.dumps(source_state))
                         report['samples'].append(sample)
                         try:
                             status, latency = api(opener, port, password,
@@ -446,6 +679,8 @@ def main():
             report['harness_error'] = f'{type(exc).__name__}: {exc}'
         finally:
             stop.set()
+            if source_thread is not None:
+                source_thread.join()
             try:
                 terminate_owned_scope(group)
                 if process is not None:
@@ -454,6 +689,8 @@ def main():
                     log_thread.join(timeout=5)
                     if log_thread.is_alive():
                         raise RuntimeError('daemon log drain did not stop')
+                if source_thread is not None and source_thread.is_alive():
+                    raise RuntimeError('source observer did not stop')
             except Exception as exc:
                 report['state'] = 'failed'
                 report['harness_error'] = f'cleanup: {type(exc).__name__}: {exc}'
@@ -463,11 +700,14 @@ def main():
                 report['harness_error'] = 'daemon log cap or I/O failure'
             with guard:
                 report['viewers'] = json.loads(json.dumps(viewer_state))
+                if source_state is not None:
+                    report['source_observation'] = json.loads(json.dumps(source_state))
             report['end_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
             try:
                 if media_dir.exists():
                     shutil.rmtree(media_dir)
                 (state_dir / 'config.json').unlink(missing_ok=True)
+                (state_dir / 'config.json.node-id').unlink(missing_ok=True)
                 (state_dir / 'checkpoint.json').unlink(missing_ok=True)
             except OSError as exc:
                 report['state'] = 'failed'

@@ -1,6 +1,7 @@
 """Safety and diagnostic contracts for the owned sustained HTTP runner."""
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import signal
@@ -11,6 +12,8 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/run-sustained-http.py"
@@ -24,12 +27,263 @@ def load_runner():
     return module
 
 
+def serve_source_responses(responses):
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            received.append((self.path, self.headers.get("Authorization")))
+            body = responses.pop(0) if len(responses) > 1 else responses[0]
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, _format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, received
+
+
 class SustainedHttpRunnerTests(unittest.TestCase):
+    def test_source_observer_samples_both_streams_and_stops_without_raw_config(self):
+        runner = load_runner()
+        secret = "tshttp://private.example/secret?token=do-not-record"
+        response = json.dumps({
+            "inputs": [{"url": secret}],
+            "stats": {"status": "running", "media_age_ms": 1500,
+                      "bytes_in": 100},
+        }).encode()
+        server, thread, _ = serve_source_responses([response])
+        state = {name: runner.new_source_record() for name in runner.STREAMS}
+        stop = threading.Event()
+        started = time.monotonic()
+        observer = threading.Thread(
+            target=runner.observe_source,
+            args=(server.server_port, "secret", started, started + 5,
+                  stop, state, threading.Lock()),
+        )
+        try:
+            observer.start()
+            time.sleep(1.2)
+            stop.set()
+            observer.join(timeout=1.5)
+            self.assertFalse(observer.is_alive())
+            for record in state.values():
+                self.assertGreaterEqual(record["samples"], 2)
+                self.assertEqual(record["errors"], 0)
+            self.assertNotIn(secret, json.dumps(state))
+            self.assertNotIn("secret", json.dumps(state))
+        finally:
+            stop.set()
+            observer.join(timeout=2)
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_source_observer_stops_after_blocked_api_request(self):
+        runner = load_runner()
+        requested = threading.Event()
+
+        class SlowHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requested.set()
+                time.sleep(2)
+                try:
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, _format, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+        server.daemon_threads = True
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        state = {name: runner.new_source_record() for name in runner.STREAMS}
+        stop = threading.Event()
+        started = time.monotonic()
+        observer = threading.Thread(
+            target=runner.observe_source,
+            args=(server.server_port, "secret", started, started + 5,
+                  stop, state, threading.Lock()),
+        )
+        try:
+            observer.start()
+            self.assertTrue(requested.wait(timeout=1))
+            stop.set()
+            observer.join(timeout=1.5)
+            self.assertFalse(observer.is_alive())
+            self.assertGreaterEqual(sum(record["errors"] for record in state.values()), 1)
+        finally:
+            stop.set()
+            observer.join(timeout=2)
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+    def test_source_stall_episode_matches_viewer_time_base(self):
+        runner = load_runner()
+        record = runner.new_source_record()
+        runner.record_source_sample(record, 0.0, 40, 100)
+        runner.record_source_sample(record, 1.5, 1500, 100)
+        runner.record_source_sample(record, 4.5, 4500, 100)
+        runner.record_source_sample(record, 5.0, 20, 600)
+        self.assertEqual(record["samples"], 4)
+        self.assertEqual(record["max_age_ms"], 4500)
+        self.assertEqual(record["max_poll_interval_ms"], 3000)
+        self.assertEqual(record["stalls_over_1000_ms_count"], 1)
+        self.assertEqual(record["stalls"], [{
+            "start_elapsed_seconds": 1.5, "end_elapsed_seconds": 5.0,
+            "max_age_ms": 4500, "bytes_in_at_start": 100,
+            "bytes_in_at_end": 600, "observation_errors": 0,
+        }])
+
+    def test_source_stall_history_is_bounded_but_first_and_last_survive(self):
+        runner = load_runner()
+        record = runner.new_source_record()
+        for index in range(100):
+            runner.record_source_sample(record, index * 2.0, 1500, index * 10)
+            runner.record_source_sample(record, index * 2.0 + 1.0, 10,
+                                        index * 10 + 1)
+        self.assertEqual(record["stalls_over_1000_ms_count"], 100)
+        self.assertEqual(record["first_stall"]["start_elapsed_seconds"], 0.0)
+        self.assertEqual(record["last_stall"]["start_elapsed_seconds"], 198.0)
+        self.assertEqual(len(record["stalls"]), 32)
+        self.assertEqual(record["stalls"][0]["start_elapsed_seconds"], 136.0)
+
+    def test_source_poll_error_marks_episode_incomplete(self):
+        runner = load_runner()
+        record = runner.new_source_record()
+        runner.record_source_sample(record, 1.5, 1500, 100)
+        runner.record_source_error(record, 2.0)
+        self.assertEqual(record["first_stall"]["observation_errors"], 1)
+        self.assertEqual(record["open_stall"]["observation_errors"], 1)
+        runner.record_source_sample(record, 4.0, 20, 600)
+        self.assertEqual(record["errors"], 1)
+        self.assertEqual(record["max_poll_interval_ms"], 2000)
+        self.assertEqual(record["stalls"][0]["observation_errors"], 1)
+
+    def test_source_errors_locate_missing_evidence_between_successes(self):
+        runner = load_runner()
+        record = runner.new_source_record()
+        runner.record_source_sample(record, 1.0, 20, 100)
+        runner.record_source_error(record, 1.5)
+        runner.record_source_error(record, 2.0)
+        self.assertEqual(record["open_error_gap"]["start_elapsed_seconds"], 1.0)
+        self.assertEqual(record["open_error_gap"]["last_error_elapsed_seconds"], 2.0)
+        runner.record_source_sample(record, 2.5, 20, 200)
+        self.assertEqual(record["error_gaps_count"], 1)
+        self.assertEqual(record["error_gaps"], [{
+            "start_elapsed_seconds": 1.0, "first_error_elapsed_seconds": 1.5,
+            "last_error_elapsed_seconds": 2.0, "end_elapsed_seconds": 2.5,
+            "errors": 2, "had_prior_sample": True,
+        }])
+        self.assertIsNone(record["open_error_gap"])
+
+    def test_source_error_and_poll_gap_histories_are_bounded(self):
+        runner = load_runner()
+        record = runner.new_source_record()
+        for index in range(100):
+            runner.record_source_error(record, index * 2.0 + 0.5)
+            runner.record_source_sample(record, index * 2.0 + 1.0, 20, index)
+        self.assertEqual(record["error_gaps_count"], 100)
+        self.assertEqual(record["first_error_gap"]["first_error_elapsed_seconds"], 0.5)
+        self.assertEqual(record["last_error_gap"]["first_error_elapsed_seconds"], 198.5)
+        self.assertEqual(len(record["error_gaps"]), 32)
+        self.assertEqual(record["first_error_gap"]["had_prior_sample"], False)
+        self.assertEqual(record["poll_gaps_over_750_ms_count"], 99)
+        self.assertEqual(len(record["poll_gaps"]), 32)
+        self.assertEqual(record["first_poll_gap"]["start_elapsed_seconds"], 1.0)
+        self.assertEqual(record["last_poll_gap"]["end_elapsed_seconds"], 198.5)
+
+    def test_source_stats_trickle_has_absolute_deadline(self):
+        runner = load_runner()
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listener.settimeout(2)
+        server_stop = threading.Event()
+
+        def serve():
+            try:
+                connection, _ = listener.accept()
+                with connection:
+                    connection.recv(4096)
+                    connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n")
+                    while not server_stop.wait(0.05):
+                        connection.sendall(b"x")
+            except OSError:
+                pass
+
+        server = threading.Thread(target=serve, daemon=True)
+        server.start()
+        start = time.monotonic()
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with self.assertRaises((OSError, RuntimeError)):
+                runner.source_stats(opener, listener.getsockname()[1], "secret", "soak_a")
+            self.assertLess(time.monotonic() - start, 1.5)
+        finally:
+            server_stop.set()
+            listener.close()
+            server.join(timeout=2)
+
+    def test_source_stats_projects_only_counters_from_authenticated_response(self):
+        runner = load_runner()
+        secret = "tshttp://private.example/input?token=do-not-record"
+        response = json.dumps({
+            "name": "soak_a", "inputs": [{"url": secret}],
+            "stats": {"status": "running", "media_age_ms": 1234,
+                      "bytes_in": 5678, "private_debug": secret},
+        }).encode()
+        server, thread, received = serve_source_responses([response])
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            result = runner.source_stats(opener, server.server_port, "secret", "soak_a")
+            self.assertEqual(result, (1234, 5678))
+            self.assertEqual(received[0][0], "/streamer/api/v3/streams/soak_a")
+            self.assertEqual(received[0][1], "Basic YWRtaW46c2VjcmV0")
+            self.assertNotIn(secret, json.dumps(result))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_source_stats_rejects_invalid_counters_and_oversized_body(self):
+        runner = load_runner()
+        responses = [
+            json.dumps({"stats": {"media_age_ms": True, "bytes_in": 10}}).encode(),
+            json.dumps({"stats": {"media_age_ms": -1, "bytes_in": 10}}).encode(),
+            json.dumps({"stats": {"media_age_ms": 1, "bytes_in": "10"}}).encode(),
+            b"x" * 1_000_001,
+        ]
+        server, thread, _ = serve_source_responses(responses)
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            for _ in range(4):
+                with self.assertRaises((RuntimeError, ValueError)):
+                    runner.source_stats(opener, server.server_port, "secret", "soak_a")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_cli_accepts_explicit_binary_state_and_revision(self):
         run = subprocess.run([sys.executable, str(SCRIPT), "--help"],
                              capture_output=True, text=True, timeout=5)
         self.assertEqual(run.returncode, 0)
-        for flag in ("--binary", "--state", "--revision"):
+        for flag in ("--binary", "--state", "--revision", "--observe-source"):
             self.assertIn(flag, run.stdout)
         self.assertNotIn("--remove-binary-on-exit", run.stdout)
 
