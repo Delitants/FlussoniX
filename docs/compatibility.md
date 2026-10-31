@@ -15,7 +15,8 @@ All paths below are relative to `/streamer/api/v3`.
 Config JSON reads distinguish the reference's compact and full profiles:
 `GET /config` (or `?full=false`) reports `server_id` and runtime `stats`,
 while `?full=true` also returns the five saved collections. `stats.id` equals
-the UUID in `server_id`. The UUID is stored in an owner-only
+the UUID in `server_id`. `GET /config/stats` returns that stats object directly;
+FlussoniX-only diagnostics remain under `/flussonix/api/v1/node`. The UUID is stored in an owner-only
 `<config-file>.node-id` file; back it up with the configuration and keep it
 unique per installation. The Config and Cluster screens request `full=true`
 and write only saved collections, so changing counters cannot create an edit

@@ -77,6 +77,76 @@ async fn config_default_is_compact_and_full_is_explicit() {
 }
 
 #[tokio::test]
+async fn config_stats_is_top_level_and_shared_between_roles() {
+    let state = tempfile::tempdir().unwrap();
+    let app = App::new(
+        state.path().join("config.json"),
+        state.path().join("media"),
+        Options {
+            admin_user: "admin".into(),
+            admin_password: "test-secret".into(),
+            view_user: Some("viewer".into()),
+            view_password: Some("view-secret".into()),
+            peer_key: "test-peer-secret-1234".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    app.config
+        .replace(json!({"streams":[{"name":"music","inputs":[{"url":"testsrc://"}]}]}))
+        .unwrap();
+    let id = get(app.clone(), "/streamer/api/v3/config").await.1["server_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    for credentials in ["admin:test-secret", "viewer:view-secret"] {
+        let response = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/streamer/api/v3/config/stats")
+                    .header(
+                        "Authorization",
+                        format!("Basic {}", STANDARD.encode(credentials)),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 100_000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["id"], id);
+        assert_eq!(body["server_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["streamer_status"], "running");
+        assert_eq!(body["total_streams"], 1);
+        assert!(body["now"].is_u64());
+        for native_field in ["stats", "management_role", "iptv_public_origin", "streams"] {
+            assert!(
+                body.get(native_field).is_none(),
+                "unexpected {native_field}"
+            );
+        }
+    }
+
+    let response = router(app)
+        .oneshot(
+            Request::builder()
+                .uri("/streamer/api/v3/config/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn config_server_identity_survives_restart() {
     let state = tempfile::tempdir().unwrap();
     let first = get(app(state.path()), "/streamer/api/v3/config").await.1["server_id"].clone();
