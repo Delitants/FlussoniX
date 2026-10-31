@@ -12,6 +12,7 @@ pub struct Settings {
     pub interface: Option<Ipv4Addr>,
     pub source_ip: Option<IpAddr>,
     pub jitter: Duration,
+    pub receive_buffer_bytes: Option<u32>,
     pub ttl: u32,
     pub key_file: Option<PathBuf>,
     pub elementary: bool,
@@ -86,6 +87,7 @@ impl Settings {
                 "interface",
                 "source_ip",
                 "jitter_ms",
+                "receive_buffer_bytes",
                 "ttl",
                 "key_file",
                 "profile",
@@ -172,12 +174,17 @@ impl Settings {
         if secure != key_file.is_some() {
             return Err("SRTP requires a key file; plaintext RTP forbids one".into());
         }
+        let receive_buffer_bytes = opts
+            .get("receive_buffer_bytes")
+            .map(|_| number(&opts, "receive_buffer_bytes", 0, 65536, 33554432).map(|n| n as u32))
+            .transpose()?;
         Ok(Self {
             address: SocketAddr::new(ip, port),
             secure,
             interface,
             source_ip,
             jitter: Duration::from_millis(number(&opts, "jitter_ms", 50, 0, 1000)?),
+            receive_buffer_bytes,
             ttl: number(&opts, "ttl", 16, 1, 255)? as u32,
             key_file,
             elementary,
@@ -226,6 +233,7 @@ pub fn outputs(cfg: &Value) -> Result<Vec<Output>, String> {
                 if settings.address.ip().is_unspecified()
                     || settings.sdp_file.is_some()
                     || settings.source_ip.is_some()
+                    || settings.receive_buffer_bytes.is_some()
                     || row["flussonix_rtp"].get("jitter_ms").is_some()
                 {
                     return Err(

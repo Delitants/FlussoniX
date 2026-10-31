@@ -4,6 +4,7 @@ export const directRTP=(url:string)=>/^(srtp|rtp):\/\//.test(url);
 const owns=(v:Item,k:string)=>Object.prototype.hasOwnProperty.call(v,k);
 function option(row:Item,key:string,value:any):Item {const options={...row.flussonix_rtp};if(value===''||value===undefined)delete options[key];else options[key]=value;const next={...row};if(Object.keys(options).length)next.flussonix_rtp=options;else delete next.flussonix_rtp;return next}
 export function RTPInputFields({row,onChange,suffix=''}:{row:Item,onChange:(v:Item)=>void,suffix?:string}) {
+ const [bufferText,setBufferText]=React.useState<string|undefined>();
  if(!directRTP(row.url||''))return null;
  const opts=row.flussonix_rtp||{};
  return <div className="form-grid rtp-input-options">
@@ -12,6 +13,7 @@ export function RTPInputFields({row,onChange,suffix=''}:{row:Item,onChange:(v:It
   <Field label={'RTP interface IP'+suffix} help="Local IPv4 interface. Required for multicast; with a wildcard bind, restricts reception to this address. Otherwise it must match the input URL."><input value={opts.interface||''} placeholder="192.168.1.10" onChange={e=>onChange(option(row,'interface',e.target.value))}/></Field>
   <Field label={'RTP source IP'+suffix} help="Optional exact sender IP filter. The first valid sender and SSRC are pinned until restart."><input value={opts.source_ip||''} onChange={e=>onChange(option(row,'source_ip',e.target.value))}/></Field>
   <Field label={'RTP jitter (milliseconds)'+suffix} help="Reorder packets for up to 0–1000 ms; default 50. Queue is bounded to 64 packets."><input type="number" min="0" max="1000" placeholder="50" value={opts.jitter_ms??''} onChange={e=>onChange(option(row,'jitter_ms',e.target.value===''?'':Number(e.target.value)))}/></Field>
+  <Field label={'RTP receive buffer (MiB)'+suffix} help="Optional public RTP socket buffer per input track, from 0.0625 to 32 MiB. Leave blank for the system default. The host must permit the requested size (net.core.rmem_max on Linux)."><input type="text" inputMode="decimal" placeholder="System default" value={bufferText??(opts.receive_buffer_bytes===undefined?'':opts.receive_buffer_bytes/1048576)} onChange={e=>{const text=e.target.value;setBufferText(text);onChange(option(row,'receive_buffer_bytes',text===''?'':/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(text)?Math.round(Number(text)*1048576):text))}} onBlur={()=>{if(bufferText===''||typeof opts.receive_buffer_bytes==='number')setBufferText(undefined)}}/></Field>
   {row.url?.startsWith('srtp://')&&<KeyField label={'SRTP key file'+suffix} value={opts.key_file||''} onChange={v=>onChange(option(row,'key_file',v))}/>}
  </div>;
 }
@@ -40,6 +42,7 @@ export function rtpError(value:Item):string|undefined {
   if(/[\s\x00-\x1f\x7f]/.test(row.url)||row.url.split('://')[1]?.replace(/\/$/,'').includes('/'))return 'RTP URL cannot contain whitespace or a path.';
   try {const u=new URL(row.url);const host=u.hostname.replace(/^\[|\]$/g,'');const ipv4=/^(\d{1,3}\.){3}\d{1,3}$/.test(host)&&host.split('.').every(n=>Number(n)<=255);if(!ipv4&&!host.includes(':')||!u.port||Number(u.port)<1024||Number(u.port)>65534||u.search||u.hash||u.username||u.password||!['','/'].includes(u.pathname))return 'RTP URL needs a literal IP and port 1024–65534, without path, query or credentials.';}catch{return 'Enter a complete RTP or SRTP IP address and port.'}
   const o=row.flussonix_rtp||{};for(const [k,min,max] of [['jitter_ms',0,1000],['ttl',1,255]] as const)if(owns(o,k)&&(!Number.isInteger(o[k])||o[k]<min||o[k]>max))return `RTP ${k==='ttl'?'TTL':'jitter'} must be a whole number from ${min} to ${max}.`;
+  if(owns(o,'receive_buffer_bytes')){if(!value.inputs?.includes(row))return 'RTP receive buffer applies only to inputs.';if(!Number.isInteger(o.receive_buffer_bytes)||o.receive_buffer_bytes<65536||o.receive_buffer_bytes>33554432)return 'RTP receive buffer must be from 0.0625 to 32 MiB.';}
   if(o.profile==='elementary'){if(Number(new URL(row.url).port)>65520)return 'Elementary RTP needs a base port from 1024 to 65520.';if(value.inputs?.includes(row)&&!o.sdp_file?.startsWith('/'))return 'Elementary RTP input needs an absolute SDP file path on this node.';}
   if(row.url.startsWith('srtp://')&&!o.key_file?.startsWith('/'))return 'SRTP requires an absolute key file path on this node.';
   if(owns(row,'max_mbps')&&(!Number.isInteger(row.max_mbps)||row.max_mbps<1||row.max_mbps>10000))return 'RTP maximum bitrate must be 1–10000 Mbps.';
