@@ -2,14 +2,62 @@
 
 import importlib.util
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/qualify-live-vendor.py"
 SPEC = importlib.util.spec_from_file_location("qualify_live_vendor", SCRIPT)
 PROBE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PROBE)
+
+
+class SourceArgumentsTests(unittest.TestCase):
+    def test_daemon_accepted_numeric_server_roots_remain_usable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key = Path(directory) / "cluster.key"
+            key.write_text("test-key", encoding="utf-8")
+            key.chmod(0o600)
+            for source in ("m4s://127.1", "m4s://127.0.0.1."):
+                with self.subTest(source=source):
+                    argv = ["probe", "--binary", "/bin/true", "--source", source,
+                            "--stream", "live", "--cluster-key-file", str(key),
+                            "--topology"]
+                    with patch.object(sys, "argv", argv):
+                        try:
+                            parsed = PROBE.arguments()
+                        except SystemExit:
+                            self.fail(f"valid server root rejected: {source}")
+                        self.assertEqual(parsed.source, source)
+
+    def test_non_root_sources_are_rejected_before_starting_local_daemon(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key = Path(directory) / "cluster.key"
+            key.write_text("test-key", encoding="utf-8")
+            key.chmod(0o600)
+            for source in (
+                "m4s://origin.example/live",
+                "m4s://origin.example/\n",
+                "m4s://origin.example\\live",
+                "m4s://origin.example%2Flive",
+                "m4s://origin.example:0",
+                "m4s://origin^.example",
+                "m4s://origin|.example",
+                "m4s://origin<.example",
+                "m4s://origin>.example",
+            ):
+                with self.subTest(source=source):
+                    result = subprocess.run(
+                        ["python3", str(SCRIPT), "--binary", "/bin/true",
+                         "--source", source, "--stream", "live",
+                         "--cluster-key-file", str(key), "--topology"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("server-root", result.stderr)
 
 
 class M4fAnnouncementTests(unittest.TestCase):
