@@ -11,6 +11,25 @@ revision is self-reported; binary/package provenance and all other release
 gates remain separate. A local loopback pass would not establish WAN or
 production-scale capacity.
 
+The versioned `scripts/run-sustained-http.py` creates the report in a fresh,
+private state directory. Run it in a separate cgroup-v2 scope limited to two
+CPU cores, 1 GiB of memory and 512 processes, for example:
+
+```sh
+systemd-run --scope --collect -p CPUQuota=200% -p MemoryMax=1G -p TasksMax=512 \
+  python3 scripts/run-sustained-http.py --binary /path/to/flussonix \
+  --state /private/new-soak --revision FULL_40_CHARACTER_GIT_SHA
+python3 scripts/assess-sustained-http.py \
+  --report /private/new-soak/report.json --revision FULL_40_CHARACTER_GIT_SHA
+```
+
+The state directory must not exist beforehand. The runner hashes the supplied
+binary, records bounded timestamps for media gaps over three seconds, checks
+media disk use at each sample, and caps the private daemon log at 1 MiB. It
+stops its owned cgroup children and removes media and config on exit. It leaves
+the private report and log for diagnosis; the supplied binary is never removed.
+The assessor's passing memory threshold remains 512 MiB, below the scope limit.
+
 Two ongoing owned runs have no viewer, TS sync, metadata or OOM errors so far,
 but each has already recorded a steady-media gap beyond three seconds. They
 remain in progress for resource observation and are not passing release

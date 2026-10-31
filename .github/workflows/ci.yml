@@ -26,6 +26,7 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_inspect_demo.py' -v
           python3 -m unittest tests.test_qualify_live_vendor -v
           python3 -m unittest tests.test_sustained_http_gate -v
+          python3 -m unittest tests.test_run_sustained_http -v
       - run: rustup show
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
