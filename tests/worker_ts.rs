@@ -308,3 +308,80 @@ fn gop_preflight_preserves_mux_state_and_checks_intra_and_inter_gop_clocks() {
         assert_eq!(mux.frame(f).unwrap(), expected.frame(f).unwrap());
     }
 }
+
+#[test]
+fn small_video_boundary_overlap_keeps_original_presentation_time_in_worker_ts() {
+    let h264 = Track {
+        id: 1,
+        codec: "h264".into(),
+        config: vec![
+            1, 100, 0, 40, 255, 225, 0, 4, 103, 100, 0, 40, 1, 0, 2, 104, 1,
+        ],
+    };
+    let sample = vec![0, 0, 0, 2, 0x65, 1];
+    let mut mux = Muxer::new(&[h264]).unwrap();
+    let first = frame(1, 90_000, sample.clone());
+    mux.frame(&first).unwrap();
+    let mut next = [Frame {
+        pts_offset: 3_600,
+        ..frame(1, 89_760, sample)
+    }];
+    mux.retime_video_boundary(&mut next).unwrap();
+    assert_eq!(next[0].dts, 90_001);
+    assert_eq!(next[0].pts_offset, 3_359);
+    let bytes = mux.frame(&next[0]).unwrap();
+    let packet = bytes
+        .chunks_exact(188)
+        .find(|p| p[1] & 0x40 != 0 && p[1] & 31 == 1 && p[2] == 0)
+        .unwrap();
+    let start = if packet[3] & 0x20 != 0 {
+        5 + usize::from(packet[4])
+    } else {
+        4
+    };
+    let pes = &packet[start..];
+    let decode = |b: &[u8]| {
+        (u64::from((b[0] >> 1) & 7) << 30)
+            | (u64::from(b[1]) << 22)
+            | (u64::from(b[2] >> 1) << 15)
+            | (u64::from(b[3]) << 7)
+            | u64::from(b[4] >> 1)
+    };
+    assert_eq!(decode(&pes[9..14]), 93_360);
+    assert_eq!(decode(&pes[14..19]), 90_001);
+}
+
+#[test]
+fn boundary_retime_still_rejects_large_and_intra_gop_regressions() {
+    let mut video_mux = Muxer::new(&[video()]).unwrap();
+    let sample = include_bytes!("fixtures/codecs/hevc-00.bin").to_vec();
+    video_mux.frame(&frame(1, 90_000, sample.clone())).unwrap();
+    assert!(
+        video_mux
+            .retime_video_boundary(&mut [frame(1, 89_000, sample.clone())])
+            .is_err()
+    );
+    assert!(
+        video_mux
+            .retime_video_boundary(&mut [Frame {
+                key: false,
+                ..frame(1, 89_760, sample.clone())
+            }])
+            .is_err()
+    );
+    assert!(
+        video_mux
+            .retime_video_boundary(&mut [
+                frame(1, 93_000, sample.clone()),
+                frame(1, 92_760, sample),
+            ])
+            .is_err()
+    );
+    let mut audio_mux = Muxer::new(&[audio("m2a", 2)]).unwrap();
+    audio_mux.frame(&frame(2, 90_000, mp2())).unwrap();
+    assert!(
+        audio_mux
+            .retime_video_boundary(&mut [frame(2, 89_999, mp2())])
+            .is_err()
+    );
+}

@@ -23,11 +23,15 @@ use flussonix::{
 };
 use serde_json::{Value, json};
 use std::{
+    collections::HashSet,
     io,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 type Feed = mpsc::UnboundedSender<Result<Bytes, io::Error>>;
 const DENIED_TOKEN: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 struct Remote {
@@ -416,7 +420,7 @@ async fn failed_cancelled_or_late_renewal_never_extends_the_published_deadline()
 }
 
 #[tokio::test]
-async fn newer_attempt_wins_and_an_older_pending_response_cannot_roll_back() {
+async fn scheduled_renewals_serialize_and_observe_after_prior_commit() {
     let mut f = Fixture::start().await;
     let registry = SharedInputs::new(f.owner.clone());
     let rows = f.inventory(Duration::from_secs(3)).await;
@@ -425,12 +429,26 @@ async fn newer_attempt_wins_and_an_older_pending_response_cannot_roll_back() {
     let old = registry.renew(&f.handle, Duration::from_secs(3));
     tokio::pin!(old);
     tokio::select! {r=&mut old=>panic!("early {}",r.is_ok()),_=started=>{}}
-    let next = registry
-        .renew(&f.handle, Duration::from_secs(3))
-        .await
-        .unwrap();
+    let before = f.calls.lock().unwrap().len();
+    let next = registry.renew(&f.handle, Duration::from_secs(3));
+    tokio::pin!(next);
+    tokio::select! {
+        result = &mut next => panic!("overlapping observation: {}", result.is_ok()),
+        _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+    }
+    assert_eq!(f.calls.lock().unwrap().len(), before);
     release.send(()).unwrap();
-    assert!(old.await.is_err());
+    assert_eq!(old.await.unwrap().renewed, 1);
+    let next = next.await.unwrap();
+    assert_eq!(
+        f.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.ends_with("/streams"))
+            .count(),
+        3
+    );
     v.current().unwrap();
     let a = registry
         .attach(
@@ -539,15 +557,18 @@ async fn proposed_deadline_and_newer_failed_attempt_cannot_restore_older_refresh
     tokio::pin!(older);
     tokio::select! {r=&mut older=>panic!("early {}",r.is_ok()),_=started=>{}}
     f.remote.lock().unwrap().status = StatusCode::FORBIDDEN;
-    assert!(
-        registry
-            .renew(&f.handle, Duration::from_secs(3))
-            .await
-            .is_err()
-    );
+    let before = f.calls.lock().unwrap().len();
+    let newer = registry.renew(&f.handle, Duration::from_secs(3));
+    tokio::pin!(newer);
+    tokio::select! {
+        result = &mut newer => panic!("overlapping observation: {}", result.is_ok()),
+        _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+    }
+    assert_eq!(f.calls.lock().unwrap().len(), before);
     v.current().unwrap();
     release.send(()).unwrap();
-    assert!(older.await.is_err());
+    assert_eq!(older.await.unwrap().renewed, 1);
+    assert!(newer.await.is_err());
     v.current().unwrap();
     f.remote.lock().unwrap().status = StatusCode::OK;
     assert_eq!(
@@ -624,5 +645,221 @@ async fn renewal_never_revives_a_stale_unstarted_worker_beside_a_fresh_route() {
         assert_eq!(f.media_calls(), 0);
         registry.shutdown();
         drop((a.input, b.input));
+    }
+}
+
+#[tokio::test]
+async fn eof_waits_for_scheduled_then_observes_again() {
+    let mut f = Fixture::start().await;
+    let registry = Arc::new(SharedInputs::new(f.owner.clone()));
+    let rows = f.inventory(Duration::from_secs(3)).await;
+    let (_viewer, worker, _feed) = f.run(&registry, &rows, "one").await;
+    let (started, release) = f.hold();
+    let first_registry = registry.clone();
+    let first_handle = f.handle.clone();
+    let scheduled = tokio::spawn(async move {
+        first_registry
+            .renew(&first_handle, Duration::from_secs(3))
+            .await
+    });
+    started.await.unwrap();
+    let before = f.calls.lock().unwrap().len();
+    let eof_registry = registry.clone();
+    let eof_handle = f.handle.clone();
+    let eof = tokio::spawn(async move {
+        eof_registry
+            .renew_after_eof(&eof_handle, Duration::from_secs(3))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(f.calls.lock().unwrap().len(), before);
+    release.send(()).unwrap();
+    assert_eq!(scheduled.await.unwrap().unwrap().renewed, 1);
+    assert_eq!(eof.await.unwrap().unwrap().renewed, 1);
+    assert_eq!(
+        f.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.ends_with("/streams"))
+            .count(),
+        3
+    );
+    registry.shutdown();
+    joined(worker).await;
+}
+
+#[tokio::test]
+async fn eof_renewal_capacity_and_timeout_are_bounded() {
+    let mut f = Fixture::start().await;
+    let registry = Arc::new(SharedInputs::new(f.owner.clone()));
+    let rows = f.inventory(Duration::from_millis(350)).await;
+    let (_viewer, worker, _feed) = f.run(&registry, &rows, "one").await;
+    let (started, _release) = f.hold();
+    let mut attempts = Vec::new();
+    for _ in 0..5 {
+        let registry = registry.clone();
+        let handle = f.handle.clone();
+        attempts.push(tokio::spawn(async move {
+            registry
+                .renew_after_eof(&handle, Duration::from_secs(3))
+                .await
+        }));
+    }
+    started.await.unwrap();
+    let before = f.calls.lock().unwrap().len();
+    for attempt in attempts {
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), attempt)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+    }
+    assert_eq!(f.calls.lock().unwrap().len(), before);
+    registry.shutdown();
+    joined(worker).await;
+}
+
+#[tokio::test]
+async fn eof_renewal_uses_four_slots_across_distinct_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(ConfigStore::open(dir.path().join("config.json")).unwrap());
+    let holding = Arc::new(AtomicBool::new(false));
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let mut sources = Vec::new();
+    let mut releases = Vec::new();
+    let mut servers = Vec::new();
+    for index in 0..5 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let key = format!("m4f://{}", listener.local_addr().unwrap());
+        let name = format!("source-{index}");
+        let id = format!("origin-{index}");
+        let release = Arc::new(Semaphore::new(0));
+        let router = Router::new().fallback(get({
+            let (name, id) = (name.clone(), id.clone());
+            let (release, holding, started) =
+                (release.clone(), holding.clone(), started_tx.clone());
+            move |OriginalUri(uri): OriginalUri, headers: HeaderMap| {
+                let (name, id) = (name.clone(), id.clone());
+                let (release, holding, started) =
+                    (release.clone(), holding.clone(), started.clone());
+                async move {
+                    assert!(uri.path().starts_with("/streamer/"));
+                    assert!(headers.contains_key("authorization"));
+                    let body = if uri.path().ends_with("/config") {
+                        json!({"stats":{"id":id}})
+                    } else {
+                        assert!(uri.path().ends_with("/streams"));
+                        if holding.load(Ordering::SeqCst) {
+                            started.send(index).unwrap();
+                            release.acquire().await.unwrap().forget();
+                        }
+                        json!({"server_id":id,"streams":[row(&name)]})
+                    };
+                    Response::new(Body::from(body.to_string()))
+                }
+            }
+        }));
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        }));
+        config
+            .put(
+                "sources",
+                &key,
+                json!({"url":key,"flussonix_source_kind":"flussonic",
+                       "cluster_key":"owned-private-key","on_play":"true",
+                       "group_config":{"same":{"on_play":"true"}},
+                       "flussonix_group_pins":{(name.clone()):["same"]}}),
+            )
+            .unwrap();
+        sources.push((key, name));
+        releases.push(release);
+    }
+    let owner = Arc::new(ModernSourceCoordinator::new(config, "local").unwrap());
+    let registry = Arc::new(SharedInputs::new(owner.clone()));
+    let auth = PlaybackAuth::new(32);
+    let mut handles = Vec::new();
+    let mut attachments = Vec::new();
+    for (key, name) in &sources {
+        let handle = install(&owner, key);
+        let rows = owner
+            .inventory(&handle, Duration::from_secs(8))
+            .await
+            .unwrap();
+        let AdmissionOutcome::Allowed(admission) = owner
+            .admit(
+                rows.candidate(name).unwrap(),
+                &auth,
+                ViewerRequest {
+                    name: name.clone(),
+                    token: name.clone(),
+                    proto: "m4f".into(),
+                    ip: "127.0.0.1".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("owned source denied");
+        };
+        let attachment = registry
+            .attach(admission, SharedInputOptions::default())
+            .unwrap();
+        assert!(attachment.input.is_some());
+        handles.push(handle);
+        attachments.push(attachment);
+    }
+    holding.store(true, Ordering::SeqCst);
+    let tasks = handles
+        .into_iter()
+        .map(|handle| {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                registry
+                    .renew_after_eof(&handle, Duration::from_secs(8))
+                    .await
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut first = HashSet::new();
+    for _ in 0..4 {
+        let index = tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.insert(index), "a source entered twice before release");
+    }
+    assert_eq!(first.len(), 4);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), started_rx.recv())
+            .await
+            .is_err(),
+        "fifth distinct source entered without a free EOF slot"
+    );
+    releases[*first.iter().next().unwrap()].add_permits(1);
+    let fifth = tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!first.contains(&fifth));
+    for release in &releases {
+        release.add_permits(1);
+    }
+    for task in tasks {
+        let result = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!((result.renewed, result.retired), (1, 0));
+    }
+    registry.shutdown();
+    drop(attachments);
+    for server in servers {
+        server.abort();
     }
 }

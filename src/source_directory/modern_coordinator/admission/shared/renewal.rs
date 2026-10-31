@@ -1,6 +1,90 @@
 //! Explicit owner-scheduled refresh; no timer, retry, route activation or failover.
 use super::super::super::{CoordinatedInventory, CoordinationFailure, SourceHandle};
 use super::*;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+
+pub(super) struct RenewalContext {
+    owner: Arc<ModernSourceCoordinator>,
+    workers: Arc<Mutex<Registry>>,
+    gates: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+    eof_slots: Semaphore,
+}
+impl RenewalContext {
+    pub(super) fn new(owner: Arc<ModernSourceCoordinator>, workers: Arc<Mutex<Registry>>) -> Self {
+        Self {
+            owner,
+            workers,
+            gates: Mutex::new(HashMap::new()),
+            eof_slots: Semaphore::new(4),
+        }
+    }
+
+    fn gate(&self, handle: &SourceHandle) -> Result<Arc<AsyncMutex<()>>, SharedFailure> {
+        let mut gates = self.gates.lock().map_err(|_| SharedFailure::Unavailable)?;
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        Ok(gates
+            .entry(handle.stamp.key.clone())
+            .or_default()
+            .upgrade()
+            .unwrap_or_else(|| {
+                let gate = Arc::new(AsyncMutex::new(()));
+                gates.insert(handle.stamp.key.clone(), Arc::downgrade(&gate));
+                gate
+            }))
+    }
+
+    fn remaining(&self, handle: &SourceHandle) -> Result<Duration, SharedFailure> {
+        let registry = self
+            .workers
+            .lock()
+            .map_err(|_| SharedFailure::Unavailable)?;
+        let anchor = registry
+            .workers
+            .values()
+            .filter_map(Weak::upgrade)
+            .find(|worker| same_source(&worker.handle, handle) && worker.current().is_ok())
+            .ok_or(SharedFailure::Unavailable)?;
+        Ok(anchor
+            .route
+            .lock()
+            .unwrap()
+            .expires_at()
+            .saturating_duration_since(std::time::Instant::now()))
+    }
+
+    async fn renew(
+        &self,
+        handle: &SourceHandle,
+        lifetime: Duration,
+    ) -> Result<SharedRenewal, SharedFailure> {
+        let gate = self.gate(handle)?;
+        let _turn = gate.lock().await;
+        self.renew_inner(handle, lifetime).await
+    }
+
+    pub(super) async fn renew_after_eof(
+        &self,
+        handle: &SourceHandle,
+        lifetime: Duration,
+    ) -> Result<SharedRenewal, SharedFailure> {
+        let deadline = self.remaining(handle)?.min(Duration::from_secs(5));
+        if deadline.is_zero() {
+            return Err(SharedFailure::Unavailable);
+        }
+        tokio::time::timeout(deadline, async {
+            let _slot = self
+                .eof_slots
+                .acquire()
+                .await
+                .map_err(|_| SharedFailure::Closed)?;
+            let gate = self.gate(handle)?;
+            let _turn = gate.lock().await;
+            self.renew_inner(handle, lifetime).await
+        })
+        .await
+        .unwrap_or(Err(SharedFailure::Unavailable))
+    }
+}
 
 pub struct SharedRenewal {
     pub inventory: CoordinatedInventory,
@@ -12,6 +96,23 @@ impl SharedInputs {
     /// routes renew atomically before the old deadline; failed/cancelled attempts
     /// never extend it. The caller owns/schedules this future. No lease resurrection.
     pub async fn renew(
+        &self,
+        handle: &SourceHandle,
+        lifetime: Duration,
+    ) -> Result<SharedRenewal, SharedFailure> {
+        self.renewal.renew(handle, lifetime).await
+    }
+
+    pub async fn renew_after_eof(
+        &self,
+        handle: &SourceHandle,
+        lifetime: Duration,
+    ) -> Result<SharedRenewal, SharedFailure> {
+        self.renewal.renew_after_eof(handle, lifetime).await
+    }
+}
+impl RenewalContext {
+    async fn renew_inner(
         &self,
         handle: &SourceHandle,
         lifetime: Duration,

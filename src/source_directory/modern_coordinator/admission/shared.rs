@@ -55,7 +55,8 @@ pub struct SharedInputs {
     owner: Arc<ModernSourceCoordinator>,
     id: Arc<()>,
     failures: Mutex<HashMap<String, FailureSlot>>,
-    workers: Mutex<Registry>,
+    workers: Arc<Mutex<Registry>>,
+    renewal: Arc<renewal::RenewalContext>,
 }
 struct Registry {
     workers: HashMap<String, Weak<Worker>>,
@@ -65,6 +66,7 @@ struct Worker {
     id: Uuid,
     registry: Arc<()>,
     owner: Arc<ModernSourceCoordinator>,
+    renewal: Weak<renewal::RenewalContext>,
     handle: super::super::SourceHandle,
     route: Mutex<super::super::CoordinatedCandidate>,
     scope: Option<super::super::ReplicaRoute>,
@@ -365,14 +367,17 @@ impl SharedInputs {
             .map_err(|e| SharedFailure::Authority(AdmissionFailure::Coordination(e)))
     }
     pub fn new(owner: Arc<ModernSourceCoordinator>) -> Self {
+        let workers = Arc::new(Mutex::new(Registry {
+            workers: HashMap::new(),
+            epoch: Arc::new(()),
+        }));
+        let renewal = Arc::new(renewal::RenewalContext::new(owner.clone(), workers.clone()));
         Self {
             owner,
             id: Arc::new(()),
             failures: Mutex::new(HashMap::new()),
-            workers: Mutex::new(Registry {
-                workers: HashMap::new(),
-                epoch: Arc::new(()),
-            }),
+            workers,
+            renewal,
         }
     }
     /// Consume opaque replica admission with its selected-route fence intact.
@@ -520,6 +525,7 @@ impl SharedInputs {
                             id: Uuid::new_v4(),
                             registry: self.id.clone(),
                             owner: self.owner.clone(),
+                            renewal: Arc::downgrade(&self.renewal),
                             handle: admission.candidate().handle.clone(),
                             route: Mutex::new(copy_route(admission.candidate())),
                             scope: admission.selection().cloned(),
@@ -707,6 +713,26 @@ impl AsyncWrite for QueueWriter<'_> {
         Poll::Ready(Ok(()))
     }
 }
+fn allow_clean_eof_reopen(
+    eofs: &mut VecDeque<std::time::Instant>,
+    now: std::time::Instant,
+    media_progressed: bool,
+) -> bool {
+    if media_progressed {
+        while eofs
+            .front()
+            .is_some_and(|old| now.saturating_duration_since(*old) >= Duration::from_secs(30))
+        {
+            eofs.pop_front();
+        }
+    }
+    if eofs.len() >= 4 {
+        return false;
+    }
+    eofs.push_back(now);
+    true
+}
+
 impl SharedInput {
     /// Run this unique input in the caller's task. Drop/abort closes the generation.
     pub async fn run(self) -> Result<(), SharedFailure> {
@@ -724,49 +750,106 @@ impl SharedInput {
             required,
         };
         let (tx, mut metadata) = oneshot::channel();
-        let pull = self.input.pull_guarded_classified(
-            &mut output,
-            Some(&worker.hub),
-            tx,
-            crate::m4_ingest::PullOptions {
-                preserve: worker.options.preserve_subtitles,
-                detected: Some(&worker.detected),
-                conversion: worker.options.conversion.as_deref(),
-                ..Default::default()
-            },
-            &authority,
-        );
-        tokio::pin!(pull);
+        let mut sender = Some(tx);
+        let mut m4f = crate::m4_ingest::m4f_session::M4fSession::default();
+        let mut rapid_eofs = VecDeque::new();
+        let mut last_eof_segments = 0;
         let mut metadata_pending = true;
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tokio::select! { biased;
-                _=worker.cancel.cancelled()=>return Err(SharedFailure::Closed),
-                _=worker.changed.notified()=>worker.current()?,
-                _=tick.tick()=>worker.current()?,
-                tracks = &mut metadata, if metadata_pending => {
-                    metadata_pending = false;
-                    if let Ok(tracks) = tracks {
-                        worker.current()?;
-                        worker.at_source_route(|_| {
-                            let commit=|| {
-                                if worker.active_viewer().is_none(){return Err(AdmissionFailure::Revoked);}
-                                *worker.tracks.lock().unwrap()=Some(tracks);
-                                worker.metadata_ready.notify_waiters();Ok(())
-                            };
-                            match &worker.scope {Some(scope)=>scope.accept_private(commit),None=>commit()}
-                        })?;
+            let result = {
+                let metadata_sender = sender.take();
+                let pull = async {
+                    let options = crate::m4_ingest::PullOptions {
+                        preserve: worker.options.preserve_subtitles,
+                        detected: Some(&worker.detected),
+                        conversion: worker.options.conversion.as_deref(),
+                        ..Default::default()
+                    };
+                    if worker.transport == crate::m4_ingest::flussonic::Transport::M4f {
+                        self.input
+                            .pull_m4f_session_guarded(
+                                &mut output,
+                                Some(&worker.hub),
+                                &mut m4f,
+                                metadata_sender,
+                                options,
+                                &authority,
+                            )
+                            .await
+                    } else {
+                        self.input
+                            .pull_guarded_classified(
+                                &mut output,
+                                Some(&worker.hub),
+                                metadata_sender.expect("M4S worker never reopens in place"),
+                                options,
+                                &authority,
+                            )
+                            .await
                     }
-                },
-                result = &mut pull => {
-                    worker.current()?;
-                    if let Err(kind)=result {
-                        worker.input_failed(kind,false)?;
+                };
+                tokio::pin!(pull);
+                loop {
+                    tokio::select! { biased;
+                        _=worker.cancel.cancelled()=>return Err(SharedFailure::Closed),
+                        _=worker.changed.notified()=>worker.current()?,
+                        _=tick.tick()=>worker.current()?,
+                        tracks = &mut metadata, if metadata_pending => {
+                            metadata_pending = false;
+                            if let Ok(tracks) = tracks {
+                                worker.current()?;
+                                worker.at_source_route(|_| {
+                                    let commit=|| {
+                                        if worker.active_viewer().is_none(){return Err(AdmissionFailure::Revoked);}
+                                        *worker.tracks.lock().unwrap()=Some(tracks);
+                                        worker.metadata_ready.notify_waiters();Ok(())
+                                    };
+                                    match &worker.scope {Some(scope)=>scope.accept_private(commit),None=>commit()}
+                                })?;
+                            }
+                        }
+                        result = &mut pull => break result,
+                    }
+                }
+            };
+            worker.current()?;
+            match result {
+                Err(crate::m4_ingest::flussonic::InputFailure::CleanControlEof)
+                    if worker.transport == crate::m4_ingest::flussonic::Transport::M4f =>
+                {
+                    let now = std::time::Instant::now();
+                    if !allow_clean_eof_reopen(
+                        &mut rapid_eofs,
+                        now,
+                        m4f.accepted_segments() > last_eof_segments,
+                    ) {
+                        worker.input_failed(
+                            crate::m4_ingest::flussonic::InputFailure::Transient,
+                            false,
+                        )?;
                         return Err(SharedFailure::Input);
                     }
-                    return Ok(());
+                    last_eof_segments = m4f.accepted_segments();
+                    let renewal = worker.renewal.upgrade().ok_or(SharedFailure::Closed)?;
+                    let refresh = renewal.renew_after_eof(&worker.handle, Duration::from_secs(3));
+                    tokio::pin!(refresh);
+                    loop {
+                        tokio::select! { biased;
+                            _=worker.cancel.cancelled()=>return Err(SharedFailure::Closed),
+                            _=worker.changed.notified()=>worker.current()?,
+                            _=tick.tick()=>worker.current()?,
+                            result=&mut refresh=>{result?; break;}
+                        }
+                    }
+                    worker.current()?;
                 }
+                Err(kind) => {
+                    worker.input_failed(kind, false)?;
+                    return Err(SharedFailure::Input);
+                }
+                Ok(()) => return Ok(()),
             }
         }
     }
@@ -840,5 +923,43 @@ impl SharedInputs {
     pub(crate) fn take_failure(&self, name: &str) -> Option<FailureObservation> {
         let slot = self.failures.lock().ok()?.get(name)?.clone();
         slot.lock().ok()?.take()
+    }
+}
+
+#[cfg(test)]
+mod rapid_eof_tests {
+    use super::*;
+
+    #[test]
+    fn media_progress_expires_only_eofs_outside_the_rolling_window() {
+        let base = std::time::Instant::now();
+        let mut eofs = VecDeque::new();
+        assert!(allow_clean_eof_reopen(&mut eofs, base, false));
+        for seconds in [20, 40, 60, 80] {
+            assert!(allow_clean_eof_reopen(
+                &mut eofs,
+                base + Duration::from_secs(seconds),
+                true
+            ));
+        }
+        assert_eq!(eofs.len(), 2);
+    }
+
+    #[test]
+    fn no_new_media_keeps_the_eof_cap_even_when_closes_are_spaced_out() {
+        let base = std::time::Instant::now();
+        let mut eofs = VecDeque::new();
+        for seconds in [0, 20, 40, 60] {
+            assert!(allow_clean_eof_reopen(
+                &mut eofs,
+                base + Duration::from_secs(seconds),
+                false
+            ));
+        }
+        assert!(!allow_clean_eof_reopen(
+            &mut eofs,
+            base + Duration::from_secs(80),
+            false
+        ));
     }
 }

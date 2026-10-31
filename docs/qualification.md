@@ -1,5 +1,61 @@
 # Preview qualification
 
+## Authority-checked M4F control reconnect (2026-10-30)
+
+An owned local origin now closes an established M4F control stream after a
+complete, privately acknowledged segment. FlussoniX obtains a fresh full
+catalog for the same source, opens a new playback session, and continues with
+the same media worker and packager PID. Replayed announcements are skipped
+before fetch. An isolated vendor-origin/CDN daemon test closed control twice:
+the first renewed session replayed the old timestamp without a second fetch;
+the next announced a new timestamp, fetched it once, and delivered distinct
+native media timestamps with the original packager PID. A two-GOP MPEG-TS
+fixture retained per-PID continuity counters and decoded with FFmpeg. Owned
+cases also close the old worker for an uncovered forward announcement, a
+contiguous announcement whose first served audio/video frame is far ahead,
+an unknown backward timestamp, changed audio/video metadata, or a fifth
+rapid EOF after four reopens. Sparse subtitle presence remains compatible;
+older EOFs leave the rolling 30-second budget only after new media progress.
+The focused run passed 48 packaging, 11 renewal, 69 daemon playback, and
+51 daemon failover tests. All-target Clippy passed with warnings denied.
+
+Held-renewal tests reject stream removal, disablement, changed origin ID,
+locally pinned group mismatch, changed source relationship, source/configuration
+or processing edits, expired demand, and last-viewer revocation before another
+control request. One revoked viewer stays closed when a second authorized
+viewer keeps the worker. Four EOF renewal slots and a five-second/remaining-
+lease deadline bound the new path; scheduled and EOF renewals share a
+per-source gate. M4S/M4SS behavior and vendor wire formats are unchanged.
+An owned five-origin fixture now holds four distinct source catalogs in
+renewal concurrently and observes the fifth begin only after one finishes.
+Changing the limit to three or five makes the test fail at the respective
+boundary; the restored four-slot implementation passes all 12 renewal tests.
+This qualifies the renewal budget, not production media throughput.
+
+The full `cargo test` run passed 2,683 tests across 189 result targets, with
+36 intentionally ignored hardware or extended-load cases and zero failures.
+`cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` passed.
+A 45-second read-only private M4F comparison against the approved cdn4 origin
+found nine matching, actually served timestamps in the aligned source/CDN
+range, with no source-only or CDN-only timestamp there. The source served 13
+segments and the isolated CDN served nine overall; observation edges differed.
+The probe's temporary daemon and owner-only files were removed.
+
+A later read-only 600-second comparison, with a control-read observer timeout
+above the private input's 15-second deadline, matched all 106 origin-served
+timestamps in its fixed measurement window through the isolated CDN. Both
+sides returned four control HTTP 503s during startup; the CDN then ran without
+a control reconnect, read error, or missing measured timestamp. An earlier
+300-second comparison using an eight-second observer timeout missed four
+origin-served timestamps. That timeout may have induced a probe reconnect,
+but the cause of the miss was not proved. All temporary media and processes
+were removed.
+
+These samples do not establish that a live Flussonic origin will replay
+every missing announcement or keep every segment available during an outage.
+Sustained read-only source/CDN parity, production capacity, and exact-head CI
+remain release gates.
+
 ## Bounded vendor M4F recovery after an origin outage (2026-10-29)
 
 A paired five-minute read-only run against the authorized cdn4 source found
@@ -24,8 +80,13 @@ requests. Its temporary daemons and files were removed.
 
 This check shows recovery and compatible media after a live source outage; it
 does not establish gapless delivery, a sustained post-change source/CDN
-timestamp match, or production capacity. Exact-head CI and those release gates
-remain open.
+timestamp match, or production capacity. The exact PR17 head `4cb0f18` passed
+[full verification](https://github.com/Delitants/FlussoniX/actions/runs/40985266390)
+and publication-safety CI on 2026-10-30. A diff-scoped security review of the
+four changed source files found no candidate vulnerabilities; it was not a
+whole-repository audit. The 35 local package and service-preview regression
+tests passed on the same runtime source. Source/CDN continuity and production
+capacity remain open release gates.
 
 Two subsequent five-minute read-only comparisons used the exact PR candidate
 against the authorized origin and an isolated local CDN. The first observed 53

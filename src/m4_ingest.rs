@@ -2,6 +2,7 @@
 pub(crate) mod authority;
 mod bootstrap;
 pub mod flussonic;
+pub(crate) mod m4f_session;
 pub(crate) mod records;
 use crate::{
     m4s::{Decoder, Event, PackedGop, Track},
@@ -13,7 +14,6 @@ use bytes::{Bytes, BytesMut};
 use flussonic::diagnostic::{Diagnostics, Phase};
 use futures_util::StreamExt;
 use std::{
-    collections::VecDeque,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -223,6 +223,7 @@ pub(crate) struct PullOptions<'a> {
     pub conversion: Option<&'a crate::caption_hls::State>,
     pub failure: Option<&'a std::sync::atomic::AtomicU8>,
     pub diagnostic: Option<&'a Diagnostics>,
+    pub classify_clean_eof: bool,
 }
 pub(crate) async fn pull_ready_with_options<W: AsyncWrite + Unpin>(
     input: &str,
@@ -386,10 +387,34 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
     requests: &Requests,
     output: &mut W,
     hub: Option<&Hub>,
-    mut metadata: Option<oneshot::Sender<Vec<Track>>>,
+    metadata: Option<oneshot::Sender<Vec<Track>>>,
     subtitles: PullOptions<'_>,
     authority: Authority<'_>,
 ) -> Result<(), String> {
+    let mut session = m4f_session::M4fSession::default();
+    consume_guarded_session(
+        requests,
+        output,
+        hub,
+        metadata,
+        subtitles,
+        Some(&mut session),
+        authority,
+    )
+    .await
+}
+
+async fn consume_guarded_session<W: AsyncWrite + Unpin>(
+    requests: &Requests,
+    output: &mut W,
+    hub: Option<&Hub>,
+    mut metadata: Option<oneshot::Sender<Vec<Track>>>,
+    subtitles: PullOptions<'_>,
+    session: Option<&mut m4f_session::M4fSession>,
+    authority: Authority<'_>,
+) -> Result<(), String> {
+    let mut fallback = m4f_session::M4fSession::default();
+    let session = session.unwrap_or(&mut fallback);
     check_authority(authority)?;
     let mut writer = flussonic::failure::Writer {
         output,
@@ -461,25 +486,51 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
     let mut stream = response.bytes_stream();
     let mut decoder = Decoder::default();
     let mut signals = Signals::default();
-    let mut tracks = Vec::new();
-    let mut declared = None;
-    let mut muxer = None;
-    let mut seen: VecDeque<String> = VecDeque::new();
-    let mut skipped_startup_segment = None;
     loop {
         Diagnostics::phase(subtitles.diagnostic, Phase::ControlRead);
         let bytes = tokio::time::timeout(Duration::from_secs(15), stream.next())
             .await
             .map_err(|_| transient("source timed out"))?
-            .ok_or_else(|| transient("source closed"))?
+            .ok_or_else(|| {
+                if subtitles.classify_clean_eof && is_m4f && !signals.pending.is_empty() {
+                    flussonic::failure::record(
+                        subtitles.failure,
+                        flussonic::InputFailure::Invalid,
+                        "incomplete M4F signal",
+                    )
+                } else if subtitles.classify_clean_eof
+                    && is_m4f
+                    && session.accepted_segments > 0
+                    && !session.tracks.is_empty()
+                    && session.muxer.is_some()
+                {
+                    session.reconnect();
+                    flussonic::failure::record(
+                        subtitles.failure,
+                        flussonic::InputFailure::CleanControlEof,
+                        "source closed",
+                    )
+                } else {
+                    transient("source closed")
+                }
+            })?
             .map_err(|_| transient("transport failed"))?;
         check_authority(authority)?;
         if is_m4f {
             Diagnostics::phase(subtitles.diagnostic, Phase::SignalDecode);
             for n in signals.push(&bytes)? {
                 check_authority(authority)?;
-                if seen.contains(&n.name) || skipped_startup_segment.as_ref() == Some(&n.name) {
-                    continue;
+                match session.classify_notification(&n) {
+                    Ok(m4f_session::ReplayDecision::Skip) => continue,
+                    Ok(m4f_session::ReplayDecision::Publish) => {}
+                    Err(kind) => {
+                        return Err(flussonic::failure::record(
+                            subtitles.failure,
+                            kind,
+                            "M4F source timeline changed",
+                        )
+                        .into());
+                    }
                 }
                 let mut url = requests.base.clone();
                 url.set_path(&format!("{}/{}", requests.base.path(), n.name));
@@ -515,8 +566,8 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                     // Before any metadata, allow one distinct missing object and
                     // keep the existing control session for the next GOP. Worker
                     // startup/cancellation deadlines still own this entire wait.
-                    if tracks.is_empty() && skipped_startup_segment.is_none() {
-                        skipped_startup_segment = Some(n.name);
+                    if session.tracks.is_empty() && session.skipped_startup_segment.is_none() {
+                        session.skipped_startup_segment = Some(n.name);
                         tracing::debug!(
                             target: "flussonix::private_input",
                             protocol = "m4f",
@@ -555,36 +606,48 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                     }
                 }
                 let source_start = frames.iter().map(|f| f.dts).min();
+                let media_start = m4f_session::M4fSession::media_start(&new, &frames);
                 let source_tracks = new.clone();
-                let (body, new, frames) = if !preserve && new.iter().any(|t| t.codec == "subtitle")
-                {
-                    let filtered = crate::native_subtitles::segment(&body)?;
-                    let (new, frames) = crate::m4f::unpack(&filtered)?;
-                    (filtered, new, frames)
-                } else {
-                    (body, new, frames)
-                };
+                let (body, new, mut frames) =
+                    if !preserve && new.iter().any(|t| t.codec == "subtitle") {
+                        let filtered = crate::native_subtitles::segment(&body)?;
+                        let (new, frames) = crate::m4f::unpack(&filtered)?;
+                        (filtered, new, frames)
+                    } else {
+                        (body, new, frames)
+                    };
                 if frames.is_empty() {
                     return Err("empty M4F segment".into());
                 }
+                if let Err(kind) = session.check_served_timeline(&n, media_start) {
+                    return Err(flussonic::failure::record(
+                        subtitles.failure,
+                        kind,
+                        "M4F source media timeline changed",
+                    )
+                    .into());
+                }
                 configs(
                     stdin,
-                    &mut tracks,
-                    &mut declared,
-                    &mut muxer,
+                    &mut session.tracks,
+                    &mut session.declared,
+                    &mut session.muxer,
                     source_tracks,
                     &mut metadata,
                     policy,
                 )
                 .await?;
+                // Only worker-bound samples are retimed. `body`, the native
+                // relay object, still contains the source's original clocks.
+                Diagnostics::phase(subtitles.diagnostic, Phase::BridgeFrame);
+                session
+                    .muxer
+                    .as_ref()
+                    .ok_or("native frame before metadata")?
+                    .retime_video_boundary(&mut frames)?;
                 if let Some(hub) = hub {
                     // A paced bridge can block within this GOP. Validate all
                     // samples before exposing the original native relay object.
-                    Diagnostics::phase(subtitles.diagnostic, Phase::BridgeFrame);
-                    muxer
-                        .as_ref()
-                        .ok_or("native frame before metadata")?
-                        .validate_frames(&frames)?;
                     Diagnostics::phase(subtitles.diagnostic, Phase::Relay);
                     check_authority(authority)?;
                     let gop = PackedGop {
@@ -597,7 +660,7 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                     hub.relay_segment(
                         Segment {
                             name: n.name.clone(),
-                            signal: n.wire,
+                            signal: n.wire.clone(),
                             bytes: body,
                         },
                         new.clone(),
@@ -605,21 +668,18 @@ async fn consume_guarded<W: AsyncWrite + Unpin>(
                     )?;
                 }
                 for f in &frames {
-                    write_frame(stdin, &mut muxer, f, subtitles.diagnostic).await?;
+                    write_frame(stdin, &mut session.muxer, f, subtitles.diagnostic).await?;
                 }
-                seen.push_back(n.name);
-                if seen.len() > 16 {
-                    seen.pop_front();
-                }
+                session.published(&n, media_start);
             }
         } else {
             Diagnostics::phase(subtitles.diagnostic, Phase::M4sDecode);
             records::events(
                 stdin,
                 records::State {
-                    tracks: &mut tracks,
-                    declared: &mut declared,
-                    muxer: &mut muxer,
+                    tracks: &mut session.tracks,
+                    declared: &mut session.declared,
+                    muxer: &mut session.muxer,
                     metadata: &mut metadata,
                 },
                 hub,

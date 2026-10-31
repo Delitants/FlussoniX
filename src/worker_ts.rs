@@ -245,6 +245,43 @@ impl Muxer {
         }
         Ok(())
     }
+    /// Correct a tiny video clock overlap at a GOP boundary for the TS worker.
+    /// The native M4F object remains byte-for-byte unchanged by the caller.
+    pub fn retime_video_boundary(&self, frames: &mut [Frame]) -> Result<(), String> {
+        const MAX_OVERLAP_TICKS: u64 = 450; // Five milliseconds at 90 kHz.
+        let mut seen = vec![false; self.streams.len()];
+        for frame in frames.iter_mut() {
+            let Some(index) = self.stream_index(frame)? else {
+                continue;
+            };
+            if seen[index] {
+                continue;
+            }
+            seen[index] = true;
+            let stream = &self.streams[index];
+            if !stream.kind.is_video() {
+                continue;
+            }
+            let Some(prior) = stream.last_dts else {
+                continue;
+            };
+            if frame.dts >= prior {
+                continue;
+            }
+            if !frame.key || prior - frame.dts > MAX_OVERLAP_TICKS {
+                return Err("worker track DTS goes backwards".into());
+            }
+            let next = prior.checked_add(1).ok_or("worker DTS outside timeline")?;
+            let delta =
+                i64::try_from(next - frame.dts).map_err(|_| "worker DTS outside timeline")?;
+            frame.pts_offset = frame
+                .pts_offset
+                .checked_sub(delta)
+                .ok_or("worker PTS outside timeline")?;
+            frame.dts = next;
+        }
+        self.validate_frames(frames)
+    }
     pub fn frame(&mut self, f: &Frame) -> Result<Vec<u8>, String> {
         let Some(index) = self.stream_index(f)? else {
             return Ok(Vec::new());

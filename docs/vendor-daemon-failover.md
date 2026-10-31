@@ -20,6 +20,32 @@ no other source is inferred to carry equivalent content. Each stream keeps its
 own viewer policy, including upstream group overrides. Recovery uses the same
 original permission, recent viewer demand and bounded backoff described below.
 
+An established M4F input can keep its worker and packager when its authenticated
+control stream ends cleanly after at least one complete segment. Before opening
+a new control session, it fetches a fresh, complete catalog for that exact
+source. Scheduled and EOF renewals serialize per source; EOF renewal has a
+five-second maximum, cannot outlive the old lease, and uses one of four EOF
+slots per registry. Removal, changed source identity or policy, mismatched
+group pins, configuration edits, expired demand, and last-viewer revocation
+close the old worker. A revoked viewer stays closed even if another viewer
+keeps the shared worker active.
+An owned five-origin renewal fixture verifies that four distinct catalogs can
+be in flight and the fifth waits for one slot to finish; it does not measure
+media processing capacity.
+
+The reopened M4F control gets a new playback-session ID. Replayed segment names
+are skipped before media fetch; the MPEG-TS muxer keeps its timestamps and
+continuity counters. A changed audio/video track map, unknown backward source
+timestamp, first novel announcement beyond the last published duration plus
+one second, or a contiguous announcement whose first served audio/video frame
+is far ahead closes the worker for supervised recovery. Sparse subtitle
+presence may change. A fifth EOF within the rolling 30-second budget falls
+back to supervision; old EOFs expire only after new media progress. This can
+preserve playback only when the origin replays
+the missing announcements and still serves their media. It cannot recover a
+segment that has disappeared from the origin's memory window. M4S/M4SS and
+other transport formats retain their existing reconnect behavior.
+
 The daemon shares one private input and packager across viewers. A healthy
 backup stays selected when a preferred origin returns. Temporary management or
 private-media failures can select another member. The selected origin's fresh
@@ -48,9 +74,10 @@ Control400/404 and authorization401/403 still block rotation, as do segment200/4
 responses with invalid or missing acknowledgments. Other segment400 responses,
 including missing, duplicate or altered `no_dvr` reasons, remain rejected.
 Native inputs cannot use these private exceptions. Existing5xx failures remain
-transient even without acknowledgment. Source/viewer revocation takes precedence; no credential
-fallback, control reconnect or retry of the missing object is introduced. This distinction does not prove
-why a particular reference segment was missing or promise seamless recovery.
+transient even without acknowledgment. Source/viewer revocation takes
+precedence; these unavailable-object errors introduce no credential fallback
+or retry of the missing object. They do not prove why a particular reference
+segment was missing or promise seamless recovery.
 
 On-demand recovery uses original native viewer permission and recent playback
 demand. [Selected static streams](vendor-static-activation.md) recover through

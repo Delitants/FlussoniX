@@ -26,6 +26,45 @@ pub struct MediaInput {
     requests: Requests,
 }
 impl MediaInput {
+    pub(crate) async fn pull_m4f_session_guarded<W: AsyncWrite + Unpin>(
+        &self,
+        output: &mut W,
+        hub: Option<&Hub>,
+        state: &mut super::m4f_session::M4fSession,
+        metadata: Option<oneshot::Sender<Vec<Track>>>,
+        options: PullOptions<'_>,
+        authority: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<(), InputFailure> {
+        if self.transport() != Transport::M4f {
+            return Err(InputFailure::Invalid);
+        }
+        let slot = std::sync::atomic::AtomicU8::new(InputFailure::Invalid as u8);
+        let diagnostic = diagnostic::Diagnostics::default();
+        let mut options = options;
+        options.failure = Some(&slot);
+        options.diagnostic = Some(&diagnostic);
+        options.classify_clean_eof = true;
+        super::consume_guarded_session(
+            &self.requests,
+            output,
+            hub,
+            metadata,
+            options,
+            Some(state),
+            Some(authority),
+        )
+        .await
+        .map_err(|_| {
+            let kind = if !authority() {
+                InputFailure::Revoked
+            } else {
+                failure::read(&slot)
+            };
+            diagnostic.report(self.transport(), kind);
+            kind
+        })
+    }
+
     pub(crate) fn transport(&self) -> Transport {
         if self.requests.is_m4f {
             Transport::M4f
@@ -240,6 +279,176 @@ pub(super) fn media_headers(key: &str, name: &str, timestamp: u64) -> HeaderMap 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::m4f::Frame;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::AsyncWrite;
+
+    struct BrokenWriter;
+    impl AsyncWrite for BrokenWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // Break caught: an established, accepted M4F control EOF is confused with
+    // a 503, malformed signal, denied segment, or failed local media pipe.
+    #[tokio::test]
+    async fn clean_m4f_eof_after_acknowledged_media_is_typed() {
+        use axum::{
+            Router, body::Body, extract::OriginalUri, http::StatusCode, response::Response,
+            routing::get,
+        };
+        #[derive(Clone, Copy)]
+        enum Case {
+            Complete,
+            BeforeMedia,
+            Unavailable,
+            Malformed,
+            TruncatedAfterMedia,
+            DeniedSegment,
+            BrokenPipe,
+        }
+        let track = Track {
+            id: 1,
+            codec: "mp3".into(),
+            config: vec![],
+        };
+        let segment = crate::m4f::pack(
+            std::slice::from_ref(&track),
+            &[Frame {
+                track_id: 1,
+                dts: 90_000,
+                pts_offset: 0,
+                key: true,
+                body: include_bytes!("../../tests/fixtures/codecs/mp3.bin").to_vec(),
+            }],
+            180_000,
+        )
+        .unwrap();
+        for (case, expected) in [
+            (Case::Complete, "CleanControlEof"),
+            (Case::BeforeMedia, "Transient"),
+            (Case::Unavailable, "Transient"),
+            (Case::Malformed, "Invalid"),
+            (Case::TruncatedAfterMedia, "Invalid"),
+            (Case::DeniedSegment, "Rejected"),
+            (Case::BrokenPipe, "Local"),
+        ] {
+            let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let root = format!("http://{}", tcp.local_addr().unwrap());
+            let bytes = segment.clone();
+            let router = Router::new().fallback(get(move |OriginalUri(uri): OriginalUri| {
+                let bytes = bytes.clone();
+                async move {
+                    let mut response = if uri.path() == "/owned/m4f" {
+                        match case {
+                            Case::Complete | Case::DeniedSegment | Case::BrokenPipe => {
+                                Response::new(Body::from("1 2026/10/17/00/00/00-2000\n"))
+                            }
+                            Case::BeforeMedia => Response::new(Body::empty()),
+                            Case::Malformed => Response::new(Body::from("bad\n")),
+                            Case::TruncatedAfterMedia => {
+                                Response::new(Body::from("1 2026/10/17/00/00/00-2000\nbad"))
+                            }
+                            Case::Unavailable => {
+                                let mut r = Response::new(Body::empty());
+                                *r.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                                r
+                            }
+                        }
+                    } else {
+                        assert_eq!(uri.path(), "/owned/2026/10/17/00/00/00.m4f");
+                        let mut r = Response::new(Body::from(bytes));
+                        if matches!(case, Case::DeniedSegment) {
+                            *r.status_mut() = StatusCode::FORBIDDEN;
+                        }
+                        r
+                    };
+                    response
+                        .headers_mut()
+                        .insert("cluster-auth", "yes".parse().unwrap());
+                    response
+                }
+            }));
+            let server = tokio::spawn(async move { axum::serve(tcp, router).await.unwrap() });
+            let input = MediaInput::new(&root, "owned", Transport::M4f, "owned-key", None).unwrap();
+            let hub = Hub::new();
+            let (tx, rx) = oneshot::channel();
+            let mut session = super::super::m4f_session::M4fSession::default();
+            let kind = if matches!(case, Case::BrokenPipe) {
+                input
+                    .pull_m4f_session_guarded(
+                        &mut BrokenWriter,
+                        Some(&hub),
+                        &mut session,
+                        Some(tx),
+                        PullOptions::default(),
+                        &|| true,
+                    )
+                    .await
+                    .unwrap_err()
+            } else {
+                let mut output = Vec::new();
+                let kind = input
+                    .pull_m4f_session_guarded(
+                        &mut output,
+                        Some(&hub),
+                        &mut session,
+                        Some(tx),
+                        PullOptions::default(),
+                        &|| true,
+                    )
+                    .await
+                    .unwrap_err();
+                if matches!(case, Case::Complete | Case::TruncatedAfterMedia) {
+                    assert!(!output.is_empty());
+                    assert!(hub.has_info());
+                } else {
+                    assert!(output.is_empty());
+                }
+                kind
+            };
+            if matches!(case, Case::Complete) {
+                let (legacy_tx, legacy_rx) = oneshot::channel();
+                let legacy = input
+                    .pull_guarded_classified(
+                        &mut Vec::new(),
+                        None,
+                        legacy_tx,
+                        PullOptions::default(),
+                        &|| true,
+                    )
+                    .await;
+                assert_eq!(legacy, Err(InputFailure::Transient));
+                assert_eq!(legacy_rx.await.unwrap(), vec![track.clone()]);
+            }
+            server.abort();
+            let _ = server.await;
+            if matches!(
+                case,
+                Case::Complete | Case::TruncatedAfterMedia | Case::BrokenPipe
+            ) {
+                assert_eq!(rx.await.unwrap(), vec![track.clone()]);
+            } else {
+                assert!(rx.await.is_err());
+            }
+            assert_eq!(format!("{kind:?}"), expected);
+        }
+    }
     // Break caught: inventory hash, wrong byte ordering, minutes/milliseconds,
     // or a credential header without the sensitive diagnostic marker.
     #[test]
