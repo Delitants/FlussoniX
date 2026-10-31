@@ -31,6 +31,8 @@ Implement shared packetization/depacketization for RTSP-controlled sessions and 
 
 Maintain per-source SSRC and sequence state, bounded reorder/jitter buffers, timestamp rollover handling, loss counters and RTCP sender/receiver reports. Map RTP timestamps to the encoded timeline and use sender reports for available wall-clock synchronization. Transmit with bounded pacing and MTU-aware packetization. [RTP/RTCP](https://www.rfc-editor.org/rfc/rfc3550.html)
 
+Direct RTP and SRTP input now offers an optional per-track public RTP socket receive buffer of 0.0625–32 MiB in Streams and Templates. The saved `flussonix_rtp.receive_buffer_bytes` value is in bytes; blank retains the host default. RTCP and output sockets are unaffected. The kernel must grant the request or the input fails startup with a receive-buffer error and releases its ports. On Linux, `net.core.rmem_max` may need adjustment. This setting does not establish the cause of the archived HEVC picture loss.
+
 Initial codec coverage follows the server's H.264/H.265/AAC core; add camera audio payload profiles as explicit tested capabilities. Unicast/multicast configuration includes bind interface, destination, RTP/RTCP ports and multicast scope. Raw RTP does not create an HTTP-style token exchange: authorization must bind an approved configured or negotiated session to its media endpoint.
 
 ## SRTP and SRTCP

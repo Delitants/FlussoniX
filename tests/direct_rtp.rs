@@ -80,3 +80,52 @@ fn input_interface_must_match_bind_address_or_restrict_wildcard() {
         );
     }
 }
+
+#[test]
+fn receive_buffer_request_persists_for_input_and_rejects_output_or_invalid_size() {
+    let owned = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(owned.path().join("config.json")).unwrap();
+    store
+        .put(
+            "templates",
+            "buffered",
+            json!({"inputs":[{"url":"rtp://127.0.0.1:39002","flussonix_rtp":{"receive_buffer_bytes":1048576}}]}),
+        )
+        .unwrap();
+    store
+        .put("streams", "inherited", json!({"template":"buffered"}))
+        .unwrap();
+    assert_eq!(
+        store.effective("inherited").unwrap()["inputs"][0]["flussonix_rtp"]["receive_buffer_bytes"],
+        1048576
+    );
+    let before = store.snapshot();
+    for size in [
+        json!(0),
+        json!(65535),
+        json!(33554433),
+        json!(-1),
+        json!("1048576"),
+    ] {
+        assert!(
+            store
+                .put(
+                    "streams",
+                    "invalid",
+                    json!({"inputs":[{"url":"rtp://127.0.0.1:39002","flussonix_rtp":{"receive_buffer_bytes":size}}]}),
+                )
+                .is_err(),
+            "accepted invalid receive buffer {size}"
+        );
+    }
+    assert!(
+        store
+            .put(
+                "streams",
+                "invalid",
+                json!({"flussonix_rtp_outputs":[{"url":"rtp://127.0.0.1:39002","flussonix_rtp":{"receive_buffer_bytes":1048576}}]}),
+            )
+            .is_err()
+    );
+    assert_eq!(store.snapshot(), before);
+}
