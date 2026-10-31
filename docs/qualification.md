@@ -33,9 +33,10 @@ The assessor's passing memory threshold remains 512 MiB, below the scope limit.
 For gap attribution, add `--observe-source` to the runner. It polls only the
 two owned synthetic streams every 500 ms and adds bounded source-age episodes
 with the same elapsed-time base as viewer gaps. Poll errors and the largest
-observation interval remain visible; a gap across missing observations cannot
-be attributed. The option is off by default and does not change the release
-assessor or its pass criteria.
+observation interval remain visible. Timestamped error and delayed-poll
+intervals show where source evidence is missing; a viewer gap crossing one of
+those intervals cannot be attributed from source age alone. The option is off
+by default and does not change the release assessor or its pass criteria.
 
 Two ongoing owned runs have no viewer, TS sync, metadata or OOM errors so far,
 but each has already recorded a steady-media gap beyond three seconds. They

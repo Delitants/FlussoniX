@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import select
 import shutil
 import signal
 import socket
@@ -169,14 +170,84 @@ def api(opener, port, password, path, method='GET', body=None):
 def source_stats(opener, port, password, stream):
     if stream not in STREAMS:
         raise ValueError('source observation is limited to owned streams')
-    request = urllib.request.Request(
-        f'http://127.0.0.1:{port}/streamer/api/v3/streams/{stream}',
-        headers={'Authorization': 'Basic ' + base64.b64encode(
-            f'admin:{password}'.encode()).decode()})
-    with opener.open(request, timeout=1) as response:
-        payload = response.read(1_000_001)
-        if response.status != 200 or len(payload) > 1_000_000:
-            raise RuntimeError('source stats response invalid or exceeds 1 MiB')
+    # The ordinary urllib timeout is an idle timeout: a byte-by-byte response
+    # can otherwise hold the observer (and final report snapshot) indefinitely.
+    del opener
+    deadline = time.monotonic() + 1
+    auth = base64.b64encode(f'admin:{password}'.encode()).decode()
+    request = (f'GET /streamer/api/v3/streams/{stream} HTTP/1.0\r\n'
+               f'Host: 127.0.0.1\r\nAuthorization: Basic {auth}\r\n'
+               'Connection: close\r\n\r\n').encode()
+    with socket.create_connection(('127.0.0.1', port), timeout=1) as connection:
+        connection.setblocking(False)
+        sent = 0
+        while sent < len(request):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('source stats deadline exceeded')
+            _, writable, _ = select.select([], [connection], [], remaining)
+            if not writable:
+                raise TimeoutError('source stats deadline exceeded')
+            try:
+                sent += connection.send(request[sent:])
+            except BlockingIOError:
+                continue
+        raw = bytearray()
+        header_end = None
+        content_length = None
+        while True:
+            if header_end is not None and content_length is not None \
+                    and len(raw) - header_end >= content_length:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('source stats deadline exceeded')
+            readable, _, _ = select.select([connection], [], [], remaining)
+            if not readable:
+                raise TimeoutError('source stats deadline exceeded')
+            try:
+                chunk = connection.recv(16 * 1024)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                if header_end is None or (content_length is not None
+                                           and len(raw) - header_end < content_length):
+                    raise RuntimeError('source stats response truncated')
+                break
+            raw.extend(chunk)
+            if header_end is None:
+                header_start = raw.find(b'\r\n\r\n')
+                if header_start >= 0:
+                    header_end = header_start + 4
+                    if header_end > 16 * 1024:
+                        raise RuntimeError('source stats headers exceed limit')
+                    lines = bytes(raw[:header_start]).split(b'\r\n')
+                    if not re.fullmatch(rb'HTTP/1\.[01] 200(?: .*)?', lines[0]):
+                        raise RuntimeError('source stats response invalid')
+                    headers = {}
+                    for line in lines[1:]:
+                        name, separator, value = line.partition(b':')
+                        if not separator:
+                            raise RuntimeError('source stats headers invalid')
+                        name = name.strip().lower()
+                        if name in headers:
+                            raise RuntimeError('source stats duplicate header')
+                        headers[name] = value.strip()
+                    if b'transfer-encoding' in headers:
+                        raise RuntimeError('source stats transfer encoding unsupported')
+                    if b'content-length' in headers:
+                        value = headers[b'content-length']
+                        if not value.isdigit():
+                            raise RuntimeError('source stats length invalid')
+                        content_length = int(value)
+                        if content_length > 1_000_000:
+                            raise RuntimeError('source stats response exceeds 1 MiB')
+                elif len(raw) > 16 * 1024:
+                    raise RuntimeError('source stats headers exceed limit')
+            if header_end is not None and len(raw) - header_end > 1_000_000:
+                raise RuntimeError('source stats response exceeds 1 MiB')
+        payload = bytes(raw[header_end:header_end + content_length]
+                        if content_length is not None else raw[header_end:])
     try:
         data = json.loads(payload)
         stats = data['stats']
@@ -228,6 +299,11 @@ def new_source_record():
     return {
         'samples': 0, 'errors': 0, 'max_age_ms': 0,
         'max_poll_interval_ms': 0, 'last_poll_elapsed': None,
+        'last_success_elapsed': None,
+        'poll_gaps_over_750_ms_count': 0, 'first_poll_gap': None,
+        'last_poll_gap': None, 'poll_gaps': [],
+        'error_gaps_count': 0, 'first_error_gap': None,
+        'last_error_gap': None, 'error_gaps': [], 'open_error_gap': None,
         'stalls_over_1000_ms_count': 0, 'first_stall': None,
         'last_stall': None, 'stalls': [], 'open_stall': None,
     }
@@ -237,11 +313,33 @@ def _record_source_poll(record, elapsed):
     if record['last_poll_elapsed'] is not None:
         interval = round((elapsed - record['last_poll_elapsed']) * 1000)
         record['max_poll_interval_ms'] = max(record['max_poll_interval_ms'], interval)
+        if interval > 750:
+            gap = {'start_elapsed_seconds': record['last_poll_elapsed'],
+                   'end_elapsed_seconds': round(elapsed, 2),
+                   'interval_ms': interval}
+            record['poll_gaps_over_750_ms_count'] += 1
+            if record['first_poll_gap'] is None:
+                record['first_poll_gap'] = gap
+            record['last_poll_gap'] = gap
+            record['poll_gaps'].append(gap)
+            if len(record['poll_gaps']) > GAP_EVENT_LIMIT:
+                del record['poll_gaps'][0]
     record['last_poll_elapsed'] = round(elapsed, 2)
 
 
 def record_source_sample(record, elapsed, age_ms, bytes_in):
     _record_source_poll(record, elapsed)
+    if record['open_error_gap'] is not None:
+        gap = record['open_error_gap']
+        gap['end_elapsed_seconds'] = round(elapsed, 2)
+        if record['error_gaps_count'] == 1:
+            record['first_error_gap'] = dict(gap)
+        record['last_error_gap'] = dict(gap)
+        record['error_gaps'].append(dict(gap))
+        if len(record['error_gaps']) > GAP_EVENT_LIMIT:
+            del record['error_gaps'][0]
+        record['open_error_gap'] = None
+    record['last_success_elapsed'] = round(elapsed, 2)
     record['samples'] += 1
     record['max_age_ms'] = max(record['max_age_ms'], age_ms)
     if age_ms > 1000:
@@ -275,6 +373,21 @@ def record_source_sample(record, elapsed, age_ms, bytes_in):
 def record_source_error(record, elapsed):
     _record_source_poll(record, elapsed)
     record['errors'] += 1
+    if record['open_error_gap'] is None:
+        prior = record['last_success_elapsed']
+        record['open_error_gap'] = {
+            'start_elapsed_seconds': prior if prior is not None else 0.0,
+            'first_error_elapsed_seconds': round(elapsed, 2),
+            'last_error_elapsed_seconds': round(elapsed, 2),
+            'errors': 1, 'had_prior_sample': prior is not None,
+        }
+        record['error_gaps_count'] += 1
+    else:
+        record['open_error_gap']['last_error_elapsed_seconds'] = round(elapsed, 2)
+        record['open_error_gap']['errors'] += 1
+    if record['error_gaps_count'] == 1:
+        record['first_error_gap'] = dict(record['open_error_gap'])
+    record['last_error_gap'] = dict(record['open_error_gap'])
     if record['open_stall'] is not None:
         record['open_stall']['observation_errors'] += 1
         if record['stalls_over_1000_ms_count'] == 1:
@@ -567,7 +680,7 @@ def main():
         finally:
             stop.set()
             if source_thread is not None:
-                source_thread.join(timeout=3)
+                source_thread.join()
             try:
                 terminate_owned_scope(group)
                 if process is not None:
@@ -594,6 +707,7 @@ def main():
                 if media_dir.exists():
                     shutil.rmtree(media_dir)
                 (state_dir / 'config.json').unlink(missing_ok=True)
+                (state_dir / 'config.json.node-id').unlink(missing_ok=True)
                 (state_dir / 'checkpoint.json').unlink(missing_ok=True)
             except OSError as exc:
                 report['state'] = 'failed'

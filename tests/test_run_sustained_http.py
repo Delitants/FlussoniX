@@ -37,7 +37,10 @@ def serve_source_responses(responses):
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def log_message(self, _format, *args):
             pass
@@ -170,6 +173,71 @@ class SustainedHttpRunnerTests(unittest.TestCase):
         self.assertEqual(record["errors"], 1)
         self.assertEqual(record["max_poll_interval_ms"], 2000)
         self.assertEqual(record["stalls"][0]["observation_errors"], 1)
+
+    def test_source_errors_locate_missing_evidence_between_successes(self):
+        runner = load_runner()
+        record = runner.new_source_record()
+        runner.record_source_sample(record, 1.0, 20, 100)
+        runner.record_source_error(record, 1.5)
+        runner.record_source_error(record, 2.0)
+        self.assertEqual(record["open_error_gap"]["start_elapsed_seconds"], 1.0)
+        self.assertEqual(record["open_error_gap"]["last_error_elapsed_seconds"], 2.0)
+        runner.record_source_sample(record, 2.5, 20, 200)
+        self.assertEqual(record["error_gaps_count"], 1)
+        self.assertEqual(record["error_gaps"], [{
+            "start_elapsed_seconds": 1.0, "first_error_elapsed_seconds": 1.5,
+            "last_error_elapsed_seconds": 2.0, "end_elapsed_seconds": 2.5,
+            "errors": 2, "had_prior_sample": True,
+        }])
+        self.assertIsNone(record["open_error_gap"])
+
+    def test_source_error_and_poll_gap_histories_are_bounded(self):
+        runner = load_runner()
+        record = runner.new_source_record()
+        for index in range(100):
+            runner.record_source_error(record, index * 2.0 + 0.5)
+            runner.record_source_sample(record, index * 2.0 + 1.0, 20, index)
+        self.assertEqual(record["error_gaps_count"], 100)
+        self.assertEqual(record["first_error_gap"]["first_error_elapsed_seconds"], 0.5)
+        self.assertEqual(record["last_error_gap"]["first_error_elapsed_seconds"], 198.5)
+        self.assertEqual(len(record["error_gaps"]), 32)
+        self.assertEqual(record["first_error_gap"]["had_prior_sample"], False)
+        self.assertEqual(record["poll_gaps_over_750_ms_count"], 99)
+        self.assertEqual(len(record["poll_gaps"]), 32)
+        self.assertEqual(record["first_poll_gap"]["start_elapsed_seconds"], 1.0)
+        self.assertEqual(record["last_poll_gap"]["end_elapsed_seconds"], 198.5)
+
+    def test_source_stats_trickle_has_absolute_deadline(self):
+        runner = load_runner()
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listener.settimeout(2)
+        server_stop = threading.Event()
+
+        def serve():
+            try:
+                connection, _ = listener.accept()
+                with connection:
+                    connection.recv(4096)
+                    connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n")
+                    while not server_stop.wait(0.05):
+                        connection.sendall(b"x")
+            except OSError:
+                pass
+
+        server = threading.Thread(target=serve, daemon=True)
+        server.start()
+        start = time.monotonic()
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with self.assertRaises((OSError, RuntimeError)):
+                runner.source_stats(opener, listener.getsockname()[1], "secret", "soak_a")
+            self.assertLess(time.monotonic() - start, 1.5)
+        finally:
+            server_stop.set()
+            listener.close()
+            server.join(timeout=2)
 
     def test_source_stats_projects_only_counters_from_authenticated_response(self):
         runner = load_runner()
