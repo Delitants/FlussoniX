@@ -98,9 +98,16 @@ impl Fixture {
                 .is_ok()
         );
         let policy = app.resolve("owned").await.unwrap().policy;
+        let mut pending_viewer = viewer("pending", flow.proto());
+        if matches!(flow, Flow::Http) {
+            // The HTTP route forwards its full viewer query to on_play.
+            // Match that callback lane so this fixture exercises the held
+            // admission, rather than creating a second decision context.
+            pending_viewer.qs = "token=pending".into();
+        }
         let AuthOutcome::Allowed(pending) = app
             .playback_auth
-            .authorize_control(policy.clone(), viewer("pending", flow.proto()))
+            .authorize_control(policy.clone(), pending_viewer)
             .await
         else {
             panic!("pending viewer denied")

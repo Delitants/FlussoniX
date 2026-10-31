@@ -54,7 +54,15 @@ async fn background_renewal_inhibits_idle_cleanup_without_a_media_worker() {
     {
         let all = auth.entries.lock().unwrap();
         let entry = all.values().next().unwrap();
-        entry.state.lock().unwrap().next_check = Instant::now();
+        entry
+            .state
+            .lock()
+            .unwrap()
+            .callback_lanes
+            .values_mut()
+            .next()
+            .unwrap()
+            .next_check = Instant::now();
     }
     assert_eq!(controller.snapshot()["active_operations"], 0);
     let mut renewal = Box::pin(auth.renew_due());
