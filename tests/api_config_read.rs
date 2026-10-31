@@ -196,9 +196,8 @@ fn default_relative_config_path_creates_persistent_identity() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    if ready {
-        child.kill().unwrap();
-    }
+    // Reap the daemon even when startup times out, so the test cannot hang.
+    let _ = child.kill();
     let output = child.wait_with_output().unwrap();
     assert!(
         ready,
