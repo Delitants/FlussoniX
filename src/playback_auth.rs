@@ -2171,13 +2171,16 @@ impl PlaybackAuth {
                 s.next_check = now;
                 if s.policy.kind == PolicyKind::Callback {
                     for lane in s.callback_lanes.values_mut() {
-                        if matches!(lane.decision, Decision::Allow)
-                            && !lane.cancel.is_cancelled()
-                            && (lane.live > 0
-                                || lane.playback_seen.is_some_and(|seen| {
+                        if matches!(lane.decision, Decision::Allow) && !lane.cancel.is_cancelled() {
+                            if lane.live == 0
+                                && !lane.playback_seen.is_some_and(|seen| {
                                     now.duration_since(seen) < Duration::from_secs(30)
-                                }))
-                        {
+                                })
+                            {
+                                // An idle approval cannot admit a new viewer if
+                                // the forced callback fails or is unavailable.
+                                lane.decision = Decision::Unknown;
+                            }
                             lane.next_check = now;
                         }
                     }
@@ -3603,6 +3606,102 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
+    }
+    #[tokio::test]
+    async fn force_reauth_rechecks_idle_callback_lane_in_an_occupied_session() {
+        let backend = ControlBackend::new(false).await;
+        let auth = PlaybackAuth::new(8);
+        let policy = Policy::from_config(
+            &json!({"on_play":{"url":backend.url,"session_keys":["name","proto","token"]}}),
+            &json!({}),
+        )
+        .unwrap();
+        let snapshot = auth.publish("owned", Some(policy)).unwrap();
+        let active_request = ViewerRequest {
+            name: "owned".into(),
+            proto: "mpegts".into(),
+            token: "same".into(),
+            qs: "lane=active".into(),
+            ..Default::default()
+        };
+        let idle_request = ViewerRequest {
+            qs: "lane=idle".into(),
+            ..active_request.clone()
+        };
+        let AuthOutcome::Allowed(active) = auth.authorize(snapshot.clone(), active_request).await
+        else {
+            panic!("active lane should initially be allowed")
+        };
+        let AuthOutcome::Allowed(idle) = auth
+            .authorize_control(snapshot.clone(), idle_request.clone())
+            .await
+        else {
+            panic!("idle lane should initially be allowed")
+        };
+        drop(idle);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+
+        backend.deny.store(true, Ordering::SeqCst);
+        assert_eq!(auth.force_reauth("owned"), 1);
+        auth.renew_due().await;
+        assert!(active.is_cancelled(), "the denied active lane stayed open");
+        assert!(
+            matches!(
+                auth.authorize(snapshot, idle_request).await,
+                AuthOutcome::Denied
+            ),
+            "the idle lane reused its old approval after forced reauth"
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 4);
+        backend.close().await;
+    }
+    #[tokio::test]
+    async fn force_reauth_fails_closed_for_idle_lane_during_callback_outage() {
+        let backend = ControlBackend::new(false).await;
+        let auth = PlaybackAuth::new(8);
+        let policy = Policy::from_config(
+            &json!({"on_play":{"url":backend.url,"session_keys":["name","proto","token"]}}),
+            &json!({}),
+        )
+        .unwrap();
+        let snapshot = auth.publish("owned", Some(policy)).unwrap();
+        let active_request = ViewerRequest {
+            name: "owned".into(),
+            proto: "mpegts".into(),
+            token: "same".into(),
+            qs: "lane=active".into(),
+            ..Default::default()
+        };
+        let idle_request = ViewerRequest {
+            qs: "lane=idle".into(),
+            ..active_request.clone()
+        };
+        let AuthOutcome::Allowed(active) = auth.authorize(snapshot.clone(), active_request).await
+        else {
+            panic!("active lane should initially be allowed")
+        };
+        let AuthOutcome::Allowed(idle) = auth
+            .authorize_control(snapshot.clone(), idle_request.clone())
+            .await
+        else {
+            panic!("idle lane should initially be allowed")
+        };
+        drop(idle);
+        backend.close().await;
+
+        assert_eq!(auth.force_reauth("owned"), 1);
+        auth.renew_due().await;
+        assert!(
+            !active.is_cancelled(),
+            "existing playback should survive an outage"
+        );
+        assert!(
+            matches!(
+                auth.authorize(snapshot, idle_request).await,
+                AuthOutcome::Denied
+            ),
+            "the idle lane reused an old approval while reauthorization was unavailable"
+        );
     }
     #[tokio::test]
     async fn warmed_control_allow_rechecks_callback_user_limit_without_another_callback() {
