@@ -49,6 +49,46 @@ def serve_source_responses(responses):
 
 
 class SustainedHttpRunnerTests(unittest.TestCase):
+    def test_source_stall_episode_matches_viewer_time_base(self):
+        runner = load_runner()
+        record = runner.new_source_record()
+        runner.record_source_sample(record, 0.0, 40, 100)
+        runner.record_source_sample(record, 1.5, 1500, 100)
+        runner.record_source_sample(record, 4.5, 4500, 100)
+        runner.record_source_sample(record, 5.0, 20, 600)
+        self.assertEqual(record["samples"], 4)
+        self.assertEqual(record["max_age_ms"], 4500)
+        self.assertEqual(record["max_poll_interval_ms"], 3000)
+        self.assertEqual(record["stalls_over_1000_ms_count"], 1)
+        self.assertEqual(record["stalls"], [{
+            "start_elapsed_seconds": 1.5, "end_elapsed_seconds": 5.0,
+            "max_age_ms": 4500, "bytes_in_at_start": 100,
+            "bytes_in_at_end": 600, "observation_errors": 0,
+        }])
+
+    def test_source_stall_history_is_bounded_but_first_and_last_survive(self):
+        runner = load_runner()
+        record = runner.new_source_record()
+        for index in range(100):
+            runner.record_source_sample(record, index * 2.0, 1500, index * 10)
+            runner.record_source_sample(record, index * 2.0 + 1.0, 10,
+                                        index * 10 + 1)
+        self.assertEqual(record["stalls_over_1000_ms_count"], 100)
+        self.assertEqual(record["first_stall"]["start_elapsed_seconds"], 0.0)
+        self.assertEqual(record["last_stall"]["start_elapsed_seconds"], 198.0)
+        self.assertEqual(len(record["stalls"]), 32)
+        self.assertEqual(record["stalls"][0]["start_elapsed_seconds"], 136.0)
+
+    def test_source_poll_error_marks_episode_incomplete(self):
+        runner = load_runner()
+        record = runner.new_source_record()
+        runner.record_source_sample(record, 1.5, 1500, 100)
+        runner.record_source_error(record, 2.0)
+        runner.record_source_sample(record, 4.0, 20, 600)
+        self.assertEqual(record["errors"], 1)
+        self.assertEqual(record["max_poll_interval_ms"], 2000)
+        self.assertEqual(record["stalls"][0]["observation_errors"], 1)
+
     def test_source_stats_projects_only_counters_from_authenticated_response(self):
         runner = load_runner()
         secret = "tshttp://private.example/input?token=do-not-record"

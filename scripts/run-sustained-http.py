@@ -224,6 +224,62 @@ def new_viewer_record():
     }
 
 
+def new_source_record():
+    return {
+        'samples': 0, 'errors': 0, 'max_age_ms': 0,
+        'max_poll_interval_ms': 0, 'last_poll_elapsed': None,
+        'stalls_over_1000_ms_count': 0, 'first_stall': None,
+        'last_stall': None, 'stalls': [], 'open_stall': None,
+    }
+
+
+def _record_source_poll(record, elapsed):
+    if record['last_poll_elapsed'] is not None:
+        interval = round((elapsed - record['last_poll_elapsed']) * 1000)
+        record['max_poll_interval_ms'] = max(record['max_poll_interval_ms'], interval)
+    record['last_poll_elapsed'] = round(elapsed, 2)
+
+
+def record_source_sample(record, elapsed, age_ms, bytes_in):
+    _record_source_poll(record, elapsed)
+    record['samples'] += 1
+    record['max_age_ms'] = max(record['max_age_ms'], age_ms)
+    if age_ms > 1000:
+        if record['open_stall'] is None:
+            record['open_stall'] = {
+                'start_elapsed_seconds': round(elapsed, 2),
+                'max_age_ms': age_ms, 'bytes_in_at_start': bytes_in,
+                'bytes_in_at_end': bytes_in, 'observation_errors': 0,
+            }
+            record['stalls_over_1000_ms_count'] += 1
+        else:
+            episode = record['open_stall']
+            episode['max_age_ms'] = max(episode['max_age_ms'], age_ms)
+            episode['bytes_in_at_end'] = bytes_in
+        if record['stalls_over_1000_ms_count'] == 1:
+            record['first_stall'] = dict(record['open_stall'])
+        record['last_stall'] = dict(record['open_stall'])
+    elif record['open_stall'] is not None:
+        episode = record['open_stall']
+        episode['end_elapsed_seconds'] = round(elapsed, 2)
+        episode['bytes_in_at_end'] = bytes_in
+        if record['stalls_over_1000_ms_count'] == 1:
+            record['first_stall'] = dict(episode)
+        record['last_stall'] = dict(episode)
+        record['stalls'].append(dict(episode))
+        if len(record['stalls']) > GAP_EVENT_LIMIT:
+            del record['stalls'][0]
+        record['open_stall'] = None
+
+
+def record_source_error(record, elapsed):
+    _record_source_poll(record, elapsed)
+    record['errors'] += 1
+    if record['open_stall'] is not None:
+        record['open_stall']['observation_errors'] += 1
+        record['last_stall'] = dict(record['open_stall'])
+
+
 def record_gap(record, kind, gap_ms, elapsed):
     if kind != 'media' or gap_ms <= 3000:
         return
