@@ -1,6 +1,7 @@
 """Safety and diagnostic contracts for the owned sustained HTTP runner."""
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import signal
@@ -11,6 +12,8 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/run-sustained-http.py"
@@ -24,7 +27,68 @@ def load_runner():
     return module
 
 
+def serve_source_responses(responses):
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            received.append((self.path, self.headers.get("Authorization")))
+            body = responses.pop(0)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, received
+
+
 class SustainedHttpRunnerTests(unittest.TestCase):
+    def test_source_stats_projects_only_counters_from_authenticated_response(self):
+        runner = load_runner()
+        secret = "tshttp://private.example/input?token=do-not-record"
+        response = json.dumps({
+            "name": "soak_a", "inputs": [{"url": secret}],
+            "stats": {"status": "running", "media_age_ms": 1234,
+                      "bytes_in": 5678, "private_debug": secret},
+        }).encode()
+        server, thread, received = serve_source_responses([response])
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            result = runner.source_stats(opener, server.server_port, "secret", "soak_a")
+            self.assertEqual(result, (1234, 5678))
+            self.assertEqual(received[0][0], "/streamer/api/v3/streams/soak_a")
+            self.assertEqual(received[0][1], "Basic YWRtaW46c2VjcmV0")
+            self.assertNotIn(secret, json.dumps(result))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_source_stats_rejects_invalid_counters_and_oversized_body(self):
+        runner = load_runner()
+        responses = [
+            json.dumps({"stats": {"media_age_ms": True, "bytes_in": 10}}).encode(),
+            json.dumps({"stats": {"media_age_ms": -1, "bytes_in": 10}}).encode(),
+            json.dumps({"stats": {"media_age_ms": 1, "bytes_in": "10"}}).encode(),
+            b"x" * 1_000_001,
+        ]
+        server, thread, _ = serve_source_responses(responses)
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            for _ in range(4):
+                with self.assertRaises((RuntimeError, ValueError)):
+                    runner.source_stats(opener, server.server_port, "secret", "soak_a")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_cli_accepts_explicit_binary_state_and_revision(self):
         run = subprocess.run([sys.executable, str(SCRIPT), "--help"],
                              capture_output=True, text=True, timeout=5)

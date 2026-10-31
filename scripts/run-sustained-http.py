@@ -166,6 +166,28 @@ def api(opener, port, password, path, method='GET', body=None):
         return response.status, round((time.monotonic() - started) * 1000, 2)
 
 
+def source_stats(opener, port, password, stream):
+    if stream not in STREAMS:
+        raise ValueError('source observation is limited to owned streams')
+    request = urllib.request.Request(
+        f'http://127.0.0.1:{port}/streamer/api/v3/streams/{stream}',
+        headers={'Authorization': 'Basic ' + base64.b64encode(
+            f'admin:{password}'.encode()).decode()})
+    with opener.open(request, timeout=1) as response:
+        payload = response.read(1_000_001)
+        if response.status != 200 or len(payload) > 1_000_000:
+            raise RuntimeError('source stats response invalid or exceeds 1 MiB')
+    try:
+        data = json.loads(payload)
+        stats = data['stats']
+        age, received = stats['media_age_ms'], stats['bytes_in']
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ValueError('source stats payload invalid') from exc
+    if type(age) is not int or type(received) is not int or age < 0 or received < 0:
+        raise ValueError('source stats counters invalid')
+    return age, received
+
+
 def warm_stream(stream, port, stop):
     until = time.monotonic() + 30
     while time.monotonic() < until and not stop.is_set():
