@@ -1,5 +1,22 @@
 # Preview qualification
 
+## Sustained HTTP release gate (2026-10-31)
+
+`scripts/assess-sustained-http.py` evaluates an owner-only completed report
+from the isolated two-stream, eight-viewer, 24-hour MPEG-TS HTTP soak. It
+requires continuous sampling, clean viewer and metadata checks, planned
+connection churn, per-viewer media volume, at most three-second delivery gaps,
+and bounded service-cgroup memory and media disk use. The report's short
+revision is self-reported; binary/package provenance and all other release
+gates remain separate. A local loopback pass would not establish WAN or
+production-scale capacity.
+
+Two ongoing owned runs have no viewer, TS sync, metadata or OOM errors so far,
+but each has already recorded a steady-media gap beyond three seconds. They
+remain in progress for resource observation and are not passing release
+evidence. The shared-stream pause needs attribution and correction before a
+fresh exact-head qualification.
+
 ## Config OpenMetrics subset (2026-10-31)
 
 Read-only comparison with the installed 26.04.1 reference identified its
