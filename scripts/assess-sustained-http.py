@@ -79,9 +79,12 @@ def assess(report, revision):
         return {"result": "fail", "issues": issues + ["invalid_report"]}, 2
     elapsed_samples = [row.get("elapsed") for row in samples]
     memories = [row.get("memory_bytes") for row in samples]
+    memory_peaks = [row.get("memory_peak_bytes") for row in samples]
     media_sizes = [row.get("media_dir_bytes") for row in samples]
     oom_kills = [row.get("oom_kills") for row in samples]
-    if not all(number(v) and v >= 0 for values in (elapsed_samples, memories, media_sizes, oom_kills) for v in values):
+    if not all(number(v) and v >= 0 for values in (
+        elapsed_samples, memories, memory_peaks, media_sizes, oom_kills
+    ) for v in values):
         return {"result": "fail", "issues": issues + ["invalid_report"]}, 2
     if (
         report.get("sample_seconds") != 60
@@ -92,7 +95,7 @@ def assess(report, revision):
         fail("samples_incomplete")
     if any(b <= a or b - a > 90 for a, b in zip(elapsed_samples, elapsed_samples[1:])):
         fail("samples_irregular")
-    if max(memories) > 512 * MIB:
+    if max(memories) > 512 * MIB or max(memory_peaks) > 512 * MIB:
         fail("memory_limit_exceeded")
     if memories[-1] - memories[0] > 64 * MIB:
         fail("memory_growth_exceeded")
@@ -116,6 +119,8 @@ def assess(report, revision):
         )):
             return {"result": "fail", "issues": issues + ["invalid_report"]}, 2
         total_bytes += row["bytes"]
+        if not number(total_bytes):
+            return {"result": "fail", "issues": issues + ["invalid_report"]}, 2
         max_media_gap = max(max_media_gap, row["media_gap_max_ms"])
         max_reconnect_gap = max(max_reconnect_gap, row["reconnect_gap_max_ms"])
         if row["bytes"] < 4 * GIB:
@@ -144,7 +149,7 @@ def assess(report, revision):
         "viewer_gib": round(total_bytes / GIB, 2),
         "max_media_gap_ms": round(max_media_gap, 2),
         "max_reconnect_gap_ms": round(max_reconnect_gap, 2),
-        "sampled_memory_peak_mib": round(max(memories) / MIB, 2),
+        "cgroup_memory_peak_mib": round(max(memory_peaks) / MIB, 2),
         "sampled_memory_growth_mib": round((memories[-1] - memories[0]) / MIB, 2),
     }
     return result, 1 if issues else 0
@@ -159,11 +164,16 @@ def main():
         parser.error("revision must be a full lowercase Git SHA-1")
     try:
         report = read_report(args.report)
-    except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
+    except (OSError, ValueError, UnicodeError, RecursionError):
         print(json.dumps({"result": "fail", "issues": ["invalid_report"]}))
         raise SystemExit(2)
     result, status = assess(report, args.revision)
-    print(json.dumps(result, sort_keys=True))
+    try:
+        output = json.dumps(result, sort_keys=True, allow_nan=False)
+    except (ValueError, OverflowError):
+        output = json.dumps({"result": "fail", "issues": ["invalid_report"]})
+        status = 2
+    print(output)
     raise SystemExit(status)
 
 

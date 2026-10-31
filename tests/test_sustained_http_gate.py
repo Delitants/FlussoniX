@@ -18,7 +18,8 @@ GIB = 1024 * MIB
 def complete_report():
     samples = [
         {"elapsed": i * 60, "memory_bytes": (64 if i == 0 else 80) * MIB,
-         "media_dir_bytes": 8 * MIB, "oom_kills": 0}
+         "memory_peak_bytes": 80 * MIB, "media_dir_bytes": 8 * MIB,
+         "oom_kills": 0}
         for i in range(1440)
     ]
     viewers = {
@@ -86,6 +87,44 @@ class SustainedHttpGateTests(unittest.TestCase):
         run, result = assess(report)
         self.assertEqual(run.returncode, 2)
         self.assertEqual(result["issues"], ["invalid_report"])
+
+    def test_cgroup_high_water_exceeds_limit_even_when_samples_are_low(self):
+        report = complete_report()
+        report["samples"][-1]["memory_peak_bytes"] = 700 * MIB
+        run, result = assess(report)
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("memory_limit_exceeded", result["issues"])
+
+    def test_sampled_memory_exceeds_limit_even_when_high_water_is_wrong(self):
+        report = complete_report()
+        report["samples"][-1]["memory_bytes"] = 700 * MIB
+        run, result = assess(report)
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("memory_limit_exceeded", result["issues"])
+
+    def test_finite_viewer_counters_cannot_overflow_the_summary(self):
+        report = complete_report()
+        for viewer in report["viewers"].values():
+            viewer["bytes"] = 1e308
+        run, result = assess(report)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("invalid_report", result["issues"])
+        self.assertNotIn("Infinity", run.stdout)
+
+    def test_deeply_nested_report_returns_fixed_error_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            path.write_text('{"x":' * 10000 + '0' + '}' * 10000,
+                            encoding="utf-8")
+            path.chmod(0o600)
+            run = subprocess.run(
+                [sys.executable, str(SCRIPT), "--report", str(path),
+                 "--revision", REVISION],
+                capture_output=True, text=True, timeout=5,
+            )
+        self.assertEqual(run.returncode, 2)
+        self.assertEqual(json.loads(run.stdout)["issues"], ["invalid_report"])
+        self.assertEqual(run.stderr, "")
 
     @unittest.skipUnless(os.geteuid() == 0, "administrative report read requires root")
     def test_root_can_assess_owner_only_service_report(self):
