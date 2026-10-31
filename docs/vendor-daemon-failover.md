@@ -29,6 +29,9 @@ slots per registry. Removal, changed source identity or policy, mismatched
 group pins, configuration edits, expired demand, and last-viewer revocation
 close the old worker. A revoked viewer stays closed even if another viewer
 keeps the shared worker active.
+An owned five-origin renewal fixture verifies that four distinct catalogs can
+be in flight and the fifth waits for one slot to finish; it does not measure
+media processing capacity.
 
 The reopened M4F control gets a new playback-session ID. Replayed segment names
 are skipped before media fetch; the MPEG-TS muxer keeps its timestamps and

@@ -23,11 +23,15 @@ use flussonix::{
 };
 use serde_json::{Value, json};
 use std::{
+    collections::HashSet,
     io,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 type Feed = mpsc::UnboundedSender<Result<Bytes, io::Error>>;
 const DENIED_TOKEN: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 struct Remote {
@@ -716,4 +720,146 @@ async fn eof_renewal_capacity_and_timeout_are_bounded() {
     assert_eq!(f.calls.lock().unwrap().len(), before);
     registry.shutdown();
     joined(worker).await;
+}
+
+#[tokio::test]
+async fn eof_renewal_uses_four_slots_across_distinct_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(ConfigStore::open(dir.path().join("config.json")).unwrap());
+    let holding = Arc::new(AtomicBool::new(false));
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let mut sources = Vec::new();
+    let mut releases = Vec::new();
+    let mut servers = Vec::new();
+    for index in 0..5 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let key = format!("m4f://{}", listener.local_addr().unwrap());
+        let name = format!("source-{index}");
+        let id = format!("origin-{index}");
+        let release = Arc::new(Semaphore::new(0));
+        let router = Router::new().fallback(get({
+            let (name, id) = (name.clone(), id.clone());
+            let (release, holding, started) =
+                (release.clone(), holding.clone(), started_tx.clone());
+            move |OriginalUri(uri): OriginalUri, headers: HeaderMap| {
+                let (name, id) = (name.clone(), id.clone());
+                let (release, holding, started) =
+                    (release.clone(), holding.clone(), started.clone());
+                async move {
+                    assert!(uri.path().starts_with("/streamer/"));
+                    assert!(headers.contains_key("authorization"));
+                    let body = if uri.path().ends_with("/config") {
+                        json!({"stats":{"id":id}})
+                    } else {
+                        assert!(uri.path().ends_with("/streams"));
+                        if holding.load(Ordering::SeqCst) {
+                            started.send(index).unwrap();
+                            release.acquire().await.unwrap().forget();
+                        }
+                        json!({"server_id":id,"streams":[row(&name)]})
+                    };
+                    Response::new(Body::from(body.to_string()))
+                }
+            }
+        }));
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        }));
+        config
+            .put(
+                "sources",
+                &key,
+                json!({"url":key,"flussonix_source_kind":"flussonic",
+                       "cluster_key":"owned-private-key","on_play":"true",
+                       "group_config":{"same":{"on_play":"true"}},
+                       "flussonix_group_pins":{(name.clone()):["same"]}}),
+            )
+            .unwrap();
+        sources.push((key, name));
+        releases.push(release);
+    }
+    let owner = Arc::new(ModernSourceCoordinator::new(config, "local").unwrap());
+    let registry = Arc::new(SharedInputs::new(owner.clone()));
+    let auth = PlaybackAuth::new(32);
+    let mut handles = Vec::new();
+    let mut attachments = Vec::new();
+    for (key, name) in &sources {
+        let handle = install(&owner, key);
+        let rows = owner
+            .inventory(&handle, Duration::from_secs(8))
+            .await
+            .unwrap();
+        let AdmissionOutcome::Allowed(admission) = owner
+            .admit(
+                rows.candidate(name).unwrap(),
+                &auth,
+                ViewerRequest {
+                    name: name.clone(),
+                    token: name.clone(),
+                    proto: "m4f".into(),
+                    ip: "127.0.0.1".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("owned source denied");
+        };
+        let attachment = registry
+            .attach(admission, SharedInputOptions::default())
+            .unwrap();
+        assert!(attachment.input.is_some());
+        handles.push(handle);
+        attachments.push(attachment);
+    }
+    holding.store(true, Ordering::SeqCst);
+    let tasks = handles
+        .into_iter()
+        .map(|handle| {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                registry
+                    .renew_after_eof(&handle, Duration::from_secs(8))
+                    .await
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut first = HashSet::new();
+    for _ in 0..4 {
+        let index = tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.insert(index), "a source entered twice before release");
+    }
+    assert_eq!(first.len(), 4);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), started_rx.recv())
+            .await
+            .is_err(),
+        "fifth distinct source entered without a free EOF slot"
+    );
+    releases[*first.iter().next().unwrap()].add_permits(1);
+    let fifth = tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!first.contains(&fifth));
+    for release in &releases {
+        release.add_permits(1);
+    }
+    for task in tasks {
+        let result = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!((result.renewed, result.retired), (1, 0));
+    }
+    registry.shutdown();
+    drop(attachments);
+    for server in servers {
+        server.abort();
+    }
 }
