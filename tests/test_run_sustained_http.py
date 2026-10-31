@@ -33,7 +33,7 @@ def serve_source_responses(responses):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             received.append((self.path, self.headers.get("Authorization")))
-            body = responses.pop(0)
+            body = responses.pop(0) if len(responses) > 1 else responses[0]
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -43,12 +43,92 @@ def serve_source_responses(responses):
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, thread, received
 
 
 class SustainedHttpRunnerTests(unittest.TestCase):
+    def test_source_observer_samples_both_streams_and_stops_without_raw_config(self):
+        runner = load_runner()
+        secret = "tshttp://private.example/secret?token=do-not-record"
+        response = json.dumps({
+            "inputs": [{"url": secret}],
+            "stats": {"status": "running", "media_age_ms": 1500,
+                      "bytes_in": 100},
+        }).encode()
+        server, thread, _ = serve_source_responses([response])
+        state = {name: runner.new_source_record() for name in runner.STREAMS}
+        stop = threading.Event()
+        started = time.monotonic()
+        observer = threading.Thread(
+            target=runner.observe_source,
+            args=(server.server_port, "secret", started, started + 5,
+                  stop, state, threading.Lock()),
+        )
+        try:
+            observer.start()
+            time.sleep(1.2)
+            stop.set()
+            observer.join(timeout=1.5)
+            self.assertFalse(observer.is_alive())
+            for record in state.values():
+                self.assertGreaterEqual(record["samples"], 2)
+                self.assertEqual(record["errors"], 0)
+            self.assertNotIn(secret, json.dumps(state))
+            self.assertNotIn("secret", json.dumps(state))
+        finally:
+            stop.set()
+            observer.join(timeout=2)
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_source_observer_stops_after_blocked_api_request(self):
+        runner = load_runner()
+        requested = threading.Event()
+
+        class SlowHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requested.set()
+                time.sleep(2)
+                try:
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, _format, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+        server.daemon_threads = True
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        state = {name: runner.new_source_record() for name in runner.STREAMS}
+        stop = threading.Event()
+        started = time.monotonic()
+        observer = threading.Thread(
+            target=runner.observe_source,
+            args=(server.server_port, "secret", started, started + 5,
+                  stop, state, threading.Lock()),
+        )
+        try:
+            observer.start()
+            self.assertTrue(requested.wait(timeout=1))
+            stop.set()
+            observer.join(timeout=1.5)
+            self.assertFalse(observer.is_alive())
+            self.assertGreaterEqual(sum(record["errors"] for record in state.values()), 1)
+        finally:
+            stop.set()
+            observer.join(timeout=2)
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
     def test_source_stall_episode_matches_viewer_time_base(self):
         runner = load_runner()
         record = runner.new_source_record()
@@ -84,6 +164,8 @@ class SustainedHttpRunnerTests(unittest.TestCase):
         record = runner.new_source_record()
         runner.record_source_sample(record, 1.5, 1500, 100)
         runner.record_source_error(record, 2.0)
+        self.assertEqual(record["first_stall"]["observation_errors"], 1)
+        self.assertEqual(record["open_stall"]["observation_errors"], 1)
         runner.record_source_sample(record, 4.0, 20, 600)
         self.assertEqual(record["errors"], 1)
         self.assertEqual(record["max_poll_interval_ms"], 2000)
@@ -133,7 +215,7 @@ class SustainedHttpRunnerTests(unittest.TestCase):
         run = subprocess.run([sys.executable, str(SCRIPT), "--help"],
                              capture_output=True, text=True, timeout=5)
         self.assertEqual(run.returncode, 0)
-        for flag in ("--binary", "--state", "--revision"):
+        for flag in ("--binary", "--state", "--revision", "--observe-source"):
             self.assertIn(flag, run.stdout)
         self.assertNotIn("--remove-binary-on-exit", run.stdout)
 

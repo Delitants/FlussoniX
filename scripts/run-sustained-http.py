@@ -277,7 +277,31 @@ def record_source_error(record, elapsed):
     record['errors'] += 1
     if record['open_stall'] is not None:
         record['open_stall']['observation_errors'] += 1
+        if record['stalls_over_1000_ms_count'] == 1:
+            record['first_stall'] = dict(record['open_stall'])
         record['last_stall'] = dict(record['open_stall'])
+
+
+def observe_source(port, password, started, deadline, stop, state, guard):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    while not stop.is_set() and time.monotonic() < deadline:
+        cycle = time.monotonic()
+        for stream in STREAMS:
+            if stop.is_set() or time.monotonic() >= deadline:
+                break
+            try:
+                age_ms, bytes_in = source_stats(opener, port, password, stream)
+            except (OSError, RuntimeError, ValueError):
+                with guard:
+                    record_source_error(state[stream], time.monotonic() - started)
+            else:
+                with guard:
+                    record_source_sample(state[stream], time.monotonic() - started,
+                                         age_ms, bytes_in)
+        remaining = min(0.5 - (time.monotonic() - cycle),
+                        deadline - time.monotonic())
+        if remaining > 0:
+            stop.wait(remaining)
 
 
 def record_gap(record, kind, gap_ms, elapsed):
@@ -379,6 +403,8 @@ def main():
     parser.add_argument('--binary', required=True, type=Path)
     parser.add_argument('--revision', required=True)
     parser.add_argument('--ffmpeg', default='/usr/bin/ffmpeg', type=Path)
+    parser.add_argument('--observe-source', action='store_true',
+                        help='record bounded source-age evidence alongside viewer gaps')
     args = parser.parse_args()
     if not re.fullmatch(r'[0-9a-f]{40}', args.revision):
         parser.error('revision must be a full lowercase Git SHA-1')
@@ -409,6 +435,8 @@ def main():
     signal.signal(signal.SIGINT, lambda _signum, _frame: stop.set())
     viewer_state = {f'{stream}:{index}': new_viewer_record()
         for stream in STREAMS for index in range(VIEWERS_PER_STREAM)}
+    source_state = ({stream: new_source_record() for stream in STREAMS}
+                    if args.observe_source else None)
     report = {'revision': args.revision[:7], 'binary_sha256': binary_sha256,
               'duration_seconds': args.duration,
               'sample_seconds': args.sample_seconds, 'streams': len(STREAMS),
@@ -419,6 +447,7 @@ def main():
               'state': 'starting'}
     process = None
     log_thread = None
+    source_thread = None
     log_status = {'truncated': False, 'write_error': False}
     log_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     with os.fdopen(os.open(state_dir / 'daemon.log', log_flags, 0o600), 'wb', buffering=0) as log:
@@ -465,7 +494,15 @@ def main():
             deadline = started + args.duration
             report['state'] = 'running'
             report['listen'] = f'127.0.0.1:{port}'
+            if source_state is not None:
+                report['source_observation'] = json.loads(json.dumps(source_state))
             save(state_dir / 'checkpoint.json', report)
+            if source_state is not None:
+                source_thread = threading.Thread(
+                    target=observe_source,
+                    args=(port, password, started, deadline, stop, source_state, guard),
+                    daemon=True)
+                source_thread.start()
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(viewer_state)) as pool:
                 futures = [pool.submit(viewer, stream, index, port, started, deadline,
                                        stop, viewer_state, guard)
@@ -480,6 +517,9 @@ def main():
                             continue
                         if process.poll() is not None:
                             raise RuntimeError(f'daemon exited {process.returncode}')
+                        if source_thread is not None and not source_thread.is_alive() \
+                                and time.monotonic() < deadline:
+                            raise RuntimeError('source observer stopped unexpectedly')
                         elapsed = now - started
                         scan_started = time.monotonic()
                         last_media_bytes = directory_bytes(media_dir)
@@ -496,6 +536,8 @@ def main():
                             sample['viewer_bytes'] = sum(value['bytes'] for value in viewer_state.values())
                             sample['active_viewers'] = sum(value['active'] for value in viewer_state.values())
                             report['viewers'] = json.loads(json.dumps(viewer_state))
+                            if source_state is not None:
+                                report['source_observation'] = json.loads(json.dumps(source_state))
                         report['samples'].append(sample)
                         try:
                             status, latency = api(opener, port, password,
@@ -524,6 +566,8 @@ def main():
             report['harness_error'] = f'{type(exc).__name__}: {exc}'
         finally:
             stop.set()
+            if source_thread is not None:
+                source_thread.join(timeout=3)
             try:
                 terminate_owned_scope(group)
                 if process is not None:
@@ -532,6 +576,8 @@ def main():
                     log_thread.join(timeout=5)
                     if log_thread.is_alive():
                         raise RuntimeError('daemon log drain did not stop')
+                if source_thread is not None and source_thread.is_alive():
+                    raise RuntimeError('source observer did not stop')
             except Exception as exc:
                 report['state'] = 'failed'
                 report['harness_error'] = f'cleanup: {type(exc).__name__}: {exc}'
@@ -541,6 +587,8 @@ def main():
                 report['harness_error'] = 'daemon log cap or I/O failure'
             with guard:
                 report['viewers'] = json.loads(json.dumps(viewer_state))
+                if source_state is not None:
+                    report['source_observation'] = json.loads(json.dumps(source_state))
             report['end_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
             try:
                 if media_dir.exists():
