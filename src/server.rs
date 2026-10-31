@@ -33,7 +33,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
 
@@ -137,6 +137,7 @@ pub struct App {
     pub iptv_ha: Option<Arc<HaAuthority>>,
     pub iptv_authority_client: Option<Arc<AuthorityClient>>,
     node_name: String,
+    node_id: uuid::Uuid,
     modern_sources:
         Option<Arc<crate::source_directory::modern_coordinator::ModernSourceCoordinator>>,
     vendor_playback: Option<crate::vendor_playback::Runtime>,
@@ -350,6 +351,7 @@ impl App {
         let started = Instant::now();
         let iptv_leases = Arc::new(Ledger::new(started, 100_000, iptv.revision()));
         let config = Arc::new(ConfigStore::open(config_path)?);
+        let node_id = crate::node_identity::load_or_create(config_path)?;
         let modern_sources =
             crate::source_directory::modern_coordinator::ModernSourceCoordinator::new(
                 config.clone(),
@@ -393,6 +395,7 @@ impl App {
             iptv_ha,
             iptv_authority_client,
             node_name: options.node_name.clone(),
+            node_id,
             modern_sources,
             vendor_playback,
             media: Engine::new_with_fxlink(media, &options.ffmpeg, options.fxlink_features),
@@ -705,6 +708,39 @@ impl App {
         node["version"] = json!(env!("CARGO_PKG_VERSION"));
         node["streams"] = json!(streams);
         node
+    }
+    async fn config_stats(&self) -> Value {
+        let (metrics, _) = self
+            .telemetry
+            .snapshot_with_window(self.options.uplink_mbps);
+        let percent = |field: &str| {
+            metrics[field]
+                .as_f64()
+                .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                .map(|v| (v * 100.0).round() as u64)
+        };
+        let output_kbit = metrics["egress_mbps"]
+            .as_f64()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map(|v| (v * 1000.0).round() as u64);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        json!({
+            "id":self.node_id.to_string(),
+            "now":now,
+            "streamer_status":"running",
+            "server_version":env!("CARGO_PKG_VERSION"),
+            "hostname":self.node_name,
+            "uptime":self.started.elapsed().as_secs(),
+            "total_streams":self.config.read(|root|root["streams"].as_array().map_or(0,Vec::len)),
+            "total_clients":self.active().await,
+            "total_bandwidth":(self.options.uplink_mbps*1_000_000.0).round() as u64,
+            "output_kbit":output_kbit,
+            "cpu_usage":percent("cpu"),
+            "memory_usage":percent("ram")
+        })
     }
     async fn load_node(&self) -> Value {
         // Worker setup can hold this mutex across network awaits. Obtain the
@@ -1083,7 +1119,19 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
             return error(StatusCode::NOT_FOUND, "unknown config operation");
         }
         if method == "GET" {
-            return management_read_response(role, app.config.snapshot());
+            let full = match query.get("full").map(String::as_str) {
+                None | Some("false") => false,
+                Some("true") => true,
+                Some(_) => return error(StatusCode::BAD_REQUEST, "full must be true or false"),
+            };
+            let mut result = if full {
+                app.config.snapshot()
+            } else {
+                json!({})
+            };
+            result["server_id"] = json!(app.node_id.to_string());
+            result["stats"] = app.config_stats().await;
+            return management_read_response(role, result);
         }
         if method == "POST" {
             return validate_config_request(&app.config, request).await;

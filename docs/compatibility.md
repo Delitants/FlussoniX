@@ -12,6 +12,17 @@ The local public management schema exposes 139 operations on 74 paths; its info 
 
 All paths below are relative to `/streamer/api/v3`.
 
+Config JSON reads distinguish the reference's compact and full profiles:
+`GET /config` (or `?full=false`) reports `server_id` and runtime `stats`,
+while `?full=true` also returns the five saved collections. `stats.id` equals
+the UUID in `server_id`. The UUID is stored in an owner-only
+`<config-file>.node-id` file; back it up with the configuration and keep it
+unique per installation. The Config and Cluster screens request `full=true`
+and write only saved collections, so changing counters cannot create an edit
+conflict. Invalid `full` values return HTTP 400. Flussonic-only root options,
+text/plain Config serialization, and OpenMetrics formatting remain unsupported;
+clients requiring those representations must not assume parity.
+
 | Area | Reference operations |
 |---|---|
 | Streams | GET `/streams`; GET/PUT/DELETE `/streams/{name}`; POST `/streams/{name}/stop` |

@@ -1,5 +1,29 @@
 # Preview qualification
 
+## Config JSON read compatibility (2026-10-31)
+
+An installed-schema and read-only demo comparison found that default
+`GET /streamer/api/v3/config` is a compact runtime view, while `?full=true`
+adds saved collections. FlussoniX now returns a stable UUID as both
+`server_id` and `stats.id`, with compact default and explicit full JSON reads.
+The UUID lives in an owner-only file beside the saved configuration; malformed,
+linked or readable-by-others identity files fail startup instead of silently
+changing identity. The admin editor requests the full response but compares and
+writes only saved collections, so changing runtime counters do not create a
+false edit conflict. A default relative `config.json` startup failure found by
+a regression test was fixed before qualification.
+
+Five Config/identity Rust regressions pass, together with the focused API,
+redaction, source-URL and vendor-discovery tests. The full owned live-daemon
+browser suite passed 135 tests with one intentional skip after generating the
+same media and CA fixtures used by CI. A disposable binary cold-upgrade test
+passed previous → candidate → previous → candidate, including independent HLS
+decode, IPTV data, the unchanged saved config and the stable node ID. The
+temporary daemons and staged packages were removed. All-target warnings-denied
+Clippy passed. Exact-head CI and final package qualification are still required
+for this branch. The compact response does not yet claim Flussonic-only root
+fields, text/plain serialization or OpenMetrics representation parity.
+
 ## Callback decision isolation (2026-10-31)
 
 The `on_play` callback decision now follows the exact request fields sent to

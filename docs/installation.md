@@ -116,6 +116,10 @@ Keep custom key/certificate/SDP files outside extracted releases. Referenced fil
 outside the state directory need their own backup. This is a cold upgrade:
 viewers reconnect, and uninterrupted playback is not promised.
 
+Keep `config.json.node-id` with `config.json` when backing up or moving the same
+node. It is an owner-only UUID that preserves management and cluster identity
+across restarts and upgrades. A new, separate node should generate its own ID.
+
 ## Roll back
 
 Stop the new process and start the previous release with its own `web` directory
