@@ -153,6 +153,25 @@ async fn config_openmetrics_negotiates_without_config_leak() {
     .unwrap();
     assert_eq!(body["server_id"], id);
 
+    // The installed reference uses only the first Accept field line. A later
+    // OpenMetrics field must not override an unrecognized first field.
+    let response = router(app.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/streamer/api/v3/config")
+                .header("Accept", "application/xml")
+                .header("Accept", "application/openmetrics-text")
+                .header(
+                    "Authorization",
+                    format!("Basic {}", STANDARD.encode("admin:test-secret")),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["content-type"], "application/json");
+
     let response = router(app.clone())
         .oneshot(
             Request::builder()
