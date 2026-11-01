@@ -61,8 +61,10 @@ cat ./flussonix-preview.service
 ```
 
 The helper verifies the release manifest and requires a non-root account, a
-private state directory and a protected credentials file. Executable paths must
-refer to real files; resolve an FFmpeg symlink with `readlink -f` if needed.
+private state directory and a protected credentials file. It also checks that
+the release and FFmpeg paths cannot be replaced through writable files or
+directories. When run as root, these paths must be root-owned. Executable paths
+must refer to real files; resolve an FFmpeg symlink with `readlink -f` if needed.
 The unit references the credentials file without embedding its contents.
 
 After reviewing the unit, install and start it explicitly. Ensure the destination

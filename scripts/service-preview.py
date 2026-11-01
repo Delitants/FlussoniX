@@ -86,7 +86,21 @@ def traverse(path, account, groups):
             raise ValueError('service account cannot traverse a selected directory')
 
 
+def trusted_install_path(path):
+    operator = os.geteuid()
+    for component in [path, *path.parents]:
+        info = component.stat(follow_symlinks=False)
+        if info.st_uid not in {0, operator} or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            raise ValueError('service executable path has an untrusted owner or file type')
+        if info.st_mode & 0o022 and not (
+                component != path and stat.S_ISDIR(info.st_mode) and
+                info.st_uid == 0 and info.st_mode & stat.S_ISVTX):
+            raise ValueError('service executable path is writable by another account')
+
+
 def verified_release(release, account, groups):
+    trusted_install_path(release)
+    trusted_install_path(release / 'manifest.json')
     raw, _ = read_regular(release / 'manifest.json', 1024 * 1024)
     manifest = json.loads(raw)
     if not isinstance(manifest, dict) or manifest.get('format') != 1 or manifest.get('name') != 'FlussoniX':
@@ -104,6 +118,7 @@ def verified_release(release, account, groups):
         full = release / path
         if any((release / Path(*path.parts[:i])).is_symlink() for i in range(1, len(path.parts) + 1)):
             raise ValueError('release payload cannot contain links')
+        trusted_install_path(full)
         data, _ = read_regular(full, 128 * 1024 * 1024)
         total += len(data)
         if total > 256 * 1024 * 1024 or len(data) != row['bytes'] or hashlib.sha256(data).hexdigest() != row['sha256']:
@@ -168,6 +183,7 @@ def render(args):
     verified_release(release, account, groups)
     if not ffmpeg.is_file() or not can_access(ffmpeg, account, groups, 5) or ffmpeg.is_relative_to('/opt/flussonic'):
         raise ValueError('select an independently installed readable/executable FFmpeg')
+    trusted_install_path(ffmpeg)
     traverse(ffmpeg.parent, account, groups)
     listen = listener(args.listen)
     name = 'flussonix-' + args.instance + '.service'
