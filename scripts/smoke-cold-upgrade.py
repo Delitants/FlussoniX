@@ -7,6 +7,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import signal
@@ -60,6 +61,7 @@ class Lab:
         self.ffprobe = shutil.which('ffprobe', path=os.defpath) if media else None
         if media and (not self.ffmpeg or not self.ffprobe):
             raise RuntimeError('media smoke requires independent FFmpeg and FFprobe')
+        self.last_media_generation = None
 
     def request(self, path, method='GET', body=None, authenticated=False):
         headers = {'Authorization': self.auth} if authenticated else {}
@@ -151,26 +153,31 @@ class Lab:
 
     def media_probe(self):
         deadline = time.monotonic() + 20
-        manifest = None
+        selected = None
         while time.monotonic() < deadline:
             try:
                 _, body = self.request('/upgrade_smoke/index.m3u8')
                 if b'#EXTM3U' in body and b'#EXTINF' in body:
-                    manifest = body.decode('utf-8')
-                    break
+                    segments = [line.strip() for line in body.decode('utf-8').splitlines()
+                                if line.strip() and not line.startswith('#')]
+                    require(bool(segments), 'HLS playlist has no media URI')
+                    url = urllib.parse.urlsplit(urllib.parse.urljoin(
+                        f'http://127.0.0.1:{self.port}/upgrade_smoke/index.m3u8', segments[-1]))
+                    require(url.hostname == '127.0.0.1' and url.port == self.port
+                            and url.path.startswith('/upgrade_smoke/') and not url.fragment,
+                            'HLS segment escaped owned loopback stream')
+                    generation = re.fullmatch(
+                        r'g([0-9a-f]{32})_(?:p)?[0-9]+\.ts', url.path.rsplit('/', 1)[-1])
+                    require(generation is not None, 'HLS segment lacks a worker generation')
+                    if generation.group(1) != self.last_media_generation:
+                        selected = (url, generation.group(1))
+                        break
             except urllib.error.HTTPError as error:
                 if error.code not in (404, 425, 503):
                     raise
             time.sleep(0.2)
-        require(manifest is not None, 'test stream produced no HLS segment')
-        segments = [line.strip() for line in manifest.splitlines()
-                    if line.strip() and not line.startswith('#')]
-        require(bool(segments), 'HLS playlist has no media URI')
-        url = urllib.parse.urlsplit(urllib.parse.urljoin(
-            f'http://127.0.0.1:{self.port}/upgrade_smoke/index.m3u8', segments[-1]))
-        require(url.hostname == '127.0.0.1' and url.port == self.port
-                and url.path.startswith('/upgrade_smoke/') and not url.fragment,
-                'HLS segment escaped owned loopback stream')
+        require(selected is not None, 'test stream produced no fresh HLS generation')
+        url, generation = selected
         _, segment = self.request(url.path + ('?' + url.query if url.query else ''))
         require(isinstance(segment, bytes) and len(segment) >= 1880,
                 'HLS segment is missing or too short')
@@ -181,6 +188,16 @@ class Lab:
         streams = json.loads(probe.stdout)['streams']
         require(any(stream.get('codec_name') == 'h264' for stream in streams),
                 'packaged stream did not decode as H.264')
+        decoded = subprocess.run([
+            self.ffmpeg, '-hide_banner', '-loglevel', 'error', '-xerror',
+            '-nostdin', '-i', 'pipe:0', '-map', '0:v:0', '-frames:v', '5',
+            '-f', 'framemd5', 'pipe:1'], input=segment, capture_output=True,
+            timeout=8, env=self.env)
+        pictures = sum(bool(line) and not line.startswith(b'#')
+                       for line in decoded.stdout.splitlines())
+        require(decoded.returncode == 0 and pictures >= 5,
+                'packaged stream yielded fewer than five decoded H.264 pictures')
+        self.last_media_generation = generation
 
 
 def smoke(previous, current, media=False):
@@ -242,7 +259,7 @@ def main():
     parser.add_argument('--previous', required=True, type=Path)
     parser.add_argument('--current', required=True, type=Path)
     parser.add_argument('--media', action='store_true',
-                        help='also decode packaged HLS output with independent FFprobe')
+                        help='also decode packaged HLS output with independent FFmpeg and FFprobe')
     args = parser.parse_args()
     smoke(package(args.previous), package(args.current), args.media)
 

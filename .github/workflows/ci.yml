@@ -130,8 +130,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg libsrt1.5-gnutls
       - name: Verify vendor components are absent
         run: test ! -e /opt/flussonic
-      - name: Verify archive smoke rejects untrusted inputs
-        run: python3 -m unittest tests.test_release_archive_smoke -v
+      - name: Verify archive and upgrade smoke helpers
+        run: python3 -m unittest tests.test_release_archive_smoke tests.test_cold_upgrade_smoke -v
       - name: Build actual release daemon
         run: cargo build --locked --release
       - uses: actions/setup-node@v7
