@@ -19,6 +19,9 @@ pub(crate) struct Ticket<'a> {
     pub listener_id: &'a str,
 }
 impl App {
+    pub(crate) async fn discard_srt_credential(&self, id: &str) {
+        self.reservations.lock().await.remove(id);
+    }
     pub(crate) fn srt_listener_id(&self) -> String {
         self.srt_playback.lock().unwrap()["listener_id"]
             .as_str()
@@ -67,10 +70,50 @@ impl App {
         self.srt_match(reservation, &viewer, ticket)
             .then_some(viewer)
     }
+    /// A public capacity ticket has no stored viewer credential or IP binding.
+    /// It is still checked and consumed under the normal admission ledger.
+    pub(crate) async fn srt_public_ticket(
+        &self,
+        ticket: Ticket<'_>,
+        viewer: &ViewerRequest,
+    ) -> bool {
+        if !viewer.token.is_empty() || self.with_srt_listener(ticket, || ()).is_none() {
+            return false;
+        }
+        self.reservations
+            .lock()
+            .await
+            .get(ticket.id)
+            .is_some_and(|reservation| {
+                reservation.srt.as_ref().is_some_and(|binding| {
+                    binding.viewer.is_none()
+                        && binding.peer_ip.is_none()
+                        && self.srt_match(reservation, viewer, ticket)
+                })
+            })
+    }
     pub(crate) async fn reserve_srt_credential(
+        &self,
+        viewer: ViewerRequest,
+        hint_mbps: f64,
+    ) -> Result<String, u16> {
+        self.reserve_srt_credential_inner(viewer, hint_mbps, None)
+            .await
+    }
+    pub(crate) async fn reserve_srt_vendor_credential(
+        &self,
+        viewer: ViewerRequest,
+        hint_mbps: f64,
+        reserved: Arc<ReservedCandidate>,
+    ) -> Result<String, u16> {
+        self.reserve_srt_credential_inner(viewer, hint_mbps, Some(reserved))
+            .await
+    }
+    async fn reserve_srt_credential_inner(
         &self,
         mut viewer: ViewerRequest,
         hint_mbps: f64,
+        preselected: Option<Arc<ReservedCandidate>>,
     ) -> Result<String, u16> {
         if !matches!(self.options.role.as_str(), "cdn" | "standalone")
             || self.options.drain
@@ -88,27 +131,31 @@ impl App {
         let route = self.config.read(|root| {
             crate::vendor_playback::select(root, &viewer.name, self.config.revision())
         });
-        let (revision, signature, vendor) = match route {
-            crate::vendor_playback::Selection::Native => {
-                let resolved = self.resolve(&viewer.name).await.ok_or(404u16)?;
-                if resolved.config["disabled"] == true {
-                    return Err(404);
+        let (revision, signature, vendor) = if let Some(reserved) = preselected {
+            (reserved.config_revision(), None, Some(reserved))
+        } else {
+            match route {
+                crate::vendor_playback::Selection::Native => {
+                    let resolved = self.resolve(&viewer.name).await.ok_or(404u16)?;
+                    if resolved.config["disabled"] == true {
+                        return Err(404);
+                    }
+                    (
+                        resolved.revision,
+                        Some(crate::media::media_signature(&resolved.config)),
+                        None,
+                    )
                 }
-                (
-                    resolved.revision,
-                    Some(crate::media::media_signature(&resolved.config)),
-                    None,
-                )
+                crate::vendor_playback::Selection::Vendor { key, revision } => {
+                    let runtime = self.vendor_playback.as_ref().ok_or(503u16)?;
+                    let reserved = runtime
+                        .rtsp_reserve(self, &viewer.name, &key, revision)
+                        .await?;
+                    (revision, None, Some(Arc::new(reserved)))
+                }
+                crate::vendor_playback::Selection::Excluded => return Err(404),
+                crate::vendor_playback::Selection::Ambiguous => return Err(503),
             }
-            crate::vendor_playback::Selection::Vendor { key, revision } => {
-                let runtime = self.vendor_playback.as_ref().ok_or(503u16)?;
-                let reserved = runtime
-                    .rtsp_reserve(self, &viewer.name, &key, revision)
-                    .await?;
-                (revision, None, Some(Arc::new(reserved)))
-            }
-            crate::vendor_playback::Selection::Excluded => return Err(404),
-            crate::vendor_playback::Selection::Ambiguous => return Err(503),
         };
         let listener = self.srt_playback.lock().unwrap().clone();
         if listener["enabled"] != true || listener["encrypted"] != true {

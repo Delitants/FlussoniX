@@ -169,6 +169,29 @@ async fn native_lookup_returns_an_opaque_token_bound_ticket_without_lb_media() {
     cdn.close().await;
 }
 #[tokio::test]
+async fn public_encrypted_lookup_reserves_and_plays_without_a_viewer_token() {
+    let cdn = Native::new(4).await;
+    let (_dir, lb) = app();
+    lb.config.put("peers", "cdn", cdn.peer()).unwrap();
+    let https = Https::new(lb.clone()).await;
+    let response = https.lookup("#!::r=local/news,m=request", None).await;
+    assert_eq!(response.status(), 200);
+    let value: Value = response.json().await.unwrap();
+    assert_eq!(value["address"], cdn.address);
+    assert_eq!(value["encryption_required"], true);
+    let id = value["streamid"].as_str().unwrap();
+    assert!(!id.contains("u="));
+    assert_eq!(cdn.node().await["reserved"], 1);
+    let path = cdn._dir.path().join("public.ts");
+    assert!(receive(id, &cdn.address, &path).await);
+    assert!(path.metadata().unwrap().len() > 0);
+    assert_eq!(cdn.node().await["reserved"], 0);
+    let replay = cdn._dir.path().join("public-replay.ts");
+    assert!(!receive(id, &cdn.address, &replay).await);
+    https.close().await;
+    cdn.close().await;
+}
+#[tokio::test]
 async fn public_https_post_issues_tokenless_ticket_through_native_lb() {
     let cdn = Native::new(4).await;
     let (_d, lb) = app();

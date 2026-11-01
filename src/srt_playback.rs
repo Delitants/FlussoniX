@@ -98,10 +98,11 @@ async fn connection(
             encrypted,
             listener_id: &listener_id,
         };
-        let Some(restored) = app.srt_ticket_viewer(native, &viewer.name, peer.ip()).await else {
+        if let Some(restored) = app.srt_ticket_viewer(native, &viewer.name, peer.ip()).await {
+            viewer = restored;
+        } else if !app.srt_public_ticket(native, &viewer).await {
             return;
-        };
-        viewer = restored;
+        }
     }
     // Vendor discovery may validate a primary and two bounded replica waves.
     // This snapshot chooses timing only; ts_admit rechecks actual authority.

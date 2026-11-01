@@ -203,6 +203,7 @@ impl App {
     ) -> Result<Value, u16> {
         let encrypted = !matches!(mode, SrtLookupMode::Any);
         let ticket_only = matches!(mode, SrtLookupMode::Ticket);
+        let private = ticket_only || (encrypted && !viewer.token.is_empty());
         let peers = self.config.snapshot()["peers"]
             .as_array()
             .cloned()
@@ -217,7 +218,11 @@ impl App {
             if encrypted && !required {
                 return None;
             }
-            if vendor && (ticket_only || peer["flussonix_srt_allow_direct_token"] != true) {
+            if vendor
+                && (ticket_only
+                    || (!viewer.token.is_empty()
+                        && peer["flussonix_srt_allow_direct_token"] != true))
+            {
                 return None;
             }
             if !vendor && (encrypted || ticket_only) && !required {
@@ -228,13 +233,13 @@ impl App {
                     streamid,
                     crate::config::vendor_peers::remote_name(&peer, &viewer.name)?,
                 )?
-            } else if !encrypted && !ticket_only {
+            } else if !private && !viewer.token.is_empty() {
                 mapped(streamid, &viewer.name)?
             } else {
                 String::new()
             };
             if !vendor
-                && (if encrypted || ticket_only {
+                && (if viewer.token.is_empty() || private {
                     crate::srt_playback::ticket_only(
                         &viewer.name,
                         "00000000-0000-0000-0000-000000000000",
@@ -253,7 +258,9 @@ impl App {
                 if !matches!(node["role"].as_str(), Some("cdn" | "standalone"))
                     || profile["enabled"] != true
                     || profile["encrypted"] != required
-                    || (!encrypted && profile["direct_tokens_allowed"] != true)
+                    || (!private
+                        && !viewer.token.is_empty()
+                        && profile["direct_tokens_allowed"] != true)
                     || profile["listener_id"]
                         .as_str()
                         .and_then(|id| uuid::Uuid::parse_str(id).ok())
@@ -366,8 +373,7 @@ impl App {
                 let Some(api) = peer["api_url"].as_str() else {
                     continue;
                 };
-                let legacy = !encrypted && !ticket_only;
-                if !legacy
+                if encrypted
                     && !url::Url::parse(api)
                         .ok()
                         .is_some_and(|url| crate::peer_transport::require(&url, false).is_ok())
@@ -385,7 +391,7 @@ impl App {
                             .as_str()
                             .unwrap_or(&self.options.peer_key),
                     );
-                let request = if legacy {
+                let request = if !private {
                     request.json(&json!({"name":viewer.name,"protocol":"srt","encrypted":required,"token_hash":super::rtsp_balancer::token_hash(viewer),"bitrate_mbps":bitrate}))
                 } else {
                     request.header("X-Flussonix-Srt-Credential","1")
@@ -403,7 +409,7 @@ impl App {
                     continue;
                 };
                 let Some(id) = body["ticket"].as_str().and_then(|id| {
-                    if legacy {
+                    if !private && !viewer.token.is_empty() {
                         append_ticket(streamid, id)
                     } else {
                         crate::srt_playback::ticket_only(&viewer.name, id)
