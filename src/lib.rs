@@ -67,6 +67,7 @@ extern crate self as flussonix;
 
 pub mod caption_filter;
 
+mod hls_budget;
 mod raw_hls;
 
 mod teletext;
