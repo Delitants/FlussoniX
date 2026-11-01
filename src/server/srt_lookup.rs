@@ -104,7 +104,16 @@ pub(super) async fn lookup(State(app): State<Arc<App>>, request: Request) -> Res
             host: header(request.headers(), "host").unwrap_or("").into(),
             finite_media: false,
         };
-        app.srt_lookup(viewer, &q.streamid, q.encrypted).await
+        app.srt_lookup(
+            viewer,
+            &q.streamid,
+            if q.encrypted {
+                SrtLookupMode::Required
+            } else {
+                SrtLookupMode::Any
+            },
+        )
+        .await
     }
     .await;
     let mut response = match result {
@@ -124,7 +133,7 @@ impl App {
         &self,
         viewer: ViewerRequest,
         streamid: &str,
-        encrypted: bool,
+        mode: SrtLookupMode,
     ) -> Result<Value, u16> {
         let selection = self.config.read(|root| {
             crate::vendor_playback::select(root, &viewer.name, self.config.revision())
@@ -136,7 +145,7 @@ impl App {
                 return match &self.vendor_playback {
                     Some(runtime) => {
                         runtime
-                            .srt_lookup(self, viewer, &key, revision, streamid, encrypted)
+                            .srt_lookup(self, viewer, &key, revision, streamid, mode)
                             .await
                     }
                     None => Err(503),
@@ -157,7 +166,7 @@ impl App {
             AuthOutcome::Denied | AuthOutcome::Redirect(_) => return Err(403),
         };
         let result = self
-            .srt_place(&viewer, streamid, encrypted, &grant, resolved.revision)
+            .srt_place(&viewer, streamid, mode, &grant, resolved.revision)
             .await;
         let result = self
             .config
@@ -177,21 +186,23 @@ impl App {
         &self,
         viewer: &ViewerRequest,
         streamid: &str,
-        encrypted: bool,
+        mode: SrtLookupMode,
         grant: &Grant,
         revision: u64,
     ) -> Result<Value, u16> {
-        let work = self.srt_place_inner(viewer, streamid, encrypted, grant, revision);
+        let work = self.srt_place_inner(viewer, streamid, mode, grant, revision);
         tokio::select! {biased; _=grant.cancelled()=>Err(403), result=tokio::time::timeout(Duration::from_secs(8),work)=>result.map_err(|_|503u16)?}
     }
     async fn srt_place_inner(
         &self,
         viewer: &ViewerRequest,
         streamid: &str,
-        encrypted: bool,
+        mode: SrtLookupMode,
         grant: &Grant,
         revision: u64,
     ) -> Result<Value, u16> {
+        let encrypted = !matches!(mode, SrtLookupMode::Any);
+        let ticket_only = matches!(mode, SrtLookupMode::Ticket);
         let peers = self.config.snapshot()["peers"]
             .as_array()
             .cloned()
@@ -206,7 +217,10 @@ impl App {
             if encrypted && !required {
                 return None;
             }
-            if !vendor && !required {
+            if vendor && (ticket_only || peer["flussonix_srt_allow_direct_token"] != true) {
+                return None;
+            }
+            if !vendor && (encrypted || ticket_only) && !required {
                 return None;
             }
             let id = if vendor {
@@ -214,14 +228,20 @@ impl App {
                     streamid,
                     crate::config::vendor_peers::remote_name(&peer, &viewer.name)?,
                 )?
+            } else if !encrypted && !ticket_only {
+                mapped(streamid, &viewer.name)?
             } else {
                 String::new()
             };
             if !vendor
-                && crate::srt_playback::ticket_only(
-                    &viewer.name,
-                    "00000000-0000-0000-0000-000000000000",
-                )
+                && (if encrypted || ticket_only {
+                    crate::srt_playback::ticket_only(
+                        &viewer.name,
+                        "00000000-0000-0000-0000-000000000000",
+                    )
+                } else {
+                    append_ticket(&id, "00000000-0000-0000-0000-000000000000")
+                })
                 .is_none()
             {
                 return None;
@@ -233,6 +253,7 @@ impl App {
                 if !matches!(node["role"].as_str(), Some("cdn" | "standalone"))
                     || profile["enabled"] != true
                     || profile["encrypted"] != required
+                    || (!encrypted && profile["direct_tokens_allowed"] != true)
                     || profile["listener_id"]
                         .as_str()
                         .and_then(|id| uuid::Uuid::parse_str(id).ok())
@@ -345,18 +366,33 @@ impl App {
                 let Some(api) = peer["api_url"].as_str() else {
                     continue;
                 };
-                let secure_peer = url::Url::parse(api)
-                    .ok()
-                    .is_some_and(|url| crate::peer_transport::require(&url, false).is_ok());
-                if !secure_peer {
+                let legacy = !encrypted && !ticket_only;
+                if !legacy
+                    && !url::Url::parse(api)
+                        .ok()
+                        .is_some_and(|url| crate::peer_transport::require(&url, false).is_ok())
+                {
                     continue;
                 }
-                let response=client.post(format!("{}/flussonix/api/v1/admit",api.trim_end_matches('/')))
-                    .header("X-Flussonix-Peer",peer["cluster_key"].as_str().unwrap_or(&self.options.peer_key))
-                    .header("X-Flussonix-Srt-Credential","1")
-                    .json(&json!({"name":viewer.name,"protocol":"srt","encrypted":true,"token_hash":super::rtsp_balancer::token_hash(viewer),"bitrate_mbps":bitrate,
-                        "srt_viewer":{"token":viewer.token,"qs":viewer.qs,"ip":viewer.ip,"user_agent":viewer.user_agent,"referer":viewer.referer,"host":viewer.host}}))
-                    .timeout(Duration::from_secs(4)).send().await;
+                let request = client
+                    .post(format!(
+                        "{}/flussonix/api/v1/admit",
+                        api.trim_end_matches('/')
+                    ))
+                    .header(
+                        "X-Flussonix-Peer",
+                        peer["cluster_key"]
+                            .as_str()
+                            .unwrap_or(&self.options.peer_key),
+                    );
+                let request = if legacy {
+                    request.json(&json!({"name":viewer.name,"protocol":"srt","encrypted":required,"token_hash":super::rtsp_balancer::token_hash(viewer),"bitrate_mbps":bitrate}))
+                } else {
+                    request.header("X-Flussonix-Srt-Credential","1")
+                        .json(&json!({"name":viewer.name,"protocol":"srt","encrypted":true,"token_hash":super::rtsp_balancer::token_hash(viewer),"bitrate_mbps":bitrate,
+                            "srt_viewer":{"token":viewer.token,"qs":viewer.qs,"ip":viewer.ip,"user_agent":viewer.user_agent,"referer":viewer.referer,"host":viewer.host}}))
+                };
+                let response = request.timeout(Duration::from_secs(4)).send().await;
                 let Ok(response) = response else {
                     continue;
                 };
@@ -366,10 +402,13 @@ impl App {
                 let Some(body) = super::admission::read_json(response).await else {
                     continue;
                 };
-                let Some(id) = body["ticket"]
-                    .as_str()
-                    .and_then(|id| crate::srt_playback::ticket_only(&viewer.name, id))
-                else {
+                let Some(id) = body["ticket"].as_str().and_then(|id| {
+                    if legacy {
+                        append_ticket(streamid, id)
+                    } else {
+                        crate::srt_playback::ticket_only(&viewer.name, id)
+                    }
+                }) else {
                     continue;
                 };
                 id
@@ -385,4 +424,13 @@ impl App {
             );
         }
     }
+}
+
+fn append_ticket(streamid: &str, ticket: &str) -> Option<String> {
+    let id = uuid::Uuid::parse_str(ticket).ok()?;
+    if id.to_string() != ticket {
+        return None;
+    }
+    let output = format!("{streamid},flussonix_ticket={ticket}");
+    (output.len() <= 512).then_some(output)
 }

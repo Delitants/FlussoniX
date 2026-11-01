@@ -10,6 +10,47 @@ use sha2::{Digest, Sha256};
 use std::{sync::atomic::Ordering, time::Duration};
 use transport::{Receiver, Serving};
 const SECRET: &str = "owned-vendor-srt-transport-key";
+#[test]
+fn peer_direct_token_option_requires_a_vendor_srt_listener_and_boolean_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = flussonix::config::ConfigStore::open(dir.path().join("config.json")).unwrap();
+    let row = json!({
+        "flussonix_peer_kind":"flussonic",
+        "api_url":"https://vendor.invalid",
+        "public_payload_url":"https://vendor.invalid",
+        "cluster_key":"owned-vendor-cluster-key",
+        "flussonix_stream_map":[{"name":"owned","remote_name":"remote"}],
+        "flussonix_srt_url":"srt://vendor.invalid:9998",
+        "flussonix_srt_encrypted":true,
+        "flussonix_srt_allow_direct_token":true
+    });
+    assert!(store.put("peers", "vendor", row.clone()).is_ok());
+    let mut wrong_type = row.clone();
+    wrong_type["flussonix_srt_allow_direct_token"] = json!("true");
+    assert!(store.put("peers", "vendor", wrong_type).is_err());
+    let mut no_listener = row.clone();
+    no_listener
+        .as_object_mut()
+        .unwrap()
+        .remove("flussonix_srt_url");
+    no_listener
+        .as_object_mut()
+        .unwrap()
+        .remove("flussonix_srt_encrypted");
+    assert!(
+        store
+            .put("peers", "vendor-without-listener", no_listener)
+            .is_err()
+    );
+    let mut native = row;
+    native["flussonix_peer_kind"] = json!("native");
+    native
+        .as_object_mut()
+        .unwrap()
+        .remove("flussonix_stream_map");
+    native.as_object_mut().unwrap().remove("cluster_key");
+    assert!(store.put("peers", "native", native).is_err());
+}
 fn policy() -> serde_json::Value {
     json!({"only":[],"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"owned-viewer"))})
 }

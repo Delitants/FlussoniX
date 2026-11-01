@@ -9,7 +9,7 @@ impl Runtime {
         key: &str,
         revision: u64,
         streamid: &str,
-        encrypted: bool,
+        mode: crate::server::SrtLookupMode,
     ) -> Result<Value, u16> {
         if !self.running() || app.modern_source_coordinator().is_err() {
             return Err(503);
@@ -30,7 +30,7 @@ impl Runtime {
                 Ok(AdmissionOutcome::Denied | AdmissionOutcome::Redirect(_)) => return Err(403),
                 Err(_) => return Err(503),
             };
-            app.balance_vendor_srt(&self.owner, &admitted, &viewer, streamid, encrypted)
+            app.balance_vendor_srt(&self.owner, &admitted, &viewer, streamid, mode)
                 .await
         };
         tokio::select! {biased; _=self.closed.cancelled()=>Err(503), result=work=>result}

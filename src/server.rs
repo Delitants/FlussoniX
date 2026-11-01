@@ -37,6 +37,13 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+#[derive(Clone, Copy)]
+pub(crate) enum SrtLookupMode {
+    Ticket,
+    Required,
+    Any,
+}
+
 #[derive(Clone)]
 pub struct Options {
     pub admin_user: String,

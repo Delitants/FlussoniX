@@ -9,14 +9,14 @@ impl App {
         admitted: &AdmittedCandidate,
         viewer: &ViewerRequest,
         streamid: &str,
-        encrypted: bool,
+        mode: SrtLookupMode,
     ) -> Result<Value, u16> {
         if self.options.role != "lb" || owner.admitted_current(admitted).is_err() {
             return Err(503);
         }
         let (_, grant, revision) = admitted.control_route();
         let result = self
-            .srt_place(viewer, streamid, encrypted, grant, revision)
+            .srt_place(viewer, streamid, mode, grant, revision)
             .await;
         owner
             .with_admitted_current(admitted, || {
@@ -315,7 +315,13 @@ mod vendor_destination_tests {
             finite_media: false,
         };
         let response = app
-            .balance_vendor_srt(owner, &admitted, &viewer, "#!::r=owned,m=request", true)
+            .balance_vendor_srt(
+                owner,
+                &admitted,
+                &viewer,
+                "#!::r=owned,m=request",
+                SrtLookupMode::Required,
+            )
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(response, Err(503));

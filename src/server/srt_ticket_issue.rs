@@ -82,7 +82,9 @@ async fn issue_inner(app: &Arc<App>, request: Request) -> Result<Value, u16> {
         finite_media: false,
     };
     if app.options.role == "lb" {
-        return app.srt_lookup(viewer, &body.streamid, true).await;
+        return app
+            .srt_lookup(viewer, &body.streamid, SrtLookupMode::Ticket)
+            .await;
     }
     let address = app.options.srt_play_public_url.as_ref().ok_or(503u16)?;
     let profile = app.srt_playback.lock().unwrap().clone();

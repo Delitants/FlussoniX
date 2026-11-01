@@ -21,6 +21,9 @@ struct Native {
 }
 impl Native {
     async fn new(limit: usize) -> Self {
+        Self::new_with_direct_tokens(limit, false).await
+    }
+    async fn new_with_direct_tokens(limit: usize, direct_tokens: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let app = App::new(
             dir.path().join("config.json"),
@@ -42,14 +45,20 @@ impl Native {
                 json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
             )
             .unwrap();
-        Self::start_with(app, dir, limit, KEY).await
+        Self::start_with(app, dir, limit, KEY, direct_tokens).await
     }
-    async fn start_with(app: Arc<App>, dir: tempfile::TempDir, limit: usize, key: &str) -> Self {
+    async fn start_with(
+        app: Arc<App>,
+        dir: tempfile::TempDir,
+        limit: usize,
+        key: &str,
+        direct_tokens: bool,
+    ) -> Self {
         let listener = Listener::bind(
             "127.0.0.1:0".parse().unwrap(),
             Settings::new(120, limit, "owned-native-passphrase".into())
                 .unwrap()
-                .with_direct_tokens(true),
+                .with_direct_tokens(direct_tokens),
         )
         .unwrap();
         let address = format!("srt://{}", listener.address());
@@ -199,6 +208,66 @@ async fn private_viewer_transfer_refuses_nonliteral_http_even_with_legacy_peer_o
         .await;
     assert_eq!(response.status(), 503);
     assert_eq!(cdn.node().await["reserved"], 0);
+    https.close().await;
+    cdn.close().await;
+}
+#[tokio::test]
+async fn native_legacy_any_requires_destination_direct_token_opt_in() {
+    let secure = Native::new(4).await;
+    let (_d, lb) = app();
+    lb.config.put("peers", "cdn", secure.peer()).unwrap();
+    let https = Https::new(lb.clone()).await;
+    let id = "#!::r=local/news,m=request,u=owned-secret";
+    assert_eq!(https.lookup(id, Some("any")).await.status(), 503);
+    assert_eq!(secure.node().await["reserved"], 0);
+    https.close().await;
+    secure.close().await;
+
+    let legacy = Native::new_with_direct_tokens(4, true).await;
+    lb.config.put("peers", "cdn", legacy.peer()).unwrap();
+    let https = Https::new(lb.clone()).await;
+    let response = https.lookup(id, Some("any")).await;
+    assert_eq!(response.status(), 200);
+    let result: Value = response.json().await.unwrap();
+    assert!(
+        result["streamid"]
+            .as_str()
+            .unwrap()
+            .contains("u=owned-secret")
+    );
+    assert!(
+        result["streamid"]
+            .as_str()
+            .unwrap()
+            .contains("flussonix_ticket=")
+    );
+    assert_eq!(legacy.node().await["reserved"], 1);
+    https.close().await;
+    legacy.close().await;
+}
+#[tokio::test]
+async fn saturated_native_cdn_never_falls_back_to_unapproved_vendor_direct_token() {
+    let cdn = Native::new(1).await;
+    assert_eq!(cdn.admit("owned-hold").await.status(), 200);
+    let vendor = super::Vendor::new().await;
+    let (_d, lb) = app();
+    lb.config.put("peers", "cdn", cdn.peer()).unwrap();
+    let mut vendor_peer = super::vendor_srt_lookup::peer(&vendor);
+    vendor_peer
+        .as_object_mut()
+        .unwrap()
+        .remove("flussonix_srt_allow_direct_token");
+    lb.config.put("peers", "vendor", vendor_peer).unwrap();
+    let https = Https::new(lb.clone()).await;
+    let response = https
+        .lookup("#!::r=local/news,m=request,u=owned-secret", None)
+        .await;
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        vendor.state.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(cdn.node().await["reserved"], 1);
     https.close().await;
     cdn.close().await;
 }
@@ -588,6 +657,7 @@ async fn native_reserved_cdn_pulls_owned_vendor_origin_only_after_viewer_admissi
         tempfile::tempdir().unwrap(),
         4,
         "owned-native-peer",
+        false,
     )
     .await;
     let (_d, lb) = app();
