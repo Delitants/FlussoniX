@@ -1741,8 +1741,16 @@ default and requires an explicit trusted-network option; Flussonic peers need
 their own separate opt-in. The API and operator setup are described in
 [SRT playback](srt-playback.md) and [CDN placement](vendor-cdn-placement.md).
 
-This candidate is not a production release. Independent packet-capture proof
-of token absence, exact-head five-codec media qualification, full browser and
+An owned UDP relay captured the first 128 client datagrams of a tokenless SRT
+connection. The assertion checks raw bytes and all 32-bit word alignments used
+by the SRT Stream ID extension. The reusable token was absent, while a
+deliberately enabled direct-token control was detected by the same parser.
+Independent FFmpeg strictly decoded H.264/AAC media from both connections;
+wrong-passphrase admission did not consume the ticket, and replay after use
+delivered no media. The six-profile encrypted listener matrix and four HEVC
+MP2/MP3 M4F/M4S native recovery profiles also passed serially.
+
+This candidate is not a production release. Full exact-head Rust/browser and
 packaging checks, review, WAN/capacity measurements, the independent 24-hour
 run, archived HEVC-loss gate and installation/upgrade/recovery checks remain
 open. Local success does not establish live Flussonic SRT interoperability.

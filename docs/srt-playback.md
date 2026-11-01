@@ -15,7 +15,7 @@ network with `--srt-play-allow-direct-token`. A visible one-use ticket can also
 be raced during its short lifetime; it is bound to one stream, listener, route
 and observed client IP. See [IPTV transport support](iptv-transport.md).
 Names or viewer tokens containing commas cannot currently be represented in
-the legacy selection format.
+the original selection format, including the HTTPS ticket request.
 This follows the documented [global playback](https://flussonic.com/doc/fms/play/srt/)
 and [SRT token](https://flussonic.com/doc/fms/auth/srt-auth/) conventions.
 
