@@ -1,8 +1,8 @@
 {
-  "cargo_lock_sha256": "c4e203f21afaa4cfe49b9a33403498395a8a9e053c3df625ec89590d371d3bdd",
+  "cargo_lock_sha256": "a7f8114ae458c5d45efe56cd0e4b64bd5a4b4f8616f24a4d0fbb54e8f316fd89",
   "cargo_manifest_sha256": "dbb466d8d9949f982e72bec761cc299e42b82454221f711a199dd41d628ebf27",
   "format": 1,
-  "notices_sha256": "d0604800b78c70251831d0747533d7577d7ae18655ec9bc97b0ad62d0cc75f43",
+  "notices_sha256": "511044844a9f37da399ea533b4b198fb8e534b21f9fd414ad2af2a53a70476ac",
   "packages": [
     {
       "declared_license": "MIT OR Apache-2.0",
@@ -686,19 +686,19 @@
       "files": [
         {
           "bytes": 11358,
-          "path": "licenses/rust/ctutils-0.4.2/LICENSE-APACHE",
+          "path": "licenses/rust/ctutils-0.4.4/LICENSE-APACHE",
           "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
           "upstream_path": "LICENSE-APACHE"
         },
         {
           "bytes": 1082,
-          "path": "licenses/rust/ctutils-0.4.2/LICENSE-MIT",
+          "path": "licenses/rust/ctutils-0.4.4/LICENSE-MIT",
           "sha256": "91585c36e4fb9ab4ca0d3dfac5d66d3c0c62cc51f640a0e1196542daf2267eae",
           "upstream_path": "LICENSE-MIT"
         }
       ],
       "name": "ctutils",
-      "version": "0.4.2"
+      "version": "0.4.4"
     },
     {
       "declared_license": "Apache-2.0 OR MIT",
