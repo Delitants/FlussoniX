@@ -135,6 +135,40 @@ class ServicePreviewTests(unittest.TestCase):
         self.assertNotEqual(self.render().returncode, 0)
         self.assertFalse(self.unit.exists())
 
+    def test_writable_release_paths_cannot_become_service_executables(self):
+        self.create_credentials()
+        for path in (self.root, self.release, self.release / 'bin',
+                     self.release / 'bin/flussonix', self.release / 'manifest.json'):
+            with self.subTest(path=path):
+                original = path.stat().st_mode & 0o7777
+                path.chmod(original | 0o022)
+                try:
+                    result = self.render()
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertFalse(self.unit.exists())
+                finally:
+                    path.chmod(original)
+                    if self.unit.exists():
+                        self.unit.unlink()
+
+    def test_root_render_rejects_release_owned_by_service_account(self):
+        if os.geteuid() != 0:
+            self.skipTest('root ownership applies to root-rendered service units')
+        self.create_credentials()
+        os.chown(self.release, self.account.pw_uid, self.account.pw_gid)
+        result = self.render()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(self.unit.exists())
+
+    def test_writable_ffmpeg_executable_cannot_be_used_by_service(self):
+        self.create_credentials()
+        ffmpeg = self.root / 'ffmpeg'
+        shutil.copy2('/usr/bin/true', ffmpeg)
+        ffmpeg.chmod(0o777)
+        result = self.render('--ffmpeg', ffmpeg)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(self.unit.exists())
+
     def test_credential_symlinks_cannot_be_followed_or_overwritten(self):
         target = self.root / 'untouched'
         target.write_text('untouched')
