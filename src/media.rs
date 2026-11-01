@@ -1408,9 +1408,9 @@ impl Engine {
                     }));
                 }
                 {
-                    let dir = dir.clone(); let c = cancel.clone(); let worker = w.clone();
+                    let dir = dir.clone(); let c = cancel.clone(); let worker = w.clone(); let bytes_worker = w.clone();
                     tasks.push(tokio::spawn(async move {
-                        if let Err(reason) = crate::hls_budget::watch(dir, hls_generation, c.clone()).await
+                        if let Err(reason) = crate::hls_budget::watch(dir, hls_generation, raw_hls, move || bytes_worker.bytes.load(Ordering::Relaxed), c.clone()).await
                             && !c.is_cancelled()
                         {
                             tracing::warn!(%reason, "HLS segment budget stopped worker");
@@ -2044,6 +2044,47 @@ mod lifecycle_tests {
     use crate::server::{App, Options, router};
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
+    #[tokio::test]
+    async fn unclosed_mux_byte_budget_stops_and_reaps_worker_without_a_playlist() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let idle = d.path().join("idle-packager");
+        std::fs::write(&idle, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&idle, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let app = App::new(
+            d.path().join("config.json"),
+            d.path().join("media"),
+            Options {
+                ffmpeg: idle.to_string_lossy().into_owned(),
+                admin_password: "owned-budget-admin".into(),
+                peer_key: "owned-budget-peer".into(),
+                uplink_interface: "process".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let worker = app
+            .media
+            .ensure("owned", &json!({"inputs":[{"url":"testsrc://"}]}))
+            .await
+            .unwrap();
+        worker.bytes.store(64 * 1024 * 1024 + 1, Ordering::Relaxed);
+        let stopped = tokio::time::timeout(Duration::from_secs(3), worker.closed())
+            .await
+            .is_ok();
+        let reaped = tokio::time::timeout(Duration::from_secs(3), async {
+            while worker.pid() != 0 || worker.alive.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let reason = worker.stats()["last_error"].as_str().map(str::to_owned);
+        app.media.stop_all().await;
+        assert!(stopped, "unclosed mux bytes did not stop the worker");
+        assert!(reaped, "stopped worker retained its packager PID");
+        assert_eq!(reason.as_deref(), Some("packaging_failed"));
+    }
     #[tokio::test]
     async fn oversized_current_generation_hls_temp_segment_stops_and_reaps_worker() {
         let d = tempfile::tempdir().unwrap();

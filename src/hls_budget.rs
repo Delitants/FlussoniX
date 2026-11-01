@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 const MAX_SEGMENT: u64 = 64 * 1024 * 1024;
@@ -77,13 +78,85 @@ async fn check_generation_budget(dir: &Path, generation: &str) -> Result<(), Str
     inspect_dir(&dir.join("fmp4"), generation, true, &mut files, &mut bytes).await
 }
 
-pub async fn watch(
+#[derive(Default)]
+struct MuxProgress {
+    last_segment: Option<u64>,
+    bytes_at_last_segment: u64,
+}
+
+impl MuxProgress {
+    fn observe(
+        &mut self,
+        latest_segment: Option<u64>,
+        stdout_bytes: u64,
+        limit: u64,
+    ) -> Result<(), String> {
+        if let Some(segment) = latest_segment
+            && self.last_segment.is_none_or(|last| segment > last)
+        {
+            self.last_segment = Some(segment);
+            self.bytes_at_last_segment = stdout_bytes;
+        }
+        if stdout_bytes.saturating_sub(self.bytes_at_last_segment) > limit {
+            return Err("HLS mux buffer budget exceeded".into());
+        }
+        Ok(())
+    }
+}
+
+async fn latest_segment(
+    dir: &Path,
+    generation: &str,
+    raw_hls: bool,
+) -> Result<Option<u64>, String> {
+    let filename = if raw_hls {
+        "passthrough.m3u8"
+    } else {
+        "index.m3u8"
+    };
+    let file = match tokio::fs::File::open(dir.join(filename)).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("cannot inspect HLS playlist progress".into()),
+    };
+    let mut raw = Vec::new();
+    file.take(65537)
+        .read_to_end(&mut raw)
+        .await
+        .map_err(|_| "cannot inspect HLS playlist progress")?;
+    if raw.len() > 65536 {
+        return Err("HLS playlist progress exceeds size limit".into());
+    }
+    let text = std::str::from_utf8(&raw).map_err(|_| "invalid HLS playlist progress")?;
+    let prefix = if raw_hls {
+        format!("g{generation}_p")
+    } else {
+        format!("g{generation}_")
+    };
+    Ok(text
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix(&prefix)?
+                .strip_suffix(".ts")?
+                .parse::<u64>()
+                .ok()
+        })
+        .max())
+}
+
+pub async fn watch<F>(
     dir: PathBuf,
     generation: String,
+    raw_hls: bool,
+    output_bytes: F,
     cancel: CancellationToken,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    F: Fn() -> u64 + Send + Sync,
+{
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut progress = MuxProgress::default();
     loop {
         tokio::select! {
             biased;
@@ -95,6 +168,11 @@ pub async fn watch(
             return Ok(());
         }
         result?;
+        let latest = latest_segment(&dir, &generation, raw_hls).await?;
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        progress.observe(latest, output_bytes(), MAX_SEGMENT)?;
     }
 }
 
@@ -177,6 +255,8 @@ mod tests {
         let task = tokio::spawn(watch(
             d.path().to_path_buf(),
             "current".into(),
+            false,
+            || 0,
             cancel.clone(),
         ));
         cancel.cancel();
@@ -186,6 +266,53 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn unclosed_mux_bytes_are_bounded_even_without_a_playlist() {
+        let mut progress = MuxProgress::default();
+        assert!(progress.observe(None, MAX_SEGMENT, MAX_SEGMENT).is_ok());
+        assert!(
+            progress
+                .observe(None, MAX_SEGMENT + 1, MAX_SEGMENT)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn only_a_newer_completed_segment_rearms_mux_budget() {
+        let mut progress = MuxProgress::default();
+        assert!(progress.observe(None, MAX_SEGMENT - 1, MAX_SEGMENT).is_ok());
+        assert!(progress.observe(Some(10), MAX_SEGMENT, MAX_SEGMENT).is_ok());
+        assert!(
+            progress
+                .observe(Some(10), MAX_SEGMENT * 2, MAX_SEGMENT)
+                .is_ok()
+        );
+        assert!(
+            progress
+                .observe(Some(9), MAX_SEGMENT * 2 + 1, MAX_SEGMENT)
+                .is_err()
+        );
+        assert!(
+            progress
+                .observe(Some(11), MAX_SEGMENT * 2 + 1, MAX_SEGMENT)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn playlist_progress_requires_a_current_generation_ts_segment() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:2,\ngprevious_99.ts\n#EXTINF:2,\ngcurrent_42.ts\n",
+        )
+        .unwrap();
+        assert_eq!(
+            latest_segment(d.path(), "current", false).await.unwrap(),
+            Some(42)
         );
     }
 }
