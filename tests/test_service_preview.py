@@ -65,6 +65,84 @@ class ServicePreviewTests(unittest.TestCase):
                             '--user', self.account.pw_name, '--listen', '127.0.0.1:18210',
                             '--ffmpeg', Path('/usr/bin/true').resolve(), '--output', self.unit, *extra)
 
+    def tls_pair(self, name):
+        cert = self.root / f'{name}.crt'
+        key = self.root / f'{name}.key'
+        cert.write_text('owned certificate fixture')
+        key.write_text('owned private key fixture')
+        cert.chmod(0o644)
+        key.chmod(0o600)
+        if os.geteuid() == 0:
+            os.chown(key, self.account.pw_uid, self.account.pw_gid)
+        return cert, key
+
+    def test_combined_secure_listeners_render_a_valid_unit(self):
+        if not shutil.which('systemd-analyze'):
+            self.skipTest('requires systemd-analyze')
+        self.create_credentials()
+        https_cert, https_key = self.tls_pair('https')
+        rtsps_cert, rtsps_key = self.tls_pair('rtsps')
+        fx_cert, fx_key = self.tls_pair('fxlink')
+        result = self.render('--https-listen', '127.0.0.1:18443', '--https-cert', https_cert,
+                             '--https-key', https_key, '--https-only',
+                             '--rtsp-listen', '127.0.0.1:18554', '--rtsps-listen', '127.0.0.1:18555',
+                             '--rtsps-cert', rtsps_cert, '--rtsps-key', rtsps_key,
+                             '--rtsp-udp-ports', '22000-22003', '--rtsp-udp-mbps', '42',
+                             '--fxlink-listen', '127.0.0.1:18447', '--fxlink-cert', fx_cert,
+                             '--fxlink-key', fx_key)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unit = self.unit.read_text()
+        for expected in ('"--https-listen" "127.0.0.1:18443"', '"--https-only"',
+                         '"--rtsps-listen" "127.0.0.1:18555"',
+                         '"--rtsp-udp-ports" "22000-22003"',
+                         '"--rtsp-udp-mbps" "42"',
+                         '"--fxlink-listen" "127.0.0.1:18447"'):
+            self.assertIn(expected, unit)
+        verify = subprocess.run(['systemd-analyze', 'verify', '--man=no', str(self.unit)],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(verify.returncode, 0, verify.stderr)
+
+    def test_incomplete_tls_and_invalid_udp_controls_create_no_unit(self):
+        self.create_credentials()
+        cert, key = self.tls_pair('https')
+        for extra in [('--https-only',), ('--https-listen', '127.0.0.1:18443'),
+                      ('--https-listen', '127.0.0.1:18443', '--https-cert', cert),
+                      ('--https-cert', cert, '--https-key', key),
+                      ('--rtsps-listen', '127.0.0.1:18555'),
+                      ('--fxlink-listen', '127.0.0.1:18447'),
+                      ('--rtsp-udp-ports', '22000-22001'),
+                      ('--rtsp-listen', '127.0.0.1:18554', '--rtsp-udp-ports', '22001-22002'),
+                      ('--rtsp-listen', '127.0.0.1:18554', '--rtsp-udp-ports', '22000-22257'),
+                      ('--rtsp-listen', '127.0.0.1:18554', '--rtsp-udp-mbps', '42'),
+                      ('--rtsp-listen', '127.0.0.1:18554', '--rtsp-udp-ports', '22000-22001',
+                       '--rtsp-udp-mbps', '10001')]:
+            with self.subTest(extra=extra):
+                self.unit.unlink(missing_ok=True)
+                result = self.render(*extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.unit.exists())
+
+    def test_overlapping_tcp_bind_and_public_private_key_are_rejected(self):
+        self.create_credentials()
+        cert, key = self.tls_pair('https')
+        for address in ('127.0.0.1:18210', '0.0.0.0:18210'):
+            with self.subTest(address=address):
+                self.unit.unlink(missing_ok=True)
+                result = self.render('--https-listen', address, '--https-cert', cert, '--https-key', key)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.unit.exists())
+        key.chmod(0o644)
+        self.unit.unlink(missing_ok=True)
+        result = self.render('--https-listen', '127.0.0.1:18443', '--https-cert', cert, '--https-key', key)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.unit.exists())
+        if os.geteuid() == 0:
+            key.chmod(0o600)
+            os.chown(key, 0, 0)
+            result = self.render('--https-listen', '127.0.0.1:18443', '--https-cert', cert, '--https-key', key)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(self.unit.exists())
+
     def test_generated_unit_passes_systemd_and_keeps_secrets_out(self):
         if not shutil.which('systemd-analyze'):
             self.skipTest('requires systemd-analyze')

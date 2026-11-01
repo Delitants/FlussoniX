@@ -5,6 +5,7 @@ import getpass
 import hashlib
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import pwd
@@ -155,6 +156,52 @@ def listener(value):
     return f'[{address}]:{port}' if address.version == 6 else f'{address}:{port}'
 
 
+def runtime_file(raw: str, account, groups: list[int], *, private: bool, max_bytes: int) -> Path:
+    path = absolute(raw)
+    _, info = read_regular(path, max_bytes)
+    traverse(path.parent, account, groups)
+    if not can_access(path, account, groups, 4):
+        raise ValueError('service account cannot read a selected runtime file')
+    if private:
+        if info.st_uid != account.pw_uid or info.st_mode & 0o077:
+            raise ValueError('private runtime file must be service-owned and owner-only')
+    elif info.st_uid not in (0, account.pw_uid) or info.st_mode & 0o022:
+        raise ValueError('runtime file has an unsafe owner or writable permissions')
+    return path
+
+
+def overlapping_bind(a: str, b: str) -> bool:
+    def split(value):
+        host, port = value.rsplit(':', 1)
+        return ipaddress.ip_address(host.strip('[]')), int(port)
+    first, first_port = split(a)
+    second, second_port = split(b)
+    if first_port == 0 or first_port != second_port:
+        return False
+    if first.version == second.version:
+        return first == second or first.is_unspecified or second.is_unspecified
+    return first.is_unspecified or second.is_unspecified
+
+
+def rtsp_ports(raw: str) -> str:
+    match = re.fullmatch(r'([0-9]{4,5})-([0-9]{4,5})', raw)
+    if not match:
+        raise ValueError('RTSP UDP ports require an inclusive even/odd range')
+    first, last = map(int, match.groups())
+    if first < 1024 or first % 2 or last > 65535 or last % 2 != 1 or not 2 <= last - first + 1 <= 256:
+        raise ValueError('RTSP UDP ports require 2..256 even/odd ports >=1024')
+    return raw
+
+
+def rtsp_mbps(raw: str) -> str:
+    if not re.fullmatch(r'[0-9]{1,5}(?:\.[0-9]{1,6})?', raw):
+        raise ValueError('RTSP UDP Mbps must be a decimal number')
+    value = float(raw)
+    if not math.isfinite(value) or not 1 <= value <= 10000:
+        raise ValueError('RTSP UDP Mbps must be within 1..10000')
+    return raw
+
+
 def render(args):
     if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,39}', args.instance):
         raise ValueError('instance must contain lowercase letters, digits and hyphens')
@@ -186,14 +233,51 @@ def render(args):
     trusted_install_path(ffmpeg)
     traverse(ffmpeg.parent, account, groups)
     listen = listener(args.listen)
+    secure = {}
+    for prefix in ('https', 'rtsps', 'fxlink'):
+        values = [getattr(args, prefix + suffix) for suffix in ('_listen', '_cert', '_key')]
+        if any(value is not None for value in values):
+            if not all(value is not None for value in values):
+                raise ValueError(f'{prefix.upper()} listener requires certificate and key')
+            secure[prefix] = (
+                listener(values[0]),
+                runtime_file(values[1], account, groups, private=False, max_bytes=1024 * 1024),
+                runtime_file(values[2], account, groups, private=True, max_bytes=1024 * 1024),
+            )
+    if args.https_only and 'https' not in secure:
+        raise ValueError('HTTPS-only requires an HTTPS listener')
+    rtsp_listen = listener(args.rtsp_listen) if args.rtsp_listen is not None else None
+    if args.rtsp_udp_ports is not None and rtsp_listen is None:
+        raise ValueError('RTSP UDP ports require an RTSP listener')
+    if args.rtsp_udp_mbps is not None and args.rtsp_udp_ports is None:
+        raise ValueError('RTSP UDP Mbps requires a port range')
+    udp_ports = rtsp_ports(args.rtsp_udp_ports) if args.rtsp_udp_ports is not None else None
+    udp_mbps = rtsp_mbps(args.rtsp_udp_mbps) if args.rtsp_udp_mbps is not None else None
+    tcp = ([] if args.https_only else [listen]) + [value for value in (
+        secure.get('https', (None,))[0], rtsp_listen, secure.get('rtsps', (None,))[0]) if value]
+    if any(overlapping_bind(a, b) for i, a in enumerate(tcp) for b in tcp[i + 1:]):
+        raise ValueError('TCP listeners overlap')
     name = 'flussonix-' + args.instance + '.service'
     output = absolute(args.output)
     if output.is_relative_to(release / 'web'):
         raise ValueError('unit output cannot be inside the public web tree')
     if output.name != name:
         raise ValueError(f'output filename must be {name}')
-    command = ' '.join('"' + str(value) + '"' for value in [release / 'bin/flussonix', '--listen', listen,
-        '--config', state / 'config.json', '--media-dir', state / 'media', '--web-dir', release / 'web', '--ffmpeg', ffmpeg])
+    command_args = [release / 'bin/flussonix', '--listen', listen,
+        '--config', state / 'config.json', '--media-dir', state / 'media', '--web-dir', release / 'web', '--ffmpeg', ffmpeg]
+    for prefix in ('https', 'rtsps', 'fxlink'):
+        if prefix in secure:
+            for suffix, value in zip(('_listen', '_cert', '_key'), secure[prefix]):
+                command_args.extend(('--' + prefix + suffix.replace('_', '-'), value))
+    if rtsp_listen is not None:
+        command_args.extend(('--rtsp-listen', rtsp_listen))
+    if udp_ports is not None:
+        command_args.extend(('--rtsp-udp-ports', udp_ports))
+    if udp_mbps is not None:
+        command_args.extend(('--rtsp-udp-mbps', udp_mbps))
+    if args.https_only:
+        command_args.append('--https-only')
+    command = ' '.join('"' + str(value) + '"' for value in command_args)
     unit = f'''# Generated by FlussoniX; instance={args.instance}
 [Unit]
 Description=FlussoniX preview ({args.instance})
@@ -240,6 +324,11 @@ def main():
     for name in ['instance', 'release-dir', 'state-dir', 'credentials', 'user', 'listen', 'output']:
         service.add_argument('--' + name, required=True)
     service.add_argument('--ffmpeg', default='/usr/bin/ffmpeg')
+    for name in ('https-listen', 'https-cert', 'https-key', 'rtsp-listen', 'rtsps-listen',
+                 'rtsps-cert', 'rtsps-key', 'rtsp-udp-ports', 'rtsp-udp-mbps',
+                 'fxlink-listen', 'fxlink-cert', 'fxlink-key'):
+        service.add_argument('--' + name)
+    service.add_argument('--https-only', action='store_true')
     args = parser.parse_args()
     try:
         credentials(args) if args.command == 'credentials' else render(args)
