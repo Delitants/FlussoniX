@@ -365,14 +365,22 @@ def render(args):
                       if args.iptv_authority_secondary is not None else None)
     cluster_id = None
     if args.iptv_authority_cluster_id is not None:
-        cluster_id = str(uuid.UUID(args.iptv_authority_cluster_id))
-        if cluster_id != args.iptv_authority_cluster_id:
-            raise ValueError('IPTV cluster ID must use canonical UUID syntax')
+        parsed_cluster_id = uuid.UUID(args.iptv_authority_cluster_id)
+        cluster_id = str(parsed_cluster_id)
+        if parsed_cluster_id.int == 0 or cluster_id != args.iptv_authority_cluster_id:
+            raise ValueError('IPTV cluster ID must use non-nil canonical UUID syntax')
     if (iptv_secondary is None) != (cluster_id is None) or (iptv_secondary is not None and iptv_authority is None):
         raise ValueError('second IPTV authority requires a primary origin and cluster ID')
     if iptv_secondary is not None:
         primary_url, secondary_url = urlsplit(iptv_authority), urlsplit(iptv_secondary)
-        if (primary_url.hostname, primary_url.port or 443) == (secondary_url.hostname, secondary_url.port or 443):
+        def authority_endpoint(value):
+            host = value.hostname
+            try:
+                host = ipaddress.ip_address(host)
+            except ValueError:
+                pass
+            return host, value.port or 443
+        if authority_endpoint(primary_url) == authority_endpoint(secondary_url):
             raise ValueError('IPTV authorities must have distinct origins')
     if args.iptv_lease_authority and (iptv_authority is None or 'https' not in secure):
         raise ValueError('IPTV lease authority requires an HTTPS listener and self origin')
