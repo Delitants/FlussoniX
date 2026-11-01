@@ -116,3 +116,39 @@ jobs:
           test -s "$FLUSSONIX_HA_UI_READY_FILE"
           export FLUSSONIX_TEST_URL="$(cat "$FLUSSONIX_HA_UI_READY_FILE")"
           npm test --prefix web -- --grep 'IPTV HA live'
+
+  release_package_smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install standalone media runtime dependencies
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg libsrt1.5-gnutls
+      - name: Verify vendor components are absent
+        run: test ! -e /opt/flussonic
+      - name: Verify archive smoke rejects untrusted inputs
+        run: python3 -m unittest tests.test_release_archive_smoke -v
+      - name: Build actual release daemon
+        run: cargo build --locked --release
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build actual admin UI
+        run: npm ci --prefix web && npm run build --prefix web
+      - name: Package and start exact release archive
+        run: |
+          set -euo pipefail
+          package_dir=$(mktemp -d "$RUNNER_TEMP/flussonix-package.XXXXXXXX")
+          trap 'rm -rf "$package_dir"' EXIT
+          python3 scripts/package-preview.py --binary target/release/flussonix \
+            --web-dir web/dist --output-dir "$package_dir" --revision "$GITHUB_SHA"
+          mapfile -t archives < <(find "$package_dir" -maxdepth 1 -type f -name '*.tar.gz')
+          test "${#archives[@]}" -eq 1
+          python3 scripts/smoke-release-archive.py --archive "${archives[0]}" \
+            --revision "$GITHUB_SHA"
