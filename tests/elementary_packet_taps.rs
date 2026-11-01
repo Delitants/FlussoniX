@@ -413,6 +413,48 @@ fn handoff_rejects_foreign_native_owner() {
     assert!(!retained);
     assert_eq!(summary["incomplete"], true);
 }
+#[test]
+fn handoff_sender_source_socket_rebind_discards_raw() {
+    use std::io::{BufRead, Write};
+    let script = "import socket,sys; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('0.0.0.0',0)); port=s.getsockname()[1]; print(port); sys.stdin.readline(); s.close(); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('0.0.0.0',port)); print('rebound'); sys.stdin.readline()";
+    let mut sender = std::process::Command::new("python3")
+        .args(["-u", "-c", script])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = std::io::BufReader::new(sender.stdout.take().unwrap());
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    let port = line.trim().parse::<u16>().unwrap();
+    assert!(
+        elementary_diagnostics::udp_source_ownership(sender.id(), 1)
+            .unwrap()
+            .1
+            .contains_key(&port)
+    );
+    let reserved = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let destination = reserved.local_addr().unwrap().port();
+    let mut witness = taps::HandoffWitness::new(
+        taps::Owner::snapshot(std::process::id(), &[destination]).unwrap(),
+        taps::Owner::sender(sender.id(), 1).unwrap(),
+    );
+    let origin = std::time::Instant::now();
+    witness.release(origin).unwrap();
+    drop(reserved);
+    let native = std::net::UdpSocket::bind(("127.0.0.1", destination)).unwrap();
+    witness.bind_native(std::process::id(), origin).unwrap();
+    writeln!(sender.stdin.as_mut().unwrap(), "rebind").unwrap();
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "rebound");
+    let (summary, retained) = handoff_retention(&witness);
+    sender.kill().unwrap();
+    sender.wait().unwrap();
+    drop(native);
+    assert!(!retained);
+    assert_eq!(summary["observation"], "unavailable");
+}
 
 #[test]
 #[ignore = "requires CAP_NET_RAW and uses an owned loopback sender"]

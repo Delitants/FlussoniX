@@ -110,11 +110,21 @@ pub fn attach_pair_filter(
         code[index].jf = (source_reject - index - 1) as u8;
     }
     code[9].jt = (source_reject - 10) as u8;
-    for index in sources_begin..source_reject {
-        code[index].jt = (destination_load - index - 1) as u8;
+    for (index, entry) in code
+        .iter_mut()
+        .enumerate()
+        .take(source_reject)
+        .skip(sources_begin)
+    {
+        entry.jt = (destination_load - index - 1) as u8;
     }
-    for index in destinations_begin..destination_reject {
-        code[index].jt = (accept - index - 1) as u8;
+    for (index, entry) in code
+        .iter_mut()
+        .enumerate()
+        .take(destination_reject)
+        .skip(destinations_begin)
+    {
+        entry.jt = (accept - index - 1) as u8;
     }
     let filter = libc::sock_fprog {
         len: code.len() as u16,

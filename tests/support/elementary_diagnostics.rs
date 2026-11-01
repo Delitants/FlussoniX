@@ -548,6 +548,10 @@ pub(super) fn udp_ownership(pid: u32, ports: &[u16]) -> io::Result<(u64, BTreeMa
     }
     Ok((start_ticks, found))
 }
+#[allow(
+    dead_code,
+    reason = "source snapshots are used only by opt-in packet taps"
+)]
 pub(super) fn udp_source_ownership(
     pid: u32,
     expected: usize,
