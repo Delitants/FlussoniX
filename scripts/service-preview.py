@@ -11,6 +11,7 @@ from pathlib import Path
 import pwd
 import re
 import stat
+from urllib.parse import urlsplit
 
 
 def absolute(raw):
@@ -61,6 +62,12 @@ def credentials(args):
         password = getpass.getpass('Saved admin password: ')
         peer = getpass.getpass('Saved cluster peer key: ')
     values = {'FLUSSONIX_ADMIN_USER': user, 'FLUSSONIX_ADMIN_PASSWORD': password, 'FLUSSONIX_PEER_KEY': peer}
+    if args.with_srt_passphrase:
+        srt_passphrase = (os.environ.get('FLUSSONIX_SRT_PLAY_PASSPHRASE', '')
+            if args.from_env else getpass.getpass('SRT playback passphrase: '))
+        if not 10 <= len(srt_passphrase) <= 79 or any(not 32 <= ord(c) <= 126 for c in srt_passphrase):
+            raise ValueError('SRT playback passphrase must be 10..79 printable ASCII characters')
+        values['FLUSSONIX_SRT_PLAY_PASSPHRASE'] = srt_passphrase
     if any(not value or len(value) > 4096 or any(not 32 <= ord(c) <= 126 for c in value)
            for value in values.values()) or len(peer) < 12 or ':' in user:
         raise ValueError('credentials require printable ASCII; username cannot contain a colon; peer key needs at least 12 characters')
@@ -202,6 +209,31 @@ def rtsp_mbps(raw: str) -> str:
     return raw
 
 
+def srt_root(raw: str) -> str:
+    if len(raw) > 255 or not re.fullmatch(r'srt://(?:\[[0-9A-Fa-f:]+\]|[A-Za-z0-9.-]+):[0-9]{1,5}/?', raw):
+        raise ValueError('SRT public URL must be a credential-free listener root')
+    parsed = urlsplit(raw)
+    if parsed.scheme != 'srt' or not parsed.hostname or not parsed.port or parsed.path not in ('', '/'):
+        raise ValueError('SRT public URL requires a host and nonzero port')
+    host = parsed.hostname
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        if len(host) > 253 or any(not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label)
+                                 for label in host.split('.')):
+            raise ValueError('SRT public URL has an invalid hostname') from None
+    else:
+        if address.is_unspecified or address.is_multicast or address == ipaddress.ip_address('255.255.255.255'):
+            raise ValueError('SRT public URL requires a reachable host')
+    return raw
+
+
+def bounded_integer(raw: str, lower: int, upper: int, label: str) -> str:
+    if not re.fullmatch(r'[0-9]{1,5}', raw) or not lower <= int(raw) <= upper:
+        raise ValueError(f'{label} must be within {lower}..{upper}')
+    return raw
+
+
 def render(args):
     if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,39}', args.instance):
         raise ValueError('instance must contain lowercase letters, digits and hyphens')
@@ -257,6 +289,17 @@ def render(args):
         secure.get('https', (None,))[0], rtsp_listen, secure.get('rtsps', (None,))[0]) if value]
     if any(overlapping_bind(a, b) for i, a in enumerate(tcp) for b in tcp[i + 1:]):
         raise ValueError('TCP listeners overlap')
+    srt_listen = listener(args.srt_play_listen) if args.srt_play_listen is not None else None
+    if srt_listen is None and any((args.srt_play_public_url is not None, args.srt_play_latency is not None,
+                                  args.srt_play_client_limit is not None, args.srt_play_allow_direct_token)):
+        raise ValueError('SRT options require an SRT playback listener')
+    srt_public_url = srt_root(args.srt_play_public_url) if args.srt_play_public_url is not None else None
+    srt_latency = (bounded_integer(args.srt_play_latency, 1, 10000, 'SRT latency')
+                   if args.srt_play_latency is not None else None)
+    srt_limit = (bounded_integer(args.srt_play_client_limit, 1, 4096, 'SRT client limit')
+                 if args.srt_play_client_limit is not None else None)
+    if srt_listen is not None and 'fxlink' in secure and overlapping_bind(srt_listen, secure['fxlink'][0]):
+        raise ValueError('UDP listeners overlap')
     name = 'flussonix-' + args.instance + '.service'
     output = absolute(args.output)
     if output.is_relative_to(release / 'web'):
@@ -275,6 +318,12 @@ def render(args):
         command_args.extend(('--rtsp-udp-ports', udp_ports))
     if udp_mbps is not None:
         command_args.extend(('--rtsp-udp-mbps', udp_mbps))
+    for name, value in (('srt_play_listen', srt_listen), ('srt_play_public_url', srt_public_url),
+                        ('srt_play_latency', srt_latency), ('srt_play_client_limit', srt_limit)):
+        if value is not None:
+            command_args.extend(('--' + name.replace('_', '-'), value))
+    if args.srt_play_allow_direct_token:
+        command_args.append('--srt-play-allow-direct-token')
     if args.https_only:
         command_args.append('--https-only')
     command = ' '.join('"' + str(value) + '"' for value in command_args)
@@ -320,6 +369,7 @@ def main():
     credential.add_argument('--output', required=True)
     credential.add_argument('--admin-user', default='admin')
     credential.add_argument('--from-env', action='store_true', help='read the three FLUSSONIX credential variables')
+    credential.add_argument('--with-srt-passphrase', action='store_true')
     service = commands.add_parser('render', help='verify paths and write a unit; never starts/enables services')
     for name in ['instance', 'release-dir', 'state-dir', 'credentials', 'user', 'listen', 'output']:
         service.add_argument('--' + name, required=True)
@@ -329,6 +379,9 @@ def main():
                  'fxlink-listen', 'fxlink-cert', 'fxlink-key'):
         service.add_argument('--' + name)
     service.add_argument('--https-only', action='store_true')
+    for name in ('srt-play-listen', 'srt-play-public-url', 'srt-play-latency', 'srt-play-client-limit'):
+        service.add_argument('--' + name)
+    service.add_argument('--srt-play-allow-direct-token', action='store_true')
     args = parser.parse_args()
     try:
         credentials(args) if args.command == 'credentials' else render(args)

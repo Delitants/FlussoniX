@@ -143,6 +143,62 @@ class ServicePreviewTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(self.unit.exists())
 
+    def test_srt_options_render_without_exposing_passphrase(self):
+        self.env['FLUSSONIX_SRT_PLAY_PASSPHRASE'] = 'owned-srt-passphrase-123!'
+        saved = self.command('credentials', '--from-env', '--with-srt-passphrase', '--output', self.credentials)
+        self.assertEqual(saved.returncode, 0, saved.stderr)
+        result = self.render('--srt-play-listen', '127.0.0.1:18448',
+                             '--srt-play-public-url', 'srt://cdn.example.test:18448',
+                             '--srt-play-latency', '750', '--srt-play-client-limit', '128',
+                             '--srt-play-allow-direct-token')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unit = self.unit.read_text()
+        for expected in ('"--srt-play-listen" "127.0.0.1:18448"',
+                         '"--srt-play-public-url" "srt://cdn.example.test:18448"',
+                         '"--srt-play-latency" "750"',
+                         '"--srt-play-client-limit" "128"',
+                         '"--srt-play-allow-direct-token"'):
+            self.assertIn(expected, unit)
+        self.assertIn('FLUSSONIX_SRT_PLAY_PASSPHRASE=', self.credentials.read_text())
+        self.assertNotIn(self.env['FLUSSONIX_SRT_PLAY_PASSPHRASE'], unit + saved.stdout + saved.stderr
+                         + result.stdout + result.stderr)
+
+    def test_srt_dependent_options_and_udp_collision_create_no_unit(self):
+        self.create_credentials()
+        cert, key = self.tls_pair('fxlink')
+        invalid = [('--srt-play-public-url', 'srt://cdn.example.test:18448'),
+                   ('--srt-play-latency', '750'), ('--srt-play-client-limit', '128'),
+                   ('--srt-play-allow-direct-token',),
+                   ('--srt-play-listen', '127.0.0.1:18448', '--srt-play-latency', '0'),
+                   ('--srt-play-listen', '127.0.0.1:18448', '--srt-play-latency', '10001'),
+                   ('--srt-play-listen', '127.0.0.1:18448', '--srt-play-client-limit', '0'),
+                   ('--srt-play-listen', '127.0.0.1:18448', '--srt-play-client-limit', '4097'),
+                   ('--srt-play-listen', '127.0.0.1:18448', '--srt-play-public-url',
+                    'srt://cdn.example.test:18448?token=private'),
+                   ('--srt-play-listen', '127.0.0.1:18448', '--fxlink-listen', '0.0.0.0:18448',
+                    '--fxlink-cert', cert, '--fxlink-key', key)]
+        for extra in invalid:
+            with self.subTest(extra=extra):
+                self.unit.unlink(missing_ok=True)
+                result = self.render(*extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.unit.exists())
+
+    def test_srt_passphrase_opt_in_rejects_missing_and_invalid_values(self):
+        for value in (None, 'too-short', 'x' * 80, 'bad\nline', 'nonascii-\u00e9-key'):
+            with self.subTest(value_kind='missing' if value is None else len(value)):
+                self.credentials.unlink(missing_ok=True)
+                if value is None:
+                    self.env.pop('FLUSSONIX_SRT_PLAY_PASSPHRASE', None)
+                else:
+                    self.env['FLUSSONIX_SRT_PLAY_PASSPHRASE'] = value
+                result = self.command('credentials', '--from-env', '--with-srt-passphrase',
+                                      '--output', self.credentials)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.credentials.exists())
+                if value is not None:
+                    self.assertNotIn(value, result.stdout + result.stderr)
+
     def test_generated_unit_passes_systemd_and_keeps_secrets_out(self):
         if not shutil.which('systemd-analyze'):
             self.skipTest('requires systemd-analyze')
