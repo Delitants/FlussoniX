@@ -106,7 +106,7 @@ async fn admit(
         .map_err(|_| 503u16)?;
     let id = uuid::Uuid::new_v4().to_string();
     let mut grant = Grant {
-        metadata: json!({"name":name,"proto":"rtsp","ip":peer.ip().to_string(),"token":token,"qs":qs,"user_agent":r.headers.get("user-agent").map(String::as_str).unwrap_or(""),"referer":r.headers.get("referer").map(String::as_str).unwrap_or(""),"host":r.headers.get("host").map(String::as_str).unwrap_or(""),"session_id":id}),
+        metadata: json!({"name":name,"proto":"rtsp","ip":peer.ip().to_string(),"token":token,"qs":crate::publish::callback_query(qs),"user_agent":r.headers.get("user-agent").map(String::as_str).unwrap_or(""),"referer":r.headers.get("referer").map(String::as_str).unwrap_or(""),"host":r.headers.get("host").map(String::as_str).unwrap_or(""),"session_id":id}),
         started: Instant::now(),
         number: 0,
         bytes: 0,

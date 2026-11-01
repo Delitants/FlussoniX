@@ -596,7 +596,8 @@ async fn publisher_callback_uses_post_metadata_and_renews_same_session_before_de
     assert_eq!(log[1]["request_type"], "update_session");
     assert_eq!(log[0]["session_id"], log[1]["session_id"]);
     assert_eq!(log[1]["bytes"], 188);
-    assert!(log[0]["qs"].as_str().unwrap().contains("extra=one%20two"));
+    assert_eq!(log[0]["qs"], "token=owned%2Btoken&extra=one%20two");
+    assert_eq!(log[1]["qs"], "token=owned%2Btoken&extra=one%20two");
     drop(log);
     a.media.stop_all().await;
     backend.abort();
