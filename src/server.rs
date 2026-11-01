@@ -503,6 +503,48 @@ impl App {
             }
         };
     }
+    fn reservation_capacity(
+        &self,
+        reservations: &HashMap<String, Reservation>,
+        srt: Option<&srt_tickets::Binding>,
+        bitrate_mbps: f64,
+    ) -> bool {
+        let expected = bitrate_mbps / self.options.uplink_mbps;
+        let (n, window) = self
+            .telemetry
+            .snapshot_with_window(self.options.uplink_mbps);
+        let reserved_mbps: f64 = reservations.values().map(|r| r.bitrate_mbps).sum::<f64>()
+            + self
+                .http_handoffs
+                .unmeasured(window, n["http_egress_mbps"].as_f64());
+        let active = self.playback_auth.active();
+        let srt_full = srt.is_some_and(|binding| {
+            let listener = self.srt_playback.lock().unwrap();
+            let limit = listener["client_limit"].as_u64().unwrap_or(0);
+            let pending = reservations
+                .values()
+                .filter(|r| {
+                    r.srt
+                        .as_ref()
+                        .is_some_and(|b| b.listener_id == binding.listener_id)
+                })
+                .count() as u64;
+            self.srt_connections
+                .load(Ordering::Relaxed)
+                .saturating_add(pending)
+                >= limit
+        });
+        !srt_full
+            && !self.options.drain
+            && reservations.len() < 20000
+            && active.saturating_add(reservations.len() as u64) < self.options.client_limit
+            && n["uplink"].as_f64().unwrap_or(1.0)
+                + reserved_mbps / self.options.uplink_mbps
+                + expected
+                < 0.9
+            && n["cpu"].as_f64().unwrap_or(1.0) < 0.9
+            && n["ram"].as_f64().unwrap_or(1.0) < 0.95
+    }
     fn cluster_client(&self, node: &Value) -> Result<reqwest::Client, String> {
         let endpoint = node["api_url"]
             .as_str()
@@ -919,6 +961,11 @@ impl App {
             self.media.direct_egress.load(Ordering::Relaxed),
             self.fxlink.lock().unwrap().1.load(Ordering::Relaxed),
         );
+        // The one-second daemon tick also releases expired in-memory viewer
+        // credentials when no new admissions or node-status reads arrive.
+        if let Ok(mut reservations) = self.reservations.try_lock() {
+            reservations.retain(|_, reservation| reservation.expires > at);
+        }
     }
 
     fn resolved(&self, name: &str, config: Value, revision: u64) -> Option<Resolved> {
@@ -1734,6 +1781,8 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
                 listener_id: listener["listener_id"].as_str().unwrap_or("").into(),
                 revision: app.config.revision(),
                 signature: None,
+                viewer: None,
+                peer_ip: None,
             });
         }
         if matches!(
@@ -1826,40 +1875,7 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
                 "stream cost exceeds admission bounds",
             );
         }
-        let expected = bitrate_mbps / app.options.uplink_mbps;
-        let (n, window) = app.telemetry.snapshot_with_window(app.options.uplink_mbps);
-        let reserved_mbps: f64 = reservations.values().map(|r| r.bitrate_mbps).sum::<f64>()
-            + app
-                .http_handoffs
-                .unmeasured(window, n["http_egress_mbps"].as_f64());
-        let active = app.playback_auth.active();
-        let srt_full = srt.as_ref().is_some_and(|binding| {
-            let listener = app.srt_playback.lock().unwrap();
-            let limit = listener["client_limit"].as_u64().unwrap_or(0);
-            let pending = reservations
-                .values()
-                .filter(|r| {
-                    r.srt
-                        .as_ref()
-                        .is_some_and(|b| b.listener_id == binding.listener_id)
-                })
-                .count() as u64;
-            app.srt_connections
-                .load(Ordering::Relaxed)
-                .saturating_add(pending)
-                >= limit
-        });
-        if srt_full
-            || app.options.drain
-            || reservations.len() >= 20000
-            || active + reservations.len() as u64 >= app.options.client_limit
-            || n["uplink"].as_f64().unwrap_or(1.0)
-                + reserved_mbps / app.options.uplink_mbps
-                + expected
-                >= 0.9
-            || n["cpu"].as_f64().unwrap_or(1.0) >= 0.9
-            || n["ram"].as_f64().unwrap_or(1.0) >= 0.95
-        {
+        if !app.reservation_capacity(&reservations, srt.as_ref(), bitrate_mbps) {
             return error(StatusCode::SERVICE_UNAVAILABLE, "node has no capacity");
         }
         let native_http = matches!(kind, rtsp_balancer::Kind::Http)
