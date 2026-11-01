@@ -24,10 +24,15 @@ branch or file alias for those exact paths. This is a source finding, not a
 runtime status-code or full contract check. A native `/health` route and native
 `fmp4/index.m3u8` path do not satisfy the differently named reference paths.
 
-The other 170 operations say `not_assessed`. This is deliberately different
-from `not_implemented`: an unreviewed route may exist. Two first-release rows
-in this group, `/play` and `/publish`, describe outbound authorization callback
-contracts rather than server handlers; they need a separate caller-side audit.
+The two first-release authorization callback rows say
+`caller_present_contract_unqualified`: `src/playback_auth.rs` sends a configured
+HTTP GET with viewer fields, and `src/server/publication.rs` sends a configured
+HTTP POST for publisher authorization. Their `/play` and `/publish` labels are
+reference callback paths, not paths served by FlussoniX. Source inspection
+does not prove complete callback field or decision parity.
+
+The other 168 operations say `not_assessed`. This is deliberately different
+from `not_implemented`: an unreviewed route may exist.
 Existing endpoint tests, the schema and this inventory are separate evidence;
 none alone establishes complete API compatibility. Update a row to a stronger
 status only after recording direct behavior evidence for its exact method/path.

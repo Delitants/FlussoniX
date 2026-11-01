@@ -229,5 +229,5 @@ installed-streaming,POST,/{name}/whep,webrtc_play,webrtc,201|400|404,later_or_de
 installed-streaming,POST,/{name}/whip,webrtc_publish,webrtc,201|400|403|404,later_or_dependency_review,not_assessed,schema_observed_only
 installed-streaming,PUT,/{name}/sessions/{id},session_save,session,204,later_or_dependency_review,not_assessed,schema_observed_only
 installed-streaming,PUT,/{name}/sessions/{id}/request_tracks,request_tracks,api,204|400|404,later_or_dependency_review,not_assessed,schema_observed_only
-published-authorization,GET,/play,auth_request,auth,200|302|403,first_release_callback_contract,not_assessed,schema_observed_only
-published-authorization,POST,/publish,publish_request,auth,200|403,first_release_callback_contract,not_assessed,schema_observed_only
+published-authorization,GET,/play,auth_request,auth,200|302|403,first_release_callback_contract,caller_present_contract_unqualified,source_inspected_only
+published-authorization,POST,/publish,publish_request,auth,200|403,first_release_callback_contract,caller_present_contract_unqualified,source_inspected_only
