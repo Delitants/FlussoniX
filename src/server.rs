@@ -1153,6 +1153,7 @@ pub fn router(app: Arc<App>) -> Router {
  .route("/flussonix/peer/v1/iptv/leases/release",axum::routing::post(iptv_peer::release))
  .route("/flussonix/peer/v1/iptv/leases/rollback",axum::routing::post(iptv_peer::rollback))
  .route("/flussonix/api/v1/srt-lookup",axum::routing::any(srt_lookup::lookup))
+ .route("/flussonix/api/v1/srt-ticket",axum::routing::any(srt_ticket_issue::issue))
  .route("/flussonix/api/v1/{*tail}",axum::routing::any(native))
  .nest_service("/admin",tower_http::services::ServeDir::new(&app.options.web_dir).append_index_html_on_directories(true))
  .fallback(media_request).with_state(app).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024))
@@ -2919,6 +2920,7 @@ mod http_handoff;
 mod http_tickets;
 pub(crate) mod rtsp_balancer;
 mod srt_lookup;
+mod srt_ticket_issue;
 pub(crate) mod srt_tickets;
 mod vendor_balancer;
 mod vendor_http_state;

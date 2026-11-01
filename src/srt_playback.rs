@@ -7,6 +7,7 @@ use crate::{
 };
 pub use native::{Listener, Socket};
 pub use selection::Selection;
+pub(crate) use selection::ticket_only;
 use std::{
     net::SocketAddr,
     sync::{Arc, atomic::Ordering},

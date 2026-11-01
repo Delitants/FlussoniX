@@ -70,10 +70,6 @@ impl App {
         self.srt_match(reservation, &viewer, ticket)
             .then_some(viewer)
     }
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the HTTPS issuer wires this in Task 3")
-    )]
     pub(crate) async fn reserve_srt_credential(
         &self,
         mut viewer: ViewerRequest,
