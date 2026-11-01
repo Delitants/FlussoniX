@@ -2,6 +2,7 @@
 use super::{
     packet,
     sdp::{Session, Track},
+    startup::StartupQueue,
 };
 use crate::direct_rtp::{config::Settings, crypto, packet as control, sockets::Pair, stats::Stats};
 use std::{
@@ -10,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 struct Lane {
     public: Pair,
@@ -148,17 +150,49 @@ impl Input {
     ) -> Result<(), String> {
         let stats = self.stats.clone();
         let ports: Vec<_> = self.lanes.iter().map(|lane| lane.target.port()).collect();
+        let decoder_ports: Vec<_> = ports.iter().flat_map(|port| [*port, *port + 1]).collect();
         let sdp = self.session.decoder_sdp(&ports);
         self.reservations.clear();
+        let child = cancel.child_token();
+        let (ready_tx, ready_rx) = watch::channel(false);
+        let mut tasks = tokio::task::JoinSet::new();
+        for lane in self.lanes.drain(..) {
+            tasks.spawn(relay(lane, stats.clone(), child.clone(), ready_rx.clone()));
+        }
         let initialized: Result<bool, &'static str> = tokio::select! {biased;_=cancel.cancelled()=>Ok(false),result=tokio::time::timeout(Duration::from_secs(2),async{writer.write_all(sdp.as_bytes()).await?;writer.shutdown().await})=>match result{Ok(Ok(()))=>Ok(true),Ok(Err(_))=>Err("Elementary decoder SDP write failed"),Err(_)=>Err("Elementary decoder SDP write stalled")}};
         // Unix ChildStdin::shutdown is a no-op. Drop the owned pipe to deliver
         // EOF before FFmpeg can parse the full SDP and bind its decoder sockets.
         drop(writer);
-        let result = match initialized {
-            Ok(true) => self.receive(&cancel, decoder_pid).await,
+        let startup = match initialized {
+            Ok(true) => self.receive(&cancel, decoder_pid, &decoder_ports).await,
             Ok(false) => Ok(()),
             Err(e) => Err(e),
         };
+        if startup.is_ok() && initialized == Ok(true) && !cancel.is_cancelled() {
+            *stats.status.lock().unwrap() = if stats.packets.load(Ordering::Relaxed) > 0 {
+                "receiving"
+            } else {
+                "bound"
+            };
+            ready_tx.send_replace(true);
+        } else {
+            child.cancel();
+        }
+        let mut task_error = None;
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    task_error.get_or_insert(e);
+                    child.cancel();
+                }
+                Err(_) => {
+                    task_error.get_or_insert("Elementary RTP relay task failed");
+                    child.cancel();
+                }
+            }
+        }
+        let result = startup.and_then(|()| task_error.map_or(Ok(()), Err));
         *stats.status.lock().unwrap() = if result.is_err() { "failed" } else { "stopped" };
         *stats.error.lock().unwrap() = result.as_ref().err().copied();
         result.map_err(str::to_owned)
@@ -167,19 +201,15 @@ impl Input {
         &mut self,
         cancel: &CancellationToken,
         decoder_pid: Option<u32>,
+        decoder_ports: &[u16],
     ) -> Result<(), &'static str> {
-        // Do not admit public datagrams until the owned decoder has opened every
-        // private pair. The shared loopback trust boundary matches other worker bridges.
-        let decoder_ports: Vec<_> = self
-            .lanes
-            .iter()
-            .flat_map(|lane| [lane.target.port(), lane.target.port() + 1])
-            .collect();
+        // Public admission runs in the bounded reader tasks. Private delivery
+        // remains gated on ownership of every decoder RTP/RTCP socket.
         let ready: Result<(), &'static str> = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let ready = match decoder_pid {
-                    Some(pid) => super::readiness::owned(&decoder_ports, pid, &self.reservation_inodes)?,
-                    None => super::readiness::bound(&decoder_ports)?,
+                    Some(pid) => super::readiness::owned(decoder_ports, pid, &self.reservation_inodes)?,
+                    None => super::readiness::bound(decoder_ports)?,
                 };
                 if ready {return Ok(());}
                 tokio::select! { _=cancel.cancelled()=>return Ok(()), _=tokio::time::sleep(Duration::from_millis(10))=>{} }
@@ -189,32 +219,7 @@ impl Input {
         if cancel.is_cancelled() {
             return Ok(());
         }
-        *self.stats.status.lock().unwrap() = "bound";
-        let child = cancel.child_token();
-        let mut tasks = tokio::task::JoinSet::new();
-        for lane in self.lanes.drain(..) {
-            let c = child.clone();
-            let stats = self.stats.clone();
-            tasks.spawn(relay(lane, stats, c));
-        }
-        let mut error = None;
-        while let Some(result) = tasks.join_next().await {
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    error.get_or_insert(e);
-                    child.cancel();
-                }
-                Err(_) => {
-                    error.get_or_insert("Elementary RTP relay task failed");
-                    child.cancel();
-                }
-            }
-        }
-        match error {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        Ok(())
     }
 }
 async fn send(
@@ -225,43 +230,152 @@ async fn send(
 ) -> Result<(), &'static str> {
     tokio::select! {biased;_=cancel.cancelled()=>Ok(()),result=tokio::time::timeout(Duration::from_secs(2),async{match to{Some(to)=>socket.send_to(bytes,to).await,None=>socket.send(bytes).await}})=>{let n=result.map_err(|_|"Elementary RTP relay write stalled")?.map_err(|_|"Elementary RTP relay write failed")?;if n!=bytes.len(){return Err("Elementary RTP relay datagram truncated");}Ok(())}}
 }
+fn admit_rtp(
+    lane: &mut Lane,
+    stats: &Stats,
+    peer: &mut Option<(SocketAddr, u32)>,
+    bytes: &[u8],
+    addr: SocketAddr,
+) -> Result<Option<(Vec<u8>, u16)>, &'static str> {
+    if lane.settings.source_ip.is_some_and(|ip| ip != addr.ip())
+        || peer.is_some_and(|(p, _)| p != addr)
+    {
+        stats.foreign.fetch_add(1, Ordering::Relaxed);
+        return Ok(None);
+    }
+    let mut plain = bytes.to_vec();
+    if let Some(crypto) = &mut lane.crypto {
+        if crypto.unprotect(&mut plain, false).is_err() {
+            stats.auth_failed.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+    }
+    let parsed = match packet::parse(&plain, &lane.track) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            stats.invalid.fetch_add(1, Ordering::Relaxed);
+            if peer.is_none() {
+                if let Some(crypto) = &mut lane.crypto {
+                    crypto.discard_candidate()?;
+                }
+            }
+            return Ok(None);
+        }
+    };
+    if peer.is_some_and(|(_, ssrc)| ssrc != parsed.ssrc) {
+        stats.foreign.fetch_add(1, Ordering::Relaxed);
+        return Ok(None);
+    }
+    peer.get_or_insert((addr, parsed.ssrc));
+    stats.packets.fetch_add(1, Ordering::Relaxed);
+    stats
+        .bytes
+        .fetch_add(parsed.payload.len() as u64, Ordering::Relaxed);
+    let sequence = parsed.sequence;
+    Ok(Some((plain, sequence)))
+}
+
+fn admit_rtcp(
+    lane: &mut Lane,
+    stats: &Stats,
+    peer: Option<(SocketAddr, u32)>,
+    bytes: &[u8],
+    addr: SocketAddr,
+) -> Option<Vec<u8>> {
+    let (p, ssrc) = peer?;
+    if addr.ip() != p.ip() || p.port().checked_add(1) != Some(addr.port()) {
+        stats.foreign.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let mut plain = bytes.to_vec();
+    if let Some(crypto) = &mut lane.crypto {
+        if crypto.unprotect(&mut plain, true).is_err() {
+            stats.auth_failed.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    }
+    if !control::valid_rtcp(&plain)
+        || plain[1] != 200
+        || u32::from_be_bytes(plain[4..8].try_into().unwrap()) != ssrc
+    {
+        stats.invalid.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    Some(plain)
+}
 async fn relay(
     mut lane: Lane,
     stats: Arc<Stats>,
     cancel: CancellationToken,
+    mut ready_signal: watch::Receiver<bool>,
 ) -> Result<(), &'static str> {
     let mut buffer = [0; control::MAX_PACKET + 11];
     let mut rtcp = [0; 2049];
     let mut feedback = [0; 2049];
     let mut peer: Option<(SocketAddr, u32)> = None;
+    let mut queue = StartupQueue::new(1024, 2 * 1024 * 1024, 64, 128 * 1024);
+    let mut decoder_owned = *ready_signal.borrow();
     let mut reorder = control::Reorder::new(lane.settings.jitter);
     let mut duplicates = 0;
     let mut lost = 0;
     let mut tick = tokio::time::interval(Duration::from_millis(5));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let ready = tokio::select! {_=cancel.cancelled()=>return Ok(()),
-         result=lane.public.rtp.recv_from(&mut buffer)=>{
-          let(n,addr)=result.map_err(|_|"Elementary RTP public socket failed")?;
-          if lane.settings.source_ip.is_some_and(|ip|ip!=addr.ip()) || peer.is_some_and(|(p,_)|p!=addr){stats.foreign.fetch_add(1,Ordering::Relaxed);continue;}
-          let mut plain=buffer[..n].to_vec();if let Some(crypto)=&mut lane.crypto {if crypto.unprotect(&mut plain,false).is_err(){stats.auth_failed.fetch_add(1,Ordering::Relaxed);continue;}}
-          let parsed=match packet::parse(&plain,&lane.track){Ok(p)=>p,Err(_)=>{stats.invalid.fetch_add(1,Ordering::Relaxed);if peer.is_none(){if let Some(crypto)=&mut lane.crypto {crypto.discard_candidate()?;}}continue;}};
-          if peer.is_some_and(|(_,ssrc)|ssrc!=parsed.ssrc){stats.foreign.fetch_add(1,Ordering::Relaxed);continue;}
-          peer.get_or_insert((addr,parsed.ssrc));*stats.status.lock().unwrap()="receiving";stats.packets.fetch_add(1,Ordering::Relaxed);stats.bytes.fetch_add(parsed.payload.len() as u64,Ordering::Relaxed);
-          reorder.push(parsed.sequence,plain,Instant::now())
-         },
-         _=tick.tick()=>reorder.flush(Instant::now()),
-         result=lane.public.rtcp.recv_from(&mut rtcp)=>{
-          let(n,addr)=result.map_err(|_|"Elementary RTCP public socket failed")?;
-          let Some((p,ssrc))=peer else{continue;};if addr.ip()!=p.ip() || p.port().checked_add(1)!=Some(addr.port()){stats.foreign.fetch_add(1,Ordering::Relaxed);continue;}
-          let mut plain=rtcp[..n].to_vec();if let Some(crypto)=&mut lane.crypto {if crypto.unprotect(&mut plain,true).is_err(){stats.auth_failed.fetch_add(1,Ordering::Relaxed);continue;}}
-          if !control::valid_rtcp(&plain) || plain[1]!=200 || u32::from_be_bytes(plain[4..8].try_into().unwrap())!=ssrc{stats.invalid.fetch_add(1,Ordering::Relaxed);continue;}
-          send(&lane.local.rtcp,&plain,None,&cancel).await?;stats.rtcp.fetch_add(1,Ordering::Relaxed);continue;
-         },
-         result=lane.local.rtcp.recv(&mut feedback)=>{
-          let n=result.map_err(|_|"Elementary RTCP private socket failed")?;let Some((p,_))=peer else{continue;};let Some(port)=p.port().checked_add(1)else{continue;};
-          if !control::valid_rtcp(&feedback[..n]){continue;}let mut body=feedback[..n].to_vec();if let Some(crypto)=&mut lane.feedback {crypto.protect(&mut body,true)?;}send(&lane.public.rtcp,&body,Some(SocketAddr::new(p.ip(),port)),&cancel).await?;stats.rtcp.fetch_add(1,Ordering::Relaxed);continue;
-         },
+        let ready = tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            changed = ready_signal.changed(), if !decoder_owned => {
+                changed.map_err(|_| "Elementary RTP decoder readiness lost")?;
+                decoder_owned = *ready_signal.borrow_and_update();
+                continue;
+            },
+            result = lane.public.rtp.recv_from(&mut buffer) => {
+                let (n, addr) = result.map_err(|_| "Elementary RTP public socket failed")?;
+                let Some((plain, sequence)) = admit_rtp(&mut lane, &stats, &mut peer, &buffer[..n], addr)? else { continue; };
+                if decoder_owned {
+                    *stats.status.lock().unwrap() = "receiving";
+                }
+                if !decoder_owned || queue.has_rtp() {
+                    let dropped = queue.push_rtp(plain);
+                    stats.startup_dropped_packets.fetch_add(dropped, Ordering::Relaxed);
+                    continue;
+                }
+                reorder.push(sequence, plain, Instant::now())
+            },
+            result = lane.public.rtcp.recv_from(&mut rtcp) => {
+                let (n, addr) = result.map_err(|_| "Elementary RTCP public socket failed")?;
+                let Some(plain) = admit_rtcp(&mut lane, &stats, peer, &rtcp[..n], addr) else { continue; };
+                if !decoder_owned || queue.has_rtcp() {
+                    let dropped = queue.push_rtcp(plain);
+                    stats.startup_dropped_rtcp_packets.fetch_add(dropped, Ordering::Relaxed);
+                } else {
+                    send(&lane.local.rtcp, &plain, None, &cancel).await?;
+                    stats.rtcp.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            },
+            _ = std::future::ready(()), if decoder_owned && queue.has_rtp() => {
+                let plain = queue.pop_rtp().expect("queued RTP packet");
+                let sequence = u16::from_be_bytes([plain[2], plain[3]]);
+                reorder.push(sequence, plain, Instant::now())
+            },
+            _ = std::future::ready(()), if decoder_owned && queue.has_rtcp() => {
+                let plain = queue.pop_rtcp().expect("queued RTCP packet");
+                send(&lane.local.rtcp, &plain, None, &cancel).await?;
+                stats.rtcp.fetch_add(1, Ordering::Relaxed);
+                continue;
+            },
+            _ = tick.tick(), if decoder_owned => reorder.flush(Instant::now()),
+            result = lane.local.rtcp.recv(&mut feedback), if decoder_owned => {
+                let n = result.map_err(|_| "Elementary RTCP private socket failed")?;
+                let Some((p, _)) = peer else { continue; };
+                let Some(port) = p.port().checked_add(1) else { continue; };
+                if !control::valid_rtcp(&feedback[..n]) { continue; }
+                let mut body = feedback[..n].to_vec();
+                if let Some(crypto) = &mut lane.feedback { crypto.protect(&mut body, true)?; }
+                send(&lane.public.rtcp, &body, Some(SocketAddr::new(p.ip(), port)), &cancel).await?;
+                stats.rtcp.fetch_add(1, Ordering::Relaxed);
+                continue;
+            },
         };
         stats.duplicates.fetch_add(
             reorder.duplicates.saturating_sub(duplicates),

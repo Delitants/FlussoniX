@@ -274,7 +274,7 @@ async fn engine_does_not_admit_media_to_sockets_owned_by_another_process() {
         !leaked,
         "port occupancy admitted media to a foreign decoder"
     );
-    assert_eq!(stats["direct_rtp_input"]["packets"], 0);
+    assert_eq!(stats["direct_rtp_input"]["packets"], 1);
     assert_eq!(stats["direct_rtp_input"]["status"], "starting");
     for n in [p, p + 1] {
         assert_released(n).await;

@@ -29,6 +29,30 @@ CPU-transcoded outputs use the same worker path. Internal VAAPI H.264 is opt-in 
 
 Qualification uses independent FFmpeg senders and SDP receivers, exact codec/frame checks and strict decode: H.264 and HEVC paired with AAC/MP2/MP3, AAC audio-only, distinct MP2+MP3 tracks, and actual CPU video/audio conversion. Native tests cover malformed/foreign admission, reorder, RTCP, authenticated SDP, zero media epoch, late receivers, stale target/generation, shared workers and reaping. These small localhost fixtures do not establish WAN, sustained throughput or a complete Flussonic direction matrix.
 
+### Decoder startup buffering
+
+Elementary RTP/SRTP input now reads and validates public packets while its
+private decoder starts. Each track holds at most 1,024 admitted RTP packets or
+2 MiB, plus at most 64 authenticated RTCP packets or 128 KiB. The oldest queued
+packet is discarded if either limit is reached; `startup_dropped_packets` and
+`startup_dropped_rtcp_packets` expose these discards separately from RTP
+sequence loss. Public packets still cannot reach any private socket until all
+RTP/RTCP ports belong to the expected decoder process. Failed startup,
+cancellation and input replacement discard the queue.
+
+An owned two-track SRTP regression sends packets before decoder binding,
+rejects wrong-key, malformed and foreign candidates, proves no early private
+delivery, and checks buffered RTP/SRTCP after binding. Separate tests exercise
+the RTP and RTCP limits, track isolation, arrivals during drain and cancellation
+with queued media. A fresh 27-case plaintext/secure localhost media run on the
+candidate strictly decoded the worker and independent receiver recordings.
+All 27 evidence files finished qualified and complete, with zero native
+startup discards, native RTP sequence loss and observed UDP socket drops.
+These observations do not prove the older intermittent HEVC picture loss is
+fixed: that specific failure did not recur, and the passive packet taps still
+begin after private decoder readiness. The queue cannot recover network loss,
+packets discarded before its reader starts, or a burst beyond its fixed cap.
+
 ## Investigating intermittent media loss
 
 The independent elementary fixtures can retain private evidence with

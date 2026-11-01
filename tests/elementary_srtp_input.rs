@@ -278,9 +278,24 @@ async fn secure_cancellation_before_decoder_bind_releases_public_lanes() {
     std::fs::write(&s, description(p)).unwrap();
     drop(res);
     let input = Input::bind(&config(p, &s, &k)).await.unwrap();
+    let stats = input.stats.clone();
     let c = CancellationToken::new();
     let (writer, _reader) = tokio::io::duplex(1);
     let task = tokio::spawn(input.run(writer, c.clone()));
+    let sender = AsyncUdp::bind("127.0.0.1:0").await.unwrap();
+    let mut encrypted = media(1, 222, 4);
+    crypto::Session::new([0x31; 30], Some(222))
+        .unwrap()
+        .protect(&mut encrypted, false)
+        .unwrap();
+    sender.send_to(&encrypted, ("127.0.0.1", p)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while stats.packets.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("packet must be queued while SDP writer is blocked");
     c.cancel();
     tokio::time::timeout(Duration::from_secs(1), task)
         .await
@@ -290,4 +305,410 @@ async fn secure_cancellation_before_decoder_bind_releases_public_lanes() {
     for n in p..p + 4 {
         assert!(UdpSocket::bind(("127.0.0.1", n)).is_ok());
     }
+}
+
+#[tokio::test]
+async fn secure_packets_wait_for_all_owned_decoder_ports_without_filling_public_socket() {
+    let d = tempfile::tempdir().unwrap();
+    let key = key_file(d.path());
+    let (port, reserved) = ports(4);
+    let sdp = d.path().join("owned.sdp");
+    std::fs::write(&sdp, description(port)).unwrap();
+    drop(reserved);
+    let input = Input::bind(&config(port, &sdp, &key)).await.unwrap();
+    let stats = input.stats.clone();
+    let cancel = CancellationToken::new();
+    let (writer, mut reader) = tokio::io::duplex(32768);
+    let mut task = tokio::spawn(input.run(writer, cancel.clone()));
+    let mut text = Vec::new();
+    reader.read_to_end(&mut text).await.unwrap();
+    let private_ports: Vec<u16> = String::from_utf8(text)
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("m=audio "))
+        .map(|line| line.split_whitespace().nth(1).unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(private_ports.len(), 2);
+
+    let (_, sender_pair) = ports(2);
+    let mut sender_pair = sender_pair.into_iter().map(|socket| {
+        socket.set_nonblocking(true).unwrap();
+        AsyncUdp::from_std(socket).unwrap()
+    });
+    let sender = sender_pair.next().unwrap();
+    let sender_rtcp = sender_pair.next().unwrap();
+    let foreign = AsyncUdp::bind("127.0.0.2:0").await.unwrap();
+    let wrong_key_sender = AsyncUdp::bind("127.0.0.1:0").await.unwrap();
+    let malformed_sender = AsyncUdp::bind("127.0.0.1:0").await.unwrap();
+    assert_ne!(
+        wrong_key_sender.local_addr().unwrap(),
+        sender.local_addr().unwrap()
+    );
+    assert_ne!(
+        malformed_sender.local_addr().unwrap(),
+        sender.local_addr().unwrap()
+    );
+    foreign
+        .send_to(&media(8, 777, 4), ("127.0.0.1", port))
+        .await
+        .unwrap();
+    let mut wrong_key = media(9, 901, 4);
+    crypto::Session::new([0x32; 30], Some(901))
+        .unwrap()
+        .protect(&mut wrong_key, false)
+        .unwrap();
+    wrong_key_sender
+        .send_to(&wrong_key, ("127.0.0.1", port))
+        .await
+        .unwrap();
+    let mut malformed = media(9, 902, 4);
+    malformed[1] = 96;
+    crypto::Session::new([0x31; 30], Some(902))
+        .unwrap()
+        .protect(&mut malformed, false)
+        .unwrap();
+    let mut source_crypto = crypto::Session::new([0x31; 30], Some(777)).unwrap();
+    malformed_sender
+        .send_to(&malformed, ("127.0.0.1", port))
+        .await
+        .unwrap();
+    let original = media(10, 777, 4);
+    let mut encrypted = original.clone();
+    source_crypto.protect(&mut encrypted, false).unwrap();
+    sender
+        .send_to(&encrypted, ("127.0.0.1", port))
+        .await
+        .unwrap();
+    let second_original = media(11, 888, 4);
+    let mut second_encrypted = second_original.clone();
+    crypto::Session::new([0x31; 30], Some(888))
+        .unwrap()
+        .protect(&mut second_encrypted, false)
+        .unwrap();
+    sender
+        .send_to(&second_encrypted, ("127.0.0.1", port + 2))
+        .await
+        .unwrap();
+    let admitted = tokio::time::timeout(Duration::from_secs(1), async {
+        while stats.packets.load(Ordering::Relaxed) < 2
+            || stats.auth_failed.load(Ordering::Relaxed) == 0
+            || stats.invalid.load(Ordering::Relaxed) == 0
+            || stats.foreign.load(Ordering::Relaxed) == 0
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_ok();
+    if !admitted {
+        cancel.cancel();
+        (&mut task).await.unwrap().unwrap();
+    }
+    assert!(
+        admitted,
+        "valid public SRTP must be read during decoder startup"
+    );
+
+    // RTCP is accepted only after RTP has established the legitimate peer.
+    let mut report = sr(777);
+    source_crypto.protect(&mut report, true).unwrap();
+    sender_rtcp
+        .send_to(&report, ("127.0.0.1", port + 1))
+        .await
+        .unwrap();
+
+    let first_rtp = AsyncUdp::bind(("127.0.0.1", private_ports[0]))
+        .await
+        .unwrap();
+    let first_rtcp = AsyncUdp::bind(("127.0.0.1", private_ports[0] + 1))
+        .await
+        .unwrap();
+    let mut received = [0; 1600];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), first_rtp.recv(&mut received))
+            .await
+            .is_err(),
+        "one bound decoder track must not release packets"
+    );
+    let second_rtp = AsyncUdp::bind(("127.0.0.1", private_ports[1]))
+        .await
+        .unwrap();
+    let _second_rtcp = AsyncUdp::bind(("127.0.0.1", private_ports[1] + 1))
+        .await
+        .unwrap();
+    let n = tokio::time::timeout(Duration::from_secs(2), first_rtp.recv(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&received[..n], original);
+    let n = tokio::time::timeout(Duration::from_secs(2), second_rtp.recv(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&received[..n], second_original);
+    let n = tokio::time::timeout(Duration::from_secs(2), first_rtcp.recv(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&received[..n], sr(777));
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), &mut task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn secure_startup_overflow_drops_oldest_without_kernel_loss() {
+    let d = tempfile::tempdir().unwrap();
+    let key = key_file(d.path());
+    let (port, reserved) = ports(4);
+    let sdp = d.path().join("owned.sdp");
+    std::fs::write(&sdp, description(port)).unwrap();
+    drop(reserved);
+    let input = Input::bind(&config(port, &sdp, &key)).await.unwrap();
+    let stats = input.stats.clone();
+    let cancel = CancellationToken::new();
+    let (writer, mut reader) = tokio::io::duplex(32768);
+    let task = tokio::spawn(input.run(writer, cancel.clone()));
+    let mut text = Vec::new();
+    reader.read_to_end(&mut text).await.unwrap();
+    let private_ports: Vec<u16> = String::from_utf8(text)
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("m=audio "))
+        .map(|line| line.split_whitespace().nth(1).unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(private_ports.len(), 2);
+    let sender = AsyncUdp::bind("127.0.0.1:0").await.unwrap();
+    let mut crypto = crypto::Session::new([0x31; 30], Some(222)).unwrap();
+    for seq in 0..=1024u16 {
+        let mut packet = media(seq, 222, 4);
+        crypto.protect(&mut packet, false).unwrap();
+        sender.send_to(&packet, ("127.0.0.1", port)).await.unwrap();
+        if seq % 32 == 31 || seq == 1024 {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while stats.packets.load(Ordering::Relaxed) < u64::from(seq) + 1 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the public reader must keep up with paced startup packets");
+        }
+    }
+    let second_original = media(200, 333, 4);
+    let mut second_encrypted = second_original.clone();
+    crypto::Session::new([0x31; 30], Some(333))
+        .unwrap()
+        .protect(&mut second_encrypted, false)
+        .unwrap();
+    sender
+        .send_to(&second_encrypted, ("127.0.0.1", port + 2))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while stats.packets.load(Ordering::Relaxed) < 1026 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(stats.packets.load(Ordering::Relaxed), 1026);
+    assert_eq!(stats.startup_dropped_packets.load(Ordering::Relaxed), 1);
+    let decoder = AsyncUdp::bind(("127.0.0.1", private_ports[0]))
+        .await
+        .unwrap();
+    let _control = AsyncUdp::bind(("127.0.0.1", private_ports[0] + 1))
+        .await
+        .unwrap();
+    let second_decoder = AsyncUdp::bind(("127.0.0.1", private_ports[1]))
+        .await
+        .unwrap();
+    let _second_control = AsyncUdp::bind(("127.0.0.1", private_ports[1] + 1))
+        .await
+        .unwrap();
+    let mut plain = [0; 1600];
+    let n = tokio::time::timeout(Duration::from_secs(2), decoder.recv(&mut plain))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, media(1, 222, 4).len());
+    assert_eq!(u16::from_be_bytes([plain[2], plain[3]]), 1);
+    let n = tokio::time::timeout(Duration::from_secs(2), second_decoder.recv(&mut plain))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&plain[..n], second_original);
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn secure_startup_rtcp_overflow_has_its_own_bound() {
+    let d = tempfile::tempdir().unwrap();
+    let key = key_file(d.path());
+    let (port, reserved) = ports(4);
+    let sdp = d.path().join("owned.sdp");
+    std::fs::write(&sdp, description(port)).unwrap();
+    drop(reserved);
+    let input = Input::bind(&config(port, &sdp, &key)).await.unwrap();
+    let stats = input.stats.clone();
+    let cancel = CancellationToken::new();
+    let (writer, mut reader) = tokio::io::duplex(32768);
+    let task = tokio::spawn(input.run(writer, cancel.clone()));
+    let mut text = Vec::new();
+    reader.read_to_end(&mut text).await.unwrap();
+    let private_ports: Vec<u16> = String::from_utf8(text)
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("m=audio "))
+        .map(|line| line.split_whitespace().nth(1).unwrap().parse().unwrap())
+        .collect();
+    let (_, sockets) = ports(2);
+    let mut sockets = sockets.into_iter().map(|socket| {
+        socket.set_nonblocking(true).unwrap();
+        AsyncUdp::from_std(socket).unwrap()
+    });
+    let sender = sockets.next().unwrap();
+    let sender_rtcp = sockets.next().unwrap();
+    let mut crypto = crypto::Session::new([0x31; 30], Some(555)).unwrap();
+    let mut media = media(1, 555, 4);
+    crypto.protect(&mut media, false).unwrap();
+    sender.send_to(&media, ("127.0.0.1", port)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while stats.packets.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for marker in 1..=65u32 {
+        let mut report = sr(555);
+        report[8..12].copy_from_slice(&marker.to_be_bytes());
+        crypto.protect(&mut report, true).unwrap();
+        sender_rtcp
+            .send_to(&report, ("127.0.0.1", port + 1))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while stats.startup_dropped_rtcp_packets.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        stats.startup_dropped_rtcp_packets.load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(stats.startup_dropped_packets.load(Ordering::Relaxed), 0);
+    let _first_rtp = AsyncUdp::bind(("127.0.0.1", private_ports[0]))
+        .await
+        .unwrap();
+    let first_rtcp = AsyncUdp::bind(("127.0.0.1", private_ports[0] + 1))
+        .await
+        .unwrap();
+    let _second_rtp = AsyncUdp::bind(("127.0.0.1", private_ports[1]))
+        .await
+        .unwrap();
+    let _second_rtcp = AsyncUdp::bind(("127.0.0.1", private_ports[1] + 1))
+        .await
+        .unwrap();
+    let mut received = [0; 2048];
+    let n = tokio::time::timeout(Duration::from_secs(2), first_rtcp.recv(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(n >= 12);
+    assert_eq!(u32::from_be_bytes(received[8..12].try_into().unwrap()), 2);
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn secure_startup_drain_keeps_order_with_new_arrivals() {
+    let d = tempfile::tempdir().unwrap();
+    let key = key_file(d.path());
+    let (port, reserved) = ports(4);
+    let sdp = d.path().join("owned.sdp");
+    std::fs::write(&sdp, description(port)).unwrap();
+    drop(reserved);
+    let input = Input::bind(&config(port, &sdp, &key)).await.unwrap();
+    let stats = input.stats.clone();
+    let cancel = CancellationToken::new();
+    let (writer, mut reader) = tokio::io::duplex(32768);
+    let task = tokio::spawn(input.run(writer, cancel.clone()));
+    let mut text = Vec::new();
+    reader.read_to_end(&mut text).await.unwrap();
+    let private_ports: Vec<u16> = String::from_utf8(text)
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("m=audio "))
+        .map(|line| line.split_whitespace().nth(1).unwrap().parse().unwrap())
+        .collect();
+    let sender = AsyncUdp::bind("127.0.0.1:0").await.unwrap();
+    let mut crypto = crypto::Session::new([0x31; 30], Some(666)).unwrap();
+    for sequence in 0..64u16 {
+        let mut packet = media(sequence, 666, 4);
+        crypto.protect(&mut packet, false).unwrap();
+        sender.send_to(&packet, ("127.0.0.1", port)).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while stats.packets.load(Ordering::Relaxed) < 64 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let decoder = AsyncUdp::bind(("127.0.0.1", private_ports[0]))
+        .await
+        .unwrap();
+    let _control = AsyncUdp::bind(("127.0.0.1", private_ports[0] + 1))
+        .await
+        .unwrap();
+    let _second_decoder = AsyncUdp::bind(("127.0.0.1", private_ports[1]))
+        .await
+        .unwrap();
+    let _second_control = AsyncUdp::bind(("127.0.0.1", private_ports[1] + 1))
+        .await
+        .unwrap();
+    let receiver = tokio::spawn(async move {
+        let mut buffer = [0; 1600];
+        let mut seen = Vec::new();
+        while seen.len() < 128 {
+            let n = decoder.recv(&mut buffer).await.unwrap();
+            assert_eq!(n, media(0, 666, 4).len());
+            seen.push(u16::from_be_bytes([buffer[2], buffer[3]]));
+        }
+        seen
+    });
+    for sequence in 64..128u16 {
+        let mut packet = media(sequence, 666, 4);
+        crypto.protect(&mut packet, false).unwrap();
+        sender.send_to(&packet, ("127.0.0.1", port)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let seen = tokio::time::timeout(Duration::from_secs(3), receiver)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seen, (0..128).collect::<Vec<u16>>());
+    assert_eq!(stats.startup_dropped_packets.load(Ordering::Relaxed), 0);
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
