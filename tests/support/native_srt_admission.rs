@@ -24,6 +24,12 @@ impl Native {
         Self::new_with_direct_tokens(limit, false).await
     }
     async fn new_with_direct_tokens(limit: usize, direct_tokens: bool) -> Self {
+        Self::new_with_settings(limit, direct_tokens, true).await
+    }
+    async fn new_plaintext(limit: usize) -> Self {
+        Self::new_with_settings(limit, false, false).await
+    }
+    async fn new_with_settings(limit: usize, direct_tokens: bool, encrypted: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let app = App::new(
             dir.path().join("config.json"),
@@ -45,7 +51,19 @@ impl Native {
                 json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
             )
             .unwrap();
-        Self::start_with(app, dir, limit, KEY, direct_tokens).await
+        Self::start_with(
+            app,
+            dir,
+            limit,
+            KEY,
+            direct_tokens,
+            if encrypted {
+                "owned-native-passphrase"
+            } else {
+                ""
+            },
+        )
+        .await
     }
     async fn start_with(
         app: Arc<App>,
@@ -53,10 +71,11 @@ impl Native {
         limit: usize,
         key: &str,
         direct_tokens: bool,
+        passphrase: &str,
     ) -> Self {
         let listener = Listener::bind(
             "127.0.0.1:0".parse().unwrap(),
-            Settings::new(120, limit, "owned-native-passphrase".into())
+            Settings::new(120, limit, passphrase.into())
                 .unwrap()
                 .with_direct_tokens(direct_tokens),
         )
@@ -230,6 +249,51 @@ async fn private_viewer_transfer_refuses_nonliteral_http_even_with_legacy_peer_o
         .issue("#!::r=local/news,m=request,u=owned-secret")
         .await;
     assert_eq!(response.status(), 503);
+    assert_eq!(cdn.node().await["reserved"], 0);
+    https.close().await;
+    cdn.close().await;
+}
+#[tokio::test]
+async fn public_encrypted_lookup_keeps_explicit_legacy_http_peer_compatibility() {
+    let cdn = Native::new(4).await;
+    let (_d, lb) = app();
+    let mut peer = cdn.peer();
+    peer["api_url"] = json!(cdn.url.replace("127.0.0.1", "localhost"));
+    peer["flussonix_allow_insecure_peer_http"] = json!(true);
+    lb.config.put("peers", "cdn", peer).unwrap();
+    let https = Https::new(lb.clone()).await;
+    let response = https.lookup("#!::r=local/news,m=request", None).await;
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["encryption_required"], true);
+    assert!(
+        body["streamid"]
+            .as_str()
+            .unwrap()
+            .contains("flussonix_ticket=")
+    );
+    assert!(!body["streamid"].as_str().unwrap().contains("u="));
+    assert_eq!(cdn.node().await["reserved"], 1);
+    assert_eq!(lb.media.count().await, 0);
+    https.close().await;
+    cdn.close().await;
+}
+#[tokio::test]
+async fn plaintext_native_listener_is_not_a_ticket_destination_for_public_any_lookup() {
+    let cdn = Native::new_plaintext(4).await;
+    assert_eq!(cdn.node().await["srt_playback"]["encrypted"], false);
+    let (_d, lb) = app();
+    let mut peer = cdn.peer();
+    peer["flussonix_srt_encrypted"] = json!(false);
+    lb.config.put("peers", "cdn", peer).unwrap();
+    let https = Https::new(lb.clone()).await;
+    assert_eq!(
+        https
+            .lookup("#!::r=local/news,m=request", Some("any"))
+            .await
+            .status(),
+        503
+    );
     assert_eq!(cdn.node().await["reserved"], 0);
     https.close().await;
     cdn.close().await;
@@ -681,6 +745,7 @@ async fn native_reserved_cdn_pulls_owned_vendor_origin_only_after_viewer_admissi
         4,
         "owned-native-peer",
         false,
+        "owned-native-passphrase",
     )
     .await;
     let (_d, lb) = app();

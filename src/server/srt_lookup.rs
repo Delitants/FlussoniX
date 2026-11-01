@@ -225,7 +225,7 @@ impl App {
             {
                 return None;
             }
-            if !vendor && (encrypted || ticket_only) && !required {
+            if !vendor && !required {
                 return None;
             }
             let id = if vendor {
@@ -373,7 +373,7 @@ impl App {
                 let Some(api) = peer["api_url"].as_str() else {
                     continue;
                 };
-                if encrypted
+                if private
                     && !url::Url::parse(api)
                         .ok()
                         .is_some_and(|url| crate::peer_transport::require(&url, false).is_ok())
