@@ -45,6 +45,60 @@ fn delivered(packet: &[u8], ports: &[u16]) -> io::Result<bool> {
         Err(e) => Err(e),
     }
 }
+fn pair_delivered(packet: &[u8], sources: &[u16], destinations: &[u16]) -> io::Result<bool> {
+    let (tx, rx) = UnixDatagram::pair()?;
+    rx.set_read_timeout(Some(Duration::from_millis(30)))?;
+    taps::attach_pair_filter(rx.as_raw_fd(), sources, destinations)?;
+    tx.send(packet)?;
+    match rx.recv(&mut [0; 2048]) {
+        Ok(_) => Ok(true),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+#[test]
+fn pair_filter_requires_owned_source_and_destination() {
+    assert!(pair_delivered(&packet(41000, 42000), &[41000, 41002], &[42000, 42002]).unwrap());
+    assert!(!pair_delivered(&packet(41001, 42000), &[41000], &[42000]).unwrap());
+    assert!(!pair_delivered(&packet(41000, 42001), &[41000], &[42000]).unwrap());
+    let mut nonloopback = packet(41000, 42000);
+    nonloopback[12] = 192;
+    assert!(!pair_delivered(&nonloopback, &[41000], &[42000]).unwrap());
+    let mut fragment = packet(41000, 42000);
+    fragment[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+    assert!(!pair_delivered(&fragment, &[41000], &[42000]).unwrap());
+    let (_, rx) = UnixDatagram::pair().unwrap();
+    for invalid in [vec![], vec![0], vec![41000, 41000], vec![41000; 9]] {
+        assert!(taps::attach_pair_filter(rx.as_raw_fd(), &invalid, &[42000]).is_err());
+        assert!(taps::attach_pair_filter(rx.as_raw_fd(), &[41000], &invalid).is_err());
+    }
+}
+#[test]
+fn sender_source_snapshot_uses_local_inodes_and_rejects_missing_or_foreign_sockets() {
+    let source = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let port = source.local_addr().unwrap().port();
+    let (_, owned) = elementary_diagnostics::udp_source_ownership(std::process::id(), 1).unwrap();
+    assert_eq!(owned.len(), 1);
+    assert!(owned.contains_key(&port));
+    assert!(taps::Owner::sender(std::process::id(), 1).is_ok());
+    assert!(taps::Owner::sender(std::process::id(), 2).is_err());
+    let mut child = std::process::Command::new("sleep")
+        .arg("10")
+        .spawn()
+        .unwrap();
+    assert!(taps::Owner::sender(child.id(), 1).is_err());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    drop(source);
+    assert!(taps::Owner::sender(std::process::id(), 1).is_err());
+}
 #[test]
 fn kernel_filter_admits_only_owned_loopback_udp_destinations() {
     assert!(delivered(&packet(41000, 42000), &[42000, 42002]).unwrap());

@@ -55,6 +55,86 @@ pub fn attach_filter(fd: RawFd, ports: &[u16]) -> io::Result<()> {
     Ok(())
 }
 
+pub fn attach_pair_filter(
+    fd: RawFd,
+    source_ports: &[u16],
+    destination_ports: &[u16],
+) -> io::Result<()> {
+    let valid = |ports: &[u16]| {
+        !ports.is_empty()
+            && ports.len() <= 8
+            && ports.iter().all(|port| *port != 0)
+            && ports
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                == ports.len()
+    };
+    if !valid(source_ports) || !valid(destination_ports) {
+        return Err(io::Error::other("invalid owned packet tap pair scope"));
+    }
+    let instruction = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
+    let mut code = vec![
+        instruction(0x30, 0, 0, 0),
+        instruction(0x15, 0, 0, 0x45), // IPv4, 20-byte header only.
+        instruction(0x30, 0, 0, 9),
+        instruction(0x15, 0, 0, 17), // UDP.
+        instruction(0x20, 0, 0, 12),
+        instruction(0x15, 0, 0, 0x7f000001),
+        instruction(0x20, 0, 0, 16),
+        instruction(0x15, 0, 0, 0x7f000001),
+        instruction(0x28, 0, 0, 6),
+        instruction(0x45, 0, 0, 0x3fff), // No fragments.
+        instruction(0x80, 0, 0, 0),
+        instruction(0x35, 0, 0, 28),
+        instruction(0x28, 0, 0, 20), // Source port.
+    ];
+    let sources_begin = code.len();
+    for port in source_ports {
+        code.push(instruction(0x15, 0, 0, u32::from(*port)));
+    }
+    let source_reject = code.len();
+    code.push(instruction(0x06, 0, 0, 0));
+    let destination_load = code.len();
+    code.push(instruction(0x28, 0, 0, 22));
+    let destinations_begin = code.len();
+    for port in destination_ports {
+        code.push(instruction(0x15, 0, 0, u32::from(*port)));
+    }
+    let destination_reject = code.len();
+    code.push(instruction(0x06, 0, 0, 0));
+    let accept = code.len();
+    code.push(instruction(0x06, 0, 0, 65535));
+    for index in [1, 3, 5, 7, 11] {
+        code[index].jf = (source_reject - index - 1) as u8;
+    }
+    code[9].jt = (source_reject - 10) as u8;
+    for index in sources_begin..source_reject {
+        code[index].jt = (destination_load - index - 1) as u8;
+    }
+    for index in destinations_begin..destination_reject {
+        code[index].jt = (accept - index - 1) as u8;
+    }
+    let filter = libc::sock_fprog {
+        len: code.len() as u16,
+        filter: code.as_mut_ptr(),
+    };
+    if unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ATTACH_FILTER,
+            (&filter as *const libc::sock_fprog).cast(),
+            std::mem::size_of_val(&filter) as libc::socklen_t,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub fn udp_packet(packet: &[u8]) -> Option<(u16, u16, &[u8])> {
     if packet.len() < 28
         || packet[0] != 0x45
@@ -170,7 +250,7 @@ impl<'a> Tap<'a> {
         origin: Instant,
     ) -> io::Result<Self> {
         let ports = owner.sockets.keys().copied().collect::<Vec<_>>();
-        let socket = packet_socket(&ports)?;
+        let socket = packet_socket(&ports, None)?;
         let ownership =
             json!({"pid":owner.pid,"start_ticks":owner.start_ticks,"socket_inodes":owner.sockets});
         let activated = origin.elapsed().as_nanos() as u64;
@@ -319,7 +399,7 @@ impl<'a> Tap<'a> {
         })
     }
 }
-fn packet_socket(ports: &[u16]) -> io::Result<OwnedFd> {
+fn packet_socket(ports: &[u16], source_ports: Option<&[u16]>) -> io::Result<OwnedFd> {
     // Protocol zero disables reception until the strict filter is installed.
     let raw = unsafe {
         libc::socket(
@@ -333,7 +413,11 @@ fn packet_socket(ports: &[u16]) -> io::Result<OwnedFd> {
     }
     // Own exactly the descriptor returned by socket, including on setup error.
     let socket = unsafe { OwnedFd::from_raw_fd(raw) };
-    attach_filter(socket.as_raw_fd(), ports)?;
+    if let Some(sources) = source_ports {
+        attach_pair_filter(socket.as_raw_fd(), sources, ports)?;
+    } else {
+        attach_filter(socket.as_raw_fd(), ports)?;
+    }
     let lock: libc::c_int = 1;
     option(
         socket.as_raw_fd(),
@@ -425,6 +509,23 @@ pub struct Owner {
     sockets: std::collections::BTreeMap<u16, u64>,
 }
 impl Owner {
+    pub fn sender(pid: u32, expected: usize) -> io::Result<Self> {
+        let mut race = None;
+        for _ in 0..4 {
+            match super::elementary_diagnostics::udp_source_ownership(pid, expected) {
+                Ok((start_ticks, sockets)) => {
+                    return Ok(Self {
+                        pid,
+                        start_ticks,
+                        sockets,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => race = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(race.unwrap())
+    }
     pub fn snapshot(pid: u32, ports: &[u16]) -> io::Result<Self> {
         // Only retry a transient descriptor-scan race. Missing/changed owners or
         // sockets are never converted to successful evidence, and media is not retried.
