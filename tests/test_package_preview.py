@@ -4,8 +4,10 @@ import inspect
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import runpy
+import shutil
 import struct
 import subprocess
 import sys
@@ -88,6 +90,68 @@ class PackagePreviewTests(unittest.TestCase):
             for member in tar.getmembers():
                 self.assertEqual((member.uid, member.gid, member.mtime), (0, 0, EPOCH))
                 self.assertFalse(member.issym() or member.islnk())
+
+    def test_packaged_service_helper_renders_secure_cluster_unit(self):
+        if not shutil.which('systemd-analyze'):
+            self.skipTest('requires systemd-analyze')
+        archive = self.successful()
+        self.directory.chmod(0o755)
+        release = self.directory / 'installed'
+        release.mkdir(mode=0o755)
+        with tarfile.open(archive) as tar:
+            for member in tar.getmembers():
+                relative = Path(member.name).relative_to(archive.name[:-7])
+                if not relative.parts:
+                    continue
+                target = release / relative
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(tar.extractfile(member).read())
+                target.chmod(member.mode)
+        account = pwd.getpwnam('nobody') if os.geteuid() == 0 else pwd.getpwuid(os.geteuid())
+        state = self.directory / 'state'
+        state.mkdir(mode=0o700)
+        if os.geteuid() == 0:
+            os.chown(state, account.pw_uid, account.pw_gid)
+        cert = self.directory / 'https.crt'
+        key = self.directory / 'https.key'
+        cert.write_text('owned certificate fixture')
+        key.write_text('owned key fixture')
+        cert.chmod(0o644)
+        key.chmod(0o600)
+        if os.geteuid() == 0:
+            os.chown(key, account.pw_uid, account.pw_gid)
+        secret = self.directory / 'credentials.env'
+        unit = self.directory / 'flussonix-owned.service'
+        helper = release / 'bin/flussonix-service'
+        env = {**os.environ, 'FLUSSONIX_ADMIN_USER': 'admin',
+               'FLUSSONIX_ADMIN_PASSWORD': 'owned-admin-secret',
+               'FLUSSONIX_PEER_KEY': 'owned-peer-key-123456'}
+        saved = subprocess.run([sys.executable, str(helper), 'credentials', '--from-env',
+                                '--output', str(secret)], env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(saved.returncode, 0, saved.stderr)
+        rendered = subprocess.run([sys.executable, str(helper), 'render', '--instance', 'owned',
+                                   '--release-dir', str(release), '--state-dir', str(state),
+                                   '--credentials', str(secret), '--user', account.pw_name,
+                                   '--listen', '127.0.0.1:18210', '--ffmpeg', str(Path('/usr/bin/true').resolve()),
+                                   '--https-listen', '127.0.0.1:18443', '--https-cert', str(cert),
+                                   '--https-key', str(key), '--role', 'cdn', '--node-name', 'cdn-owned',
+                                   '--uplink-mbps', '750', '--client-limit', '100',
+                                   '--iptv-authority', 'https://authority.example.test',
+                                   '--output', str(unit)], env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        text = unit.read_text()
+        self.assertIn('"--https-listen" "127.0.0.1:18443"', text)
+        self.assertIn('"--role" "cdn"', text)
+        self.assertIn('"--iptv-authority" "https://authority.example.test"', text)
+        visible = text + saved.stdout + saved.stderr + rendered.stdout + rendered.stderr
+        self.assertNotIn('owned-admin-secret', visible)
+        self.assertNotIn('owned-peer-key-123456', visible)
+        verify = subprocess.run(['systemd-analyze', 'verify', '--man=no', str(unit)],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(verify.returncode, 0, verify.stderr)
 
     def test_same_inputs_ignore_source_mtime_and_permissions(self):
         first = self.successful('first').read_bytes()
