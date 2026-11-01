@@ -199,6 +199,94 @@ class ServicePreviewTests(unittest.TestCase):
                 if value is not None:
                     self.assertNotIn(value, result.stdout + result.stderr)
 
+    def test_cluster_cdn_options_render_in_stable_order(self):
+        self.create_credentials()
+        ca = self.root / 'iptv-ca.crt'
+        ca.write_text('owned CA fixture')
+        ca.chmod(0o644)
+        result = self.render('--role', 'cdn', '--node-name', 'cdn-east', '--uplink-mbps', '750.5',
+                             '--client-limit', '5000', '--uplink-interface', 'eth0', '--drain',
+                             '--iptv-data', self.state / 'iptv.json',
+                             '--iptv-public-origin', 'https://cdn.example.test',
+                             '--iptv-authority', 'https://authority-a.example.test',
+                             '--iptv-authority-secondary', 'https://authority-b.example.test',
+                             '--iptv-authority-cluster-id', 'a3192376-6df5-4b76-a15c-43942fd3d466',
+                             '--iptv-authority-ca', ca)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unit = self.unit.read_text()
+        for expected in ('"--role" "cdn"', '"--node-name" "cdn-east"',
+                         '"--uplink-mbps" "750.5"', '"--client-limit" "5000"',
+                         '"--uplink-interface" "eth0"', '"--drain"',
+                         '"--iptv-authority-secondary" "https://authority-b.example.test"'):
+            self.assertIn(expected, unit)
+        self.assertLess(unit.index('"--role"'), unit.index('"--iptv-authority"'))
+
+    def test_ha_authority_unit_has_https_and_private_db_path(self):
+        if not shutil.which('systemd-analyze'):
+            self.skipTest('requires systemd-analyze')
+        self.create_credentials()
+        cert, key = self.tls_pair('https')
+        database = self.root / 'iptv-ha-db.json'
+        database.write_text('{"owned":"private database fixture"}')
+        database.chmod(0o600)
+        if os.geteuid() == 0:
+            os.chown(database, self.account.pw_uid, self.account.pw_gid)
+        result = self.render('--https-listen', '127.0.0.1:18443', '--https-cert', cert,
+                             '--https-key', key, '--https-only', '--iptv-lease-authority',
+                             '--iptv-ha-db-config', database,
+                             '--iptv-authority', 'https://authority-a.example.test',
+                             '--role', 'source', '--node-name', 'authority-a')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unit = self.unit.read_text()
+        self.assertIn('"--iptv-lease-authority"', unit)
+        self.assertIn(f'"--iptv-ha-db-config" "{database}"', unit)
+        self.assertNotIn('private database fixture', unit + result.stdout + result.stderr)
+        verify = subprocess.run(['systemd-analyze', 'verify', '--man=no', str(self.unit)],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(verify.returncode, 0, verify.stderr)
+
+    def test_invalid_iptv_and_cluster_options_create_no_unit(self):
+        self.create_credentials()
+        cert, key = self.tls_pair('https')
+        database = self.root / 'iptv-ha-db.json'
+        database.write_text('{"owned":"private database fixture"}')
+        database.chmod(0o600)
+        if os.geteuid() == 0:
+            os.chown(database, self.account.pw_uid, self.account.pw_gid)
+        uuid = 'a3192376-6df5-4b76-a15c-43942fd3d466'
+        invalid = [('--iptv-lease-authority',),
+                   ('--iptv-lease-authority', '--iptv-authority', 'https://authority-a.example.test'),
+                   ('--iptv-ha-db-config', database),
+                   ('--iptv-data', self.root / 'outside-state.json'),
+                   ('--iptv-authority', 'https://authority-a.example.test',
+                    '--iptv-authority-secondary', 'https://authority-a.example.test',
+                    '--iptv-authority-cluster-id', uuid),
+                   ('--iptv-authority', 'https://authority-a.example.test',
+                    '--iptv-authority-secondary', 'http://authority-b.example.test',
+                    '--iptv-authority-cluster-id', uuid),
+                   ('--iptv-authority', 'https://authority-a.example.test',
+                    '--iptv-authority-secondary', 'https://authority-b.example.test'),
+                   ('--iptv-authority', 'https://user:pass@authority-a.example.test'),
+                   ('--iptv-authority', 'https://authority-a.example.test/%n'),
+                   ('--role', 'load-balancer'), ('--node-name', 'bad%name'),
+                   ('--uplink-interface', 'bad interface'), ('--uplink-mbps', '0'),
+                   ('--uplink-mbps', 'nan'), ('--uplink-mbps', '1e3'),
+                   ('--client-limit', '0'), ('--client-limit', '18446744073709551616')]
+        for extra in invalid:
+            with self.subTest(extra=extra):
+                self.unit.unlink(missing_ok=True)
+                result = self.render(*extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.unit.exists())
+        database.chmod(0o644)
+        self.unit.unlink(missing_ok=True)
+        result = self.render('--https-listen', '127.0.0.1:18443', '--https-cert', cert,
+                             '--https-key', key, '--iptv-lease-authority',
+                             '--iptv-ha-db-config', database,
+                             '--iptv-authority', 'https://authority-a.example.test')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.unit.exists())
+
     def test_generated_unit_passes_systemd_and_keeps_secrets_out(self):
         if not shutil.which('systemd-analyze'):
             self.skipTest('requires systemd-analyze')
