@@ -25,6 +25,14 @@ pub(super) fn validate(peer: &Value) -> Result<(), String> {
             .as_bool()
             .ok_or("SRT requires an explicit encryption declaration")?;
     }
+    if let Some(value) = peer.get("flussonix_srt_allow_direct_token") {
+        if !value.is_boolean() {
+            return Err("SRT direct-token compatibility must be boolean".into());
+        }
+        if !is_vendor(peer) || peer.get("flussonix_srt_url").is_none() {
+            return Err("SRT direct-token compatibility requires a Flussonic SRT peer".into());
+        }
+    }
     if !is_vendor(peer) {
         if peer.get("flussonix_stream_map").is_some() {
             return Err("stream mappings require a Flussonic peer".into());

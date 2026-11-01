@@ -59,7 +59,9 @@ async fn run(push: bool, digital: bool, hevc: bool, input: &[u8], expected: &BTr
         } else {
             let listener = Listener::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                Settings::new(120, 2, SECRET.into()).unwrap(),
+                Settings::new(120, 2, SECRET.into())
+                    .unwrap()
+                    .with_direct_tokens(true),
             )
             .unwrap();
             endpoint = format!(

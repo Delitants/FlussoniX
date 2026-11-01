@@ -49,6 +49,14 @@ impl Https {
         }
         req.send().await.unwrap()
     }
+    pub(super) async fn issue(&self, id: &str) -> reqwest::Response {
+        self.client
+            .post(format!("{}/flussonix/api/v1/srt-ticket", self.url))
+            .json(&json!({"streamid":id,"encryption":"required"}))
+            .send()
+            .await
+            .unwrap()
+    }
     pub(super) async fn close(self) {
         self.stop.cancel();
         tokio::time::timeout(Duration::from_secs(6), self.task)
@@ -57,11 +65,32 @@ impl Https {
             .unwrap();
     }
 }
-fn peer(v: &Vendor) -> Value {
+pub(super) fn peer(v: &Vendor) -> Value {
     let mut p = v.peer();
     p["flussonix_srt_url"] = json!("srt://owned-edge.invalid:9998");
     p["flussonix_srt_encrypted"] = json!(true);
+    p["flussonix_srt_allow_direct_token"] = json!(true);
     p
+}
+#[tokio::test]
+async fn vendor_srt_is_excluded_until_each_peer_explicitly_allows_direct_tokens() {
+    let vendor = Vendor::new().await;
+    let (_dir, lb) = app();
+    let mut row = peer(&vendor);
+    row.as_object_mut()
+        .unwrap()
+        .remove("flussonix_srt_allow_direct_token");
+    lb.config.put("peers", "edge", row).unwrap();
+    let https = Https::new(lb.clone()).await;
+    let id = "#!::r=local/news,m=request,u=private-viewer-token";
+    let lookup = https.lookup(id, None).await;
+    assert_eq!(lookup.status(), 503);
+    let legacy = https.lookup(id, Some("any")).await;
+    assert_eq!(legacy.status(), 503);
+    let post = https.issue(id).await;
+    assert_eq!(post.status(), 503);
+    assert_eq!(vendor.state.calls.load(Ordering::SeqCst), 0);
+    https.close().await;
 }
 #[tokio::test]
 async fn https_lookup_returns_mapped_connection_fields_with_opaque_viewer_token() {
@@ -78,6 +107,14 @@ async fn https_lookup_returns_mapped_connection_fields_with_opaque_viewer_token(
     assert_eq!(
         result,
         json!({"address":"srt://owned-edge.invalid:9998","streamid":"#!::u=one%2B+é,r=remote/news,a=owned,m=request","encryption_required":true,"expires_in":5})
+    );
+    assert_eq!(
+        https
+            .issue("#!::u=one%2B+é,r=local/news,m=request")
+            .await
+            .status(),
+        503,
+        "POST ticket issuance must not return a vendor direct token"
     );
     assert!(!result.to_string().contains("owned-vendor-cluster-key"));
     assert_eq!(a.media.count().await, 0);
@@ -236,6 +273,10 @@ async fn srt_peer_requires_paired_fields_safe_explicit_port_and_representable_ve
     let mut p = peer(&v);
     p["flussonix_peer_kind"] = json!("native");
     p.as_object_mut().unwrap().remove("flussonix_stream_map");
+    assert!(a.config.put("peers", "edge", p.clone()).is_err());
+    p.as_object_mut()
+        .unwrap()
+        .remove("flussonix_srt_allow_direct_token");
     assert!(a.config.put("peers", "edge", p).is_ok());
     let mut p = peer(&v);
     p["flussonix_stream_map"][0]["remote_name"] = json!("remote,news");
@@ -424,7 +465,9 @@ async fn mapped_srt_lookup_delivers_encrypted_av_and_destination_enforces_its_ow
     cdn.config.put("streams","remote/news",json!({"static":false,"inputs":[{"url":"testsrc://"}],"flussonix_token_sha256":format!("{:x}",Sha256::digest(token.as_bytes()))})).unwrap();
     let listener = Listener::bind(
         "127.0.0.1:0".parse().unwrap(),
-        Settings::new(120, 4, "owned-srt-passphrase".into()).unwrap(),
+        Settings::new(120, 4, "owned-srt-passphrase".into())
+            .unwrap()
+            .with_direct_tokens(true),
     )
     .unwrap();
     let address = format!("srt://{}", listener.address());

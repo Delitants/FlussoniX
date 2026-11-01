@@ -48,8 +48,9 @@ async fn fresh(client: &reqwest::Client, lb: &Daemon, cdn: &Daemon) -> Value {
     assert_eq!(value["address"], cdn.srt_url.as_deref().unwrap());
     assert_eq!(value["encryption_required"], true);
     let id = value["streamid"].as_str().unwrap();
-    assert!(id.contains(&format!("u={TOKEN},")));
-    assert!(id.contains(",flussonix_ticket="));
+    assert!(id.starts_with(&format!("#!::r={STREAM},m=request,flussonix_ticket=")));
+    assert!(!id.contains(TOKEN));
+    assert!(!id.contains("a=opaque"));
     for secret in [lb.key.as_str(), cdn.key.as_str(), PASSPHRASE] {
         assert!(!value.to_string().contains(secret));
     }

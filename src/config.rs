@@ -519,6 +519,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "flussonix_rtsps_url",
                     "flussonix_srt_url",
                     "flussonix_srt_encrypted",
+                    "flussonix_srt_allow_direct_token",
                     "flussonix_peer_kind",
                     "flussonix_stream_map",
                     "private_payload_url",
@@ -558,6 +559,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     || item.get("flussonix_stream_map").is_some()
                     || item.get("flussonix_srt_url").is_some()
                     || item.get("flussonix_srt_encrypted").is_some()
+                    || item.get("flussonix_srt_allow_direct_token").is_some()
                 {
                     return Err("destination type and mappings are peer-only".into());
                 }

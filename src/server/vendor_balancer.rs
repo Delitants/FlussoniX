@@ -9,14 +9,14 @@ impl App {
         admitted: &AdmittedCandidate,
         viewer: &ViewerRequest,
         streamid: &str,
-        encrypted: bool,
+        mode: SrtLookupMode,
     ) -> Result<Value, u16> {
         if self.options.role != "lb" || owner.admitted_current(admitted).is_err() {
             return Err(503);
         }
         let (_, grant, revision) = admitted.control_route();
         let result = self
-            .srt_place(viewer, streamid, encrypted, grant, revision)
+            .srt_place(viewer, streamid, mode, grant, revision)
             .await;
         owner
             .with_admitted_current(admitted, || {
@@ -293,7 +293,7 @@ mod vendor_destination_tests {
    else{tokio::time::sleep(Duration::from_millis(300)).await;json_response(json!({"name":"owned","disabled":false,"named_by":"remote","stats":{"running":true}}))}
   }}));
         let cdn = tokio::spawn(async move { axum::serve(tcp, service).await.unwrap() });
-        let peer = json!({"hostname":"edge","api_url":api,"public_payload_url":"https://edge.invalid","flussonix_srt_url":"srt://edge.invalid:9998","flussonix_srt_encrypted":true,"cluster_key":"owned-vendor-cluster-key","flussonix_peer_kind":"flussonic","flussonix_stream_map":[{"name":"owned","remote_name":"owned"}]});
+        let peer = json!({"hostname":"edge","api_url":api,"public_payload_url":"https://edge.invalid","flussonix_srt_url":"srt://edge.invalid:9998","flussonix_srt_encrypted":true,"flussonix_srt_allow_direct_token":true,"cluster_key":"owned-vendor-cluster-key","flussonix_peer_kind":"flussonic","flussonix_stream_map":[{"name":"owned","remote_name":"owned"}]});
         let (_dir, app, admitted, origin, _key) =
             crate::server::test_vendor_admission::admitted_source(
                 Duration::from_secs(2),
@@ -315,7 +315,13 @@ mod vendor_destination_tests {
             finite_media: false,
         };
         let response = app
-            .balance_vendor_srt(owner, &admitted, &viewer, "#!::r=owned,m=request", true)
+            .balance_vendor_srt(
+                owner,
+                &admitted,
+                &viewer,
+                "#!::r=owned,m=request",
+                SrtLookupMode::Required,
+            )
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(response, Err(503));

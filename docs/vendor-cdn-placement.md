@@ -193,97 +193,70 @@ qualification remain separate work. The HTTP adapter is based on the
 [Flussonic management API](https://flussonic.com/doc/api/reference/) and its
 [HTTP load-balancing model](https://flussonic.com/doc/fms/cluster/loadbalancer/).
 
-### SRT lookup for compatible clients
+### SRT ticket placement for compatible clients
 
-SRT has no redirect response. A client with lookup support can call
-`GET /flussonix/api/v1/srt-lookup` over **HTTPS on the LB**, with one URL-form-encoded
-`streamid` parameter, then connect directly to the returned CDN. Existing SRT
-URLs need client integration to use this extension.
+SRT itself has no redirect response. A lookup-aware client sends its original
+selection over verified HTTPS before opening SRT. Prefer
+`POST /flussonix/api/v1/srt-ticket` with a JSON body:
 
-For each Flussonic peer, enter **Public SRT URL** with an explicit port and choose
-**SRT encryption** to match its configured listener. Configure the passphrase on
-the CDN and client; neither Cluster keys nor passphrases are returned. This
-setting is an operator declaration, not a remote encryption check. The client
-must enforce encrypted SRT and verify the LB's HTTPS certificate.
+```json
+{"streamid":"#!::r=news,m=request,u=viewer-token","encryption":"required"}
+```
 
-The default lookup only selects destinations declared encrypted. An explicit
-`encryption=any` also permits declared unencrypted listeners. A successful
-response has `Cache-Control: no-store` and these fields:
+The token belongs in the request body, not a URL. The response is private,
+uncacheable and contains the selected CDN address and a new Stream ID:
 
 ```json
 {
   "address": "srt://cdn.example:9998",
-  "streamid": "#!::r=news,u=viewer-token,m=request",
+  "streamid": "#!::r=news,m=request,flussonix_ticket=00000000-0000-0000-0000-000000000000",
   "encryption_required": true,
   "expires_in": 5
 }
 ```
 
-Pass the returned stream ID as a separate SRT client option. Its values are
-opaque: do not decode percent sequences or interpret plus signs again. The LB
-maps only the resource name and supplies `m=request` if missing. IDs must fit
-512 UTF-8 bytes after mapping; mapped names cannot contain commas. Duplicate or
-unknown lookup parameters and stream ID fields are rejected.
+The UUID above is an example shape, not a usable ticket. Pass the entire
+returned Stream ID unchanged to an encrypted SRT caller, with the passphrase
+configured separately. Connect within five seconds and request a fresh ticket
+for every reconnect or failover. The HTTPS request and SRT connection must
+arrive from the same public IP; a proxy or NAT that changes the observed IP
+between them makes redemption fail. A visible ticket can be raced by an on-path
+attacker during its brief lifetime, but the reusable viewer token is absent
+from the SRT handshake. The LB sends no media.
 
-The lookup uses SRT viewer policy, with the original stream ID in the callback
-query. Admin, Basic and Cluster credentials do not grant viewer access. Callback
-redirects are rejected. The CDN independently checks the token and encryption.
-HTTP, RTSP and SRT share fresh vendor load observations and five-second per-LB
-advisory holds; no media crosses the LB. Configuration changes and expired
-source authority prevent a pending lookup from returning a destination.
+`GET /flussonix/api/v1/srt-lookup` remains for existing lookup-aware clients.
+It requires HTTPS and one URL-form-encoded `streamid` parameter. Native
+FlussoniX destinations return the same tokenless ticket by default. Prefer
+POST because URLs are more likely to be logged by intermediaries. An explicit
+`encryption=any` request never creates a tokenless ticket; it succeeds only
+with a configured trusted-network direct-token destination. Admin, Basic and
+Cluster credentials are not viewer authorization.
 
-This extension supports native FlussoniX CDNs and explicitly mapped Flussonic
-peers. It does not provide a single-address SRT relay or production throughput
-qualification. Flussonic capacity holds remain local to each LB. Owned
-independent SRT tests cover encrypted audio/video decoding, destination token
-denial and mismatched passphrases; they do not establish live Flussonic SRT
-interoperability.
-For Flussonic destinations, `expires_in` describes the advisory placement
-estimate, not a redeemable admission ticket. Request a fresh lookup before
-connecting after that interval.
+For a native CDN, configure its **Public SRT URL**, encrypted SRT listener,
+verified HTTPS management address and management CA as needed. The LB checks
+its live listener, load and capacity, then sends the private viewer identity
+only over verified TLS (literal loopback HTTP is for local tests). The CDN
+holds a single-use five-second reservation, rechecks the original viewer
+policy and actual UDP peer IP at final admission, and starts media only after
+successful redemption. Revocation, wrong stream/IP, expired ticket, listener
+restart and changed source authority deny playback. Admission holds share the
+native HTTP/RTSP/SRT capacity ledger and never pull upstream media by
+themselves.
 
+A Flussonic peer cannot redeem a native ticket. It is excluded by default.
+The **Allow direct viewer tokens over SRT** switch on that specific peer enables
+the legacy `u=viewer-token` Stream ID on a trusted network; its public SRT URL
+and encryption setting are operator declarations, not remote checks. This
+exposes a reusable token in the handshake even if media encryption is enabled.
+There is no automatic fallback from a failed native ticket to a vendor or
+plaintext destination. Native direct-token playback likewise needs the
+node-wide `--srt-play-allow-direct-token` startup option and a matching
+explicit legacy lookup; ticket issuance never uses it.
 
-### Native FlussoniX SRT destinations
-
-Choose **FlussoniX** as the peer type, enter its management address and **Public
-SRT URL**, and match the **SRT encryption** setting to its enabled global playback
-listener. Configure a trusted management CA when needed. The client still calls
-the HTTPS lookup and then connects directly; the LB carries no media.
-
-The LB checks the CDN's enabled listener and encryption metadata. The CDN then
-reserves capacity for five seconds through its authenticated native admission
-API. Concurrent LBs share this CDN-owned reservation ledger with HTTP and RTSP;
-SRT also respects the listener's connection limit. Actual connections and other
-traffic still compete for resources: a reservation does not guarantee delivery.
-If admission fails, lookup tries another eligible CDN within its time budget.
-
-A native response appends `flussonix_ticket=<opaque UUID>` to the returned stream
-ID. Pass the **entire returned stream ID unchanged** to the SRT client. The ticket
-is single-use and binds the stream, viewer token, encryption, listener generation
-and source configuration. Its lifetime starts when the CDN issues it, so connect
-promptly; an expired ticket requires a new lookup. The full ID,
-including this field, must fit 512 UTF-8 bytes; lookup checks that before asking
-for a reservation. Supplying a ticket to the lookup endpoint is rejected.
-
-The CDN independently authorizes playback before redeeming the ticket and
-starting media. The internal ticket is removed from its authorization callback
-and session query, while opaque viewer fields remain unchanged. A wrong token,
-stream, transport or listener cannot redeem it. Configuration changes, revoked
-viewer grants and expired source or replica authority prevent playback. Source
-reservations never pull upstream media by themselves.
-
-Existing ticketless SRT clients keep their normal viewer policy. Native tickets
-are never sent to Flussonic destinations. Listener support and owned decoder tests
-do not establish live Flussonic interoperability or production capacity.
-
-When a native CDN switches to an equivalent origin, an existing SRT connection
-can close. Request a **fresh HTTPS lookup** and connect using the new stream ID;
-an old ticket cannot be reused. The CDN can recover its upstream automatically
-while authorized playback demand remains recent. A complete origin outage
-rejects lookup and stops stale source media; restored availability permits a new
-lookup and connection.
-
-Owned daemon tests cover this reconnect flow with HEVC and MP2/MP3 audio over
-both M4F and M4S private inputs, including origin failure and total outage with
-restoration. These tests do not qualify uninterrupted SRT connections or gapless
-timestamps. See [native recovery qualification](cluster-loadbalancing.md#encrypted-srt-reconnection-after-native-origin-recovery).
+Owned daemon tests cover encrypted native reconnect with HEVC and MP2/MP3 over
+M4F and M4S private inputs, including origin failure and restoration. They do
+not qualify uninterrupted SRT connections, gapless timestamps, live Flussonic
+SRT interoperability, WAN loss/retransmission performance or production
+capacity. Vendor holds are advisory and local to each LB; for a vendor
+response, `expires_in` is a placement estimate rather than a redeemable
+ticket. See [native recovery qualification](cluster-loadbalancing.md#encrypted-srt-reconnection-after-native-origin-recovery).

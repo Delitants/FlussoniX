@@ -3,11 +3,14 @@ use super::*;
 use crate::source_directory::modern_coordinator::{
     AdmittedCandidate, ModernSourceCoordinator, ReservedCandidate,
 };
+use std::net::IpAddr;
 #[derive(Clone)]
 pub(super) struct Binding {
     pub listener_id: String,
     pub revision: u64,
     pub signature: Option<String>,
+    pub viewer: Option<ViewerRequest>,
+    pub peer_ip: Option<IpAddr>,
 }
 #[derive(Clone, Copy)]
 pub(crate) struct Ticket<'a> {
@@ -16,6 +19,9 @@ pub(crate) struct Ticket<'a> {
     pub listener_id: &'a str,
 }
 impl App {
+    pub(crate) async fn discard_srt_credential(&self, id: &str) {
+        self.reservations.lock().await.remove(id);
+    }
     pub(crate) fn srt_listener_id(&self) -> String {
         self.srt_playback.lock().unwrap()["listener_id"]
             .as_str()
@@ -29,8 +35,207 @@ impl App {
             && r.stream == viewer.name
             && matches!(&r.kind,rtsp_balancer::Kind::Srt{encrypted,token_hash} if *encrypted==ticket.encrypted && *token_hash==rtsp_balancer::token_hash(viewer))
             && r.srt.as_ref().is_some_and(|b| {
-                b.listener_id == ticket.listener_id && b.revision == self.config.revision()
+                b.listener_id == ticket.listener_id
+                    && b.revision == self.config.revision()
+                    && b.peer_ip
+                        .is_none_or(|ip| viewer.ip.parse::<IpAddr>().ok() == Some(ip))
+                    && b.viewer.as_ref().is_none_or(|saved| {
+                        saved.name == viewer.name
+                            && saved.proto == viewer.proto
+                            && saved.ip == viewer.ip
+                            && saved.token == viewer.token
+                            && saved.qs == viewer.qs
+                            && saved.user_agent == viewer.user_agent
+                            && saved.referer == viewer.referer
+                            && saved.host == viewer.host
+                            && saved.finite_media == viewer.finite_media
+                    })
             })
+    }
+    pub(crate) async fn srt_ticket_viewer(
+        &self,
+        ticket: Ticket<'_>,
+        name: &str,
+        peer_ip: IpAddr,
+    ) -> Option<ViewerRequest> {
+        self.with_srt_listener(ticket, || ())?;
+        let ledger = self.reservations.lock().await;
+        let reservation = ledger.get(ticket.id)?;
+        let binding = reservation.srt.as_ref()?;
+        if binding.peer_ip != Some(peer_ip) || reservation.stream != name {
+            return None;
+        }
+        let mut viewer = binding.viewer.clone()?;
+        viewer.ip = peer_ip.to_string();
+        self.srt_match(reservation, &viewer, ticket)
+            .then_some(viewer)
+    }
+    /// A public capacity ticket has no stored viewer credential or IP binding.
+    /// It is still checked and consumed under the normal admission ledger.
+    pub(crate) async fn srt_public_ticket(
+        &self,
+        ticket: Ticket<'_>,
+        viewer: &ViewerRequest,
+    ) -> bool {
+        if !viewer.token.is_empty() || self.with_srt_listener(ticket, || ()).is_none() {
+            return false;
+        }
+        self.reservations
+            .lock()
+            .await
+            .get(ticket.id)
+            .is_some_and(|reservation| {
+                reservation.srt.as_ref().is_some_and(|binding| {
+                    binding.viewer.is_none()
+                        && binding.peer_ip.is_none()
+                        && self.srt_match(reservation, viewer, ticket)
+                })
+            })
+    }
+    pub(crate) async fn reserve_srt_credential(
+        &self,
+        viewer: ViewerRequest,
+        hint_mbps: f64,
+    ) -> Result<String, u16> {
+        self.reserve_srt_credential_inner(viewer, hint_mbps, None)
+            .await
+    }
+    pub(crate) async fn reserve_srt_vendor_credential(
+        &self,
+        viewer: ViewerRequest,
+        hint_mbps: f64,
+        reserved: Arc<ReservedCandidate>,
+    ) -> Result<String, u16> {
+        self.reserve_srt_credential_inner(viewer, hint_mbps, Some(reserved))
+            .await
+    }
+    async fn reserve_srt_credential_inner(
+        &self,
+        mut viewer: ViewerRequest,
+        hint_mbps: f64,
+        preselected: Option<Arc<ReservedCandidate>>,
+    ) -> Result<String, u16> {
+        if !matches!(self.options.role.as_str(), "cdn" | "standalone")
+            || self.options.drain
+            || viewer.proto != "srt"
+            || viewer.token.is_empty()
+            || viewer.finite_media
+            || viewer.ip.parse::<IpAddr>().is_err()
+            || crate::config::valid_name(&viewer.name).is_err()
+            || !hint_mbps.is_finite()
+            || !(0.0..=crate::cluster::MAX_HINT_MBPS).contains(&hint_mbps)
+            || hint_mbps == 0.0
+        {
+            return Err(503);
+        }
+        let route = self.config.read(|root| {
+            crate::vendor_playback::select(root, &viewer.name, self.config.revision())
+        });
+        let (revision, signature, vendor) = if let Some(reserved) = preselected {
+            (reserved.config_revision(), None, Some(reserved))
+        } else {
+            match route {
+                crate::vendor_playback::Selection::Native => {
+                    let resolved = self.resolve(&viewer.name).await.ok_or(404u16)?;
+                    if resolved.config["disabled"] == true {
+                        return Err(404);
+                    }
+                    (
+                        resolved.revision,
+                        Some(crate::media::media_signature(&resolved.config)),
+                        None,
+                    )
+                }
+                crate::vendor_playback::Selection::Vendor { key, revision } => {
+                    let runtime = self.vendor_playback.as_ref().ok_or(503u16)?;
+                    let reserved = runtime
+                        .rtsp_reserve(self, &viewer.name, &key, revision)
+                        .await?;
+                    (revision, None, Some(Arc::new(reserved)))
+                }
+                crate::vendor_playback::Selection::Excluded => return Err(404),
+                crate::vendor_playback::Selection::Ambiguous => return Err(503),
+            }
+        };
+        let listener = self.srt_playback.lock().unwrap().clone();
+        if listener["enabled"] != true || listener["encrypted"] != true {
+            return Err(503);
+        }
+        let listener_id = listener["listener_id"].as_str().ok_or(503u16)?.to_owned();
+        let peer_ip = viewer.ip.parse::<IpAddr>().map_err(|_| 503u16)?;
+        viewer.ip = peer_ip.to_string();
+        let binding = Binding {
+            listener_id: listener_id.clone(),
+            revision,
+            signature,
+            viewer: Some(viewer.clone()),
+            peer_ip: Some(peer_ip),
+        };
+        let observations = json!({"stream_bitrates":self.media.output_bitrates().await});
+        let observed_at = Instant::now();
+        let mut reservations = self.reservations.lock().await;
+        reservations.retain(|_, reservation| reservation.expires > Instant::now());
+        let bitrate_mbps = hint_mbps
+            .max(
+                crate::cluster::observed_bitrate(
+                    &observations,
+                    &viewer.name,
+                    observed_at
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                )
+                .unwrap_or(crate::cluster::FALLBACK_MBPS),
+            )
+            .max(crate::cluster::FALLBACK_MBPS);
+        if !bitrate_mbps.is_finite()
+            || bitrate_mbps > crate::cluster::MAX_HINT_MBPS
+            || reservations
+                .values()
+                .filter(|r| r.srt.as_ref().is_some_and(|b| b.viewer.is_some()))
+                .count()
+                >= 4096
+            || !self.reservation_capacity(&reservations, Some(&binding), bitrate_mbps)
+        {
+            return Err(503);
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let ticket = Ticket {
+            id: &id,
+            encrypted: true,
+            listener_id: &listener_id,
+        };
+        let mut reservation = Some(Reservation {
+            http_slot: None,
+            srt: Some(binding.clone()),
+            vendor: vendor.clone(),
+            kind: rtsp_balancer::Kind::Srt {
+                encrypted: true,
+                token_hash: rtsp_balancer::token_hash(&viewer),
+            },
+            bitrate_mbps,
+            stream: viewer.name,
+            expires: Instant::now() + Duration::from_secs(5),
+        });
+        let mut commit = || {
+            self.with_srt_listener(ticket, || {
+                reservations.insert(id.clone(), reservation.take().unwrap());
+                true
+            })
+            .unwrap_or(false)
+        };
+        let committed = if let Some(reserved) = &vendor {
+            let owner = self.modern_sources.as_ref().ok_or(503u16)?;
+            owner.with_reserved_current(reserved, commit).ok() == Some(true)
+        } else {
+            self.config.at_revision(binding.revision, |_| commit()) == Some(true)
+        };
+        if !committed {
+            reservations.remove(&id);
+            return Err(503);
+        }
+        Ok(id)
     }
     fn with_srt_listener<T>(&self, ticket: Ticket<'_>, commit: impl FnOnce() -> T) -> Option<T> {
         let listener = self.srt_playback.lock().unwrap();
@@ -123,6 +328,283 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
+    #[tokio::test]
+    async fn private_ticket_restores_original_callback_identity_only_for_observed_peer_ip() {
+        let (_d, app, _legacy, _grant, _signature) = native().await;
+        let original = ViewerRequest {
+            name: "owned".into(),
+            proto: "srt".into(),
+            ip: "127.0.0.1".into(),
+            token: "private-owned-token".into(),
+            qs: "streamid=%23%21%3A%3Ar%3Downed%2Cu%3Dprivate-owned-token".into(),
+            user_agent: "owned-client".into(),
+            referer: "https://viewer.invalid/".into(),
+            host: "playback.invalid".into(),
+            finite_media: false,
+        };
+        let id = app
+            .reserve_srt_credential(original.clone(), 5.0)
+            .await
+            .unwrap();
+        let ticket = Ticket {
+            id: &id,
+            encrypted: true,
+            listener_id: "owned-listener",
+        };
+        let wrong: IpAddr = "127.0.0.2".parse().unwrap();
+        assert!(
+            app.srt_ticket_viewer(ticket, "owned", wrong)
+                .await
+                .is_none()
+        );
+        assert!(
+            app.srt_ticket_viewer(ticket, "other", "127.0.0.1".parse().unwrap())
+                .await
+                .is_none()
+        );
+        let restored = app
+            .srt_ticket_viewer(ticket, "owned", "127.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(restored.token, original.token);
+        assert_eq!(restored.qs, original.qs);
+        assert_eq!(restored.user_agent, original.user_agent);
+        assert_eq!(restored.referer, original.referer);
+        assert_eq!(restored.host, original.host);
+        assert_eq!(restored.ip, "127.0.0.1");
+        assert!(
+            app.srt_ticket_viewer(
+                Ticket {
+                    encrypted: false,
+                    ..ticket
+                },
+                "owned",
+                "127.0.0.1".parse().unwrap()
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(
+            app.reservations.lock().await.len(),
+            2,
+            "wrong claims must not consume the ticket"
+        );
+    }
+    #[tokio::test]
+    async fn private_ticket_accepts_the_same_ipv6_address_in_canonical_form() {
+        let (_d, app, mut viewer, _grant, _signature) = native().await;
+        viewer.ip = "0:0:0:0:0:0:0:1".into();
+        let id = app.reserve_srt_credential(viewer, 5.0).await.unwrap();
+        let ticket = Ticket {
+            id: &id,
+            encrypted: true,
+            listener_id: "owned-listener",
+        };
+        let restored = app
+            .srt_ticket_viewer(ticket, "owned", "::1".parse().unwrap())
+            .await;
+        assert_eq!(restored.unwrap().ip, "::1");
+    }
+    #[tokio::test]
+    async fn private_ticket_expires_and_rejects_listener_or_config_changes_without_consumption() {
+        for reason in ["expiry", "listener", "config"] {
+            let (_d, app, mut viewer, _grant, _signature) = native().await;
+            viewer.ip = "127.0.0.1".into();
+            let id = app.reserve_srt_credential(viewer, 5.0).await.unwrap();
+            let ticket = Ticket {
+                id: &id,
+                encrypted: true,
+                listener_id: "owned-listener",
+            };
+            match reason {
+                "expiry" => {
+                    app.reservations.lock().await.get_mut(&id).unwrap().expires =
+                        Instant::now() - Duration::from_millis(1)
+                }
+                "listener" => {
+                    app.srt_playback.lock().unwrap()["listener_id"] = json!("restarted-listener")
+                }
+                _ => {
+                    app.config
+                        .put("streams", "owned", json!({"title":"changed"}))
+                        .unwrap();
+                }
+            }
+            assert!(
+                app.srt_ticket_viewer(ticket, "owned", "127.0.0.1".parse().unwrap())
+                    .await
+                    .is_none(),
+                "{reason}"
+            );
+            assert!(app.reservations.lock().await.contains_key(&id));
+            assert_eq!(app.media.count().await, 0);
+        }
+    }
+    #[tokio::test]
+    async fn periodic_metrics_tick_erases_expired_private_credentials_without_new_admissions() {
+        let (_d, app, mut viewer, _grant, _signature) = native().await;
+        viewer.ip = "127.0.0.1".into();
+        let id = app.reserve_srt_credential(viewer, 5.0).await.unwrap();
+        app.reservations.lock().await.get_mut(&id).unwrap().expires =
+            Instant::now() - Duration::from_millis(1);
+        app.sample_metrics();
+        assert!(!app.reservations.lock().await.contains_key(&id));
+    }
+    #[tokio::test]
+    async fn private_ticket_redemption_is_single_use_when_same_ip_connections_race() {
+        let (_d, app, mut viewer, _grant, _signature) = native().await;
+        viewer.ip = "127.0.0.1".into();
+        let id = app.reserve_srt_credential(viewer, 5.0).await.unwrap();
+        let ticket = Ticket {
+            id: &id,
+            encrypted: true,
+            listener_id: "owned-listener",
+        };
+        let restored = app
+            .srt_ticket_viewer(ticket, "owned", "127.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        let (first, second) = tokio::join!(
+            app.ts_admit_ticket(restored.clone(), Some(ticket)),
+            app.ts_admit_ticket(restored, Some(ticket)),
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert!(app.reservations.lock().await.get(&id).is_none());
+        app.media.stop_all().await;
+    }
+    #[tokio::test]
+    async fn redeemed_private_ticket_obeys_iptv_session_limit_and_subscriber_revocation() {
+        let (_d, app, _viewer, _grant, _signature) = native().await;
+        app.config
+            .put(
+                "streams",
+                "owned",
+                json!({"inputs":[{"url":"testsrc://"}],"on_play":"iptv://"}),
+            )
+            .unwrap();
+        app.iptv.set_enabled(true).unwrap();
+        app.iptv
+            .put_package("basic", json!({"channels":["owned"]}))
+            .unwrap();
+        app.iptv
+            .put_subscriber(
+                "alice",
+                json!({"token":"private-subscriber-token","packages":["basic"],"max_sessions":1}),
+            )
+            .unwrap();
+        let viewer = ViewerRequest {
+            name: "owned".into(),
+            proto: "srt".into(),
+            ip: "127.0.0.1".into(),
+            token: "private-subscriber-token".into(),
+            ..Default::default()
+        };
+        let first_id = app
+            .reserve_srt_credential(viewer.clone(), 5.0)
+            .await
+            .unwrap();
+        let first_ticket = Ticket {
+            id: &first_id,
+            encrypted: true,
+            listener_id: "owned-listener",
+        };
+        let first_viewer = app
+            .srt_ticket_viewer(first_ticket, "owned", "127.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        let first = app
+            .ts_admit_ticket(first_viewer, Some(first_ticket))
+            .await
+            .unwrap();
+        let second_id = app.reserve_srt_credential(viewer, 5.0).await.unwrap();
+        let second_ticket = Ticket {
+            id: &second_id,
+            encrypted: true,
+            listener_id: "owned-listener",
+        };
+        let second_viewer = app
+            .srt_ticket_viewer(second_ticket, "owned", "127.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        let second = app
+            .ts_admit_ticket(second_viewer, Some(second_ticket))
+            .await;
+        assert!(
+            second.is_err(),
+            "subscriber limit admitted a second SRT session"
+        );
+        assert!(first.current());
+        app.iptv.delete_subscriber("alice").unwrap();
+        tokio::time::timeout(Duration::from_millis(200), first.cancelled())
+            .await
+            .unwrap();
+        assert!(!first.current());
+        drop(first);
+        app.media.stop_all().await;
+    }
+    #[tokio::test]
+    async fn private_reservations_stop_at_4096_even_if_other_capacity_is_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-admin-secret".into(),
+                peer_key: "owned-cluster-key".into(),
+                uplink_interface: "process".into(),
+                uplink_mbps: 100_000.0,
+                client_limit: 6000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.config
+            .put("streams", "owned", json!({"inputs":[{"url":"testsrc://"}]}))
+            .unwrap();
+        *app.srt_playback.lock().unwrap() = json!({"enabled":true,"listener_id":"owned-listener","encrypted":true,"client_limit":5000});
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        app.sample_metrics();
+        let viewer = ViewerRequest {
+            name: "owned".into(),
+            proto: "srt".into(),
+            ip: "127.0.0.1".into(),
+            token: "owned-token".into(),
+            ..Default::default()
+        };
+        let binding = Binding {
+            listener_id: "owned-listener".into(),
+            revision: app.config.revision(),
+            signature: None,
+            viewer: Some(viewer.clone()),
+            peer_ip: Some("127.0.0.1".parse().unwrap()),
+        };
+        let mut ledger = app.reservations.lock().await;
+        for index in 0..4096 {
+            ledger.insert(
+                format!("pending-{index}"),
+                Reservation {
+                    http_slot: None,
+                    srt: Some(binding.clone()),
+                    vendor: None,
+                    kind: rtsp_balancer::Kind::Srt {
+                        encrypted: true,
+                        token_hash: rtsp_balancer::token_hash(&viewer),
+                    },
+                    bitrate_mbps: 0.0,
+                    stream: "owned".into(),
+                    expires: Instant::now() + Duration::from_secs(5),
+                },
+            );
+        }
+        drop(ledger);
+        assert_eq!(
+            app.reserve_srt_credential(viewer.clone(), 5.0).await,
+            Err(503)
+        );
+        app.reservations.lock().await.remove("pending-0");
+        assert!(app.reserve_srt_credential(viewer, 5.0).await.is_ok());
+    }
     async fn native() -> (tempfile::TempDir, Arc<App>, ViewerRequest, Grant, String) {
         let d = tempfile::tempdir().unwrap();
         let app = App::new(
@@ -131,6 +613,7 @@ mod tests {
             Options {
                 admin_password: "owned-admin".into(),
                 peer_key: "owned-peer-key".into(),
+                uplink_interface: "process".into(),
                 ..Default::default()
             },
         )
@@ -142,8 +625,9 @@ mod tests {
                 json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
             )
             .unwrap();
-        *app.srt_playback.lock().unwrap() =
-            json!({"enabled":true,"listener_id":"owned-listener","encrypted":true});
+        *app.srt_playback.lock().unwrap() = json!({"enabled":true,"listener_id":"owned-listener","encrypted":true,"client_limit":4096});
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        app.sample_metrics();
         let viewer = ViewerRequest {
             name: "owned".into(),
             proto: "srt".into(),
@@ -167,6 +651,8 @@ mod tests {
                     listener_id: "owned-listener".into(),
                     revision: app.config.revision(),
                     signature: Some(signature.clone()),
+                    viewer: None,
+                    peer_ip: None,
                 }),
                 vendor: None,
                 kind: rtsp_balancer::Kind::Srt {
@@ -348,6 +834,8 @@ mod tests {
                     listener_id: "owned-listener".into(),
                     revision: app.config.revision(),
                     signature: None,
+                    viewer: None,
+                    peer_ip: None,
                 }),
                 vendor: Some(reserved.clone()),
                 kind: rtsp_balancer::Kind::Srt {

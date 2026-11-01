@@ -69,6 +69,12 @@ struct Args {
     /// Optional shared SRT playback UDP listener (disabled by default).
     #[arg(long)]
     srt_play_listen: Option<SocketAddr>,
+    /// Public SRT listener root used in HTTPS-issued playback tickets.
+    #[arg(long, requires = "srt_play_listen")]
+    srt_play_public_url: Option<String>,
+    /// Permit reusable viewer tokens directly in SRT Stream IDs on trusted networks.
+    #[arg(long, requires = "srt_play_listen")]
+    srt_play_allow_direct_token: bool,
     #[arg(long, requires = "srt_play_listen")]
     srt_play_latency: Option<u32>,
     #[arg(long, requires = "srt_play_listen")]
@@ -293,6 +299,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
     // Validate encryption/limits and bind UDP before config/media ownership starts.
+    let srt_play_public_url = a
+        .srt_play_public_url
+        .as_deref()
+        .map(|raw| {
+            flussonix::server::validate_srt_public_url(raw)
+                .ok_or_else(|| std::io::Error::other("invalid public SRT playback URL"))
+        })
+        .transpose()?;
     let srt_listener = match a.srt_play_listen {
         Some(address) => Some(flussonix::srt_playback::Listener::bind(
             address,
@@ -300,7 +314,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 a.srt_play_latency.unwrap_or(120),
                 a.srt_play_client_limit.unwrap_or(128),
                 a.srt_play_passphrase.unwrap_or_default(),
-            )?,
+            )?
+            .with_direct_tokens(a.srt_play_allow_direct_token),
         )?),
         None => None,
     };
@@ -322,6 +337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .admin_password
             .expect("clap requires daemon admin password"),
         admin_public_origin: a.admin_public_origin,
+        srt_play_public_url: srt_play_public_url.clone(),
         allow_insecure_remote_management: a.allow_insecure_remote_management,
         view_user: a.view_user,
         view_password: a.view_password,
@@ -393,7 +409,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.set_rtsp_publication_udp(udp_pool.is_some());
     println!(
         "{}",
-        serde_json::json!({"service":"FlussoniX","listen":http_address.map(|a|a.to_string()),"https_listen":https_address.map(|a|a.to_string()),"rtsp_listen":rtsp_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"rtsps_listen":tls_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"fxlink_listen":fxlink_listener.as_ref().map(|l|l.address().to_string()),"srt_play_listen":srt_listener.as_ref().map(|l|l.address().to_string()),"srt_play_encrypted":srt_listener.as_ref().map(|l|l.settings().encrypted()),"rtsp_udp_ports":a.rtsp_udp_ports.map(|p|p.to_string()),"rtsp_udp_mbps":a.rtsp_udp_ports.map(|_|udp_rate),"version":env!("CARGO_PKG_VERSION")})
+        serde_json::json!({"service":"FlussoniX","listen":http_address.map(|a|a.to_string()),"https_listen":https_address.map(|a|a.to_string()),"rtsp_listen":rtsp_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"rtsps_listen":tls_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"fxlink_listen":fxlink_listener.as_ref().map(|l|l.address().to_string()),"srt_play_listen":srt_listener.as_ref().map(|l|l.address().to_string()),"srt_play_encrypted":srt_listener.as_ref().map(|l|l.settings().encrypted()),"srt_play_public_url":srt_play_public_url.as_ref().map(url::Url::as_str),"srt_play_direct_tokens_allowed":a.srt_play_allow_direct_token,"rtsp_udp_ports":a.rtsp_udp_ports.map(|p|p.to_string()),"rtsp_udp_mbps":a.rtsp_udp_ports.map(|_|udp_rate),"version":env!("CARGO_PKG_VERSION")})
     );
     app.reconcile().await;
     let background = app.clone();

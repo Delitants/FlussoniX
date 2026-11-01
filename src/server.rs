@@ -37,11 +37,19 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+#[derive(Clone, Copy)]
+pub(crate) enum SrtLookupMode {
+    Ticket,
+    Required,
+    Any,
+}
+
 #[derive(Clone)]
 pub struct Options {
     pub admin_user: String,
     pub admin_password: String,
     pub admin_public_origin: Option<url::Url>,
+    pub srt_play_public_url: Option<url::Url>,
     pub allow_insecure_remote_management: bool,
     pub view_user: Option<String>,
     pub view_password: Option<String>,
@@ -66,12 +74,36 @@ pub struct Options {
     pub drain: bool,
     pub fxlink_features: crate::fxlink::Features,
 }
+/// Validate an advertised SRT root independently of the HTTP Host header.
+pub fn validate_srt_public_url(raw: &str) -> Option<url::Url> {
+    let url = crate::config::vendor_peers::srt_root(raw)?;
+    // `srt` is a non-special URL scheme, so even a numeric host may parse as Domain.
+    let host = url
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(ip)
+                if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() =>
+            {
+                return None;
+            }
+            std::net::IpAddr::V6(ip) if ip.is_unspecified() || ip.is_multicast() => {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    Some(url)
+}
 impl Default for Options {
     fn default() -> Self {
         Self {
             admin_user: "admin".into(),
             admin_password: String::new(),
             admin_public_origin: None,
+            srt_play_public_url: None,
             allow_insecure_remote_management: false,
             view_user: None,
             view_password: None,
@@ -207,6 +239,13 @@ impl App {
     ) -> Result<Arc<Self>, String> {
         if options.admin_password.is_empty() || options.peer_key.len() < 12 {
             return Err("admin password required; peer key must be at least 12 characters".into());
+        }
+        if options
+            .srt_play_public_url
+            .as_ref()
+            .is_some_and(|url| validate_srt_public_url(url.as_str()).is_none())
+        {
+            return Err("invalid public SRT playback URL".into());
         }
         if options.iptv_peer_allow_insecure_loopback && !options.iptv_lease_authority {
             return Err("IPTV loopback peer exception requires IPTV lease authority".into());
@@ -464,10 +503,54 @@ impl App {
     pub fn set_srt_playback(&self, listener: Option<&crate::srt_playback::Listener>) {
         *self.srt_playback.lock().unwrap() = match listener {
             Some(l) => {
-                json!({"enabled":true,"listener_id":uuid::Uuid::new_v4().to_string(),"listen":l.address().to_string(),"encrypted":l.settings().encrypted(),"latency_ms":l.settings().latency_millis(),"client_limit":l.settings().client_limit()})
+                json!({"enabled":true,"listener_id":uuid::Uuid::new_v4().to_string(),"listen":l.address().to_string(),"encrypted":l.settings().encrypted(),"latency_ms":l.settings().latency_millis(),"client_limit":l.settings().client_limit(),"direct_tokens_allowed":l.settings().allow_direct_tokens(),"public_url":self.options.srt_play_public_url.as_ref().map(url::Url::as_str)})
             }
-            None => json!({"enabled":false,"listen":null,"encrypted":false}),
+            None => {
+                json!({"enabled":false,"listen":null,"encrypted":false,"direct_tokens_allowed":false,"public_url":null})
+            }
         };
+    }
+    fn reservation_capacity(
+        &self,
+        reservations: &HashMap<String, Reservation>,
+        srt: Option<&srt_tickets::Binding>,
+        bitrate_mbps: f64,
+    ) -> bool {
+        let expected = bitrate_mbps / self.options.uplink_mbps;
+        let (n, window) = self
+            .telemetry
+            .snapshot_with_window(self.options.uplink_mbps);
+        let reserved_mbps: f64 = reservations.values().map(|r| r.bitrate_mbps).sum::<f64>()
+            + self
+                .http_handoffs
+                .unmeasured(window, n["http_egress_mbps"].as_f64());
+        let active = self.playback_auth.active();
+        let srt_full = srt.is_some_and(|binding| {
+            let listener = self.srt_playback.lock().unwrap();
+            let limit = listener["client_limit"].as_u64().unwrap_or(0);
+            let pending = reservations
+                .values()
+                .filter(|r| {
+                    r.srt
+                        .as_ref()
+                        .is_some_and(|b| b.listener_id == binding.listener_id)
+                })
+                .count() as u64;
+            self.srt_connections
+                .load(Ordering::Relaxed)
+                .saturating_add(pending)
+                >= limit
+        });
+        !srt_full
+            && !self.options.drain
+            && reservations.len() < 20000
+            && active.saturating_add(reservations.len() as u64) < self.options.client_limit
+            && n["uplink"].as_f64().unwrap_or(1.0)
+                + reserved_mbps / self.options.uplink_mbps
+                + expected
+                < 0.9
+            && n["cpu"].as_f64().unwrap_or(1.0) < 0.9
+            && n["ram"].as_f64().unwrap_or(1.0) < 0.95
     }
     fn cluster_client(&self, node: &Value) -> Result<reqwest::Client, String> {
         let endpoint = node["api_url"]
@@ -885,6 +968,11 @@ impl App {
             self.media.direct_egress.load(Ordering::Relaxed),
             self.fxlink.lock().unwrap().1.load(Ordering::Relaxed),
         );
+        // The one-second daemon tick also releases expired in-memory viewer
+        // credentials when no new admissions or node-status reads arrive.
+        if let Ok(mut reservations) = self.reservations.try_lock() {
+            reservations.retain(|_, reservation| reservation.expires > at);
+        }
     }
 
     fn resolved(&self, name: &str, config: Value, revision: u64) -> Option<Resolved> {
@@ -1072,6 +1160,7 @@ pub fn router(app: Arc<App>) -> Router {
  .route("/flussonix/peer/v1/iptv/leases/release",axum::routing::post(iptv_peer::release))
  .route("/flussonix/peer/v1/iptv/leases/rollback",axum::routing::post(iptv_peer::rollback))
  .route("/flussonix/api/v1/srt-lookup",axum::routing::any(srt_lookup::lookup))
+ .route("/flussonix/api/v1/srt-ticket",axum::routing::any(srt_ticket_issue::issue))
  .route("/flussonix/api/v1/{*tail}",axum::routing::any(native))
  .nest_service("/admin",tower_http::services::ServeDir::new(&app.options.web_dir).append_index_html_on_directories(true))
  .fallback(media_request).with_state(app).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024))
@@ -1654,9 +1743,32 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
         }
     }
     if tail == "admit" && request.method() == "POST" && peer {
-        let b = match read_json(request).await {
-            Ok(b) => b,
-            Err((code, message)) => return error(code, &message),
+        let socket_peer = request.extensions().get::<ConnectInfo<SocketAddr>>();
+        let secure_srt_peer = socket_peer.is_some_and(|peer| {
+            request
+                .extensions()
+                .get::<crate::http_tls::SecureHttp>()
+                .is_some()
+                || peer.0.ip().is_loopback()
+        });
+        if header(request.headers(), "x-flussonix-srt-credential").is_some() && !secure_srt_peer {
+            return error(
+                StatusCode::UPGRADE_REQUIRED,
+                "secure SRT admission required",
+            );
+        }
+        let bytes = match axum::body::to_bytes(request.into_body(), 4096).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "admission body exceeds limit",
+                );
+            }
+        };
+        let b: Value = match serde_json::from_slice(&bytes) {
+            Ok(body) => body,
+            Err(_) => return error(StatusCode::BAD_REQUEST, "invalid admission JSON"),
         };
         let Some(name) = b["name"].as_str() else {
             return error(StatusCode::BAD_REQUEST, "name required");
@@ -1683,6 +1795,25 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
             Ok(kind) => kind,
             Err(message) => return error(StatusCode::BAD_REQUEST, &message),
         };
+        let private_viewer = match admission::srt_viewer(&b, name) {
+            Ok(viewer) => viewer,
+            Err(status) => return error(status, "invalid SRT viewer"),
+        };
+        if let Some(viewer) = private_viewer {
+            if !secure_srt_peer {
+                return error(
+                    StatusCode::UPGRADE_REQUIRED,
+                    "secure SRT admission required",
+                );
+            }
+            return match app.reserve_srt_credential(viewer, hint).await {
+                Ok(ticket) => json_response(json!({"ticket":ticket,"expires_in":5})),
+                Err(status) => error(
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+                    "SRT admission unavailable",
+                ),
+            };
+        }
         let mut vendor = None;
         let mut srt = None;
         if let rtsp_balancer::Kind::Srt { encrypted, .. } = &kind {
@@ -1700,6 +1831,8 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
                 listener_id: listener["listener_id"].as_str().unwrap_or("").into(),
                 revision: app.config.revision(),
                 signature: None,
+                viewer: None,
+                peer_ip: None,
             });
         }
         if matches!(
@@ -1792,40 +1925,7 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
                 "stream cost exceeds admission bounds",
             );
         }
-        let expected = bitrate_mbps / app.options.uplink_mbps;
-        let (n, window) = app.telemetry.snapshot_with_window(app.options.uplink_mbps);
-        let reserved_mbps: f64 = reservations.values().map(|r| r.bitrate_mbps).sum::<f64>()
-            + app
-                .http_handoffs
-                .unmeasured(window, n["http_egress_mbps"].as_f64());
-        let active = app.playback_auth.active();
-        let srt_full = srt.as_ref().is_some_and(|binding| {
-            let listener = app.srt_playback.lock().unwrap();
-            let limit = listener["client_limit"].as_u64().unwrap_or(0);
-            let pending = reservations
-                .values()
-                .filter(|r| {
-                    r.srt
-                        .as_ref()
-                        .is_some_and(|b| b.listener_id == binding.listener_id)
-                })
-                .count() as u64;
-            app.srt_connections
-                .load(Ordering::Relaxed)
-                .saturating_add(pending)
-                >= limit
-        });
-        if srt_full
-            || app.options.drain
-            || reservations.len() >= 20000
-            || active + reservations.len() as u64 >= app.options.client_limit
-            || n["uplink"].as_f64().unwrap_or(1.0)
-                + reserved_mbps / app.options.uplink_mbps
-                + expected
-                >= 0.9
-            || n["cpu"].as_f64().unwrap_or(1.0) >= 0.9
-            || n["ram"].as_f64().unwrap_or(1.0) >= 0.95
-        {
+        if !app.reservation_capacity(&reservations, srt.as_ref(), bitrate_mbps) {
             return error(StatusCode::SERVICE_UNAVAILABLE, "node has no capacity");
         }
         let native_http = matches!(kind, rtsp_balancer::Kind::Http)
@@ -2869,6 +2969,7 @@ mod http_handoff;
 mod http_tickets;
 pub(crate) mod rtsp_balancer;
 mod srt_lookup;
+mod srt_ticket_issue;
 pub(crate) mod srt_tickets;
 mod vendor_balancer;
 mod vendor_http_state;

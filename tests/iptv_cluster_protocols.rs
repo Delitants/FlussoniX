@@ -191,7 +191,9 @@ async fn clustered_iptv_srt_stream_id_enforces_the_authority_subscriber_token() 
         .unwrap();
     let listener = Listener::bind(
         "127.0.0.1:0".parse().unwrap(),
-        Settings::new(120, 4, String::new()).unwrap(),
+        Settings::new(120, 4, String::new())
+            .unwrap()
+            .with_direct_tokens(true),
     )
     .unwrap();
     let address = listener.address();
