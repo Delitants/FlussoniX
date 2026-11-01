@@ -284,6 +284,15 @@ pub(crate) struct TransportPolicy {
 
 fn remote_management_request(request: &Request) -> bool {
     let path = request.uri().path();
+    if request.method() == axum::http::Method::GET
+        && !request.headers().contains_key(header::AUTHORIZATION)
+        && matches!(
+            path,
+            "/streamer/api/v3/monitoring/liveness" | "/streamer/api/v3/monitoring/readiness"
+        )
+    {
+        return false;
+    }
     path == "/admin"
         || path.starts_with("/admin/")
         || path == "/streamer/api/v3"

@@ -192,6 +192,7 @@ pub struct App {
     telemetry: crate::telemetry::Sampler,
     pub started: Instant,
     started_at_epoch_secs: u64,
+    readiness_ha: Mutex<Option<(Instant, bool)>>,
     mirrors: fxlink_access::Mirrors,
     source_queries: tokio::sync::Semaphore,
     source_activation: Mutex<source_activation::State>,
@@ -466,6 +467,7 @@ impl App {
             telemetry: crate::telemetry::Sampler::new(&options.uplink_interface)?,
             started,
             started_at_epoch_secs,
+            readiness_ha: Mutex::new(None),
             mirrors: fxlink_access::Mirrors::default(),
             source_queries: tokio::sync::Semaphore::new(64),
             source_activation: Mutex::new(source_activation::State::default()),
@@ -1151,6 +1153,8 @@ pub(crate) fn parse_query(q: Option<&str>) -> HashMap<String, String> {
 }
 pub fn router(app: Arc<App>) -> Router {
     Router::new().route("/health",axum::routing::get(||async{axum::Json(json!({"status":"ok","service":"FlussoniX","version":env!("CARGO_PKG_VERSION")}))}))
+ .route("/streamer/api/v3/monitoring/liveness",axum::routing::get(monitoring_liveness))
+ .route("/streamer/api/v3/monitoring/readiness",axum::routing::get(monitoring_readiness))
  .route("/streamer/api/v3/{*tail}",axum::routing::any(management))
  .route("/tv/playlists/{subscriber}",axum::routing::get(iptv_playlist_http))
  .route("/flussonix/peer/v1/iptv/leases/status",axum::routing::post(iptv_peer::status))
@@ -1164,6 +1168,47 @@ pub fn router(app: Arc<App>) -> Router {
  .route("/flussonix/api/v1/{*tail}",axum::routing::any(native))
  .nest_service("/admin",tower_http::services::ServeDir::new(&app.options.web_dir).append_index_html_on_directories(true))
  .fallback(media_request).with_state(app).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024))
+}
+fn monitoring_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+async fn monitoring_liveness() -> impl IntoResponse {
+    axum::Json(json!({
+        "now": monitoring_now(),
+        "build": 0,
+        "server_version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+async fn monitoring_readiness(State(app): State<Arc<App>>) -> Response {
+    if let Some(pool) = &app.iptv_ha_pool {
+        // Coalesce concurrent probes and bound both database work and cache lifetime.
+        let mut cached = app.readiness_ha.lock().await;
+        let ready = match *cached {
+            Some((checked, ready)) if checked.elapsed() < Duration::from_secs(2) => ready,
+            _ => {
+                let ready = tokio::time::timeout(Duration::from_secs(9), pool.verify_startup())
+                    .await
+                    .is_ok_and(|result| result.is_ok());
+                *cached = Some((Instant::now(), ready));
+                ready
+            }
+        };
+        if !ready {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "Service is not ready");
+        }
+    }
+    axum::Json(json!({
+        "now": monitoring_now(),
+        "build": 0,
+        "started_at": app.started_at_epoch_secs,
+        "server_version": env!("CARGO_PKG_VERSION"),
+    }))
+    .into_response()
 }
 async fn iptv_playlist_http(
     State(app): State<Arc<App>>,
