@@ -59,10 +59,7 @@ impl App {
         let ledger = self.reservations.lock().await;
         let reservation = ledger.get(ticket.id)?;
         let binding = reservation.srt.as_ref()?;
-        if binding.peer_ip != Some(peer_ip)
-            || reservation.stream != name
-            || reservation.vendor.is_some()
-        {
+        if binding.peer_ip != Some(peer_ip) || reservation.stream != name {
             return None;
         }
         let mut viewer = binding.viewer.clone()?;
@@ -91,13 +88,28 @@ impl App {
         let route = self.config.read(|root| {
             crate::vendor_playback::select(root, &viewer.name, self.config.revision())
         });
-        if !matches!(route, crate::vendor_playback::Selection::Native) {
-            return Err(503);
-        }
-        let resolved = self.resolve(&viewer.name).await.ok_or(404u16)?;
-        if resolved.config["disabled"] == true {
-            return Err(404);
-        }
+        let (revision, signature, vendor) = match route {
+            crate::vendor_playback::Selection::Native => {
+                let resolved = self.resolve(&viewer.name).await.ok_or(404u16)?;
+                if resolved.config["disabled"] == true {
+                    return Err(404);
+                }
+                (
+                    resolved.revision,
+                    Some(crate::media::media_signature(&resolved.config)),
+                    None,
+                )
+            }
+            crate::vendor_playback::Selection::Vendor { key, revision } => {
+                let runtime = self.vendor_playback.as_ref().ok_or(503u16)?;
+                let reserved = runtime
+                    .rtsp_reserve(self, &viewer.name, &key, revision)
+                    .await?;
+                (revision, None, Some(Arc::new(reserved)))
+            }
+            crate::vendor_playback::Selection::Excluded => return Err(404),
+            crate::vendor_playback::Selection::Ambiguous => return Err(503),
+        };
         let listener = self.srt_playback.lock().unwrap().clone();
         if listener["enabled"] != true || listener["encrypted"] != true {
             return Err(503);
@@ -107,8 +119,8 @@ impl App {
         viewer.ip = peer_ip.to_string();
         let binding = Binding {
             listener_id: listener_id.clone(),
-            revision: resolved.revision,
-            signature: Some(crate::media::media_signature(&resolved.config)),
+            revision,
+            signature,
             viewer: Some(viewer.clone()),
             peer_ip: Some(peer_ip),
         };
@@ -147,29 +159,35 @@ impl App {
             encrypted: true,
             listener_id: &listener_id,
         };
-        let committed = self
-            .config
-            .at_revision(binding.revision, |_| {
-                self.with_srt_listener(ticket, || {
-                    reservations.insert(
-                        id.clone(),
-                        Reservation {
-                            http_slot: None,
-                            srt: Some(binding),
-                            vendor: None,
-                            kind: rtsp_balancer::Kind::Srt {
-                                encrypted: true,
-                                token_hash: rtsp_balancer::token_hash(&viewer),
-                            },
-                            bitrate_mbps,
-                            stream: viewer.name,
-                            expires: Instant::now() + Duration::from_secs(5),
-                        },
-                    );
-                })
+        let mut reservation = Some(Reservation {
+            http_slot: None,
+            srt: Some(binding.clone()),
+            vendor: vendor.clone(),
+            kind: rtsp_balancer::Kind::Srt {
+                encrypted: true,
+                token_hash: rtsp_balancer::token_hash(&viewer),
+            },
+            bitrate_mbps,
+            stream: viewer.name,
+            expires: Instant::now() + Duration::from_secs(5),
+        });
+        let mut commit = || {
+            self.with_srt_listener(ticket, || {
+                reservations.insert(id.clone(), reservation.take().unwrap());
+                true
             })
-            .flatten();
-        committed.ok_or(503u16)?;
+            .unwrap_or(false)
+        };
+        let committed = if let Some(reserved) = &vendor {
+            let owner = self.modern_sources.as_ref().ok_or(503u16)?;
+            owner.with_reserved_current(reserved, commit).ok() == Some(true)
+        } else {
+            self.config.at_revision(binding.revision, |_| commit()) == Some(true)
+        };
+        if !committed {
+            reservations.remove(&id);
+            return Err(503);
+        }
         Ok(id)
     }
     fn with_srt_listener<T>(&self, ticket: Ticket<'_>, commit: impl FnOnce() -> T) -> Option<T> {

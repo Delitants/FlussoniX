@@ -54,7 +54,6 @@ impl Daemon {
                     "127.0.0.1:0",
                     "--srt-play-client-limit",
                     "8",
-                    "--srt-play-allow-direct-token",
                 ])
                 .env("FLUSSONIX_SRT_PLAY_PASSPHRASE", passphrase);
         } else {

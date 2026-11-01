@@ -147,7 +147,9 @@ async fn native_lookup_returns_an_opaque_token_bound_ticket_without_lb_media() {
     assert_eq!(result["address"], cdn.address);
     assert_eq!(result["encryption_required"], true);
     let id = result["streamid"].as_str().unwrap();
-    assert!(id.starts_with("#!::u=one%2B+é,r=local/news,a=opaque,m=request,flussonix_ticket="));
+    assert!(id.starts_with("#!::r=local/news,m=request,flussonix_ticket="));
+    assert!(!id.contains("one%2B+é"));
+    assert!(!id.contains("a=opaque"));
     assert!(uuid::Uuid::parse_str(id.split_once("flussonix_ticket=").unwrap().1).is_ok());
     assert!(!result.to_string().contains(KEY));
     assert!(!result.to_string().contains("owned-native-passphrase"));
@@ -155,6 +157,112 @@ async fn native_lookup_returns_an_opaque_token_bound_ticket_without_lb_media() {
     assert_eq!(cdn.app.media.count().await, 0);
     assert_eq!(lb.media.count().await, 0);
     https.close().await;
+    cdn.close().await;
+}
+#[tokio::test]
+async fn public_https_post_issues_tokenless_ticket_through_native_lb() {
+    let cdn = Native::new(4).await;
+    let (_d, lb) = app();
+    lb.config.put("peers", "cdn", cdn.peer()).unwrap();
+    let https = Https::new(lb.clone()).await;
+    let response = https
+        .issue("#!::r=local/news,m=request,u=owned-secret")
+        .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["cache-control"], "private, no-store");
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["address"], cdn.address);
+    assert_eq!(body["expires_in"], 5);
+    assert!(
+        body["streamid"]
+            .as_str()
+            .unwrap()
+            .contains("flussonix_ticket=")
+    );
+    assert!(!body.to_string().contains("owned-secret"));
+    assert_eq!(cdn.node().await["reserved"], 1);
+    assert_eq!(lb.media.count().await, 0);
+    https.close().await;
+    cdn.close().await;
+}
+#[tokio::test]
+async fn private_viewer_transfer_refuses_nonliteral_http_even_with_legacy_peer_opt_in() {
+    let cdn = Native::new(4).await;
+    let (_d, lb) = app();
+    let mut peer = cdn.peer();
+    peer["api_url"] = json!(cdn.url.replace("127.0.0.1", "localhost"));
+    peer["flussonix_allow_insecure_peer_http"] = json!(true);
+    lb.config.put("peers", "cdn", peer).unwrap();
+    let https = Https::new(lb.clone()).await;
+    let response = https
+        .issue("#!::r=local/news,m=request,u=owned-secret")
+        .await;
+    assert_eq!(response.status(), 503);
+    assert_eq!(cdn.node().await["reserved"], 0);
+    https.close().await;
+    cdn.close().await;
+}
+#[tokio::test]
+async fn credential_transfer_rejects_mismatched_hash_and_extra_viewer_fields() {
+    use sha2::{Digest, Sha256};
+    let cdn = Native::new(4).await;
+    let endpoint = format!("{}/flussonix/api/v1/admit", cdn.url);
+    let viewer = json!({
+        "token":"owned-private-token",
+        "qs":"streamid=%23%21%3A%3Ar%3Dlocal%2Fnews%2Cu%3Downed-private-token",
+        "ip":"127.0.0.1",
+        "user_agent":"owned-client",
+        "referer":"https://viewer.invalid/",
+        "host":"owned.example"
+    });
+    let body = json!({"name":"local/news","protocol":"srt","encrypted":true,
+        "token_hash":format!("{:x}",Sha256::digest(b"owned-private-token")),
+        "bitrate_mbps":2,"srt_viewer":viewer});
+    let client = reqwest::Client::new();
+    let mut wrong_hash = body.clone();
+    wrong_hash["token_hash"] = json!(format!("{:x}", Sha256::digest(b"other-token")));
+    let response = client
+        .post(&endpoint)
+        .header("x-flussonix-peer", KEY)
+        .json(&wrong_hash)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let mut extra = body.clone();
+    extra["srt_viewer"]["admin"] = json!(true);
+    let response = client
+        .post(&endpoint)
+        .header("x-flussonix-peer", KEY)
+        .json(&extra)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let mut outer = body.clone();
+    outer["surprise"] = json!(true);
+    let response = client
+        .post(&endpoint)
+        .header("x-flussonix-peer", KEY)
+        .json(&outer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert_eq!(cdn.node().await["reserved"], 0);
+    let response = client
+        .post(&endpoint)
+        .header("x-flussonix-peer", KEY)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let value: Value = response.json().await.unwrap();
+    let ticket = value["ticket"].as_str().unwrap();
+    assert!(uuid::Uuid::parse_str(ticket).is_ok());
+    assert!(!value.to_string().contains("owned-private-token"));
+    assert_eq!(cdn.node().await["reserved"], 1);
     cdn.close().await;
 }
 #[tokio::test]
@@ -237,8 +345,16 @@ async fn encrypted_native_lookup_ticket_is_single_use_and_never_replaces_viewer_
         assert_eq!(r.status(), 200);
         let value: Value = r.json().await.unwrap();
         let id = value["streamid"].as_str().unwrap();
+        assert!(!id.contains(token));
         let wrong = cdn._dir.path().join("wrong.ts");
-        assert!(!receive(&id.replace(token, "wrong-token"), &cdn.address, &wrong).await);
+        assert!(
+            !receive(
+                &id.replace("local/news", "other/news"),
+                &cdn.address,
+                &wrong
+            )
+            .await
+        );
         assert_eq!(std::fs::metadata(&wrong).map(|m| m.len()).unwrap_or(0), 0);
         assert_eq!(cdn.app.media.count().await, 0);
         assert_eq!(
@@ -366,8 +482,8 @@ async fn native_listener_encryption_attestation_and_streamid_budget_precede_admi
     assert_eq!(cdn.node().await["reserved"], 0);
     lb.config.put("peers", "cdn", cdn.peer()).unwrap();
     let prefix = "#!::r=local/news,m=request,u=";
-    let id = format!("{prefix}{}", "x".repeat(512 - prefix.len()));
-    assert_eq!(https.lookup(&id, None).await.status(), 503);
+    let id = format!("{prefix}{}", "x".repeat(513 - prefix.len()));
+    assert_eq!(https.lookup(&id, None).await.status(), 400);
     assert_eq!(cdn.node().await["reserved"], 0);
     assert_eq!(
         https
@@ -379,6 +495,12 @@ async fn native_listener_encryption_attestation_and_streamid_budget_precede_admi
             .status(),
         400
     );
+    let prefix = "#!::r=local/news,u=";
+    let exact = format!("{prefix}{}", "x".repeat(512 - prefix.len()));
+    let exact_reply = https.lookup(&exact, None).await;
+    assert_eq!(exact_reply.status(), 200);
+    let exact_body: Value = exact_reply.json().await.unwrap();
+    assert_eq!(exact_body["streamid"].as_str().unwrap().len(), 80);
     https.close().await;
     cdn.close().await;
 }
@@ -434,15 +556,13 @@ async fn native_ticket_stays_out_of_destination_callback_and_lookup_rejects_call
                 .into_owned()
                 .collect();
         assert_eq!(query["proto"], "srt");
+        assert_eq!(query["ip"], "127.0.0.1");
         assert_eq!(query["token"], "one%2B+é");
         let clean: std::collections::HashMap<String, String> =
             url::form_urlencoded::parse(query["qs"].as_bytes())
                 .into_owned()
                 .collect();
-        assert_eq!(
-            clean["streamid"],
-            "#!::u=one%2B+é,r=local/news,a=opaque,m=request"
-        );
+        assert_eq!(clean["streamid"], "#!::u=one%2B+é,r=local/news,a=opaque");
         assert!(!rows[0].contains("flussonix_ticket"));
     })
     .catch_unwind()

@@ -65,15 +65,9 @@ async fn issue_inner(app: &Arc<App>, request: Request) -> Result<Value, u16> {
     if selection.token.is_empty() || !body.streamid.split(',').any(|part| part == "m=request") {
         return Err(400);
     }
-    if !matches!(app.options.role.as_str(), "standalone" | "cdn") || app.options.drain {
+    if !matches!(app.options.role.as_str(), "standalone" | "cdn" | "lb") || app.options.drain {
         return Err(503);
     }
-    let address = app.options.srt_play_public_url.as_ref().ok_or(503u16)?;
-    let profile = app.srt_playback.lock().unwrap().clone();
-    if profile["enabled"] != true || profile["encrypted"] != true {
-        return Err(503);
-    }
-    let listener_id = profile["listener_id"].as_str().ok_or(503u16)?.to_owned();
     let viewer = ViewerRequest {
         name: selection.name,
         token: selection.token,
@@ -87,6 +81,15 @@ async fn issue_inner(app: &Arc<App>, request: Request) -> Result<Value, u16> {
         host,
         finite_media: false,
     };
+    if app.options.role == "lb" {
+        return app.srt_lookup(viewer, &body.streamid, true).await;
+    }
+    let address = app.options.srt_play_public_url.as_ref().ok_or(503u16)?;
+    let profile = app.srt_playback.lock().unwrap().clone();
+    if profile["enabled"] != true || profile["encrypted"] != true {
+        return Err(503);
+    }
+    let listener_id = profile["listener_id"].as_str().ok_or(503u16)?.to_owned();
     let route = app
         .config
         .read(|root| crate::vendor_playback::select(root, &viewer.name, app.config.revision()));

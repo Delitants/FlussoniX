@@ -120,7 +120,7 @@ pub(super) async fn lookup(State(app): State<Arc<App>>, request: Request) -> Res
     response
 }
 impl App {
-    async fn srt_lookup(
+    pub(super) async fn srt_lookup(
         &self,
         viewer: ViewerRequest,
         streamid: &str,
@@ -206,15 +206,24 @@ impl App {
             if encrypted && !required {
                 return None;
             }
-            let id = mapped(
-                streamid,
-                if vendor {
-                    crate::config::vendor_peers::remote_name(&peer, &viewer.name)?
-                } else {
-                    &viewer.name
-                },
-            )?;
-            if !vendor && append_ticket(&id, "00000000-0000-0000-0000-000000000000").is_none() {
+            if !vendor && !required {
+                return None;
+            }
+            let id = if vendor {
+                mapped(
+                    streamid,
+                    crate::config::vendor_peers::remote_name(&peer, &viewer.name)?,
+                )?
+            } else {
+                String::new()
+            };
+            if !vendor
+                && crate::srt_playback::ticket_only(
+                    &viewer.name,
+                    "00000000-0000-0000-0000-000000000000",
+                )
+                .is_none()
+            {
                 return None;
             }
             let snapshot = self.http_snapshot(&peer, &viewer.name, revision).await?;
@@ -336,9 +345,17 @@ impl App {
                 let Some(api) = peer["api_url"].as_str() else {
                     continue;
                 };
+                let secure_peer = url::Url::parse(api)
+                    .ok()
+                    .is_some_and(|url| crate::peer_transport::require(&url, false).is_ok());
+                if !secure_peer {
+                    continue;
+                }
                 let response=client.post(format!("{}/flussonix/api/v1/admit",api.trim_end_matches('/')))
                     .header("X-Flussonix-Peer",peer["cluster_key"].as_str().unwrap_or(&self.options.peer_key))
-                    .json(&json!({"name":viewer.name,"protocol":"srt","encrypted":required,"token_hash":super::rtsp_balancer::token_hash(viewer),"bitrate_mbps":bitrate}))
+                    .header("X-Flussonix-Srt-Credential","1")
+                    .json(&json!({"name":viewer.name,"protocol":"srt","encrypted":true,"token_hash":super::rtsp_balancer::token_hash(viewer),"bitrate_mbps":bitrate,
+                        "srt_viewer":{"token":viewer.token,"qs":viewer.qs,"ip":viewer.ip,"user_agent":viewer.user_agent,"referer":viewer.referer,"host":viewer.host}}))
                     .timeout(Duration::from_secs(4)).send().await;
                 let Ok(response) = response else {
                     continue;
@@ -351,7 +368,7 @@ impl App {
                 };
                 let Some(id) = body["ticket"]
                     .as_str()
-                    .and_then(|id| append_ticket(streamid, id))
+                    .and_then(|id| crate::srt_playback::ticket_only(&viewer.name, id))
                 else {
                     continue;
                 };
@@ -368,13 +385,4 @@ impl App {
             );
         }
     }
-}
-
-fn append_ticket(streamid: &str, ticket: &str) -> Option<String> {
-    let id = uuid::Uuid::parse_str(ticket).ok()?;
-    if id.to_string() != ticket {
-        return None;
-    }
-    let output = format!("{streamid},flussonix_ticket={ticket}");
-    (output.len() <= 512).then_some(output)
 }

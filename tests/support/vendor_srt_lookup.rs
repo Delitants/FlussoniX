@@ -49,6 +49,14 @@ impl Https {
         }
         req.send().await.unwrap()
     }
+    pub(super) async fn issue(&self, id: &str) -> reqwest::Response {
+        self.client
+            .post(format!("{}/flussonix/api/v1/srt-ticket", self.url))
+            .json(&json!({"streamid":id,"encryption":"required"}))
+            .send()
+            .await
+            .unwrap()
+    }
     pub(super) async fn close(self) {
         self.stop.cancel();
         tokio::time::timeout(Duration::from_secs(6), self.task)

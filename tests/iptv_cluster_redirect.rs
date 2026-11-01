@@ -323,9 +323,7 @@ async fn lb_redirect_does_not_hold_the_only_iptv_slot_needed_by_its_cdn() {
     );
     let srt_listener = srt_playback::Listener::bind(
         "127.0.0.1:0".parse().unwrap(),
-        srt_playback::Settings::new(120, 4, "owned-srt-passphrase".into())
-            .unwrap()
-            .with_direct_tokens(true),
+        srt_playback::Settings::new(120, 4, "owned-srt-passphrase".into()).unwrap(),
     )
     .unwrap();
     let srt_address = format!("srt://{}", srt_listener.address());
@@ -403,27 +401,64 @@ async fn lb_redirect_does_not_hold_the_only_iptv_slot_needed_by_its_cdn() {
     );
     let srt_target: Value = lookup.json().await.unwrap();
     assert_eq!(srt_target["address"], srt_address);
-    let admitted = client
-        .get(format!("{cdn_url}/news/index.m3u8?token=srt-viewer-token"))
-        .send()
-        .await
-        .unwrap();
-    let admitted = if admitted.status().is_redirection() {
-        let location = admitted.headers()["location"].to_str().unwrap();
-        client
-            .get(format!("{cdn_url}{location}"))
-            .send()
-            .await
+    assert!(
+        srt_target["streamid"]
+            .as_str()
             .unwrap()
-    } else {
-        admitted
-    };
-    assert_eq!(
-        admitted.status(),
-        200,
-        "CDN could not claim the subscriber slot after SRT lookup"
+            .contains("flussonix_ticket=")
     );
-    assert!(admitted.text().await.unwrap().starts_with("#EXTM3U"));
+    assert!(!srt_target.to_string().contains("srt-viewer-token"));
+    let capture = dir.path().join("iptv-srt.ts");
+    let mut receiver = tokio::process::Command::new("/usr/bin/ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-threads",
+            "1",
+            "-analyzeduration",
+            "1000000",
+            "-probesize",
+            "524288",
+            "-srt_streamid",
+            srt_target["streamid"].as_str().unwrap(),
+            "-passphrase",
+            "owned-srt-passphrase",
+            "-i",
+            &format!(
+                "{srt_address}?mode=caller&latency=120000&connect_timeout=1000&timeout=5000000"
+            ),
+            "-t",
+            "1",
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            "-f",
+            "mpegts",
+        ])
+        .arg(&capture)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(6), async {
+        while lb.iptv_leases.active_leases() == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("CDN SRT viewer never acquired the subscriber lease");
+    let played = tokio::time::timeout(Duration::from_secs(18), receiver.wait())
+        .await
+        .expect("owned SRT receiver timed out")
+        .unwrap();
+    assert!(played.success(), "CDN SRT receiver did not play");
+    assert!(std::fs::metadata(&capture).unwrap().len() > 188);
     tls_stop.cancel();
     srt_stop.cancel();
     tls_task.await.unwrap().unwrap();

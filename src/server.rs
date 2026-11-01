@@ -1736,9 +1736,32 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
         }
     }
     if tail == "admit" && request.method() == "POST" && peer {
-        let b = match read_json(request).await {
-            Ok(b) => b,
-            Err((code, message)) => return error(code, &message),
+        let socket_peer = request.extensions().get::<ConnectInfo<SocketAddr>>();
+        let secure_srt_peer = socket_peer.is_some_and(|peer| {
+            request
+                .extensions()
+                .get::<crate::http_tls::SecureHttp>()
+                .is_some()
+                || peer.0.ip().is_loopback()
+        });
+        if header(request.headers(), "x-flussonix-srt-credential").is_some() && !secure_srt_peer {
+            return error(
+                StatusCode::UPGRADE_REQUIRED,
+                "secure SRT admission required",
+            );
+        }
+        let bytes = match axum::body::to_bytes(request.into_body(), 4096).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "admission body exceeds limit",
+                );
+            }
+        };
+        let b: Value = match serde_json::from_slice(&bytes) {
+            Ok(body) => body,
+            Err(_) => return error(StatusCode::BAD_REQUEST, "invalid admission JSON"),
         };
         let Some(name) = b["name"].as_str() else {
             return error(StatusCode::BAD_REQUEST, "name required");
@@ -1765,6 +1788,25 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
             Ok(kind) => kind,
             Err(message) => return error(StatusCode::BAD_REQUEST, &message),
         };
+        let private_viewer = match admission::srt_viewer(&b, name) {
+            Ok(viewer) => viewer,
+            Err(status) => return error(status, "invalid SRT viewer"),
+        };
+        if let Some(viewer) = private_viewer {
+            if !secure_srt_peer {
+                return error(
+                    StatusCode::UPGRADE_REQUIRED,
+                    "secure SRT admission required",
+                );
+            }
+            return match app.reserve_srt_credential(viewer, hint).await {
+                Ok(ticket) => json_response(json!({"ticket":ticket,"expires_in":5})),
+                Err(status) => error(
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+                    "SRT admission unavailable",
+                ),
+            };
+        }
         let mut vendor = None;
         let mut srt = None;
         if let rtsp_balancer::Kind::Srt { encrypted, .. } = &kind {
