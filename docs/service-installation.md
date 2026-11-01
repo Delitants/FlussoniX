@@ -60,6 +60,61 @@ systemd-analyze verify --man=no ./flussonix-preview.service
 cat ./flussonix-preview.service
 ```
 
+The command above renders a standalone HTTP preview. To render an HTTPS CDN,
+prepare its own private state directory and credentials file, then use a
+separate instance name and unused ports:
+
+```bash
+sudo python3 ./bin/flussonix-service render \
+  --instance cdn --user flussonix --release-dir "$flussonix_release" \
+  --state-dir /var/lib/flussonix-cdn --credentials /etc/flussonix-cdn.env \
+  --listen 127.0.0.1:18210 --https-listen 0.0.0.0:18443 \
+  --https-cert /etc/flussonix/tls/server.crt \
+  --https-key /etc/flussonix/tls/server.key \
+  --role cdn --node-name cdn1 --uplink-mbps 1000 --client-limit 5000 \
+  --iptv-authority https://authority.example.test \
+  --output "$PWD/flussonix-cdn.service"
+systemd-analyze verify --man=no ./flussonix-cdn.service
+```
+
+For an IPTV HA authority, prepare its PostgreSQL settings file and HTTPS
+certificate first. The authority origin must identify this node:
+
+```bash
+sudo python3 ./bin/flussonix-service render \
+  --instance authority --user flussonix --release-dir "$flussonix_release" \
+  --state-dir /var/lib/flussonix-authority --credentials /etc/flussonix-authority.env \
+  --listen 127.0.0.1:18210 --https-listen 0.0.0.0:18443 \
+  --https-cert /etc/flussonix/tls/server.crt \
+  --https-key /etc/flussonix/tls/server.key --https-only \
+  --role source --node-name authority1 --iptv-lease-authority \
+  --iptv-ha-db-config /etc/flussonix/ha-db.json \
+  --iptv-authority https://authority.example.test \
+  --output "$PWD/flussonix-authority.service"
+systemd-analyze verify --man=no ./flussonix-authority.service
+```
+
+Use distinct ports when these units share a host. `--listen` remains required
+by the helper even with `--https-only`; the daemon does not bind it in that
+mode. The TLS private key and HA database settings file must be owned by the
+service account, mode 0600, and readable through their parent directories.
+Certificates and a private authority CA must also be readable by that account.
+The helper checks file access and option combinations; the daemon validates
+certificate and database contents at startup. A custom `--iptv-data` file must
+stay inside the instance's writable state directory.
+
+Other named options include `--rtsp-listen`, the `--rtsps-listen`/`--rtsps-cert`/
+`--rtsps-key` trio, `--rtsp-udp-ports` with optional `--rtsp-udp-mbps`, the
+`--fxlink-listen`/`--fxlink-cert`/`--fxlink-key` trio, and
+`--srt-play-listen` with optional public URL, latency and client limit. SRT
+uses ticket-only playback by default; `--srt-play-allow-direct-token` is an
+explicit legacy setting. To encrypt SRT playback, create a new credentials
+file with `credentials --with-srt-passphrase` and enter the passphrase at the
+prompt. The passphrase stays in that owner-only file, never in the unit.
+For two IPTV authorities, add `--iptv-authority-secondary`, the shared
+`--iptv-authority-cluster-id`, and `--iptv-authority-ca` if using a private CA.
+Review the generated unit and run `systemd-analyze verify` before installation.
+
 The helper verifies the release manifest and requires a non-root account, a
 private state directory and a protected credentials file. It also checks that
 the release and FFmpeg paths cannot be replaced through writable files or
