@@ -130,8 +130,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg libsrt1.5-gnutls
       - name: Verify vendor components are absent
         run: test ! -e /opt/flussonic
-      - name: Verify archive smoke rejects untrusted inputs
-        run: python3 -m unittest tests.test_release_archive_smoke -v
+      - name: Verify archive and upgrade smoke helpers
+        run: python3 -m unittest tests.test_release_archive_smoke tests.test_cold_upgrade_smoke -v
       - name: Build actual release daemon
         run: cargo build --locked --release
       - uses: actions/setup-node@v7
@@ -152,3 +152,19 @@ jobs:
           test "${#archives[@]}" -eq 1
           python3 scripts/smoke-release-archive.py --archive "${archives[0]}" \
             --revision "$GITHUB_SHA"
+          baseline_archive="$package_dir/flussonix-v0.10.0-preview-linux-x86_64.tar.gz"
+          curl --fail --location --retry 3 --retry-delay 2 \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --output "$baseline_archive" \
+            https://github.com/Delitants/FlussoniX/releases/download/v0.10.0-preview/flussonix-v0.10.0-preview-linux-x86_64.tar.gz
+          printf '%s  %s\n' \
+            '68fed74f74db1107c39adb6b369fa58d70336fbccde464b9ab73e6c1ec29f4a0' \
+            "$baseline_archive" | sha256sum --check
+          mkdir "$package_dir/previous" "$package_dir/current"
+          tar --extract --gzip --file "$baseline_archive" \
+            --directory "$package_dir/previous" --no-same-owner --no-same-permissions
+          tar --extract --gzip --file "${archives[0]}" \
+            --directory "$package_dir/current" --strip-components=1 \
+            --no-same-owner --no-same-permissions
+          TMPDIR="$package_dir" python3 scripts/smoke-cold-upgrade.py \
+            --previous "$package_dir/previous" --current "$package_dir/current" --media
