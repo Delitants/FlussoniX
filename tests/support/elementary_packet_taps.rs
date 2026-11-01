@@ -180,6 +180,7 @@ pub struct Tap<'a> {
     thread: Option<JoinHandle<()>>,
     outcome: Option<(Value, Option<DatagramCapture>)>,
     owner: Owner,
+    handoff: Option<HandoffWitness>,
 }
 impl<'a> Tap<'a> {
     #[allow(
@@ -206,7 +207,41 @@ impl<'a> Tap<'a> {
                 })
                 .collect::<io::Result<Vec<_>>>()?;
             let owner = Owner::snapshot(std::process::id(), &ports)?;
-            Self::start(owner, "source_to_public", evidence, artifact, origin)
+            Self::start(owner, None, "source_to_public", evidence, artifact, origin)
+        })();
+        Self::report_activation(result, "source_to_public", evidence)
+    }
+    pub fn public_handoff(
+        reserved: &[UdpSocket],
+        sender_pid: u32,
+        expected_sender_sockets: usize,
+        evidence: &'a Evidence,
+        artifact: &Path,
+        origin: Instant,
+    ) -> io::Result<Self> {
+        let result = (|| {
+            let ports = reserved
+                .iter()
+                .map(|socket| {
+                    let address = socket.local_addr()?;
+                    if address.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+                        return Err(io::Error::other(
+                            "packet tap requires owned loopback sockets",
+                        ));
+                    }
+                    Ok(address.port())
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let reservation = Owner::snapshot(std::process::id(), &ports)?;
+            let sender = Owner::sender(sender_pid, expected_sender_sockets)?;
+            Self::start(
+                reservation.clone(),
+                Some(HandoffWitness::new(reservation, sender)),
+                "source_to_public",
+                evidence,
+                artifact,
+                origin,
+            )
         })();
         Self::report_activation(result, "source_to_public", evidence)
     }
@@ -217,8 +252,9 @@ impl<'a> Tap<'a> {
         artifact: &Path,
         origin: Instant,
     ) -> io::Result<Self> {
-        let result = Owner::snapshot(pid, ports)
-            .and_then(|owner| Self::start(owner, "source_to_public", evidence, artifact, origin));
+        let result = Owner::snapshot(pid, ports).and_then(|owner| {
+            Self::start(owner, None, "source_to_public", evidence, artifact, origin)
+        });
         Self::report_activation(result, "source_to_public", evidence)
     }
     pub fn decoder(
@@ -228,8 +264,9 @@ impl<'a> Tap<'a> {
         artifact: &Path,
         origin: Instant,
     ) -> io::Result<Self> {
-        let result = Owner::snapshot(pid, ports)
-            .and_then(|owner| Self::start(owner, "relay_to_decoder", evidence, artifact, origin));
+        let result = Owner::snapshot(pid, ports).and_then(|owner| {
+            Self::start(owner, None, "relay_to_decoder", evidence, artifact, origin)
+        });
         Self::report_activation(result, "relay_to_decoder", evidence)
     }
     fn report_activation(
@@ -244,13 +281,17 @@ impl<'a> Tap<'a> {
     }
     fn start(
         owner: Owner,
+        handoff: Option<HandoffWitness>,
         boundary: &'static str,
         evidence: &'a Evidence,
         artifact: &Path,
         origin: Instant,
     ) -> io::Result<Self> {
         let ports = owner.sockets.keys().copied().collect::<Vec<_>>();
-        let socket = packet_socket(&ports, None)?;
+        let source_ports = handoff
+            .as_ref()
+            .map(|witness| witness.sender.sockets.keys().copied().collect::<Vec<_>>());
+        let socket = packet_socket(&ports, source_ports.as_deref())?;
         let ownership =
             json!({"pid":owner.pid,"start_ticks":owner.start_ticks,"socket_inodes":owner.sockets});
         let activated = origin.elapsed().as_nanos() as u64;
@@ -323,7 +364,11 @@ impl<'a> Tap<'a> {
                     malformed += 1;
                     continue;
                 };
-                if !ports.contains(&destination) {
+                if !ports.contains(&destination)
+                    || source_ports
+                        .as_ref()
+                        .is_some_and(|sources| !sources.contains(&source))
+                {
                     malformed += 1;
                     continue;
                 }
@@ -396,7 +441,20 @@ impl<'a> Tap<'a> {
             thread: Some(thread),
             outcome: None,
             owner,
+            handoff,
         })
+    }
+    pub fn release_reservation(&mut self, origin: Instant) -> io::Result<()> {
+        self.handoff
+            .as_mut()
+            .ok_or_else(|| io::Error::other("not a handoff tap"))?
+            .release(origin)
+    }
+    pub fn bind_native(&mut self, pid: u32, origin: Instant) -> io::Result<()> {
+        self.handoff
+            .as_mut()
+            .ok_or_else(|| io::Error::other("not a handoff tap"))?
+            .bind_native(pid, origin)
     }
 }
 fn packet_socket(ports: &[u16], source_ports: Option<&[u16]>) -> io::Result<OwnedFd> {
@@ -477,17 +535,21 @@ impl Tap<'_> {
             Ok((summary, capture)) => {
                 if self.thread.take().unwrap().join().is_err() {
                     (
-                        json!({"boundary":self.boundary,"incomplete":true,"thread_failed":true}),
+                        json!({"boundary":self.boundary,"incomplete":true,"observation":"unavailable","thread_failed":true}),
                         None,
                     )
                 } else {
-                    enforce_owner(&self.owner, summary, capture)
+                    if let Some(witness) = &self.handoff {
+                        enforce_handoff(witness, summary, capture)
+                    } else {
+                        enforce_owner(&self.owner, summary, capture)
+                    }
                 }
             }
             Err(_) => {
                 self.thread.take();
                 (
-                    json!({"boundary":self.boundary,"incomplete":true,"completion_unavailable":true}),
+                    json!({"boundary":self.boundary,"incomplete":true,"observation":"unavailable","completion_unavailable":true}),
                     None,
                 )
             }
@@ -503,6 +565,7 @@ impl Drop for Tap<'_> {
     }
 }
 
+#[derive(Clone)]
 pub struct Owner {
     pid: u32,
     start_ticks: u64,
@@ -544,6 +607,127 @@ impl Owner {
             }
         }
         Err(race.unwrap())
+    }
+}
+pub struct HandoffWitness {
+    reservation: Owner,
+    sender: Owner,
+    release_ns: Option<u64>,
+    native: Option<Owner>,
+    native_ns: Option<u64>,
+    failed: bool,
+}
+impl HandoffWitness {
+    pub fn new(reservation: Owner, sender: Owner) -> Self {
+        Self {
+            reservation,
+            sender,
+            release_ns: None,
+            native: None,
+            native_ns: None,
+            failed: false,
+        }
+    }
+    pub fn release(&mut self, origin: Instant) -> io::Result<()> {
+        let result = (|| {
+            if self.failed || self.release_ns.is_some() {
+                return Err(io::Error::other("reservation release already recorded"));
+            }
+            let ports = self.reservation.sockets.keys().copied().collect::<Vec<_>>();
+            let now = Owner::snapshot(self.reservation.pid, &ports)?;
+            if now.start_ticks != self.reservation.start_ticks
+                || now.sockets != self.reservation.sockets
+            {
+                return Err(io::Error::other(
+                    "reservation ownership changed before release",
+                ));
+            }
+            self.release_ns = Some(origin.elapsed().as_nanos() as u64);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    pub fn bind_native(&mut self, pid: u32, origin: Instant) -> io::Result<()> {
+        let result = (|| {
+            if self.failed
+                || self.release_ns.is_none()
+                || self.native.is_some()
+                || pid != self.reservation.pid
+            {
+                return Err(io::Error::other("native bind out of handoff order"));
+            }
+            let ports = self.reservation.sockets.keys().copied().collect::<Vec<_>>();
+            let now = Owner::snapshot(pid, &ports)?;
+            if now.sockets == self.reservation.sockets {
+                return Err(io::Error::other("reservation sockets were not replaced"));
+            }
+            let timestamp = origin.elapsed().as_nanos() as u64;
+            if timestamp <= self.release_ns.unwrap() {
+                return Err(io::Error::other("native bind preceded release"));
+            }
+            self.native = Some(now);
+            self.native_ns = Some(timestamp);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+}
+pub fn enforce_handoff(
+    witness: &HandoffWitness,
+    mut summary: Value,
+    capture: DatagramCapture,
+) -> (Value, Option<DatagramCapture>) {
+    let snapshot = |owner: &Owner, sender: bool| {
+        let current = if sender {
+            Owner::sender(owner.pid, owner.sockets.len())
+        } else {
+            Owner::snapshot(
+                owner.pid,
+                &owner.sockets.keys().copied().collect::<Vec<_>>(),
+            )
+        };
+        current
+            .is_ok_and(|now| now.start_ticks == owner.start_ticks && now.sockets == owner.sockets)
+    };
+    let reservation = &witness.reservation;
+    let sender = &witness.sender;
+    summary["reservation_witness"] = json!({"pid":reservation.pid,"start_ticks":reservation.start_ticks,"socket_inodes":reservation.sockets});
+    summary["sender_witness"] =
+        json!({"pid":sender.pid,"start_ticks":sender.start_ticks,"socket_inodes":sender.sockets});
+    summary["source_prefix_unobserved"] = json!(true);
+    summary["application_receipt_proven"] = json!(false);
+    summary["reservation_release_ns"] = json!(witness.release_ns);
+    summary["native_owner_verified_ns"] = json!(witness.native_ns);
+    let native = witness.native.as_ref();
+    if let Some(native) = native {
+        summary["native_witness"] = json!({"pid":native.pid,"start_ticks":native.start_ticks,"socket_inodes":native.sockets});
+    }
+    let start = summary["coverage_start_ns"].as_u64();
+    let end = summary["coverage_end_ns"].as_u64();
+    let ordered = matches!((start, witness.release_ns, witness.native_ns, end),
+        (Some(start), Some(release), Some(native), Some(end)) if start < release && release < native && native < end);
+    let unchanged = !witness.failed
+        && ordered
+        && snapshot(sender, true)
+        && native.is_some_and(|owner| snapshot(owner, false));
+    if unchanged {
+        summary["handoff_captured"] = json!(true);
+        summary["ownership_at_stop"] = json!("unchanged");
+        (summary, Some(capture))
+    } else {
+        summary["handoff_captured"] = json!(false);
+        summary["ownership_at_stop"] = json!("unavailable_or_changed");
+        summary["observation"] = json!("unavailable");
+        summary["incomplete"] = json!(true);
+        summary["discarded_records"] = summary["records"].clone();
+        summary["records"] = json!(0);
+        (summary, None)
     }
 }
 pub fn enforce_owner(
