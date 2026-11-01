@@ -61,7 +61,7 @@ class Lab:
         self.ffprobe = shutil.which('ffprobe', path=os.defpath) if media else None
         if media and (not self.ffmpeg or not self.ffprobe):
             raise RuntimeError('media smoke requires independent FFmpeg and FFprobe')
-        self.last_media_generation = None
+        self.seen_media_generations = set()
 
     def request(self, path, method='GET', body=None, authenticated=False):
         headers = {'Authorization': self.auth} if authenticated else {}
@@ -161,16 +161,20 @@ class Lab:
                     segments = [line.strip() for line in body.decode('utf-8').splitlines()
                                 if line.strip() and not line.startswith('#')]
                     require(bool(segments), 'HLS playlist has no media URI')
-                    url = urllib.parse.urlsplit(urllib.parse.urljoin(
-                        f'http://127.0.0.1:{self.port}/upgrade_smoke/index.m3u8', segments[-1]))
-                    require(url.hostname == '127.0.0.1' and url.port == self.port
-                            and url.path.startswith('/upgrade_smoke/') and not url.fragment,
-                            'HLS segment escaped owned loopback stream')
-                    generation = re.fullmatch(
-                        r'g([0-9a-f]{32})_(?:p)?[0-9]+\.ts', url.path.rsplit('/', 1)[-1])
-                    require(generation is not None, 'HLS segment lacks a worker generation')
-                    if generation.group(1) != self.last_media_generation:
-                        selected = (url, generation.group(1))
+                    urls = [urllib.parse.urlsplit(urllib.parse.urljoin(
+                        f'http://127.0.0.1:{self.port}/upgrade_smoke/index.m3u8', segment))
+                        for segment in segments]
+                    generations = set()
+                    for url in urls:
+                        require(url.hostname == '127.0.0.1' and url.port == self.port
+                                and url.path.startswith('/upgrade_smoke/') and not url.fragment,
+                                'HLS segment escaped owned loopback stream')
+                        generation = re.fullmatch(
+                            r'g([0-9a-f]{32})_(?:p)?[0-9]+\.ts', url.path.rsplit('/', 1)[-1])
+                        require(generation is not None, 'HLS segment lacks a worker generation')
+                        generations.add(generation.group(1))
+                    if len(generations) == 1 and generations.isdisjoint(self.seen_media_generations):
+                        selected = (urls[-1], generations.pop())
                         break
             except urllib.error.HTTPError as error:
                 if error.code not in (404, 425, 503):
@@ -197,7 +201,7 @@ class Lab:
                        for line in decoded.stdout.splitlines())
         require(decoded.returncode == 0 and pictures >= 5,
                 'packaged stream yielded fewer than five decoded H.264 pictures')
-        self.last_media_generation = generation
+        self.seen_media_generations.add(generation)
 
 
 def smoke(previous, current, media=False):
