@@ -1729,3 +1729,20 @@ counters were zero. The controlled overflow tests show the counters work, but
 normal media rates did not exercise their limits. This does not establish that
 the archived 38-picture HEVC loss is repaired. The loss did not reproduce in
 this run, and passive packet taps do not cover the startup interval.
+
+## Tokenless SRT playback candidate
+
+The isolated SRT ticket candidate issues five-second, single-use playback
+credentials over HTTPS for encrypted native SRT listeners. The returned SRT
+Stream ID omits the original viewer token. Local and two-node tests cover
+single-use redemption, wrong-IP denial, viewer-policy recheck, native CDN
+placement and HEVC with MP2/MP3 recovery. Direct-token playback is off by
+default and requires an explicit trusted-network option; Flussonic peers need
+their own separate opt-in. The API and operator setup are described in
+[SRT playback](srt-playback.md) and [CDN placement](vendor-cdn-placement.md).
+
+This candidate is not a production release. Independent packet-capture proof
+of token absence, exact-head five-codec media qualification, full browser and
+packaging checks, review, WAN/capacity measurements, the independent 24-hour
+run, archived HEVC-loss gate and installation/upgrade/recovery checks remain
+open. Local success does not establish live Flussonic SRT interoperability.

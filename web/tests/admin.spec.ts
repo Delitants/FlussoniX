@@ -211,10 +211,20 @@ test('Config shows readable SRT playback state without exposing startup secrets'
  const node=await(await request.get('/flussonix/api/v1/node',{headers})).json();
  await page.getByRole('button',{name:'Config',exact:true}).click();
  const playback=page.getByRole('region',{name:'SRT playback',exact:true});await expect(playback).toBeVisible();
- await expect(playback).toContainText(node.srt_playback?.listen||'Not enabled');await expect(playback).toContainText('startup options');await expect(playback.locator('input,textarea')).toHaveCount(0);
+ await expect(playback).toContainText(node.srt_playback?.listen||'Not enabled');await expect(playback).toContainText('startup options');await expect(playback).toContainText('Ticket playback');await expect(playback).toContainText('Direct tokens');await expect(playback.locator('input,textarea')).toHaveCount(0);
  if(node.srt_playback?.enabled){await expect(playback).toContainText(node.srt_playback.encrypted?'Encrypted':'Plaintext');await expect(playback).toContainText(`${node.srt_playback.latency_ms} ms`);}
  await page.route('**/flussonix/api/v1/node',async route=>{const response=await route.fetch();const data=await response.json();data.srt_playback={enabled:false,listen:null,encrypted:false,passphrase:'owned-never-rendered-secret'};await route.fulfill({response,json:data});});
- await expect(playback).toContainText('Not enabled');await expect(page.getByText('owned-never-rendered-secret',{exact:false})).toHaveCount(0);
+ await expect(playback).toContainText('Not enabled');await expect(playback).toContainText('Needs encrypted SRT listener');await expect(page.getByText('owned-never-rendered-secret',{exact:false})).toHaveCount(0);
+});
+test('Config explains SRT ticket readiness and explicit direct-token exposure',async({page})=>{
+ await page.route('**/flussonix/api/v1/node',async route=>{const response=await route.fetch();const data=await response.json();data.http_delivery={http:'127.0.0.1:18210',https:'127.0.0.1:18443'};data.srt_playback={enabled:true,listen:'0.0.0.0:9998',public_url:'srt://cdn.example:9998',encrypted:true,direct_tokens_allowed:true,latency_ms:120,client_limit:128,clients:0,passphrase:'owned-never-rendered-secret'};await route.fulfill({response,json:data});});
+ await page.getByRole('button',{name:'Config',exact:true}).click();const playback=page.getByRole('region',{name:'SRT playback',exact:true});
+ await expect(playback).toContainText('srt://cdn.example:9998');await expect(playback).toContainText('Ticket playback');await expect(playback).toContainText('Ready');await expect(playback).toContainText('Direct tokens');await expect(playback).toContainText('Allowed');await expect(playback).toContainText('--srt-play-allow-direct-token');await expect(playback).not.toContainText('owned-never-rendered-secret');
+});
+test('Config marks wildcard SRT listener without public URL as ticket unavailable',async({page})=>{
+ await page.route('**/flussonix/api/v1/node',async route=>{const response=await route.fetch();const data=await response.json();data.http_delivery={http:'127.0.0.1:18210',https:'127.0.0.1:18443'};data.srt_playback={enabled:true,listen:'[::]:9998',public_url:null,encrypted:true,direct_tokens_allowed:false,latency_ms:120,client_limit:128,clients:0};await route.fulfill({response,json:data});});
+ await page.setViewportSize({width:393,height:852});await page.getByRole('button',{name:'Config',exact:true}).click();const playback=page.getByRole('region',{name:'SRT playback',exact:true});
+ await expect(playback).toContainText('Needs public SRT URL');await expect(playback).toContainText('--srt-play-public-url');await expect(playback).toContainText('Off');expect(await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth)).toBe(false);
 });
 test('SRT playback status remains visible in mobile Config',async({page})=>{
  await page.addStyleTag({content:':root{font-family:"DejaVu Sans",sans-serif}'});
@@ -228,7 +238,7 @@ for (const width of [1440,901,900,393,320]) for (const ipv6 of [false,true]) {
   await page.route('**/flussonix/api/v1/node',async route=>{
    const response=await route.fetch();const data=await response.json();
    data.http_delivery={http:ipv6?`${address}:18210`:'127.0.0.1:18210',https:ipv6?`${address}:443`:null,https_only:false};
-   data.srt_playback={enabled:ipv6,listen:ipv6?`${address}:9998`:null,encrypted:ipv6,latency_ms:120,client_limit:128,clients:0};
+   data.srt_playback={enabled:ipv6,listen:ipv6?`${address}:9998`:null,public_url:ipv6?`srt://${address}:9998`:null,encrypted:ipv6,direct_tokens_allowed:false,latency_ms:120,client_limit:128,clients:0};
    data.fxlink={...data.fxlink,enabled:ipv6,listen:ipv6?`${address}:55000`:null};
    await route.fulfill({response,json:data});
   });
@@ -239,7 +249,7 @@ for (const width of [1440,901,900,393,320]) for (const ipv6 of [false,true]) {
    ipv6?`${address}:18210`:'127.0.0.1:18210',ipv6?`${address}:443`:'Not enabled',ipv6?'HTTP and HTTPS':'HTTP',
   ]);
   await expect(sidebar.getByRole('region',{name:'SRT playback',exact:true}).locator('dd')).toHaveText([
-   ipv6?`${address}:9998`:'Not enabled',ipv6?'Encrypted':'—',ipv6?'120 ms':'—',ipv6?'128':'—',ipv6?'0':'—',
+   ipv6?`${address}:9998`:'Not enabled',ipv6?'Encrypted':'—',ipv6?'120 ms':'—',ipv6?'128':'—',ipv6?'0':'—',ipv6?`srt://${address}:9998`:'Not configured',ipv6?'Ready':'Needs encrypted SRT listener','Off',
   ]);
   await expect(sidebar.getByRole('region',{name:'FXLink transport',exact:true}).locator('dd')).toHaveText([
    ipv6?`${address}:55000`:'Not enabled','TLS + Reed–Solomon FEC','1,000 ms',
@@ -253,7 +263,7 @@ for (const width of [1440,901,900,393,320]) for (const ipv6 of [false,true]) {
   await testInfo.attach('sidebar-values',{body:JSON.stringify(values,null,2),contentType:'application/json'});
   await page.screenshot({path:testInfo.outputPath('config.png'),fullPage:true});
   for(const value of values){
-   expect(value.lines,`${value.text} should remain readable`).toBeLessThanOrEqual(value.text.startsWith('[')?3:value.label==='Protection'?2:1);
+   expect(value.lines,`${value.text} should remain readable`).toBeLessThanOrEqual(value.label==='Public SRT URL'||value.text.startsWith('[')?3:value.label==='Ticket playback'||value.label==='Protection'?2:1);
    expect(value.left).toBeGreaterThanOrEqual(value.panelLeft);
    expect(value.right).toBeLessThanOrEqual(value.panelRight);
    expect(value.scrollWidth).toBeLessThanOrEqual(value.width+1);
@@ -261,12 +271,12 @@ for (const width of [1440,901,900,393,320]) for (const ipv6 of [false,true]) {
   expect(await page.evaluate(()=>document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
  });
 }
-test('SRT playback URL uses an IPv6 endpoint and token placeholder without saved secrets',async({page,request})=>{
+test('SRT ticket Output uses an IPv6 endpoint and tokenless handshake without saved secrets',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
  expect((await request.put('/streamer/api/v3/streams/srt-ui-playback',{headers,data:{inputs:[{url:'testsrc://'}],static:false}})).ok()).toBeTruthy();
- await page.route('**/flussonix/api/v1/node',async route=>{const response=await route.fetch();const data=await response.json();data.srt_playback={enabled:true,listen:'[::1]:28567',encrypted:true,latency_ms:120,client_limit:128,clients:0,passphrase:'owned-never-rendered-secret'};await route.fulfill({response,json:data});});
+ await page.route('**/flussonix/api/v1/node',async route=>{const response=await route.fetch();const data=await response.json();data.http_delivery={http:'127.0.0.1:18210',https:'[::1]:18443'};data.srt_playback={enabled:true,listen:'[::1]:28567',public_url:'srt://[::1]:28567',encrypted:true,direct_tokens_allowed:false,latency_ms:120,client_limit:128,clients:0,passphrase:'owned-never-rendered-secret'};await route.fulfill({response,json:data});});
  await page.getByRole('button',{name:'Streams',exact:true}).click();await page.getByRole('button',{name:'srt-ui-playback',exact:true}).click();await page.getByRole('button',{name:'Output',exact:true}).click();
- const playback=page.getByRole('region',{name:'SRT playback URL',exact:true});await expect(playback).toBeVisible();await expect(playback).toContainText('srt://[::1]:28567');await expect(playback).toContainText('#!::r=srt-ui-playback,m=request,u=YOUR_TOKEN');await expect(playback).toContainText('client passphrase');await expect(playback).not.toContainText('owned-never-rendered-secret');await expect(page.locator('textarea')).toHaveCount(0);
+ const playback=page.getByRole('region',{name:'SRT playback URL',exact:true});await expect(playback).toBeVisible();await expect(playback).toContainText('srt://[::1]:28567');await expect(playback).toContainText('POST /flussonix/api/v1/srt-ticket');await expect(playback).toContainText('#!::r=srt-ui-playback,m=request,u=YOUR_TOKEN');await expect(playback).toContainText('flussonix_ticket=');await expect(playback).toContainText('five seconds');await expect(playback).toContainText('client passphrase');await expect(playback).not.toContainText('owned-never-rendered-secret');await expect(playback.getByText(/flussonix_ticket=/)).not.toContainText('u=YOUR_TOKEN');await expect(page.locator('textarea')).toHaveCount(0);
  await page.addStyleTag({content:':root{font-family:"DejaVu Sans",sans-serif}'});
  await page.setViewportSize({width:393,height:852});await expect(playback).toBeVisible();expect(await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth)).toBe(false);
 });
