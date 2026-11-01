@@ -166,5 +166,5 @@ jobs:
           tar --extract --gzip --file "${archives[0]}" \
             --directory "$package_dir/current" --strip-components=1 \
             --no-same-owner --no-same-permissions
-          python3 scripts/smoke-cold-upgrade.py \
+          TMPDIR="$package_dir" python3 scripts/smoke-cold-upgrade.py \
             --previous "$package_dir/previous" --current "$package_dir/current" --media
