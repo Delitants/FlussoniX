@@ -338,24 +338,37 @@ async fn secure_packets_wait_for_all_owned_decoder_ports_without_filling_public_
     let sender = sender_pair.next().unwrap();
     let sender_rtcp = sender_pair.next().unwrap();
     let foreign = AsyncUdp::bind("127.0.0.2:0").await.unwrap();
+    let wrong_key_sender = AsyncUdp::bind("127.0.0.1:0").await.unwrap();
+    let malformed_sender = AsyncUdp::bind("127.0.0.1:0").await.unwrap();
+    assert_ne!(
+        wrong_key_sender.local_addr().unwrap(),
+        sender.local_addr().unwrap()
+    );
+    assert_ne!(
+        malformed_sender.local_addr().unwrap(),
+        sender.local_addr().unwrap()
+    );
     foreign
         .send_to(&media(8, 777, 4), ("127.0.0.1", port))
         .await
         .unwrap();
-    let mut wrong_key = media(9, 777, 4);
-    crypto::Session::new([0x32; 30], Some(777))
+    let mut wrong_key = media(9, 901, 4);
+    crypto::Session::new([0x32; 30], Some(901))
         .unwrap()
         .protect(&mut wrong_key, false)
         .unwrap();
-    sender
+    wrong_key_sender
         .send_to(&wrong_key, ("127.0.0.1", port))
         .await
         .unwrap();
-    let mut malformed = media(9, 777, 4);
+    let mut malformed = media(9, 902, 4);
     malformed[1] = 96;
+    crypto::Session::new([0x31; 30], Some(902))
+        .unwrap()
+        .protect(&mut malformed, false)
+        .unwrap();
     let mut source_crypto = crypto::Session::new([0x31; 30], Some(777)).unwrap();
-    source_crypto.protect(&mut malformed, false).unwrap();
-    sender
+    malformed_sender
         .send_to(&malformed, ("127.0.0.1", port))
         .await
         .unwrap();
@@ -374,12 +387,6 @@ async fn secure_packets_wait_for_all_owned_decoder_ports_without_filling_public_
         .unwrap();
     sender
         .send_to(&second_encrypted, ("127.0.0.1", port + 2))
-        .await
-        .unwrap();
-    let mut report = sr(777);
-    source_crypto.protect(&mut report, true).unwrap();
-    sender_rtcp
-        .send_to(&report, ("127.0.0.1", port + 1))
         .await
         .unwrap();
     let admitted = tokio::time::timeout(Duration::from_secs(1), async {
@@ -401,6 +408,14 @@ async fn secure_packets_wait_for_all_owned_decoder_ports_without_filling_public_
         admitted,
         "valid public SRTP must be read during decoder startup"
     );
+
+    // RTCP is accepted only after RTP has established the legitimate peer.
+    let mut report = sr(777);
+    source_crypto.protect(&mut report, true).unwrap();
+    sender_rtcp
+        .send_to(&report, ("127.0.0.1", port + 1))
+        .await
+        .unwrap();
 
     let first_rtp = AsyncUdp::bind(("127.0.0.1", private_ports[0]))
         .await
