@@ -293,7 +293,7 @@ mod vendor_destination_tests {
    else{tokio::time::sleep(Duration::from_millis(300)).await;json_response(json!({"name":"owned","disabled":false,"named_by":"remote","stats":{"running":true}}))}
   }}));
         let cdn = tokio::spawn(async move { axum::serve(tcp, service).await.unwrap() });
-        let peer = json!({"hostname":"edge","api_url":api,"public_payload_url":"https://edge.invalid","flussonix_srt_url":"srt://edge.invalid:9998","flussonix_srt_encrypted":true,"cluster_key":"owned-vendor-cluster-key","flussonix_peer_kind":"flussonic","flussonix_stream_map":[{"name":"owned","remote_name":"owned"}]});
+        let peer = json!({"hostname":"edge","api_url":api,"public_payload_url":"https://edge.invalid","flussonix_srt_url":"srt://edge.invalid:9998","flussonix_srt_encrypted":true,"flussonix_srt_allow_direct_token":true,"cluster_key":"owned-vendor-cluster-key","flussonix_peer_kind":"flussonic","flussonix_stream_map":[{"name":"owned","remote_name":"owned"}]});
         let (_dir, app, admitted, origin, _key) =
             crate::server::test_vendor_admission::admitted_source(
                 Duration::from_secs(2),
