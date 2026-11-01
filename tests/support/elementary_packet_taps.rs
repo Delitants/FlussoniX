@@ -245,18 +245,6 @@ impl<'a> Tap<'a> {
         })();
         Self::report_activation(result, "source_to_public", evidence)
     }
-    pub fn native_input(
-        pid: u32,
-        ports: &[u16],
-        evidence: &'a Evidence,
-        artifact: &Path,
-        origin: Instant,
-    ) -> io::Result<Self> {
-        let result = Owner::snapshot(pid, ports).and_then(|owner| {
-            Self::start(owner, None, "source_to_public", evidence, artifact, origin)
-        });
-        Self::report_activation(result, "source_to_public", evidence)
-    }
     pub fn decoder(
         pid: u32,
         ports: &[u16],

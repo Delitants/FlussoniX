@@ -403,6 +403,26 @@ pub async fn qualify(
             .unwrap();
         engine.stop_all().await;
     }
+    #[cfg(target_os = "linux")]
+    if packet_taps {
+        let public_sockets = (audio.len() + usize::from(video.is_some())) * 2;
+        public_tap = Some(
+            elementary_packet_taps::Tap::public_handoff(
+                &input_reserved[..public_sockets],
+                sender.id().unwrap(),
+                public_sockets,
+                evidence.as_ref().unwrap(),
+                artifact.as_ref().unwrap(),
+                fixture_origin,
+            )
+            .expect("Owned public handoff packet tap setup failed"),
+        );
+        public_tap
+            .as_mut()
+            .unwrap()
+            .release_reservation(fixture_origin)
+            .expect("Public reservation changed before release");
+    }
     drop(input_reserved);
     let mut cfg = json!({"inputs":[{"url":format!("{input_scheme}://127.0.0.1:{input}"),"flussonix_rtp":{"profile":"elementary","sdp_file":input_sdp}}],"flussonix_rtp_outputs":[{"url":format!("{output_scheme}://127.0.0.1:{output}"),"flussonix_rtp":{"profile":"elementary"}}],"transcoder":profile,"flussonix_input_timeout":15});
     if secure_input {
@@ -468,17 +488,11 @@ pub async fn qualify(
         );
         #[cfg(target_os = "linux")]
         if packet_taps {
-            public_tap = Some(
-                elementary_packet_taps::Tap::native_input(
-                    std::process::id(),
-                    &(input..input + (audio.len() + usize::from(video.is_some())) as u16 * 2)
-                        .collect::<Vec<_>>(),
-                    evidence.as_ref().unwrap(),
-                    artifact.as_ref().unwrap(),
-                    fixture_origin,
-                )
-                .expect("Owned native input packet tap setup failed"),
-            );
+            public_tap
+                .as_mut()
+                .unwrap()
+                .bind_native(std::process::id(), fixture_origin)
+                .expect("Owned native input handoff verification failed");
             let ports = local
                 .iter()
                 .map(|address| {
@@ -615,8 +629,6 @@ pub async fn qualify(
     }
     record_cancel.cancel();
     recording.await.unwrap();
-    let _ = sender.kill().await;
-    let _ = sender.wait().await;
     if result.is_err() {
         let _ = receiver.kill().await;
         let _ = receiver.wait().await;
@@ -626,6 +638,16 @@ pub async fn qualify(
     // Stop while the input/decoder still own their destination ports. Submit the
     // in-memory recordings only after the worker has stopped.
     #[cfg(target_os = "linux")]
+    if packet_taps {
+        // Quiesce only this owned synthetic sender; its sockets remain available
+        // for the stop witness while the packet threads drain their last frames.
+        assert_eq!(
+            unsafe { libc::kill(sender.id().unwrap() as i32, libc::SIGSTOP) },
+            0
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    #[cfg(target_os = "linux")]
     {
         if let Some(tap) = &mut public_tap {
             tap.stop();
@@ -634,6 +656,8 @@ pub async fn qualify(
             tap.stop();
         }
     }
+    let _ = sender.kill().await;
+    let _ = sender.wait().await;
     engine.stop_all().await;
     stage("worker_stopped");
     #[cfg(target_os = "linux")]
