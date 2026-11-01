@@ -163,6 +163,20 @@ mod tests {
     use super::*;
     use crate::srt_playback::{Listener, Settings};
 
+    async fn wait_for_capacity(app: &App) {
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            app.sample_metrics();
+            let metrics = app.telemetry.snapshot(app.options.uplink_mbps);
+            if metrics["cpu"].as_f64().is_some_and(|v| v < 0.9)
+                && metrics["ram"].as_f64().is_some_and(|v| v < 0.95)
+            {
+                return;
+            }
+        }
+        panic!("owned issuer test needs an available host capacity sample");
+    }
+
     #[tokio::test]
     async fn local_vendor_origin_can_issue_until_source_is_removed() {
         use axum::{extract::OriginalUri, routing::get};
@@ -222,7 +236,7 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
         app.set_srt_playback(Some(&listener));
-        app.sample_metrics();
+        wait_for_capacity(&app).await;
         let request = || {
             let mut request = Request::builder()
                 .method(axum::http::Method::POST)
@@ -305,7 +319,7 @@ mod tests {
         )
         .unwrap();
         app.set_srt_playback(Some(&listener));
-        app.sample_metrics();
+        wait_for_capacity(&app).await;
         let actual: SocketAddr = "198.51.100.22:40001".parse().unwrap();
         let mut request = Request::builder()
             .method(axum::http::Method::POST)
