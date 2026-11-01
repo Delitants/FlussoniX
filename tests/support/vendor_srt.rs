@@ -16,7 +16,9 @@ impl Serving {
     pub async fn start(app: std::sync::Arc<flussonix::server::App>, secret: &str) -> Self {
         let listener = Listener::bind(
             "127.0.0.1:0".parse().unwrap(),
-            Settings::new(120, 8, secret.into()).unwrap(),
+            Settings::new(120, 8, secret.into())
+                .unwrap()
+                .with_direct_tokens(true),
         )
         .unwrap();
         let address = listener.address();

@@ -53,7 +53,7 @@ pub async fn serve(
                     let accepted=match listener.accept(){Ok(v)=>v,Err(e)=>break 'serving Err(e)};
                     let Some((socket,peer))=accepted else {break};
                     let Ok(permit)=slots.clone().try_acquire_owned() else {drop(socket);continue;};
-                    app.srt_connections.fetch_add(1,Ordering::Relaxed);let slot=Slot{_permit:permit,app:app.clone()};let a=app.clone();let c=stop.clone();let address=listener.address();let context=(address,listener.settings().encrypted(),listener_id.clone());
+                    app.srt_connections.fetch_add(1,Ordering::Relaxed);let slot=Slot{_permit:permit,app:app.clone()};let a=app.clone();let c=stop.clone();let address=listener.address();let context=(address,listener.settings().encrypted(),listener.settings().allow_direct_tokens(),listener_id.clone());
                     tasks.spawn(async move {let _slot=slot;connection(socket,peer,context,a,c).await;});
                 }
             }
@@ -67,15 +67,18 @@ pub async fn serve(
 async fn connection(
     socket: Socket,
     peer: SocketAddr,
-    context: (SocketAddr, bool, String),
+    context: (SocketAddr, bool, bool, String),
     app: Arc<App>,
     cancel: CancellationToken,
 ) {
     let Ok(id) = socket.stream_id() else { return };
-    let (address, encrypted, listener_id) = context;
+    let (address, encrypted, allow_direct_tokens, listener_id) = context;
     let Ok((selection, ticket, clean)) = selection::playback(&id) else {
         return;
     };
+    if !allow_direct_tokens && !selection.token.is_empty() {
+        return;
+    }
     let query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("streamid", &clean)
         .finish();
@@ -208,6 +211,7 @@ pub struct Settings {
     latency_millis: u32,
     client_limit: usize,
     passphrase: String,
+    direct_tokens: bool,
 }
 impl Settings {
     pub fn new(
@@ -228,6 +232,7 @@ impl Settings {
             latency_millis,
             client_limit,
             passphrase,
+            direct_tokens: false,
         })
     }
     pub fn latency_millis(&self) -> u32 {
@@ -238,6 +243,13 @@ impl Settings {
     }
     pub fn encrypted(&self) -> bool {
         !self.passphrase.is_empty()
+    }
+    pub fn with_direct_tokens(mut self, allow: bool) -> Self {
+        self.direct_tokens = allow;
+        self
+    }
+    pub fn allow_direct_tokens(&self) -> bool {
+        self.direct_tokens
     }
 }
 #[cfg(test)]

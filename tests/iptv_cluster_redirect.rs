@@ -323,7 +323,9 @@ async fn lb_redirect_does_not_hold_the_only_iptv_slot_needed_by_its_cdn() {
     );
     let srt_listener = srt_playback::Listener::bind(
         "127.0.0.1:0".parse().unwrap(),
-        srt_playback::Settings::new(120, 4, "owned-srt-passphrase".into()).unwrap(),
+        srt_playback::Settings::new(120, 4, "owned-srt-passphrase".into())
+            .unwrap()
+            .with_direct_tokens(true),
     )
     .unwrap();
     let srt_address = format!("srt://{}", srt_listener.address());

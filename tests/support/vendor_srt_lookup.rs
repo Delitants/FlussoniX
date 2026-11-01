@@ -424,7 +424,9 @@ async fn mapped_srt_lookup_delivers_encrypted_av_and_destination_enforces_its_ow
     cdn.config.put("streams","remote/news",json!({"static":false,"inputs":[{"url":"testsrc://"}],"flussonix_token_sha256":format!("{:x}",Sha256::digest(token.as_bytes()))})).unwrap();
     let listener = Listener::bind(
         "127.0.0.1:0".parse().unwrap(),
-        Settings::new(120, 4, "owned-srt-passphrase".into()).unwrap(),
+        Settings::new(120, 4, "owned-srt-passphrase".into())
+            .unwrap()
+            .with_direct_tokens(true),
     )
     .unwrap();
     let address = format!("srt://{}", listener.address());

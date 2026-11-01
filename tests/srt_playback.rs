@@ -22,6 +22,24 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 static MEDIA: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[test]
+fn programmatic_options_cannot_advertise_a_wildcard_srt_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = Options {
+        admin_password: "owned-admin-secret".into(),
+        peer_key: "owned-cluster-peer-secret".into(),
+        srt_play_public_url: Some(url::Url::parse("srt://0.0.0.0:9000").unwrap()),
+        ..Default::default()
+    };
+    assert!(
+        App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            options
+        )
+        .is_err()
+    );
+}
 struct Lab {
     _dir: tempfile::TempDir,
     app: Arc<App>,
@@ -34,6 +52,15 @@ struct Lab {
 }
 impl Lab {
     async fn start(config: Value, role: &str, secret: &str, limit: usize) -> Self {
+        Self::start_with_direct_tokens(config, role, secret, limit, true).await
+    }
+    async fn start_with_direct_tokens(
+        config: Value,
+        role: &str,
+        secret: &str,
+        limit: usize,
+        direct_tokens: bool,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let app = App::new(
             dir.path().join("config.json"),
@@ -50,7 +77,9 @@ impl Lab {
         app.config.put("streams", "owned", config).unwrap();
         let listener = Listener::bind(
             "127.0.0.1:0".parse().unwrap(),
-            Settings::new(120, limit, secret.into()).unwrap(),
+            Settings::new(120, limit, secret.into())
+                .unwrap()
+                .with_direct_tokens(direct_tokens),
         )
         .unwrap();
         let address = listener.address();
@@ -106,6 +135,14 @@ fn config() -> Value {
     json!({"inputs":[{"url":"testsrc://"}],"static":false})
 }
 fn receiver(lab: &Lab, token: &str, path: &Path, duration: &str) -> Child {
+    receiver_id(
+        lab,
+        &format!("#!::r=owned,m=request,u={token}"),
+        path,
+        duration,
+    )
+}
+fn receiver_id(lab: &Lab, id: &str, path: &Path, duration: &str) -> Child {
     let mut cmd = Command::new("ffmpeg");
     cmd.args([
         "-hide_banner",
@@ -120,7 +157,7 @@ fn receiver(lab: &Lab, token: &str, path: &Path, duration: &str) -> Child {
         "-probesize",
         "524288",
         "-srt_streamid",
-        &format!("#!::r=owned,m=request,u={token}"),
+        id,
     ]);
     if lab.address.port() == 0 {
         panic!("Unbound owned listener");
@@ -147,6 +184,40 @@ fn receiver(lab: &Lab, token: &str, path: &Path, duration: &str) -> Child {
     .kill_on_drop(true)
     .spawn()
     .unwrap()
+}
+#[tokio::test]
+async fn secure_default_blocks_direct_token_before_worker_and_keeps_public_ticketless_playback() {
+    let _lock = MEDIA.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg["flussonix_token_sha256"] = json!(format!("{:x}", Sha256::digest(b"owned-token")));
+    let lab = Lab::start_with_direct_tokens(cfg, "standalone", "", 4, false).await;
+    let denied_path = dir.path().join("direct-denied.ts");
+    let mut denied = receiver(&lab, "owned-token", &denied_path, "1");
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(8), denied.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(lab.app.media.count().await, 0);
+    assert_eq!(lab.app.srt_egress.load(Ordering::Relaxed), 0);
+    assert!(!denied_path.exists() || denied_path.metadata().unwrap().len() == 0);
+    lab.stop().await;
+
+    let public = Lab::start_with_direct_tokens(config(), "standalone", "", 4, false).await;
+    let public_path = dir.path().join("public.ts");
+    let mut viewer = receiver_id(&public, "#!::r=owned,m=request", &public_path, "1");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(15), viewer.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert!(public_path.metadata().unwrap().len() > 0);
+    public.stop().await;
 }
 fn encrypted_receiver(lab: &Lab, token: &str, secret: &str, path: &Path) -> Child {
     Command::new("ffmpeg")

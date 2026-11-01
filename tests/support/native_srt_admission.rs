@@ -47,7 +47,9 @@ impl Native {
     async fn start_with(app: Arc<App>, dir: tempfile::TempDir, limit: usize, key: &str) -> Self {
         let listener = Listener::bind(
             "127.0.0.1:0".parse().unwrap(),
-            Settings::new(120, limit, "owned-native-passphrase".into()).unwrap(),
+            Settings::new(120, limit, "owned-native-passphrase".into())
+                .unwrap()
+                .with_direct_tokens(true),
         )
         .unwrap();
         let address = format!("srt://{}", listener.address());

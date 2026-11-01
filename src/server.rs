@@ -42,6 +42,7 @@ pub struct Options {
     pub admin_user: String,
     pub admin_password: String,
     pub admin_public_origin: Option<url::Url>,
+    pub srt_play_public_url: Option<url::Url>,
     pub allow_insecure_remote_management: bool,
     pub view_user: Option<String>,
     pub view_password: Option<String>,
@@ -66,12 +67,36 @@ pub struct Options {
     pub drain: bool,
     pub fxlink_features: crate::fxlink::Features,
 }
+/// Validate an advertised SRT root independently of the HTTP Host header.
+pub fn validate_srt_public_url(raw: &str) -> Option<url::Url> {
+    let url = crate::config::vendor_peers::srt_root(raw)?;
+    // `srt` is a non-special URL scheme, so even a numeric host may parse as Domain.
+    let host = url
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(ip)
+                if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() =>
+            {
+                return None;
+            }
+            std::net::IpAddr::V6(ip) if ip.is_unspecified() || ip.is_multicast() => {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    Some(url)
+}
 impl Default for Options {
     fn default() -> Self {
         Self {
             admin_user: "admin".into(),
             admin_password: String::new(),
             admin_public_origin: None,
+            srt_play_public_url: None,
             allow_insecure_remote_management: false,
             view_user: None,
             view_password: None,
@@ -207,6 +232,13 @@ impl App {
     ) -> Result<Arc<Self>, String> {
         if options.admin_password.is_empty() || options.peer_key.len() < 12 {
             return Err("admin password required; peer key must be at least 12 characters".into());
+        }
+        if options
+            .srt_play_public_url
+            .as_ref()
+            .is_some_and(|url| validate_srt_public_url(url.as_str()).is_none())
+        {
+            return Err("invalid public SRT playback URL".into());
         }
         if options.iptv_peer_allow_insecure_loopback && !options.iptv_lease_authority {
             return Err("IPTV loopback peer exception requires IPTV lease authority".into());
@@ -464,9 +496,11 @@ impl App {
     pub fn set_srt_playback(&self, listener: Option<&crate::srt_playback::Listener>) {
         *self.srt_playback.lock().unwrap() = match listener {
             Some(l) => {
-                json!({"enabled":true,"listener_id":uuid::Uuid::new_v4().to_string(),"listen":l.address().to_string(),"encrypted":l.settings().encrypted(),"latency_ms":l.settings().latency_millis(),"client_limit":l.settings().client_limit()})
+                json!({"enabled":true,"listener_id":uuid::Uuid::new_v4().to_string(),"listen":l.address().to_string(),"encrypted":l.settings().encrypted(),"latency_ms":l.settings().latency_millis(),"client_limit":l.settings().client_limit(),"direct_tokens_allowed":l.settings().allow_direct_tokens(),"public_url":self.options.srt_play_public_url.as_ref().map(url::Url::as_str)})
             }
-            None => json!({"enabled":false,"listen":null,"encrypted":false}),
+            None => {
+                json!({"enabled":false,"listen":null,"encrypted":false,"direct_tokens_allowed":false,"public_url":null})
+            }
         };
     }
     fn cluster_client(&self, node: &Value) -> Result<reqwest::Client, String> {
