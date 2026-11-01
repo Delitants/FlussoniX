@@ -8,8 +8,15 @@ mod taps;
 use std::{
     io,
     os::{fd::AsRawFd, unix::net::UnixDatagram},
+    sync::{Mutex, MutexGuard},
     time::Duration,
 };
+static DESCRIPTOR_TEST_LOCK: Mutex<()> = Mutex::new(());
+fn serialize_descriptors() -> MutexGuard<'static, ()> {
+    DESCRIPTOR_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
 fn packet(source: u16, destination: u16) -> Vec<u8> {
     let mut p = vec![0u8; 40];
     p[0] = 0x45;
@@ -65,6 +72,7 @@ fn pair_delivered(packet: &[u8], sources: &[u16], destinations: &[u16]) -> io::R
 }
 #[test]
 fn pair_filter_requires_owned_source_and_destination() {
+    let _serial = serialize_descriptors();
     assert!(pair_delivered(&packet(41000, 42000), &[41000, 41002], &[42000, 42002]).unwrap());
     assert!(!pair_delivered(&packet(41001, 42000), &[41000], &[42000]).unwrap());
     assert!(!pair_delivered(&packet(41000, 42001), &[41000], &[42000]).unwrap());
@@ -82,6 +90,7 @@ fn pair_filter_requires_owned_source_and_destination() {
 }
 #[test]
 fn sender_source_snapshot_uses_local_inodes_and_rejects_missing_or_foreign_sockets() {
+    let _serial = serialize_descriptors();
     let source = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
     let port = source.local_addr().unwrap().port();
     let (_, owned) = elementary_diagnostics::udp_source_ownership(std::process::id(), 1).unwrap();
@@ -101,6 +110,7 @@ fn sender_source_snapshot_uses_local_inodes_and_rejects_missing_or_foreign_socke
 }
 #[test]
 fn kernel_filter_admits_only_owned_loopback_udp_destinations() {
+    let _serial = serialize_descriptors();
     assert!(delivered(&packet(41000, 42000), &[42000, 42002]).unwrap());
     assert!(delivered(&packet(41000, 42002), &[42000, 42002]).unwrap());
     assert!(
@@ -121,6 +131,7 @@ fn kernel_filter_admits_only_owned_loopback_udp_destinations() {
 }
 #[test]
 fn kernel_filter_rejects_fragments_short_packets_and_ip_options() {
+    let _serial = serialize_descriptors();
     for fragment in [0x2000u16, 1, 0x3fff] {
         let mut p = packet(41000, 42000);
         p[6..8].copy_from_slice(&fragment.to_be_bytes());
@@ -135,6 +146,7 @@ fn kernel_filter_rejects_fragments_short_packets_and_ip_options() {
 }
 #[test]
 fn empty_zero_or_excessive_filter_scope_is_rejected() {
+    let _serial = serialize_descriptors();
     let (_, rx) = UnixDatagram::pair().unwrap();
     for ports in [vec![], vec![0], vec![42000; 9]] {
         assert!(taps::attach_filter(rx.as_raw_fd(), &ports).is_err());
@@ -142,6 +154,7 @@ fn empty_zero_or_excessive_filter_scope_is_rejected() {
 }
 #[test]
 fn udp_parser_preserves_rtp_headers_and_rejects_truncation() {
+    let _serial = serialize_descriptors();
     let p = packet(41000, 42000);
     let (source, dest, rtp) = taps::udp_packet(&p).expect("Complete owned packet");
     assert_eq!((source, dest), (41000, 42000));
@@ -159,6 +172,7 @@ fn udp_parser_preserves_rtp_headers_and_rejects_truncation() {
 
 #[test]
 fn private_capture_rejects_sockets_owned_by_another_process_before_activation() {
+    let _serial = serialize_descriptors();
     let source = tempfile::tempdir().unwrap();
     let artifact = tempfile::tempdir().unwrap();
     let evidence = elementary_diagnostics::Evidence::start(source.path(), artifact.path()).unwrap();
@@ -186,6 +200,7 @@ fn private_capture_rejects_sockets_owned_by_another_process_before_activation() 
 }
 #[test]
 fn public_capture_rejects_a_wildcard_reservation_before_activation() {
+    let _serial = serialize_descriptors();
     let source = tempfile::tempdir().unwrap();
     let artifact = tempfile::tempdir().unwrap();
     let evidence = elementary_diagnostics::Evidence::start(source.path(), artifact.path()).unwrap();
@@ -221,6 +236,7 @@ fn assert_unavailable(path: &std::path::Path) {
 }
 #[test]
 fn exited_owner_rebound_port_discards_ambiguous_datagrams() {
+    let _serial = serialize_descriptors();
     use std::{
         io::BufRead,
         process::{Command, Stdio},
@@ -240,6 +256,7 @@ fn exited_owner_rebound_port_discards_ambiguous_datagrams() {
 }
 #[test]
 fn same_process_rebound_socket_inode_discards_ambiguous_datagrams() {
+    let _serial = serialize_descriptors();
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let port = socket.local_addr().unwrap().port();
     let witness = taps::Owner::snapshot(std::process::id(), &[port]).unwrap();
@@ -327,6 +344,7 @@ fn handoff_retention(witness: &taps::HandoffWitness) -> (serde_json::Value, bool
 }
 #[test]
 fn handoff_missing_markers_and_release_races_discard_raw() {
+    let _serial = serialize_descriptors();
     let (mut sender, reserved, mut witness) = handoff_fixture();
     let origin = std::time::Instant::now();
     let (summary, retained) = handoff_retention(&witness);
@@ -343,6 +361,7 @@ fn handoff_missing_markers_and_release_races_discard_raw() {
 }
 #[test]
 fn handoff_same_port_rebind_retains_only_stable_sender_and_native() {
+    let _serial = serialize_descriptors();
     let (mut sender, reserved, mut witness) = handoff_fixture();
     let port = reserved.local_addr().unwrap().port();
     let origin = std::time::Instant::now();
@@ -364,6 +383,7 @@ fn handoff_same_port_rebind_retains_only_stable_sender_and_native() {
 }
 #[test]
 fn handoff_sender_exit_and_stop_boundary_race_discard_raw() {
+    let _serial = serialize_descriptors();
     let (mut sender, reserved, mut witness) = handoff_fixture();
     let port = reserved.local_addr().unwrap().port();
     let origin = std::time::Instant::now();
@@ -380,6 +400,7 @@ fn handoff_sender_exit_and_stop_boundary_race_discard_raw() {
 }
 #[test]
 fn handoff_rejects_foreign_native_owner() {
+    let _serial = serialize_descriptors();
     use std::io::BufRead;
     let (mut sender, reserved, mut witness) = handoff_fixture();
     let port = reserved.local_addr().unwrap().port();
@@ -415,6 +436,7 @@ fn handoff_rejects_foreign_native_owner() {
 }
 #[test]
 fn handoff_sender_source_socket_rebind_discards_raw() {
+    let _serial = serialize_descriptors();
     use std::io::{BufRead, Write};
     let script = "import socket,sys; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('0.0.0.0',0)); port=s.getsockname()[1]; print(port); sys.stdin.readline(); s.close(); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('0.0.0.0',port)); print('rebound'); sys.stdin.readline()";
     let mut sender = std::process::Command::new("python3")
@@ -459,6 +481,7 @@ fn handoff_sender_source_socket_rebind_discards_raw() {
 #[test]
 #[ignore = "requires CAP_NET_RAW and uses an owned loopback sender"]
 fn public_handoff_keeps_one_capture_across_rebind() {
+    let _serial = serialize_descriptors();
     use std::io::{BufRead, Write};
     let source = tempfile::tempdir().unwrap();
     let artifact = tempfile::tempdir().unwrap();
