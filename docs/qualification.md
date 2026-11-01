@@ -1705,3 +1705,27 @@ regressions distinguish missing/ambiguous acknowledgment from accepted media and
 retain public/native-peer behavior. Read-only reference header checks support the
 wire contract; they do not qualify serving-server identity, consistent live M4F
 payloads or automatic mixed-vendor routing. See [endpoint checks](vendor-endpoint-checks.md).
+
+## Elementary RTP/SRTP decoder startup queue
+
+The isolated candidate at `437c704` starts public per-track RTP/SRTP admission
+before writing the private decoder SDP. Valid early packets wait behind the
+existing all-port decoder-ownership gate. A track can retain 1,024 RTP packets
+or 2 MiB and 64 RTCP packets or 128 KiB; oldest overflow drops have distinct
+runtime counters. Wrong-key, malformed and foreign early packets cannot pin a
+peer, queued media cannot reach a partly bound or foreign decoder, and queued
+packets are discarded on cancellation. Real UDP regressions cover 1,025 paced
+SRTP packets (one intentional oldest drop), two-track isolation, 65 SRTCP
+reports (one intentional oldest drop), and ordered delivery across startup.
+
+The fresh serial `elementary_media` and `elementary_srtp_media` matrices passed
+five plaintext and four secure test functions, with one hardware-only case
+ignored in each. Their 27 owned H.264/HEVC with AAC/MP2/MP3, audio-only and CPU
+conversion cases all finished with strict worker/receiver decoding. All 27
+retained boundary evidence files ended qualified and complete. Their worker
+snapshots reported zero `startup_dropped_packets`,
+`startup_dropped_rtcp_packets` and native RTP `lost`; observed UDP socket-drop
+counters were zero. The controlled overflow tests show the counters work, but
+normal media rates did not exercise their limits. This does not establish that
+the archived 38-picture HEVC loss is repaired. The loss did not reproduce in
+this run, and passive packet taps do not cover the startup interval.
