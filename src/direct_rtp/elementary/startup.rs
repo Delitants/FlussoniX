@@ -72,6 +72,14 @@ impl StartupQueue {
     pub(crate) fn pop_rtcp(&mut self) -> Option<Vec<u8>> {
         self.rtcp.pop()
     }
+
+    pub(crate) fn has_rtp(&self) -> bool {
+        !self.rtp.values.is_empty()
+    }
+
+    pub(crate) fn has_rtcp(&self) -> bool {
+        !self.rtcp.values.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -87,12 +95,14 @@ mod tests {
             assert_eq!(count.push_rtp(vec![(n % 251) as u8]), 0);
         }
         assert_eq!(count.push_rtp(vec![255]), 1);
+        assert!(count.has_rtp());
         assert_eq!(count.pop_rtp(), Some(vec![1]));
         for n in 2..1024 {
             assert_eq!(count.pop_rtp(), Some(vec![(n % 251) as u8]));
         }
         assert_eq!(count.pop_rtp(), Some(vec![255]));
         assert_eq!(count.pop_rtp(), None);
+        assert!(!count.has_rtp());
 
         let mut bytes = StartupQueue::new(1024, 2 * 1024 * 1024, 64, 128 * 1024);
         for n in 0..512 {
@@ -110,6 +120,7 @@ mod tests {
             assert_eq!(queue.push_rtcp(vec![n as u8; 2048]), 0);
         }
         assert_eq!(queue.push_rtcp(vec![255]), 1);
+        assert!(queue.has_rtcp());
         assert_eq!(queue.pop_rtcp(), Some(vec![1; 2048]));
         assert_eq!(queue.pop_rtp(), Some(vec![7]));
     }
