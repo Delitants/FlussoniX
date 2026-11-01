@@ -1494,6 +1494,7 @@ async fn callback_denial_and_pending_renewal_never_admit_a_worker() {
         let first = rx.recv().await.unwrap();
         assert_eq!(first["proto"], "rtsp");
         assert_eq!(first["token"], "owned-token");
+        assert_eq!(first["qs"], "token=owned-token");
         assert_eq!(first["ip"], "127.0.0.1");
         assert_eq!(first["request_number"], 0);
         assert_eq!(first["request_type"], "new_session");
@@ -1506,6 +1507,7 @@ async fn callback_denial_and_pending_renewal_never_admit_a_worker() {
             assert_eq!(second["session_id"], first["session_id"]);
             assert_eq!(second["request_number"], 1);
             assert_eq!(second["request_type"], "update_session");
+            assert_eq!(second["qs"], "token=owned-token");
             let mut b = Vec::new();
             tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut b))
                 .await

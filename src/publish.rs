@@ -47,3 +47,13 @@ pub fn is_input(cfg: &Value) -> bool {
         .as_array()
         .is_some_and(|inputs| inputs.len() == 1 && inputs[0]["url"] == "publish://")
 }
+
+/// Preserve callback query metadata except for the local publisher credential.
+pub(crate) fn callback_query(qs: &str) -> String {
+    qs.split('&')
+        .filter(|field| {
+            !url::form_urlencoded::parse(field.as_bytes()).any(|(key, _)| key == "password")
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
