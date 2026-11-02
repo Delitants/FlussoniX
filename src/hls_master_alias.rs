@@ -74,7 +74,7 @@ fn bandwidth(output_rate: Option<(f64, u64)>) -> u64 {
     if age_ms > 5_000 || !mbps.is_finite() || mbps <= 0.0 {
         return FALLBACK_BPS;
     }
-    (mbps * 1_200_000.0).round().clamp(1_000.0, MAX_BPS as f64) as u64
+    (mbps * 1_200_000.0).round().clamp(1.0, MAX_BPS as f64) as u64
 }
 
 pub(crate) fn render(
@@ -243,6 +243,14 @@ mod tests {
             std::str::from_utf8(&body)
                 .unwrap()
                 .contains("BANDWIDTH=100000000000")
+        );
+        let low = render(Alias::Ts, media, Some((0.0005, 0)), "").unwrap();
+        assert!(std::str::from_utf8(&low).unwrap().contains("BANDWIDTH=600"));
+        let sub_bit = render(Alias::Ts, media, Some((f64::MIN_POSITIVE, 0)), "").unwrap();
+        assert!(
+            std::str::from_utf8(&sub_bit)
+                .unwrap()
+                .contains("BANDWIDTH=1")
         );
     }
 }
