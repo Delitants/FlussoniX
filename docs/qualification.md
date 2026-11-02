@@ -66,11 +66,15 @@ intervals show where source evidence is missing; a viewer gap crossing one of
 those intervals cannot be attributed from source age alone. The option is off
 by default and does not change the release assessor or its pass criteria.
 
-Two ongoing owned runs have no viewer, TS sync, metadata or OOM errors so far,
-but each has already recorded a steady-media gap beyond three seconds. They
-remain in progress for resource observation and are not passing release
-evidence. The shared-stream pause needs attribution and correction before a
-fresh exact-head qualification.
+An isolated 24-hour run on commit `4286712` passed the assessor: 1,440
+samples, 88.82 GiB delivered to eight viewers, no reported failures, a
+2,938.75 ms maximum media gap, a 1,969.92 ms maximum reconnect gap, and a
+98.4 MiB cgroup memory peak. Its report and package provenance were retained
+after the binary hash was checked. This is evidence for that earlier commit,
+not the final candidate. A later run on `5256867` ended early when its
+temporary filesystem fell below the runner's free-space threshold; the
+exact-head 24-hour gate must be repeated after release fixes using a state
+directory on the root filesystem.
 
 ## Config OpenMetrics subset (2026-10-31)
 
