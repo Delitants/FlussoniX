@@ -697,6 +697,17 @@ pub async fn qualify(
         )
         .unwrap();
     }
+    for counter in [
+        "lost",
+        "startup_dropped_packets",
+        "startup_dropped_rtcp_packets",
+    ] {
+        assert_eq!(
+            stats["direct_rtp_input"][counter].as_u64(),
+            Some(0),
+            "controlled elementary input {counter} must be zero: {stats}"
+        );
+    }
     let status = result
         .unwrap_or_else(|_| {
             panic!(
