@@ -1728,7 +1728,30 @@ snapshots reported zero `startup_dropped_packets`,
 counters were zero. The controlled overflow tests show the counters work, but
 normal media rates did not exercise their limits. This does not establish that
 the archived 38-picture HEVC loss is repaired. The loss did not reproduce in
-this run, and passive packet taps do not cover the startup interval.
+this run, and the passive taps used in that prior run did not cover startup.
+
+## Elementary RTP/SRTP startup handoff capture
+
+The optional owned-fixture public tap now starts after the synthetic sender's
+SDP, before input reservations are released, and stays on one filtered packet
+socket through native input binding. It records sender, reservation and native
+socket witnesses and the handoff timestamps. The unchanged private tap starts
+after decoder readiness. This is a test-only diagnostic change; no server media
+path or ordinary CI privilege requirement changed.
+
+On the isolated Linux host, the strict H.264/HEVC × AAC/MP2/MP3 plaintext
+matrix and the corresponding encrypted-source SRTP matrix each passed all six
+owned cases. Every public and private tap retained an attributable, complete
+trace. Public captures contained 278–464 packets per case; private captures
+contained 214–324. Within each observed RTP/SRTP lane, distinct sequence
+counts equaled the first-to-last sequence span. All 24 taps reported zero
+packet-socket drops and zero queued bytes at stop. Native input reported zero
+RTP sequence loss, zero startup RTP drops and zero startup RTCP drops. The
+independent worker and receiver recordings passed strict codec, frame and
+decode checks. The pre-activation sender prefix is still unobserved, and
+packets observed during handoff are attempts rather than proof of native
+application receipt. The archived 38-picture HEVC loss did not recur in these
+cases; its cause and repair remain a release blocker.
 
 ## Tokenless SRT playback candidate
 
