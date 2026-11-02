@@ -9,6 +9,10 @@ use std::{path::Path, sync::Arc, time::Duration};
 use tower::ServiceExt;
 
 fn app(state: &Path) -> Arc<App> {
+    app_with_role(state, "standalone")
+}
+
+fn app_with_role(state: &Path, role: &str) -> Arc<App> {
     App::new(
         state.join("config.json"),
         state.join("media"),
@@ -19,10 +23,89 @@ fn app(state: &Path) -> Arc<App> {
             view_password: Some("owned-view-secret".into()),
             peer_key: "owned-peer-secret-1234".into(),
             uplink_interface: "process".into(),
+            role: role.into(),
             ..Default::default()
         },
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn load_balancer_selection_does_not_start_a_local_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_role(dir.path(), "lb");
+    app.config
+        .put(
+            "streams",
+            "owned",
+            json!({"static":true,"inputs":[{"url":"testsrc://"},{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    let (status, _) = call(
+        app.clone(),
+        Method::POST,
+        &select("owned", "1"),
+        Some("admin:owned-edit-secret"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    app.reconcile().await;
+    assert_eq!(app.media.count().await, 0);
+    assert_eq!(
+        app.media
+            .preferred_input("owned", &app.config.effective("owned").unwrap())
+            .await,
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn selecting_during_on_demand_retry_starts_the_new_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(dir.path());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    app.config.put("streams", "owned", json!({"static":false,"inputs":[{"url":format!("tshttp://127.0.0.1:{port}/dead")},{"url":"testsrc://"}]})).unwrap();
+    let current = app.config.effective("owned").unwrap();
+    let failed = app.media.ensure("owned", &current).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if app.media.stats("owned").await["status"] == "retrying" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(failed.is_closed());
+    let (status, _) = call(
+        app.clone(),
+        Method::POST,
+        &select("owned", "1"),
+        Some("admin:owned-edit-secret"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let next = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let stats = app.media.stats("owned").await;
+            if stats["input_index"] == 1 && stats["pid"].as_u64().unwrap_or(0) > 0 {
+                break stats;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(next["input_index"], 1);
+    app.media.stop_all().await;
 }
 
 async fn call(

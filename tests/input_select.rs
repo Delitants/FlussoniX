@@ -132,6 +132,26 @@ async fn changing_the_effective_input_list_clears_the_old_selection() {
 }
 
 #[tokio::test]
+async fn stale_ensure_cannot_clear_a_newer_selected_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "ffmpeg");
+    let old = inputs(2);
+    let current = inputs(3);
+    engine
+        .select_input_guarded("owned", &current, 2, std::future::ready(true))
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .ensure_guarded("owned", &old, false, std::future::ready(false))
+            .await
+            .is_err()
+    );
+    assert_eq!(engine.preferred_input("owned", &current).await, Some(2));
+    engine.stop_all().await;
+}
+
+#[tokio::test]
 async fn stale_selection_cannot_retire_a_worker_from_a_newer_input_list() {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(dir.path(), "ffmpeg");

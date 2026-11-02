@@ -1314,7 +1314,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         let result = app.config.replace(body);
         return match result {
             Ok(v) => {
-                app.media.prune_input_preferences(&v).await;
+                app.media.prune_input_preferences(&app.config).await;
                 app.invalidate_sessions().await;
                 app.reconcile().await;
                 json_response(v)
@@ -1428,14 +1428,12 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
                 })
                 .await;
             if app.config.revision() != revision {
-                app.media
-                    .prune_input_preferences(&app.config.snapshot())
-                    .await;
+                app.media.prune_input_preferences(&app.config).await;
                 return error(StatusCode::BAD_REQUEST, "stream configuration changed");
             }
             return match result {
                 Ok(was_active) => {
-                    if was_active || config["static"] != false {
+                    if app.options.role != "lb" && (was_active || config["static"] != false) {
                         let app = app.clone();
                         let stream = stream.to_owned();
                         tokio::spawn(async move {
@@ -1484,9 +1482,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
             return match app.config.put(kind, name, body) {
                 Ok(mut v) => {
                     if matches!(kind, "streams" | "templates") {
-                        app.media
-                            .prune_input_preferences(&app.config.snapshot())
-                            .await;
+                        app.media.prune_input_preferences(&app.config).await;
                     }
                     app.invalidate_sessions().await;
                     if kind == "sources" {
@@ -1509,12 +1505,8 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         if method == "DELETE" {
             return match app.config.delete(kind, name) {
                 Ok(true) => {
-                    if kind == "streams" {
-                        app.media.forget_input(name).await;
-                    } else if kind == "templates" {
-                        app.media
-                            .prune_input_preferences(&app.config.snapshot())
-                            .await;
+                    if matches!(kind, "streams" | "templates") {
+                        app.media.prune_input_preferences(&app.config).await;
                     }
                     app.invalidate_sessions().await;
                     if kind == "streams" {

@@ -27,7 +27,7 @@ test('Input tab selects the second configured input without saving secrets', asy
   const selectedResponse = await response;
   expect(selectedResponse.status()).toBe(204);
   expect(selectedResponse.request().postData()).toBeNull();
-  await expect(selector).toContainText('Pending input 2');
+  await expect(selector).toContainText('Preferred input 2');
   const current = await (await request.get(streamURL, {headers})).json();
   expect(current.stats.preferred_input_index).toBe(1);
   expect(current.stats.input_index).toBeUndefined();
@@ -49,6 +49,41 @@ test('Input tab selects the second configured input without saving secrets', asy
   }
  } finally {
   await request.delete(streamURL, {headers});
+ }
+});
+
+test('Input tab distinguishes a failed retry from the preferred and active fallback', async ({page, request}) => {
+ const user = process.env.FLUSSONIX_ADMIN_USER || 'admin';
+ const password = process.env.FLUSSONIX_ADMIN_PASSWORD!;
+ const headers = {Authorization: 'Basic ' + Buffer.from(`${user}:${password}`).toString('base64')};
+ const name = 'ui-input-status-' + Date.now().toString(36);
+ const path = `/streamer/api/v3/streams/${name}`;
+ expect((await request.put(path, {headers, data: {$reset:true, static:false, inputs:[{url:'testsrc://'},{url:'testsrc://'}]}})).ok()).toBeTruthy();
+ let status = 'retrying';
+ let inputIndex = 0;
+ await page.route('**/streamer/api/v3/streams?limit=1000', async route => {
+  const response = await route.fetch();
+  const payload = await response.json();
+  const item = payload.streams.find((stream:{name:string}) => stream.name === name);
+  if (item) item.stats = {...item.stats, status, input_index:inputIndex, preferred_input_index:1};
+  await route.fulfill({response, json:payload});
+ });
+ try {
+  await page.goto('/admin/');
+  await page.getByLabel('Username').fill(user);
+  await page.getByLabel('Password', {exact:true}).fill(password);
+  await page.getByRole('button', {name:'Sign in', exact:true}).click();
+  await page.getByRole('button', {name, exact:true}).click();
+  await page.getByRole('button', {name:'Input', exact:true}).click();
+  const selector = page.getByRole('region', {name:'Stream input selection'});
+  await expect(selector).toContainText('Retrying input 1');
+  await expect(selector).toContainText('Preferred input 2');
+  await expect(selector).not.toContainText('Active input 1');
+  status = 'running'; inputIndex = 1;
+  await expect(selector).toContainText('Active input 2', {timeout:7000});
+  await expect(selector).not.toContainText('Retrying input 1');
+ } finally {
+  await request.delete(path, {headers});
  }
 });
 

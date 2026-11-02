@@ -24,7 +24,9 @@ export function InputSelector({stream, managementRole, request, onRefresh}: Prop
  const [error, setError] = useState('');
  useEffect(() => {setPending(null); setError('');}, [stream.name]);
  const inputs: Item[] = Array.isArray(stream.inputs) ? stream.inputs : [];
- const active = typeof stream.stats?.input_index === 'number' ? stream.stats.input_index : null;
+ const runtimeInput = typeof stream.stats?.input_index === 'number' ? stream.stats.input_index : null;
+ const runtimeStatus = stream.stats?.status;
+ const active = runtimeStatus === 'running' || runtimeStatus === 'starting' ? runtimeInput : null;
  const preferred = typeof stream.stats?.preferred_input_index === 'number' ? stream.stats.preferred_input_index : null;
  const publisher = inputs.some(input => input?.url === 'publish://');
  const editable = managementRole === 'edit' && !publisher && !stream.disabled;
@@ -47,7 +49,7 @@ export function InputSelector({stream, managementRole, request, onRefresh}: Prop
   <p className="muted">Choose which source to try first. Automatic fallback remains available. This does not change saved configuration.</p>
   {error && <p className="error" role="alert">{error}</p>}
   {inputs.length ? <div className="input-selection-list">{inputs.map((input, index) => {
-   const state = active === index ? `Active input ${index + 1}` : preferred === index ? `Pending input ${index + 1}` : 'Standby';
+   const state = active === index ? `Active input ${index + 1}` : runtimeInput === index && runtimeStatus === 'retrying' ? `Retrying input ${index + 1}` : preferred === index ? `Preferred input ${index + 1}` : 'Standby';
    return <div className="input-selection-row" key={index}>
     <div><strong>Input {index + 1}</strong><span className="tag">{protocol(input)}</span><small>{state}</small></div>
     {editable && <button type="button" disabled={pending !== null} onClick={() => void select(index)} aria-label={`Select input ${index + 1}`}>{pending === index ? 'Selecting…' : 'Select'}</button>}

@@ -1785,12 +1785,14 @@ accepts a zero-based configured input index and returns empty `204`. Invalid,
 disabled or publisher selections return `400`; an absent stream returns `404`.
 Normal edit-role, management transport and browser-origin checks apply. A
 selection changes a runtime preference, not saved input order. Active and
-static local workers switch; idle on-demand streams remain idle. Automatic
+static local workers switch; retrying on-demand workers resume on the new
+input, while never-started on-demand streams remain idle. Load-balancer nodes
+do not start local media for a selection. Automatic
 fallback remains in effect, and the preference clears when effective inputs
 change or the daemon restarts. Shared-source workers are excluded.
 
-The focused engine, API, recovery and native-startup suites passed 30 tests.
-The owned-daemon browser test verified the bodyless request, pending state,
+Focused engine, API, recovery and native-startup tests passed. The owned-daemon
+browser tests verified the bodyless request, preferred/retrying/active labels,
 credential masking and view-only controls. An isolated loopback smoke observed
 the old MPEG-TS viewer close after its queued data drained, the old worker
 process exit, a new worker on input 2, and fresh TS packets for a reconnecting

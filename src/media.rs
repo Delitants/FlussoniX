@@ -292,24 +292,25 @@ impl Engine {
     }
     pub async fn preferred_input(&self, name: &str, cfg: &Value) -> Option<usize> {
         let fingerprint = input_fingerprint(cfg)?;
-        let mut preferences = self.input_preferences.lock().await;
-        match preferences.get(name) {
-            Some(preference) if preference.inputs == fingerprint => Some(preference.index),
-            Some(_) => {
-                preferences.remove(name);
-                None
-            }
-            None => None,
-        }
+        self.input_preferences
+            .lock()
+            .await
+            .get(name)
+            .filter(|preference| preference.inputs == fingerprint)
+            .map(|preference| preference.index)
     }
     pub async fn forget_input(&self, name: &str) {
         self.input_preferences.lock().await.remove(name);
     }
-    pub async fn prune_input_preferences(&self, root: &Value) {
+    pub async fn prune_input_preferences(&self, config: &crate::config::ConfigStore) {
         let mut preferences = self.input_preferences.lock().await;
-        preferences.retain(|name, preference| {
-            crate::config::effective(root, name).and_then(|cfg| input_fingerprint(&cfg))
-                == Some(preference.inputs)
+        // Read the current root while holding the preference lock. A delayed
+        // caller must never prune a preference accepted against a newer edit.
+        config.read(|root| {
+            preferences.retain(|name, preference| {
+                crate::config::effective(root, name).and_then(|cfg| input_fingerprint(&cfg))
+                    == Some(preference.inputs)
+            });
         });
     }
     pub async fn select_input_guarded(
@@ -353,6 +354,15 @@ impl Engine {
                 && !worker.is_closed()
                 && worker.signature == signature
         });
+        // An on-demand worker in retry cooldown still owns recent demand.
+        // Retiring it must immediately hand that demand to the selected input.
+        let retry_demand = workers.get(name).is_some_and(|worker| {
+            !active
+                && worker.signature == signature
+                && (worker.idle_seconds() < 60
+                    || worker.viewers.load(Ordering::Relaxed) > 0
+                    || worker.active_pushes)
+        });
         let same = active
             && workers
                 .get(name)
@@ -372,7 +382,7 @@ impl Engine {
         if let Some(worker) = retired {
             self.stop_worker(name, worker).await;
         }
-        Ok(active)
+        Ok(active || retry_demand)
     }
     pub async fn publish_guarded(
         &self,
