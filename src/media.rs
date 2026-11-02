@@ -21,11 +21,29 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::Command,
     sync::{Mutex, Semaphore, oneshot},
 };
 use tokio_util::sync::CancellationToken;
+
+async fn copy_to_packager<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    progress: &crate::source_directory::modern_coordinator::SharedDrain,
+) -> std::io::Result<u64> {
+    let mut buffer = [0u8; 16 * 1024];
+    let mut copied = 0u64;
+    loop {
+        let n = reader.read(&mut buffer).await?;
+        if n == 0 {
+            return Ok(copied);
+        }
+        writer.write_all(&buffer[..n]).await?;
+        progress.wrote_packager(n);
+        copied += n as u64;
+    }
+}
 
 pub struct Engine {
     root: PathBuf,
@@ -1282,12 +1300,21 @@ impl Engine {
             .iter()
             .map(|state| tokio::spawn(state.clone().run_worker(worker.clone(), cancel.clone())))
             .collect();
+        let shared_drain = shared
+            .as_ref()
+            .filter(|s| s.feed.protocol() == "m4f")
+            .map(|s| s.feed.drain());
+        let shared_local_failure: Option<Arc<dyn Fn() + Send + Sync>> = shared
+            .as_ref()
+            .filter(|s| s.feed.protocol() == "m4f")
+            .map(|s| Arc::new(s.feed.local_failure()) as Arc<dyn Fn() + Send + Sync>);
         tokio::spawn(async move {
             let mut tasks = Vec::new();
             let shared_startup_timeout = shared.as_ref().map(|s| s.feed.startup_timeout());
             if let Some(input) = shared.as_mut().and_then(|s| s.input.take()) {
                 let c = cancel.clone();
                 let source_worker = w.clone();
+                let drain = shared_drain.clone();
                 tasks.push(tokio::spawn(async move {
                     let result =
                         tokio::select! {biased;_=c.cancelled()=>return,result=input.run()=>result};
@@ -1297,7 +1324,18 @@ impl Engine {
                         tracing::debug!(target: "flussonix::worker_lifecycle", ?reason,
                             "shared input stopped before worker cancellation");
                         source_worker.failed("input_closed");
-                        c.cancel();
+                        if let Some(deadline) = drain
+                            .as_ref()
+                            .filter(|d| d.is_complete())
+                            .and_then(|d| d.deadline())
+                        {
+                            tokio::select! { biased;
+                                _=c.cancelled()=>{},
+                                _=tokio::time::sleep_until(deadline)=>c.cancel(),
+                            }
+                        } else {
+                            c.cancel();
+                        }
                     }
                 }));
             }
@@ -1435,6 +1473,7 @@ impl Engine {
                     let (metadata_tx, metadata_rx) = oneshot::channel();
                     let c = cancel.clone();
                     let input_worker = w.clone();
+                    let drain = shared_drain.clone();
                     tasks.push(tokio::spawn(async move {
                         let result = tokio::select! { biased;
                             _=c.cancelled()=>Ok(()),
@@ -1459,11 +1498,13 @@ impl Engine {
                                 }
                             }=>result,
                         };
-                        if let Err(reason) = result {
+                        if let Err(reason) = &result {
                             input_worker.failed(if reason == "native_subtitle_transcode_unsupported" { "native_subtitle_transcode_unsupported" } else { "input_closed" });
                             tracing::warn!(error = %reason, "wire input stopped");
                         }
-                        c.cancel();
+                        if !drain.as_ref().is_some_and(|d| d.is_complete() && result.is_ok()) {
+                            c.cancel();
+                        }
                     }));
                     let tracks = tokio::select! { biased;
                         _=cancel.cancelled()=>return,
@@ -1487,6 +1528,8 @@ impl Engine {
                     if let Some(mut stdin) = child.stdin.take() {
                         let c = cancel.clone();
                         let pipe_worker = w.clone();
+                        let progress = shared_drain.clone();
+                        let local_failure = shared_local_failure.clone();
                         tasks.push(tokio::spawn(async move {
                             let mut stdin = crate::m4_ingest::authority::Writer {
                                 inner: &mut stdin,
@@ -1494,9 +1537,18 @@ impl Engine {
                             };
                             let result = tokio::select! { biased;
                                 _=c.cancelled()=>return,
-                                result=tokio::io::copy(&mut reader,&mut stdin)=>result,
+                                result=async {
+                                    if let Some(progress)=progress.as_deref(){
+                                        copy_to_packager(&mut reader,&mut stdin,progress).await
+                                    }else{
+                                        tokio::io::copy(&mut reader,&mut stdin).await
+                                    }
+                                }=>result,
                             };
                             if result.is_err() {
+                                if let Some(commit) = local_failure {
+                                    commit();
+                                }
                                 pipe_worker.failed("packaging_failed");
                                 c.cancel();
                             }
@@ -1598,6 +1650,13 @@ impl Engine {
                     };
                     match read {
                         Ok(Ok(0)) => {
+                            // Child exit can precede the next GOP, leaving the
+                            // stdin copy parked on a read with no write error.
+                            if shared_drain.as_ref().is_some_and(|d| !d.is_complete())
+                                && let Some(commit) = &shared_local_failure
+                            {
+                                commit();
+                            }
                             tracing::debug!(target: "flussonix::worker_lifecycle",
                                 bytes_in = w.bytes.load(Ordering::Relaxed),
                                 "packager stdout closed before worker cancellation");
@@ -1610,6 +1669,11 @@ impl Engine {
                             break;
                         }
                         Ok(Err(_)) => {
+                            if shared_drain.as_ref().is_some_and(|d| !d.is_complete())
+                                && let Some(commit) = &shared_local_failure
+                            {
+                                commit();
+                            }
                             w.failed("packaging_failed");
                             break;
                         }

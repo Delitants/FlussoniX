@@ -1,5 +1,7 @@
 //! One private input per generation; viewer grants remain independently owned.
+mod bridge;
 mod feed;
+mod m4f_run;
 mod permission;
 mod renewal;
 use super::{AdmissionFailure, AdmittedCandidate, ModernSourceCoordinator};
@@ -14,7 +16,10 @@ use std::{
     collections::{HashMap, VecDeque},
     io,
     pin::Pin,
-    sync::{Arc, Mutex, Weak, atomic::AtomicU64},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -81,9 +86,40 @@ struct Worker {
     transport: crate::m4_ingest::flussonic::Transport,
     ts: media_queue::Channel,
     required: Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>,
+    required_issued: AtomicU64,
+    drain: Arc<SharedDrain>,
     tracks: Mutex<Option<Vec<Track>>>,
     metadata_ready: Notify,
     detected: AtomicU64,
+}
+/// Owner-only completion fence for M4F's required TS feed and child stdin.
+#[derive(Default)]
+pub(crate) struct SharedDrain {
+    written: AtomicU64,
+    complete: AtomicBool,
+    deadline: Mutex<Option<tokio::time::Instant>>,
+}
+impl SharedDrain {
+    fn start(&self) -> tokio::time::Instant {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        *self.deadline.lock().unwrap() = Some(deadline);
+        deadline
+    }
+    fn complete(&self) {
+        self.complete.store(true, Ordering::Release);
+    }
+    pub(crate) fn is_complete(&self) -> bool {
+        self.complete.load(Ordering::Acquire)
+    }
+    pub(crate) fn deadline(&self) -> Option<tokio::time::Instant> {
+        *self.deadline.lock().unwrap()
+    }
+    pub(crate) fn wrote_packager(&self, n: usize) {
+        self.written.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    fn written(&self) -> u64 {
+        self.written.load(Ordering::Relaxed)
+    }
 }
 struct Viewer {
     id: Uuid,
@@ -540,6 +576,8 @@ impl SharedInputs {
                             transport: input.transport(),
                             ts: media_queue::Channel::new(128, 8 * 1024 * 1024),
                             required: Mutex::new(None),
+                            required_issued: AtomicU64::new(0),
+                            drain: Arc::new(SharedDrain::default()),
                             tracks: Mutex::new(None),
                             metadata_ready: Notify::new(),
                             detected: AtomicU64::new(0),
@@ -594,6 +632,12 @@ impl Drop for SharedInputs {
     }
 }
 impl SharedViewer {
+    /// A terminal M4F source may still be draining accepted TS into its child.
+    /// Refuse fresh control readers while the old packaging worker is alive.
+    pub(crate) fn m4f_terminal(&self) -> bool {
+        self.inner.worker.transport == crate::m4_ingest::flussonic::Transport::M4f
+            && self.inner.worker.drain.deadline().is_some()
+    }
     pub(crate) fn counts_as_viewer(&self) -> bool {
         self.inner.admission.counts_as_viewer()
     }
@@ -651,9 +695,16 @@ impl SharedViewer {
         self.subscription(bootstrap, receiver)
     }
     pub fn subscribe_m4f(&self) -> Result<SharedSubscription, SharedFailure> {
+        if self.m4f_terminal() {
+            return Err(SharedFailure::Closed);
+        }
         self.current()?;
         let (bootstrap, receiver) = self.inner.worker.hub.signal_subscribe();
-        self.subscription(bootstrap, receiver)
+        let subscription = self.subscription(bootstrap, receiver)?;
+        if self.m4f_terminal() {
+            return Err(SharedFailure::Closed);
+        }
+        Ok(subscription)
     }
     pub fn segment(&self, name: &str) -> Result<Option<Bytes>, SharedFailure> {
         self.current()?;
@@ -674,6 +725,7 @@ impl SharedViewer {
 struct QueueWriter<'a> {
     channel: &'a media_queue::Channel,
     required: Option<tokio_util::sync::PollSender<Bytes>>,
+    required_issued: &'a AtomicU64,
 }
 impl AsyncWrite for QueueWriter<'_> {
     fn poll_write(
@@ -698,6 +750,8 @@ impl AsyncWrite for QueueWriter<'_> {
             if required.send_item(bytes.clone()).is_err() {
                 return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
             }
+            this.required_issued
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         }
         Poll::Ready(
             this.channel
@@ -736,6 +790,9 @@ fn allow_clean_eof_reopen(
 impl SharedInput {
     /// Run this unique input in the caller's task. Drop/abort closes the generation.
     pub async fn run(self) -> Result<(), SharedFailure> {
+        if self.worker.transport == crate::m4_ingest::flussonic::Transport::M4f {
+            return self.run_m4f_buffered().await;
+        }
         let worker = &self.worker;
         worker.current()?;
         let authority = || worker.current().is_ok();
@@ -748,108 +805,52 @@ impl SharedInput {
         let mut output = QueueWriter {
             channel: &worker.ts,
             required,
+            required_issued: &worker.required_issued,
         };
         let (tx, mut metadata) = oneshot::channel();
-        let mut sender = Some(tx);
-        let mut m4f = crate::m4_ingest::m4f_session::M4fSession::default();
-        let mut rapid_eofs = VecDeque::new();
-        let mut last_eof_segments = 0;
+        let options = crate::m4_ingest::PullOptions {
+            preserve: worker.options.preserve_subtitles,
+            detected: Some(&worker.detected),
+            conversion: worker.options.conversion.as_deref(),
+            ..Default::default()
+        };
+        let pull = self.input.pull_guarded_classified(
+            &mut output,
+            Some(&worker.hub),
+            tx,
+            options,
+            &authority,
+        );
+        tokio::pin!(pull);
         let mut metadata_pending = true;
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let result = {
-                let metadata_sender = sender.take();
-                let pull = async {
-                    let options = crate::m4_ingest::PullOptions {
-                        preserve: worker.options.preserve_subtitles,
-                        detected: Some(&worker.detected),
-                        conversion: worker.options.conversion.as_deref(),
-                        ..Default::default()
-                    };
-                    if worker.transport == crate::m4_ingest::flussonic::Transport::M4f {
-                        self.input
-                            .pull_m4f_session_guarded(
-                                &mut output,
-                                Some(&worker.hub),
-                                &mut m4f,
-                                metadata_sender,
-                                options,
-                                &authority,
-                            )
-                            .await
-                    } else {
-                        self.input
-                            .pull_guarded_classified(
-                                &mut output,
-                                Some(&worker.hub),
-                                metadata_sender.expect("M4S worker never reopens in place"),
-                                options,
-                                &authority,
-                            )
-                            .await
+            tokio::select! { biased;
+                _=worker.cancel.cancelled()=>return Err(SharedFailure::Closed),
+                _=worker.changed.notified()=>worker.current()?,
+                _=tick.tick()=>worker.current()?,
+                tracks=&mut metadata, if metadata_pending=>{
+                    metadata_pending=false;
+                    if let Ok(tracks)=tracks {
+                        worker.current()?;
+                        worker.at_source_route(|_| {
+                            let commit=|| {
+                                if worker.active_viewer().is_none(){return Err(AdmissionFailure::Revoked);}
+                                *worker.tracks.lock().unwrap()=Some(tracks);
+                                worker.metadata_ready.notify_waiters();Ok(())
+                            };
+                            match &worker.scope {Some(scope)=>scope.accept_private(commit),None=>commit()}
+                        })?;
                     }
-                };
-                tokio::pin!(pull);
-                loop {
-                    tokio::select! { biased;
-                        _=worker.cancel.cancelled()=>return Err(SharedFailure::Closed),
-                        _=worker.changed.notified()=>worker.current()?,
-                        _=tick.tick()=>worker.current()?,
-                        tracks = &mut metadata, if metadata_pending => {
-                            metadata_pending = false;
-                            if let Ok(tracks) = tracks {
-                                worker.current()?;
-                                worker.at_source_route(|_| {
-                                    let commit=|| {
-                                        if worker.active_viewer().is_none(){return Err(AdmissionFailure::Revoked);}
-                                        *worker.tracks.lock().unwrap()=Some(tracks);
-                                        worker.metadata_ready.notify_waiters();Ok(())
-                                    };
-                                    match &worker.scope {Some(scope)=>scope.accept_private(commit),None=>commit()}
-                                })?;
-                            }
-                        }
-                        result = &mut pull => break result,
-                    }
-                }
-            };
-            worker.current()?;
-            match result {
-                Err(crate::m4_ingest::flussonic::InputFailure::CleanControlEof)
-                    if worker.transport == crate::m4_ingest::flussonic::Transport::M4f =>
-                {
-                    let now = std::time::Instant::now();
-                    if !allow_clean_eof_reopen(
-                        &mut rapid_eofs,
-                        now,
-                        m4f.accepted_segments() > last_eof_segments,
-                    ) {
-                        worker.input_failed(
-                            crate::m4_ingest::flussonic::InputFailure::Transient,
-                            false,
-                        )?;
-                        return Err(SharedFailure::Input);
-                    }
-                    last_eof_segments = m4f.accepted_segments();
-                    let renewal = worker.renewal.upgrade().ok_or(SharedFailure::Closed)?;
-                    let refresh = renewal.renew_after_eof(&worker.handle, Duration::from_secs(3));
-                    tokio::pin!(refresh);
-                    loop {
-                        tokio::select! { biased;
-                            _=worker.cancel.cancelled()=>return Err(SharedFailure::Closed),
-                            _=worker.changed.notified()=>worker.current()?,
-                            _=tick.tick()=>worker.current()?,
-                            result=&mut refresh=>{result?; break;}
-                        }
-                    }
+                },
+                result=&mut pull=>{
                     worker.current()?;
-                }
-                Err(kind) => {
-                    worker.input_failed(kind, false)?;
-                    return Err(SharedFailure::Input);
-                }
-                Ok(()) => return Ok(()),
+                    return match result {
+                        Err(kind)=>{worker.input_failed(kind,false)?;Err(SharedFailure::Input)},
+                        Ok(())=>Ok(()),
+                    };
+                },
             }
         }
     }

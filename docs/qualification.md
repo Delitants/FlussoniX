@@ -1,5 +1,33 @@
 # Preview qualification
 
+## M4F ingest bridge backpressure and terminal control (2026-11-02)
+
+The independent M4F ingest bridge at code commit `461c376` bounds queued
+child-stdin payloads to 8 MiB, counts delivery only after a successful child
+write, and retains a 15-second upper deadline for accepted media on a
+transient source failure. A terminal source failure fences new M4F control
+subscriptions before the accepted media drains. Invalid or rejected input
+retires immediately. The focused bridge, selected-route, daemon, packaging,
+renewal and private-pull regressions, formatting, warnings-denied all-target
+Clippy and the binary build passed on that code commit.
+
+Three separate, read-only, 600-second comparisons used the authorized cdn4
+Flussonic M4F source and an isolated FlussoniX CDN. In the common 20–580 second
+window, the source served 100, 99 and 101 timestamped segments respectively;
+every one appeared in the CDN announcements and was successfully fetched from
+the CDN. Each comparison observed one origin control EOF, approximately one
+minute of origin unavailability and a successful new origin/CDN control. The
+CDN returned 503 during the outage and opened only two successful controls per
+comparison. The earlier repeated short HTTP 200/EOF controls did not recur.
+Probe-owned daemons, FFmpeg children and media directories were reaped after
+each run.
+
+This establishes timestamp availability in these three windows, not byte-for-
+byte segment identity, every M4F codec variant, production capacity or full
+mixed-vendor behavior. The separate 24-hour HTTP soak, exact-head CI, archived
+HEVC-loss investigation and installation/upgrade/recovery checks remain release
+gates.
+
 ## Sustained HTTP release gate (2026-10-31)
 
 `scripts/assess-sustained-http.py` evaluates an owner-only completed report

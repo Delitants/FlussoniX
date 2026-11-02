@@ -310,9 +310,16 @@ impl PackagedPlayback {
         self.subscription(bootstrap, Receiver::Native(receiver))
     }
     pub fn subscribe_m4f(&self) -> Result<PackagedSubscription, SharedPackagingFailure> {
+        if self.inner.source.m4f_terminal() {
+            return Err(SharedPackagingFailure::Closed);
+        }
         self.current()?;
         let (bootstrap, receiver) = self.inner.worker.wire.signal_subscribe();
-        self.subscription(bootstrap, Receiver::Native(receiver))
+        let subscription = self.subscription(bootstrap, Receiver::Native(receiver))?;
+        if self.inner.source.m4f_terminal() {
+            return Err(SharedPackagingFailure::Closed);
+        }
+        Ok(subscription)
     }
 }
 impl PackagedSubscription {
@@ -378,3 +385,7 @@ mod activation_tests {
 #[cfg(test)]
 #[path = "activation_idle_tests.rs"]
 mod activation_idle_tests;
+
+#[cfg(test)]
+#[path = "shared_sink_failure_tests.rs"]
+mod shared_sink_failure_tests;
