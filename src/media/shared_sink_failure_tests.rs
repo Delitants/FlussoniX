@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 const NAME: &str = "owned";
 type Feed = mpsc::UnboundedSender<Result<Bytes, io::Error>>;
 
-async fn run_sink_failure(after_source_failure: bool) {
+async fn run_sink_failure(after_source_failure: bool, between_gops: bool) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let key = format!("m4f://{}", listener.local_addr().unwrap());
     let (connection_tx, mut connections) = mpsc::unbounded_channel::<Feed>();
@@ -102,7 +102,9 @@ async fn run_sink_failure(after_source_failure: bool) {
     let script = dir.path().join("packager");
     std::fs::write(
         &script,
-        if after_source_failure {
+        if between_gops {
+            "#!/bin/sh\nhead -c 188 >/dev/null\nexit 0\n"
+        } else if after_source_failure {
             "#!/bin/sh\nsleep 1\nexit 0\n"
         } else {
             "#!/bin/sh\nsleep 0.2\nexit 0\n"
@@ -133,7 +135,7 @@ async fn run_sink_failure(after_source_failure: bool) {
         codec: "mp3".into(),
         config: vec![],
     };
-    let frames = (0..5_000)
+    let frames = (0..if between_gops { 1 } else { 5_000 })
         .map(|i| Frame {
             track_id: 1,
             dts: 90_000 + i * 2_160,
@@ -183,10 +185,15 @@ async fn run_sink_failure(after_source_failure: bool) {
 
 #[tokio::test]
 async fn child_stdin_failure_while_source_open_is_local() {
-    run_sink_failure(false).await;
+    run_sink_failure(false, false).await;
 }
 
 #[tokio::test]
 async fn child_stdin_failure_during_transient_drain_is_local() {
-    run_sink_failure(true).await;
+    run_sink_failure(true, false).await;
+}
+
+#[tokio::test]
+async fn child_exit_between_gops_while_source_open_is_local() {
+    run_sink_failure(false, true).await;
 }

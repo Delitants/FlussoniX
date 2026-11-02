@@ -1304,10 +1304,10 @@ impl Engine {
             .as_ref()
             .filter(|s| s.feed.protocol() == "m4f")
             .map(|s| s.feed.drain());
-        let shared_local_failure = shared
+        let shared_local_failure: Option<Arc<dyn Fn() + Send + Sync>> = shared
             .as_ref()
             .filter(|s| s.feed.protocol() == "m4f")
-            .map(|s| s.feed.local_failure());
+            .map(|s| Arc::new(s.feed.local_failure()) as Arc<dyn Fn() + Send + Sync>);
         tokio::spawn(async move {
             let mut tasks = Vec::new();
             let shared_startup_timeout = shared.as_ref().map(|s| s.feed.startup_timeout());
@@ -1529,7 +1529,7 @@ impl Engine {
                         let c = cancel.clone();
                         let pipe_worker = w.clone();
                         let progress = shared_drain.clone();
-                        let local_failure = shared_local_failure;
+                        let local_failure = shared_local_failure.clone();
                         tasks.push(tokio::spawn(async move {
                             let mut stdin = crate::m4_ingest::authority::Writer {
                                 inner: &mut stdin,
@@ -1650,6 +1650,13 @@ impl Engine {
                     };
                     match read {
                         Ok(Ok(0)) => {
+                            // Child exit can precede the next GOP, leaving the
+                            // stdin copy parked on a read with no write error.
+                            if shared_drain.as_ref().is_some_and(|d| !d.is_complete())
+                                && let Some(commit) = &shared_local_failure
+                            {
+                                commit();
+                            }
                             tracing::debug!(target: "flussonix::worker_lifecycle",
                                 bytes_in = w.bytes.load(Ordering::Relaxed),
                                 "packager stdout closed before worker cancellation");
@@ -1662,6 +1669,11 @@ impl Engine {
                             break;
                         }
                         Ok(Err(_)) => {
+                            if shared_drain.as_ref().is_some_and(|d| !d.is_complete())
+                                && let Some(commit) = &shared_local_failure
+                            {
+                                commit();
+                            }
                             w.failed("packaging_failed");
                             break;
                         }
