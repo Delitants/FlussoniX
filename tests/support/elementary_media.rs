@@ -650,14 +650,13 @@ pub async fn qualify(
         let _ = receiver.kill().await;
         let _ = receiver.wait().await;
     }
-    let stats = worker.stats();
     stage("worker_shutdown");
     // Stop while the input/decoder still own their destination ports. Submit the
     // in-memory recordings only after the worker has stopped.
     #[cfg(target_os = "linux")]
-    if packet_taps {
-        // Quiesce only this owned synthetic sender; its sockets remain available
-        // for the stop witness while the packet threads drain their last frames.
+    {
+        // Quiesce only this owned synthetic sender. Let the native reorder
+        // timer account for any final sequence gap before taking final stats.
         assert_eq!(
             unsafe { libc::kill(sender.id().unwrap() as i32, libc::SIGSTOP) },
             0
@@ -677,6 +676,7 @@ pub async fn qualify(
     let _ = sender.wait().await;
     engine.stop_all().await;
     stage("worker_stopped");
+    let stats = worker.stats();
     #[cfg(target_os = "linux")]
     {
         drop(public_tap);
@@ -696,6 +696,17 @@ pub async fn qualify(
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
+    }
+    for counter in [
+        "lost",
+        "startup_dropped_packets",
+        "startup_dropped_rtcp_packets",
+    ] {
+        assert_eq!(
+            stats["direct_rtp_input"][counter].as_u64(),
+            Some(0),
+            "controlled elementary input {counter} must be zero: {stats}"
+        );
     }
     let status = result
         .unwrap_or_else(|_| {
