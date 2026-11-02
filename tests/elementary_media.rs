@@ -190,7 +190,9 @@ async fn elementary_handoff_capture_starts_before_public_release() {
         .unwrap();
     let ns = |tap: &serde_json::Value, name: &str| tap[name].as_u64().unwrap_or(0);
     assert!(
-        ns(public, "coverage_start_ns") < ns(public, "reservation_release_ns")
+        ns(public, "coverage_start_ns") < ns(public, "sender_spawn_ns")
+            && ns(public, "sender_spawn_ns") < ns(public, "sender_witness_ns")
+            && ns(public, "sender_witness_ns") < ns(public, "reservation_release_ns")
             && ns(public, "reservation_release_ns") < ns(public, "native_owner_verified_ns")
             && ns(public, "native_owner_verified_ns") < ns(public, "coverage_end_ns"),
         "public capture must span reservation release and native bind: {public}"
@@ -200,6 +202,8 @@ async fn elementary_handoff_capture_starts_before_public_release() {
         assert!(!case.join("source_to_public.packets").exists());
     } else {
         assert_eq!(public["handoff_captured"], true);
+        assert_eq!(public["source_prefix_unobserved"], false);
+        assert_eq!(public["capture_sources_owned"], true);
         assert_eq!(public["incomplete"], false);
     }
 }
