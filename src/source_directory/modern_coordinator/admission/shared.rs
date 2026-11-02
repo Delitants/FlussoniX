@@ -632,6 +632,12 @@ impl Drop for SharedInputs {
     }
 }
 impl SharedViewer {
+    /// A terminal M4F source may still be draining accepted TS into its child.
+    /// Refuse fresh control readers while the old packaging worker is alive.
+    pub(crate) fn m4f_terminal(&self) -> bool {
+        self.inner.worker.transport == crate::m4_ingest::flussonic::Transport::M4f
+            && self.inner.worker.drain.deadline().is_some()
+    }
     pub(crate) fn counts_as_viewer(&self) -> bool {
         self.inner.admission.counts_as_viewer()
     }
@@ -689,9 +695,16 @@ impl SharedViewer {
         self.subscription(bootstrap, receiver)
     }
     pub fn subscribe_m4f(&self) -> Result<SharedSubscription, SharedFailure> {
+        if self.m4f_terminal() {
+            return Err(SharedFailure::Closed);
+        }
         self.current()?;
         let (bootstrap, receiver) = self.inner.worker.hub.signal_subscribe();
-        self.subscription(bootstrap, receiver)
+        let subscription = self.subscription(bootstrap, receiver)?;
+        if self.m4f_terminal() {
+            return Err(SharedFailure::Closed);
+        }
+        Ok(subscription)
     }
     pub fn segment(&self, name: &str) -> Result<Option<Bytes>, SharedFailure> {
         self.current()?;

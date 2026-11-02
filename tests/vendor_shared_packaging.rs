@@ -1013,6 +1013,16 @@ async fn m4f_terminal_source_failure_drains_accepted_ts_to_delayed_sink() {
         )))
         .unwrap();
     drop(second.feed);
+    let refused = tokio::time::timeout(Duration::from_millis(750), async {
+        loop {
+            if playback.subscribe_m4f().is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
     let complete = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if std::fs::metadata(&captured).is_ok_and(|meta| meta.len() >= minimum_ts as u64) {
@@ -1028,6 +1038,7 @@ async fn m4f_terminal_source_failure_drains_accepted_ts_to_delayed_sink() {
         complete,
         "accepted TS bytes were lost during source failure"
     );
+    assert!(refused, "failed M4F source admitted empty control sessions");
 }
 
 #[tokio::test]

@@ -167,9 +167,9 @@ impl SharedInput {
                         now,
                         m4f.accepted_segments() > last_eof_segments,
                     ) {
+                        let deadline = worker.drain.start();
                         worker.hub.finish();
                         drop(buffered);
-                        let deadline = worker.drain.start();
                         let drained = drain_all(worker, &mut copy, deadline).await;
                         return terminal_failure(worker, InputFailure::Transient, drained);
                     }
@@ -189,20 +189,21 @@ impl SharedInput {
                     worker.current()?;
                 }
                 Err(kind) => {
-                    worker.hub.finish();
                     if matches!(kind, InputFailure::Rejected | InputFailure::Invalid) {
                         worker.input_failed(kind, false)?;
+                        worker.hub.finish();
                         return Err(SharedFailure::Input);
                     }
-                    drop(buffered);
                     let deadline = worker.drain.start();
+                    worker.hub.finish();
+                    drop(buffered);
                     let drained = drain_all(worker, &mut copy, deadline).await;
                     return terminal_failure(worker, kind, drained);
                 }
                 Ok(()) => {
+                    let deadline = worker.drain.start();
                     worker.hub.finish();
                     drop(buffered);
-                    let deadline = worker.drain.start();
                     return match drain_all(worker, &mut copy, deadline).await {
                         Ok(Ok(())) => {
                             worker.drain.complete();
