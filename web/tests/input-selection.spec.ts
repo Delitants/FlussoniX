@@ -32,7 +32,7 @@ test('Input tab selects the second configured input without saving secrets', asy
   expect(current.stats.preferred_input_index).toBe(1);
   expect(current.stats.input_index).toBeUndefined();
 
-  const viewContext = await browser.newContext({baseURL:process.env.FLUSSONIX_TEST_URL});
+  const viewContext = await browser.newContext({baseURL:new URL(page.url()).origin});
   try {
    const viewPage = await viewContext.newPage();
    await viewPage.goto('/admin/');
@@ -49,5 +49,27 @@ test('Input tab selects the second configured input without saving secrets', asy
   }
  } finally {
   await request.delete(streamURL, {headers});
+ }
+});
+
+test('Input tab does not offer selection for a publisher stream', async ({page, request}) => {
+ const user = process.env.FLUSSONIX_ADMIN_USER || 'admin';
+ const password = process.env.FLUSSONIX_ADMIN_PASSWORD!;
+ const headers = {Authorization: 'Basic ' + Buffer.from(`${user}:${password}`).toString('base64')};
+ const name = 'ui-publisher-select-' + Date.now().toString(36);
+ const path = `/streamer/api/v3/streams/${name}`;
+ expect((await request.put(path, {headers, data: {$reset:true, static:false, inputs:[{url:'publish://'}]}})).ok()).toBeTruthy();
+ try {
+  await page.goto('/admin/');
+  await page.getByLabel('Username').fill(user);
+  await page.getByLabel('Password', {exact:true}).fill(password);
+  await page.getByRole('button', {name:'Sign in', exact:true}).click();
+  await page.getByRole('button', {name, exact:true}).click();
+  await page.getByRole('button', {name:'Input', exact:true}).click();
+  const selector = page.getByRole('region', {name:'Stream input selection'});
+  await expect(selector).toContainText('published media');
+  await expect(selector.getByRole('button', {name:/Select input/})).toHaveCount(0);
+ } finally {
+  await request.delete(path, {headers});
  }
 });

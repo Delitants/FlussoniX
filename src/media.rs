@@ -367,7 +367,9 @@ impl Engine {
         if same {
             return Ok(false);
         }
-        if let Some(worker) = workers.remove(name) {
+        let retired = workers.remove(name);
+        drop(workers);
+        if let Some(worker) = retired {
             self.stop_worker(name, worker).await;
         }
         Ok(active)
@@ -2731,6 +2733,42 @@ mod ts_backlog_tests {
             assert!(a[..4].iter().chain(a[8..].iter()).all(|b| *b == 0x47));
             assert_eq!(a, b);
         }
+    }
+}
+
+#[cfg(test)]
+mod input_selection_lock_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn selection_teardown_does_not_block_unrelated_worker_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(dir.path(), "ffmpeg"));
+        let config = json!({"inputs":[{"url":"testsrc://"},{"url":"testsrc://"}]});
+        let worker = engine.ensure("switching", &config).await.unwrap();
+        engine.ensure("unrelated", &config).await.unwrap();
+        let hold_completion = worker.done.lock().await;
+        let selecting = {
+            let engine = engine.clone();
+            let config = config.clone();
+            tokio::spawn(async move {
+                engine
+                    .select_input_guarded("switching", &config, 1, std::future::ready(true))
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !worker.cancel.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let unrelated = tokio::time::timeout(Duration::from_millis(250), engine.count()).await;
+        drop(hold_completion);
+        selecting.await.unwrap().unwrap();
+        assert_eq!(unrelated.unwrap(), 1);
+        engine.stop_all().await;
     }
 }
 
