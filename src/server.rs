@@ -1314,6 +1314,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         let result = app.config.replace(body);
         return match result {
             Ok(v) => {
+                app.media.prune_input_preferences(&v).await;
                 app.invalidate_sessions().await;
                 app.reconcile().await;
                 json_response(v)
@@ -1381,6 +1382,71 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         return error(StatusCode::NOT_FOUND, "API operation not implemented");
     }
     if let Some(name) = name {
+        if kind == "streams" && method == "POST" && name.contains("/inputs/") {
+            let Some((stream, tail)) = name.rsplit_once("/inputs/") else {
+                return error(StatusCode::BAD_REQUEST, "invalid input selection path");
+            };
+            let Some(index) = tail.strip_suffix("/select") else {
+                return error(StatusCode::BAD_REQUEST, "invalid input selection path");
+            };
+            if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+                return error(StatusCode::BAD_REQUEST, "invalid input index");
+            }
+            let Ok(index) = index.parse::<usize>() else {
+                return error(StatusCode::BAD_REQUEST, "invalid input index");
+            };
+            if !matches!(
+                axum::body::to_bytes(request.into_body(), 1).await,
+                Ok(bytes) if bytes.is_empty()
+            ) {
+                return error(StatusCode::BAD_REQUEST, "input selection has no body");
+            }
+            let revision = app.config.revision();
+            let Some(config) = app
+                .config
+                .at_revision(revision, |root| crate::config::effective(root, stream))
+            else {
+                return error(StatusCode::BAD_REQUEST, "stream configuration changed");
+            };
+            let Some(config) = config else {
+                return error(StatusCode::NOT_FOUND, "stream not found");
+            };
+            if config["inputs"]
+                .as_array()
+                .is_none_or(|inputs| index >= inputs.len())
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "input is not found by the specified index",
+                );
+            }
+            let config_store = app.config.clone();
+            let result = app
+                .media
+                .select_input_guarded(stream, &config, index, async move {
+                    config_store.revision() == revision
+                })
+                .await;
+            if app.config.revision() != revision {
+                app.media
+                    .prune_input_preferences(&app.config.snapshot())
+                    .await;
+                return error(StatusCode::BAD_REQUEST, "stream configuration changed");
+            }
+            return match result {
+                Ok(was_active) => {
+                    if was_active || config["static"] != false {
+                        let app = app.clone();
+                        let stream = stream.to_owned();
+                        tokio::spawn(async move {
+                            app.recover_current(&stream, &config, revision).await;
+                        });
+                    }
+                    StatusCode::NO_CONTENT.into_response()
+                }
+                Err(message) => error(StatusCode::BAD_REQUEST, &message),
+            };
+        }
         if kind == "streams" && method == "POST" && name.ends_with("/stop") {
             let name = name.trim_end_matches("/stop");
             app.playback_auth.stop_playback(name);
@@ -1417,6 +1483,11 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
             };
             return match app.config.put(kind, name, body) {
                 Ok(mut v) => {
+                    if matches!(kind, "streams" | "templates") {
+                        app.media
+                            .prune_input_preferences(&app.config.snapshot())
+                            .await;
+                    }
                     app.invalidate_sessions().await;
                     if kind == "sources" {
                         app.invalidate_sessions().await;
@@ -1438,6 +1509,13 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         if method == "DELETE" {
             return match app.config.delete(kind, name) {
                 Ok(true) => {
+                    if kind == "streams" {
+                        app.media.forget_input(name).await;
+                    } else if kind == "templates" {
+                        app.media
+                            .prune_input_preferences(&app.config.snapshot())
+                            .await;
+                    }
                     app.invalidate_sessions().await;
                     if kind == "streams" {
                         app.media.stop(name).await;

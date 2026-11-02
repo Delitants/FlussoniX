@@ -341,10 +341,17 @@ impl Engine {
         {
             return Err("shared or publisher worker cannot be selected".into());
         }
+        let signature = media_signature(cfg);
+        if workers
+            .get(name)
+            .is_some_and(|worker| worker.signature != signature)
+        {
+            return Err("media route changed".into());
+        }
         let active = workers.get(name).is_some_and(|worker| {
             worker.alive.load(Ordering::Relaxed)
                 && !worker.is_closed()
-                && worker.signature == media_signature(cfg)
+                && worker.signature == signature
         });
         let same = active
             && workers
