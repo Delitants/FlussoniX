@@ -1031,6 +1031,97 @@ async fn m4f_terminal_source_failure_drains_accepted_ts_to_delayed_sink() {
 }
 
 #[tokio::test]
+async fn m4f_terminal_failure_waits_for_small_gop_to_reach_child_stdin() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = Fixture::start(true).await;
+    let registry = SharedInputs::new(f.owner.clone());
+    let rows = f.inventory(Duration::from_secs(30)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let captured = dir.path().join("captured.ts");
+    let delayed = dir.path().join("delayed-packager");
+    std::fs::write(
+        &delayed,
+        format!(
+            "#!/bin/sh\nsleep 1\ncat > '{}'\nsleep 30\n",
+            captured.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&delayed, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = Engine::new(dir.path(), delayed.to_str().unwrap());
+    let playback = engine
+        .package_shared(
+            attach(&f, f.admitted(&rows, "one").await, &registry),
+            &options(),
+        )
+        .await
+        .unwrap();
+    let mut signals = playback.subscribe_m4f().unwrap();
+    let control = f.connection().await;
+    control
+        .feed
+        .send(Ok(Bytes::from_static(b"1 2026/10/13/00/00/00-4000\n")))
+        .unwrap();
+    let first = f.connection().await;
+    let track = Track {
+        id: 2,
+        codec: "m2a".into(),
+        config: vec![],
+    };
+    let frames = (0..50)
+        .map(|i| Frame {
+            track_id: 2,
+            dts: 90_000 + i * 2_160,
+            pts_offset: 0,
+            key: true,
+            body: include_bytes!("fixtures/codecs/mp2.bin").to_vec(),
+        })
+        .collect::<Vec<_>>();
+    let mut muxer = flussonix::worker_ts::Muxer::new(std::slice::from_ref(&track)).unwrap();
+    let expected: usize = frames
+        .iter()
+        .map(|frame| muxer.frame(frame).unwrap().len())
+        .sum();
+    assert!(expected < 64 * 1024);
+    first
+        .feed
+        .send(Ok(Bytes::from(
+            m4f::pack(&[track], &frames, 360_000).unwrap(),
+        )))
+        .unwrap();
+    drop(first.feed);
+    receive(&mut signals).await;
+    control
+        .feed
+        .send(Ok(Bytes::from_static(b"2 2026/10/13/00/00/04-4000\n")))
+        .unwrap();
+    let second = f.connection().await;
+    second
+        .feed
+        .send(Err(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "owned source segment failure",
+        )))
+        .unwrap();
+    drop(second.feed);
+    let complete = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if std::fs::metadata(&captured).is_ok_and(|meta| meta.len() >= expected as u64) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok();
+    engine.stop_all().await;
+    assert!(
+        complete,
+        "source stopped before its small GOP reached the child"
+    );
+}
+
+#[tokio::test]
 async fn m4f_revocation_interrupts_full_bridge_with_blocked_sink() {
     use std::os::unix::fs::PermissionsExt;
     let mut f = Fixture::start(true).await;

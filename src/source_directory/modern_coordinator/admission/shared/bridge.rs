@@ -9,7 +9,10 @@ use tokio::{io::AsyncWrite, sync::mpsc};
 use tokio_util::sync::PollSender;
 
 const CHUNK_BYTES: usize = 64 * 1024;
-const MAX_CHUNKS: usize = 128;
+// Channel, producer's pending buffer, and consumer's in-flight chunk together
+// stay within 8 MiB of additional M4F bridge payload.
+const MAX_CHUNKS: usize = 126;
+const _: () = assert!((MAX_CHUNKS + 2) * CHUNK_BYTES <= 8 * 1024 * 1024);
 
 pub(super) struct Writer {
     sender: PollSender<Bytes>,
@@ -113,7 +116,7 @@ mod tests {
     #[tokio::test]
     async fn full_queue_waits_then_delivers_every_chunk_in_order() {
         let (mut writer, mut reader) = bounded();
-        for value in 0..128u8 {
+        for value in 0..MAX_CHUNKS as u8 {
             writer.write_all(&vec![value; 64 * 1024]).await.unwrap();
         }
         writer.flush().await.unwrap();
@@ -128,7 +131,7 @@ mod tests {
         assert_eq!(reader.recv().await.unwrap().as_ref(), &[0; 64 * 1024]);
         writer.flush().await.unwrap();
         drop(writer);
-        for value in 1..128u8 {
+        for value in 1..MAX_CHUNKS as u8 {
             assert_eq!(
                 reader.recv().await.unwrap().as_ref(),
                 &vec![value; 64 * 1024]

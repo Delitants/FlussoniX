@@ -16,7 +16,10 @@ use std::{
     collections::{HashMap, VecDeque},
     io,
     pin::Pin,
-    sync::{Arc, Mutex, Weak, atomic::AtomicU64},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -84,10 +87,39 @@ struct Worker {
     ts: media_queue::Channel,
     required: Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>,
     required_issued: AtomicU64,
-    required_written: AtomicU64,
+    drain: Arc<SharedDrain>,
     tracks: Mutex<Option<Vec<Track>>>,
     metadata_ready: Notify,
     detected: AtomicU64,
+}
+/// Owner-only completion fence for M4F's required TS feed and child stdin.
+#[derive(Default)]
+pub(crate) struct SharedDrain {
+    written: AtomicU64,
+    complete: AtomicBool,
+    deadline: Mutex<Option<tokio::time::Instant>>,
+}
+impl SharedDrain {
+    fn start(&self) -> tokio::time::Instant {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        *self.deadline.lock().unwrap() = Some(deadline);
+        deadline
+    }
+    fn complete(&self) {
+        self.complete.store(true, Ordering::Release);
+    }
+    pub(crate) fn is_complete(&self) -> bool {
+        self.complete.load(Ordering::Acquire)
+    }
+    pub(crate) fn deadline(&self) -> Option<tokio::time::Instant> {
+        *self.deadline.lock().unwrap()
+    }
+    pub(crate) fn wrote_packager(&self, n: usize) {
+        self.written.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    fn written(&self) -> u64 {
+        self.written.load(Ordering::Relaxed)
+    }
 }
 struct Viewer {
     id: Uuid,
@@ -545,7 +577,7 @@ impl SharedInputs {
                             ts: media_queue::Channel::new(128, 8 * 1024 * 1024),
                             required: Mutex::new(None),
                             required_issued: AtomicU64::new(0),
-                            required_written: AtomicU64::new(0),
+                            drain: Arc::new(SharedDrain::default()),
                             tracks: Mutex::new(None),
                             metadata_ready: Notify::new(),
                             detected: AtomicU64::new(0),

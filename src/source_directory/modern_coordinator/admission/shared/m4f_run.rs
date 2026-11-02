@@ -3,16 +3,12 @@ use super::*;
 use crate::m4_ingest::flussonic::InputFailure;
 use tokio::io::AsyncWriteExt;
 
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
-
 async fn drain_required(worker: &Worker) -> Result<(), SharedFailure> {
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         worker.current()?;
-        if worker
-            .required_written
-            .load(std::sync::atomic::Ordering::Relaxed)
+        if worker.drain.written()
             >= worker
                 .required_issued
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -30,8 +26,9 @@ async fn drain_required(worker: &Worker) -> Result<(), SharedFailure> {
 async fn drain_all(
     worker: &Worker,
     copy: &mut (impl std::future::Future<Output = Result<(), SharedFailure>> + Unpin),
+    deadline: tokio::time::Instant,
 ) -> Result<Result<(), SharedFailure>, tokio::time::error::Elapsed> {
-    tokio::time::timeout(DRAIN_TIMEOUT, async {
+    tokio::time::timeout_at(deadline, async {
         copy.await?;
         drain_required(worker).await
     })
@@ -50,6 +47,7 @@ fn terminal_failure(
     drained: Result<Result<(), SharedFailure>, tokio::time::error::Elapsed>,
 ) -> Result<(), SharedFailure> {
     worker.current()?;
+    let successful = matches!(&drained, Ok(Ok(())));
     let failure = match drained {
         Ok(Ok(())) => source,
         Ok(Err(_)) | Err(_) if matches!(source, InputFailure::Rejected | InputFailure::Invalid) => {
@@ -57,6 +55,9 @@ fn terminal_failure(
         }
         Ok(Err(_)) | Err(_) => InputFailure::Local,
     };
+    if successful {
+        worker.drain.complete();
+    }
     worker.input_failed(failure, false)?;
     Err(SharedFailure::Input)
 }
@@ -65,7 +66,6 @@ impl SharedInput {
     pub(super) async fn run_m4f_buffered(&self) -> Result<(), SharedFailure> {
         let worker = &self.worker;
         worker.current()?;
-        let authority = || worker.current().is_ok();
         let required = worker
             .required
             .lock()
@@ -76,6 +76,11 @@ impl SharedInput {
             channel: &worker.ts,
             required,
             required_issued: &worker.required_issued,
+        };
+        let authority = || worker.current().is_ok();
+        let mut output = crate::m4_ingest::authority::Writer {
+            inner: &mut output,
+            authority: Some(&authority),
         };
         let (mut buffered, mut receiver) = bridge::bounded();
         let copy = async {
@@ -162,8 +167,10 @@ impl SharedInput {
                         now,
                         m4f.accepted_segments() > last_eof_segments,
                     ) {
+                        worker.hub.finish();
                         drop(buffered);
-                        let drained = drain_all(worker, &mut copy).await;
+                        let deadline = worker.drain.start();
+                        let drained = drain_all(worker, &mut copy, deadline).await;
                         return terminal_failure(worker, InputFailure::Transient, drained);
                     }
                     last_eof_segments = m4f.accepted_segments();
@@ -182,14 +189,25 @@ impl SharedInput {
                     worker.current()?;
                 }
                 Err(kind) => {
+                    worker.hub.finish();
+                    if matches!(kind, InputFailure::Rejected | InputFailure::Invalid) {
+                        worker.input_failed(kind, false)?;
+                        return Err(SharedFailure::Input);
+                    }
                     drop(buffered);
-                    let drained = drain_all(worker, &mut copy).await;
+                    let deadline = worker.drain.start();
+                    let drained = drain_all(worker, &mut copy, deadline).await;
                     return terminal_failure(worker, kind, drained);
                 }
                 Ok(()) => {
+                    worker.hub.finish();
                     drop(buffered);
-                    return match drain_all(worker, &mut copy).await {
-                        Ok(Ok(())) => Ok(()),
+                    let deadline = worker.drain.start();
+                    return match drain_all(worker, &mut copy, deadline).await {
+                        Ok(Ok(())) => {
+                            worker.drain.complete();
+                            Ok(())
+                        }
                         Ok(Err(error)) => writer_stopped(worker, Err(error)),
                         Err(_) => writer_stopped(worker, Err(SharedFailure::Input)),
                     };
