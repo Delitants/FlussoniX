@@ -69,8 +69,8 @@ installed-management-public,GET,/iptv/subscribers,subscribers_list,iptv,200,firs
 installed-management-public,GET,/iptv/subscribers/{name},subscriber_get,iptv,200,first_release_candidate,handler_present_contract_unqualified,source_inspected_only
 installed-management-public,GET,/logos,logos_list,logo,200,later_or_dependency_review,not_assessed,schema_observed_only
 installed-management-public,GET,/logos/{name},logo_get,logo,200,later_or_dependency_review,not_assessed,schema_observed_only
-installed-management-public,GET,/monitoring/liveness,liveness_probe,monitoring,200,first_release_candidate,no_exact_handler_seen,source_inspected_only
-installed-management-public,GET,/monitoring/readiness,readiness_probe,monitoring,200,first_release_candidate,no_exact_handler_seen,source_inspected_only
+installed-management-public,GET,/monitoring/liveness,liveness_probe,monitoring,200,first_release_candidate,handler_present_contract_unqualified,route_and_test_inspected
+installed-management-public,GET,/monitoring/readiness,readiness_probe,monitoring,200,first_release_candidate,handler_present_contract_unqualified,route_and_test_inspected
 installed-management-public,GET,/rproxy,rproxy_get,vsaas,200,later_or_dependency_review,not_assessed,schema_observed_only
 installed-management-public,GET,/rproxy/agents,rproxy_agents_list,vsaas,200,later_or_dependency_review,not_assessed,schema_observed_only
 installed-management-public,GET,/sessions,sessions_list,session,200,first_release_candidate,handler_present_contract_unqualified,source_inspected_only
