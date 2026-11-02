@@ -871,6 +871,227 @@ async fn native_text_copy_is_preserved_and_unsupported_transcoding_fails_before_
 
 // A normal M4F GOP contains more than128 TS writes; startup must drain fairly.
 #[tokio::test]
+async fn m4f_reader_fetches_next_segment_while_ts_sink_is_blocked() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = Fixture::start(true).await;
+    let registry = SharedInputs::new(f.owner.clone());
+    let rows = f.inventory(Duration::from_secs(30)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let blocked = dir.path().join("blocked-packager");
+    std::fs::write(&blocked, b"#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = Engine::new(dir.path(), blocked.to_str().unwrap());
+    let playback = engine
+        .package_shared(
+            attach(&f, f.admitted(&rows, "one").await, &registry),
+            &options(),
+        )
+        .await
+        .unwrap();
+    let mut signals = playback.subscribe_m4f().unwrap();
+    let control = f.connection().await;
+    control
+        .feed
+        .send(Ok(Bytes::from_static(b"1 2026/10/13/00/00/00-4000\n")))
+        .unwrap();
+    let first = f.connection().await;
+    assert!(first.path.ends_with("00.m4f"));
+    let track = Track {
+        id: 2,
+        codec: "m2a".into(),
+        config: vec![],
+    };
+    let frames = (0..15_000)
+        .map(|i| Frame {
+            track_id: 2,
+            dts: 90_000 + i * 2_160,
+            pts_offset: 0,
+            key: true,
+            body: include_bytes!("fixtures/codecs/mp2.bin").to_vec(),
+        })
+        .collect::<Vec<_>>();
+    let mut muxer = flussonix::worker_ts::Muxer::new(std::slice::from_ref(&track)).unwrap();
+    let ts_bytes: usize = frames.iter().map(|f| muxer.frame(f).unwrap().len()).sum();
+    assert!(
+        (8 * 1024 * 1024..16 * 1024 * 1024).contains(&ts_bytes),
+        "fixture TS payload {ts_bytes} bytes must fit both bounded stages"
+    );
+    let original = Bytes::from(m4f::pack(&[track], &frames, 360_000).unwrap());
+    first.feed.send(Ok(original.clone())).unwrap();
+    drop(first.feed);
+    assert_eq!(
+        receive(&mut signals).await,
+        Bytes::from_static(b"1 2026/10/13/00/00/00-4000\n")
+    );
+    assert_eq!(
+        engine
+            .read_shared(&playback, "2026/10/13/00/00/00.m4f")
+            .await
+            .unwrap(),
+        original
+    );
+    control
+        .feed
+        .send(Ok(Bytes::from_static(b"2 2026/10/13/00/00/04-4000\n")))
+        .unwrap();
+    let next = tokio::time::timeout(Duration::from_secs(3), f.connections.recv()).await;
+    engine.stop_all().await;
+    let second = next
+        .expect("the M4F reader waited for the blocked TS sink")
+        .unwrap();
+    assert!(second.path.ends_with("04.m4f"));
+}
+
+#[tokio::test]
+async fn m4f_terminal_source_failure_drains_accepted_ts_to_delayed_sink() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = Fixture::start(true).await;
+    let registry = SharedInputs::new(f.owner.clone());
+    let rows = f.inventory(Duration::from_secs(30)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let captured = dir.path().join("captured.ts");
+    let delayed = dir.path().join("delayed-packager");
+    std::fs::write(
+        &delayed,
+        format!(
+            "#!/bin/sh\nsleep 1\ncat > '{}'\nsleep 30\n",
+            captured.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&delayed, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = Engine::new(dir.path(), delayed.to_str().unwrap());
+    let playback = engine
+        .package_shared(
+            attach(&f, f.admitted(&rows, "one").await, &registry),
+            &options(),
+        )
+        .await
+        .unwrap();
+    let mut signals = playback.subscribe_m4f().unwrap();
+    let control = f.connection().await;
+    control
+        .feed
+        .send(Ok(Bytes::from_static(b"1 2026/10/13/00/00/00-4000\n")))
+        .unwrap();
+    let first = f.connection().await;
+    let track = Track {
+        id: 2,
+        codec: "m2a".into(),
+        config: vec![],
+    };
+    let frames = (0..5_000)
+        .map(|i| Frame {
+            track_id: 2,
+            dts: 90_000 + i * 2_160,
+            pts_offset: 0,
+            key: true,
+            body: include_bytes!("fixtures/codecs/mp2.bin").to_vec(),
+        })
+        .collect::<Vec<_>>();
+    let mut muxer = flussonix::worker_ts::Muxer::new(std::slice::from_ref(&track)).unwrap();
+    let minimum_ts: usize = frames.iter().map(|f| muxer.frame(f).unwrap().len()).sum();
+    assert!(minimum_ts < 8 * 1024 * 1024);
+    first
+        .feed
+        .send(Ok(Bytes::from(
+            m4f::pack(&[track], &frames, 360_000).unwrap(),
+        )))
+        .unwrap();
+    drop(first.feed);
+    receive(&mut signals).await;
+    control
+        .feed
+        .send(Ok(Bytes::from_static(b"2 2026/10/13/00/00/04-4000\n")))
+        .unwrap();
+    let second = f.connection().await;
+    second
+        .feed
+        .send(Err(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "owned source segment failure",
+        )))
+        .unwrap();
+    drop(second.feed);
+    let complete = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if std::fs::metadata(&captured).is_ok_and(|meta| meta.len() >= minimum_ts as u64) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok();
+    engine.stop_all().await;
+    assert!(
+        complete,
+        "accepted TS bytes were lost during source failure"
+    );
+}
+
+#[tokio::test]
+async fn m4f_revocation_interrupts_full_bridge_with_blocked_sink() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = Fixture::start(true).await;
+    let registry = SharedInputs::new(f.owner.clone());
+    let rows = f.inventory(Duration::from_secs(30)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let blocked = dir.path().join("blocked-packager");
+    std::fs::write(&blocked, b"#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = Engine::new(dir.path(), blocked.to_str().unwrap());
+    let playback = engine
+        .package_shared(
+            attach(&f, f.admitted(&rows, "one").await, &registry),
+            &options(),
+        )
+        .await
+        .unwrap();
+    let id = f.auth.snapshots()[0]["id"].as_str().unwrap().to_owned();
+    let control = f.connection().await;
+    control
+        .feed
+        .send(Ok(Bytes::from_static(b"1 2026/10/13/00/00/00-4000\n")))
+        .unwrap();
+    let first = f.connection().await;
+    let track = Track {
+        id: 2,
+        codec: "m2a".into(),
+        config: vec![],
+    };
+    let frames = (0..30_000)
+        .map(|i| Frame {
+            track_id: 2,
+            dts: 90_000 + i * 2_160,
+            pts_offset: 0,
+            key: true,
+            body: include_bytes!("fixtures/codecs/mp2.bin").to_vec(),
+        })
+        .collect::<Vec<_>>();
+    let mut muxer = flussonix::worker_ts::Muxer::new(std::slice::from_ref(&track)).unwrap();
+    let ts_bytes: usize = frames
+        .iter()
+        .map(|frame| muxer.frame(frame).unwrap().len())
+        .sum();
+    assert!(ts_bytes > 16 * 1024 * 1024);
+    first
+        .feed
+        .send(Ok(Bytes::from(
+            m4f::pack(&[track], &frames, 360_000).unwrap(),
+        )))
+        .unwrap();
+    drop(first.feed);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(f.auth.revoke(&id));
+    tokio::time::timeout(Duration::from_secs(2), control.feed.closed())
+        .await
+        .expect("revocation left the full M4F bridge reader running");
+    assert!(playback.current().is_err());
+    engine.stop_all().await;
+}
+
+#[tokio::test]
 async fn m4f_multitrack_gop_packaging_preserves_native_segment_and_decodes_hls() {
     let mut f = Fixture::start(true).await;
     let registry = SharedInputs::new(f.owner.clone());

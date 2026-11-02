@@ -189,7 +189,12 @@ impl SharedFeed {
                     },
                     result=&mut write=>{
                         if unsupported(){return Err(failure().into());}
-                        result.map_err(|_|"media pipe closed")?;break;
+                        result.map_err(|_|"media pipe closed")?;
+                        worker.required_written.fetch_add(
+                            bytes.len() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        break;
                     },
                 }
             }
