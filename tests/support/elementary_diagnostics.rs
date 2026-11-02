@@ -687,6 +687,46 @@ impl DatagramCapture {
         self.bytes.extend_from_slice(packet);
         Ok(())
     }
+    // These are userspace dequeue timestamps. Passing this check only rules
+    // out obvious pre-marker records; it does not establish sender ownership.
+    #[allow(dead_code, reason = "used by optional packet tap test modules")]
+    pub fn source_ports_since(
+        &self,
+        sender_spawn_ns: u64,
+    ) -> io::Result<std::collections::HashSet<u16>> {
+        let mut ports = std::collections::HashSet::new();
+        let mut offset = 0;
+        while offset < self.bytes.len() {
+            let end = offset
+                .checked_add(4)
+                .ok_or_else(|| io::Error::other("invalid capture"))?;
+            let length = self
+                .bytes
+                .get(offset..end)
+                .ok_or_else(|| io::Error::other("invalid capture"))?;
+            let length = u32::from_be_bytes(length.try_into().unwrap()) as usize;
+            let start = end;
+            let end = start
+                .checked_add(length)
+                .ok_or_else(|| io::Error::other("invalid capture"))?;
+            let record = self
+                .bytes
+                .get(start..end)
+                .ok_or_else(|| io::Error::other("invalid capture"))?;
+            let observed = record
+                .get(0..8)
+                .ok_or_else(|| io::Error::other("invalid capture"))?;
+            if u64::from_be_bytes(observed.try_into().unwrap()) < sender_spawn_ns {
+                return Err(io::Error::other("capture predates sender spawn"));
+            }
+            let source = record
+                .get(8..10)
+                .ok_or_else(|| io::Error::other("invalid capture"))?;
+            ports.insert(u16::from_be_bytes(source.try_into().unwrap()));
+            offset = end;
+        }
+        Ok(ports)
+    }
     pub fn save(self) -> io::Result<()> {
         let mut file = OpenOptions::new()
             .create(true)

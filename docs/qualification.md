@@ -1799,3 +1799,27 @@ process exit, a new worker on input 2, and fresh TS packets for a reconnecting
 viewer; the saved config bytes did not change. This is local qualification of
 the candidate route and UI, not a claim of seamless viewer continuity or full
 Flussonic parity.
+
+## Pre-sender elementary RTP trace candidate
+
+The optional, owned-fixture public packet tap now activates before FFmpeg is
+spawned and keeps one bounded capture through SDP creation, reservation release
+and native input binding. Because the sender source ports are not yet known at
+activation, the locked kernel filter limits capture to the fixture's exact
+loopback destination ports. Final retention requires unchanged sender and
+native socket owners, candidate source ports matching the later sender witness,
+and userspace observation timestamps after the spawn marker. Incomplete or
+ambiguous traces are discarded. The pre-witness prefix is labeled candidate
+only: later port ownership and dequeue timestamps cannot prove its sender.
+
+On the isolated Linux host, strict H.264/HEVC × AAC/MP2/MP3 plaintext and
+encrypted-source/encrypted-destination matrices passed all 12 cases. All 12
+public taps began before sender spawn and retained complete, port-correlated
+candidate traces; all 12 private decoder taps were complete. Public taps retained 272–486
+RTP packets per case, reported zero packet-socket drops, and native input
+reported zero RTP loss or startup packet drops. The two privileged loopback tap
+regressions, the sender-spawn ordering regression and the handoff media
+assertion also passed. The early interval is now visible as candidate packets,
+but sender attribution in that interval and the private pre-readiness interval
+remain limits. The archived 38-picture HEVC failure did not
+reproduce, its cause is still unknown, and no production media repair is claimed.
