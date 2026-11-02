@@ -207,7 +207,7 @@ impl Worker {
         }
         stats
     }
-    fn output_bitrate(&self) -> Option<(f64, u64)> {
+    pub(crate) fn output_bitrate(&self) -> Option<(f64, u64)> {
         if !self.alive.load(Ordering::Relaxed) || self.is_closed() {
             return None;
         }

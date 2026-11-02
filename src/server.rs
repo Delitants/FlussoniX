@@ -2711,12 +2711,14 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         )
             .into_response();
     }
+    let alias = crate::hls_master_alias::Alias::from_file(file);
+    let read_file = alias.map_or(file, |alias| alias.underlying_file());
     let deadline = Instant::now() + Duration::from_secs(8);
     let bytes = loop {
         if grant.is_cancelled() {
             return error(StatusCode::FORBIDDEN, "playback revoked");
         }
-        match app.media.read(name, file).await {
+        match app.media.read(name, read_file).await {
             Ok(b) => break b,
             Err(_)
                 if file.ends_with(".m3u8")
@@ -2735,11 +2737,20 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         let suffix = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(q.iter())
             .finish();
-        Bytes::from(rewrite_playlist(&String::from_utf8_lossy(&bytes), &suffix))
+        if let Some(alias) = alias {
+            match crate::hls_master_alias::render(alias, &bytes, worker.output_bitrate(), &suffix) {
+                Ok(master) => master,
+                Err(_) => {
+                    return error(StatusCode::SERVICE_UNAVAILABLE, "HLS master unavailable");
+                }
+            }
+        } else {
+            Bytes::from(rewrite_playlist(&String::from_utf8_lossy(&bytes), &suffix))
+        }
     } else {
         bytes
     };
-    if grant.is_cancelled() {
+    if grant.is_cancelled() || (alias.is_some() && worker.is_closed()) {
         return error(StatusCode::FORBIDDEN, "playback revoked");
     }
     grant.add_bytes(bytes.len());
