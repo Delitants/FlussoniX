@@ -805,7 +805,18 @@ pub fn enforce_handoff(
     }
     summary["sender_spawn_ns"] = json!(witness.sender_spawn_ns);
     summary["sender_witness_ns"] = json!(witness.sender_witness_ns);
-    summary["source_prefix_unobserved"] = json!(!witness.prestart);
+    // A pre-sender socket can observe destination-port candidates, but a later
+    // source-port witness cannot prove which process sent an earlier packet.
+    summary["source_prefix_unobserved"] = json!(true);
+    summary["startup_not_observed"] = json!(true);
+    summary["sender_prefix_attribution"] = json!(if witness.prestart {
+        "candidate_only"
+    } else {
+        "not_captured"
+    });
+    if witness.prestart {
+        summary["observation"] = json!("kernel_loopback_host_copy_port_candidate");
+    }
     summary["application_receipt_proven"] = json!(false);
     summary["reservation_release_ns"] = json!(witness.release_ns);
     summary["native_owner_verified_ns"] = json!(witness.native_ns);
@@ -831,11 +842,12 @@ pub fn enforce_handoff(
                     .is_ok_and(|ports| ports.iter().all(|port| sender.sockets.contains_key(port)))
             })
         });
-    summary["capture_sources_owned"] = json!(sources_owned);
+    summary["candidate_source_ports_match_sender_witness"] = json!(sources_owned);
     let unchanged = !witness.failed
         && ordered
         && prestart_ordered
         && sources_owned
+        && summary["incomplete"] == false
         && sender.is_some_and(|sender| snapshot(sender, true))
         && native.is_some_and(|owner| snapshot(owner, false));
     if unchanged {

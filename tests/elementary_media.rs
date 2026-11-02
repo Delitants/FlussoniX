@@ -202,8 +202,10 @@ async fn elementary_handoff_capture_starts_before_public_release() {
         assert!(!case.join("source_to_public.packets").exists());
     } else {
         assert_eq!(public["handoff_captured"], true);
-        assert_eq!(public["source_prefix_unobserved"], false);
-        assert_eq!(public["capture_sources_owned"], true);
+        assert_eq!(public["source_prefix_unobserved"], true);
+        assert_eq!(public["startup_not_observed"], true);
+        assert_eq!(public["sender_prefix_attribution"], "candidate_only");
+        assert_eq!(public["candidate_source_ports_match_sender_witness"], true);
         assert_eq!(public["incomplete"], false);
     }
 }

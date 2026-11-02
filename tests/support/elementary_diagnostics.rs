@@ -687,6 +687,8 @@ impl DatagramCapture {
         self.bytes.extend_from_slice(packet);
         Ok(())
     }
+    // These are userspace dequeue timestamps. Passing this check only rules
+    // out obvious pre-marker records; it does not establish sender ownership.
     #[allow(dead_code, reason = "used by optional packet tap test modules")]
     pub fn source_ports_since(
         &self,
