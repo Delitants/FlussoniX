@@ -33,6 +33,7 @@ pub struct Engine {
     tesseract: String,
     hls_epoch: crate::hls_generation::Epoch,
     workers: Mutex<HashMap<String, Arc<Worker>>>,
+    input_preferences: Mutex<HashMap<String, InputPreference>>,
     startup_gates: std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     rtsp_probe_slots: Semaphore,
     fxlink_pool: Arc<crate::fxlink::ClientPool>,
@@ -41,6 +42,11 @@ pub struct Engine {
     pub direct_egress: Arc<AtomicU64>,
     pub rtsp_push_egress: Arc<AtomicU64>,
     pub http_push_egress: Arc<AtomicU64>,
+}
+#[derive(Clone, Copy)]
+struct InputPreference {
+    index: usize,
+    inputs: [u8; 32],
 }
 #[derive(Clone, Copy)]
 enum PublicationInput {
@@ -245,6 +251,7 @@ impl Engine {
             tesseract: tesseract.into(),
             hls_epoch: crate::hls_generation::Epoch::new(),
             workers: Mutex::new(HashMap::new()),
+            input_preferences: Mutex::new(HashMap::new()),
             startup_gates: std::sync::Mutex::new(HashMap::new()),
             rtsp_probe_slots: Semaphore::new(32),
             fxlink_pool: Arc::new(crate::fxlink::ClientPool::with_features(features)),
@@ -282,6 +289,100 @@ impl Engine {
         let gate = Arc::new(Mutex::new(()));
         gates.insert(name.to_owned(), Arc::downgrade(&gate));
         gate
+    }
+    pub async fn preferred_input(&self, name: &str, cfg: &Value) -> Option<usize> {
+        let fingerprint = input_fingerprint(cfg)?;
+        self.input_preferences
+            .lock()
+            .await
+            .get(name)
+            .filter(|preference| preference.inputs == fingerprint)
+            .map(|preference| preference.index)
+    }
+    pub async fn forget_input(&self, name: &str) {
+        self.input_preferences.lock().await.remove(name);
+    }
+    pub async fn prune_input_preferences(&self, config: &crate::config::ConfigStore) {
+        let mut preferences = self.input_preferences.lock().await;
+        // Read the current root while holding the preference lock. A delayed
+        // caller must never prune a preference accepted against a newer edit.
+        config.read(|root| {
+            preferences.retain(|name, preference| {
+                crate::config::effective(root, name).and_then(|cfg| input_fingerprint(&cfg))
+                    == Some(preference.inputs)
+            });
+        });
+    }
+    pub async fn select_input_guarded(
+        &self,
+        name: &str,
+        cfg: &Value,
+        index: usize,
+        current: impl std::future::Future<Output = bool>,
+    ) -> Result<bool, String> {
+        let inputs = cfg["inputs"].as_array().ok_or("stream has no input")?;
+        if index >= inputs.len() {
+            return Err("input is not found by the specified index".into());
+        }
+        if cfg["disabled"] == true {
+            return Err("stream disabled".into());
+        }
+        if inputs.iter().any(|input| input["url"] == "publish://") {
+            return Err("publisher input cannot be selected".into());
+        }
+        let fingerprint = input_fingerprint(cfg).ok_or("stream has no input")?;
+        let _startup = self.startup_gate(name).lock_owned().await;
+        if !current.await {
+            return Err("media route changed".into());
+        }
+        let mut workers = self.workers.lock().await;
+        if workers
+            .get(name)
+            .is_some_and(|worker| worker.publication || worker.shared_generation.is_some())
+        {
+            return Err("shared or publisher worker cannot be selected".into());
+        }
+        let signature = media_signature(cfg);
+        if workers
+            .get(name)
+            .is_some_and(|worker| worker.signature != signature)
+        {
+            return Err("media route changed".into());
+        }
+        let active = workers.get(name).is_some_and(|worker| {
+            worker.alive.load(Ordering::Relaxed)
+                && !worker.is_closed()
+                && worker.signature == signature
+        });
+        // An on-demand worker in retry cooldown still owns recent demand.
+        // Retiring it must immediately hand that demand to the selected input.
+        let retry_demand = workers.get(name).is_some_and(|worker| {
+            !active
+                && worker.signature == signature
+                && (worker.idle_seconds() < 60
+                    || worker.viewers.load(Ordering::Relaxed) > 0
+                    || worker.active_pushes)
+        });
+        let same = active
+            && workers
+                .get(name)
+                .is_some_and(|worker| worker.input_index == index);
+        self.input_preferences.lock().await.insert(
+            name.to_owned(),
+            InputPreference {
+                index,
+                inputs: fingerprint,
+            },
+        );
+        if same {
+            return Ok(false);
+        }
+        let retired = workers.remove(name);
+        drop(workers);
+        if let Some(worker) = retired {
+            self.stop_worker(name, worker).await;
+        }
+        Ok(active || retry_demand)
     }
     pub async fn publish_guarded(
         &self,
@@ -408,6 +509,11 @@ impl Engine {
             return Err("HLS caption conversion requires a real H.264/HEVC video source; GPU conversion is not qualified".into());
         }
         let _startup = self.startup_gate(name).lock_owned().await;
+        let preferred_input = if publishing.is_none() && shared.is_none() {
+            self.preferred_input(name, cfg).await
+        } else {
+            None
+        };
         let profile = crate::transcoder::Profile::resolve(cfg, false)?;
         // A DESCRIBE-only codec probe must not hold the global worker map over
         // a network round trip. A per-stream gate prevents cold-viewer herds.
@@ -431,7 +537,7 @@ impl Engine {
                 .filter(|w| {
                     !running && w.signature == signature && w.shared_generation == shared_generation
                 })
-                .map_or(0, |w| w.input_index + 1);
+                .map_or(preferred_input.unwrap_or(0), |w| w.input_index + 1);
             if running {
                 None
             } else {
@@ -532,7 +638,7 @@ impl Engine {
             return Err("media route changed".into());
         }
         let signature = media_signature(cfg);
-        let mut index = 0;
+        let mut index = preferred_input.unwrap_or(0);
         let mut restart_count = 0;
         let mut streak = 0;
         let mut last_access = Arc::new(std::sync::Mutex::new(
@@ -2038,6 +2144,11 @@ pub fn media_signature(cfg: &Value) -> String {
     format!("{:x}",Sha256::digest(serde_json::to_vec(&json!({"inputs":cfg["inputs"],"transcoder":cfg["transcoder"],"pushes":cfg["pushes"],"direct_outputs":cfg["flussonix_rtp_outputs"],"peer":cfg["flussonix_peer_key"],"allow_insecure_peer_http":cfg["flussonix_allow_insecure_peer_http"],"timeout":cfg["flussonix_input_timeout"],"subtitle_tracks":cfg["flussonix_subtitle_tracks"],"hls_captions":cfg["flussonix_hls_captions"],"hls_subtitles":cfg["flussonix_hls_subtitles"]})).unwrap()))
 }
 
+fn input_fingerprint(cfg: &Value) -> Option<[u8; 32]> {
+    cfg["inputs"].as_array()?;
+    Some(Sha256::digest(serde_json::to_vec(&cfg["inputs"]).ok()?).into())
+}
+
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
@@ -2632,6 +2743,42 @@ mod ts_backlog_tests {
             assert!(a[..4].iter().chain(a[8..].iter()).all(|b| *b == 0x47));
             assert_eq!(a, b);
         }
+    }
+}
+
+#[cfg(test)]
+mod input_selection_lock_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn selection_teardown_does_not_block_unrelated_worker_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(dir.path(), "ffmpeg"));
+        let config = json!({"inputs":[{"url":"testsrc://"},{"url":"testsrc://"}]});
+        let worker = engine.ensure("switching", &config).await.unwrap();
+        engine.ensure("unrelated", &config).await.unwrap();
+        let hold_completion = worker.done.lock().await;
+        let selecting = {
+            let engine = engine.clone();
+            let config = config.clone();
+            tokio::spawn(async move {
+                engine
+                    .select_input_guarded("switching", &config, 1, std::future::ready(true))
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !worker.cancel.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let unrelated = tokio::time::timeout(Duration::from_millis(250), engine.count()).await;
+        drop(hold_completion);
+        selecting.await.unwrap().unwrap();
+        assert_eq!(unrelated.unwrap(), 1);
+        engine.stop_all().await;
     }
 }
 

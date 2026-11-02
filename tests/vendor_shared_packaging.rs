@@ -311,6 +311,43 @@ async fn feed_samples(feed: Feed) {
     std::future::pending::<()>().await;
 }
 
+#[tokio::test]
+async fn manual_native_input_selection_cannot_replace_an_active_shared_packager() {
+    let mut fixture = Fixture::start(false).await;
+    let registry = SharedInputs::new(fixture.owner.clone());
+    let rows = fixture.inventory(Duration::from_secs(30)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "ffmpeg");
+    let playback = engine
+        .package_shared(
+            attach(&fixture, fixture.admitted(&rows, "one").await, &registry),
+            &options(),
+        )
+        .await
+        .unwrap();
+    let connection = fixture.connection().await;
+    let feeder = tokio::spawn(feed_audio(connection.feed));
+    let mut native = playback.subscribe_m4s().unwrap();
+    receive(&mut native).await;
+    let pid = playback.pid();
+    let result = engine
+        .select_input_guarded(
+            NAME,
+            &json!({"inputs":[{"url":"testsrc://"}]}),
+            0,
+            std::future::ready(true),
+        )
+        .await;
+    let active = engine.count().await;
+    let unchanged = playback.pid() == pid && playback.current().is_ok();
+    engine.stop_all().await;
+    feeder.abort();
+    let _ = feeder.await;
+    assert!(result.is_err());
+    assert_eq!(active, 1);
+    assert!(unchanged);
+}
+
 // Reopening HTTP/FFmpeg per viewer or retaining the first grant breaks this path.
 #[tokio::test]
 async fn shared_packager_reuses_one_pull_and_keeps_second_viewer_after_revocation() {

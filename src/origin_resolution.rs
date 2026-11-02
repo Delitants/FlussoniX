@@ -152,6 +152,11 @@ impl App {
     }
     pub(super) async fn stream_stats(&self, name: &str) -> Value {
         let mut stats = self.media.stats(name).await;
+        if let Some(config) = self.config.effective(name)
+            && let Some(index) = self.media.preferred_input(name, &config).await
+        {
+            stats["preferred_input_index"] = json!(index);
+        }
         if let Some(m) = self
             .mirrors
             .lock()
