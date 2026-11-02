@@ -1,4 +1,5 @@
 //! One private input per generation; viewer grants remain independently owned.
+mod bridge;
 mod feed;
 mod permission;
 mod renewal;
