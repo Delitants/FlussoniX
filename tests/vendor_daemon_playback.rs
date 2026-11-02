@@ -1879,6 +1879,95 @@ async fn fmp4_hls_child_segments_are_guarded_and_decode_with_init() {
     assert!(result.unwrap().status.success());
 }
 
+#[tokio::test]
+async fn vendor_hls_master_aliases_preserve_authorized_child_playback() {
+    use sha2::{Digest, Sha256};
+    let hash = format!("{:x}", Sha256::digest(b"alias-viewer"));
+    let f = Fixture::new(json!({"flussonix_token_sha256": hash})).await;
+    let denied = f.get("/owned/index.ts.m3u8?token=wrong").await.status();
+    let mut results = Vec::new();
+    for (alias, child, extension) in [
+        ("index.ts.m3u8", "index.m3u8", ".ts"),
+        ("index.fmp4.m3u8", "fmp4/index.m3u8", ".m4s"),
+    ] {
+        let response = f.get(&format!("/owned/{alias}?token=alias-viewer")).await;
+        let status = response.status();
+        let body = String::from_utf8(bytes(response).await.to_vec()).unwrap();
+        let child_line = body.lines().find(|line| line.starts_with(child));
+        let (child_status, child_body, segment_status, unguarded_status) =
+            if let Some(line) = child_line {
+                let child_response = f.get(&format!("/owned/{line}")).await;
+                let child_status = child_response.status();
+                let child_body = String::from_utf8(bytes(child_response).await.to_vec()).unwrap();
+                let segment = child_body
+                    .lines()
+                    .find(|line| !line.is_empty() && !line.starts_with('#'));
+                let (segment_status, unguarded_status) = if let Some(segment) = segment {
+                    let parent = child.rsplit_once('/').map_or("", |(parent, _)| parent);
+                    let relative = if parent.is_empty() {
+                        segment.to_owned()
+                    } else {
+                        format!("{parent}/{segment}")
+                    };
+                    let segment_status = f.get(&format!("/owned/{relative}")).await.status();
+                    let unguarded_status = f
+                        .get(&format!("/owned/{}", relative.split('?').next().unwrap()))
+                        .await
+                        .status();
+                    (segment_status, unguarded_status)
+                } else {
+                    (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND)
+                };
+                (child_status, child_body, segment_status, unguarded_status)
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    String::new(),
+                    StatusCode::NOT_FOUND,
+                    StatusCode::NOT_FOUND,
+                )
+            };
+        results.push((
+            status,
+            body,
+            child_status,
+            child_body,
+            segment_status,
+            unguarded_status,
+            child,
+            extension,
+        ));
+    }
+    f.stop().await;
+    assert_eq!(denied, StatusCode::FORBIDDEN);
+    for (
+        status,
+        body,
+        child_status,
+        child_body,
+        segment_status,
+        unguarded_status,
+        child,
+        extension,
+    ) in results
+    {
+        assert_eq!(status, StatusCode::OK, "{child}: {body}");
+        assert!(body.contains("#EXT-X-STREAM-INF:BANDWIDTH="));
+        assert!(body.contains(&format!("{child}?token=alias-viewer")));
+        assert!(!body.contains("flussonix_ticket"));
+        assert!(!body.contains("flussonix_handoff"));
+        assert_eq!(child_status, StatusCode::OK, "{child}: {body}");
+        assert!(
+            child_body
+                .lines()
+                .any(|line| line.split('?').next().unwrap().ends_with(extension)),
+            "{child}: {child_body}"
+        );
+        assert_eq!(segment_status, StatusCode::OK, "{child}: {child_body}");
+        assert_eq!(unguarded_status, StatusCode::FORBIDDEN);
+    }
+}
+
 #[path = "vendor_daemon_playback/placement.rs"]
 mod placement;
 

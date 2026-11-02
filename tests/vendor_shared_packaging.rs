@@ -376,6 +376,98 @@ async fn shared_packager_reuses_one_pull_and_keeps_second_viewer_after_revocatio
     decode(&decoded).await;
 }
 
+#[tokio::test]
+async fn mapped_shared_read_counts_emitted_bytes_and_rechecks_revocation() {
+    let mut f = Fixture::start(false).await;
+    let registry = SharedInputs::new(f.owner.clone());
+    let rows = f.inventory(Duration::from_secs(30)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "ffmpeg");
+    let playback = engine
+        .package_shared(
+            attach(&f, f.admitted(&rows, "mapped").await, &registry),
+            &options(),
+        )
+        .await
+        .unwrap();
+    let conn = f.connection().await;
+    let feeder = tokio::spawn(feed_audio(conn.feed.clone()));
+    let original = ready(&engine, &playback).await;
+    let id = f.auth.snapshots()[0]["id"].as_str().unwrap().to_owned();
+    let before = f.auth.snapshots()[0]["bytes"].as_u64().unwrap();
+    let mapped = engine
+        .read_shared_mapped(&playback, "index.m3u8", |_| {
+            Ok(Bytes::from_static(b"mapped"))
+        })
+        .await;
+    let after = f.auth.snapshots()[0]["bytes"].as_u64().unwrap();
+    let auth = f.auth.clone();
+    let rejected = engine
+        .read_shared_mapped(&playback, "index.m3u8", move |_| {
+            assert!(auth.revoke(&id));
+            Ok(Bytes::from_static(b"must not escape"))
+        })
+        .await;
+    let after_revoke = f.auth.snapshots()[0]["bytes"].as_u64().unwrap();
+    engine.stop_all().await;
+    feeder.abort();
+    let _ = feeder.await;
+    assert!(original.len() > 6);
+    assert_eq!(mapped.unwrap(), Bytes::from_static(b"mapped"));
+    assert_eq!(after - before, 6);
+    assert!(rejected.is_err());
+    assert_eq!(after_revoke, after);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mapped_shared_read_rejects_bytes_after_package_replacement() {
+    let mut f = Fixture::start(false).await;
+    let registry = SharedInputs::new(f.owner.clone());
+    let rows = f.inventory(Duration::from_secs(30)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "ffmpeg"));
+    let first = engine
+        .package_shared(
+            attach(&f, f.admitted(&rows, "first").await, &registry),
+            &options(),
+        )
+        .await
+        .unwrap();
+    let conn = f.connection().await;
+    let feeder = tokio::spawn(feed_audio(conn.feed.clone()));
+    ready(&engine, &first).await;
+    let replacement_registry = SharedInputs::new(f.owner.clone());
+    let replacement = attach(
+        &f,
+        f.admitted(&rows, "replacement").await,
+        &replacement_registry,
+    );
+    let old_pid = first.pid();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let replacement_engine = engine.clone();
+    let result = engine
+        .read_shared_mapped(&first, "index.m3u8", move |_| {
+            tokio::spawn(async move {
+                replacement_engine.stop(NAME).await;
+                let new_playback = replacement_engine
+                    .package_shared(replacement, &options())
+                    .await;
+                let _ = tx.send(new_playback);
+            });
+            let new_playback = rx.recv_timeout(Duration::from_secs(8)).unwrap().unwrap();
+            assert_ne!(new_playback.pid(), old_pid);
+            assert!(new_playback.current().is_ok());
+            Ok(Bytes::from_static(b"stale master"))
+        })
+        .await;
+    let replacement_current = engine.count().await;
+    engine.stop_all().await;
+    feeder.abort();
+    let _ = feeder.await;
+    assert!(result.is_err());
+    assert_eq!(replacement_current, 1);
+}
+
 // A stale admitted source or a caller-provided input must never start HTTP or FFmpeg.
 #[tokio::test]
 async fn invalid_settings_and_stale_authority_fail_before_private_io() {
