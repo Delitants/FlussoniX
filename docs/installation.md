@@ -88,7 +88,9 @@ the stream's **Built-in IPTV subscribers** viewer policy. Playlist links appear
 only when the public origin is set. Subscriber tokens are stored in
 `$flussonix_data/iptv.json` by default, separately from `config.json`, with
 owner-only permissions. `--iptv-data /absolute/path/iptv.json` selects another
-location; back it up with the rest of your state. Session limits are local on a
+location; its parent directory must belong to the daemon user, must not be a
+symlink, and must not be group or world writable. Back it up with the rest of
+your state. Session limits are local on a
 single standalone node. For a FlussoniX cluster, configure one shared IPTV
 authority on every viewer-serving node so the limit applies across those nodes;
 see [IPTV transport and authority setup](iptv-transport.md). Existing Flussonic

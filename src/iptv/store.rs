@@ -3,12 +3,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(not(unix))]
+use std::fs;
 
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PACKAGES: usize = 1_024;
@@ -462,17 +465,35 @@ fn parse_expiry(value: &str) -> Result<SystemTime, String> {
 }
 
 pub(crate) fn read_document(path: &Path) -> Result<Option<IptvDocument>, String> {
-    let mut options = OpenOptions::new();
-    options.read(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
-    }
-    let mut file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err("cannot open IPTV data file".into()),
+    let (parent, name) = open_trusted_parent(path)?;
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err("cannot open IPTV data file".into());
+        }
+        unsafe { File::from_raw_fd(fd) }
+    };
+    #[cfg(not(unix))]
+    let mut file = {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("cannot open IPTV data file".into()),
+        }
     };
     let metadata = file.metadata().map_err(|_| "cannot stat IPTV data file")?;
     if !metadata.is_file() {
@@ -480,7 +501,10 @@ pub(crate) fn read_document(path: &Path) -> Result<Option<IptvDocument>, String>
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err("IPTV data file must be owned by the daemon user".into());
+        }
         if metadata.permissions().mode() & 0o077 != 0 {
             return Err("IPTV data file must be owner-only (0600)".into());
         }
@@ -500,40 +524,100 @@ pub(crate) fn read_document(path: &Path) -> Result<Option<IptvDocument>, String>
     Ok(Some(document))
 }
 
-pub(crate) fn save_document(path: &Path, bytes: &[u8]) -> Result<(), String> {
+#[cfg(unix)]
+fn open_trusted_parent(path: &Path) -> Result<(File, std::ffi::CString), String> {
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt, fs::OpenOptionsExt};
+
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let name = path.file_name().ok_or("invalid IPTV data path")?;
-    let tmp = parent.join(format!(
-        ".{}.{}.tmp",
-        name.to_string_lossy(),
-        uuid::Uuid::new_v4()
-    ));
-    let result = (|| -> Result<(), String> {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&tmp)
-            .map_err(|_| "cannot create IPTV data file")?;
-        file.write_all(bytes)
-            .map_err(|_| "cannot write IPTV data file")?;
-        file.sync_all().map_err(|_| "cannot sync IPTV data file")?;
-        drop(file);
-        fs::rename(&tmp, path).map_err(|_| "cannot replace IPTV data file")?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| "cannot sync IPTV data directory")?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| "invalid IPTV data path")?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)
+        .map_err(|_| "cannot open IPTV data directory")?;
+    let metadata = directory
+        .metadata()
+        .map_err(|_| "cannot stat IPTV data directory")?;
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+        return Err("IPTV data directory must be daemon-owned and not group/world writable".into());
     }
-    result
+    Ok((directory, name))
+}
+
+pub(crate) fn save_document(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let (directory, name) = open_trusted_parent(path)?;
+        let temp_name = std::ffi::CString::new(format!(".iptv-{}.tmp", uuid::Uuid::new_v4()))
+            .map_err(|_| "invalid IPTV data path")?;
+        let dirfd = directory.as_raw_fd();
+        let fd = unsafe {
+            libc::openat(
+                dirfd,
+                temp_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err("cannot create IPTV data file".into());
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let result = (|| -> Result<(), String> {
+            file.write_all(bytes)
+                .map_err(|_| "cannot write IPTV data file")?;
+            file.sync_all().map_err(|_| "cannot sync IPTV data file")?;
+            drop(file);
+            if unsafe { libc::renameat(dirfd, temp_name.as_ptr(), dirfd, name.as_ptr()) } != 0 {
+                return Err("cannot replace IPTV data file".into());
+            }
+            directory
+                .sync_all()
+                .map_err(|_| "cannot sync IPTV data directory")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            unsafe { libc::unlinkat(dirfd, temp_name.as_ptr(), 0) };
+        }
+        result
+    }
+    #[cfg(not(unix))]
+    {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let name = path.file_name().ok_or("invalid IPTV data path")?;
+        let tmp = parent.join(format!(
+            ".{}.{}.tmp",
+            name.to_string_lossy(),
+            uuid::Uuid::new_v4()
+        ));
+        let result = (|| -> Result<(), String> {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            let mut file = options
+                .open(&tmp)
+                .map_err(|_| "cannot create IPTV data file")?;
+            file.write_all(bytes)
+                .map_err(|_| "cannot write IPTV data file")?;
+            file.sync_all().map_err(|_| "cannot sync IPTV data file")?;
+            drop(file);
+            fs::rename(&tmp, path).map_err(|_| "cannot replace IPTV data file")?;
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| "cannot sync IPTV data directory")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result
+    }
 }

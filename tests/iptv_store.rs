@@ -204,6 +204,59 @@ fn oversized_corrupt_or_unsafe_existing_files_refuse_startup() {
 
 #[cfg(unix)]
 #[test]
+fn iptv_catalog_refuses_untrusted_parent_before_creation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("iptv.json");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(IptvStore::open(path.clone()).is_err());
+    assert!(!path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn iptv_catalog_refuses_foreign_owned_file_even_when_owner_only() {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt, os::unix::fs::PermissionsExt};
+
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("iptv.json");
+    fs::write(&path, serde_json::to_vec(&fixture()).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::chown(cpath.as_ptr(), 65534, 65534) }, 0);
+    assert!(IptvStore::open(path).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn iptv_catalog_refuses_parent_that_becomes_writable_before_save() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("iptv.json");
+    let store = open(&path);
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(replace(&store, fixture()).is_err());
+    assert!(!path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn iptv_catalog_refuses_symlinked_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let actual = dir.path().join("actual");
+    let alias = dir.path().join("alias");
+    fs::create_dir(&actual).unwrap();
+    std::os::unix::fs::symlink(&actual, &alias).unwrap();
+    assert!(IptvStore::open(alias.join("iptv.json")).is_err());
+}
+
+#[cfg(unix)]
+#[test]
 fn nonregular_iptv_fifo_is_rejected_without_blocking_startup() {
     use std::{ffi::CString, os::unix::ffi::OsStrExt, sync::mpsc, time::Duration};
     let dir = tempfile::tempdir().unwrap();
