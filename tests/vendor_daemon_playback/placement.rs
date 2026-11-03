@@ -81,6 +81,59 @@ async fn vendor_http_placement_redeems_once_without_pulling_until_clean_playback
 }
 
 #[tokio::test]
+async fn vendor_hls_master_alias_ticket_redeems_to_clean_authorized_children() {
+    use sha2::{Digest, Sha256};
+    let f = Fixture::variant(
+        json!({"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"viewer"))}),
+        "m4s",
+        "cdn",
+    )
+    .await;
+    let mut results = Vec::new();
+    for (alias, child) in [
+        ("index.ts.m3u8", "index.m3u8"),
+        ("index.fmp4.m3u8", "fmp4/index.m3u8"),
+    ] {
+        let ticket = http_reservation(&f, "owned").await;
+        let path = format!("/owned/{alias}?token=viewer&flussonix_ticket={ticket}");
+        let redeemed = f.get(&path).await;
+        let status = redeemed.status();
+        let clean = redeemed
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .unwrap_or_default();
+        let manifest = f.get(&clean).await;
+        let manifest_status = manifest.status();
+        let manifest_body = String::from_utf8(bytes(manifest).await.to_vec()).unwrap();
+        let child_status = f
+            .get(&format!("/owned/{child}?token=viewer"))
+            .await
+            .status();
+        results.push((
+            alias,
+            child,
+            status,
+            clean,
+            manifest_status,
+            manifest_body,
+            child_status,
+        ));
+    }
+    f.stop().await;
+    for (alias, child, status, clean, manifest_status, body, child_status) in results {
+        assert_eq!(status, StatusCode::FOUND);
+        assert!(clean.starts_with(&format!("/owned/{alias}?")), "{clean}");
+        assert!(!clean.contains("flussonix_ticket"));
+        assert_eq!(manifest_status, StatusCode::OK, "{body}");
+        assert!(body.contains(&format!("{child}?token=viewer")), "{body}");
+        assert!(!body.contains("flussonix_ticket"));
+        assert_eq!(child_status, StatusCode::OK);
+    }
+}
+
+#[tokio::test]
 async fn vendor_http_placement_denied_viewer_cannot_consume_valid_ticket() {
     use sha2::{Digest, Sha256};
     let f =

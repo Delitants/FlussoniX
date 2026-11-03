@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    media::PackagedSubscription,
+    media::{PackagedSubscription, SharedPackagingFailure},
     playback_auth::ViewerRequest,
     server::{error, header, parse_query, rewrite_playlist},
     source_directory::modern_coordinator::AdmissionOutcome,
@@ -229,8 +229,26 @@ impl Runtime {
         // Keep the normal read grace, but do not cut short a current worker's
         // configured startup allowance. The allowance belongs to its generation.
         let deadline = (Instant::now() + Duration::from_secs(8)).max(playback.startup_deadline());
+        let alias = crate::hls_master_alias::Alias::from_file(file);
+        let read_file = alias.map_or(file, |alias| alias.underlying_file());
+        let mut child_query = query.clone();
+        child_query.remove("flussonix_ticket");
+        child_query.remove("flussonix_handoff");
+        let suffix = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(child_query.iter())
+            .finish();
         let bytes = loop {
-            let read = tokio::select! {biased;_=self.closed.cancelled()=>return error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),result=app.media.read_shared(&playback,file)=>result};
+            let read = tokio::select! {biased;_=self.closed.cancelled()=>return error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),result=async {
+                if let Some(alias) = alias {
+                    let worker = playback.worker();
+                    app.media.read_shared_mapped(&playback, read_file, |bytes| {
+                        crate::hls_master_alias::render(alias, &bytes, worker.output_bitrate(), &suffix)
+                            .map_err(|_| SharedPackagingFailure::Unavailable)
+                    }).await
+                } else {
+                    app.media.read_shared(&playback, file).await
+                }
+            }=>result};
             match read {
                 Ok(bytes) => break bytes,
                 Err(_)
@@ -243,10 +261,7 @@ impl Runtime {
                 Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "media not ready"),
             }
         };
-        let bytes = if file.ends_with(".m3u8") {
-            let suffix = url::form_urlencoded::Serializer::new(String::new())
-                .extend_pairs(query.iter())
-                .finish();
+        let bytes = if file.ends_with(".m3u8") && alias.is_none() {
             Bytes::from(rewrite_playlist(&String::from_utf8_lossy(&bytes), &suffix))
         } else {
             bytes

@@ -34,6 +34,7 @@ pub mod peer_hls;
 pub mod recovery;
 
 mod hls_generation;
+mod hls_master_alias;
 
 pub mod source_directory;
 

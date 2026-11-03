@@ -10,6 +10,37 @@ async fn discovered_vendor_lb_routes_guarded_decodable_hls_without_local_stream_
     super::placement::check_native_lb_vendor_cdn("index.m3u8", true).await;
 }
 #[tokio::test]
+async fn vendor_lb_preserves_exact_hls_master_alias_path() {
+    let f = Fixture::variant(json!({"on_play":"true"}), "m4s", "lb").await;
+    let peer = Peer::new().await;
+    peer.configure(&f);
+    let mut results = Vec::new();
+    for alias in ["index.ts.m3u8", "index.fmp4.m3u8"] {
+        let response = f.get(&format!("/owned/{alias}?token=viewer")).await;
+        results.push((
+            alias,
+            response.status(),
+            response
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+        ));
+    }
+    let media_calls = f.media_calls();
+    let media_workers = f.app.media.count().await;
+    peer.stop().await;
+    f.stop().await;
+    for (alias, status, location) in results {
+        assert_eq!(status, StatusCode::FOUND);
+        let location = location.unwrap();
+        assert!(location.contains(&format!("/owned/{alias}?")), "{location}");
+        assert!(location.contains("token=viewer"));
+    }
+    assert_eq!(media_calls, 0);
+    assert_eq!(media_workers, 0);
+}
+#[tokio::test]
 async fn vendor_lb_denial_and_absence_do_not_start_media() {
     use sha2::{Digest, Sha256};
     let f = Fixture::variant(

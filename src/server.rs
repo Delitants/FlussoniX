@@ -192,6 +192,7 @@ pub struct App {
     telemetry: crate::telemetry::Sampler,
     pub started: Instant,
     started_at_epoch_secs: u64,
+    readiness_ha: Mutex<Option<(Instant, bool)>>,
     mirrors: fxlink_access::Mirrors,
     source_queries: tokio::sync::Semaphore,
     source_activation: Mutex<source_activation::State>,
@@ -466,6 +467,7 @@ impl App {
             telemetry: crate::telemetry::Sampler::new(&options.uplink_interface)?,
             started,
             started_at_epoch_secs,
+            readiness_ha: Mutex::new(None),
             mirrors: fxlink_access::Mirrors::default(),
             source_queries: tokio::sync::Semaphore::new(64),
             source_activation: Mutex::new(source_activation::State::default()),
@@ -1151,6 +1153,8 @@ pub(crate) fn parse_query(q: Option<&str>) -> HashMap<String, String> {
 }
 pub fn router(app: Arc<App>) -> Router {
     Router::new().route("/health",axum::routing::get(||async{axum::Json(json!({"status":"ok","service":"FlussoniX","version":env!("CARGO_PKG_VERSION")}))}))
+ .route("/streamer/api/v3/monitoring/liveness",axum::routing::get(monitoring_liveness))
+ .route("/streamer/api/v3/monitoring/readiness",axum::routing::get(monitoring_readiness))
  .route("/streamer/api/v3/{*tail}",axum::routing::any(management))
  .route("/tv/playlists/{subscriber}",axum::routing::get(iptv_playlist_http))
  .route("/flussonix/peer/v1/iptv/leases/status",axum::routing::post(iptv_peer::status))
@@ -1164,6 +1168,47 @@ pub fn router(app: Arc<App>) -> Router {
  .route("/flussonix/api/v1/{*tail}",axum::routing::any(native))
  .nest_service("/admin",tower_http::services::ServeDir::new(&app.options.web_dir).append_index_html_on_directories(true))
  .fallback(media_request).with_state(app).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024))
+}
+fn monitoring_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+async fn monitoring_liveness() -> impl IntoResponse {
+    axum::Json(json!({
+        "now": monitoring_now(),
+        "build": 0,
+        "server_version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+async fn monitoring_readiness(State(app): State<Arc<App>>) -> Response {
+    if let Some(pool) = &app.iptv_ha_pool {
+        // Coalesce concurrent probes and bound both database work and cache lifetime.
+        let mut cached = app.readiness_ha.lock().await;
+        let ready = match *cached {
+            Some((checked, ready)) if checked.elapsed() < Duration::from_secs(2) => ready,
+            _ => {
+                let ready = tokio::time::timeout(Duration::from_secs(9), pool.verify_startup())
+                    .await
+                    .is_ok_and(|result| result.is_ok());
+                *cached = Some((Instant::now(), ready));
+                ready
+            }
+        };
+        if !ready {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "Service is not ready");
+        }
+    }
+    axum::Json(json!({
+        "now": monitoring_now(),
+        "build": 0,
+        "started_at": app.started_at_epoch_secs,
+        "server_version": env!("CARGO_PKG_VERSION"),
+    }))
+    .into_response()
 }
 async fn iptv_playlist_http(
     State(app): State<Arc<App>>,
@@ -1269,6 +1314,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         let result = app.config.replace(body);
         return match result {
             Ok(v) => {
+                app.media.prune_input_preferences(&app.config).await;
                 app.invalidate_sessions().await;
                 app.reconcile().await;
                 json_response(v)
@@ -1336,6 +1382,69 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         return error(StatusCode::NOT_FOUND, "API operation not implemented");
     }
     if let Some(name) = name {
+        if kind == "streams" && method == "POST" && name.contains("/inputs/") {
+            let Some((stream, tail)) = name.rsplit_once("/inputs/") else {
+                return error(StatusCode::BAD_REQUEST, "invalid input selection path");
+            };
+            let Some(index) = tail.strip_suffix("/select") else {
+                return error(StatusCode::BAD_REQUEST, "invalid input selection path");
+            };
+            if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+                return error(StatusCode::BAD_REQUEST, "invalid input index");
+            }
+            let Ok(index) = index.parse::<usize>() else {
+                return error(StatusCode::BAD_REQUEST, "invalid input index");
+            };
+            if !matches!(
+                axum::body::to_bytes(request.into_body(), 1).await,
+                Ok(bytes) if bytes.is_empty()
+            ) {
+                return error(StatusCode::BAD_REQUEST, "input selection has no body");
+            }
+            let revision = app.config.revision();
+            let Some(config) = app
+                .config
+                .at_revision(revision, |root| crate::config::effective(root, stream))
+            else {
+                return error(StatusCode::BAD_REQUEST, "stream configuration changed");
+            };
+            let Some(config) = config else {
+                return error(StatusCode::NOT_FOUND, "stream not found");
+            };
+            if config["inputs"]
+                .as_array()
+                .is_none_or(|inputs| index >= inputs.len())
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "input is not found by the specified index",
+                );
+            }
+            let config_store = app.config.clone();
+            let result = app
+                .media
+                .select_input_guarded(stream, &config, index, async move {
+                    config_store.revision() == revision
+                })
+                .await;
+            if app.config.revision() != revision {
+                app.media.prune_input_preferences(&app.config).await;
+                return error(StatusCode::BAD_REQUEST, "stream configuration changed");
+            }
+            return match result {
+                Ok(was_active) => {
+                    if app.options.role != "lb" && (was_active || config["static"] != false) {
+                        let app = app.clone();
+                        let stream = stream.to_owned();
+                        tokio::spawn(async move {
+                            app.recover_current(&stream, &config, revision).await;
+                        });
+                    }
+                    StatusCode::NO_CONTENT.into_response()
+                }
+                Err(message) => error(StatusCode::BAD_REQUEST, &message),
+            };
+        }
         if kind == "streams" && method == "POST" && name.ends_with("/stop") {
             let name = name.trim_end_matches("/stop");
             app.playback_auth.stop_playback(name);
@@ -1372,6 +1481,9 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
             };
             return match app.config.put(kind, name, body) {
                 Ok(mut v) => {
+                    if matches!(kind, "streams" | "templates") {
+                        app.media.prune_input_preferences(&app.config).await;
+                    }
                     app.invalidate_sessions().await;
                     if kind == "sources" {
                         app.invalidate_sessions().await;
@@ -1393,6 +1505,9 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         if method == "DELETE" {
             return match app.config.delete(kind, name) {
                 Ok(true) => {
+                    if matches!(kind, "streams" | "templates") {
+                        app.media.prune_input_preferences(&app.config).await;
+                    }
                     app.invalidate_sessions().await;
                     if kind == "streams" {
                         app.media.stop(name).await;
@@ -2666,12 +2781,14 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         )
             .into_response();
     }
+    let alias = crate::hls_master_alias::Alias::from_file(file);
+    let read_file = alias.map_or(file, |alias| alias.underlying_file());
     let deadline = Instant::now() + Duration::from_secs(8);
     let bytes = loop {
         if grant.is_cancelled() {
             return error(StatusCode::FORBIDDEN, "playback revoked");
         }
-        match app.media.read(name, file).await {
+        match app.media.read(name, read_file).await {
             Ok(b) => break b,
             Err(_)
                 if file.ends_with(".m3u8")
@@ -2690,11 +2807,20 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         let suffix = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(q.iter())
             .finish();
-        Bytes::from(rewrite_playlist(&String::from_utf8_lossy(&bytes), &suffix))
+        if let Some(alias) = alias {
+            match crate::hls_master_alias::render(alias, &bytes, worker.output_bitrate(), &suffix) {
+                Ok(master) => master,
+                Err(_) => {
+                    return error(StatusCode::SERVICE_UNAVAILABLE, "HLS master unavailable");
+                }
+            }
+        } else {
+            Bytes::from(rewrite_playlist(&String::from_utf8_lossy(&bytes), &suffix))
+        }
     } else {
         bytes
     };
-    if grant.is_cancelled() {
+    if grant.is_cancelled() || (alias.is_some() && worker.is_closed()) {
         return error(StatusCode::FORBIDDEN, "playback revoked");
     }
     grant.add_bytes(bytes.len());

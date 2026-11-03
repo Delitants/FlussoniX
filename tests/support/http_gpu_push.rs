@@ -107,6 +107,18 @@ async fn decoded_with_video(path: &Path, video: &str, audio: &str) -> Value {
         .await
         .expect("independent full decode is bounded")
         .unwrap();
+    if (!output.status.success() || !output.stderr.is_empty())
+        && let Some(root) = std::env::var_os("FLUSSONIX_HTTP_GPU_FAILURE_DIR")
+    {
+        // Retain only a failed, owned test capture. The receiver already caps
+        // each session at 4 MiB; successful media does not fill CI artifacts.
+        let root = std::path::PathBuf::from(root);
+        if std::fs::create_dir_all(&root).is_ok()
+            && let Some(name) = path.file_name()
+        {
+            let _ = std::fs::copy(path, root.join(name));
+        }
+    }
     assert!(
         output.status.success() && output.stderr.is_empty(),
         "{}",

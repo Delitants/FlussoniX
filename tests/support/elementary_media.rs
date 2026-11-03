@@ -234,12 +234,27 @@ pub async fn qualify(
     if let Some(evidence) = &evidence {
         evidence.watch_process("native_test_process", std::process::id());
     }
-    let (input, reserved) = ports();
+    let (input, input_reserved) = ports();
     #[cfg(target_os = "linux")]
     if packet_taps {
         elementary_packet_taps::check_capability(evidence.as_ref().unwrap())
             .expect("Owned packet tap setup failed; Linux CAP_NET_RAW is required");
     }
+    #[cfg(target_os = "linux")]
+    let mut public_tap = if packet_taps {
+        let public_sockets = (audio.len() + usize::from(video.is_some())) * 2;
+        Some(
+            elementary_packet_taps::Tap::public_prestart(
+                &input_reserved[..public_sockets],
+                evidence.as_ref().unwrap(),
+                artifact.as_ref().unwrap(),
+                fixture_origin,
+            )
+            .expect("Owned pre-sender public packet tap setup failed"),
+        )
+    } else {
+        None
+    };
     let (input_sdp, output_sdp) = (d.path().join("input.sdp"), d.path().join("output.sdp"));
     let mut sender = Command::new(&ffmpeg);
     sender.args([
@@ -334,7 +349,16 @@ pub async fn qualify(
         .stderr(std::fs::File::create(d.path().join("sender.log")).unwrap())
         .kill_on_drop(true);
     stage("sender_spawn");
+    #[cfg(target_os = "linux")]
+    if let Some(tap) = &mut public_tap {
+        tap.sender_spawning(fixture_origin)
+            .expect("Pre-sender packet tap spawn marker failed");
+    }
     let mut sender = sender.spawn().unwrap();
+    // Drop the tap before the sender on SDP-startup failures, while its socket
+    // identity is still available for evidence validation.
+    #[cfg(target_os = "linux")]
+    let mut public_tap = public_tap;
     if let Some(evidence) = &evidence {
         evidence.watch_process("sender", sender.id().unwrap());
     }
@@ -350,6 +374,12 @@ pub async fn qualify(
     })
     .await
     .unwrap();
+    #[cfg(target_os = "linux")]
+    if let Some(tap) = &mut public_tap {
+        let public_sockets = (audio.len() + usize::from(video.is_some())) * 2;
+        tap.bind_sender(sender.id().unwrap(), public_sockets, fixture_origin)
+            .expect("Owned sender packet tap witness failed");
+    }
     if secure_input {
         // FFmpeg emits AVP + inline SDES even for encrypted SRTP. Only the owned
         // test fixture converts it to our explicitly out-of-band SAVP descriptor.
@@ -364,7 +394,6 @@ pub async fn qualify(
         std::fs::write(&input_sdp, text).unwrap();
         std::fs::set_permissions(&input_sdp, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
-    let input_reserved = reserved;
     // Keep the output pairs owned until FFmpeg is ready to bind them; the native
     // sender can publish actual SDP without provoking ICMP destination failures.
     let (output, reserved) = ports();
@@ -387,7 +416,7 @@ pub async fn qualify(
     let engine = Engine::new(d.path().join("media"), executable.to_str().unwrap());
     // Shadow the moved guard so unwinding stops capture before dropping the engine.
     #[cfg(target_os = "linux")]
-    let mut public_tap = None;
+    let mut public_tap = public_tap;
     #[cfg(target_os = "linux")]
     let mut decoder_tap = None;
     if profile["encoder"]
@@ -402,6 +431,14 @@ pub async fn qualify(
             .await
             .unwrap();
         engine.stop_all().await;
+    }
+    #[cfg(target_os = "linux")]
+    if packet_taps {
+        public_tap
+            .as_mut()
+            .unwrap()
+            .release_reservation(fixture_origin)
+            .expect("Public reservation changed before release");
     }
     drop(input_reserved);
     let mut cfg = json!({"inputs":[{"url":format!("{input_scheme}://127.0.0.1:{input}"),"flussonix_rtp":{"profile":"elementary","sdp_file":input_sdp}}],"flussonix_rtp_outputs":[{"url":format!("{output_scheme}://127.0.0.1:{output}"),"flussonix_rtp":{"profile":"elementary"}}],"transcoder":profile,"flussonix_input_timeout":15});
@@ -468,17 +505,11 @@ pub async fn qualify(
         );
         #[cfg(target_os = "linux")]
         if packet_taps {
-            public_tap = Some(
-                elementary_packet_taps::Tap::native_input(
-                    std::process::id(),
-                    &(input..input + (audio.len() + usize::from(video.is_some())) as u16 * 2)
-                        .collect::<Vec<_>>(),
-                    evidence.as_ref().unwrap(),
-                    artifact.as_ref().unwrap(),
-                    fixture_origin,
-                )
-                .expect("Owned native input packet tap setup failed"),
-            );
+            public_tap
+                .as_mut()
+                .unwrap()
+                .bind_native(std::process::id(), fixture_origin)
+                .expect("Owned native input handoff verification failed");
             let ports = local
                 .iter()
                 .map(|address| {
@@ -615,16 +646,23 @@ pub async fn qualify(
     }
     record_cancel.cancel();
     recording.await.unwrap();
-    let _ = sender.kill().await;
-    let _ = sender.wait().await;
     if result.is_err() {
         let _ = receiver.kill().await;
         let _ = receiver.wait().await;
     }
-    let stats = worker.stats();
     stage("worker_shutdown");
     // Stop while the input/decoder still own their destination ports. Submit the
     // in-memory recordings only after the worker has stopped.
+    #[cfg(target_os = "linux")]
+    {
+        // Quiesce only this owned synthetic sender. Let the native reorder
+        // timer account for any final sequence gap before taking final stats.
+        assert_eq!(
+            unsafe { libc::kill(sender.id().unwrap() as i32, libc::SIGSTOP) },
+            0
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     #[cfg(target_os = "linux")]
     {
         if let Some(tap) = &mut public_tap {
@@ -634,8 +672,11 @@ pub async fn qualify(
             tap.stop();
         }
     }
+    let _ = sender.kill().await;
+    let _ = sender.wait().await;
     engine.stop_all().await;
     stage("worker_stopped");
+    let stats = worker.stats();
     #[cfg(target_os = "linux")]
     {
         drop(public_tap);
@@ -655,6 +696,17 @@ pub async fn qualify(
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
+    }
+    for counter in [
+        "lost",
+        "startup_dropped_packets",
+        "startup_dropped_rtcp_packets",
+    ] {
+        assert_eq!(
+            stats["direct_rtp_input"][counter].as_u64(),
+            Some(0),
+            "controlled elementary input {counter} must be zero: {stats}"
+        );
     }
     let status = result
         .unwrap_or_else(|_| {

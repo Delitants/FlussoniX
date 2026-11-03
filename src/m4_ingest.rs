@@ -670,6 +670,7 @@ async fn consume_guarded_session<W: AsyncWrite + Unpin>(
                 for f in &frames {
                     write_frame(stdin, &mut session.muxer, f, subtitles.diagnostic).await?;
                 }
+                stdin.flush().await.map_err(|_| "media pipe closed")?;
                 session.published(&n, media_start);
             }
         } else {
