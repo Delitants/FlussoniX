@@ -407,6 +407,12 @@ mod tests {
     use crate::fxlink::Request as LinkRequest;
     use futures_util::StreamExt;
     fn app(dir: &Path) -> Arc<App> {
+        std::fs::create_dir_all(dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         App::new(
             dir.join("config.json"),
             dir.join("media"),
