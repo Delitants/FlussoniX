@@ -278,6 +278,61 @@ async fn check_source_cdn_balancer(transport: &str) {
             .iter()
             .any(|s| s["codec_name"] == "h264")
     );
+    if transport == "m4s" {
+        for (alias, child_name, extension) in [
+            ("index.ts.m3u8", "index.m3u8", ".ts"),
+            ("index.fmp4.m3u8", "fmp4/index.m3u8", ".m4s"),
+        ] {
+            let route = client
+                .get(format!(
+                    "{lb_url}/region/news/{alias}?token=viewer-test-token"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(route.status(), 302);
+            let destination = route.headers()["location"].to_str().unwrap();
+            assert!(destination.contains(&format!("/region/news/{alias}?")));
+            let redeemed = client.get(destination).send().await.unwrap();
+            assert_eq!(redeemed.status(), 302);
+            let clean = redeemed.headers()["location"].to_str().unwrap();
+            assert!(clean.starts_with(&format!("/region/news/{alias}?")));
+            assert!(!clean.contains("flussonix_ticket"));
+            let entry_url = url::Url::parse(&format!("{cdn_url}{clean}")).unwrap();
+            let master = client.get(entry_url.clone()).send().await.unwrap();
+            assert_eq!(master.status(), 200);
+            let master = master.text().await.unwrap();
+            assert!(master.contains("#EXT-X-STREAM-INF:BANDWIDTH="), "{master}");
+            assert!(
+                master.contains(&format!("{child_name}?token=viewer-test-token")),
+                "{master}"
+            );
+            let child = master
+                .lines()
+                .find(|line| !line.is_empty() && !line.starts_with('#'))
+                .unwrap();
+            let child_url = entry_url.join(child).unwrap();
+            let media = client.get(child_url.clone()).send().await.unwrap();
+            assert_eq!(media.status(), 200);
+            let media = media.text().await.unwrap();
+            let segment = media
+                .lines()
+                .find(|line| !line.is_empty() && !line.starts_with('#'))
+                .unwrap();
+            assert!(
+                segment.split('?').next().unwrap().ends_with(extension),
+                "{media}"
+            );
+            let segment_url = child_url.join(segment).unwrap();
+            let denied = client
+                .get(segment_url.as_str().split('?').next().unwrap())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), 403);
+            assert_eq!(client.get(segment_url).send().await.unwrap().status(), 200);
+        }
+    }
     for app in [&source, &cdn, &lb] {
         app.media.stop_all().await;
     }

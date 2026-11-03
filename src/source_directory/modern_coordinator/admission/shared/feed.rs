@@ -33,6 +33,9 @@ impl SharedViewer {
     }
 }
 impl SharedFeed {
+    pub(crate) fn drain(&self) -> Arc<SharedDrain> {
+        self.worker.drain.clone()
+    }
     pub(crate) fn static_demand(&self) -> impl Fn() -> bool + Send + Sync + 'static {
         let worker = self.worker.clone();
         move || {
@@ -47,6 +50,14 @@ impl SharedFeed {
         let worker = self.worker.clone();
         move || {
             let _ = worker.input_failed(crate::m4_ingest::flussonic::InputFailure::Transient, true);
+        }
+    }
+    /// The child-stdin owner commits a local failure before media cancellation
+    /// can drop the source run future and lose its typed recovery notice.
+    pub(crate) fn local_failure(&self) -> impl Fn() + Send + Sync + 'static {
+        let worker = self.worker.clone();
+        move || {
+            let _ = worker.input_failed(crate::m4_ingest::flussonic::InputFailure::Local, false);
         }
     }
 
@@ -164,6 +175,9 @@ impl SharedFeed {
             authority: Some(&authority),
         };
         loop {
+            if worker.drain.is_complete() {
+                return Ok(());
+            }
             if !authority() {
                 return Err(failure().into());
             }
@@ -172,9 +186,15 @@ impl SharedFeed {
                 std::sync::atomic::Ordering::Relaxed,
             );
             let bytes = tokio::select! {biased;
-                _=worker.cancel.cancelled()=>return Err("shared source closed".into()),
+                _=worker.cancel.cancelled()=>{
+                    return if worker.drain.is_complete() { Ok(()) } else { Err("shared source closed".into()) };
+                },
                 _=tick.tick()=>continue,
-                result=receiver.recv()=>result.ok_or("shared source pipe closed")?,
+                result=receiver.recv()=>match result {
+                    Some(bytes)=>bytes,
+                    None if worker.drain.is_complete()=>return Ok(()),
+                    None=>return Err("shared source pipe closed".into()),
+                },
             };
             if !authority() {
                 return Err(failure().into());
@@ -189,7 +209,8 @@ impl SharedFeed {
                     },
                     result=&mut write=>{
                         if unsupported(){return Err(failure().into());}
-                        result.map_err(|_|"media pipe closed")?;break;
+                        result.map_err(|_|"media pipe closed")?;
+                        break;
                     },
                 }
             }

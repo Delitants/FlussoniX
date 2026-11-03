@@ -154,6 +154,74 @@ async fn elementary_roundtrip_cpu_h264_hevc_and_all_audio_codecs_decode() {
         }
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "isolated HEVC/MP3 intermittent-loss diagnostic; use a fresh evidence directory"]
+async fn diagnostic_hevc_mp3_plaintext_input_once() {
+    qualify(
+        Some("libx265"),
+        &["libmp3lame"],
+        json!({"encoder":"copy","acodec":"copy"}),
+        false,
+        false,
+    )
+    .await;
+}
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires CAP_NET_RAW, system FFmpeg and a fresh owned artifact directory"]
+async fn elementary_handoff_capture_starts_before_public_release() {
+    let base = std::env::var("FLUSSONIX_ELEMENTARY_ARTIFACT_DIR")
+        .expect("set a fresh owner-only artifact directory");
+    assert_eq!(
+        std::env::var("FLUSSONIX_ELEMENTARY_PACKET_TAPS").as_deref(),
+        Ok("1")
+    );
+    let case = std::path::Path::new(&base).join("libx265-mp2-copy-false-false");
+    assert!(!case.exists(), "this case needs a fresh artifact directory");
+    qualify(
+        Some("libx265"),
+        &["mp2"],
+        json!({"encoder":"copy","acodec":"copy"}),
+        false,
+        false,
+    )
+    .await;
+    let entries = std::fs::read_to_string(case.join("boundary-evidence.jsonl")).unwrap();
+    let taps: Vec<serde_json::Value> = entries
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .flat_map(|entry| entry["packet_taps"].as_array().cloned().unwrap_or_default())
+        .collect();
+    let public = taps
+        .iter()
+        .find(|tap| tap["boundary"] == "source_to_public")
+        .unwrap();
+    let private = taps
+        .iter()
+        .find(|tap| tap["boundary"] == "relay_to_decoder")
+        .unwrap();
+    let ns = |tap: &serde_json::Value, name: &str| tap[name].as_u64().unwrap_or(0);
+    assert!(
+        ns(public, "coverage_start_ns") < ns(public, "sender_spawn_ns")
+            && ns(public, "sender_spawn_ns") < ns(public, "sender_witness_ns")
+            && ns(public, "sender_witness_ns") < ns(public, "reservation_release_ns")
+            && ns(public, "reservation_release_ns") < ns(public, "native_owner_verified_ns")
+            && ns(public, "native_owner_verified_ns") < ns(public, "coverage_end_ns"),
+        "public capture must span reservation release and native bind: {public}"
+    );
+    assert!(ns(private, "coverage_start_ns") >= ns(public, "native_owner_verified_ns"));
+    if public["observation"] == "unavailable" {
+        assert!(!case.join("source_to_public.packets").exists());
+    } else {
+        assert_eq!(public["handoff_captured"], true);
+        assert_eq!(public["source_prefix_unobserved"], true);
+        assert_eq!(public["startup_not_observed"], true);
+        assert_eq!(public["sender_prefix_attribution"], "candidate_only");
+        assert_eq!(public["candidate_source_ports_match_sender_witness"], true);
+        assert_eq!(public["incomplete"], false);
+    }
+}
 #[tokio::test]
 async fn elementary_audio_only_and_multiple_mpeg_audio_tracks_remain_distinct() {
     qualify(

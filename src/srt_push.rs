@@ -315,9 +315,13 @@ impl State {
             }
         };
         drop(candidates);
-        // The live source may have advanced while the SRT handshake ran.
-        // Start a fresh feed rather than replaying an evicted TS backlog.
-        *receiver = receiver.resubscribe();
+        // Preserve the initial PAT/PMT and keyframe queued before or during
+        // the handshake. Retries already resubscribe in run(); a genuinely
+        // evicted initial cursor must fail explicitly instead of sending a
+        // media tail without the bootstrap needed by the downstream demuxer.
+        if receiver.is_lagged() {
+            return "push_queue_overflow";
+        }
         let mut cmd = crate::child_process::command(ffmpeg);
         cmd.args([
             "-hide_banner",
@@ -442,5 +446,128 @@ impl State {
         let _ = child.wait().await;
         self.counters.lock().unwrap().pid = 0;
         error
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use crate::media_queue::Channel;
+    use std::process::Stdio;
+
+    #[tokio::test]
+    async fn queued_ts_survives_srt_handshake_before_first_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("source.ts");
+        let generated = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x90:rate=25",
+                "-t",
+                "4",
+                "-c:v",
+                "mpeg2video",
+                "-g",
+                "25",
+                "-f",
+                "mpegts",
+            ])
+            .arg(&fixture)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "fixture generation failed: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let recording = dir.path().join("received.ts");
+        let mut listener = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-probesize",
+                "32768",
+                "-analyzeduration",
+                "100000",
+                "-i",
+                &format!("srt://127.0.0.1:{port}?mode=listener&listen_timeout=10000000"),
+                "-t",
+                "0.5",
+                "-c",
+                "copy",
+                "-f",
+                "mpegts",
+            ])
+            .arg(&recording)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let queue = Channel::live(32 * 1024, 4 * 1024 * 1024);
+        let mut cursor = queue.subscribe();
+        for chunk in std::fs::read(&fixture).unwrap().chunks(1316) {
+            queue.send(Bytes::copy_from_slice(chunk)).unwrap();
+        }
+        assert!(!cursor.is_lagged(), "fixture must fit the bounded queue");
+        let destination = configuration(&serde_json::json!({"pushes":[{
+            "url":format!("srt://127.0.0.1:{port}"),
+            "connect_timeout":2
+        }]}))
+        .unwrap()
+        .remove(0);
+        let state = State::new(destination, 0);
+        let cancel = CancellationToken::new();
+        let send = tokio::spawn({
+            let state = state.clone();
+            let cancel = cancel.clone();
+            async move { state.attempt("ffmpeg", &mut cursor, &cancel).await }
+        });
+        let received = tokio::time::timeout(Duration::from_secs(8), listener.wait()).await;
+        cancel.cancel();
+        let send_error = send.await.unwrap();
+        let Ok(Ok(status)) = received else {
+            let _ = listener.kill().await;
+            let output = listener.wait_with_output().await.unwrap();
+            panic!(
+                "SRT receiver did not receive the queued TS bootstrap: send={send_error}, stats={}, bytes={}, stderr={}",
+                state.stats(),
+                std::fs::metadata(&recording).map_or(0, |m| m.len()),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        assert!(
+            status.success(),
+            "SRT recording failed: {status}, send={send_error}"
+        );
+        let decoded = tokio::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-xerror", "-i"])
+            .arg(&recording)
+            .args(["-map", "0:v:0", "-f", "null", "-"])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            decoded.status.success(),
+            "queued TS did not decode: {}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
     }
 }

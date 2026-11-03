@@ -290,7 +290,8 @@ fn video_id(init: &[u8]) -> Result<Option<(u32, bool, usize)>, String> {
             continue;
         }
         let tkhd = field(trak, b"tkhd")?;
-        let id = number(tkhd, if tkhd[0] == 1 { 20 } else { 12 })?;
+        let version = *tkhd.first().ok_or("short caption track header")?;
+        let id = number(tkhd, if version == 1 { 20 } else { 12 })?;
         let stsd = field(field(field(mdia, b"minf")?, b"stbl")?, b"stsd")?;
         let entry = stsd.get(8..).ok_or("short caption sample entry")?;
         let (kind, body) = boxes(entry)?
@@ -437,6 +438,16 @@ pub fn mp4(init: &[u8], data: &mut [u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_video_track_header_is_rejected_without_panicking() {
+        let handler = crate::m4s::atom(b"hdlr", b"\0\0\0\0\0\0\0\0vide");
+        let media = crate::m4s::atom(b"mdia", &handler);
+        let mut track = crate::m4s::atom(b"tkhd", &[]);
+        track.extend(media);
+        let init = crate::m4s::atom(b"moov", &crate::m4s::atom(b"trak", &track));
+        assert!(mp4(&init, &mut []).is_err());
+    }
+
     #[test]
     fn targeted_608_708_filter_preserves_other_metadata_and_length() {
         for hevc in [false, true] {

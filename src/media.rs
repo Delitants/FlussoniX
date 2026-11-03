@@ -1,3 +1,4 @@
+mod file_reader;
 mod shared;
 use crate::wire::Hub;
 use bytes::Bytes;
@@ -21,11 +22,29 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::Command,
     sync::{Mutex, Semaphore, oneshot},
 };
 use tokio_util::sync::CancellationToken;
+
+async fn copy_to_packager<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    progress: &crate::source_directory::modern_coordinator::SharedDrain,
+) -> std::io::Result<u64> {
+    let mut buffer = [0u8; 16 * 1024];
+    let mut copied = 0u64;
+    loop {
+        let n = reader.read(&mut buffer).await?;
+        if n == 0 {
+            return Ok(copied);
+        }
+        writer.write_all(&buffer[..n]).await?;
+        progress.wrote_packager(n);
+        copied += n as u64;
+    }
+}
 
 pub struct Engine {
     root: PathBuf,
@@ -33,6 +52,7 @@ pub struct Engine {
     tesseract: String,
     hls_epoch: crate::hls_generation::Epoch,
     workers: Mutex<HashMap<String, Arc<Worker>>>,
+    input_preferences: Mutex<HashMap<String, InputPreference>>,
     startup_gates: std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     rtsp_probe_slots: Semaphore,
     fxlink_pool: Arc<crate::fxlink::ClientPool>,
@@ -41,6 +61,11 @@ pub struct Engine {
     pub direct_egress: Arc<AtomicU64>,
     pub rtsp_push_egress: Arc<AtomicU64>,
     pub http_push_egress: Arc<AtomicU64>,
+}
+#[derive(Clone, Copy)]
+struct InputPreference {
+    index: usize,
+    inputs: [u8; 32],
 }
 #[derive(Clone, Copy)]
 enum PublicationInput {
@@ -207,7 +232,7 @@ impl Worker {
         }
         stats
     }
-    fn output_bitrate(&self) -> Option<(f64, u64)> {
+    pub(crate) fn output_bitrate(&self) -> Option<(f64, u64)> {
         if !self.alive.load(Ordering::Relaxed) || self.is_closed() {
             return None;
         }
@@ -245,6 +270,7 @@ impl Engine {
             tesseract: tesseract.into(),
             hls_epoch: crate::hls_generation::Epoch::new(),
             workers: Mutex::new(HashMap::new()),
+            input_preferences: Mutex::new(HashMap::new()),
             startup_gates: std::sync::Mutex::new(HashMap::new()),
             rtsp_probe_slots: Semaphore::new(32),
             fxlink_pool: Arc::new(crate::fxlink::ClientPool::with_features(features)),
@@ -282,6 +308,100 @@ impl Engine {
         let gate = Arc::new(Mutex::new(()));
         gates.insert(name.to_owned(), Arc::downgrade(&gate));
         gate
+    }
+    pub async fn preferred_input(&self, name: &str, cfg: &Value) -> Option<usize> {
+        let fingerprint = input_fingerprint(cfg)?;
+        self.input_preferences
+            .lock()
+            .await
+            .get(name)
+            .filter(|preference| preference.inputs == fingerprint)
+            .map(|preference| preference.index)
+    }
+    pub async fn forget_input(&self, name: &str) {
+        self.input_preferences.lock().await.remove(name);
+    }
+    pub async fn prune_input_preferences(&self, config: &crate::config::ConfigStore) {
+        let mut preferences = self.input_preferences.lock().await;
+        // Read the current root while holding the preference lock. A delayed
+        // caller must never prune a preference accepted against a newer edit.
+        config.read(|root| {
+            preferences.retain(|name, preference| {
+                crate::config::effective(root, name).and_then(|cfg| input_fingerprint(&cfg))
+                    == Some(preference.inputs)
+            });
+        });
+    }
+    pub async fn select_input_guarded(
+        &self,
+        name: &str,
+        cfg: &Value,
+        index: usize,
+        current: impl std::future::Future<Output = bool>,
+    ) -> Result<bool, String> {
+        let inputs = cfg["inputs"].as_array().ok_or("stream has no input")?;
+        if index >= inputs.len() {
+            return Err("input is not found by the specified index".into());
+        }
+        if cfg["disabled"] == true {
+            return Err("stream disabled".into());
+        }
+        if inputs.iter().any(|input| input["url"] == "publish://") {
+            return Err("publisher input cannot be selected".into());
+        }
+        let fingerprint = input_fingerprint(cfg).ok_or("stream has no input")?;
+        let _startup = self.startup_gate(name).lock_owned().await;
+        if !current.await {
+            return Err("media route changed".into());
+        }
+        let mut workers = self.workers.lock().await;
+        if workers
+            .get(name)
+            .is_some_and(|worker| worker.publication || worker.shared_generation.is_some())
+        {
+            return Err("shared or publisher worker cannot be selected".into());
+        }
+        let signature = media_signature(cfg);
+        if workers
+            .get(name)
+            .is_some_and(|worker| worker.signature != signature)
+        {
+            return Err("media route changed".into());
+        }
+        let active = workers.get(name).is_some_and(|worker| {
+            worker.alive.load(Ordering::Relaxed)
+                && !worker.is_closed()
+                && worker.signature == signature
+        });
+        // An on-demand worker in retry cooldown still owns recent demand.
+        // Retiring it must immediately hand that demand to the selected input.
+        let retry_demand = workers.get(name).is_some_and(|worker| {
+            !active
+                && worker.signature == signature
+                && (worker.idle_seconds() < 60
+                    || worker.viewers.load(Ordering::Relaxed) > 0
+                    || worker.active_pushes)
+        });
+        let same = active
+            && workers
+                .get(name)
+                .is_some_and(|worker| worker.input_index == index);
+        self.input_preferences.lock().await.insert(
+            name.to_owned(),
+            InputPreference {
+                index,
+                inputs: fingerprint,
+            },
+        );
+        if same {
+            return Ok(false);
+        }
+        let retired = workers.remove(name);
+        drop(workers);
+        if let Some(worker) = retired {
+            self.stop_worker(name, worker).await;
+        }
+        Ok(active || retry_demand)
     }
     pub async fn publish_guarded(
         &self,
@@ -408,6 +528,11 @@ impl Engine {
             return Err("HLS caption conversion requires a real H.264/HEVC video source; GPU conversion is not qualified".into());
         }
         let _startup = self.startup_gate(name).lock_owned().await;
+        let preferred_input = if publishing.is_none() && shared.is_none() {
+            self.preferred_input(name, cfg).await
+        } else {
+            None
+        };
         let profile = crate::transcoder::Profile::resolve(cfg, false)?;
         // A DESCRIBE-only codec probe must not hold the global worker map over
         // a network round trip. A per-stream gate prevents cold-viewer herds.
@@ -431,7 +556,7 @@ impl Engine {
                 .filter(|w| {
                     !running && w.signature == signature && w.shared_generation == shared_generation
                 })
-                .map_or(0, |w| w.input_index + 1);
+                .map_or(preferred_input.unwrap_or(0), |w| w.input_index + 1);
             if running {
                 None
             } else {
@@ -532,7 +657,7 @@ impl Engine {
             return Err("media route changed".into());
         }
         let signature = media_signature(cfg);
-        let mut index = 0;
+        let mut index = preferred_input.unwrap_or(0);
         let mut restart_count = 0;
         let mut streak = 0;
         let mut last_access = Arc::new(std::sync::Mutex::new(
@@ -1176,12 +1301,21 @@ impl Engine {
             .iter()
             .map(|state| tokio::spawn(state.clone().run_worker(worker.clone(), cancel.clone())))
             .collect();
+        let shared_drain = shared
+            .as_ref()
+            .filter(|s| s.feed.protocol() == "m4f")
+            .map(|s| s.feed.drain());
+        let shared_local_failure: Option<Arc<dyn Fn() + Send + Sync>> = shared
+            .as_ref()
+            .filter(|s| s.feed.protocol() == "m4f")
+            .map(|s| Arc::new(s.feed.local_failure()) as Arc<dyn Fn() + Send + Sync>);
         tokio::spawn(async move {
             let mut tasks = Vec::new();
             let shared_startup_timeout = shared.as_ref().map(|s| s.feed.startup_timeout());
             if let Some(input) = shared.as_mut().and_then(|s| s.input.take()) {
                 let c = cancel.clone();
                 let source_worker = w.clone();
+                let drain = shared_drain.clone();
                 tasks.push(tokio::spawn(async move {
                     let result =
                         tokio::select! {biased;_=c.cancelled()=>return,result=input.run()=>result};
@@ -1191,7 +1325,18 @@ impl Engine {
                         tracing::debug!(target: "flussonix::worker_lifecycle", ?reason,
                             "shared input stopped before worker cancellation");
                         source_worker.failed("input_closed");
-                        c.cancel();
+                        if let Some(deadline) = drain
+                            .as_ref()
+                            .filter(|d| d.is_complete())
+                            .and_then(|d| d.deadline())
+                        {
+                            tokio::select! { biased;
+                                _=c.cancelled()=>{},
+                                _=tokio::time::sleep_until(deadline)=>c.cancel(),
+                            }
+                        } else {
+                            c.cancel();
+                        }
                     }
                 }));
             }
@@ -1329,6 +1474,7 @@ impl Engine {
                     let (metadata_tx, metadata_rx) = oneshot::channel();
                     let c = cancel.clone();
                     let input_worker = w.clone();
+                    let drain = shared_drain.clone();
                     tasks.push(tokio::spawn(async move {
                         let result = tokio::select! { biased;
                             _=c.cancelled()=>Ok(()),
@@ -1353,11 +1499,13 @@ impl Engine {
                                 }
                             }=>result,
                         };
-                        if let Err(reason) = result {
+                        if let Err(reason) = &result {
                             input_worker.failed(if reason == "native_subtitle_transcode_unsupported" { "native_subtitle_transcode_unsupported" } else { "input_closed" });
                             tracing::warn!(error = %reason, "wire input stopped");
                         }
-                        c.cancel();
+                        if !drain.as_ref().is_some_and(|d| d.is_complete() && result.is_ok()) {
+                            c.cancel();
+                        }
                     }));
                     let tracks = tokio::select! { biased;
                         _=cancel.cancelled()=>return,
@@ -1381,6 +1529,8 @@ impl Engine {
                     if let Some(mut stdin) = child.stdin.take() {
                         let c = cancel.clone();
                         let pipe_worker = w.clone();
+                        let progress = shared_drain.clone();
+                        let local_failure = shared_local_failure.clone();
                         tasks.push(tokio::spawn(async move {
                             let mut stdin = crate::m4_ingest::authority::Writer {
                                 inner: &mut stdin,
@@ -1388,9 +1538,18 @@ impl Engine {
                             };
                             let result = tokio::select! { biased;
                                 _=c.cancelled()=>return,
-                                result=tokio::io::copy(&mut reader,&mut stdin)=>result,
+                                result=async {
+                                    if let Some(progress)=progress.as_deref(){
+                                        copy_to_packager(&mut reader,&mut stdin,progress).await
+                                    }else{
+                                        tokio::io::copy(&mut reader,&mut stdin).await
+                                    }
+                                }=>result,
                             };
                             if result.is_err() {
+                                if let Some(commit) = local_failure {
+                                    commit();
+                                }
                                 pipe_worker.failed("packaging_failed");
                                 c.cancel();
                             }
@@ -1492,6 +1651,13 @@ impl Engine {
                     };
                     match read {
                         Ok(Ok(0)) => {
+                            // Child exit can precede the next GOP, leaving the
+                            // stdin copy parked on a read with no write error.
+                            if shared_drain.as_ref().is_some_and(|d| !d.is_complete())
+                                && let Some(commit) = &shared_local_failure
+                            {
+                                commit();
+                            }
                             tracing::debug!(target: "flussonix::worker_lifecycle",
                                 bytes_in = w.bytes.load(Ordering::Relaxed),
                                 "packager stdout closed before worker cancellation");
@@ -1504,6 +1670,11 @@ impl Engine {
                             break;
                         }
                         Ok(Err(_)) => {
+                            if shared_drain.as_ref().is_some_and(|d| !d.is_complete())
+                                && let Some(commit) = &shared_local_failure
+                            {
+                                commit();
+                            }
                             w.failed("packaging_failed");
                             break;
                         }
@@ -1617,16 +1788,7 @@ impl Engine {
         } else {
             return Err("media worker unavailable".into());
         }
-        let path = self.directory(name).join(file);
-        let meta = tokio::fs::metadata(&path)
-            .await
-            .map_err(|_| "media not ready")?;
-        if meta.len() > 32 * 1024 * 1024 {
-            return Err("segment exceeds size limit".into());
-        }
-        let mut data = tokio::fs::read(&path)
-            .await
-            .map_err(|_| "media not ready")?;
+        let mut data = file_reader::read(&self.root, name, file, 32 * 1024 * 1024).await?;
         let drop_captions = self
             .workers
             .lock()
@@ -1637,28 +1799,32 @@ impl Engine {
             if file.ends_with(".ts") {
                 crate::caption_filter::ts(&mut data)?;
             } else if file.ends_with(".m4s") {
-                let dir = path.parent().ok_or("media not ready")?;
-                let list = tokio::fs::read_to_string(dir.join("index.m3u8"))
-                    .await
-                    .map_err(|_| "media not ready")?;
+                let prefix = if file.starts_with("fmp4/") {
+                    "fmp4/"
+                } else {
+                    ""
+                };
+                let list = file_reader::read(
+                    &self.root,
+                    name,
+                    &format!("{prefix}index.m3u8"),
+                    2 * 1024 * 1024,
+                )
+                .await?;
+                let list = String::from_utf8(list).map_err(|_| "media not ready")?;
                 let init = list
                     .lines()
                     .find_map(|l| l.strip_prefix("#EXT-X-MAP:URI=\""))
                     .and_then(|l| l.split('"').next())
                     .filter(|l| valid_file(l) && l.ends_with(".mp4"))
                     .ok_or("caption initialization unavailable")?;
-                let init_path = dir.join(init);
-                if tokio::fs::metadata(&init_path)
-                    .await
-                    .map_err(|_| "media not ready")?
-                    .len()
-                    > 2 * 1024 * 1024
-                {
-                    return Err("caption initialization exceeds limit".into());
-                }
-                let init = tokio::fs::read(init_path)
-                    .await
-                    .map_err(|_| "media not ready")?;
+                let init = file_reader::read(
+                    &self.root,
+                    name,
+                    &format!("{prefix}{init}"),
+                    2 * 1024 * 1024,
+                )
+                .await?;
                 crate::caption_filter::mp4(&init, &mut data)?;
             }
         }
@@ -1909,6 +2075,7 @@ fn valid_file(file: &str) -> bool {
             || f == "init.mp4"
             || f.starts_with('g') && f.ends_with("_init.mp4"))
 }
+
 pub fn translate_input(input: &str) -> Result<String, String> {
     let (scheme, rest) = input.split_once("://").ok_or("invalid input URL")?;
     let scheme = match scheme {
@@ -2036,6 +2203,11 @@ async fn feed_owned_input(
 
 pub fn media_signature(cfg: &Value) -> String {
     format!("{:x}",Sha256::digest(serde_json::to_vec(&json!({"inputs":cfg["inputs"],"transcoder":cfg["transcoder"],"pushes":cfg["pushes"],"direct_outputs":cfg["flussonix_rtp_outputs"],"peer":cfg["flussonix_peer_key"],"allow_insecure_peer_http":cfg["flussonix_allow_insecure_peer_http"],"timeout":cfg["flussonix_input_timeout"],"subtitle_tracks":cfg["flussonix_subtitle_tracks"],"hls_captions":cfg["flussonix_hls_captions"],"hls_subtitles":cfg["flussonix_hls_subtitles"]})).unwrap()))
+}
+
+fn input_fingerprint(cfg: &Value) -> Option<[u8; 32]> {
+    cfg["inputs"].as_array()?;
+    Some(Sha256::digest(serde_json::to_vec(&cfg["inputs"]).ok()?).into())
 }
 
 #[cfg(test)]
@@ -2632,6 +2804,84 @@ mod ts_backlog_tests {
             assert!(a[..4].iter().chain(a[8..].iter()).all(|b| *b == 0x47));
             assert_eq!(a, b);
         }
+    }
+}
+
+#[cfg(test)]
+mod push_startup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn configured_push_registers_for_ts_before_its_task_is_polled() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "ffmpeg");
+        let cfg = json!({"inputs":[{"url":"testsrc://"}]});
+        let worker = engine.ensure("push-startup", &cfg).await.unwrap();
+        assert!(!worker.tx.has_receivers());
+        let http = crate::push::Destination::Http(
+            crate::http_push::Destination::parse(&json!({"url":"http://127.0.0.1:18299/owned"}))
+                .unwrap(),
+        );
+        let srt = crate::push::Destination::Srt(
+            crate::srt_push::configuration(&json!({"pushes":[{"url":"srt://127.0.0.1:18299"}]}))
+                .unwrap()
+                .remove(0),
+        );
+        let mut observed = Vec::new();
+        for (index, destination) in [http, srt].into_iter().enumerate() {
+            let push = crate::push::State::new(
+                destination,
+                index,
+                engine.rtsp_push_egress.clone(),
+                engine.http_push_egress.clone(),
+            );
+            let future = push.run("ffmpeg".into(), worker.clone(), CancellationToken::new());
+            observed.push(worker.tx.has_receivers());
+            drop(future);
+            assert!(!worker.tx.has_receivers());
+        }
+        engine.stop_all().await;
+        assert_eq!(
+            observed,
+            [true, true],
+            "configured HTTP and SRT pushes must hold TS cursors before task scheduling"
+        );
+    }
+}
+
+#[cfg(test)]
+mod input_selection_lock_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn selection_teardown_does_not_block_unrelated_worker_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(dir.path(), "ffmpeg"));
+        let config = json!({"inputs":[{"url":"testsrc://"},{"url":"testsrc://"}]});
+        let worker = engine.ensure("switching", &config).await.unwrap();
+        engine.ensure("unrelated", &config).await.unwrap();
+        let hold_completion = worker.done.lock().await;
+        let selecting = {
+            let engine = engine.clone();
+            let config = config.clone();
+            tokio::spawn(async move {
+                engine
+                    .select_input_guarded("switching", &config, 1, std::future::ready(true))
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !worker.cancel.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let unrelated = tokio::time::timeout(Duration::from_millis(250), engine.count()).await;
+        drop(hold_completion);
+        selecting.await.unwrap().unwrap();
+        assert_eq!(unrelated.unwrap(), 1);
+        engine.stop_all().await;
     }
 }
 

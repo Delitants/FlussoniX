@@ -166,6 +166,19 @@ impl Engine {
         playback: &PackagedPlayback,
         file: &str,
     ) -> Result<Bytes, SharedPackagingFailure> {
+        self.read_shared_mapped(playback, file, Ok).await
+    }
+    /// Transform bytes while the authorized package still owns the exact output
+    /// generation, then account only the bytes actually returned to this viewer.
+    pub async fn read_shared_mapped<F>(
+        &self,
+        playback: &PackagedPlayback,
+        file: &str,
+        transform: F,
+    ) -> Result<Bytes, SharedPackagingFailure>
+    where
+        F: FnOnce(Bytes) -> Result<Bytes, SharedPackagingFailure>,
+    {
         playback.current()?;
         if !self.is_shared_current(playback).await {
             return Err(SharedPackagingFailure::Closed);
@@ -178,6 +191,7 @@ impl Engine {
             )
             .await
             .map_err(|_| SharedPackagingFailure::Unavailable)?;
+        let bytes = transform(bytes)?;
         playback.current()?;
         if !self.is_shared_current(playback).await {
             return Err(SharedPackagingFailure::Closed);
@@ -296,9 +310,16 @@ impl PackagedPlayback {
         self.subscription(bootstrap, Receiver::Native(receiver))
     }
     pub fn subscribe_m4f(&self) -> Result<PackagedSubscription, SharedPackagingFailure> {
+        if self.inner.source.m4f_terminal() {
+            return Err(SharedPackagingFailure::Closed);
+        }
         self.current()?;
         let (bootstrap, receiver) = self.inner.worker.wire.signal_subscribe();
-        self.subscription(bootstrap, Receiver::Native(receiver))
+        let subscription = self.subscription(bootstrap, Receiver::Native(receiver))?;
+        if self.inner.source.m4f_terminal() {
+            return Err(SharedPackagingFailure::Closed);
+        }
+        Ok(subscription)
     }
 }
 impl PackagedSubscription {
@@ -364,3 +385,7 @@ mod activation_tests {
 #[cfg(test)]
 #[path = "activation_idle_tests.rs"]
 mod activation_idle_tests;
+
+#[cfg(test)]
+#[path = "shared_sink_failure_tests.rs"]
+mod shared_sink_failure_tests;

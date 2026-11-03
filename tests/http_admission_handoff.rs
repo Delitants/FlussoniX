@@ -371,6 +371,65 @@ async fn hls_handoff_playlist_can_refresh_without_spending_a_second_session() {
 }
 
 #[tokio::test]
+async fn hls_master_alias_handoff_preserves_url_and_authorized_child_session() {
+    use futures_util::FutureExt;
+    let (_dir, app) = setup(1, 1000.0).await;
+    app.config
+        .put(
+            "streams",
+            "owned",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    let result = std::panic::AssertUnwindSafe(async {
+        let ticket = ticket(&app, 2.0).await;
+        let redirect = request(
+            &app,
+            &format!("/owned/index.ts.m3u8?token=viewer&flussonix_ticket={ticket}"),
+            None,
+        )
+        .await;
+        assert_eq!(redirect.status(), 302);
+        let location = redirect.headers()["location"].to_str().unwrap().to_owned();
+        assert!(location.starts_with("/owned/index.ts.m3u8?"), "{location}");
+        for _ in 0..2 {
+            let response = request(&app, &location, None).await;
+            assert_eq!(response.status(), 200);
+            let master = String::from_utf8(
+                to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(master.contains("#EXT-X-STREAM-INF:"), "{master}");
+            assert!(!master.contains("flussonix_handoff"), "{master}");
+            assert!(!master.contains("flussonix_ticket"), "{master}");
+            let child = master
+                .lines()
+                .find(|line| !line.is_empty() && !line.starts_with('#'))
+                .unwrap();
+            assert!(child.starts_with("index.m3u8?token=viewer"), "{child}");
+            let child_response = request(&app, &format!("/owned/{child}"), None).await;
+            assert_eq!(child_response.status(), 200);
+        }
+        assert_eq!(reserve(&app, 2.0).await.status(), 503);
+        assert_eq!(
+            request(&app, "/owned/index.ts.m3u8?token=other", None)
+                .await
+                .status(),
+            403
+        );
+    })
+    .catch_unwind()
+    .await;
+    app.media.stop_all().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
 async fn concurrent_first_hls_handoff_gets_share_the_reserved_session() {
     use futures_util::{FutureExt, future::join_all};
     let (_dir, app) = setup(1, 1000.0).await;

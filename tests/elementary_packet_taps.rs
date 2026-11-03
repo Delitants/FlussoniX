@@ -8,8 +8,15 @@ mod taps;
 use std::{
     io,
     os::{fd::AsRawFd, unix::net::UnixDatagram},
+    sync::{Mutex, MutexGuard},
     time::Duration,
 };
+static DESCRIPTOR_TEST_LOCK: Mutex<()> = Mutex::new(());
+fn serialize_descriptors() -> MutexGuard<'static, ()> {
+    DESCRIPTOR_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
 fn packet(source: u16, destination: u16) -> Vec<u8> {
     let mut p = vec![0u8; 40];
     p[0] = 0x45;
@@ -45,8 +52,65 @@ fn delivered(packet: &[u8], ports: &[u16]) -> io::Result<bool> {
         Err(e) => Err(e),
     }
 }
+fn pair_delivered(packet: &[u8], sources: &[u16], destinations: &[u16]) -> io::Result<bool> {
+    let (tx, rx) = UnixDatagram::pair()?;
+    rx.set_read_timeout(Some(Duration::from_millis(30)))?;
+    taps::attach_pair_filter(rx.as_raw_fd(), sources, destinations)?;
+    tx.send(packet)?;
+    match rx.recv(&mut [0; 2048]) {
+        Ok(_) => Ok(true),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+#[test]
+fn pair_filter_requires_owned_source_and_destination() {
+    let _serial = serialize_descriptors();
+    assert!(pair_delivered(&packet(41000, 42000), &[41000, 41002], &[42000, 42002]).unwrap());
+    assert!(!pair_delivered(&packet(41001, 42000), &[41000], &[42000]).unwrap());
+    assert!(!pair_delivered(&packet(41000, 42001), &[41000], &[42000]).unwrap());
+    let mut nonloopback = packet(41000, 42000);
+    nonloopback[12] = 192;
+    assert!(!pair_delivered(&nonloopback, &[41000], &[42000]).unwrap());
+    let mut fragment = packet(41000, 42000);
+    fragment[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+    assert!(!pair_delivered(&fragment, &[41000], &[42000]).unwrap());
+    let (_, rx) = UnixDatagram::pair().unwrap();
+    for invalid in [vec![], vec![0], vec![41000, 41000], vec![41000; 9]] {
+        assert!(taps::attach_pair_filter(rx.as_raw_fd(), &invalid, &[42000]).is_err());
+        assert!(taps::attach_pair_filter(rx.as_raw_fd(), &[41000], &invalid).is_err());
+    }
+}
+#[test]
+fn sender_source_snapshot_uses_local_inodes_and_rejects_missing_or_foreign_sockets() {
+    let _serial = serialize_descriptors();
+    let source = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let port = source.local_addr().unwrap().port();
+    let (_, owned) = elementary_diagnostics::udp_source_ownership(std::process::id(), 1).unwrap();
+    assert_eq!(owned.len(), 1);
+    assert!(owned.contains_key(&port));
+    assert!(taps::Owner::sender(std::process::id(), 1).is_ok());
+    assert!(taps::Owner::sender(std::process::id(), 2).is_err());
+    let mut child = std::process::Command::new("sleep")
+        .arg("10")
+        .spawn()
+        .unwrap();
+    assert!(taps::Owner::sender(child.id(), 1).is_err());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    drop(source);
+    assert!(taps::Owner::sender(std::process::id(), 1).is_err());
+}
 #[test]
 fn kernel_filter_admits_only_owned_loopback_udp_destinations() {
+    let _serial = serialize_descriptors();
     assert!(delivered(&packet(41000, 42000), &[42000, 42002]).unwrap());
     assert!(delivered(&packet(41000, 42002), &[42000, 42002]).unwrap());
     assert!(
@@ -67,6 +131,7 @@ fn kernel_filter_admits_only_owned_loopback_udp_destinations() {
 }
 #[test]
 fn kernel_filter_rejects_fragments_short_packets_and_ip_options() {
+    let _serial = serialize_descriptors();
     for fragment in [0x2000u16, 1, 0x3fff] {
         let mut p = packet(41000, 42000);
         p[6..8].copy_from_slice(&fragment.to_be_bytes());
@@ -81,6 +146,7 @@ fn kernel_filter_rejects_fragments_short_packets_and_ip_options() {
 }
 #[test]
 fn empty_zero_or_excessive_filter_scope_is_rejected() {
+    let _serial = serialize_descriptors();
     let (_, rx) = UnixDatagram::pair().unwrap();
     for ports in [vec![], vec![0], vec![42000; 9]] {
         assert!(taps::attach_filter(rx.as_raw_fd(), &ports).is_err());
@@ -88,6 +154,7 @@ fn empty_zero_or_excessive_filter_scope_is_rejected() {
 }
 #[test]
 fn udp_parser_preserves_rtp_headers_and_rejects_truncation() {
+    let _serial = serialize_descriptors();
     let p = packet(41000, 42000);
     let (source, dest, rtp) = taps::udp_packet(&p).expect("Complete owned packet");
     assert_eq!((source, dest), (41000, 42000));
@@ -105,6 +172,7 @@ fn udp_parser_preserves_rtp_headers_and_rejects_truncation() {
 
 #[test]
 fn private_capture_rejects_sockets_owned_by_another_process_before_activation() {
+    let _serial = serialize_descriptors();
     let source = tempfile::tempdir().unwrap();
     let artifact = tempfile::tempdir().unwrap();
     let evidence = elementary_diagnostics::Evidence::start(source.path(), artifact.path()).unwrap();
@@ -132,6 +200,7 @@ fn private_capture_rejects_sockets_owned_by_another_process_before_activation() 
 }
 #[test]
 fn public_capture_rejects_a_wildcard_reservation_before_activation() {
+    let _serial = serialize_descriptors();
     let source = tempfile::tempdir().unwrap();
     let artifact = tempfile::tempdir().unwrap();
     let evidence = elementary_diagnostics::Evidence::start(source.path(), artifact.path()).unwrap();
@@ -167,6 +236,7 @@ fn assert_unavailable(path: &std::path::Path) {
 }
 #[test]
 fn exited_owner_rebound_port_discards_ambiguous_datagrams() {
+    let _serial = serialize_descriptors();
     use std::{
         io::BufRead,
         process::{Command, Stdio},
@@ -186,6 +256,7 @@ fn exited_owner_rebound_port_discards_ambiguous_datagrams() {
 }
 #[test]
 fn same_process_rebound_socket_inode_discards_ambiguous_datagrams() {
+    let _serial = serialize_descriptors();
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let port = socket.local_addr().unwrap().port();
     let witness = taps::Owner::snapshot(std::process::id(), &[port]).unwrap();
@@ -223,4 +294,446 @@ fn discard_later_owner(witness: taps::Owner, rebound: std::net::UdpSocket) {
         "The whole ambiguous trace must be discarded after ownership changes"
     );
     assert_unavailable(artifact.path());
+}
+
+fn handoff_fixture() -> (
+    std::process::Child,
+    std::net::UdpSocket,
+    taps::HandoffWitness,
+) {
+    use std::io::BufRead;
+    let mut sender = std::process::Command::new("python3")
+        .args(["-u", "-c", "import socket,sys; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('0.0.0.0',0)); print(s.getsockname()[1]); sys.stdin.read(1)"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn().unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(sender.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let sender_port = line.trim().parse::<u16>().unwrap();
+    assert!(
+        elementary_diagnostics::udp_source_ownership(sender.id(), 1)
+            .unwrap()
+            .1
+            .contains_key(&sender_port)
+    );
+    let reserved = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let destination_port = reserved.local_addr().unwrap().port();
+    let witness = taps::HandoffWitness::new(
+        taps::Owner::snapshot(std::process::id(), &[destination_port]).unwrap(),
+        taps::Owner::sender(sender.id(), 1).unwrap(),
+    );
+    (sender, reserved, witness)
+}
+fn handoff_retention(witness: &taps::HandoffWitness) -> (serde_json::Value, bool) {
+    let source = tempfile::tempdir().unwrap();
+    let artifact = tempfile::tempdir().unwrap();
+    let evidence = elementary_diagnostics::Evidence::start(source.path(), artifact.path()).unwrap();
+    let path = artifact.path().join("handoff.packets");
+    let mut capture = elementary_diagnostics::DatagramCapture::new(path.clone());
+    capture.append(b"owned-marker").unwrap();
+    let (summary, capture) = taps::enforce_handoff(
+        witness,
+        serde_json::json!({"boundary":"source_to_public","records":1,"coverage_start_ns":0,"coverage_end_ns":1000000000000u64,"incomplete":false}),
+        capture,
+    );
+    evidence.save_packet_tap(summary.clone(), capture);
+    drop(evidence);
+    (summary, path.exists())
+}
+#[test]
+fn handoff_missing_markers_and_release_races_discard_raw() {
+    let _serial = serialize_descriptors();
+    let (mut sender, reserved, mut witness) = handoff_fixture();
+    let origin = std::time::Instant::now();
+    let (summary, retained) = handoff_retention(&witness);
+    assert!(!retained);
+    assert_eq!(summary["incomplete"], true);
+    witness.release(origin).unwrap();
+    let (summary, retained) = handoff_retention(&witness);
+    assert!(!retained);
+    assert_eq!(summary["incomplete"], true);
+    assert!(witness.bind_native(std::process::id(), origin).is_err());
+    sender.kill().unwrap();
+    sender.wait().unwrap();
+    drop(reserved);
+}
+#[test]
+fn handoff_does_not_retain_incomplete_raw_capture() {
+    let _serial = serialize_descriptors();
+    let (mut sender, reserved, mut witness) = handoff_fixture();
+    let destination = reserved.local_addr().unwrap().port();
+    let origin = std::time::Instant::now();
+    witness.release(origin).unwrap();
+    drop(reserved);
+    let native = std::net::UdpSocket::bind(("127.0.0.1", destination)).unwrap();
+    witness.bind_native(std::process::id(), origin).unwrap();
+    let artifact = tempfile::tempdir().unwrap();
+    let mut capture =
+        elementary_diagnostics::DatagramCapture::new(artifact.path().join("incomplete.packets"));
+    capture.append(b"partial").unwrap();
+    let (summary, raw) = taps::enforce_handoff(
+        &witness,
+        serde_json::json!({"boundary":"source_to_public","records":1,
+            "coverage_start_ns":0,"coverage_end_ns":1000000000000u64,"incomplete":true}),
+        capture,
+    );
+    drop(native);
+    sender.kill().unwrap();
+    sender.wait().unwrap();
+    assert!(raw.is_none(), "incomplete raw data must not be retained");
+    assert_eq!(summary["incomplete"], true);
+}
+#[test]
+fn handoff_same_port_rebind_retains_only_stable_sender_and_native() {
+    let _serial = serialize_descriptors();
+    let (mut sender, reserved, mut witness) = handoff_fixture();
+    let port = reserved.local_addr().unwrap().port();
+    let origin = std::time::Instant::now();
+    witness.release(origin).unwrap();
+    drop(reserved);
+    let native = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
+    witness.bind_native(std::process::id(), origin).unwrap();
+    let (summary, retained) = handoff_retention(&witness);
+    assert!(retained);
+    assert_eq!(summary["handoff_captured"], true);
+    drop(native);
+    let rebound = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
+    let (summary, retained) = handoff_retention(&witness);
+    assert!(!retained);
+    assert_eq!(summary["observation"], "unavailable");
+    drop(rebound);
+    sender.kill().unwrap();
+    sender.wait().unwrap();
+}
+#[test]
+fn handoff_sender_exit_and_stop_boundary_race_discard_raw() {
+    let _serial = serialize_descriptors();
+    let (mut sender, reserved, mut witness) = handoff_fixture();
+    let port = reserved.local_addr().unwrap().port();
+    let origin = std::time::Instant::now();
+    witness.release(origin).unwrap();
+    drop(reserved);
+    let native = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
+    witness.bind_native(std::process::id(), origin).unwrap();
+    sender.kill().unwrap();
+    sender.wait().unwrap();
+    let (summary, retained) = handoff_retention(&witness);
+    assert!(!retained);
+    assert_eq!(summary["incomplete"], true);
+    drop(native);
+}
+#[test]
+fn handoff_rejects_foreign_native_owner() {
+    let _serial = serialize_descriptors();
+    use std::io::BufRead;
+    let (mut sender, reserved, mut witness) = handoff_fixture();
+    let port = reserved.local_addr().unwrap().port();
+    let origin = std::time::Instant::now();
+    witness.release(origin).unwrap();
+    drop(reserved);
+    let script = format!(
+        "import socket,sys; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('127.0.0.1',{port})); print('ready'); sys.stdin.read(1)"
+    );
+    let mut foreign = std::process::Command::new("python3")
+        .args(["-u", "-c", &script])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(foreign.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(line.trim(), "ready");
+    let result = witness.bind_native(foreign.id(), origin);
+    foreign.kill().unwrap();
+    foreign.wait().unwrap();
+    sender.kill().unwrap();
+    sender.wait().unwrap();
+    assert!(
+        result.is_err(),
+        "only the fixture process may own native input"
+    );
+    let (summary, retained) = handoff_retention(&witness);
+    assert!(!retained);
+    assert_eq!(summary["incomplete"], true);
+}
+#[test]
+fn handoff_sender_source_socket_rebind_discards_raw() {
+    let _serial = serialize_descriptors();
+    use std::io::{BufRead, Write};
+    let script = "import socket,sys; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('0.0.0.0',0)); port=s.getsockname()[1]; print(port); sys.stdin.readline(); s.close(); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('0.0.0.0',port)); print('rebound'); sys.stdin.readline()";
+    let mut sender = std::process::Command::new("python3")
+        .args(["-u", "-c", script])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = std::io::BufReader::new(sender.stdout.take().unwrap());
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    let port = line.trim().parse::<u16>().unwrap();
+    assert!(
+        elementary_diagnostics::udp_source_ownership(sender.id(), 1)
+            .unwrap()
+            .1
+            .contains_key(&port)
+    );
+    let reserved = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let destination = reserved.local_addr().unwrap().port();
+    let mut witness = taps::HandoffWitness::new(
+        taps::Owner::snapshot(std::process::id(), &[destination]).unwrap(),
+        taps::Owner::sender(sender.id(), 1).unwrap(),
+    );
+    let origin = std::time::Instant::now();
+    witness.release(origin).unwrap();
+    drop(reserved);
+    let native = std::net::UdpSocket::bind(("127.0.0.1", destination)).unwrap();
+    witness.bind_native(std::process::id(), origin).unwrap();
+    writeln!(sender.stdin.as_mut().unwrap(), "rebind").unwrap();
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "rebound");
+    let (summary, retained) = handoff_retention(&witness);
+    sender.kill().unwrap();
+    sender.wait().unwrap();
+    drop(native);
+    assert!(!retained);
+    assert_eq!(summary["observation"], "unavailable");
+}
+
+#[test]
+fn prestart_handoff_discards_packets_that_predate_sender_spawn_even_when_port_matches() {
+    let _serial = serialize_descriptors();
+    let (mut sender, reserved, _) = handoff_fixture();
+    let destination = reserved.local_addr().unwrap().port();
+    let sender_port = *elementary_diagnostics::udp_source_ownership(sender.id(), 1)
+        .unwrap()
+        .1
+        .keys()
+        .next()
+        .unwrap();
+    let mut witness = taps::HandoffWitness::new_prestart(
+        taps::Owner::snapshot(std::process::id(), &[destination]).unwrap(),
+    );
+    let origin = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    witness.sender_spawning(origin).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    let candidate_timestamp = origin.elapsed().as_nanos() as u64;
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    witness.bind_sender(sender.id(), 1, origin).unwrap();
+    witness.release(origin).unwrap();
+    drop(reserved);
+    let native = std::net::UdpSocket::bind(("127.0.0.1", destination)).unwrap();
+    witness.bind_native(std::process::id(), origin).unwrap();
+    let artifact = tempfile::tempdir().unwrap();
+    let mut capture =
+        elementary_diagnostics::DatagramCapture::new(artifact.path().join("prestart.packets"));
+    let mut record = 0u64.to_be_bytes().to_vec();
+    record.extend(sender_port.to_be_bytes());
+    record.extend(destination.to_be_bytes());
+    record.extend(b"RTP");
+    capture.append(&record).unwrap();
+    let (summary, retained) = taps::enforce_handoff(
+        &witness,
+        serde_json::json!({"boundary":"source_to_public","records":1,
+            "coverage_start_ns":0,"coverage_end_ns":1000000000000u64,"incomplete":false}),
+        capture,
+    );
+    let mut capture =
+        elementary_diagnostics::DatagramCapture::new(artifact.path().join("foreign.packets"));
+    let mut foreign = (origin.elapsed().as_nanos() as u64).to_be_bytes().to_vec();
+    foreign.extend(if sender_port == 1 { 2u16 } else { 1u16 }.to_be_bytes());
+    foreign.extend(destination.to_be_bytes());
+    foreign.extend(b"RTP");
+    capture.append(&foreign).unwrap();
+    let (foreign_summary, foreign_retained) = taps::enforce_handoff(
+        &witness,
+        serde_json::json!({"boundary":"source_to_public","records":1,
+            "coverage_start_ns":0,"coverage_end_ns":1000000000000u64,"incomplete":false}),
+        capture,
+    );
+    // A later matching source port does not prove which process sent this
+    // pre-witness packet; it must remain labeled as a candidate.
+    let mut capture =
+        elementary_diagnostics::DatagramCapture::new(artifact.path().join("candidate.packets"));
+    let mut candidate = candidate_timestamp.to_be_bytes().to_vec();
+    candidate.extend(sender_port.to_be_bytes());
+    candidate.extend(destination.to_be_bytes());
+    candidate.extend(b"RTP");
+    capture.append(&candidate).unwrap();
+    let (candidate_summary, candidate_raw) = taps::enforce_handoff(
+        &witness,
+        serde_json::json!({"boundary":"source_to_public","records":1,
+            "coverage_start_ns":0,"coverage_end_ns":1000000000000u64,"incomplete":false}),
+        capture,
+    );
+    drop(native);
+    sender.kill().unwrap();
+    sender.wait().unwrap();
+    assert!(
+        retained.is_none(),
+        "pre-spawn packets cannot be assigned to a later owner"
+    );
+    assert_eq!(summary["incomplete"], true);
+    assert!(
+        foreign_retained.is_none(),
+        "foreign source cannot enter a retained trace"
+    );
+    assert_eq!(
+        foreign_summary["candidate_source_ports_match_sender_witness"],
+        false
+    );
+    assert!(candidate_raw.is_some());
+    assert_eq!(
+        candidate_summary["sender_prefix_attribution"],
+        "candidate_only"
+    );
+    assert_eq!(candidate_summary["source_prefix_unobserved"], true);
+}
+
+#[test]
+#[ignore = "requires CAP_NET_RAW and uses an owned loopback sender"]
+fn public_handoff_keeps_one_capture_across_rebind() {
+    let _serial = serialize_descriptors();
+    use std::io::{BufRead, Write};
+    let source = tempfile::tempdir().unwrap();
+    let artifact = tempfile::tempdir().unwrap();
+    let evidence = elementary_diagnostics::Evidence::start(source.path(), artifact.path()).unwrap();
+    taps::check_capability(&evidence).unwrap();
+    let reserved = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    let mut sender = std::process::Command::new("python3")
+        .args(["-u", "-c", "import socket,sys; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('0.0.0.0',0)); print(s.getsockname()[1]); [(s.sendto(bytes.fromhex(line.split()[1]),('127.0.0.1',int(line.split()[0])))) for line in sys.stdin]"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn().unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(sender.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    line.trim().parse::<u16>().unwrap();
+    let result = (|| -> io::Result<()> {
+        let origin = std::time::Instant::now();
+        let mut tap = taps::Tap::public_handoff(
+            &[reserved.try_clone()?],
+            sender.id(),
+            1,
+            &evidence,
+            artifact.path(),
+            origin,
+        )?;
+        writeln!(sender.stdin.as_mut().unwrap(), "{port} 505245")?;
+        std::thread::sleep(Duration::from_millis(100));
+        tap.release_reservation(origin)?;
+        drop(reserved);
+        let native = std::net::UdpSocket::bind(("127.0.0.1", port))?;
+        tap.bind_native(std::process::id(), origin)?;
+        writeln!(sender.stdin.as_mut().unwrap(), "{port} 504f5354")?;
+        std::thread::sleep(Duration::from_millis(100));
+        tap.stop();
+        drop(tap);
+        drop(native);
+        Ok(())
+    })();
+    sender.kill().unwrap();
+    sender.wait().unwrap();
+    drop(evidence);
+    result.unwrap();
+    let bytes = std::fs::read(artifact.path().join("source_to_public.packets")).unwrap();
+    let pre = bytes
+        .windows(3)
+        .position(|window| window == b"PRE")
+        .unwrap();
+    let post = bytes
+        .windows(4)
+        .position(|window| window == b"POST")
+        .unwrap();
+    assert!(
+        pre < post,
+        "one tap must retain packets on both sides of handoff"
+    );
+    let summaries =
+        std::fs::read_to_string(artifact.path().join("boundary-evidence.jsonl")).unwrap();
+    assert!(summaries.lines().any(|line| {
+        let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        entry["packet_taps"].as_array().is_some_and(|taps| {
+            taps.iter()
+                .any(|tap| tap["handoff_captured"] == true && tap["incomplete"] == false)
+        })
+    }));
+}
+
+#[test]
+#[ignore = "requires CAP_NET_RAW and uses an owned loopback sender"]
+fn public_prestart_tap_retains_sender_prefix() {
+    let _serial = serialize_descriptors();
+    use std::io::{BufRead, Write};
+    let source = tempfile::tempdir().unwrap();
+    let artifact = tempfile::tempdir().unwrap();
+    let evidence = elementary_diagnostics::Evidence::start(source.path(), artifact.path()).unwrap();
+    taps::check_capability(&evidence).unwrap();
+    let reserved = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    let origin = std::time::Instant::now();
+    let mut tap = taps::Tap::public_prestart(
+        &[reserved.try_clone().unwrap()],
+        &evidence,
+        artifact.path(),
+        origin,
+    )
+    .unwrap();
+    tap.sender_spawning(origin).unwrap();
+    let script = format!(
+        "import socket,sys; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('0.0.0.0',0)); s.sendto(b'EARLY',('127.0.0.1',{port})); print('ready',flush=True); [s.sendto(line.strip().encode(),('127.0.0.1',{port})) for line in sys.stdin]"
+    );
+    let mut sender = std::process::Command::new("python3")
+        .args(["-u", "-c", &script])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(sender.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(line.trim(), "ready");
+    tap.bind_sender(sender.id(), 1, origin).unwrap();
+    tap.release_reservation(origin).unwrap();
+    drop(reserved);
+    let native = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
+    tap.bind_native(std::process::id(), origin).unwrap();
+    writeln!(sender.stdin.as_mut().unwrap(), "LATE").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    tap.stop();
+    drop(tap);
+    drop(native);
+    sender.kill().unwrap();
+    sender.wait().unwrap();
+    drop(evidence);
+    let bytes = std::fs::read(artifact.path().join("source_to_public.packets")).unwrap();
+    let early = bytes
+        .windows(5)
+        .position(|window| window == b"EARLY")
+        .unwrap();
+    let late = bytes
+        .windows(4)
+        .position(|window| window == b"LATE")
+        .unwrap();
+    assert!(early < late);
+    let summaries =
+        std::fs::read_to_string(artifact.path().join("boundary-evidence.jsonl")).unwrap();
+    assert!(summaries.lines().any(|line| {
+        let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        entry["packet_taps"].as_array().is_some_and(|taps| {
+            taps.iter().any(|tap| {
+                tap["sender_prefix_attribution"] == "candidate_only"
+                    && tap["startup_not_observed"] == true
+                    && tap["handoff_captured"] == true
+            })
+        })
+    }));
 }

@@ -317,6 +317,67 @@ async fn remote_plaintext_guard_wraps_the_real_management_router() {
 }
 
 #[tokio::test]
+async fn remote_plaintext_allows_only_credential_free_get_monitoring_probes() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = crate::server::App::new(
+        dir.path().join("config.json"),
+        dir.path().join("media"),
+        crate::server::Options {
+            admin_password: "owned-admin-secret".into(),
+            peer_key: "owned-peer-secret".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let server = tokio::spawn(serve_listener(
+        SyntheticPeer::remote(tcp),
+        crate::server::router(app),
+        CancellationToken::new(),
+        TransportPolicy::default(),
+    ));
+    let client = reqwest::Client::new();
+    for path in [
+        "/streamer/api/v3/monitoring/liveness",
+        "/streamer/api/v3/monitoring/readiness",
+    ] {
+        let url = format!("http://{address}{path}");
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .get(&url)
+                .header("Authorization", "Basic YWRtaW46b3duZWQtYWRtaW4tc2VjcmV0")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            client.post(&url).send().await.unwrap().status(),
+            reqwest::StatusCode::FORBIDDEN,
+        );
+    }
+    assert_eq!(
+        client
+            .get(format!(
+                "http://{address}/streamer/api/v3/monitoring/liveness/extra"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN,
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn stale_watch_cannot_abort_reused_or_unrelated_connection() {
     let control = Control::default();
     let unrelated = Control::default();

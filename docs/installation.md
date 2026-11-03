@@ -38,6 +38,10 @@ mkdir -p "$flussonix_data"
 chmod 700 "$flussonix_data"
 ```
 
+The media directory must belong to the daemon account and must not be writable
+by another account. HLS delivery rejects symlinked or foreign-owned generated
+files and media directories; keep `--media-dir` under this private state path.
+
 Choose an admin password and create a cluster peer key once with
 `openssl rand -hex 32`. Save both in your password manager and reuse them after
 every restart. FlussoniX nodes in the same native cluster use the same peer key.
@@ -84,7 +88,9 @@ the stream's **Built-in IPTV subscribers** viewer policy. Playlist links appear
 only when the public origin is set. Subscriber tokens are stored in
 `$flussonix_data/iptv.json` by default, separately from `config.json`, with
 owner-only permissions. `--iptv-data /absolute/path/iptv.json` selects another
-location; back it up with the rest of your state. Session limits are local on a
+location; its parent directory must belong to the daemon user, must not be a
+symlink, and must not be group or world writable. Back it up with the rest of
+your state. Session limits are local on a
 single standalone node. For a FlussoniX cluster, configure one shared IPTV
 authority on every viewer-serving node so the limit applies across those nodes;
 see [IPTV transport and authority setup](iptv-transport.md). Existing Flussonic

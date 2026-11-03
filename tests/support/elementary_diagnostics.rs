@@ -548,6 +548,54 @@ pub(super) fn udp_ownership(pid: u32, ports: &[u16]) -> io::Result<(u64, BTreeMa
     }
     Ok((start_ticks, found))
 }
+#[allow(
+    dead_code,
+    reason = "source snapshots are used only by opt-in packet taps"
+)]
+pub(super) fn udp_source_ownership(
+    pid: u32,
+    expected: usize,
+) -> io::Result<(u64, BTreeMap<u16, u64>)> {
+    if !(1..=8).contains(&expected) {
+        return Err(io::Error::other("invalid sender UDP socket count"));
+    }
+    let start_ticks = identity(pid)?.0;
+    let (state, rows, races) = observe(&Target {
+        pid,
+        start_ticks: Some(start_ticks),
+    })?;
+    if state == "Z" {
+        return Err(io::Error::other("sender UDP ownership unavailable"));
+    }
+    if races != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "sender UDP descriptor race",
+        ));
+    }
+    if rows.len() != expected {
+        return Err(io::Error::other("sender UDP socket count changed"));
+    }
+    let loopback = format!("{:08X}", u32::from_ne_bytes([127, 0, 0, 1]));
+    let mut found = BTreeMap::new();
+    for row in rows {
+        if row["local_ip_hex"] != "00000000" && row["local_ip_hex"] != loopback {
+            return Err(io::Error::other("sender UDP socket is not local"));
+        }
+        let port = row["local_port"]
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .filter(|port| *port != 0)
+            .ok_or_else(|| io::Error::other("invalid sender UDP source port"))?;
+        let inode = row["inode"]
+            .as_u64()
+            .ok_or_else(|| io::Error::other("missing sender UDP inode"))?;
+        if found.insert(port, inode).is_some() {
+            return Err(io::Error::other("ambiguous sender UDP source port"));
+        }
+    }
+    Ok((start_ticks, found))
+}
 fn preserve(source: &Path, artifact: &Path, activity: &Activity) -> bool {
     let mut failed = false;
     // The allowlist excludes inline keys, wrapper arguments and any host configuration.
@@ -638,6 +686,46 @@ impl DatagramCapture {
             .extend_from_slice(&(packet.len() as u32).to_be_bytes());
         self.bytes.extend_from_slice(packet);
         Ok(())
+    }
+    // These are userspace dequeue timestamps. Passing this check only rules
+    // out obvious pre-marker records; it does not establish sender ownership.
+    #[allow(dead_code, reason = "used by optional packet tap test modules")]
+    pub fn source_ports_since(
+        &self,
+        sender_spawn_ns: u64,
+    ) -> io::Result<std::collections::HashSet<u16>> {
+        let mut ports = std::collections::HashSet::new();
+        let mut offset = 0;
+        while offset < self.bytes.len() {
+            let end = offset
+                .checked_add(4)
+                .ok_or_else(|| io::Error::other("invalid capture"))?;
+            let length = self
+                .bytes
+                .get(offset..end)
+                .ok_or_else(|| io::Error::other("invalid capture"))?;
+            let length = u32::from_be_bytes(length.try_into().unwrap()) as usize;
+            let start = end;
+            let end = start
+                .checked_add(length)
+                .ok_or_else(|| io::Error::other("invalid capture"))?;
+            let record = self
+                .bytes
+                .get(start..end)
+                .ok_or_else(|| io::Error::other("invalid capture"))?;
+            let observed = record
+                .get(0..8)
+                .ok_or_else(|| io::Error::other("invalid capture"))?;
+            if u64::from_be_bytes(observed.try_into().unwrap()) < sender_spawn_ns {
+                return Err(io::Error::other("capture predates sender spawn"));
+            }
+            let source = record
+                .get(8..10)
+                .ok_or_else(|| io::Error::other("invalid capture"))?;
+            ports.insert(u16::from_be_bytes(source.try_into().unwrap()));
+            offset = end;
+        }
+        Ok(ports)
     }
     pub fn save(self) -> io::Result<()> {
         let mut file = OpenOptions::new()

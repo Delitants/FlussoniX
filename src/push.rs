@@ -65,16 +65,24 @@ impl State {
             Self::Rtsp(s) => s.stats(),
         }
     }
-    pub async fn run(
+    pub fn run(
         self: Arc<Self>,
         ffmpeg: String,
         worker: Arc<crate::media::Worker>,
         cancel: CancellationToken,
-    ) {
-        match self.as_ref() {
-            Self::Http(s) => s.clone().run(worker.subscribe(), cancel).await,
-            Self::Srt(s) => s.clone().run(ffmpeg, worker.subscribe(), cancel).await,
-            Self::Rtsp(s) => s.clone().run(worker.clone(), cancel).await,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        // Claim the live TS cursor before Tokio schedules the destination task.
+        // A late first poll must not skip the new encoder's PAT/PMT or keyframe.
+        let receiver = match self.as_ref() {
+            Self::Http(_) | Self::Srt(_) => Some(worker.subscribe()),
+            Self::Rtsp(_) => None,
+        };
+        async move {
+            match self.as_ref() {
+                Self::Http(s) => s.clone().run(receiver.unwrap(), cancel).await,
+                Self::Srt(s) => s.clone().run(ffmpeg, receiver.unwrap(), cancel).await,
+                Self::Rtsp(s) => s.clone().run(worker, cancel).await,
+            }
         }
     }
 }

@@ -168,7 +168,12 @@ async fn outputs(receivers: &[Receiver; 2], directory: &Path, generation: usize)
     let mut reports = vec![];
     for (index, receiver) in receivers.iter().enumerate() {
         let path = directory.join(format!("output-{index}.ts"));
-        std::fs::write(&path, session(receiver, generation)).unwrap();
+        let capture = session(receiver, generation);
+        std::fs::write(
+            &path,
+            complete_media_prefix(&capture).expect("complete HTTP publishing media prefix"),
+        )
+        .unwrap();
         let mut report = decoded(&path, "aac").await;
         report["transport"] = json!(if index == 0 { "http" } else { "verified_https" });
         reports.push(report);

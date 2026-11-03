@@ -65,6 +65,234 @@ class ServicePreviewTests(unittest.TestCase):
                             '--user', self.account.pw_name, '--listen', '127.0.0.1:18210',
                             '--ffmpeg', Path('/usr/bin/true').resolve(), '--output', self.unit, *extra)
 
+    def tls_pair(self, name):
+        cert = self.root / f'{name}.crt'
+        key = self.root / f'{name}.key'
+        cert.write_text('owned certificate fixture')
+        key.write_text('owned private key fixture')
+        cert.chmod(0o644)
+        key.chmod(0o600)
+        if os.geteuid() == 0:
+            os.chown(key, self.account.pw_uid, self.account.pw_gid)
+        return cert, key
+
+    def test_combined_secure_listeners_render_a_valid_unit(self):
+        if not shutil.which('systemd-analyze'):
+            self.skipTest('requires systemd-analyze')
+        self.create_credentials()
+        https_cert, https_key = self.tls_pair('https')
+        rtsps_cert, rtsps_key = self.tls_pair('rtsps')
+        fx_cert, fx_key = self.tls_pair('fxlink')
+        result = self.render('--https-listen', '127.0.0.1:18443', '--https-cert', https_cert,
+                             '--https-key', https_key, '--https-only',
+                             '--rtsp-listen', '127.0.0.1:18554', '--rtsps-listen', '127.0.0.1:18555',
+                             '--rtsps-cert', rtsps_cert, '--rtsps-key', rtsps_key,
+                             '--rtsp-udp-ports', '22000-22003', '--rtsp-udp-mbps', '42',
+                             '--fxlink-listen', '127.0.0.1:18447', '--fxlink-cert', fx_cert,
+                             '--fxlink-key', fx_key)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unit = self.unit.read_text()
+        for expected in ('"--https-listen" "127.0.0.1:18443"', '"--https-only"',
+                         '"--rtsps-listen" "127.0.0.1:18555"',
+                         '"--rtsp-udp-ports" "22000-22003"',
+                         '"--rtsp-udp-mbps" "42"',
+                         '"--fxlink-listen" "127.0.0.1:18447"'):
+            self.assertIn(expected, unit)
+        verify = subprocess.run(['systemd-analyze', 'verify', '--man=no', str(self.unit)],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(verify.returncode, 0, verify.stderr)
+
+    def test_incomplete_tls_and_invalid_udp_controls_create_no_unit(self):
+        self.create_credentials()
+        cert, key = self.tls_pair('https')
+        for extra in [('--https-only',), ('--https-listen', '127.0.0.1:18443'),
+                      ('--https-listen', '127.0.0.1:18443', '--https-cert', cert),
+                      ('--https-cert', cert, '--https-key', key),
+                      ('--rtsps-listen', '127.0.0.1:18555'),
+                      ('--fxlink-listen', '127.0.0.1:18447'),
+                      ('--rtsp-udp-ports', '22000-22001'),
+                      ('--rtsp-listen', '127.0.0.1:18554', '--rtsp-udp-ports', '22001-22002'),
+                      ('--rtsp-listen', '127.0.0.1:18554', '--rtsp-udp-ports', '22000-22257'),
+                      ('--rtsp-listen', '127.0.0.1:18554', '--rtsp-udp-mbps', '42'),
+                      ('--rtsp-listen', '127.0.0.1:18554', '--rtsp-udp-ports', '22000-22001',
+                       '--rtsp-udp-mbps', '10001')]:
+            with self.subTest(extra=extra):
+                self.unit.unlink(missing_ok=True)
+                result = self.render(*extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.unit.exists())
+
+    def test_overlapping_tcp_bind_and_public_private_key_are_rejected(self):
+        self.create_credentials()
+        cert, key = self.tls_pair('https')
+        for address in ('127.0.0.1:18210', '0.0.0.0:18210'):
+            with self.subTest(address=address):
+                self.unit.unlink(missing_ok=True)
+                result = self.render('--https-listen', address, '--https-cert', cert, '--https-key', key)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.unit.exists())
+        key.chmod(0o644)
+        self.unit.unlink(missing_ok=True)
+        result = self.render('--https-listen', '127.0.0.1:18443', '--https-cert', cert, '--https-key', key)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.unit.exists())
+        if os.geteuid() == 0:
+            key.chmod(0o600)
+            os.chown(key, 0, 0)
+            result = self.render('--https-listen', '127.0.0.1:18443', '--https-cert', cert, '--https-key', key)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(self.unit.exists())
+
+    def test_srt_options_render_without_exposing_passphrase(self):
+        self.env['FLUSSONIX_SRT_PLAY_PASSPHRASE'] = 'owned-srt-passphrase-123!'
+        saved = self.command('credentials', '--from-env', '--with-srt-passphrase', '--output', self.credentials)
+        self.assertEqual(saved.returncode, 0, saved.stderr)
+        result = self.render('--srt-play-listen', '127.0.0.1:18448',
+                             '--srt-play-public-url', 'srt://cdn.example.test:18448',
+                             '--srt-play-latency', '750', '--srt-play-client-limit', '128',
+                             '--srt-play-allow-direct-token')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unit = self.unit.read_text()
+        for expected in ('"--srt-play-listen" "127.0.0.1:18448"',
+                         '"--srt-play-public-url" "srt://cdn.example.test:18448"',
+                         '"--srt-play-latency" "750"',
+                         '"--srt-play-client-limit" "128"',
+                         '"--srt-play-allow-direct-token"'):
+            self.assertIn(expected, unit)
+        self.assertIn('FLUSSONIX_SRT_PLAY_PASSPHRASE=', self.credentials.read_text())
+        self.assertNotIn(self.env['FLUSSONIX_SRT_PLAY_PASSPHRASE'], unit + saved.stdout + saved.stderr
+                         + result.stdout + result.stderr)
+
+    def test_srt_dependent_options_and_udp_collision_create_no_unit(self):
+        self.create_credentials()
+        cert, key = self.tls_pair('fxlink')
+        invalid = [('--srt-play-public-url', 'srt://cdn.example.test:18448'),
+                   ('--srt-play-latency', '750'), ('--srt-play-client-limit', '128'),
+                   ('--srt-play-allow-direct-token',),
+                   ('--srt-play-listen', '127.0.0.1:18448', '--srt-play-latency', '0'),
+                   ('--srt-play-listen', '127.0.0.1:18448', '--srt-play-latency', '10001'),
+                   ('--srt-play-listen', '127.0.0.1:18448', '--srt-play-client-limit', '0'),
+                   ('--srt-play-listen', '127.0.0.1:18448', '--srt-play-client-limit', '4097'),
+                   ('--srt-play-listen', '127.0.0.1:18448', '--srt-play-public-url',
+                    'srt://cdn.example.test:18448?token=private'),
+                   ('--srt-play-listen', '127.0.0.1:18448', '--fxlink-listen', '0.0.0.0:18448',
+                    '--fxlink-cert', cert, '--fxlink-key', key)]
+        for extra in invalid:
+            with self.subTest(extra=extra):
+                self.unit.unlink(missing_ok=True)
+                result = self.render(*extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.unit.exists())
+
+    def test_srt_passphrase_opt_in_rejects_missing_and_invalid_values(self):
+        for value in (None, 'too-short', 'x' * 80, 'bad\nline', 'nonascii-\u00e9-key'):
+            with self.subTest(value_kind='missing' if value is None else len(value)):
+                self.credentials.unlink(missing_ok=True)
+                if value is None:
+                    self.env.pop('FLUSSONIX_SRT_PLAY_PASSPHRASE', None)
+                else:
+                    self.env['FLUSSONIX_SRT_PLAY_PASSPHRASE'] = value
+                result = self.command('credentials', '--from-env', '--with-srt-passphrase',
+                                      '--output', self.credentials)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.credentials.exists())
+                if value is not None:
+                    self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_cluster_cdn_options_render_in_stable_order(self):
+        self.create_credentials()
+        ca = self.root / 'iptv-ca.crt'
+        ca.write_text('owned CA fixture')
+        ca.chmod(0o644)
+        result = self.render('--role', 'cdn', '--node-name', 'cdn-east', '--uplink-mbps', '750.5',
+                             '--client-limit', '5000', '--uplink-interface', 'eth0', '--drain',
+                             '--iptv-data', self.state / 'iptv.json',
+                             '--iptv-public-origin', 'https://cdn.example.test',
+                             '--iptv-authority', 'https://authority-a.example.test',
+                             '--iptv-authority-secondary', 'https://authority-b.example.test',
+                             '--iptv-authority-cluster-id', 'a3192376-6df5-4b76-a15c-43942fd3d466',
+                             '--iptv-authority-ca', ca)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unit = self.unit.read_text()
+        for expected in ('"--role" "cdn"', '"--node-name" "cdn-east"',
+                         '"--uplink-mbps" "750.5"', '"--client-limit" "5000"',
+                         '"--uplink-interface" "eth0"', '"--drain"',
+                         '"--iptv-authority-secondary" "https://authority-b.example.test"'):
+            self.assertIn(expected, unit)
+        self.assertLess(unit.index('"--role"'), unit.index('"--iptv-authority"'))
+
+    def test_ha_authority_unit_has_https_and_private_db_path(self):
+        if not shutil.which('systemd-analyze'):
+            self.skipTest('requires systemd-analyze')
+        self.create_credentials()
+        cert, key = self.tls_pair('https')
+        database = self.root / 'iptv-ha-db.json'
+        database.write_text('{"owned":"private database fixture"}')
+        database.chmod(0o600)
+        if os.geteuid() == 0:
+            os.chown(database, self.account.pw_uid, self.account.pw_gid)
+        result = self.render('--https-listen', '127.0.0.1:18443', '--https-cert', cert,
+                             '--https-key', key, '--https-only', '--iptv-lease-authority',
+                             '--iptv-ha-db-config', database,
+                             '--iptv-authority', 'https://authority-a.example.test',
+                             '--role', 'source', '--node-name', 'authority-a')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unit = self.unit.read_text()
+        self.assertIn('"--iptv-lease-authority"', unit)
+        self.assertIn(f'"--iptv-ha-db-config" "{database}"', unit)
+        self.assertNotIn('private database fixture', unit + result.stdout + result.stderr)
+        verify = subprocess.run(['systemd-analyze', 'verify', '--man=no', str(self.unit)],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(verify.returncode, 0, verify.stderr)
+
+    def test_invalid_iptv_and_cluster_options_create_no_unit(self):
+        self.create_credentials()
+        cert, key = self.tls_pair('https')
+        database = self.root / 'iptv-ha-db.json'
+        database.write_text('{"owned":"private database fixture"}')
+        database.chmod(0o600)
+        if os.geteuid() == 0:
+            os.chown(database, self.account.pw_uid, self.account.pw_gid)
+        uuid = 'a3192376-6df5-4b76-a15c-43942fd3d466'
+        invalid = [('--iptv-lease-authority',),
+                   ('--iptv-lease-authority', '--iptv-authority', 'https://authority-a.example.test'),
+                   ('--iptv-ha-db-config', database),
+                   ('--iptv-data', self.root / 'outside-state.json'),
+                   ('--iptv-authority', 'https://authority-a.example.test',
+                    '--iptv-authority-secondary', 'https://authority-a.example.test',
+                    '--iptv-authority-cluster-id', uuid),
+                   ('--iptv-authority', 'https://[2001:db8::1]',
+                    '--iptv-authority-secondary', 'https://[2001:db8:0:0:0:0:0:1]',
+                    '--iptv-authority-cluster-id', uuid),
+                   ('--iptv-authority', 'https://authority-a.example.test',
+                    '--iptv-authority-secondary', 'https://authority-b.example.test',
+                    '--iptv-authority-cluster-id', '00000000-0000-0000-0000-000000000000'),
+                   ('--iptv-authority', 'https://authority-a.example.test',
+                    '--iptv-authority-secondary', 'http://authority-b.example.test',
+                    '--iptv-authority-cluster-id', uuid),
+                   ('--iptv-authority', 'https://authority-a.example.test',
+                    '--iptv-authority-secondary', 'https://authority-b.example.test'),
+                   ('--iptv-authority', 'https://user:pass@authority-a.example.test'),
+                   ('--iptv-authority', 'https://authority-a.example.test/%n'),
+                   ('--role', 'load-balancer'), ('--node-name', 'bad%name'),
+                   ('--uplink-interface', 'bad interface'), ('--uplink-mbps', '0'),
+                   ('--uplink-mbps', 'nan'), ('--uplink-mbps', '1e3'),
+                   ('--client-limit', '0'), ('--client-limit', '18446744073709551616')]
+        for extra in invalid:
+            with self.subTest(extra=extra):
+                self.unit.unlink(missing_ok=True)
+                result = self.render(*extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.unit.exists())
+        database.chmod(0o644)
+        self.unit.unlink(missing_ok=True)
+        result = self.render('--https-listen', '127.0.0.1:18443', '--https-cert', cert,
+                             '--https-key', key, '--iptv-lease-authority',
+                             '--iptv-ha-db-config', database,
+                             '--iptv-authority', 'https://authority-a.example.test')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.unit.exists())
+
     def test_generated_unit_passes_systemd_and_keeps_secrets_out(self):
         if not shutil.which('systemd-analyze'):
             self.skipTest('requires systemd-analyze')
