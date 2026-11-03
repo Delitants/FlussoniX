@@ -135,7 +135,7 @@ async fn streams_select_nested_effective_fields_and_retain_required_name_without
     .await;
     assert_eq!(
         body,
-        json!({"estimated_count":3,"timing":{},"streams":[
+        json!({"estimated_count":3,"server_id":body["server_id"],"timing":{},"streams":[
             {"name":"alpha","title":"Needle first","static":false,"transcoder":{"vb":600},"stats":{"status":"waiting"},"config_on_disk":{"name":"alpha","template":"base"}},
             {"name":"beta","title":"Other","static":false,"transcoder":{"vb":600},"stats":{"status":"waiting"},"config_on_disk":{"name":"beta","template":"base"}},
             {"name":"gamma","title":"Needle last","static":false,"transcoder":{"vb":600},"stats":{"status":"waiting"},"config_on_disk":{"name":"gamma","template":"base"}}
@@ -180,7 +180,7 @@ async fn select_keeps_search_sort_counts_and_cursor_pages_based_on_unprojected_r
     .await;
     assert_eq!(
         first,
-        json!({"estimated_count":2,"next":first["next"],"timing":{},"streams":[{"name":"gamma","static":false}]})
+        json!({"estimated_count":2,"server_id":first["server_id"],"next":first["next"],"timing":{},"streams":[{"name":"gamma","static":false}]})
     );
     assert!(first["next"].is_string());
     let cursor = url::form_urlencoded::Serializer::new(String::new())
@@ -193,13 +193,13 @@ async fn select_keeps_search_sort_counts_and_cursor_pages_based_on_unprojected_r
     .await;
     assert_eq!(
         second,
-        json!({"estimated_count":2,"prev":second["prev"],"timing":{},"streams":[{"name":"alpha","static":false}]})
+        json!({"estimated_count":2,"server_id":second["server_id"],"prev":second["prev"],"timing":{},"streams":[{"name":"alpha","static":false}]})
     );
     assert!(second["prev"].is_string());
     let absent = selected(&app, "/streamer/api/v3/streams?select=name&q=not-present").await;
     assert_eq!(
         absent,
-        json!({"estimated_count":0,"timing":{},"streams":[]})
+        json!({"estimated_count":0,"server_id":absent["server_id"],"timing":{},"streams":[]})
     );
 }
 

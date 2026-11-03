@@ -1595,6 +1595,9 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         total
     };
     let mut result = json!({"estimated_count":estimated_count,"timing":{}});
+    if kind == "streams" {
+        result["server_id"] = json!(app.node_id.to_string());
+    }
     if let Some(next) = next {
         result["next"] = json!(next);
     }

@@ -306,6 +306,7 @@ pub fn effective(root: &Value, name: &str) -> Option<Value> {
         }
     }
     result = merge(&result, disk);
+    result["named_by"] = json!("config");
     result["config_on_disk"] = disk.clone();
     Some(result)
 }
