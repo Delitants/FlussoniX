@@ -65,6 +65,114 @@ async fn decoded(path: &Path, audio: &str) -> Value {
     decoded_with_video(path, "h264", audio).await
 }
 
+fn complete_media_prefix(data: &[u8]) -> Result<&[u8], &'static str> {
+    // A planned daemon/worker stop can close an HTTP upload during the last
+    // video or audio PES. Decode every earlier complete PES, while still
+    // rejecting missing packets anywhere in the captured transport stream.
+    if data.len() >= 4 * 1024 * 1024 {
+        return Err("HTTP media capture reached its byte limit");
+    }
+    let mut continuity = [None; 8192];
+    let mut last_video = None;
+    let mut last_audio = None;
+    let mut videos = 0;
+    let mut audios = 0;
+    for (index, packet) in data.chunks_exact(188).enumerate() {
+        if packet[0] != 0x47 || packet[1] & 0x80 != 0 || packet[3] & 0xc0 != 0 {
+            return Err("invalid captured MPEG-TS packet");
+        }
+        let pid = (usize::from(packet[1] & 0x1f) << 8) | usize::from(packet[2]);
+        let mode = (packet[3] >> 4) & 3;
+        if mode == 0 {
+            return Err("invalid captured MPEG-TS adaptation mode");
+        }
+        let start = if mode & 2 != 0 {
+            5 + usize::from(packet[4])
+        } else {
+            4
+        };
+        if start > 188 {
+            return Err("invalid captured MPEG-TS adaptation length");
+        }
+        if mode & 1 == 0 || start == 188 {
+            continue;
+        }
+        if pid != 8191 {
+            let counter = packet[3] & 15;
+            if continuity[pid].is_some_and(|previous| (previous + 1) & 15 != counter) {
+                return Err("captured MPEG-TS continuity gap");
+            }
+            continuity[pid] = Some(counter);
+        }
+        if packet[1] & 0x40 != 0
+            && packet
+                .get(start..start + 4)
+                .is_some_and(|payload| payload[..3] == [0, 0, 1])
+        {
+            let stream = packet[start + 3];
+            if (0xe0..=0xef).contains(&stream) {
+                last_video = Some(index * 188);
+                videos += 1;
+            } else if (0xc0..=0xdf).contains(&stream) {
+                last_audio = Some(index * 188);
+                audios += 1;
+            }
+        }
+    }
+    if videos < 2 || audios < 2 {
+        return Err("captured MPEG-TS has no complete audio/video prefix");
+    }
+    let cut = last_video.unwrap().min(last_audio.unwrap());
+    Ok(&data[..cut])
+}
+
+#[cfg(test)]
+mod complete_prefix_tests {
+    use super::complete_media_prefix;
+
+    fn packet(pid: u16, cc: u8, start: bool, stream: Option<u8>) -> [u8; 188] {
+        let mut packet = [0xff; 188];
+        packet[0] = 0x47;
+        packet[1] = ((pid >> 8) as u8 & 0x1f) | if start { 0x40 } else { 0 };
+        packet[2] = pid as u8;
+        packet[3] = 0x10 | cc;
+        if let Some(stream) = stream {
+            packet[4..8].copy_from_slice(&[0, 0, 1, stream]);
+        }
+        packet
+    }
+
+    #[test]
+    fn intentional_shutdown_excludes_only_unfinished_audio_video_pes() {
+        let packets = [
+            packet(0, 0, true, None),
+            packet(256, 0, true, Some(0xe0)),
+            packet(256, 1, false, None),
+            packet(257, 0, true, Some(0xc0)),
+            packet(256, 2, true, Some(0xe0)),
+            packet(257, 1, true, Some(0xc0)),
+            packet(256, 3, false, None),
+        ];
+        let capture = packets.concat();
+        assert_eq!(
+            complete_media_prefix(&capture).unwrap(),
+            &capture[..4 * 188]
+        );
+    }
+
+    #[test]
+    fn missing_interior_ts_packet_cannot_be_hidden_by_tail_trimming() {
+        let packets = [
+            packet(256, 0, true, Some(0xe0)),
+            packet(257, 0, true, Some(0xc0)),
+            packet(256, 2, false, None),
+            packet(256, 3, true, Some(0xe0)),
+            packet(257, 1, true, Some(0xc0)),
+        ];
+        assert!(complete_media_prefix(&packets.concat()).is_err());
+    }
+}
+
 async fn decoded_with_video(path: &Path, video: &str, audio: &str) -> Value {
     let probe = tokio::process::Command::new("ffprobe")
         .kill_on_drop(true)
@@ -207,7 +315,11 @@ async fn evidence(receivers: &[Receiver; 2], directory: &Path, audio: &str) -> V
         closed(receiver).await;
         let bytes = receiver.capture.data.lock().unwrap().clone();
         let file = directory.join(format!("output-{index}.ts"));
-        std::fs::write(&file, &bytes[..bytes.len() / 188 * 188]).unwrap();
+        std::fs::write(
+            &file,
+            complete_media_prefix(&bytes).expect("complete HTTP publishing media prefix"),
+        )
+        .unwrap();
         let mut report = decoded(&file, audio).await;
         report["transport"] = json!(if index == 0 { "http" } else { "verified_https" });
         reports.push(report);
