@@ -1,3 +1,4 @@
+mod file_reader;
 mod shared;
 use crate::wire::Hub;
 use bytes::Bytes;
@@ -1787,16 +1788,7 @@ impl Engine {
         } else {
             return Err("media worker unavailable".into());
         }
-        let path = self.directory(name).join(file);
-        let meta = tokio::fs::metadata(&path)
-            .await
-            .map_err(|_| "media not ready")?;
-        if meta.len() > 32 * 1024 * 1024 {
-            return Err("segment exceeds size limit".into());
-        }
-        let mut data = tokio::fs::read(&path)
-            .await
-            .map_err(|_| "media not ready")?;
+        let mut data = file_reader::read(&self.root, name, file, 32 * 1024 * 1024).await?;
         let drop_captions = self
             .workers
             .lock()
@@ -1807,28 +1799,32 @@ impl Engine {
             if file.ends_with(".ts") {
                 crate::caption_filter::ts(&mut data)?;
             } else if file.ends_with(".m4s") {
-                let dir = path.parent().ok_or("media not ready")?;
-                let list = tokio::fs::read_to_string(dir.join("index.m3u8"))
-                    .await
-                    .map_err(|_| "media not ready")?;
+                let prefix = if file.starts_with("fmp4/") {
+                    "fmp4/"
+                } else {
+                    ""
+                };
+                let list = file_reader::read(
+                    &self.root,
+                    name,
+                    &format!("{prefix}index.m3u8"),
+                    2 * 1024 * 1024,
+                )
+                .await?;
+                let list = String::from_utf8(list).map_err(|_| "media not ready")?;
                 let init = list
                     .lines()
                     .find_map(|l| l.strip_prefix("#EXT-X-MAP:URI=\""))
                     .and_then(|l| l.split('"').next())
                     .filter(|l| valid_file(l) && l.ends_with(".mp4"))
                     .ok_or("caption initialization unavailable")?;
-                let init_path = dir.join(init);
-                if tokio::fs::metadata(&init_path)
-                    .await
-                    .map_err(|_| "media not ready")?
-                    .len()
-                    > 2 * 1024 * 1024
-                {
-                    return Err("caption initialization exceeds limit".into());
-                }
-                let init = tokio::fs::read(init_path)
-                    .await
-                    .map_err(|_| "media not ready")?;
+                let init = file_reader::read(
+                    &self.root,
+                    name,
+                    &format!("{prefix}{init}"),
+                    2 * 1024 * 1024,
+                )
+                .await?;
                 crate::caption_filter::mp4(&init, &mut data)?;
             }
         }
@@ -2079,6 +2075,7 @@ fn valid_file(file: &str) -> bool {
             || f == "init.mp4"
             || f.starts_with('g') && f.ends_with("_init.mp4"))
 }
+
 pub fn translate_input(input: &str) -> Result<String, String> {
     let (scheme, rest) = input.split_once("://").ok_or("invalid input URL")?;
     let scheme = match scheme {

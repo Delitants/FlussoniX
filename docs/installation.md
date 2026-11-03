@@ -38,6 +38,10 @@ mkdir -p "$flussonix_data"
 chmod 700 "$flussonix_data"
 ```
 
+The media directory must belong to the daemon account and must not be writable
+by another account. HLS delivery rejects symlinked or foreign-owned generated
+files and media directories; keep `--media-dir` under this private state path.
+
 Choose an admin password and create a cluster peer key once with
 `openssl rand -hex 32`. Save both in your password manager and reuse them after
 every restart. FlussoniX nodes in the same native cluster use the same peer key.
