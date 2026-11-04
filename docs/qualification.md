@@ -2034,9 +2034,16 @@ Outbound keys are matched by packetizer track ID, media and encoding before
 sockets and SDP are published. Live UDP tests decrypted each lane with only its
 configured key, rejected duplicate key bytes, and withdrew SDP on a same-count
 track-ID change. The Streams and Templates browser flows saved, reloaded and
-cleared the new labeled controls without a JSON editor. Exact-head CI,
-cross-host SRTP qualification and the remaining release blockers are still
-pending; these local results do not establish a production-ready release.
+cleared the new labeled controls without a JSON editor. On isolated test
+daemons, CDN4 sent encrypted MP2T SRTP over the private LAN to CDN5 using a
+fresh receiver key epoch. CDN5 returned an HLS playlist and a 280,120-byte
+segment; independent FFprobe identified H.264 video and AAC audio in that
+segment. The receiver history recorded the new key claim. The temporary
+firewall rule, test daemons and test files were removed afterward; both hosts'
+Flussonic services remained active. This checks one cross-host MP2T profile,
+not the elementary profiles or a sustained-loss run. Exact-head CI and the
+remaining release blockers are still pending; these results do not establish
+a production-ready release.
 
 The candidate capabilities endpoint now reports receiver-history readiness
 without disclosing its path or fingerprints; a background check is coalesced
