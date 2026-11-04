@@ -159,6 +159,11 @@ struct Resolved {
     policy: PolicySnapshot,
     revision: u64,
 }
+#[derive(Default)]
+struct SrtpLedgerHealth {
+    checked: Option<(Instant, bool)>,
+    probing: bool,
+}
 pub struct App {
     http_delivery: std::sync::Mutex<Value>,
     srt_playback: std::sync::Mutex<Value>,
@@ -195,6 +200,7 @@ pub struct App {
     pub started: Instant,
     started_at_epoch_secs: u64,
     readiness_ha: Mutex<Option<(Instant, bool)>>,
+    srtp_ledger_health: Arc<std::sync::Mutex<SrtpLedgerHealth>>,
     mirrors: fxlink_access::Mirrors,
     source_queries: tokio::sync::Semaphore,
     source_activation: Mutex<source_activation::State>,
@@ -204,6 +210,38 @@ pub struct App {
     source_lookups: Mutex<HashMap<String, origin_resolution::Ticket>>,
 }
 impl App {
+    fn srtp_ledger_capability(&self) -> Value {
+        let Some(path) = self.options.srtp_receiver_ledger.clone() else {
+            return json!({"configured":false,"healthy":false,"verified":true});
+        };
+        let mut health = self.srtp_ledger_health.lock().unwrap();
+        let fresh = health
+            .checked
+            .as_ref()
+            .is_some_and(|(checked, _)| checked.elapsed() < Duration::from_secs(30));
+        if !fresh && !health.probing {
+            health.probing = true;
+            let status = self.srtp_ledger_health.clone();
+            tokio::spawn(async move {
+                let healthy = tokio::task::spawn_blocking(move || {
+                    crate::direct_rtp::key_ledger::Ledger::new(path)
+                        .probe()
+                        .is_ok()
+                })
+                .await
+                .unwrap_or(false);
+                let mut state = status.lock().unwrap();
+                state.checked = Some((Instant::now(), healthy));
+                state.probing = false;
+            });
+        }
+        if fresh {
+            let (checked, healthy) = health.checked.as_ref().unwrap();
+            json!({"configured":true,"healthy":healthy,"verified":true,"age_ms":checked.elapsed().as_millis().min(u128::from(u64::MAX)) as u64})
+        } else {
+            json!({"configured":true,"healthy":null,"verified":false,"age_ms":health.checked.as_ref().map(|(checked,_)|checked.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)})
+        }
+    }
     fn owns_iptv_catalog(&self) -> bool {
         self.options.iptv_lease_authority
             || (self.options.role == "standalone" && self.options.iptv_authority.is_none())
@@ -478,6 +516,7 @@ impl App {
             started,
             started_at_epoch_secs,
             readiness_ha: Mutex::new(None),
+            srtp_ledger_health: Arc::new(std::sync::Mutex::new(SrtpLedgerHealth::default())),
             mirrors: fxlink_access::Mirrors::default(),
             source_queries: tokio::sync::Semaphore::new(64),
             source_activation: Mutex::new(source_activation::State::default()),
@@ -1831,7 +1870,7 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
         let (gpu_profiles, vaapi_profiles) =
             tokio::join!(app.media.gpu_capabilities(), app.media.vaapi_capabilities());
         return json_response(
-            json!({"fxlink":app.fxlink.lock().unwrap().0.clone(),"rtsp_publication":app.rtsp_publication.lock().unwrap().clone(),"api":"Flussonic v3 subset","input":["fxlink (verified QUIC TLS, original native records, FEC)","hls","hlss","tshttp","tshttps","rtsp","rtsp-udp (unicast RTP/RTCP)","rtsp2 (RTSP/1.0 camera input, AAC audio default)","rtsps (verified TLS, interleaved TCP)","srt","rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","publish:// (HTTP MPEG-TS; RTSP TCP / opt-in unicast UDP; RTSPS TLS TCP receive; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/HEVC video, AAC/Layer II/MP3 audio; frames and packed GOPs)","m4f (H.264/HEVC video, AAC/Layer II/MP3 audio; bounded segments)","testsrc"],"output":["rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","srt (caller push / global listener playback, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","http / https / tshttp / tshttps (native continuous MPEG-TS POST push, optional Basic; verified HTTPS TLS)","rtsp (TCP or unicast UDP publish push; TCP / opt-in unicast UDP playback; H264/HEVC/AAC-LC/MP2/MP3)","rtsps (verified TLS TCP publish push; opt-in TLS TCP playback; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/HEVC video, AAC/Layer II/MP3 audio; frames and packed GOPs)","m4f (H.264/HEVC video, AAC/Layer II/MP3 audio; bounded segments)"],"unimplemented":["SDP negotiation","DTLS-SRTP / automatic key negotiation","rtsp Basic / Digest viewer auth","dvr","push protocols beyond SRT/RTSP/RTSPS/HTTP MPEG-TS","srt publication policy / per-stream playback listeners"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA / VAAPI H.264 / HEVC; profile readiness check, no software fallback","gpu_profiles":gpu_profiles,"vaapi_profiles":vaapi_profiles},"direct_srtp":{"available":crate::direct_rtp::crypto::availability(),"profile":"AES_CM_128_HMAC_SHA1_80","library":"independent system libsrtp2"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP/RTSP/RTSPS redirects"}),
+            json!({"fxlink":app.fxlink.lock().unwrap().0.clone(),"rtsp_publication":app.rtsp_publication.lock().unwrap().clone(),"api":"Flussonic v3 subset","input":["fxlink (verified QUIC TLS, original native records, FEC)","hls","hlss","tshttp","tshttps","rtsp","rtsp-udp (unicast RTP/RTCP)","rtsp2 (RTSP/1.0 camera input, AAC audio default)","rtsps (verified TLS, interleaved TCP)","srt","rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","publish:// (HTTP MPEG-TS; RTSP TCP / opt-in unicast UDP; RTSPS TLS TCP receive; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/HEVC video, AAC/Layer II/MP3 audio; frames and packed GOPs)","m4f (H.264/HEVC video, AAC/Layer II/MP3 audio; bounded segments)","testsrc"],"output":["rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","srt (caller push / global listener playback, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","http / https / tshttp / tshttps (native continuous MPEG-TS POST push, optional Basic; verified HTTPS TLS)","rtsp (TCP or unicast UDP publish push; TCP / opt-in unicast UDP playback; H264/HEVC/AAC-LC/MP2/MP3)","rtsps (verified TLS TCP publish push; opt-in TLS TCP playback; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/HEVC video, AAC/Layer II/MP3 audio; frames and packed GOPs)","m4f (H.264/HEVC video, AAC/Layer II/MP3 audio; bounded segments)"],"unimplemented":["SDP negotiation","DTLS-SRTP / automatic key negotiation","rtsp Basic / Digest viewer auth","dvr","push protocols beyond SRT/RTSP/RTSPS/HTTP MPEG-TS","srt publication policy / per-stream playback listeners"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA / VAAPI H.264 / HEVC; profile readiness check, no software fallback","gpu_profiles":gpu_profiles,"vaapi_profiles":vaapi_profiles},"direct_srtp":{"available":crate::direct_rtp::crypto::availability(),"profile":"AES_CM_128_HMAC_SHA1_80","library":"independent system libsrtp2","receiver_ledger":app.srtp_ledger_capability()},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP/RTSP/RTSPS redirects"}),
         );
     }
     if let Some(name) = tail.strip_prefix("stream/") {
