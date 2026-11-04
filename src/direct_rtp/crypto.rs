@@ -369,9 +369,7 @@ pub fn receive_track_sessions(
         return Err("Elementary SRTP requires 1..8 receive tracks");
     }
     let ids: Vec<_> = expected.iter().flatten().copied().collect();
-    if ids.iter().any(|id| *id == 0)
-        || ids.iter().copied().collect::<HashSet<_>>().len() != ids.len()
-    {
+    if ids.contains(&0) || ids.iter().copied().collect::<HashSet<_>>().len() != ids.len() {
         return Err("Elementary SRTP source identities must be distinct");
     }
     match (&settings.key_file, &settings.track_key_files) {

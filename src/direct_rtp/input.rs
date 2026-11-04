@@ -137,7 +137,7 @@ impl Mp2t {
 }
 
 enum Implementation {
-    Mp2t(Mp2t),
+    Mp2t(Box<Mp2t>),
     Elementary(super::elementary::input::Input),
 }
 pub struct Input {
@@ -156,7 +156,7 @@ impl Input {
             let input = Mp2t::bind(settings).await?;
             Ok(Self {
                 stats: input.stats.clone(),
-                inner: Implementation::Mp2t(input),
+                inner: Implementation::Mp2t(Box::new(input)),
             })
         }
     }
