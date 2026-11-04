@@ -87,11 +87,13 @@ async fn secure_four_destinations_have_fresh_epochs_encrypted_feedback_and_key_f
     let mut first_ssrc = 0;
     for (i, (port, sockets)) in listeners.iter().enumerate() {
         let mut contexts = vec![];
+        let mut wire_ssrcs = vec![];
         for (lane, pt) in [(0, 96), (2, 97)] {
             let (mut body, _) = recv(&sockets[lane]).await;
             assert_eq!(u16::from_be_bytes(body[2..4].try_into().unwrap()), 0);
             assert_eq!(body[1] & 127, pt);
             let id = u32::from_be_bytes(body[8..12].try_into().unwrap());
+            wire_ssrcs.push(id);
             assert!(identities.insert(id));
             if i == 0 && lane == 0 {
                 first_ssrc = id;
@@ -107,6 +109,10 @@ async fn secure_four_destinations_have_fresh_epochs_encrypted_feedback_and_key_f
         let sdp = e.rtp_sdp("owned", i, &cfg).await.unwrap();
         assert!(sdp.contains(&format!("m=video {port} RTP/SAVP 96")));
         assert!(sdp.contains(&format!("m=audio {} RTP/SAVP 97", port + 2)));
+        assert_eq!(sdp.matches("a=ssrc:").count(), 2);
+        for id in &wire_ssrcs {
+            assert!(sdp.contains(&format!("a=ssrc:{id} cname:")));
+        }
         assert!(!sdp.contains("RTP/AVP"));
         assert!(!sdp.contains("crypto:"));
         assert!(!sdp.contains("owned.key"));
@@ -146,6 +152,10 @@ async fn secure_four_destinations_have_fresh_epochs_encrypted_feedback_and_key_f
                 }
             }
             assert_eq!(names[0], names[1]);
+            let cname = std::str::from_utf8(&names[0]).unwrap();
+            for id in &wire_ssrcs {
+                assert!(sdp.contains(&format!("a=ssrc:{id} cname:{cname}\r\n")));
+            }
         }
     }
     tokio::time::sleep(Duration::from_millis(100)).await;

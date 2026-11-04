@@ -32,7 +32,14 @@ enum Sent {
     Unavailable,
     Cancelled,
 }
-fn sdp(description: &Description, address: SocketAddr, secure: bool) -> String {
+fn sdp(
+    description: &Description,
+    address: SocketAddr,
+    secure: bool,
+    senders: &[u32],
+    cname: &str,
+) -> String {
+    debug_assert_eq!(description.tracks.len(), senders.len());
     let transport = if secure { "RTP/SAVP" } else { "RTP/AVP" };
     let family = if address.is_ipv4() { "IP4" } else { "IP6" };
     let ip = address.ip();
@@ -51,6 +58,9 @@ fn sdp(description: &Description, address: SocketAddr, secure: bool) -> String {
         ));
         if !t.fmtp.is_empty() {
             out.push_str(&format!("a=fmtp:{} {}\r\n", t.payload, t.fmtp));
+        }
+        if secure {
+            out.push_str(&format!("a=ssrc:{} cname:{cname}\r\n", senders[i]));
         }
     }
     out
@@ -190,9 +200,16 @@ async fn send(
     if !current(worker, &description) {
         return Err("Elementary RTP generation changed");
     }
+    let cname = format!("fx-{}", uuid::Uuid::new_v4());
     *state.sdp.lock().unwrap() = Some((
         description.generation,
-        sdp(&description, state.definition.settings.address, secure),
+        sdp(
+            &description,
+            state.definition.settings.address,
+            secure,
+            &senders,
+            &cname,
+        ),
     ));
     let mut pacer = crate::rtsp::udp::Pacer::new(state.definition.max_mbps as f64)
         .map_err(|_| "Elementary RTP rate invalid")?;
@@ -204,7 +221,6 @@ async fn send(
     // All related media share one stable decode-time/wall-time mapping.
     // Packet PTS offsets and pacing delays must never re-anchor this mapping.
     let mut epoch: Option<(u64, Instant)> = None;
-    let cname = format!("fx-{}", uuid::Uuid::new_v4());
     let mut reports = tokio::time::interval(Duration::from_secs(5));
     reports.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     reports.tick().await;

@@ -22,6 +22,7 @@ pub struct Track {
     pub encoding: String,
     pub fmtp: String,
     pub video: bool,
+    pub ssrc: Option<u32>,
 }
 #[derive(Clone, Debug)]
 pub struct Session {
@@ -35,6 +36,27 @@ struct Raw {
     encoding: Option<String>,
     fmtp: Option<String>,
     address: Option<IpAddr>,
+    ssrc: Option<u32>,
+}
+fn source_identity(value: &str) -> Result<u32, String> {
+    let (number, cname) = value
+        .split_once(" cname:")
+        .ok_or("Invalid SDP source identity")?;
+    if number.is_empty()
+        || !number.bytes().all(|b| b.is_ascii_digit())
+        || cname.is_empty()
+        || cname.len() > 64
+        || !cname
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("Invalid SDP source identity".into());
+    }
+    number
+        .parse::<u32>()
+        .ok()
+        .filter(|id| *id != 0)
+        .ok_or("Invalid SDP source identity".into())
 }
 fn connection(value: &str) -> Result<IpAddr, String> {
     let f: Vec<_> = value.split_whitespace().collect();
@@ -236,6 +258,7 @@ fn validate(raw: Raw) -> Result<Track, String> {
         encoding,
         fmtp,
         video: raw.video,
+        ssrc: raw.ssrc,
     })
 }
 impl Session {
@@ -304,11 +327,21 @@ impl Session {
                         encoding: None,
                         fmtp: None,
                         address: None,
+                        ssrc: None,
                     });
                 }
                 "a" => {
                     if let Some((kind, value)) = value.split_once(':') {
                         if kind == "tool" && value.len() <= 256 {
+                            continue;
+                        }
+                        if kind == "ssrc" && settings.secure {
+                            let raw = raws
+                                .last_mut()
+                                .ok_or("SDP source identity requires media")?;
+                            if raw.ssrc.replace(source_identity(value)?).is_some() {
+                                return Err("Duplicate SDP source identity".into());
+                            }
                             continue;
                         }
                         if !["rtpmap", "fmtp"].contains(&kind) {
@@ -355,11 +388,23 @@ impl Session {
             return Err("First SDP media address/port must match the input URL".into());
         }
         let mut ports = HashSet::new();
+        let mut sources = HashSet::new();
         let mut tracks = vec![];
+        if let Some(expected) = &settings.expected_ssrcs {
+            if expected.len() != raws.len()
+                || raws
+                    .iter()
+                    .zip(expected)
+                    .any(|(raw, expected)| raw.ssrc != Some(*expected))
+            {
+                return Err("SDP source identities disagree with input settings".into());
+            }
+        }
         for raw in raws {
             if raw.address.or(global) != Some(address)
                 || !ports.insert(raw.port)
                 || !ports.insert(raw.port + 1)
+                || raw.ssrc.is_some_and(|id| !sources.insert(id))
             {
                 return Err("SDP tracks require one address and exclusive RTP/RTCP ports".into());
             }
