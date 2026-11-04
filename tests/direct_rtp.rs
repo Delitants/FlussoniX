@@ -129,3 +129,118 @@ fn receive_buffer_request_persists_for_input_and_rejects_output_or_invalid_size(
     );
     assert_eq!(store.snapshot(), before);
 }
+
+#[test]
+fn elementary_srtp_accepts_explicit_receive_track_protection_modes() {
+    use flussonix::direct_rtp::config::Settings;
+
+    let shared = json!({"url":"srtp://127.0.0.1:40000","flussonix_rtp":{
+        "profile":"elementary","sdp_file":"/tmp/owned.sdp",
+        "key_file":"/tmp/shared.key","expected_ssrcs":[101,202]
+    }});
+    let separate = json!({"url":"srtp://127.0.0.1:40000","flussonix_rtp":{
+        "profile":"elementary","sdp_file":"/tmp/owned.sdp",
+        "track_key_files":["/tmp/video.key","/tmp/audio.key"]
+    }});
+    assert!(
+        Settings::input(&shared).is_ok(),
+        "shared key plus bound SSRCs"
+    );
+    assert!(
+        Settings::input(&separate).is_ok(),
+        "one distinct key path per track"
+    );
+    assert!(
+        Settings::input(&json!({"url":"srtp://127.0.0.1:40000","flussonix_rtp":{
+            "profile":"elementary","sdp_file":"/tmp/owned.sdp","key_file":"/tmp/one.key"
+        }}))
+        .is_ok(),
+        "single-track compatibility remains available until SDP count is known"
+    );
+}
+
+#[test]
+fn elementary_srtp_rejects_conflicting_or_unbounded_receive_bindings() {
+    use flussonix::direct_rtp::config::Settings;
+
+    let base = json!({"url":"srtp://127.0.0.1:40000","flussonix_rtp":{
+        "profile":"elementary","sdp_file":"/tmp/owned.sdp","key_file":"/tmp/shared.key"
+    }});
+    let invalid = [
+        json!({"expected_ssrcs":[]}),
+        json!({"expected_ssrcs":[0]}),
+        json!({"expected_ssrcs":[101,101]}),
+        json!({"expected_ssrcs":[-1]}),
+        json!({"expected_ssrcs":[4294967296u64]}),
+        json!({"expected_ssrcs":["101"]}),
+        json!({"expected_ssrcs":[1,2,3,4,5,6,7,8,9]}),
+        json!({"track_key_files":["/tmp/video.key"]}),
+        json!({"track_key_files":[]}),
+    ];
+    for fields in invalid {
+        let mut row = base.clone();
+        for (key, value) in fields.as_object().unwrap() {
+            row["flussonix_rtp"][key] = value.clone();
+        }
+        assert!(Settings::input(&row).is_err(), "accepted {row}");
+    }
+    for keys in [
+        json!(["relative.key"]),
+        json!(["/tmp/a.key", "relative.key"]),
+        json!(["/tmp/a.key", "/tmp/a.key"]),
+        json!(["/tmp/a.key\n"]),
+        json!([1]),
+        json!(vec!["/tmp/a.key"; 9]),
+    ] {
+        let row = json!({"url":"srtp://127.0.0.1:40000","flussonix_rtp":{
+            "profile":"elementary","sdp_file":"/tmp/owned.sdp","track_key_files":keys
+        }});
+        assert!(Settings::input(&row).is_err(), "accepted {row}");
+    }
+    for url in ["rtp://127.0.0.1:40000", "srtp://127.0.0.1:40000"] {
+        let row = json!({"url":url,"flussonix_rtp":{
+            "profile":"mp2t","key_file":"/tmp/shared.key","expected_ssrcs":[101]
+        }});
+        assert!(Settings::input(&row).is_err(), "accepted {row}");
+    }
+}
+
+#[test]
+fn elementary_srtp_output_track_keys_require_exact_typed_mapping() {
+    use flussonix::direct_rtp::config::{Settings, outputs};
+
+    let entries = json!([
+        {"track_id":7,"media":"video","encoding":"H264/90000","key_file":"/tmp/video.key"},
+        {"track_id":9,"media":"audio","encoding":"MPEG4-GENERIC/48000/2","key_file":"/tmp/audio.key"}
+    ]);
+    let row = json!({"url":"srtp://127.0.0.1:40000","flussonix_rtp":{
+        "profile":"elementary","track_keys":entries
+    }});
+    assert!(outputs(&json!({"flussonix_rtp_outputs":[row.clone()]})).is_ok());
+    let mut input_row = row.clone();
+    input_row["flussonix_rtp"]["sdp_file"] = json!("/tmp/owned.sdp");
+    assert!(
+        Settings::input(&input_row).is_err(),
+        "output mapping must not be accepted as input"
+    );
+    let mut bad = row.clone();
+    for replacement in [
+        json!([]),
+        json!([{"track_id":0,"media":"video","encoding":"H264/90000","key_file":"/tmp/v.key"}]),
+        json!([{"track_id":7,"media":"video","encoding":"H264/90000","key_file":"/tmp/v.key"},{"track_id":7,"media":"audio","encoding":"MPA/90000","key_file":"/tmp/a.key"}]),
+        json!([{"track_id":7,"media":"text","encoding":"H264/90000","key_file":"/tmp/v.key"}]),
+        json!([{"track_id":7,"media":"video","encoding":"H264/90000","key_file":"relative.key"}]),
+        json!([{"track_id":7,"media":"video","encoding":"H264/90000","key_file":"/tmp/v.key","unknown":true}]),
+        json!("not-an-array"),
+    ] {
+        bad["flussonix_rtp"]["track_keys"] = replacement;
+        assert!(
+            outputs(&json!({"flussonix_rtp_outputs":[bad.clone()]})).is_err(),
+            "accepted {bad}"
+        );
+    }
+    for url in ["rtp://127.0.0.1:40000", "srtp://127.0.0.1:40000"] {
+        let row = json!({"url":url,"flussonix_rtp":{"profile":"mp2t","track_keys":entries}});
+        assert!(outputs(&json!({"flussonix_rtp_outputs":[row]})).is_err());
+    }
+}
