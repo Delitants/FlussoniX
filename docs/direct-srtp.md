@@ -16,9 +16,9 @@ Set its ownership to the daemon's service UID. Provision the same key/salt to th
 Before admitting direct SRTP input, initialize an owner-only receiver history once and pass its path to the daemon:
 
 ```sh
-install -d -m 700 /var/lib/flussonix
-flussonix --init-srtp-receiver-ledger /var/lib/flussonix/srtp-receiver-epochs
-flussonix --srtp-receiver-ledger /var/lib/flussonix/srtp-receiver-epochs \
+sudo install -d -o flussonix -g flussonix -m 700 /var/lib/flussonix
+sudo -u flussonix flussonix --init-srtp-receiver-ledger /var/lib/flussonix/srtp-receiver-epochs
+sudo -u flussonix flussonix --srtp-receiver-ledger /var/lib/flussonix/srtp-receiver-epochs \
   --listen 127.0.0.1:18210 --config /etc/flussonix/config.json
 ```
 

@@ -2037,3 +2037,13 @@ track-ID change. The Streams and Templates browser flows saved, reloaded and
 cleared the new labeled controls without a JSON editor. Exact-head CI,
 cross-host SRTP qualification and the remaining release blockers are still
 pending; these local results do not establish a production-ready release.
+
+The candidate capabilities endpoint now reports receiver-history readiness
+without disclosing its path or fingerprints; a background check is coalesced
+for 30 seconds. The focused API test covered absent, valid and unsafe history
+with 12 concurrent authenticated requests. The optional systemd helper now
+renders a stable history path under the private state directory without
+creating it. All 28 helper tests passed, including unsafe ledger/lock refusal
+and an actual `systemd-analyze verify` on a generated secure-listener unit.
+The upgrade instructions require explicit initialization and a fresh sender
+key/epoch before media admission. The helper itself does not start a service.

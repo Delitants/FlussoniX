@@ -178,6 +178,32 @@ def runtime_file(raw: str, account, groups: list[int], *, private: bool, max_byt
     return path
 
 
+def srtp_receiver_history(state: Path, account) -> Path:
+    """Check existing owner-only history names without creating or scanning them."""
+    ledger = state / 'srtp-receiver-ledger'
+    lock = state / 'srtp-receiver-ledger.lock'
+    present = [os.path.lexists(path) for path in (ledger, lock)]
+    if not any(present):
+        return ledger
+    if not all(present):
+        raise ValueError('SRTP receiver history and lock must both exist')
+    for path, limit in ((ledger, 8 + 65 * 1_000_000), (lock, 0)):
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC), 'rb') as file:
+            info = os.fstat(file.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != account.pw_uid
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                    or info.st_size > limit):
+                raise ValueError('SRTP receiver history or lock is unsafe')
+            if path == ledger:
+                if (info.st_size < 8 or (info.st_size - 8) % 65 != 0
+                        or file.read(8) != b'FXSRTP1\n'):
+                    raise ValueError('SRTP receiver history header is invalid')
+        current = path.stat(follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            raise ValueError('SRTP receiver history changed during validation')
+    return ledger
+
+
 def overlapping_bind(a: str, b: str) -> bool:
     def split(value):
         host, port = value.rsplit(':', 1)
@@ -286,6 +312,7 @@ def render(args):
     traverse(state, account, groups)
     if not can_access(state, account, groups, 7):
         raise ValueError('service account needs read/write access to state')
+    srtp_ledger = srtp_receiver_history(state, account)
     config = state / 'config.json'
     if config.exists() or config.is_symlink():
         _, info = read_regular(config, 16 * 1024 * 1024)
@@ -399,7 +426,8 @@ def render(args):
     if output.name != name:
         raise ValueError(f'output filename must be {name}')
     command_args = [release / 'bin/flussonix', '--listen', listen,
-        '--config', state / 'config.json', '--media-dir', state / 'media', '--web-dir', release / 'web', '--ffmpeg', ffmpeg]
+        '--config', state / 'config.json', '--media-dir', state / 'media', '--web-dir', release / 'web', '--ffmpeg', ffmpeg,
+        '--srtp-receiver-ledger', srtp_ledger]
     for prefix in ('https', 'rtsps', 'fxlink'):
         if prefix in secure:
             for suffix, value in zip(('_listen', '_cert', '_key'), secure[prefix]):
