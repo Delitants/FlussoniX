@@ -144,15 +144,18 @@ async fn send(
         })
         .collect();
     let mut contexts = if secure {
-        crypto::track_sessions(
-            state
-                .definition
-                .settings
-                .key_file
-                .as_deref()
-                .ok_or("SRTP key file required")?,
-            &senders.iter().copied().map(Some).collect::<Vec<_>>(),
-        )?
+        let settings = &state.definition.settings;
+        if let Some(keys) = &settings.track_keys {
+            crypto::send_track_sessions(keys, &description, &senders)?
+        } else {
+            crypto::track_sessions(
+                settings
+                    .key_file
+                    .as_deref()
+                    .ok_or("SRTP key file required")?,
+                &senders.iter().copied().map(Some).collect::<Vec<_>>(),
+            )?
+        }
         .into_iter()
     } else {
         vec![].into_iter()

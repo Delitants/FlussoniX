@@ -1,5 +1,8 @@
 //! Narrow libSRTP 2.x ABI. No custom cryptography or vendor media component.
-use crate::direct_rtp::config::Settings;
+use crate::{
+    direct_rtp::config::{OutputTrackKey, Settings, TrackMedia},
+    rtp::Description,
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
@@ -353,6 +356,58 @@ pub(crate) fn track_sessions(
             Ok((
                 Session::create(&mut key, None, false)?,
                 Session::create(&mut key, *sender, true)?,
+            ))
+        })
+        .collect()
+}
+/// Resolve output keys by stable packetizer ID rather than configuration order.
+/// Every key is loaded and checked before the caller opens a public socket or
+/// advertises an SDP generation.
+pub fn send_track_sessions(
+    keys: &[OutputTrackKey],
+    description: &Description,
+    senders: &[u32],
+) -> Result<Vec<(Session, Session)>, &'static str> {
+    if keys.is_empty()
+        || keys.len() > 8
+        || keys.len() != description.tracks.len()
+        || senders.len() != description.tracks.len()
+        || senders.contains(&0)
+        || senders.iter().collect::<HashSet<_>>().len() != senders.len()
+    {
+        return Err("Elementary SRTP output track set is invalid");
+    }
+    let mut snapshots = Vec::with_capacity(keys.len());
+    let mut fingerprints = HashSet::with_capacity(keys.len());
+    for track in &description.tracks {
+        let mut matching = keys.iter().filter(|key| key.track_id == track.id);
+        let key = matching
+            .next()
+            .filter(|_| matching.next().is_none())
+            .ok_or("Elementary SRTP output track ID mismatch")?;
+        if key.media
+            != if track.video {
+                TrackMedia::Video
+            } else {
+                TrackMedia::Audio
+            }
+            || key.encoding != track.encoding
+        {
+            return Err("Elementary SRTP output track media or encoding changed");
+        }
+        let snapshot = Secret(read_key(&key.key_file)?);
+        if !fingerprints.insert(key_fingerprint(&snapshot.0)) {
+            return Err("Elementary SRTP output track keys must contain different key material");
+        }
+        snapshots.push(snapshot);
+    }
+    snapshots
+        .iter_mut()
+        .zip(senders)
+        .map(|(key, sender)| {
+            Ok((
+                Session::create(key, None, false)?,
+                Session::create(key, Some(*sender), true)?,
             ))
         })
         .collect()
