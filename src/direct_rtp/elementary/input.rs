@@ -55,13 +55,15 @@ impl Input {
             settings,
         )?;
         let mut contexts = if settings.secure {
-            crypto::track_sessions(
-                settings
-                    .key_file
-                    .as_deref()
-                    .ok_or("SRTP key file required")?,
-                &vec![None; session.tracks.len()],
+            crypto::receive_track_sessions(
+                settings,
+                &session
+                    .tracks
+                    .iter()
+                    .map(|track| track.ssrc)
+                    .collect::<Vec<_>>(),
             )?
+            .sessions
             .into_iter()
             .map(Some)
             .collect::<Vec<_>>()

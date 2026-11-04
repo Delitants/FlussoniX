@@ -29,14 +29,21 @@ fn ports(count: u16) -> (u16, Vec<UdpSocket>) {
     }
     panic!("owned ports unavailable")
 }
-fn description(port: u16) -> String {
+fn description(port: u16, identities: [u32; 2]) -> String {
     format!(
-        "v=0\no=- 0 0 IN IP4 127.0.0.1\ns=Owned secure input\nc=IN IP4 127.0.0.1\nt=0 0\nm=audio {port} RTP/SAVP 97\na=rtpmap:97 MPEG4-GENERIC/48000/2\na=fmtp:97 mode=AAC-hbr;config=1190;sizeLength=13;indexLength=3;indexDeltaLength=3\nm=audio {} RTP/SAVP 97\na=rtpmap:97 MPEG4-GENERIC/48000/2\na=fmtp:97 mode=AAC-hbr;config=1190;sizeLength=13;indexLength=3;indexDeltaLength=3\n",
-        port + 2
+        "v=0\no=- 0 0 IN IP4 127.0.0.1\ns=Owned secure input\nc=IN IP4 127.0.0.1\nt=0 0\nm=audio {port} RTP/SAVP 97\na=rtpmap:97 MPEG4-GENERIC/48000/2\na=fmtp:97 mode=AAC-hbr;config=1190;sizeLength=13;indexLength=3;indexDeltaLength=3\na=ssrc:{} cname:fx-audio-a\nm=audio {} RTP/SAVP 97\na=rtpmap:97 MPEG4-GENERIC/48000/2\na=fmtp:97 mode=AAC-hbr;config=1190;sizeLength=13;indexLength=3;indexDeltaLength=3\na=ssrc:{} cname:fx-audio-b\n",
+        identities[0],
+        port + 2,
+        identities[1]
     )
 }
-fn config(port: u16, sdp: &std::path::Path, key: &std::path::Path) -> Settings {
-    Settings::input(&json!({"url":format!("srtp://127.0.0.1:{port}"),"flussonix_rtp":{"profile":"elementary","sdp_file":sdp,"key_file":key,"jitter_ms":0,"source_ip":"127.0.0.1"}})).expect("secure elementary configuration accepted").unwrap()
+fn config(
+    port: u16,
+    sdp: &std::path::Path,
+    key: &std::path::Path,
+    identities: [u32; 2],
+) -> Settings {
+    Settings::input(&json!({"url":format!("srtp://127.0.0.1:{port}"),"flussonix_rtp":{"profile":"elementary","sdp_file":sdp,"key_file":key,"expected_ssrcs":identities,"jitter_ms":0,"source_ip":"127.0.0.1"}})).expect("secure elementary configuration accepted").unwrap()
 }
 fn key_file(dir: &std::path::Path) -> std::path::PathBuf {
     use base64::Engine;
@@ -70,8 +77,8 @@ fn secure_sdp_requires_matching_transport_and_rejects_inline_keys() {
     let d = tempfile::tempdir().unwrap();
     let k = key_file(d.path());
     let s = d.path().join("owned.sdp");
-    let cfg = config(40000, &s, &k);
-    let text = description(40000);
+    let cfg = config(40000, &s, &k, [100, 101]);
+    let text = description(40000, [100, 101]);
     assert!(Session::parse(text.as_bytes(), &cfg).is_ok());
     assert!(Session::parse(text.replace("RTP/SAVP", "RTP/AVP").as_bytes(), &cfg).is_err());
     assert!(Session::parse(format!("{text}a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n").as_bytes(),&cfg).is_err());
@@ -85,12 +92,54 @@ async fn unsafe_key_fails_before_any_elementary_public_socket_opens() {
     std::fs::set_permissions(&k, std::fs::Permissions::from_mode(0o644)).unwrap();
     let (p, res) = ports(4);
     let s = d.path().join("owned.sdp");
-    std::fs::write(&s, description(p)).unwrap();
+    std::fs::write(&s, description(p, [100, 101])).unwrap();
     drop(res);
-    let c = config(p, &s, &k);
+    let c = config(p, &s, &k, [100, 101]);
     assert!(Input::bind(&c).await.is_err());
     for n in p..p + 4 {
         assert!(UdpSocket::bind(("127.0.0.1", n)).is_ok());
+    }
+}
+#[tokio::test]
+async fn separate_track_key_errors_leave_every_public_port_unbound() {
+    use base64::Engine as _;
+    let d = tempfile::tempdir().unwrap();
+    let a = key_file(d.path());
+    let b = d.path().join("track-b.key");
+    let (port, reserved) = ports(4);
+    let sdp = d.path().join("owned.sdp");
+    std::fs::write(&sdp, description(port, [101, 202])).unwrap();
+    drop(reserved);
+    for bad_second_key in [None, Some(0x31), Some(0x32)] {
+        match bad_second_key {
+            None => {
+                let _ = std::fs::remove_file(&b);
+            }
+            Some(value) => {
+                std::fs::write(
+                    &b,
+                    base64::engine::general_purpose::STANDARD.encode([value; 30]),
+                )
+                .unwrap();
+                std::fs::set_permissions(
+                    &b,
+                    std::fs::Permissions::from_mode(if value == 0x32 { 0o644 } else { 0o600 }),
+                )
+                .unwrap();
+            }
+        }
+        let settings = Settings::input(&json!({
+            "url":format!("srtp://127.0.0.1:{port}"),
+            "flussonix_rtp":{"profile":"elementary","sdp_file":sdp,"track_key_files":[a,b]}
+        }))
+        .unwrap()
+        .unwrap();
+        let error = Input::bind(&settings).await.err().unwrap();
+        assert!(!error.contains(a.to_str().unwrap()));
+        assert!(!error.contains(b.to_str().unwrap()));
+        for candidate in port..port + 4 {
+            assert!(UdpSocket::bind(("127.0.0.1", candidate)).is_ok());
+        }
     }
 }
 #[tokio::test]
@@ -99,9 +148,9 @@ async fn authenticated_tracks_reject_bad_media_preserve_rollover_and_encrypt_fee
     let k = key_file(d.path());
     let (p, res) = ports(4);
     let s = d.path().join("owned.sdp");
-    std::fs::write(&s, description(p)).unwrap();
+    std::fs::write(&s, description(p, [100, 101])).unwrap();
     drop(res);
-    let c = config(p, &s, &k);
+    let c = config(p, &s, &k, [100, 101]);
     let input = Input::bind(&c).await.unwrap();
     // Replacing a configured file affects the next generation only. All current
     // lanes and feedback must retain the same original snapshot.
@@ -275,9 +324,9 @@ async fn secure_cancellation_before_decoder_bind_releases_public_lanes() {
     let k = key_file(d.path());
     let (p, res) = ports(4);
     let s = d.path().join("owned.sdp");
-    std::fs::write(&s, description(p)).unwrap();
+    std::fs::write(&s, description(p, [222, 223])).unwrap();
     drop(res);
-    let input = Input::bind(&config(p, &s, &k)).await.unwrap();
+    let input = Input::bind(&config(p, &s, &k, [222, 223])).await.unwrap();
     let stats = input.stats.clone();
     let c = CancellationToken::new();
     let (writer, _reader) = tokio::io::duplex(1);
@@ -313,9 +362,11 @@ async fn secure_packets_wait_for_all_owned_decoder_ports_without_filling_public_
     let key = key_file(d.path());
     let (port, reserved) = ports(4);
     let sdp = d.path().join("owned.sdp");
-    std::fs::write(&sdp, description(port)).unwrap();
+    std::fs::write(&sdp, description(port, [777, 888])).unwrap();
     drop(reserved);
-    let input = Input::bind(&config(port, &sdp, &key)).await.unwrap();
+    let input = Input::bind(&config(port, &sdp, &key, [777, 888]))
+        .await
+        .unwrap();
     let stats = input.stats.clone();
     let cancel = CancellationToken::new();
     let (writer, mut reader) = tokio::io::duplex(32768);
@@ -361,9 +412,9 @@ async fn secure_packets_wait_for_all_owned_decoder_ports_without_filling_public_
         .send_to(&wrong_key, ("127.0.0.1", port))
         .await
         .unwrap();
-    let mut malformed = media(9, 902, 4);
+    let mut malformed = media(9, 777, 4);
     malformed[1] = 96;
-    crypto::Session::new([0x31; 30], Some(902))
+    crypto::Session::new([0x31; 30], Some(777))
         .unwrap()
         .protect(&mut malformed, false)
         .unwrap();
@@ -465,9 +516,11 @@ async fn secure_startup_overflow_drops_oldest_without_kernel_loss() {
     let key = key_file(d.path());
     let (port, reserved) = ports(4);
     let sdp = d.path().join("owned.sdp");
-    std::fs::write(&sdp, description(port)).unwrap();
+    std::fs::write(&sdp, description(port, [222, 333])).unwrap();
     drop(reserved);
-    let input = Input::bind(&config(port, &sdp, &key)).await.unwrap();
+    let input = Input::bind(&config(port, &sdp, &key, [222, 333]))
+        .await
+        .unwrap();
     let stats = input.stats.clone();
     let cancel = CancellationToken::new();
     let (writer, mut reader) = tokio::io::duplex(32768);
@@ -554,9 +607,11 @@ async fn secure_startup_rtcp_overflow_has_its_own_bound() {
     let key = key_file(d.path());
     let (port, reserved) = ports(4);
     let sdp = d.path().join("owned.sdp");
-    std::fs::write(&sdp, description(port)).unwrap();
+    std::fs::write(&sdp, description(port, [555, 556])).unwrap();
     drop(reserved);
-    let input = Input::bind(&config(port, &sdp, &key)).await.unwrap();
+    let input = Input::bind(&config(port, &sdp, &key, [555, 556]))
+        .await
+        .unwrap();
     let stats = input.stats.clone();
     let cancel = CancellationToken::new();
     let (writer, mut reader) = tokio::io::duplex(32768);
@@ -642,9 +697,11 @@ async fn secure_startup_drain_keeps_order_with_new_arrivals() {
     let key = key_file(d.path());
     let (port, reserved) = ports(4);
     let sdp = d.path().join("owned.sdp");
-    std::fs::write(&sdp, description(port)).unwrap();
+    std::fs::write(&sdp, description(port, [666, 667])).unwrap();
     drop(reserved);
-    let input = Input::bind(&config(port, &sdp, &key)).await.unwrap();
+    let input = Input::bind(&config(port, &sdp, &key, [666, 667]))
+        .await
+        .unwrap();
     let stats = input.stats.clone();
     let cancel = CancellationToken::new();
     let (writer, mut reader) = tokio::io::duplex(32768);

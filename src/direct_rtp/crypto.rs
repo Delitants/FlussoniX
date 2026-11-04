@@ -1,5 +1,8 @@
 //! Narrow libSRTP 2.x ABI. No custom cryptography or vendor media component.
+use crate::direct_rtp::config::Settings;
+use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     ffi::{c_int, c_ulong, c_void},
     io::Read,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
@@ -155,6 +158,7 @@ pub struct Session {
     api: &'static Api,
     sender: bool,
     pinned: Option<u32>,
+    fixed_receive_ssrc: bool,
     candidate: Option<u32>,
     failed: bool,
 }
@@ -213,6 +217,7 @@ impl Session {
             api,
             sender: outbound,
             pinned: sender,
+            fixed_receive_ssrc: !outbound && sender.is_some(),
             candidate: None,
             failed: false,
         })
@@ -223,6 +228,9 @@ impl Session {
     pub(crate) fn discard_candidate(&mut self) -> Result<(), &'static str> {
         if self.sender {
             return Err("SRTP session direction mismatch");
+        }
+        if self.fixed_receive_ssrc {
+            return Ok(());
         }
         self.candidate = self.pinned.take();
         Ok(())
@@ -338,9 +346,106 @@ pub(crate) fn track_sessions(
         })
         .collect()
 }
+/// Receive contexts and their key fingerprints come from the same immutable
+/// snapshots. The fingerprints are claimed by the receiver epoch ledger before
+/// any public lane begins reading media.
+pub struct ReceiveTracks {
+    pub sessions: Vec<(Session, Session)>,
+    pub fingerprints: Vec<[u8; 32]>,
+}
+
+pub(crate) fn key_fingerprint(key: &[u8; 30]) -> [u8; 32] {
+    Sha256::digest(key).into()
+}
+
+/// Bind elementary SRTP lanes either by a configured SSRC under one shared
+/// key, or by different key material for every lane. No filename or key data
+/// appears in errors.
+pub fn receive_track_sessions(
+    settings: &Settings,
+    expected: &[Option<u32>],
+) -> Result<ReceiveTracks, &'static str> {
+    if !settings.secure || !settings.elementary || expected.is_empty() || expected.len() > 8 {
+        return Err("Elementary SRTP requires 1..8 receive tracks");
+    }
+    let ids: Vec<_> = expected.iter().flatten().copied().collect();
+    if ids.iter().any(|id| *id == 0)
+        || ids.iter().copied().collect::<HashSet<_>>().len() != ids.len()
+    {
+        return Err("Elementary SRTP source identities must be distinct");
+    }
+    match (&settings.key_file, &settings.track_key_files) {
+        (Some(path), None) if settings.track_keys.is_none() => {
+            if let Some(configured) = &settings.expected_ssrcs {
+                if configured.len() != expected.len()
+                    || expected
+                        .iter()
+                        .zip(configured)
+                        .any(|(observed, configured)| *observed != Some(*configured))
+                {
+                    return Err("Elementary SRTP source identities disagree");
+                }
+            } else if expected.len() != 1 {
+                return Err("Elementary SRTP shared key requires expected SSRCs for every track");
+            }
+            let mut key = Secret(read_key(path)?);
+            let fingerprint = key_fingerprint(&key.0);
+            let sessions = expected
+                .iter()
+                .map(|ssrc| {
+                    Ok((
+                        Session::create(&mut key, *ssrc, false)?,
+                        Session::create(&mut key, None, true)?,
+                    ))
+                })
+                .collect::<Result<_, &'static str>>()?;
+            Ok(ReceiveTracks {
+                sessions,
+                fingerprints: vec![fingerprint],
+            })
+        }
+        (None, Some(paths))
+            if settings.expected_ssrcs.is_none() && settings.track_keys.is_none() =>
+        {
+            if paths.len() != expected.len() {
+                return Err("Elementary SRTP track key count disagrees with SDP");
+            }
+            let mut keys = paths
+                .iter()
+                .map(|path| read_key(path).map(Secret))
+                .collect::<Result<Vec<_>, _>>()?;
+            let fingerprints: Vec<_> = keys.iter().map(|key| key_fingerprint(&key.0)).collect();
+            if fingerprints.iter().collect::<HashSet<_>>().len() != fingerprints.len() {
+                return Err("Elementary SRTP track keys must contain different key material");
+            }
+            let sessions = keys
+                .iter_mut()
+                .zip(expected)
+                .map(|(key, ssrc)| {
+                    Ok((
+                        Session::create(key, *ssrc, false)?,
+                        Session::create(key, None, true)?,
+                    ))
+                })
+                .collect::<Result<_, &'static str>>()?;
+            Ok(ReceiveTracks {
+                sessions,
+                fingerprints,
+            })
+        }
+        _ => Err("Elementary SRTP receive protection mode is invalid"),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn configured_receive_identity_survives_invalid_candidate_discard() {
+        let mut key = Secret([0x31; 30]);
+        let mut receive = Session::create(&mut key, Some(101), false).unwrap();
+        receive.discard_candidate().unwrap();
+        assert_eq!(receive.pinned, Some(101));
+    }
     #[test]
     fn invalid_candidate_preserves_rollover_and_replay_until_valid_media() {
         let mut ts = vec![0xff; 188];
