@@ -55,6 +55,7 @@ pub struct Options {
     pub view_password: Option<String>,
     pub peer_key: String,
     pub ffmpeg: String,
+    pub srtp_receiver_ledger: Option<PathBuf>,
     pub role: String,
     pub node_name: String,
     pub uplink_mbps: f64,
@@ -109,6 +110,7 @@ impl Default for Options {
             view_password: None,
             peer_key: String::new(),
             ffmpeg: "ffmpeg".into(),
+            srtp_receiver_ledger: None,
             role: "standalone".into(),
             node_name: "local".into(),
             uplink_mbps: 1000.0,
@@ -419,6 +421,14 @@ impl App {
                 PlaybackAuth::new(options.client_limit as usize)
             },
         );
+        let mut media_engine =
+            Engine::new_with_fxlink(media, &options.ffmpeg, options.fxlink_features);
+        media_engine.set_srtp_receiver_ledger(
+            options
+                .srtp_receiver_ledger
+                .as_ref()
+                .map(|path| Arc::new(crate::direct_rtp::key_ledger::Ledger::new(path.clone()))),
+        );
         let app = Arc::new(Self {
             http_delivery: std::sync::Mutex::new(
                 json!({"http":null,"https":null,"https_only":false}),
@@ -443,7 +453,7 @@ impl App {
             node_id,
             modern_sources,
             vendor_playback,
-            media: Engine::new_with_fxlink(media, &options.ffmpeg, options.fxlink_features),
+            media: media_engine,
             credentials,
             options: options.clone(),
             client: reqwest::Client::builder()

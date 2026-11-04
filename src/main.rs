@@ -88,6 +88,12 @@ struct Args {
     srt_play_passphrase: Option<String>,
     #[arg(long, default_value = "config.json")]
     config: PathBuf,
+    /// Owner-only durable history for direct SRTP receiver key generations.
+    #[arg(long, env = "FLUSSONIX_SRTP_RECEIVER_LEDGER")]
+    srtp_receiver_ledger: Option<PathBuf>,
+    /// Initialize the receiver history once, then exit without starting listeners.
+    #[arg(long, conflicts_with_all = ["iptv_ha_init_empty", "iptv_ha_init_from"])]
+    init_srtp_receiver_ledger: Option<PathBuf>,
     /// Owner-only IPTV package and subscriber data (defaults beside config.json).
     #[arg(long, env = "FLUSSONIX_IPTV_DATA")]
     iptv_data: Option<PathBuf>,
@@ -160,7 +166,7 @@ struct Args {
         long,
         env = "FLUSSONIX_ADMIN_PASSWORD",
         hide_env_values = true,
-        required_unless_present_any = ["iptv_ha_init_empty", "iptv_ha_init_from"]
+        required_unless_present_any = ["iptv_ha_init_empty", "iptv_ha_init_from", "init_srtp_receiver_ledger"]
     )]
     admin_password: Option<String>,
     #[arg(long, env = "FLUSSONIX_VIEW_USER")]
@@ -171,7 +177,7 @@ struct Args {
         long,
         env = "FLUSSONIX_PEER_KEY",
         hide_env_values = true,
-        required_unless_present_any = ["iptv_ha_init_empty", "iptv_ha_init_from"]
+        required_unless_present_any = ["iptv_ha_init_empty", "iptv_ha_init_from", "init_srtp_receiver_ledger"]
     )]
     peer_key: Option<String>,
     #[arg(long, default_value = "standalone")]
@@ -259,6 +265,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let a = Args::parse();
+    if let Some(path) = a.init_srtp_receiver_ledger.as_deref() {
+        flussonix::direct_rtp::key_ledger::Ledger::initialize(path)?;
+        println!("SRTP receiver ledger initialized");
+        return Ok(());
+    }
     if a.iptv_ha_init_empty || a.iptv_ha_init_from.is_some() {
         let options = HaOptions::load(
             a.iptv_ha_db_config
@@ -343,6 +354,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         view_password: a.view_password,
         peer_key: a.peer_key.expect("clap requires daemon peer key"),
         ffmpeg: a.ffmpeg,
+        srtp_receiver_ledger: a.srtp_receiver_ledger,
         role: a.role,
         node_name: a.node_name,
         uplink_mbps: a.uplink_mbps,

@@ -61,6 +61,7 @@ pub struct Engine {
     pub direct_egress: Arc<AtomicU64>,
     pub rtsp_push_egress: Arc<AtomicU64>,
     pub http_push_egress: Arc<AtomicU64>,
+    srtp_receiver_ledger: Option<Arc<crate::direct_rtp::key_ledger::Ledger>>,
 }
 #[derive(Clone, Copy)]
 struct InputPreference {
@@ -279,7 +280,14 @@ impl Engine {
             direct_egress: Arc::new(AtomicU64::new(0)),
             rtsp_push_egress: Arc::new(AtomicU64::new(0)),
             http_push_egress: Arc::new(AtomicU64::new(0)),
+            srtp_receiver_ledger: None,
         }
+    }
+    pub fn set_srtp_receiver_ledger(
+        &mut self,
+        ledger: Option<Arc<crate::direct_rtp::key_ledger::Ledger>>,
+    ) {
+        self.srtp_receiver_ledger = ledger;
     }
     pub async fn gpu_capabilities(&self) -> Value {
         let _activity = self.idle_memory.activity().await;
