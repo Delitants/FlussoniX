@@ -211,6 +211,13 @@ async fn live_per_track_destination_uses_mapped_keys_and_withdraws_changed_track
             .unwrap();
         observed.push(id);
     }
+    assert_eq!(
+        worker.stats()["flussonix_rtp_tracks"],
+        json!([
+            {"id":7,"media":"audio","encoding":"MPEG4-GENERIC/48000/2"},
+            {"id":9,"media":"audio","encoding":"MPEG4-GENERIC/48000/2"}
+        ])
+    );
     let sdp = engine.rtp_sdp("owned", 0, &config).await.unwrap();
     for id in observed {
         assert!(sdp.contains(&format!("a=ssrc:{id} cname:")));

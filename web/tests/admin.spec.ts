@@ -1059,6 +1059,109 @@ test('secure elementary fields preserve profiles on URL changes and remove stale
  saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(saved.inputs[0].flussonix_rtp.key_file).toBeUndefined();expect(saved.flussonix_rtp_outputs[0].flussonix_rtp.key_file).toBeUndefined();expect(saved.inputs[0].flussonix_rtp.sdp_file).toBe('/tmp/owned-secure-input.sdp');
  }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers})}
 });
+test('SRTP track protection uses labeled stream controls and clears on plaintext',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')},name='ui-srtp-tracks-'+Date.now();
+ await page.getByRole('button',{name:'Add stream'}).click();await page.getByLabel('Stream name',{exact:true}).fill(name);
+ await page.getByLabel('Input URL',{exact:true}).fill('srtp://127.0.0.1:50540');
+ await page.getByLabel('RTP input profile',{exact:true}).selectOption('elementary');
+ await page.getByLabel('RTP input SDP file',{exact:true}).fill('/tmp/owned-tracks.sdp');
+ await page.getByLabel('SRTP input protection',{exact:true}).selectOption('separate');
+ await page.getByLabel('Track key file 1',{exact:true}).fill('/tmp/track-a.key');
+ await page.getByRole('button',{name:'Add track key',exact:true}).click();
+ await page.getByLabel('Track key file 2',{exact:true}).fill('/tmp/track-b.key');
+ await page.getByLabel('Allow reused SRTP receiver key',{exact:true}).check();
+ await page.getByLabel('Direct transport destinations',{exact:true}).selectOption('override');
+ await page.getByLabel('RTP destination URL 1',{exact:true}).fill('srtp://127.0.0.1:50560');
+ await page.getByLabel('RTP destination profile 1',{exact:true}).selectOption('elementary');
+ await page.getByLabel('SRTP destination protection 1',{exact:true}).selectOption('per-track');
+ await page.getByLabel('SRTP track ID 1.1',{exact:true}).fill('7');
+ await page.getByLabel('SRTP track media 1.1',{exact:true}).selectOption('audio');
+ await page.getByLabel('SRTP track encoding 1.1',{exact:true}).fill('MPEG4-GENERIC/48000/2');
+ await page.getByLabel('SRTP track key file 1.1',{exact:true}).fill('/tmp/out-a.key');
+ await page.getByRole('button',{name:'Add SRTP track 1',exact:true}).click();
+ await page.getByLabel('SRTP track ID 1.2',{exact:true}).fill('9');
+ await page.getByLabel('SRTP track media 1.2',{exact:true}).selectOption('audio');
+ await page.getByLabel('SRTP track encoding 1.2',{exact:true}).fill('MPA/90000');
+ await page.getByLabel('SRTP track key file 1.2',{exact:true}).fill('/tmp/out-b.key');
+ await page.getByLabel('RTP destination enabled 1',{exact:true}).uncheck();
+ await page.getByLabel('Activation',{exact:true}).selectOption('ondemand');
+ await page.getByLabel('SRTP track ID 1.2',{exact:true}).fill('0');
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ await expect(page.getByRole('dialog').getByRole('alert')).toContainText('output tracks');
+ await page.getByLabel('SRTP track ID 1.2',{exact:true}).fill('9');
+ await expect(page.getByRole('dialog').locator('textarea')).toHaveCount(0);
+ await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+ try{
+  let saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();
+  expect(saved.inputs[0].flussonix_rtp.track_key_files).toEqual(['/tmp/track-a.key','/tmp/track-b.key']);
+  expect(saved.inputs[0].flussonix_rtp.allow_legacy_reused_key).toBe(true);
+  expect(saved.flussonix_rtp_outputs[0].flussonix_rtp.track_keys).toEqual([
+   {track_id:7,media:'audio',encoding:'MPEG4-GENERIC/48000/2',key_file:'/tmp/out-a.key'},
+   {track_id:9,media:'audio',encoding:'MPA/90000',key_file:'/tmp/out-b.key'}]);
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+  await expect(page.getByLabel('Track key file 2',{exact:true})).toHaveValue('/tmp/track-b.key');
+  await expect(page.getByLabel('SRTP track ID 1.2',{exact:true})).toHaveValue('9');
+  await page.getByLabel('SRTP input protection',{exact:true}).selectOption('shared');
+  await page.getByLabel('SRTP key file',{exact:true}).fill('/tmp/shared.key');
+  await page.getByLabel('Expected SSRC 1',{exact:true}).fill('101');
+  await page.getByRole('button',{name:'Add expected SSRC',exact:true}).click();
+  await page.getByLabel('Expected SSRC 2',{exact:true}).fill('202');
+  await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+  saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();
+  expect(saved.inputs[0].flussonix_rtp.track_key_files).toBeUndefined();
+  expect(saved.inputs[0].flussonix_rtp.expected_ssrcs).toEqual([101,202]);
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+  await page.getByLabel('RTP input profile',{exact:true}).selectOption('mp2t');
+  await page.getByLabel('RTP destination profile 1',{exact:true}).selectOption('mp2t');
+  await expect(page.getByLabel('Expected SSRC 1',{exact:true})).toHaveCount(0);
+  await expect(page.getByLabel('SRTP track ID 1.1',{exact:true})).toHaveCount(0);
+  await page.getByLabel('SRTP key file 1',{exact:true}).fill('/tmp/mp2t-output.key');
+  await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+  saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();
+  expect(saved.inputs[0].flussonix_rtp.expected_ssrcs).toBeUndefined();
+  expect(saved.flussonix_rtp_outputs[0].flussonix_rtp.track_keys).toBeUndefined();
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+  await page.getByLabel('Input URL',{exact:true}).fill('rtp://127.0.0.1:50540');
+  await page.getByLabel('RTP destination URL 1',{exact:true}).fill('rtp://127.0.0.1:50560');
+  await expect(page.getByLabel('SRTP input protection',{exact:true})).toHaveCount(0);
+  await expect(page.getByLabel('SRTP destination protection 1',{exact:true})).toHaveCount(0);
+  await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+  saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();
+  for(const row of [saved.inputs[0],saved.flussonix_rtp_outputs[0]])for(const field of ['key_file','track_key_files','expected_ssrcs','track_keys','allow_legacy_reused_key'])expect(row.flussonix_rtp?.[field]).toBeUndefined();
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers})}
+});
+test('SRTP template bindings inherit and reject invalid SSRCs before save',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const template='ui-srtp-template-'+Date.now(),name=template+'-stream';
+ const input={url:'srtp://127.0.0.1:50640',flussonix_rtp:{profile:'elementary',sdp_file:'/tmp/owned-template.sdp',key_file:'/tmp/owned-shared.key',expected_ssrcs:[101,202]}};
+ const output={url:'srtp://127.0.0.1:50660',disabled:true,flussonix_rtp:{profile:'elementary',track_keys:[{track_id:7,media:'audio',encoding:'MPEG4-GENERIC/48000/2',key_file:'/tmp/owned-output-a.key'}]}};
+ expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{disabled:true,static:false,inputs:[input],flussonix_rtp_outputs:[output]}})).ok()).toBeTruthy();
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{template}})).ok()).toBeTruthy();
+ try{
+  await page.getByRole('button',{name:'Templates',exact:true}).click();
+  await page.getByRole('row').filter({has:page.getByRole('cell',{name:template,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+  await expect(page.getByLabel('Expected SSRC 2',{exact:true})).toHaveValue('202');
+  await expect(page.getByLabel('SRTP track ID 1.1',{exact:true})).toHaveValue('7');
+  await page.getByLabel('Expected SSRC 2',{exact:true}).fill('0');
+  await page.getByRole('button',{name:'Save',exact:true}).click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await expect(page.getByRole('dialog').getByRole('alert')).toContainText('expected SSRCs');
+  await page.getByLabel('Expected SSRC 2',{exact:true}).fill('303');
+  await page.getByRole('button',{name:'Save',exact:true}).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  const stored=await(await request.get('/streamer/api/v3/templates/'+template,{headers})).json();
+  expect(stored.inputs[0].flussonix_rtp.expected_ssrcs).toEqual([101,303]);
+  const inherited=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();
+  expect(inherited.inputs[0].flussonix_rtp.expected_ssrcs).toEqual([101,303]);
+  expect(inherited.config_on_disk.inputs).toBeUndefined();
+  expect(inherited.config_on_disk.flussonix_rtp_outputs).toBeUndefined();
+  await page.getByRole('button',{name:'Streams',exact:true}).click();
+  await page.getByRole('button',{name,exact:true}).click();
+  await expect(page.getByRole('heading',{name:'Saved overrides'})).toBeVisible();
+  await expect(page.getByRole('main')).not.toContainText('/tmp/owned-shared.key');
+  await expect(page.getByRole('main')).not.toContainText('/tmp/owned-output-a.key');
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});await request.delete('/streamer/api/v3/templates/'+template,{headers})}
+});
 test('secure elementary SDP is key-free and explains receiver-local key setup',async({page,request})=>{
  test.setTimeout(60000);const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')},name='ui-secure-sdp-'+Date.now();
  const key=Buffer.alloc(30,0x31).toString('base64'),dir=fs.mkdtempSync(path.resolve('../.runtime/ui-srtp-'));const keyFile=path.join(dir,'key');fs.writeFileSync(keyFile,key,{mode:0o600});let port=0;let sockets:dgram.Socket[]=[];

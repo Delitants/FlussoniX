@@ -197,6 +197,13 @@ impl Worker {
                     .map(|o| o.stats())
                     .collect::<Vec<_>>()
             );
+            if let Some(Ok(description)) = self.wire.rtp.description() {
+                stats["flussonix_rtp_tracks"] = json!(description
+                    .tracks
+                    .iter()
+                    .map(|track| json!({"id":track.id,"media":if track.video {"video"} else {"audio"},"encoding":track.encoding}))
+                    .collect::<Vec<_>>());
+            }
         }
         let native_text_tracks = self.native_text_tracks.load(Ordering::Relaxed);
         if native_text_tracks > 0 {

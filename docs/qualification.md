@@ -2015,3 +2015,25 @@ assertion also passed. The early interval is now visible as candidate packets,
 but sender attribution in that interval and the private pre-readiness interval
 remain limits. The archived 38-picture HEVC failure did not
 reproduce, its cause is still unknown, and no production media repair is claimed.
+
+## Direct SRTP track binding candidate
+
+The isolated branch now requires a durable owner-only receiver key history for
+direct SRTP input by default, with an explicit legacy reuse option. MP2T and
+two-track elementary receivers deny a repeated key after restart; an occupied
+later RTP/RTCP port or failed atomic claim leaves public ports closed without
+partially consuming a new track key. Two elementary input modes were exercised:
+one shared key with SDP-matched expected SSRCs, and distinct per-track keys.
+Captured first-lane ciphertext was rejected on the second lane before its
+first packet and during the startup queue, while valid media and SRTCP from
+both lanes were delivered. Independent FFmpeg media tests passed H.264/HEVC,
+AAC/MP2/MP3 and CPU conversion cases; the Intel VAAPI-only case remains gated
+by hardware availability.
+
+Outbound keys are matched by packetizer track ID, media and encoding before
+sockets and SDP are published. Live UDP tests decrypted each lane with only its
+configured key, rejected duplicate key bytes, and withdrew SDP on a same-count
+track-ID change. The Streams and Templates browser flows saved, reloaded and
+cleared the new labeled controls without a JSON editor. Exact-head CI,
+cross-host SRTP qualification and the remaining release blockers are still
+pending; these local results do not establish a production-ready release.
