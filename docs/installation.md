@@ -18,6 +18,9 @@ requires `libsrtp2-1`. Use a binary that can load those libraries on the target
 host and verify the enabled listeners before serving viewers. A static musl
 test build ran on Ubuntu 24.04 but could not load its glibc libsrt; a compatible
 glibc build passed encrypted SRT playback on the same hosts.
+Direct SRTP receivers also need an explicitly initialized owner-only key history;
+see [direct SRTP setup](direct-srtp.md). The optional service helper renders a
+stable history path but never initializes or resets it.
 
 Download the preview archive and its matching `.sha256` file into the same
 directory. Set `package` to the downloaded filename without `.tar.gz`, then run:

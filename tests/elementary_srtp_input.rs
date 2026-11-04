@@ -2,10 +2,16 @@ use flussonix::direct_rtp::{
     config::Settings,
     crypto,
     elementary::{input::Input, sdp::Session},
+    key_ledger::Ledger,
     packet,
 };
 use serde_json::json;
-use std::{net::UdpSocket, os::unix::fs::PermissionsExt, sync::atomic::Ordering, time::Duration};
+use std::{
+    net::UdpSocket,
+    os::unix::fs::PermissionsExt,
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
 use tokio::{io::AsyncReadExt, net::UdpSocket as AsyncUdp};
 use tokio_util::sync::CancellationToken;
 fn ports(count: u16) -> (u16, Vec<UdpSocket>) {
@@ -29,14 +35,21 @@ fn ports(count: u16) -> (u16, Vec<UdpSocket>) {
     }
     panic!("owned ports unavailable")
 }
-fn description(port: u16) -> String {
+fn description(port: u16, identities: [u32; 2]) -> String {
     format!(
-        "v=0\no=- 0 0 IN IP4 127.0.0.1\ns=Owned secure input\nc=IN IP4 127.0.0.1\nt=0 0\nm=audio {port} RTP/SAVP 97\na=rtpmap:97 MPEG4-GENERIC/48000/2\na=fmtp:97 mode=AAC-hbr;config=1190;sizeLength=13;indexLength=3;indexDeltaLength=3\nm=audio {} RTP/SAVP 97\na=rtpmap:97 MPEG4-GENERIC/48000/2\na=fmtp:97 mode=AAC-hbr;config=1190;sizeLength=13;indexLength=3;indexDeltaLength=3\n",
-        port + 2
+        "v=0\no=- 0 0 IN IP4 127.0.0.1\ns=Owned secure input\nc=IN IP4 127.0.0.1\nt=0 0\nm=audio {port} RTP/SAVP 97\na=rtpmap:97 MPEG4-GENERIC/48000/2\na=fmtp:97 mode=AAC-hbr;config=1190;sizeLength=13;indexLength=3;indexDeltaLength=3\na=ssrc:{} cname:fx-audio-a\nm=audio {} RTP/SAVP 97\na=rtpmap:97 MPEG4-GENERIC/48000/2\na=fmtp:97 mode=AAC-hbr;config=1190;sizeLength=13;indexLength=3;indexDeltaLength=3\na=ssrc:{} cname:fx-audio-b\n",
+        identities[0],
+        port + 2,
+        identities[1]
     )
 }
-fn config(port: u16, sdp: &std::path::Path, key: &std::path::Path) -> Settings {
-    Settings::input(&json!({"url":format!("srtp://127.0.0.1:{port}"),"flussonix_rtp":{"profile":"elementary","sdp_file":sdp,"key_file":key,"jitter_ms":0,"source_ip":"127.0.0.1"}})).expect("secure elementary configuration accepted").unwrap()
+fn config(
+    port: u16,
+    sdp: &std::path::Path,
+    key: &std::path::Path,
+    identities: [u32; 2],
+) -> Settings {
+    Settings::input(&json!({"url":format!("srtp://127.0.0.1:{port}"),"flussonix_rtp":{"profile":"elementary","sdp_file":sdp,"key_file":key,"expected_ssrcs":identities,"allow_legacy_reused_key":true,"jitter_ms":0,"source_ip":"127.0.0.1"}})).expect("secure elementary configuration accepted").unwrap()
 }
 fn key_file(dir: &std::path::Path) -> std::path::PathBuf {
     use base64::Engine;
@@ -70,13 +83,32 @@ fn secure_sdp_requires_matching_transport_and_rejects_inline_keys() {
     let d = tempfile::tempdir().unwrap();
     let k = key_file(d.path());
     let s = d.path().join("owned.sdp");
-    let cfg = config(40000, &s, &k);
-    let text = description(40000);
+    let cfg = config(40000, &s, &k, [100, 101]);
+    let text = description(40000, [100, 101]);
     assert!(Session::parse(text.as_bytes(), &cfg).is_ok());
+    assert!(Session::parse(description(40000, [100, 102]).as_bytes(), &cfg).is_err());
     assert!(Session::parse(text.replace("RTP/SAVP", "RTP/AVP").as_bytes(), &cfg).is_err());
     assert!(Session::parse(format!("{text}a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n").as_bytes(),&cfg).is_err());
     let plain=Settings::input(&json!({"url":"rtp://127.0.0.1:40000","flussonix_rtp":{"profile":"elementary","sdp_file":s}})).unwrap().unwrap();
     assert!(Session::parse(text.as_bytes(), &plain).is_err());
+}
+#[tokio::test]
+async fn configured_ssrcs_bind_two_tracks_when_external_sdp_omits_identity_lines() {
+    let d = tempfile::tempdir().unwrap();
+    let key = key_file(d.path());
+    let (port, reserved) = ports(4);
+    let sdp = d.path().join("external.sdp");
+    let text = description(port, [101, 202])
+        .replace("a=ssrc:101 cname:fx-audio-a\n", "")
+        .replace("a=ssrc:202 cname:fx-audio-b\n", "");
+    std::fs::write(&sdp, text).unwrap();
+    drop(reserved);
+    let settings = config(port, &sdp, &key, [101, 202]);
+    let input = Input::bind(&settings).await.unwrap();
+    drop(input);
+    for lane_port in port..port + 4 {
+        assert!(UdpSocket::bind(("127.0.0.1", lane_port)).is_ok());
+    }
 }
 #[tokio::test]
 async fn unsafe_key_fails_before_any_elementary_public_socket_opens() {
@@ -85,13 +117,184 @@ async fn unsafe_key_fails_before_any_elementary_public_socket_opens() {
     std::fs::set_permissions(&k, std::fs::Permissions::from_mode(0o644)).unwrap();
     let (p, res) = ports(4);
     let s = d.path().join("owned.sdp");
-    std::fs::write(&s, description(p)).unwrap();
+    std::fs::write(&s, description(p, [100, 101])).unwrap();
     drop(res);
-    let c = config(p, &s, &k);
+    let c = config(p, &s, &k, [100, 101]);
     assert!(Input::bind(&c).await.is_err());
     for n in p..p + 4 {
         assert!(UdpSocket::bind(("127.0.0.1", n)).is_ok());
     }
+}
+#[tokio::test]
+async fn separate_track_key_errors_leave_every_public_port_unbound() {
+    use base64::Engine as _;
+    let d = tempfile::tempdir().unwrap();
+    let a = key_file(d.path());
+    let b = d.path().join("track-b.key");
+    let (port, reserved) = ports(4);
+    let sdp = d.path().join("owned.sdp");
+    std::fs::write(&sdp, description(port, [101, 202])).unwrap();
+    drop(reserved);
+    for bad_second_key in [None, Some(0x31), Some(0x32)] {
+        match bad_second_key {
+            None => {
+                let _ = std::fs::remove_file(&b);
+            }
+            Some(value) => {
+                std::fs::write(
+                    &b,
+                    base64::engine::general_purpose::STANDARD.encode([value; 30]),
+                )
+                .unwrap();
+                std::fs::set_permissions(
+                    &b,
+                    std::fs::Permissions::from_mode(if value == 0x32 { 0o644 } else { 0o600 }),
+                )
+                .unwrap();
+            }
+        }
+        let settings = Settings::input(&json!({
+            "url":format!("srtp://127.0.0.1:{port}"),
+            "flussonix_rtp":{"profile":"elementary","sdp_file":sdp,"track_key_files":[a,b],"allow_legacy_reused_key":true}
+        }))
+        .unwrap()
+        .unwrap();
+        let error = Input::bind(&settings).await.err().unwrap();
+        assert!(!error.contains(a.to_str().unwrap()));
+        assert!(!error.contains(b.to_str().unwrap()));
+        for candidate in port..port + 4 {
+            assert!(UdpSocket::bind(("127.0.0.1", candidate)).is_ok());
+        }
+    }
+}
+
+#[tokio::test]
+async fn distinct_keys_reject_captured_cross_lane_packet_before_first_media() {
+    use base64::Engine as _;
+    let d = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let ledger_path = d.path().join("receiver-epochs");
+    Ledger::initialize(&ledger_path).unwrap();
+    let ledger = Arc::new(Ledger::new(ledger_path));
+    let a = d.path().join("lane-a.key");
+    let b = d.path().join("lane-b.key");
+    for (path, value) in [(&a, 0x41), (&b, 0x42)] {
+        std::fs::write(
+            path,
+            base64::engine::general_purpose::STANDARD.encode([value; 30]),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let (port, reserved) = ports(4);
+    let sdp = d.path().join("source.sdp");
+    std::fs::write(&sdp, description(port, [101, 202])).unwrap();
+    drop(reserved);
+    let cfg = Settings::input(&json!({
+        "url":format!("srtp://127.0.0.1:{port}"),
+        "flussonix_rtp":{"profile":"elementary","sdp_file":sdp,"track_key_files":[a,b],"jitter_ms":0}
+    }))
+    .unwrap()
+    .unwrap();
+    let input = Input::bind_with_ledger(&cfg, Some(ledger.clone()))
+        .await
+        .unwrap();
+    let stats = input.stats.clone();
+    let cancel = CancellationToken::new();
+    let (writer, mut reader) = tokio::io::duplex(32768);
+    let task = tokio::spawn(input.run(writer, cancel.clone()));
+    let mut text = Vec::new();
+    reader.read_to_end(&mut text).await.unwrap();
+    let private_ports: Vec<u16> = String::from_utf8(text)
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("m=audio "))
+        .map(|line| line.split_whitespace().nth(1).unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(private_ports.len(), 2);
+    let (_, sender_pair) = ports(2);
+    let mut sender_pair = sender_pair.into_iter().map(|socket| {
+        socket.set_nonblocking(true).unwrap();
+        AsyncUdp::from_std(socket).unwrap()
+    });
+    let sender = sender_pair.next().unwrap();
+    let sender_rtcp = sender_pair.next().unwrap();
+    let mut a_tx = crypto::Session::new([0x41; 30], Some(101)).unwrap();
+    let mut b_tx = crypto::Session::new([0x42; 30], Some(202)).unwrap();
+    let a_plain = media(1, 101, 4);
+    let b_plain = media(1, 202, 4);
+    let mut a_cipher = a_plain.clone();
+    a_tx.protect(&mut a_cipher, false).unwrap();
+    sender
+        .send_to(&a_cipher, ("127.0.0.1", port))
+        .await
+        .unwrap();
+    sender
+        .send_to(&a_cipher, ("127.0.0.1", port + 2))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while stats.auth_failed.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(stats.packets.load(Ordering::Relaxed), 1);
+    let mut b_cipher = b_plain.clone();
+    b_tx.protect(&mut b_cipher, false).unwrap();
+    sender
+        .send_to(&b_cipher, ("127.0.0.1", port + 2))
+        .await
+        .unwrap();
+    for (id, tx, offset) in [(101, &mut a_tx, 1), (202, &mut b_tx, 3)] {
+        let mut report = sr(id);
+        tx.protect(&mut report, true).unwrap();
+        sender_rtcp
+            .send_to(&report, ("127.0.0.1", port + offset))
+            .await
+            .unwrap();
+    }
+    let mut private_rtp = Vec::new();
+    let mut private_rtcp = Vec::new();
+    for private_port in private_ports {
+        private_rtp.push(AsyncUdp::bind(("127.0.0.1", private_port)).await.unwrap());
+        private_rtcp.push(
+            AsyncUdp::bind(("127.0.0.1", private_port + 1))
+                .await
+                .unwrap(),
+        );
+    }
+    let mut received = [0; 1600];
+    for (index, expected) in [a_plain, b_plain].iter().enumerate() {
+        let size = tokio::time::timeout(
+            Duration::from_secs(2),
+            private_rtp[index].recv(&mut received),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&received[..size], expected);
+        let size = tokio::time::timeout(
+            Duration::from_secs(2),
+            private_rtcp[index].recv(&mut received),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&received[..size], sr(if index == 0 { 101 } else { 202 }));
+    }
+    assert_eq!(stats.packets.load(Ordering::Relaxed), 2);
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    for candidate in port..port + 4 {
+        assert!(UdpSocket::bind(("127.0.0.1", candidate)).is_ok());
+    }
+    assert!(Input::bind_with_ledger(&cfg, Some(ledger)).await.is_err());
 }
 #[tokio::test]
 async fn authenticated_tracks_reject_bad_media_preserve_rollover_and_encrypt_feedback() {
@@ -99,9 +302,9 @@ async fn authenticated_tracks_reject_bad_media_preserve_rollover_and_encrypt_fee
     let k = key_file(d.path());
     let (p, res) = ports(4);
     let s = d.path().join("owned.sdp");
-    std::fs::write(&s, description(p)).unwrap();
+    std::fs::write(&s, description(p, [100, 101])).unwrap();
     drop(res);
-    let c = config(p, &s, &k);
+    let c = config(p, &s, &k, [100, 101]);
     let input = Input::bind(&c).await.unwrap();
     // Replacing a configured file affects the next generation only. All current
     // lanes and feedback must retain the same original snapshot.
@@ -275,9 +478,9 @@ async fn secure_cancellation_before_decoder_bind_releases_public_lanes() {
     let k = key_file(d.path());
     let (p, res) = ports(4);
     let s = d.path().join("owned.sdp");
-    std::fs::write(&s, description(p)).unwrap();
+    std::fs::write(&s, description(p, [222, 223])).unwrap();
     drop(res);
-    let input = Input::bind(&config(p, &s, &k)).await.unwrap();
+    let input = Input::bind(&config(p, &s, &k, [222, 223])).await.unwrap();
     let stats = input.stats.clone();
     let c = CancellationToken::new();
     let (writer, _reader) = tokio::io::duplex(1);
@@ -313,9 +516,11 @@ async fn secure_packets_wait_for_all_owned_decoder_ports_without_filling_public_
     let key = key_file(d.path());
     let (port, reserved) = ports(4);
     let sdp = d.path().join("owned.sdp");
-    std::fs::write(&sdp, description(port)).unwrap();
+    std::fs::write(&sdp, description(port, [777, 888])).unwrap();
     drop(reserved);
-    let input = Input::bind(&config(port, &sdp, &key)).await.unwrap();
+    let input = Input::bind(&config(port, &sdp, &key, [777, 888]))
+        .await
+        .unwrap();
     let stats = input.stats.clone();
     let cancel = CancellationToken::new();
     let (writer, mut reader) = tokio::io::duplex(32768);
@@ -361,9 +566,9 @@ async fn secure_packets_wait_for_all_owned_decoder_ports_without_filling_public_
         .send_to(&wrong_key, ("127.0.0.1", port))
         .await
         .unwrap();
-    let mut malformed = media(9, 902, 4);
+    let mut malformed = media(9, 777, 4);
     malformed[1] = 96;
-    crypto::Session::new([0x31; 30], Some(902))
+    crypto::Session::new([0x31; 30], Some(777))
         .unwrap()
         .protect(&mut malformed, false)
         .unwrap();
@@ -379,6 +584,12 @@ async fn secure_packets_wait_for_all_owned_decoder_ports_without_filling_public_
         .send_to(&encrypted, ("127.0.0.1", port))
         .await
         .unwrap();
+    // A captured, correctly authenticated packet from the first lane must not
+    // become the second lane's initial peer or enter its startup queue.
+    sender
+        .send_to(&encrypted, ("127.0.0.1", port + 2))
+        .await
+        .unwrap();
     let second_original = media(11, 888, 4);
     let mut second_encrypted = second_original.clone();
     crypto::Session::new([0x31; 30], Some(888))
@@ -391,7 +602,7 @@ async fn secure_packets_wait_for_all_owned_decoder_ports_without_filling_public_
         .unwrap();
     let admitted = tokio::time::timeout(Duration::from_secs(1), async {
         while stats.packets.load(Ordering::Relaxed) < 2
-            || stats.auth_failed.load(Ordering::Relaxed) == 0
+            || stats.auth_failed.load(Ordering::Relaxed) < 2
             || stats.invalid.load(Ordering::Relaxed) == 0
             || stats.foreign.load(Ordering::Relaxed) == 0
         {
@@ -408,6 +619,7 @@ async fn secure_packets_wait_for_all_owned_decoder_ports_without_filling_public_
         admitted,
         "valid public SRTP must be read during decoder startup"
     );
+    assert_eq!(stats.packets.load(Ordering::Relaxed), 2);
 
     // RTCP is accepted only after RTP has established the legitimate peer.
     let mut report = sr(777);
@@ -465,9 +677,11 @@ async fn secure_startup_overflow_drops_oldest_without_kernel_loss() {
     let key = key_file(d.path());
     let (port, reserved) = ports(4);
     let sdp = d.path().join("owned.sdp");
-    std::fs::write(&sdp, description(port)).unwrap();
+    std::fs::write(&sdp, description(port, [222, 333])).unwrap();
     drop(reserved);
-    let input = Input::bind(&config(port, &sdp, &key)).await.unwrap();
+    let input = Input::bind(&config(port, &sdp, &key, [222, 333]))
+        .await
+        .unwrap();
     let stats = input.stats.clone();
     let cancel = CancellationToken::new();
     let (writer, mut reader) = tokio::io::duplex(32768);
@@ -554,9 +768,11 @@ async fn secure_startup_rtcp_overflow_has_its_own_bound() {
     let key = key_file(d.path());
     let (port, reserved) = ports(4);
     let sdp = d.path().join("owned.sdp");
-    std::fs::write(&sdp, description(port)).unwrap();
+    std::fs::write(&sdp, description(port, [555, 556])).unwrap();
     drop(reserved);
-    let input = Input::bind(&config(port, &sdp, &key)).await.unwrap();
+    let input = Input::bind(&config(port, &sdp, &key, [555, 556]))
+        .await
+        .unwrap();
     let stats = input.stats.clone();
     let cancel = CancellationToken::new();
     let (writer, mut reader) = tokio::io::duplex(32768);
@@ -642,9 +858,11 @@ async fn secure_startup_drain_keeps_order_with_new_arrivals() {
     let key = key_file(d.path());
     let (port, reserved) = ports(4);
     let sdp = d.path().join("owned.sdp");
-    std::fs::write(&sdp, description(port)).unwrap();
+    std::fs::write(&sdp, description(port, [666, 667])).unwrap();
     drop(reserved);
-    let input = Input::bind(&config(port, &sdp, &key)).await.unwrap();
+    let input = Input::bind(&config(port, &sdp, &key, [666, 667]))
+        .await
+        .unwrap();
     let stats = input.stats.clone();
     let cancel = CancellationToken::new();
     let (writer, mut reader) = tokio::io::duplex(32768);

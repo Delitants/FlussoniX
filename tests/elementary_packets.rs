@@ -14,6 +14,7 @@ fn track(codec: Codec) -> Track {
         codec,
         encoding: String::new(),
         fmtp: String::new(),
+        ssrc: None,
     }
 }
 fn body(payload: &[u8]) -> Vec<u8> {

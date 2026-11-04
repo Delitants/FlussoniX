@@ -4,6 +4,7 @@ use super::{
     sdp::{Session, Track},
     startup::StartupQueue,
 };
+use crate::direct_rtp::key_ledger::Ledger;
 use crate::direct_rtp::{config::Settings, crypto, packet as control, sockets::Pair, stats::Stats};
 use std::{
     net::{SocketAddr, UdpSocket},
@@ -47,6 +48,12 @@ fn reserve() -> Result<(UdpSocket, UdpSocket), String> {
 }
 impl Input {
     pub async fn bind(settings: &Settings) -> Result<Self, String> {
+        Self::bind_with_ledger(settings, None).await
+    }
+    pub async fn bind_with_ledger(
+        settings: &Settings,
+        ledger: Option<Arc<Ledger>>,
+    ) -> Result<Self, String> {
         let session = Session::read(
             settings
                 .sdp_file
@@ -54,18 +61,23 @@ impl Input {
                 .ok_or("Elementary RTP input requires an SDP file")?,
             settings,
         )?;
+        let mut fingerprints = Vec::new();
         let mut contexts = if settings.secure {
-            crypto::track_sessions(
-                settings
-                    .key_file
-                    .as_deref()
-                    .ok_or("SRTP key file required")?,
-                &vec![None; session.tracks.len()],
-            )?
-            .into_iter()
-            .map(Some)
-            .collect::<Vec<_>>()
-            .into_iter()
+            let received = crypto::receive_track_sessions(
+                settings,
+                &session
+                    .tracks
+                    .iter()
+                    .map(|track| track.ssrc)
+                    .collect::<Vec<_>>(),
+            )?;
+            fingerprints = received.fingerprints;
+            received
+                .sessions
+                .into_iter()
+                .map(Some)
+                .collect::<Vec<_>>()
+                .into_iter()
         } else {
             (0..session.tracks.len())
                 .map(|_| None)
@@ -118,6 +130,12 @@ impl Input {
                 lane.feedback = Some(transmit);
             }
             reservations.push(reserved);
+        }
+        if settings.secure && !settings.allow_legacy_reused_key {
+            let ledger = ledger.ok_or("SRTP receiver ledger required")?;
+            tokio::task::spawn_blocking(move || ledger.claim_many(&fingerprints))
+                .await
+                .map_err(|_| "SRTP receiver ledger task failed")??;
         }
         Ok(Self {
             lanes,

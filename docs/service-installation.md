@@ -122,6 +122,20 @@ directories. When run as root, these paths must be root-owned. Executable paths
 must refer to real files; resolve an FFmpeg symlink with `readlink -f` if needed.
 The unit references the credentials file without embedding its contents.
 
+The rendered unit also passes `--srtp-receiver-ledger` with a fixed path under
+this instance's state directory. Rendering does not create or reset that file.
+If you use direct SRTP input, initialize the history once as the service user
+before starting the unit:
+
+```bash
+sudo -u flussonix "$flussonix_release/bin/flussonix" \
+  --init-srtp-receiver-ledger /var/lib/flussonix-preview/srtp-receiver-ledger
+```
+
+The helper rejects unsafe existing history or lock files. Keep both files
+owner-only and back them up with the rest of the state. Without an initialized
+history, ordinary direct SRTP inputs fail closed; other protocols still work.
+
 After reviewing the unit, install and start it explicitly. Ensure the destination
 does not already belong to another instance:
 
@@ -165,6 +179,18 @@ your saved service unit, run `systemctl daemon-reload`, then start and check
 playback. Keep the old release and unit for rollback. If the old release cannot
 read a changed configuration, restore the backed-up configuration before starting
 it; doing so reverts later configuration edits.
+
+When upgrading an existing direct SRTP receiver that used a static key, stop
+the receiver first, initialize the new history as above, and provision a **new**
+sender key and sender generation before admitting media. Update the receiver's
+key-file reference or contents while stopped. Check the capability status and
+playback after startup. In an isolated test stream, a second receiver start
+with the same key must fail with a reused-key error; another freshly provisioned
+key must work. Do not restore an older history snapshot while reusing keys
+claimed after that snapshot. If restoring old state is necessary, rotate every
+affected receiver key and restart its sender with a new SSRC/sequence epoch.
+The explicit “Allow reused SRTP receiver key” stream option is for legacy
+compatibility only and weakens restart replay protection.
 
 To remove only this service registration:
 

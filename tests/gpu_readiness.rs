@@ -1,5 +1,6 @@
 use axum::{body::Body, http::Request};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use flussonix::direct_rtp::key_ledger::Ledger as SrtpLedger;
 use flussonix::server::{App, Options, router};
 use serde_json::{Value, json};
 use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc, time::Duration};
@@ -36,6 +37,131 @@ async fn capabilities(app: Arc<App>, auth: bool) -> (u16, Value) {
         .await
         .unwrap();
     (status, serde_json::from_slice(&body).unwrap())
+}
+
+#[tokio::test]
+async fn srtp_receiver_ledger_capability_is_coalesced_and_does_not_disclose_paths() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (_, absent) = capabilities(app(root.path(), "/usr/bin/ffmpeg"), true).await;
+    assert_eq!(
+        absent["direct_srtp"]["receiver_ledger"]["configured"],
+        false
+    );
+    assert_eq!(absent["direct_srtp"]["receiver_ledger"]["healthy"], false);
+
+    let ledger_path = root.path().join("private-secret-ledger");
+    SrtpLedger::initialize(&ledger_path).unwrap();
+    let configured = App::new(
+        root.path().join("configured.json"),
+        root.path().join("configured-media"),
+        Options {
+            admin_user: "admin".into(),
+            admin_password: "owned".into(),
+            peer_key: "owned-peer-key".into(),
+            srtp_receiver_ledger: Some(ledger_path.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut checks = Vec::new();
+    for _ in 0..12 {
+        let configured = configured.clone();
+        checks.push(tokio::spawn(
+            async move { capabilities(configured, true).await },
+        ));
+    }
+    for check in checks {
+        let (_, body) = check.await.unwrap();
+        let status = &body["direct_srtp"]["receiver_ledger"];
+        assert_eq!(status["configured"], true);
+        assert!(status["healthy"].is_boolean() || status["healthy"].is_null());
+        assert!(!body.to_string().contains("private-secret-ledger"));
+        assert!(!body.to_string().contains(root.path().to_str().unwrap()));
+    }
+    let healthy = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let (_, body) = capabilities(configured.clone(), true).await;
+            if body["direct_srtp"]["receiver_ledger"]["verified"] == true {
+                break body;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(healthy["direct_srtp"]["receiver_ledger"]["healthy"], true);
+    assert!(healthy["direct_srtp"]["receiver_ledger"]["age_ms"].is_u64());
+
+    let unsafe_path = root.path().join("unsafe-secret-ledger");
+    SrtpLedger::initialize(&unsafe_path).unwrap();
+    std::fs::set_permissions(&unsafe_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let unsafe_app = App::new(
+        root.path().join("unsafe.json"),
+        root.path().join("unsafe-media"),
+        Options {
+            admin_user: "admin".into(),
+            admin_password: "owned".into(),
+            peer_key: "owned-peer-key".into(),
+            srtp_receiver_ledger: Some(unsafe_path),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let unhealthy = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let (_, body) = capabilities(unsafe_app.clone(), true).await;
+            if body["direct_srtp"]["receiver_ledger"]["verified"] == true {
+                break body;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        unhealthy["direct_srtp"]["receiver_ledger"]["healthy"],
+        false
+    );
+    assert!(!unhealthy.to_string().contains("unsafe-secret-ledger"));
+}
+#[tokio::test]
+async fn receiver_ledger_capability_rejects_unwritable_owner_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let private = root.path().join("history-dir");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = private.join("history");
+    SrtpLedger::initialize(&path).unwrap();
+    let configured = App::new(
+        root.path().join("configured.json"),
+        root.path().join("configured-media"),
+        Options {
+            admin_user: "admin".into(),
+            admin_password: "owned".into(),
+            peer_key: "owned-peer-key".into(),
+            srtp_receiver_ledger: Some(path),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let unhealthy = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let (_, body) = capabilities(configured.clone(), true).await;
+            if body["direct_srtp"]["receiver_ledger"]["verified"] == true {
+                break body;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        unhealthy["direct_srtp"]["receiver_ledger"]["healthy"],
+        false
+    );
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 // Fault-injection executables test process supervision only, never media qualification.
 fn wrapper(dir: &Path, gpu_action: &str) -> String {

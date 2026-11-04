@@ -61,6 +61,7 @@ pub struct Engine {
     pub direct_egress: Arc<AtomicU64>,
     pub rtsp_push_egress: Arc<AtomicU64>,
     pub http_push_egress: Arc<AtomicU64>,
+    srtp_receiver_ledger: Option<Arc<crate::direct_rtp::key_ledger::Ledger>>,
 }
 #[derive(Clone, Copy)]
 struct InputPreference {
@@ -196,6 +197,13 @@ impl Worker {
                     .map(|o| o.stats())
                     .collect::<Vec<_>>()
             );
+            if let Some(Ok(description)) = self.wire.rtp.description() {
+                stats["flussonix_rtp_tracks"] = json!(description
+                    .tracks
+                    .iter()
+                    .map(|track| json!({"id":track.id,"media":if track.video {"video"} else {"audio"},"encoding":track.encoding}))
+                    .collect::<Vec<_>>());
+            }
         }
         let native_text_tracks = self.native_text_tracks.load(Ordering::Relaxed);
         if native_text_tracks > 0 {
@@ -279,7 +287,14 @@ impl Engine {
             direct_egress: Arc::new(AtomicU64::new(0)),
             rtsp_push_egress: Arc::new(AtomicU64::new(0)),
             http_push_egress: Arc::new(AtomicU64::new(0)),
+            srtp_receiver_ledger: None,
         }
+    }
+    pub fn set_srtp_receiver_ledger(
+        &mut self,
+        ledger: Option<Arc<crate::direct_rtp::key_ledger::Ledger>>,
+    ) {
+        self.srtp_receiver_ledger = ledger;
     }
     pub async fn gpu_capabilities(&self) -> Value {
         let _activity = self.idle_memory.activity().await;
@@ -884,7 +899,13 @@ impl Engine {
             ]);
             cmd.stdin(std::process::Stdio::piped());
         } else if let Some(settings) = crate::direct_rtp::config::Settings::input(&inputs[index])? {
-            direct_input = Some(crate::direct_rtp::input::Input::bind(&settings).await?);
+            direct_input = Some(
+                crate::direct_rtp::input::Input::bind_with_ledger(
+                    &settings,
+                    self.srtp_receiver_ledger.clone(),
+                )
+                .await?,
+            );
             if settings.elementary {
                 // SDP connection addresses describe a peer; FFmpeg otherwise
                 // binds wildcard local sockets. Decrypted media stays private.

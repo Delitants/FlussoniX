@@ -76,6 +76,60 @@ class ServicePreviewTests(unittest.TestCase):
             os.chown(key, self.account.pw_uid, self.account.pw_gid)
         return cert, key
 
+    def test_render_adds_stable_srtp_history_without_initializing_it(self):
+        self.create_credentials()
+        ledger = self.state / 'srtp-receiver-ledger'
+        lock = self.state / 'srtp-receiver-ledger.lock'
+        result = self.render()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f'"--srtp-receiver-ledger" "{ledger}"', self.unit.read_text())
+        self.assertFalse(ledger.exists())
+        self.assertFalse(lock.exists())
+        self.unit.unlink()
+
+        ledger.write_bytes(b'FXSRTP1\n')
+        lock.write_bytes(b'')
+        for path in (ledger, lock):
+            path.chmod(0o600)
+            if os.geteuid() == 0:
+                os.chown(path, self.account.pw_uid, self.account.pw_gid)
+        result = self.render()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f'"--srtp-receiver-ledger" "{ledger}"', self.unit.read_text())
+        self.assertEqual(ledger.read_bytes(), b'FXSRTP1\n')
+
+    def test_unsafe_existing_srtp_history_or_lock_refuses_unit(self):
+        self.create_credentials()
+        ledger = self.state / 'srtp-receiver-ledger'
+        lock = self.state / 'srtp-receiver-ledger.lock'
+        for target in (ledger, lock):
+            with self.subTest(target=target.name, defect='symlink'):
+                self.unit.unlink(missing_ok=True)
+                target.symlink_to(self.state / 'config.json')
+                result = self.render()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.unit.exists())
+                target.unlink()
+        ledger.write_bytes(b'FXSRTP1\n')
+        lock.write_bytes(b'')
+        for path in (ledger, lock):
+            path.chmod(0o600)
+            if os.geteuid() == 0:
+                os.chown(path, self.account.pw_uid, self.account.pw_gid)
+        for target in (ledger, lock):
+            with self.subTest(target=target.name, defect='public-mode'):
+                self.unit.unlink(missing_ok=True)
+                target.chmod(0o644)
+                result = self.render()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.unit.exists())
+                target.chmod(0o600)
+        ledger.write_bytes(b'wrong\n')
+        self.unit.unlink(missing_ok=True)
+        result = self.render()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.unit.exists())
+
     def test_combined_secure_listeners_render_a_valid_unit(self):
         if not shutil.which('systemd-analyze'):
             self.skipTest('requires systemd-analyze')

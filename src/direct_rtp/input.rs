@@ -6,6 +6,7 @@ use super::{
     sockets::Pair,
     stats::Stats,
 };
+use crate::direct_rtp::key_ledger::Ledger;
 use std::{
     net::SocketAddr,
     sync::{Arc, atomic::Ordering},
@@ -22,22 +23,31 @@ struct Mp2t {
     receiver_id: u32,
 }
 impl Mp2t {
-    pub async fn bind(settings: &Settings) -> Result<Self, String> {
+    pub async fn bind_with_ledger(
+        settings: &Settings,
+        ledger: Option<Arc<Ledger>>,
+    ) -> Result<Self, String> {
         let receiver_id =
             u32::from_be_bytes(uuid::Uuid::new_v4().as_bytes()[..4].try_into().unwrap());
-        let (receive, feedback) = if settings.secure {
-            let (rx, tx) = crypto::sessions(
+        let (receive, feedback, fingerprint) = if settings.secure {
+            let (rx, tx, fingerprint) = crypto::receive_sessions(
                 settings
                     .key_file
                     .as_deref()
                     .ok_or("SRTP key file required")?,
                 receiver_id,
             )?;
-            (Some(rx), Some(tx))
+            (Some(rx), Some(tx), Some(fingerprint))
         } else {
-            (None, None)
+            (None, None, None)
         };
         let pair = Pair::receive(settings)?;
+        if let Some(fingerprint) = fingerprint.filter(|_| !settings.allow_legacy_reused_key) {
+            let ledger = ledger.ok_or("SRTP receiver ledger required")?;
+            tokio::task::spawn_blocking(move || ledger.claim(fingerprint))
+                .await
+                .map_err(|_| "SRTP receiver ledger task failed")??;
+        }
         let stats = Arc::new(Stats::default());
         *stats.status.lock().unwrap() = "bound";
         Ok(Self {
@@ -137,7 +147,7 @@ impl Mp2t {
 }
 
 enum Implementation {
-    Mp2t(Mp2t),
+    Mp2t(Box<Mp2t>),
     Elementary(super::elementary::input::Input),
 }
 pub struct Input {
@@ -146,17 +156,23 @@ pub struct Input {
 }
 impl Input {
     pub async fn bind(settings: &Settings) -> Result<Self, String> {
+        Self::bind_with_ledger(settings, None).await
+    }
+    pub async fn bind_with_ledger(
+        settings: &Settings,
+        ledger: Option<Arc<Ledger>>,
+    ) -> Result<Self, String> {
         if settings.elementary {
-            let input = super::elementary::input::Input::bind(settings).await?;
+            let input = super::elementary::input::Input::bind_with_ledger(settings, ledger).await?;
             Ok(Self {
                 stats: input.stats.clone(),
                 inner: Implementation::Elementary(input),
             })
         } else {
-            let input = Mp2t::bind(settings).await?;
+            let input = Mp2t::bind_with_ledger(settings, ledger).await?;
             Ok(Self {
                 stats: input.stats.clone(),
-                inner: Implementation::Mp2t(input),
+                inner: Implementation::Mp2t(Box::new(input)),
             })
         }
     }

@@ -23,6 +23,10 @@ pub async fn run_cpu(secure: bool) {
 }
 async fn run_profile(video: Option<&str>, secure: bool, fixture: Option<&Path>, transcode: bool) {
     let d = tempfile::tempdir().unwrap();
+    if secure {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let input = port();
     let output = port();
     assert_ne!(input, output);
@@ -41,7 +45,14 @@ async fn run_profile(video: Option<&str>, secure: bool, fixture: Option<&Path>, 
     if transcode {
         cfg["transcoder"] = json!({"encoder":"libx264","vb":100,"acodec":"aac","ab":64});
     }
-    let e = Engine::new(d.path().join("media"), "ffmpeg");
+    let mut e = Engine::new(d.path().join("media"), "ffmpeg");
+    if secure {
+        let history = d.path().join("receiver-history");
+        flussonix::direct_rtp::key_ledger::Ledger::initialize(&history).unwrap();
+        e.set_srtp_receiver_ledger(Some(std::sync::Arc::new(
+            flussonix::direct_rtp::key_ledger::Ledger::new(history),
+        )));
+    }
     let worker = e
         .ensure_guarded("owned", &cfg, true, std::future::ready(true))
         .await

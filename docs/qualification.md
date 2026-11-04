@@ -2015,3 +2015,46 @@ assertion also passed. The early interval is now visible as candidate packets,
 but sender attribution in that interval and the private pre-readiness interval
 remain limits. The archived 38-picture HEVC failure did not
 reproduce, its cause is still unknown, and no production media repair is claimed.
+
+## Direct SRTP track binding candidate
+
+The isolated branch now requires a durable owner-only receiver key history for
+direct SRTP input by default, with an explicit legacy reuse option. MP2T and
+two-track elementary receivers deny a repeated key after restart; an occupied
+later RTP/RTCP port or failed atomic claim leaves public ports closed without
+partially consuming a new track key. Two elementary input modes were exercised:
+one shared key with SDP-matched expected SSRCs, and distinct per-track keys.
+The shared-key receiver also binds two tracks from configured SSRCs when an
+external SDP omits optional identity lines; a conflicting declared identity
+still fails. Receiver-history capability checks reject an owner-only directory
+without owner read/write/search permission.
+Captured first-lane ciphertext was rejected on the second lane before its
+first packet and during the startup queue, while valid media and SRTCP from
+both lanes were delivered. Independent FFmpeg media tests passed H.264/HEVC,
+AAC/MP2/MP3 and CPU conversion cases; the Intel VAAPI-only case remains gated
+by hardware availability.
+
+Outbound keys are matched by packetizer track ID, media and encoding before
+sockets and SDP are published. Live UDP tests decrypted each lane with only its
+configured key, rejected duplicate key bytes, and withdrew SDP on a same-count
+track-ID change. The Streams and Templates browser flows saved, reloaded and
+cleared the new labeled controls without a JSON editor. On isolated test
+daemons, CDN4 sent encrypted MP2T SRTP over the private LAN to CDN5 using a
+fresh receiver key epoch. CDN5 returned an HLS playlist and a 280,120-byte
+segment; independent FFprobe identified H.264 video and AAC audio in that
+segment. The receiver history recorded the new key claim. The temporary
+firewall rule, test daemons and test files were removed afterward; both hosts'
+Flussonic services remained active. This checks one cross-host MP2T profile,
+not the elementary profiles or a sustained-loss run. Exact-head CI and the
+remaining release blockers are still pending; these results do not establish
+a production-ready release.
+
+The candidate capabilities endpoint now reports receiver-history readiness
+without disclosing its path or fingerprints; a background check is coalesced
+for 30 seconds. The focused API test covered absent, valid and unsafe history
+with 12 concurrent authenticated requests. The optional systemd helper now
+renders a stable history path under the private state directory without
+creating it. All 28 helper tests passed, including unsafe ledger/lock refusal
+and an actual `systemd-analyze verify` on a generated secure-listener unit.
+The upgrade instructions require explicit initialization and a fresh sender
+key/epoch before media admission. The helper itself does not start a service.
