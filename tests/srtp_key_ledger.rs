@@ -92,6 +92,19 @@ fn missing_unsafe_or_corrupt_history_fails_closed_without_path_leakage() {
 }
 
 #[test]
+fn owner_only_but_unwritable_parent_is_not_ready_for_key_claims() {
+    let dir = private_dir();
+    let ledger = ledger(&dir.path().join("history"));
+    for mode in [0o500, 0o300, 0o600] {
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
+        assert!(ledger.probe().is_err());
+        assert!(ledger.claim([7; 32]).is_err());
+    }
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    ledger.probe().unwrap();
+}
+
+#[test]
 fn duplicate_history_record_and_nonregular_lock_are_rejected() {
     let dir = private_dir();
     let path = dir.path().join("history");

@@ -125,6 +125,44 @@ async fn srtp_receiver_ledger_capability_is_coalesced_and_does_not_disclose_path
     );
     assert!(!unhealthy.to_string().contains("unsafe-secret-ledger"));
 }
+#[tokio::test]
+async fn receiver_ledger_capability_rejects_unwritable_owner_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let private = root.path().join("history-dir");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = private.join("history");
+    SrtpLedger::initialize(&path).unwrap();
+    let configured = App::new(
+        root.path().join("configured.json"),
+        root.path().join("configured-media"),
+        Options {
+            admin_user: "admin".into(),
+            admin_password: "owned".into(),
+            peer_key: "owned-peer-key".into(),
+            srtp_receiver_ledger: Some(path),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let unhealthy = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let (_, body) = capabilities(configured.clone(), true).await;
+            if body["direct_srtp"]["receiver_ledger"]["verified"] == true {
+                break body;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        unhealthy["direct_srtp"]["receiver_ledger"]["healthy"],
+        false
+    );
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
 // Fault-injection executables test process supervision only, never media qualification.
 fn wrapper(dir: &Path, gpu_action: &str) -> String {
     let script = dir.join("ffmpeg-owned");

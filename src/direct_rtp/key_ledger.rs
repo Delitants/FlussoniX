@@ -61,7 +61,11 @@ fn names(path: &Path) -> Result<(File, CString, CString), String> {
         .open(parent)
         .map_err(|_| UNAVAILABLE)?;
     let meta = dir.metadata().map_err(|_| UNAVAILABLE)?;
-    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+    if !meta.is_dir()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.mode() & 0o077 != 0
+        || meta.mode() & 0o700 != 0o700
+    {
         return Err(UNAVAILABLE.into());
     }
     Ok((dir, name, lock_name))

@@ -395,12 +395,12 @@ impl Session {
                 || raws
                     .iter()
                     .zip(expected)
-                    .any(|(raw, expected)| raw.ssrc != Some(*expected))
+                    .any(|(raw, expected)| raw.ssrc.is_some_and(|declared| declared != *expected))
             {
                 return Err("SDP source identities disagree with input settings".into());
             }
         }
-        for raw in raws {
+        for (index, raw) in raws.into_iter().enumerate() {
             if raw.address.or(global) != Some(address)
                 || !ports.insert(raw.port)
                 || !ports.insert(raw.port + 1)
@@ -408,7 +408,11 @@ impl Session {
             {
                 return Err("SDP tracks require one address and exclusive RTP/RTCP ports".into());
             }
-            tracks.push(validate(raw)?);
+            let mut track = validate(raw)?;
+            if let Some(expected) = &settings.expected_ssrcs {
+                track.ssrc = Some(expected[index]);
+            }
+            tracks.push(track);
         }
         Ok(Self { address, tracks })
     }

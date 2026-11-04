@@ -93,6 +93,24 @@ fn secure_sdp_requires_matching_transport_and_rejects_inline_keys() {
     assert!(Session::parse(text.as_bytes(), &plain).is_err());
 }
 #[tokio::test]
+async fn configured_ssrcs_bind_two_tracks_when_external_sdp_omits_identity_lines() {
+    let d = tempfile::tempdir().unwrap();
+    let key = key_file(d.path());
+    let (port, reserved) = ports(4);
+    let sdp = d.path().join("external.sdp");
+    let text = description(port, [101, 202])
+        .replace("a=ssrc:101 cname:fx-audio-a\n", "")
+        .replace("a=ssrc:202 cname:fx-audio-b\n", "");
+    std::fs::write(&sdp, text).unwrap();
+    drop(reserved);
+    let settings = config(port, &sdp, &key, [101, 202]);
+    let input = Input::bind(&settings).await.unwrap();
+    drop(input);
+    for lane_port in port..port + 4 {
+        assert!(UdpSocket::bind(("127.0.0.1", lane_port)).is_ok());
+    }
+}
+#[tokio::test]
 async fn unsafe_key_fails_before_any_elementary_public_socket_opens() {
     let d = tempfile::tempdir().unwrap();
     let k = key_file(d.path());

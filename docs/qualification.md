@@ -2024,6 +2024,10 @@ two-track elementary receivers deny a repeated key after restart; an occupied
 later RTP/RTCP port or failed atomic claim leaves public ports closed without
 partially consuming a new track key. Two elementary input modes were exercised:
 one shared key with SDP-matched expected SSRCs, and distinct per-track keys.
+The shared-key receiver also binds two tracks from configured SSRCs when an
+external SDP omits optional identity lines; a conflicting declared identity
+still fails. Receiver-history capability checks reject an owner-only directory
+without owner read/write/search permission.
 Captured first-lane ciphertext was rejected on the second lane before its
 first packet and during the startup queue, while valid media and SRTCP from
 both lanes were delivered. Independent FFmpeg media tests passed H.264/HEVC,

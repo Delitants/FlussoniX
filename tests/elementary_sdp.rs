@@ -61,15 +61,14 @@ fn secure_sdp_identity_matches_expected_ssrcs_and_stays_out_of_private_decoder()
         )
         .is_err()
     );
-    assert!(
-        Session::parse(
-            source
-                .replace("a=ssrc:202 cname:fx-audio\r\n", "")
-                .as_bytes(),
-            &secure_settings(&[101, 202]),
-        )
-        .is_err()
-    );
+    let partial = source.replace("a=ssrc:202 cname:fx-audio\r\n", "");
+    let parsed = Session::parse(partial.as_bytes(), &secure_settings(&[101, 202])).unwrap();
+    assert_eq!(parsed.tracks[0].ssrc, Some(101));
+    assert_eq!(parsed.tracks[1].ssrc, Some(202));
+    let absent = partial.replace("a=ssrc:101 cname:fx-video\r\n", "");
+    let parsed = Session::parse(absent.as_bytes(), &secure_settings(&[101, 202])).unwrap();
+    assert_eq!(parsed.tracks[0].ssrc, Some(101));
+    assert_eq!(parsed.tracks[1].ssrc, Some(202));
 }
 
 #[test]
