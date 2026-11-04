@@ -199,6 +199,80 @@ async fn promised_viewer_still_starts_after_competing_direct_playback_is_denied(
 }
 
 #[tokio::test]
+async fn wrong_viewer_cannot_spend_a_continuous_http_handoff() {
+    let (_dir, app) = setup(1, 1000.0).await;
+    app.config
+        .put(
+            "streams",
+            "owned",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    let t = ticket(&app, 2.0).await;
+    let redirect = request(
+        &app,
+        &format!("/owned/mpegts?token=viewer&flussonix_ticket={t}"),
+        None,
+    )
+    .await;
+    assert_eq!(redirect.status(), 302);
+    let owner_location = redirect.headers()["location"].to_str().unwrap().to_owned();
+
+    let unauthorized = request(
+        &app,
+        &format!("/owned/mpegts?token=intruder&flussonix_handoff={t}"),
+        None,
+    )
+    .await;
+    assert_eq!(unauthorized.status(), 403);
+    let owner = request(&app, &owner_location, None).await;
+    assert_eq!(
+        owner.status(),
+        200,
+        "denied claimant spent the owner's ticket"
+    );
+    drop(owner);
+    app.media.stop_all().await;
+}
+
+#[tokio::test]
+async fn wrong_media_path_cannot_spend_a_playlist_handoff() {
+    let (_dir, app) = setup(1, 1000.0).await;
+    app.config
+        .put(
+            "streams",
+            "owned",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    let t = ticket(&app, 2.0).await;
+    let redirect = request(
+        &app,
+        &format!("/owned/index.m3u8?token=viewer&flussonix_ticket={t}"),
+        None,
+    )
+    .await;
+    assert_eq!(redirect.status(), 302);
+    let owner_location = redirect.headers()["location"].to_str().unwrap().to_owned();
+
+    let unauthorized = request(
+        &app,
+        &format!("/owned/mpegts?token=viewer&flussonix_handoff={t}"),
+        None,
+    )
+    .await;
+    assert_eq!(unauthorized.status(), 403);
+    let owner = request(&app, &owner_location, None).await;
+    assert_eq!(
+        owner.status(),
+        200,
+        "wrong media path spent the playlist ticket"
+    );
+    drop(owner);
+    app.media.stop_all().await;
+}
+
+#[tokio::test]
 async fn abandoned_redirect_expires_without_management_requests() {
     let (_dir, app) = setup(1, 1000.0).await;
     let t = ticket(&app, 2.0).await;

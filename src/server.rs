@@ -2517,9 +2517,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         let claim = if file.ends_with(".m3u8") {
             app.http_handoffs.claim_hls(ticket).await
         } else {
-            app.http_handoffs
-                .claim(ticket)
-                .map(http_handoff::Claim::once)
+            app.http_handoffs.claim_once(ticket).await
         };
         match claim {
             Some(claim) => Some(claim),
