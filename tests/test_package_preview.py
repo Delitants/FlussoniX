@@ -66,7 +66,10 @@ class PackagePreviewTests(unittest.TestCase):
                      for m in tar.getmembers() if m.isfile()}
             expected = {'bin/flussonix', 'web/index.html', 'web/assets/app.js',
                         'web/assets/app.css', 'README.md', 'installation.md',
-                        'iptv-transport.md', 'iptv-ha.md', 'manifest.json', 'LICENSE', 'NOTICE',
+                        'iptv-transport.md', 'iptv-ha.md', 'direct-rtp.md', 'direct-srtp.md',
+                        'elementary-rtp.md', 'elementary-srtp.md', 'http-ts-push.md',
+                        'vaapi.md', 'worker-output-ts.md', 'worker-ts-live.md',
+                        'manifest.json', 'LICENSE', 'NOTICE',
                         'vendor/quinn-proto/LICENSE-APACHE',
                         'vendor/quinn-proto/LICENSE-MIT',
                         'bin/flussonix-service', 'service-installation.md',
@@ -174,6 +177,14 @@ class PackagePreviewTests(unittest.TestCase):
                 for target in re.findall(r'\]\(([^)#]+\.md)(?:#[^)]*)?\)', guide):
                     self.assertIn((Path(name).parent / target).as_posix(), files,
                                   f'{name} links to missing {target}')
+
+    def test_archive_includes_current_direct_srtp_upgrade_guide(self):
+        archive = self.successful()
+        with tarfile.open(archive) as tar:
+            prefix = archive.name[:-7] + '/'
+            guide = tar.extractfile(prefix + 'direct-srtp.md').read()
+            self.assertEqual(guide, (ROOT / 'docs/direct-srtp.md').read_bytes())
+            self.assertIn(b'--init-srtp-receiver-ledger', guide)
 
     def test_archive_includes_current_ha_guide_and_offline_install_link(self):
         archive = self.successful()
