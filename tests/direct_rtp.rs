@@ -1,6 +1,41 @@
 use flussonix::config::ConfigStore;
 use serde_json::json;
 #[test]
+fn receiver_key_reuse_override_is_explicit_secure_input_only() {
+    use flussonix::direct_rtp::config::{Settings, outputs};
+    let base =
+        json!({"url":"srtp://127.0.0.1:40000","flussonix_rtp":{"key_file":"/tmp/owned.key"}});
+    assert!(
+        !Settings::input(&base)
+            .unwrap()
+            .unwrap()
+            .allow_legacy_reused_key
+    );
+    let mut legacy = base.clone();
+    legacy["flussonix_rtp"]["allow_legacy_reused_key"] = json!(true);
+    assert!(
+        Settings::input(&legacy)
+            .unwrap()
+            .unwrap()
+            .allow_legacy_reused_key
+    );
+    for invalid in [
+        json!({"url":"rtp://127.0.0.1:40000","flussonix_rtp":{"allow_legacy_reused_key":true}}),
+        json!({"url":"rtp://127.0.0.1:40000","flussonix_rtp":{"allow_legacy_reused_key":false}}),
+        json!({"url":"srtp://127.0.0.1:40000","flussonix_rtp":{"key_file":"/tmp/owned.key","allow_legacy_reused_key":"true"}}),
+    ] {
+        assert!(Settings::input(&invalid).is_err(), "accepted {invalid}");
+    }
+    assert!(outputs(&json!({"flussonix_rtp_outputs":[legacy]})).is_err());
+    assert!(
+        outputs(&json!({"flussonix_rtp_outputs":[{
+            "url":"srtp://127.0.0.1:40000",
+            "flussonix_rtp":{"key_file":"/tmp/owned.key","allow_legacy_reused_key":false}
+        }]}))
+        .is_err()
+    );
+}
+#[test]
 fn direct_rtp_configuration_inherits_and_rejects_ambiguous_endpoints() {
     let d = tempfile::tempdir().unwrap();
     let store = ConfigStore::open(d.path().join("config.json")).unwrap();

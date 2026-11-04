@@ -227,67 +227,6 @@ fn replace(dir: &File, name: &CString, held: &File, rows: &[[u8; 32]]) -> Result
     result
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{
-        fs,
-        os::unix::fs::{PermissionsExt, symlink},
-    };
-
-    fn private_history() -> (tempfile::TempDir, Ledger) {
-        let directory = tempfile::tempdir().unwrap();
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let path = directory.path().join("history");
-        Ledger::initialize(&path).unwrap();
-        (directory, Ledger::new(path))
-    }
-
-    #[test]
-    fn failed_precommit_steps_leave_the_entire_batch_unclaimed() {
-        for point in [1, 2] {
-            let (directory, ledger) = private_history();
-            ledger.claim([1; 32]).unwrap();
-            FAULT_POINT.with(|fault| fault.set(point));
-            assert!(ledger.claim_many(&[[2; 32], [3; 32]]).is_err());
-            FAULT_POINT.with(|fault| fault.set(0));
-            assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
-                !entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".srtp-ledger-")
-            }));
-            ledger.claim_many(&[[2; 32], [3; 32]]).unwrap();
-        }
-    }
-
-    #[test]
-    fn failed_postrename_directory_sync_never_exposes_a_partial_batch() {
-        let (_directory, ledger) = private_history();
-        FAULT_POINT.with(|fault| fault.set(3));
-        assert!(ledger.claim_many(&[[4; 32], [5; 32]]).is_err());
-        FAULT_POINT.with(|fault| fault.set(0));
-        ledger.probe().unwrap();
-        assert!(ledger.claim([4; 32]).is_err());
-        assert!(ledger.claim([5; 32]).is_err());
-    }
-
-    #[test]
-    fn swapped_ledger_name_cannot_be_replaced_through_a_stale_descriptor() {
-        let (directory, ledger) = private_history();
-        let (dir, name, lock_name) = names(&ledger.path).unwrap();
-        let _lock = lock(&dir, &lock_name).unwrap();
-        let (held, mut rows, _seen) = read_history(&dir, &name).unwrap();
-        let original = directory.path().join("original");
-        fs::rename(&ledger.path, &original).unwrap();
-        symlink(&original, &ledger.path).unwrap();
-        rows.push([6; 32]);
-        assert!(replace(&dir, &name, &held, &rows).is_err());
-        assert_eq!(fs::read(&original).unwrap(), HEADER);
-    }
-}
-
 impl Ledger {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
@@ -363,5 +302,66 @@ impl Ledger {
         }
         rows.extend_from_slice(fingerprints);
         replace(&dir, &name, &held, &rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt, symlink},
+    };
+
+    fn private_history() -> (tempfile::TempDir, Ledger) {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("history");
+        Ledger::initialize(&path).unwrap();
+        (directory, Ledger::new(path))
+    }
+
+    #[test]
+    fn failed_precommit_steps_leave_the_entire_batch_unclaimed() {
+        for point in [1, 2] {
+            let (directory, ledger) = private_history();
+            ledger.claim([1; 32]).unwrap();
+            FAULT_POINT.with(|fault| fault.set(point));
+            assert!(ledger.claim_many(&[[2; 32], [3; 32]]).is_err());
+            FAULT_POINT.with(|fault| fault.set(0));
+            assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".srtp-ledger-")
+            }));
+            ledger.claim_many(&[[2; 32], [3; 32]]).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_postrename_directory_sync_never_exposes_a_partial_batch() {
+        let (_directory, ledger) = private_history();
+        FAULT_POINT.with(|fault| fault.set(3));
+        assert!(ledger.claim_many(&[[4; 32], [5; 32]]).is_err());
+        FAULT_POINT.with(|fault| fault.set(0));
+        ledger.probe().unwrap();
+        assert!(ledger.claim([4; 32]).is_err());
+        assert!(ledger.claim([5; 32]).is_err());
+    }
+
+    #[test]
+    fn swapped_ledger_name_cannot_be_replaced_through_a_stale_descriptor() {
+        let (directory, ledger) = private_history();
+        let (dir, name, lock_name) = names(&ledger.path).unwrap();
+        let _lock = lock(&dir, &lock_name).unwrap();
+        let (held, mut rows, _seen) = read_history(&dir, &name).unwrap();
+        let original = directory.path().join("original");
+        fs::rename(&ledger.path, &original).unwrap();
+        symlink(&original, &ledger.path).unwrap();
+        rows.push([6; 32]);
+        assert!(replace(&dir, &name, &held, &rows).is_err());
+        assert_eq!(fs::read(&original).unwrap(), HEADER);
     }
 }

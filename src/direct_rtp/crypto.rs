@@ -325,6 +325,17 @@ pub fn sessions(path: &Path, sender: u32) -> Result<(Session, Session), &'static
     let transmit = Session::create(&mut key, Some(sender), true)?;
     Ok((receive, transmit))
 }
+/// MP2T receiver contexts and its durable claim share one key snapshot.
+pub fn receive_sessions(
+    path: &Path,
+    sender: u32,
+) -> Result<(Session, Session, [u8; 32]), &'static str> {
+    let mut key = Secret(read_key(path)?);
+    let fingerprint = key_fingerprint(&key.0);
+    let receive = Session::create(&mut key, None, false)?;
+    let feedback = Session::create(&mut key, Some(sender), true)?;
+    Ok((receive, feedback, fingerprint))
+}
 /// One immutable key snapshot for all bounded lanes in a transport generation.
 /// A wildcard transmitter is only for trusted private decoder feedback; after
 /// its first valid report Session pins that SSRC, just like specific senders.

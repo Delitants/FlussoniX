@@ -33,6 +33,7 @@ pub struct Settings {
     pub track_key_files: Option<Vec<PathBuf>>,
     pub expected_ssrcs: Option<Vec<u32>>,
     pub track_keys: Option<Vec<OutputTrackKey>>,
+    pub allow_legacy_reused_key: bool,
     pub elementary: bool,
     pub sdp_file: Option<PathBuf>,
 }
@@ -114,6 +115,7 @@ impl Settings {
                 "track_key_files",
                 "expected_ssrcs",
                 "track_keys",
+                "allow_legacy_reused_key",
                 "profile",
                 "sdp_file",
             ]
@@ -181,6 +183,18 @@ impl Settings {
             );
         }
         let secure = u.scheme() == "srtp";
+        let allow_legacy_reused_key = opts
+            .get("allow_legacy_reused_key")
+            .map(|value| {
+                value
+                    .as_bool()
+                    .ok_or("SRTP legacy key reuse option must be boolean")
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if !secure && opts.get("allow_legacy_reused_key").is_some() {
+            return Err("Plain RTP cannot override SRTP receiver key history".into());
+        }
         let key_file = opts.get("key_file").map(key_path).transpose()?;
         let track_key_files = opts
             .get("track_key_files")
@@ -314,6 +328,7 @@ impl Settings {
             track_key_files,
             expected_ssrcs,
             track_keys,
+            allow_legacy_reused_key,
             elementary,
             sdp_file,
         })
@@ -357,7 +372,12 @@ pub fn outputs(cfg: &Value) -> Result<Vec<Output>, String> {
                     return Err("RTP enabled setting must be boolean".into());
                 }
                 let settings = Settings::parse(row)?;
-                if settings.track_key_files.is_some() || settings.expected_ssrcs.is_some() {
+                if settings.track_key_files.is_some()
+                    || settings.expected_ssrcs.is_some()
+                    || row["flussonix_rtp"]
+                        .get("allow_legacy_reused_key")
+                        .is_some()
+                {
                     return Err("SRTP receive track bindings are not output options".into());
                 }
                 if settings.address.ip().is_unspecified()

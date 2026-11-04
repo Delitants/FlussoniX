@@ -192,6 +192,7 @@ pub async fn qualify(
         _ => panic!("FLUSSONIX_ELEMENTARY_PACKET_TAPS must be 1 or unset"),
     };
     let d = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let ffmpeg =
         std::env::var("FLUSSONIX_TEST_FFMPEG").unwrap_or_else(|_| "/usr/bin/ffmpeg".into());
     use base64::Engine as _;
@@ -304,6 +305,7 @@ pub async fn qualify(
                 "-srtp_out_params",
                 &key,
             ]);
+            sender.arg("-ssrc").arg((1000 + lane).to_string());
         }
         sender.args(["-f", "rtp"]).arg(format!(
             "{input_scheme}://127.0.0.1:{}?pkt_size=1200",
@@ -319,6 +321,7 @@ pub async fn qualify(
                 "-srtp_out_params",
                 &key,
             ]);
+            sender.arg("-ssrc").arg((1000 + lane).to_string());
         }
         sender
             .args([
@@ -384,13 +387,23 @@ pub async fn qualify(
         // FFmpeg emits AVP + inline SDES even for encrypted SRTP. Only the owned
         // test fixture converts it to our explicitly out-of-band SAVP descriptor.
         let source = std::fs::read_to_string(&input_sdp).unwrap();
-        let text = source
-            .lines()
-            .filter(|line| !line.starts_with("a=crypto:"))
-            .map(|line| line.replace("RTP/AVP", "RTP/SAVP"))
-            .collect::<Vec<_>>()
-            .join("\r\n")
-            + "\r\n";
+        let mut lines = Vec::new();
+        let mut media_index = 0;
+        for line in source.lines().map(|line| line.trim_end_matches('\r')) {
+            if line.starts_with("a=crypto:") || line.starts_with("a=ssrc:") {
+                continue;
+            }
+            lines.push(line.replace("RTP/AVP", "RTP/SAVP"));
+            if line.starts_with("m=") {
+                lines.push(format!(
+                    "a=ssrc:{} cname:owned-lane-{media_index}",
+                    1000 + media_index
+                ));
+                media_index += 1;
+            }
+        }
+        assert_eq!(media_index, lane as usize);
+        let text = lines.join("\r\n") + "\r\n";
         std::fs::write(&input_sdp, text).unwrap();
         std::fs::set_permissions(&input_sdp, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
@@ -413,7 +426,14 @@ pub async fn qualify(
     )
     .unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let engine = Engine::new(d.path().join("media"), executable.to_str().unwrap());
+    let mut engine = Engine::new(d.path().join("media"), executable.to_str().unwrap());
+    if secure_input {
+        let ledger_path = d.path().join("receiver-epochs");
+        flussonix::direct_rtp::key_ledger::Ledger::initialize(&ledger_path).unwrap();
+        engine.set_srtp_receiver_ledger(Some(std::sync::Arc::new(
+            flussonix::direct_rtp::key_ledger::Ledger::new(ledger_path),
+        )));
+    }
     // Shadow the moved guard so unwinding stops capture before dropping the engine.
     #[cfg(target_os = "linux")]
     let mut public_tap = public_tap;
@@ -444,6 +464,8 @@ pub async fn qualify(
     let mut cfg = json!({"inputs":[{"url":format!("{input_scheme}://127.0.0.1:{input}"),"flussonix_rtp":{"profile":"elementary","sdp_file":input_sdp}}],"flussonix_rtp_outputs":[{"url":format!("{output_scheme}://127.0.0.1:{output}"),"flussonix_rtp":{"profile":"elementary"}}],"transcoder":profile,"flussonix_input_timeout":15});
     if secure_input {
         cfg["inputs"][0]["flussonix_rtp"]["key_file"] = json!(key_path);
+        cfg["inputs"][0]["flussonix_rtp"]["expected_ssrcs"] =
+            json!((0..lane).map(|index| 1000 + index).collect::<Vec<_>>());
     }
     if secure_output {
         cfg["flussonix_rtp_outputs"][0]["flussonix_rtp"]["key_file"] = json!(key_path);

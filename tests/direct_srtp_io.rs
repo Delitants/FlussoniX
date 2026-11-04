@@ -36,7 +36,7 @@ async fn receive_authenticates_before_peer_pin_and_rejects_plaintext_tamper_repl
     key(&file, 0x33);
     let p = port();
     let cfg = Settings::parse(
-        &json!({"url":format!("srtp://127.0.0.1:{p}"),"flussonix_rtp":{"key_file":file}}),
+        &json!({"url":format!("srtp://127.0.0.1:{p}"),"flussonix_rtp":{"key_file":file,"allow_legacy_reused_key":true}}),
     )
     .unwrap();
     let input = Input::bind(&cfg).await.unwrap();
@@ -114,7 +114,7 @@ async fn srtcp_feedback_is_encrypted_and_plaintext_control_cannot_count() {
     key(&file, 0x33);
     let p = port();
     let cfg = Settings::parse(
-        &json!({"url":format!("srtp://127.0.0.1:{p}"),"flussonix_rtp":{"key_file":file}}),
+        &json!({"url":format!("srtp://127.0.0.1:{p}"),"flussonix_rtp":{"key_file":file,"allow_legacy_reused_key":true}}),
     )
     .unwrap();
     let input = Input::bind(&cfg).await.unwrap();
@@ -291,7 +291,7 @@ async fn key_reference_change_replaces_worker_and_reopens_input_pair() {
     key(&second, 0x34);
     let p = port();
     let engine = flussonix::media::Engine::new(d.path().join("media"), "ffmpeg");
-    let mut cfg = json!({"inputs":[{"url":format!("srtp://127.0.0.1:{p}"),"flussonix_rtp":{"key_file":first}}]});
+    let mut cfg = json!({"inputs":[{"url":format!("srtp://127.0.0.1:{p}"),"flussonix_rtp":{"key_file":first,"allow_legacy_reused_key":true}}]});
     let one = engine
         .ensure_guarded("owned", &cfg, true, std::future::ready(true))
         .await

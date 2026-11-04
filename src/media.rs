@@ -892,7 +892,13 @@ impl Engine {
             ]);
             cmd.stdin(std::process::Stdio::piped());
         } else if let Some(settings) = crate::direct_rtp::config::Settings::input(&inputs[index])? {
-            direct_input = Some(crate::direct_rtp::input::Input::bind(&settings).await?);
+            direct_input = Some(
+                crate::direct_rtp::input::Input::bind_with_ledger(
+                    &settings,
+                    self.srtp_receiver_ledger.clone(),
+                )
+                .await?,
+            );
             if settings.elementary {
                 // SDP connection addresses describe a peer; FFmpeg otherwise
                 // binds wildcard local sockets. Decrypted media stays private.
