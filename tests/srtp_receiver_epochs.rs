@@ -154,6 +154,45 @@ async fn mp2t_receiver_claims_before_admission_and_rejects_reused_key_after_rest
 }
 
 #[tokio::test]
+async fn elementary_receiver_without_media_consumes_track_keys_before_retry() {
+    let dir = private_dir();
+    let history = dir.path().join("history");
+    Ledger::initialize(&history).unwrap();
+    let ledger = Arc::new(Ledger::new(history));
+    let first_key = dir.path().join("video.key");
+    let second_key = dir.path().join("audio.key");
+    let sdp = dir.path().join("source.sdp");
+    key(&first_key, 0x61);
+    key(&second_key, 0x62);
+    let (port, reserved) = four_ports();
+    fs::write(&sdp, two_track_sdp(port, [301, 302])).unwrap();
+    drop(reserved);
+    let cfg = two_track_settings(port, &sdp, [&first_key, &second_key]);
+
+    // No sender is started: binding itself must durably claim both keys.
+    let first = Input::bind_with_ledger(&cfg, Some(ledger.clone()))
+        .await
+        .unwrap();
+    drop(first);
+    let refused = Input::bind_with_ledger(&cfg, Some(ledger.clone()))
+        .await
+        .err()
+        .expect("an unobserved first epoch must still block a same-key retry");
+    assert_eq!(
+        refused,
+        "SRTP receiver key already used; rotate key and restart sender"
+    );
+    for candidate in port..port + 4 {
+        assert!(UdpSocket::bind(("127.0.0.1", candidate)).is_ok());
+    }
+
+    key(&first_key, 0x63);
+    key(&second_key, 0x64);
+    let rotated = Input::bind_with_ledger(&cfg, Some(ledger)).await.unwrap();
+    drop(rotated);
+}
+
+#[tokio::test]
 async fn missing_history_or_occupied_control_port_does_not_burn_new_key() {
     let dir = private_dir();
     let history = dir.path().join("history");

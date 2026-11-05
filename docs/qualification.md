@@ -2077,6 +2077,17 @@ modes are qualified for this cross-host H.264/AAC case; sustained-loss
 recovery and the remaining release blockers are still pending. These results
 do not establish a production-ready release.
 
+A later isolated no-media regression bound the two-track elementary SRTP
+receiver without starting a sender. Binding durably claimed both keys; after
+the receiver was dropped, a same-key bind failed with the expected rotate-key
+error and closed its public UDP sockets. Rotating both keys admitted a fresh
+receiver. This confirms that a startup timeout followed by a same-key retry
+cannot recover under the approved receiver-epoch policy, even if no packet was
+received. The earlier cross-host run did not retain enough worker and ledger
+timing to attribute that specific failure solely to this mechanism. An
+operator must coordinate a new sender/key epoch after a receiver generation
+ends; the explicit legacy key-reuse option has weaker replay protection.
+
 The candidate capabilities endpoint now reports receiver-history readiness
 without disclosing its path or fingerprints; a background check is coalesced
 for 30 seconds. The focused API test covered absent, valid and unsafe history
