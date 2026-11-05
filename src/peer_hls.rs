@@ -85,6 +85,17 @@ pub(crate) async fn prepare(input: &str) -> Result<PreparedOrigin, String> {
     })
     .await
 }
+pub(crate) async fn prepare_peer(
+    input: &str,
+    allow_insecure_peer_http: bool,
+) -> Result<PreparedOrigin, String> {
+    let mut origin = Url::parse(input).map_err(|_| "invalid peer media URL")?;
+    if crate::http_basic::take_url_credentials(&mut origin)?.is_some() {
+        return Err("HTTP Basic input credentials cannot be combined with a peer key".into());
+    }
+    crate::peer_transport::require(&origin, allow_insecure_peer_http).map_err(str::to_owned)?;
+    prepare(input).await
+}
 pub struct PeerHls {
     pub url: String,
     cancel: CancellationToken,
@@ -459,7 +470,15 @@ impl PeerHls {
             .map_err(|_| "peer transport metadata task stopped")?
     }
     pub async fn start(input: &str, key: &str) -> Result<Self, String> {
-        Self::start_inner(prepare(input).await?, Some(key), false, false, None, None).await
+        Self::start_inner(
+            prepare_peer(input, false).await?,
+            Some(key),
+            false,
+            false,
+            None,
+            None,
+        )
+        .await
     }
     pub(crate) async fn start_inspected_prepared(
         prepared: PreparedOrigin,

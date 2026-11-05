@@ -727,7 +727,16 @@ impl Engine {
         };
         let prepared_hls = if let Some((index, input)) = hls_candidate {
             let translated = translate_input(&input)?;
-            Some((index, input, self.prepare_hls(&translated).await?))
+            let prepared = if cfg["flussonix_peer_key"].is_string() {
+                crate::peer_hls::prepare_peer(
+                    &translated,
+                    cfg["flussonix_allow_insecure_peer_http"] == true,
+                )
+                .await?
+            } else {
+                self.prepare_hls(&translated).await?
+            };
+            Some((index, input, prepared))
         } else {
             None
         };
