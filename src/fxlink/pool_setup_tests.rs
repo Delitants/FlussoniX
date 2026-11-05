@@ -549,6 +549,50 @@ async fn stalled_origin_does_not_delay_other_origin() {
 }
 
 #[tokio::test]
+async fn cancelling_stalled_origin_keeps_other_origin_playing() {
+    let _serial = super::super::transport::test_lock().lock().await;
+    let baseline = global().used();
+    let cert = test_tls::Certificates::new();
+    let a = Server::new(&cert);
+    let b = Server::new(&cert);
+    let pool = Arc::new(ClientPool::default());
+    let gate = gate(&pool, &a.url);
+    let cancel = CancellationToken::new();
+    let first = {
+        let pool = pool.clone();
+        let url = a.url.clone();
+        let ca = cert.ca.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            pool.subscribe(
+                &url,
+                "peer",
+                "token",
+                Some(&ca),
+                Settings::default(),
+                cancel,
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .unwrap();
+    let b_sub = tokio::time::timeout(Duration::from_secs(1), subscribe(&pool, &b.url, &cert.ca))
+        .await
+        .expect("origin B must complete within one second while A is gated");
+    cancel.cancel();
+    assert!(first.await.unwrap().is_err());
+    assert!(b_sub.current(), "cancelling A retired B's subscription");
+    gate.release.cancel();
+    drop(b_sub);
+    pool.close().await;
+    a.shutdown().await;
+    b.shutdown().await;
+    assert_eq!(global().used(), baseline);
+}
+
+#[tokio::test]
 async fn retired_router_join_does_not_block_other_origin() {
     let _serial = super::super::transport::test_lock().lock().await;
     let baseline = global().used();
