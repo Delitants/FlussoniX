@@ -53,8 +53,17 @@ impl Drop for Peer {
 }
 #[derive(Default)]
 pub struct ClientPool {
-    peers: Mutex<Vec<Peer>>,
+    inner: Arc<PoolInner>,
     features: Features,
+}
+#[derive(Default)]
+struct PoolInner {
+    state: Mutex<PoolState>,
+}
+#[derive(Default)]
+struct PoolState {
+    peers: Vec<Peer>,
+    epoch: u64,
 }
 struct Start {
     name: String,
@@ -128,7 +137,7 @@ impl Drop for Subscription {
 impl ClientPool {
     pub fn with_features(features: Features) -> Self {
         Self {
-            peers: Mutex::new(Vec::new()),
+            inner: Arc::new(PoolInner::default()),
             features,
         }
     }
@@ -160,7 +169,6 @@ impl ClientPool {
         {
             return Err("FXLink credential/name limit".into());
         }
-        let mut peers = self.peers.lock().await;
         let mut setup = global()
             .reserve(4 * 1024 * 1024)
             .map_err(|e| e.to_string())?;
@@ -174,19 +182,15 @@ impl ClientPool {
             settings: settings.clone(),
             features: self.features,
         };
-        let mut i = 0;
-        while i < peers.len() {
-            if peers[i].task.as_ref().unwrap().is_finished()
-                || peers[i].connection.close_reason().is_some()
-            {
-                let p = peers.remove(i);
-                p.cancel.cancel();
-                let Taken { task } = take_peer(p);
-                let _ = task.await;
-            } else {
-                i += 1
-            }
+        let retired = {
+            let mut state = self.inner.state.lock().await;
+            take_stale(&mut state.peers)
+        };
+        for Taken { task } in retired {
+            let _ = task.await;
         }
+        let mut pool_state = self.inner.state.lock().await;
+        let peers = &mut pool_state.peers;
         let index = if let Some(index) = peers.iter().position(|p| p.key == key) {
             let peer_setup = peer_budget(peers[index].connection.remote_address().ip())
                 .and_then(|budget| budget.reserve(4 * 1024 * 1024))
@@ -272,14 +276,18 @@ impl ClientPool {
             })
             .map_err(|_| "FXLink subscription limit")?;
         let connection = peer.connection.clone();
-        drop(peers);
+        drop(pool_state);
         ack.await.map_err(|_| "FXLink setup closed")??;
         // Transfer synchronous retirement ownership to the returned Subscription.
         guard.disarm();
         Ok(Subscription { state, connection })
     }
     pub async fn close(&self) {
-        let peers = std::mem::take(&mut *self.peers.lock().await);
+        let peers = {
+            let mut state = self.inner.state.lock().await;
+            state.epoch = state.epoch.wrapping_add(1);
+            std::mem::take(&mut state.peers)
+        };
         for peer in &peers {
             peer.cancel.cancel();
             peer.connection.close(0u32.into(), b"shutdown");
@@ -289,6 +297,23 @@ impl ClientPool {
             let _ = task.await;
         }
     }
+}
+fn take_stale(peers: &mut Vec<Peer>) -> Vec<Taken> {
+    let mut retired = Vec::new();
+    let mut i = 0;
+    while i < peers.len() {
+        if peers[i].task.as_ref().unwrap().is_finished()
+            || peers[i].connection.close_reason().is_some()
+        {
+            let p = peers.remove(i);
+            p.cancel.cancel();
+            p.connection.close(0u32.into(), b"retired");
+            retired.push(take_peer(p));
+        } else {
+            i += 1;
+        }
+    }
+    retired
 }
 // Moving a JoinHandle out of a Drop type uses a small owned wrapper instead of detaching it.
 struct Taken {
@@ -2065,3 +2090,7 @@ mod bootstrap_geometry_tests;
 #[cfg(test)]
 #[path = "geometry/clock_tests.rs"]
 mod geometry_clock_tests;
+
+#[cfg(test)]
+#[path = "pool_setup_tests.rs"]
+mod pool_setup_tests;
