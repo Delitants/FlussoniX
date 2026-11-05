@@ -302,6 +302,8 @@ M4F and M4S are **not equivalent to generic fMP4 packaging or a .m4s filename ex
 
 HLS input fetches require bounded playlist/segment state, live sliding-window handling, discontinuities, changing init data, multitrack/variant selection and relative URL resolution. Distinguish HLS encryption from authentication; encrypted input support is a separately recorded capability. First playback paths include `index.m3u8`, `index.ts.m3u8`, `index.fmp4.m3u8` and track playlists; LL-HLS is an explicit extension rather than an implied promise.
 
+For HTTP(S) HLS and continuous MPEG-TS inputs, FlussoniX resolves the configured hostname once per input generation and uses only that initial address set for playlists, media, keys and same-origin redirects. A later DNS change takes effect when the input restarts. The initial answer is not screened for private addresses, so only configure origins whose initial DNS answer you trust.
+
 ## M4F/M4S implementation plan
 
 Documented M4F behavior includes source/edge time alignment, stable segment ordering, preservation of payloads, segment availability notifications and origin DVR metadata. M4S is documented as a persistent inter-server protocol and supports redirects on publishing. [Cluster restreaming](https://flussonic.com/doc/fms/cluster/restreaming/), [stream pushing](https://flussonic.com/doc/fms/play/push/)

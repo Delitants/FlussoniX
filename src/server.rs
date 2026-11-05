@@ -1154,6 +1154,7 @@ fn redact_view_value(value: &mut Value) {
                         | "token"
                         | "streamid"
                         | "key_file"
+                        | "track_key_files"
                         | "sdp_file"
                         | "flussonix_tls_ca"
                         | "flussonix_media_tls_ca"

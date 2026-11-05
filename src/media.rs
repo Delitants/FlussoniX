@@ -62,7 +62,19 @@ pub struct Engine {
     pub rtsp_push_egress: Arc<AtomicU64>,
     pub http_push_egress: Arc<AtomicU64>,
     srtp_receiver_ledger: Option<Arc<crate::direct_rtp::key_ledger::Ledger>>,
+    #[cfg(test)]
+    hls_prepare_test_hook: Option<Arc<HlsPrepareHook>>,
 }
+#[cfg(test)]
+type HlsPrepareHook = dyn Fn(
+        String,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<crate::peer_hls::PreparedOrigin, String>>
+                + Send,
+        >,
+    > + Send
+    + Sync;
 #[derive(Clone, Copy)]
 struct InputPreference {
     index: usize,
@@ -288,7 +300,16 @@ impl Engine {
             rtsp_push_egress: Arc::new(AtomicU64::new(0)),
             http_push_egress: Arc::new(AtomicU64::new(0)),
             srtp_receiver_ledger: None,
+            #[cfg(test)]
+            hls_prepare_test_hook: None,
         }
+    }
+    async fn prepare_hls(&self, input: &str) -> Result<crate::peer_hls::PreparedOrigin, String> {
+        #[cfg(test)]
+        if let Some(hook) = &self.hls_prepare_test_hook {
+            return hook(input.to_owned()).await;
+        }
+        crate::peer_hls::prepare(input).await
     }
     pub fn set_srtp_receiver_ledger(
         &mut self,
@@ -659,6 +680,110 @@ impl Engine {
         } else {
             None
         };
+        // The per-stream gate keeps this selection stable against another
+        // startup. DNS must run before taking the shared worker-map lock.
+        let hls_candidate = if publishing.is_none()
+            && cfg["disabled"] != true
+            && !shared.as_ref().is_some_and(|s| s.input.is_none())
+        {
+            let workers = self.workers.lock().await;
+            let signature = media_signature(cfg);
+            let existing = workers.get(name);
+            let running = existing.is_some_and(|w| {
+                w.alive.load(Ordering::Relaxed)
+                    && !w.is_closed()
+                    && w.signature == signature
+                    && w.shared_generation == shared_generation
+            });
+            let index = existing
+                .filter(|w| {
+                    !running && w.signature == signature && w.shared_generation == shared_generation
+                })
+                .map_or(preferred_input.unwrap_or(0), |w| w.input_index + 1);
+            if running {
+                None
+            } else {
+                cfg["inputs"]
+                    .as_array()
+                    .filter(|inputs| !inputs.is_empty())
+                    .and_then(|inputs| {
+                        let selected_index = index % inputs.len();
+                        let input = inputs[selected_index]["url"].as_str()?;
+                        [
+                            "hls://",
+                            "hlss://",
+                            "tshttp://",
+                            "tshttps://",
+                            "http://",
+                            "https://",
+                        ]
+                        .iter()
+                        .any(|prefix| input.starts_with(prefix))
+                        .then(|| (selected_index, input.to_owned()))
+                    })
+            }
+        } else {
+            None
+        };
+        let hls_start_index = hls_candidate.as_ref().map(|(index, _)| *index);
+        let mut selected_hls_index = None;
+        let mut prepared_hls = None;
+        if let Some((first_index, _)) = hls_candidate {
+            let inputs = cfg["inputs"].as_array().ok_or("stream has no input")?;
+            let mut candidate = first_index;
+            let mut first_dns_error = None;
+            loop {
+                let input = inputs[candidate]["url"]
+                    .as_str()
+                    .ok_or("input URL required")?;
+                if ![
+                    "hls://",
+                    "hlss://",
+                    "tshttp://",
+                    "tshttps://",
+                    "http://",
+                    "https://",
+                ]
+                .iter()
+                .any(|prefix| input.starts_with(prefix))
+                {
+                    selected_hls_index = Some(candidate);
+                    break;
+                }
+                let translated = translate_input(input)?;
+                let result = if cfg["flussonix_peer_key"].is_string() {
+                    crate::peer_hls::prepare_peer(
+                        &translated,
+                        cfg["flussonix_allow_insecure_peer_http"] == true,
+                    )
+                    .await
+                } else {
+                    self.prepare_hls(&translated).await
+                };
+                match result {
+                    Ok(prepared) => {
+                        selected_hls_index = Some(candidate);
+                        prepared_hls = Some((candidate, input.to_owned(), prepared));
+                        break;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.as_str(),
+                            "peer media DNS failed"
+                                | "peer media DNS timeout"
+                                | "peer media DNS returned no addresses"
+                        ) =>
+                    {
+                        first_dns_error.get_or_insert(error);
+                        candidate = (candidate + 1) % inputs.len();
+                        if candidate == first_index {
+                            return Err(first_dns_error.unwrap());
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
         let mut workers = self.workers.lock().await;
         // Recheck after waiting for another stream startup/replacement. A stale
         // route must not cancel an already-published replacement worker.
@@ -724,7 +849,33 @@ impl Engine {
             .filter(|a| !a.is_empty())
             .ok_or("stream has no input")?;
         index %= inputs.len();
+        if let Some(start_index) = hls_start_index {
+            if index != start_index {
+                return Err("media route changed".into());
+            }
+            index = selected_hls_index.ok_or("media route changed")?;
+        }
         let input = inputs[index]["url"].as_str().ok_or("input URL required")?;
+        let mut prepared_hls = if [
+            "hls://",
+            "hlss://",
+            "tshttp://",
+            "tshttps://",
+            "http://",
+            "https://",
+        ]
+        .iter()
+        .any(|prefix| input.starts_with(prefix))
+        {
+            let (prepared_index, prepared_input, prepared) =
+                prepared_hls.ok_or("media route changed")?;
+            if prepared_index != index || prepared_input != input {
+                return Err("media route changed".into());
+            }
+            Some(prepared)
+        } else {
+            None
+        };
         if native_captions
             && !["m4f://", "m4fs://", "m4s://", "m4ss://", "fxlink://"]
                 .iter()
@@ -950,8 +1101,8 @@ impl Engine {
                 let ca = inputs[index]["flussonix_tls_ca"]
                     .as_str()
                     .map(std::path::Path::new);
-                let proxy = crate::peer_hls::PeerHls::start_inspected(
-                    &translated,
+                let proxy = crate::peer_hls::PeerHls::start_inspected_prepared(
+                    prepared_hls.take().ok_or("media route changed")?,
                     key,
                     ca,
                     allow_insecure_peer_http,
@@ -981,8 +1132,8 @@ impl Engine {
                     || ((input.starts_with("https://") || input.starts_with("http://"))
                         && !url::Url::parse(&translated)
                             .is_ok_and(|u| u.path().ends_with(".m3u8")));
-                let proxy = crate::peer_hls::PeerHls::start_external(
-                    &translated,
+                let proxy = crate::peer_hls::PeerHls::start_external_prepared(
+                    prepared_hls.take().ok_or("media route changed")?,
                     inputs[index]["flussonix_tls_ca"].as_str().map(Path::new),
                     live,
                 )
@@ -2913,3 +3064,129 @@ mod ts_diagnostics_tests;
 #[cfg(test)]
 #[path = "media/rtsp_startup_tests.rs"]
 mod rtsp_startup_tests;
+
+#[cfg(test)]
+mod hls_startup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_hls_dns_moves_to_healthy_backup_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path(), "ffmpeg");
+        engine.hls_prepare_test_hook = Some(Arc::new(|input: String| {
+            Box::pin(async move {
+                assert!(input.contains("unresolvable.invalid"));
+                Err("peer media DNS failed".into())
+            })
+        }));
+        let config = json!({"inputs":[
+            {"url":"http://unresolvable.invalid/entry.m3u8"},
+            {"url":"testsrc://"}
+        ]});
+        let worker = engine.ensure("fallback", &config).await.unwrap();
+        assert_eq!(worker.input_index, 1);
+        assert!(worker.alive.load(Ordering::Relaxed));
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn hls_prepare_does_not_hold_global_worker_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path(), "ffmpeg");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        engine.hls_prepare_test_hook = Some(Arc::new({
+            let started = started.clone();
+            let release = release.clone();
+            move |input: String| {
+                let started = started.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                    crate::peer_hls::prepare(&input).await
+                })
+            }
+        }));
+        let engine = Arc::new(engine);
+        let config = json!({"inputs":[{"url":"http://127.0.0.1:1/entry.m3u8"}]});
+        let waiting = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.ensure("waiting", &config).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), engine.count())
+                .await
+                .is_ok()
+        );
+        let other = json!({"inputs":[{"url":"testsrc://"}]});
+        tokio::time::timeout(Duration::from_secs(3), engine.ensure("unrelated", &other))
+            .await
+            .unwrap()
+            .unwrap();
+        release.notify_one();
+        let _ = waiting.await.unwrap();
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn stale_hls_preparation_cannot_publish_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path(), "ffmpeg");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        engine.hls_prepare_test_hook = Some(Arc::new({
+            let started = started.clone();
+            let release = release.clone();
+            move |input: String| {
+                let started = started.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                    crate::peer_hls::prepare(&input).await
+                })
+            }
+        }));
+        let engine = Arc::new(engine);
+        let current = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let config = json!({"inputs":[{"url":"http://127.0.0.1:1/entry.m3u8"}]});
+        let waiting = {
+            let engine = engine.clone();
+            let current = current.clone();
+            tokio::spawn(async move {
+                engine
+                    .ensure_guarded("stale", &config, true, async move {
+                        current.load(Ordering::SeqCst)
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        current.store(false, Ordering::SeqCst);
+        release.notify_one();
+        assert_eq!(
+            waiting.await.unwrap().err().as_deref(),
+            Some("media route changed")
+        );
+        assert!(engine.workers.lock().await.get("stale").is_none());
+        let cancelled = {
+            let engine = engine.clone();
+            let config = json!({"inputs":[{"url":"http://127.0.0.1:1/entry.m3u8"}]});
+            tokio::spawn(async move { engine.ensure("cancelled", &config).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        cancelled.abort();
+        assert!(cancelled.await.is_err());
+        assert!(engine.workers.lock().await.get("cancelled").is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        engine.stop_all().await;
+    }
+}

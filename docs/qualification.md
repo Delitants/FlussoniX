@@ -1,5 +1,22 @@
 # Preview qualification
 
+## HTTP HLS origin address pinning (2026-11-05)
+
+At runtime commit `b39c9cb`, the owned loopback regression used an unresolved
+hostname pinned to an OS-selected local listener. Forced new connections fetched
+the playlist, key, map, segment and a same-origin redirect with the configured
+Host header; a second listener received zero requests. Resolver tests covered
+duplicate, empty, failing and timed-out answers, the eight-address cap, IPv4
+and IPv6 literals and an initial set that includes a private address. Startup
+tests paused one origin while an unrelated stream started, then rejected a
+stale route and a cancelled preparation before worker/proxy publication; a
+failed first HLS DNS lookup selected a healthy fallback input. The HLS
+fetcher module, `peer_hls` (9 cases), `http_input_tls` (18 cases) and
+warnings-denied all-target Clippy passed locally. This pins only the initial
+resolved set for each generation; it does not validate the trustworthiness of
+the configured origin or its first DNS answer. Exact-head CI and final release
+qualification remain separate gates.
+
 ## Isolated runtime without vendor files (2026-11-02 HST)
 
 The local debug daemon with SHA-256
@@ -1945,6 +1962,14 @@ packets observed during handoff are attempts rather than proof of native
 application receipt. The archived 38-picture HEVC loss did not recur in these
 cases; its cause and repair remain a release blocker.
 
+An additional 43 serial runs of the owned HEVC/MP3 plaintext diagnostic on the
+isolated Linux host passed strict worker and receiver decoding with optional
+packet taps enabled. One inspected run retained complete public and private
+traces with zero packet-socket drops or queued bytes at stop. The inspected
+artifact and other passing-run artifacts were removed; no test FFmpeg process
+was left running. These passes did not reproduce or explain the archived
+picture loss, which remains a release blocker.
+
 ## Tokenless SRT playback candidate
 
 The isolated SRT ticket candidate issues five-second, single-use playback
@@ -1964,6 +1989,15 @@ Independent FFmpeg strictly decoded H.264/AAC media from both connections;
 wrong-passphrase admission did not consume the ticket, and replay after use
 delivered no media. The six-profile encrypted listener matrix and four HEVC
 MP2/MP3 M4F/M4S native recovery profiles also passed serially.
+
+A later full CI run (`41944935451`) failed the M4F/HEVC/MP2 recovery case at
+its first fresh HTTPS SRT lookup with HTTP 503; the other three recovery cases
+passed. The exact failing case passed six serial runs on the isolated Linux
+host, including one initial run and five repeats with failure-only placement
+diagnostics. All test-owned daemons and FFmpeg children exited, passing logs
+were removed, and the temporary build target was deleted. These passes do not
+explain or repair the CI refusal. The bounded placement diagnostic is prepared
+for the next immutable-head run; SRT recovery remains a release gate.
 
 This candidate is not a production release. Full exact-head Rust/browser and
 packaging checks, review, WAN/capacity measurements, the independent 24-hour
@@ -2068,6 +2102,17 @@ daemons, keys and media files were removed afterward. Both elementary binding
 modes are qualified for this cross-host H.264/AAC case; sustained-loss
 recovery and the remaining release blockers are still pending. These results
 do not establish a production-ready release.
+
+A later isolated no-media regression bound the two-track elementary SRTP
+receiver without starting a sender. Binding durably claimed both keys; after
+the receiver was dropped, a same-key bind failed with the expected rotate-key
+error and closed its public UDP sockets. Rotating both keys admitted a fresh
+receiver. This confirms that a startup timeout followed by a same-key retry
+cannot recover under the approved receiver-epoch policy, even if no packet was
+received. The earlier cross-host run did not retain enough worker and ledger
+timing to attribute that specific failure solely to this mechanism. An
+operator must coordinate a new sender/key epoch after a receiver generation
+ends; the explicit legacy key-reuse option has weaker replay protection.
 
 The candidate capabilities endpoint now reports receiver-history readiness
 without disclosing its path or fingerprints; a background check is coalesced
