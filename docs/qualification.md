@@ -1973,6 +1973,15 @@ wrong-passphrase admission did not consume the ticket, and replay after use
 delivered no media. The six-profile encrypted listener matrix and four HEVC
 MP2/MP3 M4F/M4S native recovery profiles also passed serially.
 
+A later full CI run (`41944935451`) failed the M4F/HEVC/MP2 recovery case at
+its first fresh HTTPS SRT lookup with HTTP 503; the other three recovery cases
+passed. The exact failing case passed six serial runs on the isolated Linux
+host, including one initial run and five repeats with failure-only placement
+diagnostics. All test-owned daemons and FFmpeg children exited, passing logs
+were removed, and the temporary build target was deleted. These passes do not
+explain or repair the CI refusal. The bounded placement diagnostic is prepared
+for the next immutable-head run; SRT recovery remains a release gate.
+
 This candidate is not a production release. Full exact-head Rust/browser and
 packaging checks, review, WAN/capacity measurements, the independent 24-hour
 run, archived HEVC-loss gate and installation/upgrade/recovery checks remain
