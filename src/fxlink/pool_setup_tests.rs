@@ -270,6 +270,242 @@ async fn pending_and_live_share_sixteen_slots() {
 }
 
 #[tokio::test]
+async fn cancel_one_waiter_keeps_sibling_setup() {
+    let _serial = super::super::transport::test_lock().lock().await;
+    let baseline = global().used();
+    let cert = test_tls::Certificates::new();
+    let server = Server::new(&cert);
+    let pool = Arc::new(ClientPool::default());
+    let gate = gate(&pool, &server.url);
+    let first_cancel = CancellationToken::new();
+    let first = {
+        let pool = pool.clone();
+        let url = server.url.clone();
+        let ca = cert.ca.clone();
+        let cancel = first_cancel.clone();
+        tokio::spawn(async move {
+            pool.subscribe(
+                &url,
+                "peer",
+                "token",
+                Some(&ca),
+                Settings::default(),
+                cancel,
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .unwrap();
+    let second = spawn_subscription(&pool, &server.url, &cert.ca, "peer", Settings::default());
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    first_cancel.cancel();
+    assert!(first.await.unwrap().is_err());
+    assert!(
+        !second.is_finished(),
+        "sibling setup retired with first waiter"
+    );
+    gate.release.cancel();
+    let sibling = second.await.unwrap().unwrap();
+    assert!(sibling.current());
+    assert_eq!(gate.starts.load(Ordering::SeqCst), 1);
+    drop(sibling);
+    pool.close().await;
+    server.shutdown().await;
+    assert_eq!(global().used(), baseline);
+}
+
+#[tokio::test]
+async fn cancel_last_waiter_closes_endpoint_and_releases_budgets() {
+    let _serial = super::super::transport::test_lock().lock().await;
+    let cert = test_tls::Certificates::new();
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("fxlink://{}/live", socket.local_addr().unwrap());
+    let peer = peer_budget("127.0.0.1".parse().unwrap()).unwrap();
+    let baseline = peer.used();
+    let pool = Arc::new(ClientPool::default());
+    let cancel = CancellationToken::new();
+    let attempt = {
+        let pool = pool.clone();
+        let url = url.clone();
+        let ca = cert.ca.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            pool.subscribe(
+                &url,
+                "peer",
+                "token",
+                Some(&ca),
+                Settings::default(),
+                cancel,
+            )
+            .await
+        })
+    };
+    let mut packet = [0; 1500];
+    tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(peer.used() - baseline, 8 * 1024 * 1024);
+    cancel.cancel();
+    assert!(attempt.await.unwrap().is_err());
+    let cleaned = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if pool.inner.state.lock().await.pending.is_empty() && peer.used() == baseline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    pool.close().await;
+    assert!(
+        cleaned.is_ok(),
+        "last cancelled waiter retained setup and budget"
+    );
+    assert_eq!(peer.used(), baseline);
+}
+
+#[tokio::test]
+async fn timed_out_setup_clears_pending_for_retry() {
+    let _serial = super::super::transport::test_lock().lock().await;
+    let baseline = global().used();
+    let cert = test_tls::Certificates::new();
+    let server = Server::new(&cert);
+    let pool = Arc::new(ClientPool::default());
+    let gate = gate(&pool, &server.url);
+    let attempt = spawn_subscription(&pool, &server.url, &cert.ca, "peer", Settings::default());
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(16), attempt)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.err().as_deref(), Some("FXLink setup timeout"));
+    let cleaned = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if pool.inner.state.lock().await.pending.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    gate.release.cancel();
+    assert!(cleaned.is_ok(), "timed-out setup retained its pending slot");
+    let retry = subscribe(&pool, &server.url, &cert.ca).await;
+    assert!(retry.current());
+    drop(retry);
+    pool.close().await;
+    server.shutdown().await;
+    assert_eq!(global().used(), baseline);
+}
+
+#[tokio::test]
+async fn dns_and_tls_failures_allow_retry() {
+    let _serial = super::super::transport::test_lock().lock().await;
+    let baseline = global().used();
+    let cert = test_tls::Certificates::new();
+    let wrong = test_tls::Certificates::new();
+    let server = Server::new(&cert);
+    let pool = ClientPool::default();
+    let missing = pool
+        .subscribe(
+            "fxlink://does-not-exist.invalid:19455/live",
+            "peer",
+            "token",
+            Some(&cert.ca),
+            Settings::default(),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(missing.is_err());
+    assert!(pool.inner.state.lock().await.pending.is_empty());
+    let bad_tls = pool
+        .subscribe(
+            &server.url,
+            "peer",
+            "token",
+            Some(&wrong.ca),
+            Settings::default(),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(bad_tls.is_err());
+    assert!(pool.inner.state.lock().await.pending.is_empty());
+    let good = subscribe(&pool, &server.url, &cert.ca).await;
+    assert!(good.current());
+    drop(good);
+    pool.close().await;
+    server.shutdown().await;
+    assert_eq!(global().used(), baseline);
+}
+
+#[tokio::test]
+async fn close_race_rejects_old_publication_but_allows_new_epoch() {
+    let _serial = super::super::transport::test_lock().lock().await;
+    let baseline = global().used();
+    let cert = test_tls::Certificates::new();
+    let server = Server::new(&cert);
+    let pool = Arc::new(ClientPool::default());
+    let gate = gate(&pool, &server.url);
+    let first = spawn_subscription(&pool, &server.url, &cert.ca, "peer", Settings::default());
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .unwrap();
+    pool.close().await;
+    assert!(first.await.unwrap().is_err());
+    assert!(pool.inner.state.lock().await.pending.is_empty());
+    assert!(pool.inner.state.lock().await.peers.is_empty());
+    gate.release.cancel();
+    let next = subscribe(&pool, &server.url, &cert.ca).await;
+    assert!(next.current());
+    drop(next);
+    pool.close().await;
+    server.shutdown().await;
+    assert_eq!(global().used(), baseline);
+}
+
+#[tokio::test]
+async fn aborted_setup_task_releases_pending_for_retry() {
+    let _serial = super::super::transport::test_lock().lock().await;
+    let baseline = global().used();
+    let cert = test_tls::Certificates::new();
+    let server = Server::new(&cert);
+    let pool = Arc::new(ClientPool::default());
+    let gate = gate(&pool, &server.url);
+    let first = spawn_subscription(&pool, &server.url, &cert.ca, "peer", Settings::default());
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .unwrap();
+    let pending = pool.inner.state.lock().await.pending[0].clone();
+    pending.task.lock().unwrap().as_ref().unwrap().abort();
+    let cleared = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if pool.inner.state.lock().await.pending.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    gate.release.cancel();
+    assert!(
+        cleared.is_ok(),
+        "aborted setup left a permanent pending origin"
+    );
+    assert!(first.await.unwrap().is_err());
+    let retry = subscribe(&pool, &server.url, &cert.ca).await;
+    drop(retry);
+    pool.close().await;
+    server.shutdown().await;
+    assert_eq!(global().used(), baseline);
+}
+
+#[tokio::test]
 async fn stalled_origin_does_not_delay_other_origin() {
     let _serial = super::super::transport::test_lock().lock().await;
     let baseline = global().used();

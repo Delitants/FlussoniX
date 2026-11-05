@@ -94,6 +94,15 @@ struct Pending {
     cancel: CancellationToken,
     result: tokio::sync::watch::Sender<Option<Result<(), String>>>,
     task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    waiters: std::sync::atomic::AtomicUsize,
+}
+struct PendingWaiter(Arc<Pending>);
+impl Drop for PendingWaiter {
+    fn drop(&mut self) {
+        if self.0.waiters.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.cancel.cancel();
+        }
+    }
 }
 struct ConnectedPeer {
     endpoint: quinn::Endpoint,
@@ -237,6 +246,7 @@ impl ClientPool {
                     .iter()
                     .find(|p| p.host == address.host && p.port == address.port)
                 {
+                    pending.waiters.fetch_add(1, Ordering::AcqRel);
                     Action::Wait(pending.clone(), false)
                 } else {
                     if state.peers.len() + state.pending.len() >= 16 {
@@ -251,6 +261,7 @@ impl ClientPool {
                         cancel: CancellationToken::new(),
                         result,
                         task: std::sync::Mutex::new(None),
+                        waiters: std::sync::atomic::AtomicUsize::new(1),
                     });
                     state.pending.push(pending.clone());
                     Action::Wait(pending, true)
@@ -264,6 +275,7 @@ impl ClientPool {
                     break (commands, connection);
                 }
                 Action::Wait(pending, new) => {
+                    let _waiter = PendingWaiter(pending.clone());
                     let mut result = pending.result.subscribe();
                     if new {
                         match global().reserve(4 * 1024 * 1024) {
@@ -347,6 +359,24 @@ async fn finish_setup(inner: &PoolInner, pending: &Arc<Pending>, outcome: Result
     }
     pending.result.send_replace(Some(outcome));
 }
+struct SetupCleanup {
+    inner: Arc<PoolInner>,
+    pending: Arc<Pending>,
+    completed: bool,
+}
+impl Drop for SetupCleanup {
+    fn drop(&mut self) {
+        if !self.completed {
+            let inner = self.inner.clone();
+            let pending = self.pending.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    finish_setup(&inner, &pending, Err("FXLink setup closed".into())).await;
+                });
+            }
+        }
+    }
+}
 async fn setup_peer(
     inner: Arc<PoolInner>,
     pending: Arc<Pending>,
@@ -354,6 +384,11 @@ async fn setup_peer(
     tls: tokio_rustls::rustls::ClientConfig,
     mut setup: super::Reservation,
 ) {
+    let mut cleanup = SetupCleanup {
+        inner: inner.clone(),
+        pending: pending.clone(),
+        completed: false,
+    };
     let result = tokio::select! {
         biased;
         _ = pending.cancel.cancelled() => Err("FXLink setup closed".into()),
@@ -364,15 +399,21 @@ async fn setup_peer(
         } => result,
     };
     let mut state = inner.state.lock().await;
-    let current =
-        state.epoch == pending.epoch && state.pending.iter().any(|p| Arc::ptr_eq(p, &pending));
+    let current = state.epoch == pending.epoch
+        && !pending.cancel.is_cancelled()
+        && pending.waiters.load(Ordering::Acquire) > 0
+        && state.pending.iter().any(|p| Arc::ptr_eq(p, &pending));
     if !current {
+        if let Some(index) = state.pending.iter().position(|p| Arc::ptr_eq(p, &pending)) {
+            state.pending.remove(index);
+        }
         if let Ok(connected) = result {
             connected.connection.close(0u32.into(), b"stale setup");
         }
         pending
             .result
             .send_replace(Some(Err("FXLink setup closed".into())));
+        cleanup.completed = true;
         return;
     }
     let index = state
@@ -406,6 +447,7 @@ async fn setup_peer(
             pending.result.send_replace(Some(Err(error)));
         }
     }
+    cleanup.completed = true;
 }
 async fn connect_peer(
     address: &Address,
