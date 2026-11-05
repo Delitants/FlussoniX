@@ -725,21 +725,65 @@ impl Engine {
         } else {
             None
         };
-        let prepared_hls = if let Some((index, input)) = hls_candidate {
-            let translated = translate_input(&input)?;
-            let prepared = if cfg["flussonix_peer_key"].is_string() {
-                crate::peer_hls::prepare_peer(
-                    &translated,
-                    cfg["flussonix_allow_insecure_peer_http"] == true,
-                )
-                .await?
-            } else {
-                self.prepare_hls(&translated).await?
-            };
-            Some((index, input, prepared))
-        } else {
-            None
-        };
+        let hls_start_index = hls_candidate.as_ref().map(|(index, _)| *index);
+        let mut selected_hls_index = None;
+        let mut prepared_hls = None;
+        if let Some((first_index, _)) = hls_candidate {
+            let inputs = cfg["inputs"].as_array().ok_or("stream has no input")?;
+            let mut candidate = first_index;
+            let mut first_dns_error = None;
+            loop {
+                let input = inputs[candidate]["url"]
+                    .as_str()
+                    .ok_or("input URL required")?;
+                if ![
+                    "hls://",
+                    "hlss://",
+                    "tshttp://",
+                    "tshttps://",
+                    "http://",
+                    "https://",
+                ]
+                .iter()
+                .any(|prefix| input.starts_with(prefix))
+                {
+                    selected_hls_index = Some(candidate);
+                    break;
+                }
+                let translated = translate_input(input)?;
+                let result = if cfg["flussonix_peer_key"].is_string() {
+                    crate::peer_hls::prepare_peer(
+                        &translated,
+                        cfg["flussonix_allow_insecure_peer_http"] == true,
+                    )
+                    .await
+                } else {
+                    self.prepare_hls(&translated).await
+                };
+                match result {
+                    Ok(prepared) => {
+                        selected_hls_index = Some(candidate);
+                        prepared_hls = Some((candidate, input.to_owned(), prepared));
+                        break;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.as_str(),
+                            "peer media DNS failed"
+                                | "peer media DNS timeout"
+                                | "peer media DNS returned no addresses"
+                        ) =>
+                    {
+                        first_dns_error.get_or_insert(error);
+                        candidate = (candidate + 1) % inputs.len();
+                        if candidate == first_index {
+                            return Err(first_dns_error.unwrap());
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
         let mut workers = self.workers.lock().await;
         // Recheck after waiting for another stream startup/replacement. A stale
         // route must not cancel an already-published replacement worker.
@@ -805,6 +849,12 @@ impl Engine {
             .filter(|a| !a.is_empty())
             .ok_or("stream has no input")?;
         index %= inputs.len();
+        if let Some(start_index) = hls_start_index {
+            if index != start_index {
+                return Err("media route changed".into());
+            }
+            index = selected_hls_index.ok_or("media route changed")?;
+        }
         let input = inputs[index]["url"].as_str().ok_or("input URL required")?;
         let mut prepared_hls = if [
             "hls://",
@@ -3018,6 +3068,26 @@ mod rtsp_startup_tests;
 #[cfg(test)]
 mod hls_startup_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_hls_dns_moves_to_healthy_backup_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path(), "ffmpeg");
+        engine.hls_prepare_test_hook = Some(Arc::new(|input: String| {
+            Box::pin(async move {
+                assert!(input.contains("unresolvable.invalid"));
+                Err("peer media DNS failed".into())
+            })
+        }));
+        let config = json!({"inputs":[
+            {"url":"http://unresolvable.invalid/entry.m3u8"},
+            {"url":"testsrc://"}
+        ]});
+        let worker = engine.ensure("fallback", &config).await.unwrap();
+        assert_eq!(worker.input_index, 1);
+        assert!(worker.alive.load(Ordering::Relaxed));
+        engine.stop_all().await;
+    }
 
     #[tokio::test]
     async fn hls_prepare_does_not_hold_global_worker_map() {

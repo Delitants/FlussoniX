@@ -48,13 +48,14 @@ impl PreparedOrigin {
         let port = origin
             .port_or_known_default()
             .ok_or("invalid peer media port")?;
-        let host = origin.host_str().ok_or("invalid peer media host")?;
-        let addresses = if let Ok(ip) = host.parse() {
-            vec![SocketAddr::new(ip, port)]
-        } else {
-            tokio::time::timeout(Duration::from_secs(5), resolve(host.to_owned(), port))
-                .await
-                .map_err(|_| "peer media DNS timeout")??
+        let addresses = match origin.host().ok_or("invalid peer media host")? {
+            url::Host::Ipv4(ip) => vec![SocketAddr::new(ip.into(), port)],
+            url::Host::Ipv6(ip) => vec![SocketAddr::new(ip.into(), port)],
+            url::Host::Domain(host) => {
+                tokio::time::timeout(Duration::from_secs(5), resolve(host.to_owned(), port))
+                    .await
+                    .map_err(|_| "peer media DNS timeout")??
+            }
         };
         let mut unique = Vec::with_capacity(addresses.len().min(8));
         for address in addresses {
@@ -574,10 +575,9 @@ impl PeerHls {
             .no_proxy()
             .redirect(redirect)
             .connect_timeout(Duration::from_secs(5));
-        client = client.resolve_to_addrs(
-            origin.host_str().ok_or("invalid peer media host")?,
-            &addresses,
-        );
+        if let Some(url::Host::Domain(host)) = origin.host() {
+            client = client.resolve_to_addrs(host, &addresses);
+        }
         if let Some(authorization) = authorization {
             let mut headers = reqwest::header::HeaderMap::new();
             headers.insert(reqwest::header::AUTHORIZATION, authorization);
@@ -694,6 +694,15 @@ mod external_origin_tests {
         assert_eq!(
             literal.addresses,
             vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8765)]
+        );
+        let ipv6 = PreparedOrigin::prepare_with("http://[::1]:8765/entry.m3u8", |_, _| async {
+            panic!("IPv6 literals must not invoke DNS");
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            ipv6.addresses,
+            vec![SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 8765))]
         );
     }
 
