@@ -163,3 +163,76 @@ async fn view_management_reads_hide_inherited_and_nested_credentials() {
         "secret search became an oracle"
     );
 }
+
+#[tokio::test]
+async fn view_management_hides_elementary_srtp_track_key_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = App::new(
+        directory.path().join("config.json"),
+        directory.path().join("media"),
+        Options {
+            admin_user: "admin".into(),
+            admin_password: "edit-password".into(),
+            view_user: Some("viewer".into()),
+            view_password: Some("view-password".into()),
+            peer_key: "node-peer-secret".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    app.config
+        .replace(json!({
+            "templates": [{
+                "name": "secure",
+                "inputs": [{
+                    "url": "srtp://127.0.0.1:40100",
+                    "flussonix_rtp": {
+                        "profile": "elementary",
+                        "sdp_file": "/tmp/secure.sdp",
+                        "track_key_files": ["/tmp/track-a-private.key", "/tmp/track-b-private.key"]
+                    }
+                }],
+                "flussonix_rtp_outputs": [{
+                    "url": "srtp://127.0.0.1:40200",
+                    "flussonix_rtp": {
+                        "profile": "elementary",
+                        "track_keys": [{
+                            "track_id": 7, "media": "audio", "encoding": "MPEG4-GENERIC/48000/2",
+                            "key_file": "/tmp/output-private.key"
+                        }]
+                    }
+                }]
+            }],
+            "streams": [{"name": "secure-stream", "template": "secure"}]
+        }))
+        .unwrap();
+
+    let edit = get(
+        app.clone(),
+        "/streamer/api/v3/config?full=true",
+        "admin:edit-password",
+    )
+    .await;
+    assert!(edit.to_string().contains("track-a-private.key"));
+
+    for path in [
+        "/streamer/api/v3/config?full=true",
+        "/streamer/api/v3/templates/secure",
+        "/streamer/api/v3/streams/secure-stream",
+    ] {
+        let view = get(app.clone(), path, "viewer:view-password").await;
+        let body = view.to_string();
+        assert!(
+            !body.contains("track-a-private.key"),
+            "View leaked first SRTP key path at {path}"
+        );
+        assert!(
+            !body.contains("track-b-private.key"),
+            "View leaked second SRTP key path at {path}"
+        );
+        assert!(
+            !body.contains("output-private.key"),
+            "View leaked output SRTP key path at {path}"
+        );
+    }
+}
