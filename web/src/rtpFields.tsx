@@ -156,7 +156,7 @@ export function rtpError(value:Item):string|undefined {
   if(elementary){if(Number(new URL(row.url).port)>65520)return 'Elementary RTP needs a base port from 1024 to 65520.';if(input&&!path(opts.sdp_file))return 'Elementary RTP input needs an absolute SDP file path on this node.';}
   if(!secure&&secureKeys.some(key=>owns(opts,key)))return 'Plaintext RTP cannot keep SRTP key or receiver options.';
   if(secure){
-   if(owns(opts,'allow_legacy_reused_key')&&(!input||opts.allow_legacy_reused_key!==true))return 'Legacy receiver-key reuse applies only to secure inputs.';
+   if(owns(opts,'allow_legacy_reused_key')&&(!input||typeof opts.allow_legacy_reused_key!=='boolean'))return 'Legacy receiver-key reuse applies only to secure inputs.';
    if(input){
     if(owns(opts,'track_keys'))return 'Output track keys cannot be used on an SRTP input.';
     if(elementary&&owns(opts,'track_key_files')){
