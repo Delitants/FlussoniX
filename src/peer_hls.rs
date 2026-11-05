@@ -461,15 +461,6 @@ impl PeerHls {
     pub async fn start(input: &str, key: &str) -> Result<Self, String> {
         Self::start_inner(prepare(input).await?, Some(key), false, false, None, None).await
     }
-    pub(crate) async fn start_inspected(
-        input: &str,
-        key: &str,
-        ca: Option<&std::path::Path>,
-        allow_insecure_peer_http: bool,
-    ) -> Result<Self, String> {
-        Self::start_inspected_prepared(prepare(input).await?, key, ca, allow_insecure_peer_http)
-            .await
-    }
     pub(crate) async fn start_inspected_prepared(
         prepared: PreparedOrigin,
         key: &str,
@@ -486,6 +477,7 @@ impl PeerHls {
         )
         .await
     }
+    #[cfg(test)]
     pub(crate) async fn start_external(
         input: &str,
         ca: Option<&std::path::Path>,
