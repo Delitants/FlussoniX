@@ -17,6 +17,7 @@ use ring::{
     rand::{SecureRandom, SystemRandom},
 };
 use std::{
+    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -28,6 +29,62 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 type Profile = (Option<u8>, Option<u8>);
+pub(crate) struct PreparedOrigin {
+    origin: Url,
+    authorization: Option<reqwest::header::HeaderValue>,
+    addresses: Vec<SocketAddr>,
+}
+impl PreparedOrigin {
+    async fn prepare_with<F, Fut>(input: &str, resolve: F) -> Result<Self, String>
+    where
+        F: FnOnce(String, u16) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<SocketAddr>, String>>,
+    {
+        let mut origin = Url::parse(input).map_err(|_| "invalid peer media URL")?;
+        let authorization = crate::http_basic::take_url_credentials(&mut origin)?;
+        if !matches!(origin.scheme(), "http" | "https") || !permitted(&origin, &origin) {
+            return Err("invalid peer media URL".into());
+        }
+        let port = origin
+            .port_or_known_default()
+            .ok_or("invalid peer media port")?;
+        let host = origin.host_str().ok_or("invalid peer media host")?;
+        let addresses = if let Ok(ip) = host.parse() {
+            vec![SocketAddr::new(ip, port)]
+        } else {
+            tokio::time::timeout(Duration::from_secs(5), resolve(host.to_owned(), port))
+                .await
+                .map_err(|_| "peer media DNS timeout")??
+        };
+        let mut unique = Vec::with_capacity(addresses.len().min(8));
+        for address in addresses {
+            let address = SocketAddr::new(address.ip(), port);
+            if !unique.contains(&address) {
+                unique.push(address);
+                if unique.len() == 8 {
+                    break;
+                }
+            }
+        }
+        if unique.is_empty() {
+            return Err("peer media DNS returned no addresses".into());
+        }
+        Ok(Self {
+            origin,
+            authorization,
+            addresses: unique,
+        })
+    }
+}
+pub(crate) async fn prepare(input: &str) -> Result<PreparedOrigin, String> {
+    PreparedOrigin::prepare_with(input, |host, port| async move {
+        tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map(|answers| answers.collect())
+            .map_err(|_| "peer media DNS failed".into())
+    })
+    .await
+}
 pub struct PeerHls {
     pub url: String,
     cancel: CancellationToken,
@@ -402,7 +459,7 @@ impl PeerHls {
             .map_err(|_| "peer transport metadata task stopped")?
     }
     pub async fn start(input: &str, key: &str) -> Result<Self, String> {
-        Self::start_inner(input, Some(key), false, false, None, None).await
+        Self::start_inner(prepare(input).await?, Some(key), false, false, None, None).await
     }
     pub(crate) async fn start_inspected(
         input: &str,
@@ -410,25 +467,52 @@ impl PeerHls {
         ca: Option<&std::path::Path>,
         allow_insecure_peer_http: bool,
     ) -> Result<Self, String> {
-        Self::start_inner(input, Some(key), allow_insecure_peer_http, true, ca, None).await
+        Self::start_inspected_prepared(prepare(input).await?, key, ca, allow_insecure_peer_http)
+            .await
+    }
+    pub(crate) async fn start_inspected_prepared(
+        prepared: PreparedOrigin,
+        key: &str,
+        ca: Option<&std::path::Path>,
+        allow_insecure_peer_http: bool,
+    ) -> Result<Self, String> {
+        Self::start_inner(
+            prepared,
+            Some(key),
+            allow_insecure_peer_http,
+            true,
+            ca,
+            None,
+        )
+        .await
     }
     pub(crate) async fn start_external(
         input: &str,
         ca: Option<&std::path::Path>,
         live: bool,
     ) -> Result<Self, String> {
-        Self::start_inner(input, None, false, false, ca, Some(live)).await
+        Self::start_external_prepared(prepare(input).await?, ca, live).await
+    }
+    pub(crate) async fn start_external_prepared(
+        prepared: PreparedOrigin,
+        ca: Option<&std::path::Path>,
+        live: bool,
+    ) -> Result<Self, String> {
+        Self::start_inner(prepared, None, false, false, ca, Some(live)).await
     }
     async fn start_inner(
-        input: &str,
+        prepared: PreparedOrigin,
         key: Option<&str>,
         allow_insecure_peer_http: bool,
         inspect: bool,
         ca: Option<&std::path::Path>,
         external_live: Option<bool>,
     ) -> Result<Self, String> {
-        let mut origin = Url::parse(input).map_err(|_| "invalid peer media URL")?;
-        let authorization = crate::http_basic::take_url_credentials(&mut origin)?;
+        let PreparedOrigin {
+            origin,
+            authorization,
+            addresses,
+        } = prepared;
         if authorization.is_some() && key.is_some() {
             return Err("HTTP Basic input credentials cannot be combined with a peer key".into());
         }
@@ -479,6 +563,10 @@ impl PeerHls {
             .no_proxy()
             .redirect(redirect)
             .connect_timeout(Duration::from_secs(5));
+        client = client.resolve_to_addrs(
+            origin.host_str().ok_or("invalid peer media host")?,
+            &addresses,
+        );
         if let Some(authorization) = authorization {
             let mut headers = reqwest::header::HeaderMap::new();
             headers.insert(reqwest::header::AUTHORIZATION, authorization);
@@ -548,6 +636,134 @@ impl PeerHls {
 mod external_origin_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn prepared_origin_bounds_and_deduplicates_answers() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let input = "http://origin.invalid:8765/entry.m3u8";
+        let first = SocketAddr::from(([127, 0, 0, 1], 8765));
+        let private = SocketAddr::from(([10, 0, 0, 1], 8765));
+        let prepared = PreparedOrigin::prepare_with(input, |host, port| async move {
+            assert_eq!(host, "origin.invalid");
+            assert_eq!(port, 8765);
+            let mut answers = vec![first, first, private];
+            answers.extend((2..20).map(|last| SocketAddr::from(([192, 0, 2, last], 8765))));
+            Ok(answers)
+        })
+        .await
+        .unwrap();
+        assert_eq!(prepared.addresses.len(), 8);
+        assert_eq!(prepared.addresses[0], first);
+        assert_eq!(prepared.addresses[1], private);
+        assert!(
+            PreparedOrigin::prepare_with(input, |_, _| async { Ok(vec![]) })
+                .await
+                .is_err()
+        );
+        assert!(
+            PreparedOrigin::prepare_with(input, |_, _| async {
+                Err("resolver unavailable".to_owned())
+            })
+            .await
+            .is_err()
+        );
+        assert!(
+            PreparedOrigin::prepare_with(input, |_, _| async {
+                std::future::pending::<Result<Vec<SocketAddr>, String>>().await
+            })
+            .await
+            .is_err()
+        );
+        let literal =
+            PreparedOrigin::prepare_with("http://127.0.0.1:8765/entry.m3u8", |_, _| async {
+                panic!("IP literals must not invoke DNS");
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            literal.addresses,
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8765)]
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_origin_reuses_initial_addresses_across_resource_requests() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = first_listener.local_addr().unwrap().port();
+        let second_listener = tokio::net::TcpListener::bind(("127.0.0.2", port))
+            .await
+            .unwrap();
+        let first_hits = Arc::new(AtomicUsize::new(0));
+        let second_hits = Arc::new(AtomicUsize::new(0));
+        let expected_host = format!("origin.invalid:{port}");
+        let hits = first_hits.clone();
+        let first = tokio::spawn(async move {
+            let app = Router::new().fallback(move |headers: HeaderMap, uri: axum::http::Uri| {
+                let hits = hits.clone();
+                let expected_host = expected_host.clone();
+                async move {
+                    assert_eq!(headers.get("host").unwrap(), HeaderValue::from_str(&expected_host).unwrap());
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let mut response = match uri.path() {
+                        "/entry.m3u8" => Response::builder().status(200).body(Body::from(
+                            "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXT-X-MAP:URI=\"init.bin\"\n#EXTINF:1,\nredirect.ts\n#EXT-X-ENDLIST\n"
+                        )).unwrap(),
+                        "/redirect.ts" => Response::builder().status(302).header("location", "/segment.ts").body(Body::empty()).unwrap(),
+                        "/segment.ts" | "/key.bin" | "/init.bin" => Response::builder().status(200).body(Body::from(vec![0x47; 188])).unwrap(),
+                        _ => Response::builder().status(404).body(Body::empty()).unwrap(),
+                    };
+                    response.headers_mut().insert("connection", HeaderValue::from_static("close"));
+                    response
+                }
+            });
+            axum::serve(first_listener, app).await.unwrap();
+        });
+        let other_hits = second_hits.clone();
+        let second = tokio::spawn(async move {
+            axum::serve(
+                second_listener,
+                Router::new().fallback(move || {
+                    other_hits.fetch_add(1, Ordering::SeqCst);
+                    async { StatusCode::IM_A_TEAPOT }
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let input = format!("http://origin.invalid:{port}/entry.m3u8");
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let prepared =
+            PreparedOrigin::prepare_with(&input, |_, _| async move { Ok(vec![address]) })
+                .await
+                .unwrap();
+        let bridge = PeerHls::start_external_prepared(prepared, None, false)
+            .await
+            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let body = client
+            .get(&bridge.url)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let resources = body
+            .split('"')
+            .filter(|v| v.starts_with("http://"))
+            .chain(body.lines().filter(|v| v.starts_with("http://")))
+            .collect::<Vec<_>>();
+        assert_eq!(resources.len(), 3);
+        for local in resources {
+            assert_eq!(client.get(local).send().await.unwrap().status(), 200);
+        }
+        assert_eq!(first_hits.load(Ordering::SeqCst), 5);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 0);
+        drop(bridge);
+        first.abort();
+        second.abort();
+    }
 
     #[test]
     fn media_text_guard_accepts_hls_media_and_rejects_embedded_manifests() {
