@@ -1945,6 +1945,14 @@ packets observed during handoff are attempts rather than proof of native
 application receipt. The archived 38-picture HEVC loss did not recur in these
 cases; its cause and repair remain a release blocker.
 
+An additional 43 serial runs of the owned HEVC/MP3 plaintext diagnostic on the
+isolated Linux host passed strict worker and receiver decoding with optional
+packet taps enabled. One inspected run retained complete public and private
+traces with zero packet-socket drops or queued bytes at stop. The inspected
+artifact and other passing-run artifacts were removed; no test FFmpeg process
+was left running. These passes did not reproduce or explain the archived
+picture loss, which remains a release blocker.
+
 ## Tokenless SRT playback candidate
 
 The isolated SRT ticket candidate issues five-second, single-use playback
