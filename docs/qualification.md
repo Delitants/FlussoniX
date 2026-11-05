@@ -1,5 +1,21 @@
 # Preview qualification
 
+## HTTP HLS origin address pinning (2026-11-05)
+
+At runtime commit `b39c9cb`, the owned loopback regression used an unresolved
+hostname pinned to an OS-selected local listener. Forced new connections fetched
+the playlist, key, map, segment and a same-origin redirect with the configured
+Host header; a second listener received zero requests. Resolver tests covered
+duplicate, empty, failing and timed-out answers, the eight-address cap, IP
+literals and an initial set that includes a private address. Startup tests
+paused one origin while an unrelated stream started, then rejected a stale
+route and a cancelled preparation before worker/proxy publication. The HLS
+fetcher module, `peer_hls` (9 cases), `http_input_tls` (18 cases) and
+warnings-denied all-target Clippy passed locally. This pins only the initial
+resolved set for each generation; it does not validate the trustworthiness of
+the configured origin or its first DNS answer. Exact-head CI and final release
+qualification remain separate gates.
+
 ## Isolated runtime without vendor files (2026-11-02 HST)
 
 The local debug daemon with SHA-256
