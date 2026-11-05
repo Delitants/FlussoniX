@@ -17,6 +17,28 @@ impl Provider for Live {
         })
     }
 }
+struct AdmissionGate {
+    calls: AtomicUsize,
+    entered: tokio::sync::Notify,
+    release: CancellationToken,
+}
+impl Provider for AdmissionGate {
+    fn subscribe(&self, _: Request, _: SocketAddr) -> BoxFuture<'_, Result<Source, u16>> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if call == 1 {
+                self.entered.notify_one();
+                self.release.cancelled().await;
+            }
+            Ok(Source {
+                pending_records: None,
+                records: Box::pin(futures_util::stream::pending()),
+                current: Arc::new(|| true),
+                cancelled: CancellationToken::new(),
+            })
+        })
+    }
+}
 
 struct Server {
     url: String,
@@ -28,6 +50,13 @@ impl Server {
         Self::new_on(cert, "127.0.0.1".parse().unwrap())
     }
     fn new_on(cert: &test_tls::Certificates, ip: std::net::IpAddr) -> Self {
+        Self::with_provider(cert, ip, Arc::new(Live))
+    }
+    fn with_provider(
+        cert: &test_tls::Certificates,
+        ip: std::net::IpAddr,
+        provider: Arc<dyn Provider>,
+    ) -> Self {
         let listener = Listener::bind(
             SocketAddr::new(ip, 0),
             &cert.cert,
@@ -37,13 +66,169 @@ impl Server {
         .unwrap();
         let url = format!("fxlink://{}/live", listener.address());
         let stop = CancellationToken::new();
-        let task = tokio::spawn(listener.serve(Arc::new(Live), stop.clone()));
+        let task = tokio::spawn(listener.serve(provider, stop.clone()));
         Self { url, stop, task }
     }
     async fn shutdown(self) {
         self.stop.cancel();
         self.task.await.unwrap().unwrap();
     }
+}
+
+#[tokio::test]
+async fn admission_keeps_four_mib_charge_until_ack() {
+    let _serial = super::super::transport::test_lock().lock().await;
+    let cert = test_tls::Certificates::new();
+    let gate = Arc::new(AdmissionGate {
+        calls: AtomicUsize::new(0),
+        entered: tokio::sync::Notify::new(),
+        release: CancellationToken::new(),
+    });
+    let server = Server::with_provider(&cert, "127.0.0.1".parse().unwrap(), gate.clone());
+    let peer = peer_budget("127.0.0.1".parse().unwrap()).unwrap();
+    let baseline = peer.used();
+    let pool = Arc::new(ClientPool::default());
+    let first = subscribe(&pool, &server.url, &cert.ca).await;
+    let connected = peer.used();
+    let cancel = CancellationToken::new();
+    let second = {
+        let pool = pool.clone();
+        let url = server.url.clone();
+        let ca = cert.ca.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            pool.subscribe(
+                &url,
+                "peer",
+                "token",
+                Some(&ca),
+                Settings::default(),
+                cancel,
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .unwrap();
+    let charged = peer.used().saturating_sub(connected);
+    cancel.cancel();
+    gate.release.cancel();
+    assert!(second.await.unwrap().is_err());
+    drop(first);
+    pool.close().await;
+    server.shutdown().await;
+    assert!(
+        charged >= 4 * 1024 * 1024,
+        "admission lost its setup reservation"
+    );
+    assert_eq!(peer.used(), baseline);
+}
+
+#[tokio::test]
+async fn cancelled_reservation_failure_cannot_strand_pending_origin() {
+    let _serial = super::super::transport::test_lock().lock().await;
+    let baseline = global().used();
+    let held = global().reserve(global().limit() - baseline).unwrap();
+    let cert = test_tls::Certificates::new();
+    let url = "fxlink://127.0.0.1:19457/live";
+    let pool = Arc::new(ClientPool::default());
+    let gate = gate(&pool, url);
+    *pool.inner.reserve_gate.lock().unwrap() = Some(gate.clone());
+    let cancel = CancellationToken::new();
+    let attempt = {
+        let pool = pool.clone();
+        let ca = cert.ca.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            pool.subscribe(url, "peer", "token", Some(&ca), Settings::default(), cancel)
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .unwrap();
+    let state_guard = pool.inner.state.lock().await;
+    gate.release.cancel();
+    tokio::task::yield_now().await;
+    cancel.cancel();
+    assert!(attempt.await.unwrap().is_err());
+    drop(state_guard);
+    let cleaned = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if pool.inner.state.lock().await.pending.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    pool.close().await;
+    drop(held);
+    assert!(
+        cleaned.is_ok(),
+        "cancelled reserve failure left a permanent slot"
+    );
+    assert_eq!(global().used(), baseline);
+}
+
+#[tokio::test]
+async fn immediate_retry_waits_for_cancelled_attempt_then_reconnects() {
+    let _serial = super::super::transport::test_lock().lock().await;
+    let baseline = global().used();
+    let cert = test_tls::Certificates::new();
+    let server = Server::new(&cert);
+    let pool = Arc::new(ClientPool::default());
+    let setup = gate(&pool, &server.url);
+    let retired = Arc::new(SetupGate {
+        host: setup.host.clone(),
+        port: setup.port,
+        entered: tokio::sync::Notify::new(),
+        release: CancellationToken::new(),
+        starts: AtomicUsize::new(0),
+    });
+    *pool.inner.retirement_gate.lock().unwrap() = Some(retired.clone());
+    let cancel = CancellationToken::new();
+    let first = {
+        let pool = pool.clone();
+        let url = server.url.clone();
+        let ca = cert.ca.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            pool.subscribe(
+                &url,
+                "peer",
+                "token",
+                Some(&ca),
+                Settings::default(),
+                cancel,
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(2), setup.entered.notified())
+        .await
+        .unwrap();
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), retired.entered.notified())
+        .await
+        .unwrap();
+    // A is cancelled and its worker is held just before removing the pending entry.
+    // A fresh caller must wait for retirement, not inherit A's error.
+    let retry = spawn_subscription(&pool, &server.url, &cert.ca, "peer", Settings::default());
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    setup.release.cancel();
+    retired.release.cancel();
+    assert!(first.await.unwrap().is_err());
+    let second = tokio::time::timeout(Duration::from_secs(3), retry)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(second.is_ok(), "new caller inherited cancelled setup");
+    drop(second);
+    pool.close().await;
+    server.shutdown().await;
+    assert_eq!(global().used(), baseline);
 }
 
 async fn subscribe(pool: &ClientPool, url: &str, ca: &Path) -> Subscription {
@@ -502,6 +687,46 @@ async fn aborted_setup_task_releases_pending_for_retry() {
     drop(retry);
     pool.close().await;
     server.shutdown().await;
+    assert_eq!(global().used(), baseline);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn abort_before_first_worker_poll_clears_pending() {
+    let _serial = super::super::transport::test_lock().lock().await;
+    let baseline = global().used();
+    let cert = test_tls::Certificates::new();
+    let pool = ClientPool::default();
+    let mut attempt = Box::pin(pool.subscribe(
+        "fxlink://127.0.0.1:19458/live",
+        "peer",
+        "token",
+        Some(&cert.ca),
+        Settings::default(),
+        CancellationToken::new(),
+    ));
+    let pending_poll = std::future::poll_fn(|cx| {
+        use std::future::Future;
+        std::task::Poll::Ready(attempt.as_mut().poll(cx).is_pending())
+    })
+    .await;
+    assert!(pending_poll);
+    let pending = pool.inner.state.lock().await.pending[0].clone();
+    pending.task.lock().unwrap().as_ref().unwrap().abort();
+    drop(attempt);
+    let cleaned = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if pool.inner.state.lock().await.pending.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    pool.close().await;
+    assert!(
+        cleaned.is_ok(),
+        "unpolled aborted worker stranded pending slot"
+    );
     assert_eq!(global().used(), baseline);
 }
 
