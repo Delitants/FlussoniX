@@ -1130,10 +1130,26 @@ test('SRTP track protection uses labeled stream controls and clears on plaintext
   for(const row of [saved.inputs[0],saved.flussonix_rtp_outputs[0]])for(const field of ['key_file','track_key_files','expected_ssrcs','track_keys','allow_legacy_reused_key'])expect(row.flussonix_rtp?.[field]).toBeUndefined();
  }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers})}
 });
+test('SRTP input with explicit false legacy override remains editable',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')},name='ui-srtp-false-'+Date.now();
+ const input={url:'srtp://127.0.0.1:50740',flussonix_rtp:{profile:'elementary',sdp_file:'/tmp/owned-false.sdp',key_file:'/tmp/owned-false.key',expected_ssrcs:[101],allow_legacy_reused_key:false}};
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{disabled:true,static:false,inputs:[input]}})).ok()).toBeTruthy();
+ try{
+  await page.getByRole('button',{name,exact:true}).click();
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+  await expect(page.getByLabel('Allow reused SRTP receiver key',{exact:true})).not.toBeChecked();
+  await page.getByLabel('Title',{exact:true}).fill('Still editable');
+  await page.getByRole('button',{name:'Save',exact:true}).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  const saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();
+  expect(saved.config_on_disk.title).toBe('Still editable');
+  expect(saved.config_on_disk.inputs[0].flussonix_rtp.allow_legacy_reused_key).toBe(false);
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers})}
+});
 test('SRTP template bindings inherit and reject invalid SSRCs before save',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
  const template='ui-srtp-template-'+Date.now(),name=template+'-stream';
- const input={url:'srtp://127.0.0.1:50640',flussonix_rtp:{profile:'elementary',sdp_file:'/tmp/owned-template.sdp',key_file:'/tmp/owned-shared.key',expected_ssrcs:[101,202]}};
+ const input={url:'srtp://127.0.0.1:50640',flussonix_rtp:{profile:'elementary',sdp_file:'/tmp/owned-template.sdp',key_file:'/tmp/owned-shared.key',expected_ssrcs:[101,202],allow_legacy_reused_key:false}};
  const output={url:'srtp://127.0.0.1:50660',disabled:true,flussonix_rtp:{profile:'elementary',track_keys:[{track_id:7,media:'audio',encoding:'MPEG4-GENERIC/48000/2',key_file:'/tmp/owned-output-a.key'}]}};
  expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{disabled:true,static:false,inputs:[input],flussonix_rtp_outputs:[output]}})).ok()).toBeTruthy();
  expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{template}})).ok()).toBeTruthy();
@@ -1151,6 +1167,7 @@ test('SRTP template bindings inherit and reject invalid SSRCs before save',async
   await expect(page.getByRole('dialog')).toHaveCount(0);
   const stored=await(await request.get('/streamer/api/v3/templates/'+template,{headers})).json();
   expect(stored.inputs[0].flussonix_rtp.expected_ssrcs).toEqual([101,303]);
+  expect(stored.inputs[0].flussonix_rtp.allow_legacy_reused_key).toBe(false);
   const inherited=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();
   expect(inherited.inputs[0].flussonix_rtp.expected_ssrcs).toEqual([101,303]);
   expect(inherited.config_on_disk.inputs).toBeUndefined();

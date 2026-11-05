@@ -2045,9 +2045,29 @@ segment; independent FFprobe identified H.264 video and AAC audio in that
 segment. The receiver history recorded the new key claim. The temporary
 firewall rule, test daemons and test files were removed afterward; both hosts'
 Flussonic services remained active. This checks one cross-host MP2T profile,
-not the elementary profiles or a sustained-loss run. Exact-head CI and the
-remaining release blockers are still pending; these results do not establish
-a production-ready release.
+not the elementary profiles or a sustained-loss run.
+
+On candidate `69da2e00`, a separate isolated two-track elementary SRTP run
+sent H.264 and AAC from CDN4 to CDN5 using a shared key and the sender's
+published per-track SSRCs. With the private-LAN UDP rule in place before
+receiver startup and a fresh key epoch, the CDN5 receiver reported 15,852
+admitted packets, 38 RTCP packets, zero authentication failures and zero loss
+at the first status check. Independent FFprobe identified H.264 video and AAC
+audio from its HLS playlist. A receiver restart with the same key returned
+503 and had no public SRTP sockets. The first attempt, started before the
+temporary firewall rule was installed, did not recover media after the rule
+was opened; that recovery path remains to be diagnosed. Both isolated daemons,
+their test files and the exact temporary firewall rule were removed, and the
+pre-existing services stayed active. This qualifies the exercised shared-key
+elementary path. A second isolated run on the same candidate used different
+keys for the H.264 and AAC tracks, mapped by output track IDs 256 and 257 and
+received in SDP media order. CDN5 reported 3,873 admitted RTP packets and 8
+RTCP packets, with no authentication failures or reported loss; FFprobe again
+decoded H.264 and AAC from its HLS output. Its exact UDP rule, short-lived
+daemons, keys and media files were removed afterward. Both elementary binding
+modes are qualified for this cross-host H.264/AAC case; sustained-loss
+recovery and the remaining release blockers are still pending. These results
+do not establish a production-ready release.
 
 The candidate capabilities endpoint now reports receiver-history readiness
 without disclosing its path or fingerprints; a background check is coalesced

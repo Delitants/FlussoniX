@@ -25,6 +25,7 @@ enum ClaimKind {
         signal: Option<watch::Sender<bool>>,
         expires: Instant,
         ledger: Option<Arc<StdMutex<State>>>,
+        reusable_hls: bool,
     },
     Reuse {
         identity: String,
@@ -32,15 +33,6 @@ enum ClaimKind {
     },
 }
 impl Claim {
-    pub(super) fn once(grant: Grant) -> Self {
-        Self(ClaimKind::First {
-            grant: Some(grant),
-            ticket: None,
-            signal: None,
-            expires: Instant::now(),
-            ledger: None,
-        })
-    }
     pub(super) fn grant(&self) -> Option<&Grant> {
         match &self.0 {
             ClaimKind::First { grant, .. } => grant.as_ref(),
@@ -62,6 +54,7 @@ impl Drop for Claim {
             signal,
             expires,
             ledger,
+            ..
         } = &mut self.0
         else {
             return;
@@ -79,7 +72,7 @@ impl Drop for Claim {
         }
         let restored = grant.take().unwrap();
         let mut state = ledger.lock().unwrap();
-        state.pending_hls.remove(&ticket);
+        state.pending.remove(&ticket);
         state.handoffs.insert(
             ticket,
             Handoff {
@@ -102,7 +95,7 @@ struct TrackedCredit {
 #[derive(Default)]
 struct State {
     handoffs: HashMap<String, Handoff>,
-    pending_hls: HashMap<String, watch::Receiver<bool>>,
+    pending: HashMap<String, watch::Receiver<bool>>,
     reusable_hls: HashMap<String, Reusable>,
     segmented: HashMap<String, Segmented>,
     credits: Vec<TrackedCredit>,
@@ -111,8 +104,7 @@ impl State {
     fn prune(&mut self) {
         self.handoffs
             .retain(|_, h| h.expires > Instant::now() && !h.grant.is_cancelled());
-        self.pending_hls
-            .retain(|_, wait| wait.has_changed().is_ok());
+        self.pending.retain(|_, wait| wait.has_changed().is_ok());
         self.reusable_hls
             .retain(|_, h| h.expires > Instant::now() && !h.cancel.is_cancelled());
         self.segmented
@@ -146,34 +138,38 @@ impl Registry {
             },
         );
     }
-    pub(super) fn claim(&self, ticket: &str) -> Option<Grant> {
-        let mut state = self.0.lock().unwrap();
-        state.prune();
-        Some(state.handoffs.remove(ticket)?.grant)
+    pub(super) async fn claim_once(&self, ticket: &str) -> Option<Claim> {
+        self.claim(ticket, false).await
     }
     pub(super) async fn claim_hls(&self, ticket: &str) -> Option<Claim> {
+        self.claim(ticket, true).await
+    }
+    async fn claim(&self, ticket: &str, reusable_hls: bool) -> Option<Claim> {
         loop {
             let mut wait = {
                 let mut state = self.0.lock().unwrap();
                 state.prune();
                 if let Some(reusable) = state.reusable_hls.get(ticket) {
-                    return Some(Claim(ClaimKind::Reuse {
-                        identity: reusable.identity.clone(),
-                        ticket: ticket.to_owned(),
-                    }));
+                    return reusable_hls.then(|| {
+                        Claim(ClaimKind::Reuse {
+                            identity: reusable.identity.clone(),
+                            ticket: ticket.to_owned(),
+                        })
+                    });
                 }
                 if let Some(handoff) = state.handoffs.remove(ticket) {
                     let (signal, wait) = watch::channel(false);
-                    state.pending_hls.insert(ticket.to_owned(), wait);
+                    state.pending.insert(ticket.to_owned(), wait);
                     return Some(Claim(ClaimKind::First {
                         grant: Some(handoff.grant),
                         ticket: Some(ticket.to_owned()),
                         signal: Some(signal),
                         expires: handoff.expires,
                         ledger: Some(self.0.clone()),
+                        reusable_hls,
                     }));
                 }
-                state.pending_hls.get(ticket)?.clone()
+                state.pending.get(ticket)?.clone()
             };
             if tokio::time::timeout(Duration::from_secs(5), wait.changed())
                 .await
@@ -195,23 +191,25 @@ impl Registry {
                 grant: handoff,
                 ticket,
                 signal,
+                reusable_hls,
                 ..
             } => {
                 let credit = self.activate(handoff.as_mut()?, grant, segmented);
                 if credit.is_some()
-                    && let (Some(ticket), Some(signal), Some(identity)) =
-                        (ticket.take(), signal.take(), grant.session_identity())
+                    && let (Some(ticket), Some(signal)) = (ticket.take(), signal.take())
                 {
                     let mut state = self.0.lock().unwrap();
-                    state.pending_hls.remove(&ticket);
-                    state.reusable_hls.insert(
-                        ticket,
-                        Reusable {
-                            identity: identity.to_owned(),
-                            cancel: grant.cancellation_token(),
-                            expires: Instant::now() + Duration::from_secs(30),
-                        },
-                    );
+                    state.pending.remove(&ticket);
+                    if *reusable_hls && let Some(identity) = grant.session_identity() {
+                        state.reusable_hls.insert(
+                            ticket,
+                            Reusable {
+                                identity: identity.to_owned(),
+                                cancel: grant.cancellation_token(),
+                                expires: Instant::now() + Duration::from_secs(30),
+                            },
+                        );
+                    }
                     let _ = signal.send(true);
                 }
                 credit
@@ -364,14 +362,14 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn activate_ticket(
+    async fn activate_ticket(
         registry: &Registry,
         ticket: &str,
         grant: &Grant,
         segmented: bool,
     ) -> Option<Arc<OutputCredit>> {
-        let mut handoff = registry.claim(ticket)?;
-        registry.activate(&mut handoff, grant, segmented)
+        let mut handoff = registry.claim_once(ticket).await?;
+        registry.activate_claim(&mut handoff, grant, segmented)
     }
     async fn viewer(
         auth: &PlaybackAuth,
@@ -444,6 +442,55 @@ mod tests {
         };
         assert!(registry.activate_claim(&mut retry, &next, true).is_some());
     }
+
+    #[tokio::test]
+    async fn cancelled_first_continuous_claim_restores_its_handoff_for_a_waiter() {
+        let auth = PlaybackAuth::new(1);
+        let policy = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let registry = Arc::new(Registry::default());
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "mpegts".into(),
+            token: "viewer".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(control) = auth
+            .authorize_control(policy.clone(), request.clone())
+            .await
+        else {
+            panic!("control denied")
+        };
+        registry.insert("ticket".into(), control, 40.0);
+        let first = registry.claim_once("ticket").await.unwrap();
+        let waiting = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.claim_once("ticket").await })
+        };
+        tokio::task::yield_now().await;
+        drop(first);
+        let mut retry = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("waiting continuous request did not wake")
+            .unwrap()
+            .expect("cancelled request lost the reserved handoff");
+        let AuthOutcome::Allowed(playback) = auth
+            .authorize_handoff(policy, request, retry.grant().unwrap())
+            .await
+        else {
+            panic!("restored handoff no longer authorizes playback")
+        };
+        assert!(
+            registry
+                .activate_claim(&mut retry, &playback, false)
+                .is_some()
+        );
+        assert!(registry.claim_once("ticket").await.is_none());
+    }
     #[tokio::test]
     async fn measured_output_does_not_discount_another_viewers_pending_bandwidth() {
         let auth = PlaybackAuth::new(10);
@@ -463,7 +510,7 @@ mod tests {
             );
         }
         let mut a = viewer(&auth, policy.clone(), "a", true).await;
-        a.set_output_credit(activate_ticket(&registry, "a", &a, false));
+        a.set_output_credit(activate_ticket(&registry, "a", &a, false).await);
         a.add_bytes(5_000_000); // 40 Mbps for the first viewer only.
         let to = from + Duration::from_secs(1);
         registry.sample(Some(from), to);
@@ -491,7 +538,9 @@ mod tests {
             40.0,
         );
         let mut first = viewer(&auth, policy.clone(), "same", true).await;
-        let credit = activate_ticket(&registry, "a", &first, false).unwrap();
+        let credit = activate_ticket(&registry, "a", &first, false)
+            .await
+            .unwrap();
         first.set_output_credit(Some(credit));
         let second = viewer(&auth, policy, "same", true).await;
         assert!(registry.take(&second, false).is_none());
@@ -513,7 +562,7 @@ mod tests {
         );
         let mut a = viewer(&auth, policy.clone(), "a", true).await;
         let identity = a.session_identity().unwrap().to_owned();
-        a.set_output_credit(activate_ticket(&registry, "a", &a, true));
+        a.set_output_credit(activate_ticket(&registry, "a", &a, true).await);
         drop(a); // A finite manifest has returned; no response grant remains.
         assert_eq!(registry.unmeasured(None, None), 40.0);
         let mut segment = viewer(&auth, policy.clone(), "a", true).await;
@@ -529,7 +578,7 @@ mod tests {
         );
         let mut b = viewer(&auth, policy, "b", true).await;
         let identity = b.session_identity().unwrap().to_owned();
-        b.set_output_credit(activate_ticket(&registry, "b", &b, true));
+        b.set_output_credit(activate_ticket(&registry, "b", &b, true).await);
         drop(b);
         registry
             .0
@@ -559,7 +608,9 @@ mod tests {
         );
         let mut signal = viewer(&auth, policy.clone(), "a", true).await;
         let identity = signal.session_identity().unwrap().to_owned();
-        let original = activate_ticket(&registry, "a", &signal, true).unwrap();
+        let original = activate_ticket(&registry, "a", &signal, true)
+            .await
+            .unwrap();
         signal.set_output_credit(Some(original.clone()));
         registry.insert(
             "abandoned-duplicate".into(),
@@ -611,7 +662,9 @@ mod tests {
         let abandoned = registry.0.lock().unwrap().handoffs.remove("a").unwrap();
         let mut signal = viewer(&auth, policy.clone(), "same", true).await;
         let identity = signal.session_identity().unwrap().to_owned();
-        let selected = activate_ticket(&registry, "b", &signal, true).unwrap();
+        let selected = activate_ticket(&registry, "b", &signal, true)
+            .await
+            .unwrap();
         signal.set_output_credit(Some(selected.clone()));
         drop(abandoned);
         registry.prune();
@@ -651,7 +704,7 @@ mod tests {
         );
         let mut a = viewer(&auth, policy.clone(), "same", true).await;
         let identity = a.session_identity().unwrap().to_owned();
-        a.set_output_credit(activate_ticket(&registry, "a", &a, true));
+        a.set_output_credit(activate_ticket(&registry, "a", &a, true).await);
         registry.insert(
             "b".into(),
             viewer(&auth, policy.clone(), "same", false).await,
@@ -675,7 +728,7 @@ mod tests {
             .expires = Instant::now() - Duration::from_secs(1);
         registry.prune();
         let mut b = viewer(&auth, policy, "same", true).await;
-        b.set_output_credit(activate_ticket(&registry, "b", &b, true));
+        b.set_output_credit(activate_ticket(&registry, "b", &b, true).await);
         b.add_bytes(10_000_000); // Both clients' finite media is attributed to the shared active credit.
         let end = to + Duration::from_secs(1);
         registry.sample(Some(to), end);
