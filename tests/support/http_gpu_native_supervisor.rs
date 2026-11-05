@@ -165,18 +165,52 @@ async fn delivering(daemon: &mut Daemon, receivers: &[Receiver; 2], generation: 
     .expect("background supervisor resumes both uploads without a new media request")
 }
 async fn outputs(receivers: &[Receiver; 2], directory: &Path, generation: usize) -> Value {
-    let mut reports = vec![];
+    // Prepare both independent captures before decoding either one. If one
+    // decoder fails, still inspect the other path so CI can distinguish a
+    // shared encoder/source defect from one destination's delivery failure.
+    let mut prepared = vec![];
     for (index, receiver) in receivers.iter().enumerate() {
         let path = directory.join(format!("output-{index}.ts"));
         let capture = session(receiver, generation);
-        std::fs::write(
-            &path,
-            complete_media_prefix(&capture).expect("complete HTTP publishing media prefix"),
-        )
-        .unwrap();
-        let mut report = decoded(&path, "aac").await;
-        report["transport"] = json!(if index == 0 { "http" } else { "verified_https" });
-        reports.push(report);
+        let complete =
+            complete_media_prefix(&capture).expect("complete HTTP publishing media prefix");
+        std::fs::write(&path, complete).unwrap();
+        prepared.push((
+            path,
+            json!({"destination":if index == 0 {"http"} else {"verified_https"},
+                "captured_bytes":capture.len(),"complete_bytes":complete.len(),
+                "captured_sha256":format!("{:x}",Sha256::digest(&capture)),
+                "complete_sha256":format!("{:x}",Sha256::digest(complete))}),
+        ));
+    }
+    let mut reports = vec![];
+    let mut diagnostics = vec![];
+    let mut first_failure = None;
+    for (path, mut diagnostic) in prepared {
+        match std::panic::AssertUnwindSafe(decoded(&path, "aac"))
+            .catch_unwind()
+            .await
+        {
+            Ok(mut report) => {
+                diagnostic["strict_decode_ok"] = json!(true);
+                report["transport"] = diagnostic["destination"].clone();
+                reports.push(report);
+            }
+            Err(error) => {
+                diagnostic["strict_decode_ok"] = json!(false);
+                if first_failure.is_none() {
+                    first_failure = Some(error);
+                }
+            }
+        }
+        diagnostics.push(diagnostic);
+    }
+    if let Some(error) = first_failure {
+        eprintln!(
+            "owned HTTP publishing paired decode failure: {}",
+            json!({"generation":generation,"outputs":diagnostics})
+        );
+        std::panic::resume_unwind(error);
     }
     json!(reports)
 }
