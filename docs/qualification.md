@@ -20,6 +20,23 @@ under `.runtime/fxlink-longhaul-9b56379/`.
 This is a short loopback loss probe. It does not qualify 500 ms RTT, a 500 ms
 buffer, sustained competing traffic, real WAN behavior, or production capacity.
 
+## Isolated IPTV authority HA load (2026-11-07)
+
+The exact `9b56379` source passed the existing real-daemon PostgreSQL load
+gate with two authority processes and a catalog of 30,016 subscribers. For
+900 seconds, 16 viewers competed across two channels and completed 28,017
+lease cycles. The test reported zero excess grants, zero missed renewals, a
+peak of 16 active sessions and zero remaining sessions after cleanup. Acquire
+latency was 341 ms at p99; renew latency was 8 ms at p99. Peak database
+connections were 24, peak authority RSS was 79,928/76,044 KiB, and WAL growth
+was 53,938,632 bytes. The owned test finished in 902.78 seconds and retained
+only a compact local log; its PostgreSQL fixture and authority processes exited.
+
+This qualifies the exercised two-authority, single-database load profile. It
+does not establish database-primary promotion, a production fencing
+controller, a larger viewer population, or a full-day authority soak. Those
+remain separate release checks.
+
 ## HTTP HLS origin address pinning (2026-11-05)
 
 At runtime commit `b39c9cb`, the owned loopback regression used an unresolved
