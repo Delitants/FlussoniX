@@ -79,6 +79,19 @@ build dependencies were removed after qualification. This is a local archive
 and cold-upgrade smoke, not a live in-place upgrade, power-loss recovery test,
 capacity qualification or final production release gate.
 
+On 2026-11-07, the exact `9b56379` release binary (SHA-256
+`cd2c5210f989d7154803f1318af9c33f5c5f386905c925ad07ab7d50bf59aacb`)
+and a fresh lockfile-pinned admin UI build produced a 395-file Linux x86-64
+archive (SHA-256
+`d0423c66e47403537579642f706200ad24e1c1f4c979c6dba9da1ed19c1481c8`).
+The extracted package passed loopback health, authenticated admin, RTSP and
+encrypted SRT smoke checks. A separate media-enabled cold upgrade from the
+checksum-pinned v0.10.0-preview archive passed upgrade, rollback and return,
+including independent HLS decode in each phase. The owned daemons, archives,
+extracted packages and temporary UI dependencies were removed. This remains
+an isolated smoke, not a live in-place upgrade, power-loss test or capacity
+qualification.
+
 ## Current NVIDIA H.264 startup check (2026-11-02)
 
 On the local GTX 750 Ti with NVIDIA driver 580.159.03, the opt-in
