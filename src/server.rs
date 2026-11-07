@@ -1164,7 +1164,7 @@ fn redact_view_value(value: &mut Value) {
                     *field = Value::String("[redacted]".into());
                 } else if matches!(
                     key.as_str(),
-                    "url" | "endpoint" | "upstream_source" | "source"
+                    "url" | "endpoint" | "upstream_source" | "source" | "origin"
                 ) || key.ends_with("_url")
                 {
                     *field = match field.as_str() {

@@ -178,6 +178,25 @@ test('IPTV HA client shows each authority state without local catalog edits',asy
  await expect(page.getByRole('region',{name:'IPTV authority origins'})).toContainText('authority-two.example');
  await expect(page.getByRole('button',{name:'Add package',exact:true})).toHaveCount(0);
 });
+test('View IPTV health distinguishes hidden authority slots without exposing URLs',async({page})=>{
+ const duplicateKeys:string[]=[];
+ page.on('console',message=>{if(message.type()==='error'&&message.text().includes('same key'))duplicateKeys.push(message.text())});
+ await page.route('**/flussonix/api/v1/node',async route=>{
+  const response=await route.fetch();const node=await response.json();
+  node.management_role='view';
+  node.iptv_cluster={mode:'client',configured:true,ready:true,connected:true,origins:[
+   {origin:'https://[redacted]',reachable:false,ready:false,refused:false},
+   {origin:'https://[redacted]',reachable:true,ready:true,refused:false}
+  ]};await route.fulfill({response,json:node});
+ });
+ await page.getByRole('button',{name:'Config',exact:true}).click();await page.getByRole('button',{name:'IPTV',exact:true}).click();
+ const health=page.getByRole('region',{name:'IPTV authority origins'});
+ await expect(health.locator('p')).toHaveCount(2);
+ await expect(health.locator('p').nth(0)).toContainText('Authority 1 · Unreachable');
+ await expect(health.locator('p').nth(1)).toContainText('Authority 2 · Ready');
+ await expect(health).not.toContainText('https://[redacted]');
+ expect(duplicateKeys).toEqual([]);
+});
 test('status strip reports the running server version and follows node status updates',async({page,request})=>{
  const health=await(await request.get('/health')).json();
  expect(typeof health.version).toBe('string');expect(health.version.length).toBeGreaterThan(0);
