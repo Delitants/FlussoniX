@@ -249,7 +249,7 @@ async fn owner_only_backup_restores_supported_schema_and_catalog_after_failed_up
     schema::initialize(&db_pool, None).await.unwrap();
     let catalog = HaCatalog::new(db_pool.clone(), certs.dir.path().join("backup-export.json"));
     catalog.edit(0, CatalogEdit::Enable(true)).await.unwrap();
-    let backup = primary.backup(&certs);
+    let backup = primary.backup();
     assert_eq!(
         fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
         0o600
@@ -263,7 +263,7 @@ async fn owner_only_backup_restores_supported_schema_and_catalog_after_failed_up
         Err(HaError::UnsupportedSchema)
     );
     drop(sql);
-    primary.restore(&certs, &backup);
+    primary.restore(&backup);
     let restored = pool(&certs, primary.port());
     restored.verify_startup().await.unwrap();
     let catalog = HaCatalog::new(restored, certs.dir.path().join("restored-export.json"));
