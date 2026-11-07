@@ -52,6 +52,17 @@ removed. This verifies one local synthetic playback profile
 without vendor files; the final packaged binary and broader protocol matrix
 still require their own exact-release qualification.
 
+On 2026-11-07, the exact `9b56379` release binary (SHA-256
+`cd2c5210f989d7154803f1318af9c33f5c5f386905c925ad07ab7d50bf59aacb`)
+passed a separate owned smoke in unprivileged mount and network namespaces.
+The host's `/opt/flussonic` was bind-hidden before daemon startup; its dynamic
+library list contained only system GNU C, math and GCC support libraries.
+Health, authenticated admin, token-protected HLS playlist and the 279,368-byte
+MPEG-TS segment all returned HTTP 200, and system FFmpeg strictly decoded the
+segment. The daemon, decoder, namespaces and temporary files were removed.
+This covers one synthetic H.264/AAC stream on the current release binary; it
+does not cover the full protocol matrix or a packaged installation.
+
 ## Exact candidate archive and cold upgrade smoke (2026-11-02)
 
 At documentation-only revision `aa767045`, the independently built web UI
