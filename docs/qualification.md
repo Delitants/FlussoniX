@@ -110,6 +110,14 @@ An isolated loopback release daemon with owner-only temporary state returned
 The admin UI consumes those statuses in Config and processing forms; existing
 browser cases cover their labels. The temporary daemon and state were removed.
 
+On 2026-11-07, the unchanged `9b56379` source's warm-start test runner passed
+both the CPU `libx265` HEVC case and the opt-in GTX 750 Ti `h264_nvenc` case.
+Each test joined a late HTTP MPEG-TS viewer between keyframes and used system
+FFmpeg to decode one second of the captured video. Both test workers exited;
+the separate 24-hour soak remained active with its two own FFmpeg children.
+This does not qualify NVIDIA HEVC encoding, sustained GPU capacity or driver
+recovery.
+
 ## Short live Flussonic source topology matrix (2026-11-02)
 
 Exact release binary SHA-256
