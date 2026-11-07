@@ -227,6 +227,21 @@ matched their baseline. This qualifies bounded secure LAN recovery on these
 hosts, not certificate rotation, long-haul capacity or the exact-head 24-hour
 release gate.
 
+On 2026-11-07, the exact `9b56379` release binary (SHA-256
+`cd2c5210f989d7154803f1318af9c33f5c5f386905c925ad07ab7d50bf59aacb`)
+ran on both approved hosts in three temporary, capped units: source and LB on
+cdn4, CDN on cdn5. Private-IP certificates verified against an ephemeral CA;
+the source catalog and CDN pull used HTTPS, and the CDN reported `m4ss` input.
+The initial and eight post-restart probes passed LB/CDN ticket redirects,
+tokenless 403 checks, and independent H.264/AAC segment decode. Restarting
+only the temporary source produced a new media generation; the eight probes,
+spaced 15 seconds apart, observed eight distinct post-restart segments, with
+the slowest probe taking 359 ms. The LB listed the discovered stream but had
+zero active media workers. All temporary units, ports, media and credentials
+were removed; both hosts' pre-existing Flussonic and FlussoniX services and
+PIDs matched their pre-test baseline. This is bounded private-LAN recovery,
+not sustained WAN capacity, certificate rotation or production failover.
+
 ## Cold package upgrade and rollback (2026-11-02)
 
 The checksum-verified published v0.6 preview archive was cold-upgraded to the
