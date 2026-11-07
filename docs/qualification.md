@@ -1,5 +1,25 @@
 # Preview qualification
 
+## Isolated FXLink v9 two-stream loss probe (2026-11-07)
+
+The exact `9b56379` release binary (SHA-256
+`cd2c5210f989d7154803f1318af9c33f5c5f386905c925ad07ab7d50bf59aacb`)
+served two owned synthetic streams through separate source and CDN daemons in
+an unprivileged network namespace. An isolated `tc netem` queue gave FXLink UDP
+125 ms delay in each direction (about 250 ms RTT) and 1% random loss; the
+receiver used a 1,000 ms media buffer. Both peers explicitly enabled the v9
+geometry-hint feature set. Over 90 seconds, each stream delivered 44
+consecutive HLS segments with no post-start fetch failures; independent FFmpeg
+strictly decoded the first and last segment from each stream. The netem queue
+dropped 416 UDP packets. FXLink reported v9 for both streams, 57 and 61
+original lost shards respectively, the same counts recovered by FEC, and zero
+expired records or queue drops. The test-owned daemons, namespace, staged
+binary, and temporary media were removed; a compact owner-only result remains
+under `.runtime/fxlink-longhaul-9b56379/`.
+
+This is a short loopback loss probe. It does not qualify 500 ms RTT, a 500 ms
+buffer, sustained competing traffic, real WAN behavior, or production capacity.
+
 ## HTTP HLS origin address pinning (2026-11-05)
 
 At runtime commit `b39c9cb`, the owned loopback regression used an unresolved
