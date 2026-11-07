@@ -117,6 +117,20 @@ records and M4F boxes; only the four HLS legs received independent decode.
 They do not qualify other codecs, source outages, sustained load, long-haul
 loss, complete vendor API parity or secure native viewer output.
 
+On 2026-11-07, the exact `9b56379` release binary (SHA-256
+`cd2c5210f989d7154803f1318af9c33f5c5f386905c925ad07ab7d50bf59aacb`)
+passed eight further read-only source-topology cases against the approved cdn4
+stream. Owned loopback LB/CDN pairs placed an authorized viewer on the CDN for
+native M4S output from M4S and verified-TLS M4SS sources, native M4F output
+from M4F and verified-TLS M4FS sources, and HLS output from each of those four
+source schemes. All local viewer endpoints used HTTP. All cases
+advertised H.264/AAC; the four HLS segments independently decoded with
+FFmpeg, while native M4S records and M4F boxes were parsed and validated.
+Every LB had zero local stream workers, and tokenless requests to both LB and
+CDN returned 403. The temporary daemons and state were removed after each
+case. This is still a short probe of one live vendor stream, without codec,
+outage, sustained-load, long-haul or full API-parity qualification.
+
 ## Intermittent native HTTP publishing CI failure (2026-11-02)
 
 GitHub Actions run `41507578327` failed one nonignored HTTP publishing
