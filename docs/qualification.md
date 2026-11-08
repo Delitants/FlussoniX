@@ -14,6 +14,18 @@ evidence for that head. Later product changes require fresh exact-head checks,
 tracked on [PR #51](https://github.com/Delitants/FlussoniX/pull/51). It does
 not close the 24-hour soak, live migration or full API-compatibility gates.
 
+## M4F/M4S origin address lifetime (2026-11-08 UTC)
+
+The candidate keeps each M4F/M4S origin's initial resolved address set for its
+input generation. Native inputs resolve when the worker pull starts; the
+explicit Flussonic media input retains its pinned client across M4F control
+reconnects and announced segment GETs. A replacement input may resolve again.
+HTTPS continues to verify the configured hostname. The focused locked Rust
+`m4_ingest::` suite passed all 21 tests on local candidate `97c2103`, including
+two-address native M4F/M4S fixtures, vendor M4F reconnect/replacement, and a
+pinned-hostname TLS fixture. This is deterministic local coverage; it does not
+establish a live DNS failover SLA.
+
 ## Completed 24-hour HTTP soak — failed gap gate (2026-11-08 UTC)
 
 The isolated two-stream/eight-viewer run on revision `9b56379e2499c25ec1f4a2998d1970399c3f21f8`
