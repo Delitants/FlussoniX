@@ -306,7 +306,7 @@ The exact live `index.ts.m3u8` and `index.fmp4.m3u8` URLs return a one-rendition
 
 For HTTP(S) HLS and continuous MPEG-TS inputs, FlussoniX resolves the configured hostname once per input generation and uses only that initial address set for playlists, media, keys and same-origin redirects. A later DNS change takes effect when the input restarts. The initial answer is not screened for private addresses, so only configure origins whose initial DNS answer you trust.
 
-Configured M4F/M4S inputs also resolve their origin once per input generation, retaining at most eight initial addresses. M4S control reconnects and M4F control reconnects and segment GETs use that pinned set; restarting the input generation refreshes DNS. HTTPS still verifies the configured hostname against the server certificate. The initial M4 address set is not screened for private addresses, so configure only trusted origins.
+Configured M4F/M4S inputs also resolve their origin once per input generation, retaining at most eight initial addresses. Control requests and M4F segment GETs use that pinned set, including M4F control reconnects within the same generation; restarting the input generation refreshes DNS. HTTPS still verifies the configured hostname against the server certificate. The initial M4 address set is not screened for private addresses, so configure only trusted origins.
 
 ## M4F/M4S implementation plan
 
