@@ -47,12 +47,17 @@ identity and idle eligibility under the stream gate. Deterministic cancellation
 tests paused old worker completion and media removal. A single-thread runtime
 test stalled one stream's state write while another stream started. The 54
 media unit cases, both real-FFmpeg HLS recovery cases, warning-denied
-all-target Clippy, and
-the full library suite (847 passed, one ignored) passed after the patch. Raw-HLS
-replacement and subtitle-policy integration regressions also passed. The
-archive and upgrade results above belong to the earlier `1917a8b` runtime;
-they do not qualify this follow-up runtime. An exact-head package smoke, the
-remaining integration suite, and the separate release gates remain open.
+all-target Clippy, and the full library suite (847 passed, one ignored)
+passed after the patch. Raw-HLS replacement and subtitle-policy integration
+regressions also passed. The archive and upgrade results above belong to the
+earlier `1917a8b` runtime. A new archive for runtime revision `ba61670` had
+binary SHA-256 `0edc22f6d3ebfb037f81fcbba6d2c34965e3681c9aca26d64a2129a08b7e0b04`
+and archive SHA-256
+`144214d1939c3928b547f937d00b964d30c94f30ebbc7a8582144a3b660edb2c`.
+The extracted archive passed loopback health, admin, RTSP, and encrypted-SRT
+smoke checks, then its temporary files and UI dependencies were removed. A
+cold-upgrade check for this newer runtime, the remaining integration suite,
+and the separate release gates remain open.
 
 ## Isolated FXLink v9 two-stream loss probe (2026-11-07)
 
