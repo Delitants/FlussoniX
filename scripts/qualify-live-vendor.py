@@ -26,6 +26,15 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def private_daemon_env(peer_key):
+    env = {key: value for key, value in os.environ.items() if not key.startswith("FLUSSONIX_")}
+    env.update(
+        FLUSSONIX_ADMIN_PASSWORD=secrets.token_urlsafe(32),
+        FLUSSONIX_PEER_KEY=peer_key,
+    )
+    return env
+
+
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
@@ -342,11 +351,7 @@ def probe(args, root):
     config_path = root / "config.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
     config_path.chmod(0o600)
-    env = {key: value for key, value in os.environ.items() if not key.startswith("FLUSSONIX_")}
-    env.update(
-        FLUSSONIX_ADMIN_PASSWORD="owned-vendor-probe-admin",
-        FLUSSONIX_PEER_KEY="owned-vendor-probe-peer-key",
-    )
+    env = private_daemon_env(secrets.token_urlsafe(24))
     with (root / "daemon.log").open("wb") as log:
         daemon = subprocess.Popen(
             [
@@ -446,8 +451,7 @@ def topology_probe(args, root):
         config.chmod(0o600)
         log = (root / f"{name}.log").open("wb")
         logs.append(log)
-        env = {key: value for key, value in os.environ.items() if not key.startswith("FLUSSONIX_")}
-        env.update(FLUSSONIX_ADMIN_PASSWORD="owned-vendor-probe-admin", FLUSSONIX_PEER_KEY=peer_key)
+        env = private_daemon_env(peer_key)
         if args.output == "m4f":
             env["RUST_LOG"] = "warn,flussonix::private_input=debug,flussonix::worker_lifecycle=debug"
         daemon = subprocess.Popen(

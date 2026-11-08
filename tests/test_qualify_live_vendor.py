@@ -60,6 +60,29 @@ class SourceArgumentsTests(unittest.TestCase):
                     self.assertIn("server-root", result.stderr)
 
 
+class DaemonCredentialsTests(unittest.TestCase):
+    def test_probe_daemons_get_fresh_admin_passwords_and_no_inherited_credentials(self):
+        with patch.dict("os.environ", {
+            "FLUSSONIX_ADMIN_PASSWORD": "operator-admin",
+            "FLUSSONIX_IPTV_DATA": "/private/catalog",
+            "PATH": "/usr/bin",
+        }, clear=True):
+            first = PROBE.private_daemon_env("probe-peer")
+            second = PROBE.private_daemon_env("probe-peer")
+        self.assertEqual(first["PATH"], "/usr/bin")
+        self.assertEqual(first["FLUSSONIX_PEER_KEY"], "probe-peer")
+        self.assertEqual(second["FLUSSONIX_PEER_KEY"], "probe-peer")
+        self.assertNotIn("FLUSSONIX_IPTV_DATA", first)
+        self.assertNotIn("FLUSSONIX_IPTV_DATA", second)
+        for environment in (first, second):
+            password = environment["FLUSSONIX_ADMIN_PASSWORD"]
+            self.assertGreaterEqual(len(password), 32)
+            self.assertNotEqual(password, "operator-admin")
+            self.assertNotEqual(password, "owned-vendor-probe-admin")
+        self.assertNotEqual(first["FLUSSONIX_ADMIN_PASSWORD"],
+                            second["FLUSSONIX_ADMIN_PASSWORD"])
+
+
 class M4fAnnouncementTests(unittest.TestCase):
     def test_relay_accepts_origin_sequence_instead_of_requiring_first_segment(self):
         timestamp = "2026/10/26/20/07/30"
