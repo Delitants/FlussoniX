@@ -25,8 +25,10 @@ sudo install -d -o flussonix -g flussonix -m 700 /var/lib/flussonix-preview
 For an existing instance, stop it and back up its state first. Copy its saved
 configuration and referenced files into the external state directory, assigning
 them to the service account with private permissions. Keep all parent directories
-traversable by that account. The helper checks access and refuses unsafe state
-permissions; it does not change ownership or copy data.
+traversable by that account and protected from replacement by other users. The
+helper rejects writable or untrusted ancestors of state and credential paths;
+root-owned sticky directories such as `/tmp` remain usable for isolated tests.
+It does not change ownership or copy data.
 
 From the extracted release directory, enter your **saved** admin password and
 cluster peer key when prompted:

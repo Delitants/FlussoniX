@@ -417,6 +417,28 @@ class ServicePreviewTests(unittest.TestCase):
         self.assertNotEqual(self.render().returncode, 0)
         self.assertFalse(self.unit.exists())
 
+    def test_writable_credential_ancestor_cannot_supply_service_environment(self):
+        self.create_credentials()
+        writable = self.root / 'writable-credentials'
+        writable.mkdir()
+        writable.chmod(0o777)
+        self.credentials = self.credentials.rename(writable / 'credentials.env')
+        result = self.render()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('ancestor', result.stderr)
+        self.assertFalse(self.unit.exists())
+
+    def test_writable_state_ancestor_cannot_replace_service_config(self):
+        self.create_credentials()
+        writable = self.root / 'writable-state'
+        writable.mkdir()
+        writable.chmod(0o777)
+        self.state = self.state.rename(writable / 'state')
+        result = self.render()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('ancestor', result.stderr)
+        self.assertFalse(self.unit.exists())
+
     def test_writable_release_paths_cannot_become_service_executables(self):
         self.create_credentials()
         for path in (self.root, self.release, self.release / 'bin',
