@@ -1,5 +1,20 @@
 # Preview qualification
 
+## Exact product-source CI (2026-11-08 UTC)
+
+[GitHub Actions run 42444739064](https://github.com/Delitants/FlussoniX/actions/runs/42444739064)
+completed successfully on PR #51 head
+`283584309636e626a74ea1ac5355ccfa77161c4e`. Its `verify` job ran
+formatting, warning-denied all-target Clippy, the full serial locked Rust
+suite with owned media fixtures, bounded IPTV authority load smokes, and the
+UI build and browser checks. Its `release_package_smoke` job built and started
+an independently packaged daemon, exercised installation/upgrade smoke checks,
+and verified official Flussonic components were absent. The local candidate
+has no product, build-script or workflow changes after that CI head; later
+commits are evidence documentation only. This closes the exact product-source
+CI and package-smoke checks, but it does not close the 24-hour soak, security,
+live migration or full API-compatibility gates.
+
 ## Durable HLS sequence recovery candidate (2026-11-07)
 
 Runtime commit `1917a8b54ca388e41980ccf259a0163a2c782350` persists a
