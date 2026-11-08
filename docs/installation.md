@@ -94,6 +94,15 @@ confidential.
 In **Media → Streams**, add `testsrc://`, save and open its player. Then check
 your own input. Press **Ctrl+C** to stop the server and its media workers.
 
+For a separate viewer-facing LB, start a node with `--role lb` and configure
+its source servers and CDN peers under **Cluster**. **Cluster → Balancers** adds
+optional named HTTP playback paths such as `/lb0/channel/index.m3u8`. A
+country-scoped balancer also needs a local Country or City MaxMindDB file
+selected at startup with `--geoip-db /absolute/path/country.mmdb`; the UI shows
+whether it loaded. Named URLs do not accept publishing POSTs. See the
+[cluster guide](cluster-loadbalancing.md#named-http-balancers) for placement
+limits and the separate CDN admission behavior.
+
 For built-in IPTV, restart with `--iptv-public-origin https://your-viewer-host`
 using the actual HTTP(S) origin viewers can reach. Open **Config → IPTV** to
 enable it, assign streams to packages and packages to subscribers, then choose

@@ -40,6 +40,51 @@ async fn vendor_lb_preserves_exact_hls_master_alias_path() {
     assert_eq!(media_calls, 0);
     assert_eq!(media_workers, 0);
 }
+
+#[tokio::test]
+async fn named_vendor_source_uses_the_authorized_cdn_without_an_lb_media_worker() {
+    use sha2::{Digest, Sha256};
+    let f = Fixture::variant(
+        json!({"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"viewer"))}),
+        "m4s",
+        "lb",
+    )
+    .await;
+    let peer = Peer::new().await;
+    peer.configure(&f);
+    f.app
+        .config
+        .put(
+            "balancers",
+            "lb0",
+            json!({"mode":"clients","servers":[{"name":"edge"}]}),
+        )
+        .unwrap();
+    let denied = f.get("/lb0/owned/m4s?token=wrong").await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(f.media_calls(), 0);
+    let allowed = f.get("/lb0/owned/m4s?token=viewer&x=%2B").await;
+    let status = allowed.status();
+    let location = allowed
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let calls = peer.calls.lock().unwrap().clone();
+    let media_calls = f.media_calls();
+    let media_workers = f.app.media.count().await;
+    peer.stop().await;
+    f.stop().await;
+    assert_eq!(status, StatusCode::FOUND);
+    let location = location.unwrap();
+    assert!(location.contains("/owned/m4s?"), "{location}");
+    assert!(!location.contains("/lb0/"), "{location}");
+    assert!(location.contains("token=viewer"), "{location}");
+    assert!(location.contains("x=%2B"), "{location}");
+    assert!(calls.iter().any(|call| call == "admit"), "{calls:?}");
+    assert_eq!(media_calls, 0);
+    assert_eq!(media_workers, 0);
+}
 #[tokio::test]
 async fn vendor_lb_denial_and_absence_do_not_start_media() {
     use sha2::{Digest, Sha256};
@@ -79,7 +124,7 @@ impl Peer {
                 assert_eq!(headers["x-flussonix-peer"],"owned-native-peer-key");
                 assert!(!headers.contains_key("cluster-auth-key"));assert!(!headers.contains_key("authorization"));
                 calls.lock().unwrap().push("node".into());
-                axum::Json(json!({"role":"cdn","uplink":0.1,"uplink_mbps":1000,"cpu":0.1,"ram":0.1,"drain":false,"age_ms":0,"active":0,"reserved":0,"reserved_mbps":0,"limit":1000,"streams":[],"stream_bitrates":{}}))
+                axum::Json(json!({"role":"cdn","uplink":0.1,"uplink_mbps":1000,"cpu":0.1,"ram":0.1,"drain":false,"age_ms":0,"active":0,"reserved":0,"reserved_mbps":0,"limit":1000,"output_kbit":1000,"bandwidth_usage":10.0,"total_clients":0,"total_streams_count":1,"streams":[],"stream_bitrates":{}}))
             }}))
             .route("/flussonix/api/v1/admit",post(move |headers:HeaderMap,Json(body):Json<Value>| {let calls=admit_calls.clone();let held=held.clone();async move {
                 assert_eq!(headers["x-flussonix-peer"],"owned-native-peer-key");
