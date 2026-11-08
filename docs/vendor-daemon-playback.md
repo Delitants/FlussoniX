@@ -47,9 +47,13 @@ uses source-fenced CDN reservations and independent viewer admission. Foreign
 admission tickets fail without media pulls.
 
 The existing opt-in SRT playback listener also serves vendor streams on CDN and
-standalone nodes. Callers select `#!::r=STREAM,m=request,u=VIEWER_TOKEN` and use
-the listener passphrase when encryption is configured. Every caller authorizes
-independently and shares the HTTP/RTSP processing worker and private input.
+standalone nodes. For a protected stream, callers first request a single-use
+ticket over HTTPS, then connect with the returned tokenless SRT Stream ID;
+see [SRT ticket playback](srt-playback.md). Use the listener passphrase when
+encryption is configured. The reusable `u=VIEWER_TOKEN` Stream ID form is
+disabled by default and requires an explicit trusted-network override. Every
+caller authorizes independently and shares the HTTP/RTSP processing worker and
+private input.
 Revocation, source edits and replica changes close affected callers; reconnect
 for current authority. LB and draining nodes refuse SRT playback before source
 discovery. SRT has no redirect mechanism, so LB placement remains separate.
