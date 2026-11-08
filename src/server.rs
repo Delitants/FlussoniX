@@ -208,6 +208,7 @@ pub struct App {
     pub(crate) publishers: Arc<tokio::sync::Semaphore>,
     iptv_peer_admission: iptv_peer::Admission,
     source_lookups: Mutex<HashMap<String, origin_resolution::Ticket>>,
+    ticket_body_gate: srt_ticket_issue::BodyGate,
 }
 impl App {
     fn srtp_ledger_capability(&self) -> Value {
@@ -524,6 +525,7 @@ impl App {
             publishers: Arc::new(tokio::sync::Semaphore::new(64)),
             iptv_peer_admission: iptv_peer::Admission::new(),
             source_lookups: Mutex::new(HashMap::new()),
+            ticket_body_gate: srt_ticket_issue::BodyGate::new(),
         });
         let weak = Arc::downgrade(&app.playback_auth);
         app.iptv.set_on_change(Box::new(move |revision| {

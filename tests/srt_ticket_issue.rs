@@ -8,6 +8,7 @@ use flussonix::{
     server::{App, Options, router},
     srt_playback::{Listener, Settings},
 };
+use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{net::SocketAddr, process::Stdio, sync::Arc, time::Duration};
@@ -142,6 +143,93 @@ async fn request_is_strict_bounded_and_never_echoes_credentials() {
         assert_eq!(cache, "private, no-store");
         assert!(!value.to_string().contains("owned-secret"));
     }
+}
+
+#[tokio::test]
+async fn unfinished_ticket_body_expires_and_closes_the_connection() {
+    let lab = Lab::new(true, true);
+    let body = Body::from_stream(
+        stream::iter([Ok::<bytes::Bytes, std::io::Error>(
+            bytes::Bytes::from_static(b"{"),
+        )])
+        .chain(stream::pending()),
+    );
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/flussonix/api/v1/srt-ticket")
+        .header("content-type", "application/json")
+        .body(body)
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(loopback()));
+    let response = tokio::time::timeout(
+        Duration::from_secs(8),
+        router(lab.app.clone()).oneshot(request),
+    )
+    .await
+    .expect("unfinished ticket body held a connection beyond the deadline")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(response.headers()["cache-control"], "private, no-store");
+    assert_eq!(response.headers()["connection"], "close");
+}
+
+#[tokio::test]
+async fn one_peer_cannot_fill_ticket_body_read_capacity() {
+    let lab = Lab::new(true, true);
+    let mut held = Vec::new();
+    let mut entered = Vec::new();
+    for _ in 0..8 {
+        let (signal, ready) = tokio::sync::oneshot::channel();
+        entered.push(ready);
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/flussonix/api/v1/srt-ticket")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream::once(async move {
+                let _ = signal.send(());
+                std::future::pending::<Result<bytes::Bytes, std::io::Error>>().await
+            })))
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(loopback()));
+        let app = lab.app.clone();
+        held.push(tokio::spawn(
+            async move { router(app).oneshot(request).await },
+        ));
+    }
+    for ready in entered {
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .expect("held body did not enter the ticket reader")
+            .unwrap();
+    }
+    let mut ninth = Request::builder()
+        .method(Method::POST)
+        .uri("/flussonix/api/v1/srt-ticket")
+        .header("content-type", "application/json")
+        .body(Body::from_stream(stream::pending::<
+            Result<bytes::Bytes, std::io::Error>,
+        >()))
+        .unwrap();
+    ninth.extensions_mut().insert(ConnectInfo(loopback()));
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        router(lab.app.clone()).oneshot(ninth),
+    )
+    .await;
+    for task in held {
+        task.abort();
+        let _ = task.await;
+    }
+    let response = response
+        .expect("ninth unfinished body was admitted from one peer")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["cache-control"], "private, no-store");
+    assert_eq!(response.headers()["connection"], "close");
+    let (status, _, _) = lab
+        .request(BODY, Some(loopback()), "/flussonix/api/v1/srt-ticket")
+        .await;
+    assert_eq!(status, StatusCode::OK, "body-read slots were not released");
 }
 
 #[tokio::test]
