@@ -1,5 +1,43 @@
 # Preview qualification
 
+## Durable HLS sequence recovery candidate (2026-11-07)
+
+Runtime commit `1917a8b54ca388e41980ccf259a0163a2c782350` persists a
+per-stream HLS sequence floor outside disposable media directories. Owned
+real-FFmpeg tests restarted both TS-HLS and fMP4 after placing the prior
+timeline ahead of the wall clock. Both public sequences advanced, old segment
+and init names were unavailable, and independent FFmpeg strictly decoded both
+new variants. A separate subtitle-passthrough restart advanced the public
+normalized TS playlist even though its private FFmpeg list restarted at a
+lower sequence. Unit cases covered surviving public playlists, corrupt and
+exhausted state, stop/replacement races, and an unrelated startup while one
+state write was stalled. The existing raw-HLS replacement and caption-policy
+regressions passed.
+
+`cargo fmt --all`, warning-denied all-target Clippy, 843 library tests (one
+ignored), 51 preview-helper tests, seven archive/upgrade-helper tests, and
+four notice-generator tests passed. A fresh release build (binary SHA-256
+`59c0cc56cb583692efff284f351c08298eed7b6a2c60c5efaa83051768c178fa`)
+and lockfile-pinned UI build produced a 395-file x86-64 archive (SHA-256
+`1c1baa1e0cdf49315658102b3687550662c8c3222c17d860af3930b9adf8dcf6`).
+The extracted archive passed loopback health, admin, RTSP, and encrypted-SRT
+smoke checks. A media-enabled cold upgrade from the checksum-pinned
+v0.10.0-preview archive passed upgrade, rollback, and return with independent
+HLS decode. All package-test daemons and files exited or were removed.
+
+The full serial `cargo test --locked -- --test-threads=1` pass was stopped
+after its 843 library tests and 16 integration targets completed; no failure
+was reported before interruption, but the remaining integration targets have
+not passed this candidate. The build temporarily raised root use to 82%; 196
+disposable test executables (61.57 GiB), the temporary archive/extractions,
+and this worktree's UI dependencies were removed. Root space afterward was
+about 145 GiB free. The separate 24-hour soak stayed active with no daemon
+restart and eight viewers, but its checkpoint recorded two simultaneous
+media gaps above three seconds on every viewer during the heavy build, with
+a maximum near 5.26 seconds. That soak cannot yet establish uninterrupted
+playback. Power-loss sequence continuity, the remaining full CI gate, and
+the separately tracked SRT/RTP and release-security work remain open.
+
 ## Isolated FXLink v9 two-stream loss probe (2026-11-07)
 
 The exact `9b56379` release binary (SHA-256
