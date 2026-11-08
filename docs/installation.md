@@ -23,6 +23,9 @@ glibc build passed encrypted SRT playback on the same hosts.
 Direct SRTP receivers also need an explicitly initialized owner-only key history;
 see [direct SRTP setup](direct-srtp.md). The optional service helper renders a
 stable history path but never initializes or resets it.
+Optional DVB bitmap subtitle conversion needs the Tesseract executable and the
+language models selected for the stream (for example, `tesseract-ocr-eng` on
+Ubuntu).
 
 Download the preview archive and its matching `.sha256` file into the same
 directory. Set `package` to the downloaded filename without `.tar.gz`, then run:
