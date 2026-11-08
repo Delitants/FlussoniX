@@ -20,7 +20,11 @@ Protocol, codec and API coverage is still incomplete. Mixed Flussonic clusters a
 
 ## Try it
 
-Use a test server and an available port. Install **FFmpeg and FFprobe** independently; the standard CPU profile needs libx264 and AAC support. Optional GPU and protocol features require their corresponding drivers or libraries.
+Use a test server and an available port. The current x86-64 release candidate
+is tested on Ubuntu 24.04 and requires glibc 2.39; check the requirements of
+the particular archive you download. Install **FFmpeg and FFprobe**
+independently; the standard CPU profile needs libx264 and AAC support. Optional
+GPU and protocol features require their corresponding drivers or libraries.
 
 [Download a Linux preview](https://github.com/Delitants/FlussoniX/releases). Packaged previews may be older than the current source. Extract the package, open a terminal in its directory and set your credentials:
 

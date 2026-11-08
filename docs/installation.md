@@ -6,7 +6,9 @@ The archive contains the server, web interface, installation guides, an optional
 service helper and a file manifest.
 It contains no configuration, credentials, media, FFmpeg or Flussonic components.
 Use Linux with the archive's CPU architecture; libc and CPU requirements depend
-on the supplied binary's build.
+on the supplied binary's build. The current x86-64 release-candidate binary
+requires glibc 2.39 and has been checked on Ubuntu 24.04. Older glibc hosts
+cannot run that binary; inspect another archive's requirements separately.
 
 ## Before starting
 
