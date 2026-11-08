@@ -92,6 +92,110 @@ pub(super) fn row_requires_geoip(row: &Value) -> bool {
         })
 }
 
+pub(super) struct HttpPath {
+    pub balancer: String,
+    pub media_path: String,
+}
+
+fn valid_percent_encoding(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' {
+            if at + 2 >= bytes.len()
+                || !bytes[at + 1].is_ascii_hexdigit()
+                || !bytes[at + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            at += 3;
+        } else {
+            at += 1;
+        }
+    }
+    true
+}
+
+/// Retain the exact post-prefix wire path while validating its decoded meaning.
+pub(super) fn http_path(root: &Value, raw_path: &str) -> Result<Option<HttpPath>, &'static str> {
+    let Some(raw) = raw_path.strip_prefix('/') else {
+        return Ok(None);
+    };
+    let (first, tail) = raw
+        .split_once('/')
+        .map_or((raw, None), |(first, tail)| (first, Some(tail)));
+    let Some(balancers) = root["balancers"].as_array() else {
+        return Ok(None);
+    };
+    let decoded_first = percent_encoding::percent_decode_str(first)
+        .decode_utf8()
+        .ok();
+    let matched = balancers.iter().find_map(|row| {
+        let name = row["name"].as_str()?;
+        (decoded_first.as_deref() == Some(name)).then_some(name)
+    });
+    let Some(name) = matched else {
+        if balancers
+            .iter()
+            .filter_map(|row| row["name"].as_str())
+            .any(|name| {
+                decoded_first
+                    .as_deref()
+                    .is_some_and(|first| first.starts_with(&format!("{name}/")))
+            })
+        {
+            return Err("invalid named balancer prefix");
+        }
+        return Ok(None);
+    };
+    let Some(tail) = tail else {
+        return Err("named balancer media path required");
+    };
+    if tail.is_empty() || raw_path.len() > 4096 || !valid_percent_encoding(raw) {
+        return Err("invalid named balancer media path");
+    }
+    let decoded = percent_encoding::percent_decode_str(tail)
+        .decode_utf8()
+        .map_err(|_| "invalid named balancer media path")?;
+    if decoded.split('/').count() != tail.split('/').count()
+        || decoded
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || decoded
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '\\' | '?' | '#'))
+    {
+        return Err("invalid named balancer media path");
+    }
+    Ok(Some(HttpPath {
+        balancer: name.to_owned(),
+        media_path: format!("/{tail}"),
+    }))
+}
+
+pub(super) fn valid_admission_query(raw: Option<&str>) -> bool {
+    let mut ticket = false;
+    let mut handoff = false;
+    for (key, _) in url::form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
+        match key.as_ref() {
+            "flussonix_ticket" => {
+                if ticket {
+                    return false;
+                }
+                ticket = true;
+            }
+            "flussonix_handoff" => {
+                if handoff {
+                    return false;
+                }
+                handoff = true;
+            }
+            _ => {}
+        }
+    }
+    !(ticket && handoff)
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct ObservedPeer<'a> {
     pub name: &'a str,
@@ -116,7 +220,13 @@ pub(super) fn rank(
         .unwrap_or_default()
         .as_secs();
     rank_at(
-        config, candidates, client, country, revision, stream, affinity, now,
+        config,
+        candidates,
+        client,
+        country,
+        revision,
+        (stream, affinity),
+        now,
     )
 }
 
@@ -141,10 +251,10 @@ fn rank_at(
     client: IpAddr,
     country: Option<&str>,
     revision: u64,
-    stream: &str,
-    affinity: &str,
+    session: (&str, &str),
     now_seconds: u64,
 ) -> Vec<String> {
+    let (stream, affinity) = session;
     let Some(servers) = config["servers"].as_array() else {
         return Vec::new();
     };

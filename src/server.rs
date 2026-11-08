@@ -27,7 +27,7 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -2235,16 +2235,22 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
     }
     error(StatusCode::NOT_FOUND, "operation not implemented")
 }
+#[derive(Clone, Copy)]
+pub(crate) struct BalanceRequest<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) path: &'a str,
+    pub(crate) query: &'a str,
+    pub(crate) secure: bool,
+    pub(crate) named: Option<&'a str>,
+    pub(crate) client_ip: Option<IpAddr>,
+}
 async fn balance(
     app: &Arc<App>,
-    name: &str,
-    path: &str,
-    query: &str,
-    secure: bool,
+    request: BalanceRequest<'_>,
     grant: &Grant,
     revision: u64,
 ) -> Response {
-    let work = balance_inner(app, name, path, query, secure, grant, revision);
+    let work = balance_inner(app, request, grant, revision);
     let response = tokio::select! { biased;
         _=grant.cancelled()=>error(StatusCode::FORBIDDEN,"playback policy changed"),
         result=tokio::time::timeout(Duration::from_secs(8),work)=>result.unwrap_or_else(|_|error(StatusCode::SERVICE_UNAVAILABLE,"placement deadline exceeded")),
@@ -2260,16 +2266,55 @@ async fn balance(
 }
 async fn balance_inner(
     app: &Arc<App>,
-    name: &str,
-    path: &str,
-    query: &str,
-    secure: bool,
+    request: BalanceRequest<'_>,
     grant: &Grant,
     revision: u64,
 ) -> Response {
     use futures_util::StreamExt;
+    let BalanceRequest {
+        name,
+        path,
+        query,
+        secure,
+        named,
+        client_ip,
+    } = request;
     let root = app.config.snapshot();
-    let peers = root["peers"].as_array().cloned().unwrap_or_default();
+    let named_policy = if let Some(named) = named {
+        let Some(row) = root["balancers"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == named))
+        else {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "named balancer configuration changed",
+            );
+        };
+        Some(row)
+    } else {
+        None
+    };
+    let allowed = named_policy.map(|row| {
+        row["servers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|server| server["name"].as_str())
+            .collect::<std::collections::HashSet<_>>()
+    });
+    let peers = root["peers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|peer| {
+            allowed.as_ref().is_none_or(|names| {
+                peer["hostname"]
+                    .as_str()
+                    .is_some_and(|name| names.contains(name))
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     if peers.len() > 64 || app.config.revision() != revision {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2388,7 +2433,45 @@ async fn balance_inner(
             };
             nodes.push(load)
         }
-        let Some(id) = app.routing_rotation.select(&nodes, 0.0, &mut turn) else {
+        let selected = if let Some(policy) = named_policy {
+            nodes.retain(|node| crate::cluster::select(std::slice::from_ref(node), 0.0).is_some());
+            let candidates = nodes
+                .iter()
+                .filter_map(|node| {
+                    let (snapshot, _, _) = observations.iter().find(|(_, peer, _)| {
+                        peer["hostname"].as_str() == Some(node.name.as_str())
+                    })?;
+                    Some(named_balancer::ObservedPeer {
+                        name: &node.name,
+                        output_kbit: snapshot.value["output_kbit"].as_u64(),
+                        bandwidth_usage: snapshot.value["bandwidth_usage"].as_f64(),
+                        clients: snapshot.value["total_clients"].as_u64(),
+                        total_streams_count: snapshot.value["total_streams_count"].as_u64(),
+                        age_ms: node.age_ms,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let ip = client_ip.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+            let country = if named_balancer::row_requires_geoip(policy) {
+                app.geoip.as_ref().and_then(|geoip| geoip.country(ip))
+            } else {
+                None
+            };
+            named_balancer::rank(
+                policy,
+                &candidates,
+                ip,
+                country.as_deref(),
+                revision,
+                name,
+                grant.session_identity().unwrap_or(""),
+            )
+            .into_iter()
+            .next()
+        } else {
+            app.routing_rotation.select(&nodes, 0.0, &mut turn)
+        };
+        let Some(id) = selected else {
             break;
         };
         attempted.insert(id.clone());
@@ -2454,13 +2537,27 @@ async fn balance_inner(
 }
 async fn media_request(State(app): State<Arc<App>>, request: Request) -> Response {
     let activity = app.media.idle_memory.activity().await;
+    let post_named = (request.method() == "POST")
+        .then(|| named_balancer::http_path(&app.config.snapshot(), request.uri().path()));
     let mut response = if request.method() == "OPTIONS" {
         StatusCode::NO_CONTENT.into_response()
     } else if request.method() == "POST" {
-        if browser_management_write_allowed(&request, app.options.admin_public_origin.as_ref()) {
-            publication::receive(app, request).await
-        } else {
-            error(StatusCode::FORBIDDEN, "cross-origin publication request")
+        match post_named.expect("POST path was checked") {
+            Err(message) => error(StatusCode::BAD_REQUEST, message),
+            Ok(Some(_)) => error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "named balancer publishing is not supported",
+            ),
+            Ok(None) => {
+                if browser_management_write_allowed(
+                    &request,
+                    app.options.admin_public_origin.as_ref(),
+                ) {
+                    publication::receive(app, request).await
+                } else {
+                    error(StatusCode::FORBIDDEN, "cross-origin publication request")
+                }
+            }
         }
     } else {
         serve_media_request(app, request).await
@@ -2488,7 +2585,20 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     if request.method() != "GET" {
         return error(StatusCode::METHOD_NOT_ALLOWED, "playback requires GET");
     }
-    let raw_path = request.uri().path();
+    let named_revision = app.config.revision();
+    let named = match named_balancer::http_path(&app.config.snapshot(), request.uri().path()) {
+        Ok(named) => named,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
+    if named.is_some() && app.options.role != "lb" {
+        return error(StatusCode::NOT_FOUND, "named balancer path is unavailable");
+    }
+    if named.is_some() && !named_balancer::valid_admission_query(request.uri().query()) {
+        return error(StatusCode::BAD_REQUEST, "conflicting admission markers");
+    }
+    let raw_path = named
+        .as_ref()
+        .map_or(request.uri().path(), |route| route.media_path.as_str());
     let path = percent_encoding::percent_decode_str(raw_path.trim_start_matches('/'))
         .decode_utf8_lossy()
         .to_string();
@@ -2544,7 +2654,15 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
                         .serve(
                             &app,
                             crate::vendor_playback::HttpRequest::new(
-                                &request, name, file, key, revision,
+                                &request,
+                                name,
+                                file,
+                                key,
+                                revision,
+                                raw_path,
+                                named
+                                    .as_ref()
+                                    .map(|route| (route.balancer.as_str(), named_revision)),
                             ),
                         )
                         .await
@@ -2569,6 +2687,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         .get::<ConnectInfo<SocketAddr>>()
         .map(|v| v.0.ip().to_string())
         .unwrap_or_else(|| "127.0.0.1".into());
+    let client_ip = ip.parse::<IpAddr>().ok();
     app.http_handoffs.prune();
     if query.contains_key("flussonix_ticket") && query.contains_key("flussonix_handoff") {
         return error(StatusCode::BAD_REQUEST, "conflicting admission markers");
@@ -2718,12 +2837,23 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         return error(StatusCode::FORBIDDEN, "playback policy changed");
     }
     if app.options.role == "lb" {
+        if named.is_some() && (named_revision != revision || app.config.revision() != revision) {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "named balancer configuration changed",
+            );
+        }
+        let viewer_query = App::http_viewer_query(request.uri().query().unwrap_or(""));
         return balance(
             &app,
-            name,
-            raw_path,
-            &App::http_viewer_query(request.uri().query().unwrap_or("")),
-            secure,
+            BalanceRequest {
+                name,
+                path: raw_path,
+                query: &viewer_query,
+                secure,
+                named: named.as_ref().map(|route| route.balancer.as_str()),
+                client_ip,
+            },
             &grant,
             revision,
         )
