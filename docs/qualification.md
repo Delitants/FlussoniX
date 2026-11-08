@@ -63,6 +63,15 @@ candidate soak must run without a concurrent heavy build on the same root
 filesystem and retain host I/O evidence for any new gap; the current run
 remains a failed uninterrupted-playback qualification.
 
+The host's sysstat sample ending at 14:50 HST covers the gap window near
+14:48. Its ten-minute averages show 21.65% CPU I/O wait, 128,956.64 kB/s
+of NVMe writes, 18.21 ms NVMe request wait and a 25.61 NVMe queue depth.
+The preceding sample had 0.10% I/O wait and 15,871.85 kB/s of NVMe writes;
+the following sample had 0.04% I/O wait. The kernel journal has no entries in
+the five-minute gap window. These coarse host measurements support a storage
+contention hypothesis but cannot prove that contention caused the source
+stalls or exclude a media-path defect.
+
 A final lifecycle review found that synchronous sequence-state I/O could stall
 the async runtime, idle cleanup could retire a newer worker, and cancellation
 could release the per-stream fence before old media was removed. The follow-up
