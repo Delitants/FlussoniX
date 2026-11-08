@@ -49,9 +49,15 @@ pub(crate) fn decode_track(fields: &[BoxView<'_>]) -> Result<Track, String> {
     if &h[8..12] != kind.handler() {
         return Err("native handler/codec kind mismatch".into());
     }
-    let config = required(fields, b"cnfg")?
-        .get(4..)
-        .ok_or("short codec configuration")?;
+    // Flussonic advertises silent text tracks in MDin/M4F metadata without a
+    // cnfg box. Audio and video still require their explicit codec setup.
+    let config = if kind == Codec::Subtitle && !fields.iter().any(|(name, _)| *name == b"cnfg") {
+        &[][..]
+    } else {
+        required(fields, b"cnfg")?
+            .get(4..)
+            .ok_or("short codec configuration")?
+    };
     if config.len() > 1024 * 1024 {
         return Err("native codec configuration exceeds limit".into());
     }

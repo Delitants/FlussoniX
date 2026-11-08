@@ -259,6 +259,22 @@ pub fn unpack(data: &[u8]) -> Result<(Vec<Track>, Vec<Frame>), String> {
             .map_err(|_| "timestamp overflow")?
             .checked_add(shift * 90000 / track_scale as i64)
             .ok_or("timestamp overflow")?;
+        // An announced subtitle track may have no samples in this segment.
+        // Preserve its identity for policy/relay handling, but only accept a
+        // fully absent sample-table set; partial tables remain malformed.
+        let has_sample_table = [
+            b"stsz".as_slice(),
+            b"stsc".as_slice(),
+            b"stco".as_slice(),
+            b"stts".as_slice(),
+            b"ctts".as_slice(),
+            b"stss".as_slice(),
+        ]
+        .iter()
+        .any(|name| fields.iter().any(|(field, _)| *field == *name));
+        if kind == Codec::Subtitle && !has_sample_table {
+            continue;
+        }
         let stsz = field(&fields, b"stsz")?;
         let count = read32(stsz, 8)? as usize;
         if frames.len() + count > 100000 || count == 0 {
@@ -333,6 +349,9 @@ pub fn unpack(data: &[u8]) -> Result<(Vec<Track>, Vec<Frame>), String> {
                 .checked_add(durations[i] * 90000 / track_scale as i64)
                 .ok_or("timestamp overflow")?;
         }
+    }
+    if frames.is_empty() {
+        return Err("empty M4F segment".into());
     }
     frames.sort_by_key(|f| f.dts);
     validate_tracks(&tracks)?;
