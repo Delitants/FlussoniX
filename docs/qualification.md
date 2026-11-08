@@ -9,11 +9,10 @@ formatting, warning-denied all-target Clippy, the full serial locked Rust
 suite with owned media fixtures, bounded IPTV authority load smokes, and the
 UI build and browser checks. Its `release_package_smoke` job built and started
 an independently packaged daemon, exercised installation/upgrade smoke checks,
-and verified official Flussonic components were absent. The local candidate
-has no product, build-script or workflow changes after that CI head; later
-commits are evidence documentation only. This closes the exact product-source
-CI and package-smoke checks, but it does not close the 24-hour soak, security,
-live migration or full API-compatibility gates.
+and verified official Flussonic components were absent. This run is historical
+evidence for that head. Later product changes require fresh exact-head checks,
+tracked on [PR #51](https://github.com/Delitants/FlussoniX/pull/51). It does
+not close the 24-hour soak, live migration or full API-compatibility gates.
 
 ## Durable HLS sequence recovery candidate (2026-11-07)
 
