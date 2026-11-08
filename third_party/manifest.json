@@ -1,8 +1,8 @@
 {
-  "cargo_lock_sha256": "a7f8114ae458c5d45efe56cd0e4b64bd5a4b4f8616f24a4d0fbb54e8f316fd89",
-  "cargo_manifest_sha256": "dbb466d8d9949f982e72bec761cc299e42b82454221f711a199dd41d628ebf27",
+  "cargo_lock_sha256": "81ceea3385c747b1a0d85d6980f22a61271df43ca2be1c785af7e4424aa7b8ba",
+  "cargo_manifest_sha256": "3174ddc642eb70cefdb3c81c88a29542a6240b3b81789ed5d7158f831f7e7896",
   "format": 1,
-  "notices_sha256": "511044844a9f37da399ea533b4b198fb8e534b21f9fd414ad2af2a53a70476ac",
+  "notices_sha256": "114634d6f48b8753fc62dc96e3ac316361ab7ce4072fd73f0288b2c972d6a19b",
   "packages": [
     {
       "declared_license": "MIT OR Apache-2.0",
@@ -1501,6 +1501,26 @@
       "ecosystem": "rust",
       "files": [
         {
+          "bytes": 11357,
+          "path": "licenses/rust/ipnetwork-0.21.1/LICENSE-APACHE.md",
+          "sha256": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1",
+          "upstream_path": "LICENSE-APACHE.md"
+        },
+        {
+          "bytes": 1075,
+          "path": "licenses/rust/ipnetwork-0.21.1/LICENSE-MIT.md",
+          "sha256": "69d42a32f6597af73843e0a4ffb3f3c11cafddf1df85986748c74296450a45ca",
+          "upstream_path": "LICENSE-MIT.md"
+        }
+      ],
+      "name": "ipnetwork",
+      "version": "0.21.1"
+    },
+    {
+      "declared_license": "MIT OR Apache-2.0",
+      "ecosystem": "rust",
+      "files": [
+        {
           "bytes": 11358,
           "path": "licenses/rust/is_terminal_polyfill-1.70.2/LICENSE-APACHE",
           "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08",
@@ -1731,6 +1751,20 @@
       ],
       "name": "matchit",
       "version": "0.8.4"
+    },
+    {
+      "declared_license": "ISC",
+      "ecosystem": "rust",
+      "files": [
+        {
+          "bytes": 772,
+          "path": "licenses/rust/maxminddb-0.27.3/LICENSE",
+          "sha256": "798ec93a28c76d881f412b285b07a2cbeb8c03ca29c25da9d46aa147448d5741",
+          "upstream_path": "LICENSE"
+        }
+      ],
+      "name": "maxminddb",
+      "version": "0.27.3"
     },
     {
       "declared_license": "MIT OR Apache-2.0",

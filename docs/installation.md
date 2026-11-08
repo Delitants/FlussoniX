@@ -100,9 +100,9 @@ optional named HTTP playback paths such as `/lb0/channel/index.m3u8`. A
 country-scoped balancer also needs a local Country or City MaxMindDB file
 selected at startup with `--geoip-db /absolute/path/country.mmdb`; use an
 absolute path so restarts find the same file. The UI shows whether it loaded.
-Named URLs do not accept publishing POSTs. See the
-[cluster guide](cluster-loadbalancing.md#named-http-balancers) for placement
-limits and the separate CDN admission behavior.
+Named paths accept HTTP GET playback and reject publishing POSTs. The LB
+redirects eligible viewers; the selected CDN checks viewer authorization and
+admission again.
 
 For built-in IPTV, restart with `--iptv-public-origin https://your-viewer-host`
 using the actual HTTP(S) origin viewers can reach. Open **Config → IPTV** to
