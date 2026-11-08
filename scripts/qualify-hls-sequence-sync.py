@@ -60,7 +60,11 @@ def check(lines: list[str]) -> None:
     if root is None or record_rename is None or temporary_record is None:
         raise RuntimeError("fixture did not create and rename its HLS sequence record")
     before_publication = {path for index, path in synced if index < record_rename}
-    missing = [str(path) for path in (root.parent, root, temporary_record) if path not in before_publication]
+    missing = [
+        str(path)
+        for path in (root.parent.parent, root.parent, root, temporary_record)
+        if path not in before_publication
+    ]
     if missing:
         raise RuntimeError("missing fsync before record rename: " + ", ".join(missing))
     if not any(index > record_rename and path == root / ".hls-sequences" for index, path in synced):

@@ -47,6 +47,8 @@ directory with broader permissions or a symlink. For an older installation,
 stop it and run `chmod 700 "$flussonix_data/media"` before upgrading. HLS
 delivery also rejects symlinked or foreign-owned generated files and media
 directories; keep `--media-dir` under this private state path.
+The daemon also needs read access to every parent directory of `--media-dir`
+so it can durably sync newly created directory entries before publishing HLS.
 
 Choose an admin password and create a cluster peer key once with
 `openssl rand -hex 32`. Save both in your password manager and reuse them after

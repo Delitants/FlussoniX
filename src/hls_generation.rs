@@ -115,20 +115,16 @@ fn ensure_state_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Persist directory entries for a newly created media root and its sequence
-/// directory before publishing a record that playback will rely on after a
+/// Persist the sequence directory and every ancestor entry of a newly created
+/// media root before publishing a record that playback will rely on after a
 /// power loss. This runs once per worker generation, not on each segment.
 fn sync_state_parents(root: &Path) -> Result<(), String> {
-    let parent = root
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| "cannot sync HLS media root parent")?;
-    File::open(root)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| "cannot sync HLS media root")?;
+    let physical_root = fs::canonicalize(root).map_err(|_| "cannot resolve HLS media root")?;
+    for path in physical_root.ancestors() {
+        File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| "cannot sync HLS media root ancestry")?;
+    }
     Ok(())
 }
 
@@ -292,7 +288,7 @@ mod tests {
     #[test]
     fn fresh_media_root_can_create_its_first_private_floor() {
         let parent = tempfile::tempdir().unwrap();
-        let root = parent.path().join("new-media-root");
+        let root = parent.path().join("runtime/new-media-root");
         let media = root.join("stream-media");
         let epoch = Epoch::with_clock(&root, 1000);
 
