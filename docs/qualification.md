@@ -60,6 +60,17 @@ release passed upgrade, rollback, and return with independent HLS decode.
 Temporary package files, test daemons, and UI dependencies were removed. The
 remaining integration suite and separate release gates remain open.
 
+An additional owned loopback check used the exact packaged candidate binary
+`0edc22f6d3ebfb037f81fcbba6d2c34965e3681c9aca26d64a2129a08b7e0b04`.
+After both TS-HLS and fMP4 published a segment, the test sent `SIGKILL` to
+the test daemon's process group, including its FFmpeg child, and restarted
+against the same private state and media directory. Both new public playlists
+started at the prior next sequence, neither reused its old segment name, old
+segment URLs were unavailable, and independent FFmpeg decoded five pictures
+from each new playlist. The test daemon, child processes and temporary state
+were removed. This verifies one ungraceful process restart; it does not model
+storage write loss or establish the separate physical power-loss gate.
+
 ## Isolated FXLink v9 two-stream loss probe (2026-11-07)
 
 The exact `9b56379` release binary (SHA-256
