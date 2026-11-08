@@ -342,6 +342,98 @@ mod tests {
     use tokio::io::AsyncWrite;
 
     #[tokio::test]
+    async fn pinned_hostname_tls_keeps_original_identity_for_native_and_vendor() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cert = crate::transport_tls_fixture::Certificates::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = requests.clone();
+        let acceptor = tokio_rustls::TlsAcceptor::from(cert.server());
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let Ok(mut stream) = acceptor.accept(socket).await else {
+                    continue;
+                };
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 8192 {
+                    let mut byte = [0];
+                    if stream.read_exact(&mut byte).await.is_err() {
+                        break;
+                    }
+                    head.push(byte[0]);
+                }
+                if head.ends_with(b"\r\n\r\n") {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        });
+
+        for (hostname, expected_requests) in [("localhost", 1), ("wrong.invalid", 1)] {
+            let input = format!("m4ss://{hostname}:{}/owned", address.port());
+            let result = super::super::pull_inner_with_resolve(
+                &input,
+                None,
+                &mut Vec::new(),
+                None,
+                None,
+                PullOptions {
+                    ca: Some(&cert.ca),
+                    ..PullOptions::default()
+                },
+                move |host, port| async move {
+                    assert_eq!(host, hostname);
+                    assert_eq!(port, address.port());
+                    Ok(vec![address])
+                },
+            )
+            .await;
+            assert!(result.is_err(), "empty fixture media must end the pull");
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                expected_requests,
+                "wrong-host certificate reached native application data"
+            );
+        }
+
+        for (hostname, expected_requests) in [("localhost", 2), ("wrong.invalid", 2)] {
+            let root = format!("https://{hostname}:{}", address.port());
+            let input =
+                MediaInput::new(&root, "owned", Transport::M4s, "key", Some(&cert.ca)).unwrap();
+            let prepared = input
+                .prepare_with(move |host, port| async move {
+                    assert_eq!(host, hostname);
+                    assert_eq!(port, address.port());
+                    Ok(vec![address])
+                })
+                .await
+                .unwrap();
+            let result = prepared
+                .get(prepared.control.clone(), None)
+                .unwrap()
+                .send()
+                .await;
+            assert_eq!(result.is_ok(), hostname == "localhost");
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                expected_requests,
+                "wrong-host certificate reached vendor application data"
+            );
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn vendor_m4f_reconnect_and_segments_keep_generation_address_pin() {
         use axum::{Router, body::Body, extract::OriginalUri, response::Response, routing::get};
         use std::{
