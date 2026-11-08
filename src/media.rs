@@ -288,7 +288,7 @@ impl Engine {
             root: root.as_ref().into(),
             ffmpeg: ffmpeg.into(),
             tesseract: tesseract.into(),
-            hls_epoch: crate::hls_generation::Epoch::new(),
+            hls_epoch: crate::hls_generation::Epoch::for_root(root.as_ref()),
             workers: Mutex::new(HashMap::new()),
             input_preferences: Mutex::new(HashMap::new()),
             startup_gates: std::sync::Mutex::new(HashMap::new()),
@@ -422,6 +422,21 @@ impl Engine {
             && workers
                 .get(name)
                 .is_some_and(|worker| worker.input_index == index);
+        if same {
+            self.input_preferences.lock().await.insert(
+                name.to_owned(),
+                InputPreference {
+                    index,
+                    inputs: fingerprint,
+                },
+            );
+            return Ok(false);
+        }
+        let retired = workers.remove(name);
+        drop(workers);
+        if let Some(worker) = retired {
+            self.retire_detached(name, worker).await?;
+        }
         self.input_preferences.lock().await.insert(
             name.to_owned(),
             InputPreference {
@@ -429,14 +444,6 @@ impl Engine {
                 inputs: fingerprint,
             },
         );
-        if same {
-            return Ok(false);
-        }
-        let retired = workers.remove(name);
-        drop(workers);
-        if let Some(worker) = retired {
-            self.stop_worker(name, worker).await;
-        }
         Ok(active || retry_demand)
     }
     pub async fn publish_guarded(
@@ -836,10 +843,6 @@ impl Engine {
                 restart_count = w.restart_count.saturating_add(1);
                 streak = recovery.next_streak();
             }
-            w.cancel.cancel();
-            if let Some(done) = w.done.lock().await.take() {
-                let _ = done.await;
-            }
         }
         if shared.as_ref().is_some_and(|s| s.input.is_none()) {
             return Err("shared input startup owner required".into());
@@ -896,11 +899,17 @@ impl Engine {
             return Err("waiting for publisher".into());
         }
         let dir = self.directory(name);
-        let replaced = workers.contains_key(name);
-        let sequence = self.hls_epoch.next(&dir).await?;
+        let retired = workers.remove(name);
+        let replaced = retired.is_some();
+        drop(workers);
+        if let Some(old) = retired {
+            self.join_and_commit(name, old).await?;
+        }
+        // Reserve the next sequence before discarding the last public playlists.
+        let sequence = self.hls_epoch.next_for(name, &dir)?;
         let generation = uuid::Uuid::new_v4().simple().to_string();
         let discontinuity = if replaced { "+discont_start" } else { "" };
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        Self::remove_media(&dir).await?;
         tokio::fs::create_dir_all(dir.join("fmp4"))
             .await
             .map_err(|e| e.to_string())?;
@@ -1454,7 +1463,21 @@ impl Engine {
             .as_str()
             .unwrap_or("")
             .to_owned();
+        let mut workers = self.workers.lock().await;
+        if workers.contains_key(name)
+            || workers
+                .values()
+                .filter(|w| w.alive.load(Ordering::Relaxed))
+                .count()
+                >= 256
+        {
+            return Err("worker limit reached".into());
+        }
+        if shared.as_ref().is_some_and(|s| !s.feed.current()) {
+            return Err("media route changed".into());
+        }
         workers.insert(name.into(), worker.clone());
+        drop(workers);
         let w = worker.clone();
         let tesseract = self.tesseract.clone();
         let push_tasks: Vec<_> = worker
@@ -2002,25 +2025,55 @@ impl Engine {
         }
         Ok(Bytes::from(data))
     }
-    async fn stop_worker(&self, name: &str, w: Arc<Worker>) {
+    async fn join_and_commit(&self, name: &str, w: Arc<Worker>) -> Result<(), String> {
         w.cancel.cancel();
         if let Some(done) = w.done.lock().await.take() {
             let _ = done.await;
         }
-        let _ = self.hls_epoch.observe(&self.directory(name)).await;
-        let _ = tokio::fs::remove_dir_all(self.directory(name)).await;
+        let directory = self.directory(name);
+        self.hls_epoch.commit_observed(name, &directory)
+    }
+    async fn remove_media(directory: &Path) -> Result<(), String> {
+        match tokio::fs::remove_dir_all(directory).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err("cannot remove retired HLS media".into()),
+        }
+    }
+    async fn retire_detached(&self, name: &str, w: Arc<Worker>) -> Result<(), String> {
+        self.join_and_commit(name, w).await?;
+        Self::remove_media(&self.directory(name)).await
     }
     pub async fn stop(&self, name: &str) {
-        let mut workers = self.workers.lock().await;
-        if let Some(w) = workers.remove(name) {
-            self.stop_worker(name, w).await;
+        let _startup = self.startup_gate(name).lock_owned().await;
+        let retired = self.workers.lock().await.remove(name);
+        if let Some(w) = retired {
+            if let Err(error) = self.retire_detached(name, w).await {
+                tracing::warn!(
+                    stream = name,
+                    error = error,
+                    "failed to retire media worker"
+                );
+            }
         }
     }
     pub async fn stop_if_current(&self, name: &str, expected: &Arc<Worker>) {
-        let mut workers = self.workers.lock().await;
-        if workers.get(name).is_some_and(|w| Arc::ptr_eq(w, expected)) {
-            let worker = workers.remove(name).unwrap();
-            self.stop_worker(name, worker).await;
+        let _startup = self.startup_gate(name).lock_owned().await;
+        let retired = {
+            let mut workers = self.workers.lock().await;
+            workers
+                .get(name)
+                .is_some_and(|worker| Arc::ptr_eq(worker, expected))
+                .then(|| workers.remove(name).unwrap())
+        };
+        if let Some(worker) = retired {
+            if let Err(error) = self.retire_detached(name, worker).await {
+                tracing::warn!(
+                    stream = name,
+                    error = error,
+                    "failed to retire media worker"
+                );
+            }
         }
     }
     pub async fn stop_all(&self) {
@@ -3026,6 +3079,62 @@ mod input_selection_lock_tests {
     use super::*;
 
     #[tokio::test]
+    async fn explicit_stop_waiting_for_worker_does_not_hold_the_global_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(dir.path(), "ffmpeg"));
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        let victim = engine.ensure("victim", &config).await.unwrap();
+        engine.ensure("unrelated", &config).await.unwrap();
+        let hold_completion = victim.done.lock().await;
+        let stopping = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.stop("victim").await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !victim.cancel.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let unrelated = tokio::time::timeout(Duration::from_secs(1), engine.count()).await;
+        drop(hold_completion);
+        stopping.await.unwrap();
+        engine.stop_all().await;
+        assert_eq!(
+            unrelated.expect("stop held the worker map across a join"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_stop_waiting_for_worker_does_not_hold_the_global_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(dir.path(), "ffmpeg"));
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        let victim = engine.ensure("victim", &config).await.unwrap();
+        engine.ensure("unrelated", &config).await.unwrap();
+        let hold_completion = victim.done.lock().await;
+        let stopping = {
+            let engine = engine.clone();
+            let victim = victim.clone();
+            tokio::spawn(async move { engine.stop_if_current("victim", &victim).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !victim.cancel.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let unrelated = tokio::time::timeout(Duration::from_secs(1), engine.count()).await;
+        drop(hold_completion);
+        stopping.await.unwrap();
+        engine.stop_all().await;
+        assert_eq!(unrelated.expect("conditional stop held the worker map"), 1);
+    }
+
+    #[tokio::test]
     async fn selection_teardown_does_not_block_unrelated_worker_queries() {
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::new(dir.path(), "ffmpeg"));
@@ -3054,6 +3163,224 @@ mod input_selection_lock_tests {
         selecting.await.unwrap().unwrap();
         assert_eq!(unrelated.unwrap(), 1);
         engine.stop_all().await;
+    }
+}
+
+#[cfg(test)]
+mod hls_retirement_tests {
+    use super::*;
+    use crate::server::{App, Options};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn replacement_join_does_not_block_unrelated_worker_queries() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(root.path(), "ffmpeg"));
+        let original = json!({"inputs":[{"url":"testsrc://"}]});
+        let changed = json!({"inputs":[{"url":"testsrc://"}],"flussonix_hls_subtitles":"drop"});
+        let old = engine.ensure("owned", &original).await.unwrap();
+        engine.ensure("unrelated", &original).await.unwrap();
+        let hold_completion = old.done.lock().await;
+        let replacing = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.ensure("owned", &changed).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !old.cancel.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let unrelated = tokio::time::timeout(Duration::from_secs(1), engine.count()).await;
+        drop(hold_completion);
+        let replacement = replacing.await.unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&old, &replacement));
+        engine.stop_all().await;
+        assert!(
+            unrelated.is_ok(),
+            "replacement held the map while joining the old worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_commit_preserves_old_media_and_publishes_no_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::new(root.path(), "ffmpeg");
+        let original = json!({"inputs":[{"url":"testsrc://"}]});
+        let changed = json!({"inputs":[{"url":"testsrc://"}],"flussonix_hls_subtitles":"drop"});
+        engine.ensure("owned", &original).await.unwrap();
+        let media = engine.directory("owned");
+        std::fs::write(media.join("recovery-marker"), b"old generation").unwrap();
+        let record = root.path().join(".hls-sequences").join(format!(
+            "{}.json",
+            media.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(record, b"{").unwrap();
+
+        let result = engine.ensure("owned", &changed).await;
+
+        assert!(result.is_err(), "replacement concealed a corrupt floor");
+        assert!(engine.workers.lock().await.get("owned").is_none());
+        assert!(
+            media.join("recovery-marker").exists(),
+            "replacement lost recovery media"
+        );
+    }
+
+    #[tokio::test]
+    async fn obsolete_conditional_stop_does_not_delete_replacement_media() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::new(root.path(), "ffmpeg");
+        let original = json!({"inputs":[{"url":"testsrc://"}]});
+        let changed = json!({"inputs":[{"url":"testsrc://"}],"flussonix_hls_subtitles":"drop"});
+        let old = engine.ensure("owned", &original).await.unwrap();
+        let current = engine.ensure("owned", &changed).await.unwrap();
+        let marker = engine.directory("owned").join("new-generation");
+        std::fs::write(&marker, b"current generation").unwrap();
+
+        engine.stop_if_current("owned", &old).await;
+
+        assert!(Arc::ptr_eq(
+            engine.workers.lock().await.get("owned").unwrap(),
+            &current
+        ));
+        assert!(marker.exists(), "obsolete stop deleted replacement media");
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn stop_all_waiting_for_one_join_keeps_other_stream_observable() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(root.path(), "ffmpeg"));
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        let old = engine.ensure("owned", &config).await.unwrap();
+        engine.ensure("other", &config).await.unwrap();
+        let hold_completion = old.done.lock().await;
+        let stopping = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.stop_all().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !old.cancel.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(1), engine.count()).await;
+        drop(hold_completion);
+        stopping.await.unwrap();
+        assert!(
+            observed.is_ok(),
+            "stop-all held the global map across a join"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_reconcile_commits_floor_before_removing_media() {
+        let root = tempfile::tempdir().unwrap();
+        let app = App::new(
+            root.path().join("config.json"),
+            root.path().join("media"),
+            Options {
+                admin_password: "owned-idle-admin".into(),
+                peer_key: "owned-idle-peer".into(),
+                uplink_interface: "process".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let config = json!({"static":false,"inputs":[{"url":"testsrc://"}]});
+        app.config.put("streams", "owned", config.clone()).unwrap();
+        let worker = app.media.ensure("owned", &config).await.unwrap();
+        *worker.last_access.lock().unwrap() = Instant::now() - Duration::from_secs(61);
+        let media = app.media.directory("owned");
+        let record = root.path().join("media/.hls-sequences").join(format!(
+            "{}.json",
+            media.file_name().unwrap().to_string_lossy()
+        ));
+
+        app.reconcile().await;
+
+        assert!(worker.is_closed());
+        assert!(app.media.workers.lock().await.get("owned").is_none());
+        assert!(record.is_file(), "idle cleanup discarded the durable floor");
+        assert!(!media.exists(), "idle cleanup retained retired media");
+        app.media.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn startup_reserves_a_durable_floor_before_publishing_a_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::new(root.path(), "ffmpeg");
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        engine.ensure("owned", &config).await.unwrap();
+        let record = root.path().join(".hls-sequences").join(format!(
+            "{}.json",
+            engine
+                .directory("owned")
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+        ));
+        let saved = record.is_file();
+        engine.stop_all().await;
+        assert!(saved, "startup published a worker without a durable floor");
+    }
+
+    #[tokio::test]
+    async fn failed_floor_commit_preserves_old_media_for_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::new(root.path(), "ffmpeg");
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        let worker = engine.ensure("owned", &config).await.unwrap();
+        let media = engine.directory("owned");
+        std::fs::write(media.join("recovery-marker"), b"old generation").unwrap();
+        let state = root.path().join(".hls-sequences");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let record = state.join(format!(
+            "{}.json",
+            media.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&record, b"{").unwrap();
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        engine.stop("owned").await;
+
+        assert!(worker.is_closed());
+        assert!(
+            media.join("recovery-marker").exists(),
+            "failed commit discarded recovery media"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_selection_commit_preserves_media_and_does_not_change_preference() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::new(root.path(), "ffmpeg");
+        let config = json!({"inputs":[{"url":"testsrc://"},{"url":"testsrc://"}]});
+        engine.ensure("owned", &config).await.unwrap();
+        let media = engine.directory("owned");
+        std::fs::write(media.join("recovery-marker"), b"old generation").unwrap();
+        let state = root.path().join(".hls-sequences");
+        let record = state.join(format!(
+            "{}.json",
+            media.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&record, b"{").unwrap();
+
+        let selection = engine
+            .select_input_guarded("owned", &config, 1, std::future::ready(true))
+            .await;
+
+        assert!(selection.is_err(), "selection hid the failed floor commit");
+        assert!(
+            media.join("recovery-marker").exists(),
+            "failed selection lost recovery media"
+        );
+        assert_eq!(engine.preferred_input("owned", &config).await, None);
     }
 }
 
