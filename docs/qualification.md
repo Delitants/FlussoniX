@@ -2364,3 +2364,15 @@ On the integrated candidate, the native TLS, vendor source binding, modern
 vendor binding and SRT ticket suites passed all 44 tests. Formatting and
 warning-denied all-target Clippy also passed. Full CI and the release security
 review still need to run on this combined source.
+
+## RTSP connection admission candidate
+
+Candidate `c55bf30` keeps a per-peer-IP connection lease for the full RTSP or
+RTSPS socket lifetime, including TLS setup, admitted playback and publication.
+One IP can hold at most 64 of a listener's 256 control connections. An owned
+loopback listener rejected a saturated IP, completed an admitted DESCRIBE from
+another IP, retained that lease through the response and re-admitted the first
+IP after release. Cancellation emptied the gate and stopped the owned worker.
+The RTSP unit and RTSP/RTSPS authorization suites passed locally, as did
+formatting and warning-denied all-target Clippy on the isolated branch. The
+same-source full CI and release security review remain pending.
