@@ -60,6 +60,7 @@ pub struct Options {
     pub node_name: String,
     pub uplink_mbps: f64,
     pub uplink_interface: String,
+    pub geoip_db: Option<PathBuf>,
     pub client_limit: u64,
     pub web_dir: PathBuf,
     pub iptv_public_origin: Option<url::Url>,
@@ -115,6 +116,7 @@ impl Default for Options {
             node_name: "local".into(),
             uplink_mbps: 1000.0,
             uplink_interface: "auto".into(),
+            geoip_db: None,
             client_limit: 1000,
             web_dir: "web/dist".into(),
             iptv_public_origin: None,
@@ -190,6 +192,7 @@ pub struct App {
     http_handoffs: http_handoff::Registry,
     rtsp_routes: rtsp_balancer::Registry,
     http_routes: http_balancer::Registry,
+    geoip: Option<named_balancer::GeoIp>,
     routing_rotation: TieRotation,
     pub egress: Arc<AtomicU64>,
     pub rtsp_egress: Arc<AtomicU64>,
@@ -437,6 +440,14 @@ impl App {
             .as_secs();
         let iptv_leases = Arc::new(Ledger::new(started, 100_000, iptv.revision()));
         let config = Arc::new(ConfigStore::open(config_path)?);
+        let geoip = options
+            .geoip_db
+            .as_deref()
+            .map(named_balancer::GeoIp::open)
+            .transpose()?;
+        if geoip.is_none() && named_balancer::requires_geoip(&config.snapshot()) {
+            return Err("named balancer country rules require --geoip-db".into());
+        }
         let node_id = crate::node_identity::load_or_create(config_path)?;
         let modern_sources =
             crate::source_directory::modern_coordinator::ModernSourceCoordinator::new(
@@ -507,6 +518,7 @@ impl App {
             http_handoffs: http_handoff::Registry::default(),
             rtsp_routes: rtsp_balancer::Registry::default(),
             http_routes: http_balancer::Registry::default(),
+            geoip,
             routing_rotation: TieRotation::default(),
             egress: Arc::new(AtomicU64::new(0)),
             rtsp_egress: Arc::new(AtomicU64::new(0)),
@@ -889,10 +901,13 @@ impl App {
             "hostname":self.node_name,
             "uptime":self.started.elapsed().as_secs(),
             "total_streams":self.config.read(|root|root["streams"].as_array().map_or(0,Vec::len)),
+            "total_streams_count":self.config.read(|root|root["streams"].as_array().map_or(0,Vec::len)),
             "online_streams":online_streams,
             "total_clients":self.active().await,
             "total_bandwidth":(self.options.uplink_mbps*1_000_000.0).round() as u64,
             "output_kbit":output_kbit,
+            "bandwidth_usage":metrics["uplink"].as_f64().filter(|n|n.is_finite() && *n>=0.0 && *n<=100.0).map(|n|n*100.0),
+            "geoip":{"configured":self.geoip.is_some(),"revision":self.geoip.as_ref().map(named_balancer::GeoIp::revision)},
             "cpu_usage":percent("cpu"),
             "memory_usage":percent("ram")
         })
@@ -998,6 +1013,21 @@ impl App {
             .as_object_mut()
             .unwrap()
             .extend(node.as_object().unwrap().clone());
+        metrics["output_kbit"] = metrics["egress_mbps"]
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .map(|n| json!((n * 1000.0).round() as u64))
+            .unwrap_or(Value::Null);
+        metrics["bandwidth_usage"] = metrics["uplink"]
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.0 && *n <= 100.0)
+            .map(|n| json!(n * 100.0))
+            .unwrap_or(Value::Null);
+        metrics["total_clients"] = metrics["active"].clone();
+        metrics["total_streams_count"] = json!(
+            self.config
+                .read(|root| root["streams"].as_array().map_or(0, Vec::len))
+        );
         metrics["stream_bitrates"] = stream_bitrates;
         metrics["source_activation"] = self.source_activation_status().await;
         if let Some(runtime) = &self.vendor_playback {
@@ -1354,7 +1384,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
             return management_read_response(role, result);
         }
         if method == "POST" {
-            return validate_config_request(&app.config, request).await;
+            return validate_config_request(&app, request).await;
         }
         let body = match read_json(request).await {
             Ok(b) => b,
@@ -1362,6 +1392,17 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         };
         if method != "PUT" {
             return error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+        }
+        if app.geoip.is_none()
+            && app
+                .config
+                .validate(body.clone())
+                .is_ok_and(|next| named_balancer::requires_geoip(&next))
+        {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "named balancer country rules require --geoip-db",
+            );
         }
         let result = app.config.replace(body);
         return match result {
@@ -1534,6 +1575,15 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
                 Ok(b) => b,
                 Err((code, message)) => return error(code, &message),
             };
+            if kind == "balancers"
+                && app.geoip.is_none()
+                && named_balancer::row_requires_geoip(&body)
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "named balancer country rules require --geoip-db",
+                );
+            }
             return match app.config.put(kind, name, body) {
                 Ok(mut v) => {
                     if matches!(kind, "streams" | "templates") {
@@ -1673,7 +1723,8 @@ async fn read_json(request: Request) -> Result<Value, (StatusCode, String)> {
         .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "body exceeds limit".into()))?;
     serde_json::from_slice(&bytes).map_err(|_| (StatusCode::BAD_REQUEST, "invalid JSON".into()))
 }
-async fn validate_config_request(config: &ConfigStore, request: Request) -> Response {
+async fn validate_config_request(app: &App, request: Request) -> Response {
+    let config = &app.config;
     let text_plain = request
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
@@ -1731,7 +1782,20 @@ async fn validate_config_request(config: &ConfigStore, request: Request) -> Resp
         }
     };
     match config.validate(patch.clone()) {
-        Ok(validated) => json_response(validated),
+        Ok(validated) => {
+            if app.geoip.is_none() && named_balancer::requires_geoip(&validated) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "error":"invalid_config","config":patch,
+                        "detail":"named balancer country rules require --geoip-db",
+                        "path":["server_config","balancers"]
+                    })),
+                )
+                    .into_response();
+            }
+            json_response(validated)
+        }
         Err(detail) => {
             let unknown = detail
                 .strip_prefix("server option ")
@@ -3133,6 +3197,7 @@ mod config_metrics;
 mod iptv_management;
 mod iptv_peer;
 mod iptv_playlist;
+mod named_balancer;
 mod native_ts_body;
 #[path = "origin_resolution.rs"]
 mod origin_resolution;

@@ -190,6 +190,9 @@ struct Args {
     client_limit: u64,
     #[arg(long, default_value = "auto")]
     uplink_interface: String,
+    /// Local MaxMindDB Country or City file for named balancer country rules.
+    #[arg(long)]
+    geoip_db: Option<PathBuf>,
     #[arg(long)]
     drain: bool,
 }
@@ -389,6 +392,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         node_name: a.node_name,
         uplink_mbps: a.uplink_mbps,
         uplink_interface: a.uplink_interface,
+        geoip_db: a.geoip_db,
         client_limit: a.client_limit,
         web_dir: a.web_dir,
         iptv_data: a.iptv_data,
