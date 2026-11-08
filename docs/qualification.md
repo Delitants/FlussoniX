@@ -2341,3 +2341,26 @@ health response while eight bodies were held, and no retained test daemon.
 Formatting and warning-denied all-target Clippy passed on the isolated fix.
 This is focused evidence; full candidate CI and release security review must
 be repeated after the remaining fixes are integrated.
+
+## M4 input-generation origin pinning candidate
+
+Candidate `2f14bd3` resolves each configured M4F/M4S origin once when its
+input generation starts, limits the result to eight addresses and keeps that
+set for control reconnects and M4F segment GETs. A new input generation
+resolves again. The integrated M4 ingest unit suite passed all 26 tests,
+including resolution timeout/cancellation, reconnect and segment placement,
+and a local HTTPS check that accepted a pinned hostname with its trusted
+certificate while rejecting a trusted certificate for a different hostname
+before any HTTP request. Native Basic and peer-key behavior remained covered.
+
+An isolated, read-only local LB/CDN qualification against the existing CDN4
+Flussonic source returned H.264/AAC media for both secure M4S and M4F.
+The M4S path delivered 61,440 bytes and the M4F path delivered 2,499,295
+bytes, including an acknowledged control and a fetched segment. The local LB
+redirected to the local CDN; unauthenticated requests were denied at both
+local nodes. This checks one live stream and these exercised paths. It does
+not establish sustained-loss recovery or a production-ready release.
+On the integrated candidate, the native TLS, vendor source binding, modern
+vendor binding and SRT ticket suites passed all 44 tests. Formatting and
+warning-denied all-target Clippy also passed. Full CI and the release security
+review still need to run on this combined source.
