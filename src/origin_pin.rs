@@ -1,22 +1,22 @@
-//! One bounded destination set per M4 input generation.
+//! One bounded destination set per configured input or inventory generation.
 use std::{future::Future, net::SocketAddr, time::Duration};
 use url::Url;
 
-pub(super) async fn resolve_with<F, Fut>(origin: &Url, lookup: F) -> Result<Vec<SocketAddr>, String>
+pub(crate) async fn resolve_with<F, Fut>(origin: &Url, lookup: F) -> Result<Vec<SocketAddr>, String>
 where
     F: FnOnce(String, u16) -> Fut,
     Fut: Future<Output = Result<Vec<SocketAddr>, String>>,
 {
     let port = origin
         .port_or_known_default()
-        .ok_or("invalid M4 origin port")?;
-    let answers = match origin.host().ok_or("invalid M4 origin host")? {
+        .ok_or("invalid origin port")?;
+    let answers = match origin.host().ok_or("invalid origin host")? {
         url::Host::Ipv4(ip) => vec![SocketAddr::new(ip.into(), port)],
         url::Host::Ipv6(ip) => vec![SocketAddr::new(ip.into(), port)],
         url::Host::Domain(host) => {
             tokio::time::timeout(Duration::from_secs(5), lookup(host.to_owned(), port))
                 .await
-                .map_err(|_| "M4 origin DNS timed out")??
+                .map_err(|_| "origin DNS timed out")??
         }
     };
     let mut addresses = Vec::with_capacity(answers.len().min(8));
@@ -30,19 +30,19 @@ where
         }
     }
     if addresses.is_empty() {
-        return Err("M4 origin DNS returned no addresses".into());
+        return Err("origin DNS returned no addresses".into());
     }
     Ok(addresses)
 }
 
-pub(super) async fn lookup(host: String, port: u16) -> Result<Vec<SocketAddr>, String> {
+pub(crate) async fn lookup(host: String, port: u16) -> Result<Vec<SocketAddr>, String> {
     tokio::net::lookup_host((host.as_str(), port))
         .await
         .map(|answers| answers.collect())
-        .map_err(|_| "M4 origin DNS failed".into())
+        .map_err(|_| "origin DNS failed".into())
 }
 
-pub(super) fn pin(
+pub(crate) fn pin(
     builder: reqwest::ClientBuilder,
     origin: &Url,
     addresses: &[SocketAddr],

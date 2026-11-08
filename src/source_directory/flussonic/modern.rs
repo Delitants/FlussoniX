@@ -35,7 +35,7 @@ impl ObservedInventory {
 
 /// Opt-in modern endpoint and refresh budget. No legacy endpoint fallback,
 /// proxies, redirects, background refresh or daemon configuration integration.
-/// The privileged key and prepared TLS client remain private and nonserializable.
+/// The privileged key and prepared TLS trust remain private and nonserializable.
 pub struct ModernInventoryClient {
     transport: InventoryClient,
     config: Url,

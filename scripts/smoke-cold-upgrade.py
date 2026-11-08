@@ -12,6 +12,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import tempfile
 import time
@@ -62,6 +63,16 @@ class Lab:
         if media and (not self.ffmpeg or not self.ffprobe):
             raise RuntimeError('media smoke requires independent FFmpeg and FFprobe')
         self.seen_media_generations = set()
+
+    def prepare_private_media_root(self):
+        """Apply the documented one-time preview-to-current permission migration."""
+        media_root = self.state / 'media'
+        metadata = media_root.lstat()
+        require(stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == os.getuid(),
+                'previous media root is not an owned directory')
+        media_root.chmod(0o700)
+        require(media_root.stat().st_mode & 0o077 == 0,
+                'media root remains accessible outside its owner')
 
     def request(self, path, method='GET', body=None, authenticated=False):
         headers = {'Authorization': self.auth} if authenticated else {}
@@ -212,6 +223,8 @@ def smoke(previous, current, media=False):
             if media:
                 lab.media_probe()
         config = (lab.state / 'config.json').read_bytes()
+        if media:
+            lab.prepare_private_media_root()
         with lab.daemon(current, 'current-first'):
             lab.saved_config()
             lab.subscriber(create=True)
