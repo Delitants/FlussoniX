@@ -38,6 +38,16 @@ a maximum near 5.26 seconds. That soak cannot yet establish uninterrupted
 playback. Power-loss sequence continuity, the remaining full CI gate, and
 the separately tracked SRT/RTP and release-security work remain open.
 
+The same soak checkpoint places the first viewer gaps at elapsed 50,250.77 s
+and the second at 50,274.90 s. Both owned source observations report aligned
+freshness stalls: 5.21/5.17 s and 3.23/3.19 s respectively, with no source
+poll gaps or observation errors in those windows. This localizes the visible
+delay upstream of the viewer responses but does not identify whether source
+generation, media processing, scheduling, or storage caused it. The next
+candidate soak must run without a concurrent heavy build on the same root
+filesystem and retain host I/O evidence for any new gap; the current run
+remains a failed uninterrupted-playback qualification.
+
 A final lifecycle review found that synchronous sequence-state I/O could stall
 the async runtime, idle cleanup could retire a newer worker, and cancellation
 could release the per-stream fence before old media was removed. The follow-up
