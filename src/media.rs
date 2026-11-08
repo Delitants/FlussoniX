@@ -3397,6 +3397,116 @@ mod hls_startup_tests {
     use super::*;
 
     #[tokio::test]
+    async fn surviving_public_playlists_raise_the_startup_floor() {
+        let root = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(root.path(), "ffmpeg");
+        engine.hls_epoch = crate::hls_generation::Epoch::with_clock(root.path(), 1000);
+        let media = engine.directory("owned");
+        std::fs::create_dir_all(media.join("fmp4")).unwrap();
+        std::fs::write(
+            media.join("index.m3u8"),
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:5000\na.ts\nb.ts\n",
+        )
+        .unwrap();
+        std::fs::write(
+            media.join("fmp4/index.m3u8"),
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:7000\na.m4s\nb.m4s\n",
+        )
+        .unwrap();
+        std::fs::write(
+            media.join("passthrough.m3u8"),
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:999999\nprivate.ts\n",
+        )
+        .unwrap();
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+
+        engine.ensure("owned", &config).await.unwrap();
+
+        let record = root.path().join(".hls-sequences").join(format!(
+            "{}.json",
+            media.file_name().unwrap().to_string_lossy()
+        ));
+        let saved: Value = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+        assert_eq!(saved["next_sequence"], 7003);
+        assert!(!media.join("passthrough.m3u8").exists());
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_or_exhausted_floor_preserves_recovery_media() {
+        for bad in [
+            "{",
+            &format!(
+                "{{\"version\":1,\"name\":\"owned\",\"next_sequence\":{}}}",
+                i64::MAX - 1
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let engine = Engine::new(root.path(), "ffmpeg");
+            let media = engine.directory("owned");
+            std::fs::create_dir(&media).unwrap();
+            std::fs::write(media.join("recovery-marker"), b"old media").unwrap();
+            let state = root.path().join(".hls-sequences");
+            std::fs::create_dir(&state).unwrap();
+            std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let record = state.join(format!(
+                "{}.json",
+                media.file_name().unwrap().to_string_lossy()
+            ));
+            std::fs::write(&record, bad).unwrap();
+            std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+            assert!(
+                engine
+                    .ensure("owned", &json!({"inputs":[{"url":"testsrc://"}]}))
+                    .await
+                    .is_err()
+            );
+            assert!(engine.workers.lock().await.is_empty());
+            assert!(media.join("recovery-marker").exists());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stalled_floor_write_for_one_stream_does_not_delay_another() {
+        let root = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(root.path(), "ffmpeg");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        engine.hls_epoch.before_write_for_test(move |name| {
+            if name == "slow" {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+        });
+        let engine = Arc::new(engine);
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        let slow = {
+            let engine = engine.clone();
+            let config = config.clone();
+            tokio::spawn(async move { engine.ensure("slow", &config).await })
+        };
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(3)))
+            .await
+            .unwrap()
+            .unwrap();
+        let fast =
+            tokio::time::timeout(Duration::from_secs(3), engine.ensure("fast", &config)).await;
+        release_tx.send(()).unwrap();
+        slow.await.unwrap().unwrap();
+        assert!(
+            fast.is_ok_and(|result| result.is_ok()),
+            "slow floor write blocked a different stream"
+        );
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
     async fn failed_hls_dns_moves_to_healthy_backup_input() {
         let dir = tempfile::tempdir().unwrap();
         let mut engine = Engine::new(dir.path(), "ffmpeg");
