@@ -55,9 +55,10 @@ binary SHA-256 `0edc22f6d3ebfb037f81fcbba6d2c34965e3681c9aca26d64a2129a08b7e0b04
 and archive SHA-256
 `144214d1939c3928b547f937d00b964d30c94f30ebbc7a8582144a3b660edb2c`.
 The extracted archive passed loopback health, admin, RTSP, and encrypted-SRT
-smoke checks, then its temporary files and UI dependencies were removed. A
-cold-upgrade check for this newer runtime, the remaining integration suite,
-and the separate release gates remain open.
+smoke checks. A media-enabled cold upgrade from the checksum-pinned previous
+release passed upgrade, rollback, and return with independent HLS decode.
+Temporary package files, test daemons, and UI dependencies were removed. The
+remaining integration suite and separate release gates remain open.
 
 ## Isolated FXLink v9 two-stream loss probe (2026-11-07)
 
