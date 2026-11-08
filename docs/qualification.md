@@ -36,6 +36,27 @@ two-address native M4F/M4S fixtures, vendor M4F reconnect/replacement, and a
 pinned-hostname TLS fixture. This is deterministic local coverage; it does not
 establish a live DNS failover SLA.
 
+## Isolated two-host private-TLS relay (2026-11-08 UTC)
+
+The `0c3b666` candidate binary (SHA-256
+`47470961eb3f38ec32784a361eaba7f6321f9b6cd206dc004afffc629558a003`)
+ran in separate resource-limited transient units on cdn4 and cdn5. cdn4
+read the existing Flussonic H.264/AAC test stream over M4SS without changing
+that server. cdn5 reached cdn4 at its private IP over HTTPS, verified a
+test-only IP certificate with an explicit CA, and pulled native M4S, then M4F.
+The insecure peer-HTTP override was absent. In each round, an anonymous CDN
+HLS request returned 403; an authorized request returned a playlist, FFprobe
+identified H.264/AAC, and FFmpeg completed strict video/audio decode. Source
+and CDN service memory peaks were 60.1 and 55.5 MB during the short probes.
+
+The first attempt using the historical test CDN's plain-HTTP source settings
+returned 404 before media activation because the current secure default
+rejects that remote peer-key transport. It was not treated as a successful
+relay. Both transient units, their FFmpeg children, credentials, certificates
+and media files were removed. Existing test units and production Flussonic
+PIDs/listeners remained unchanged. These short probes do not qualify a load
+balancer, sustained playback, WAN impairment, HEVC, or migration capacity.
+
 ## Completed 24-hour HTTP soak — failed gap gate (2026-11-08 UTC)
 
 The isolated two-stream/eight-viewer run on revision `9b56379e2499c25ec1f4a2998d1970399c3f21f8`
