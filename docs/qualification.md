@@ -2326,3 +2326,18 @@ creating it. All 28 helper tests passed, including unsafe ledger/lock refusal
 and an actual `systemd-analyze verify` on a generated secure-listener unit.
 The upgrade instructions require explicit initialization and a fresh sender
 key/epoch before media admission. The helper itself does not start a service.
+
+## SRT ticket body admission candidate
+
+Candidate `36f731b` gives the public SRT ticket issuer a five-second absolute
+body-read deadline and limits unfinished ticket bodies to 16 globally and
+eight per canonical peer IP. Deadline expiry returns 408; quota exhaustion
+returns 429. Both responses carry no-store and close the HTTP/1 connection.
+The quota is released before JSON parsing and authorization, and cancellation
+also releases it. The integrated candidate's eight issuer tests passed,
+including stalled-body expiry and same-peer capacity release. An owned raw
+loopback HTTP/1 test observed socket closure for both 408 and 429, an immediate
+health response while eight bodies were held, and no retained test daemon.
+Formatting and warning-denied all-target Clippy passed on the isolated fix.
+This is focused evidence; full candidate CI and release security review must
+be repeated after the remaining fixes are integrated.
