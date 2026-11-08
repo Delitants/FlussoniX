@@ -49,7 +49,7 @@ The separate owner-only `iptv.json` stores tokens outside `/config`. Use exact `
 
 The current HLS limit groups requests with the same stream, IP address and token on one node, so multiple players behind a shared IP may count as one session. Continuous playback connections are counted separately. The [transport guide](iptv-transport.md) describes this limit; strict per-player HLS counting is not yet claimed.
 
-Some UI behaviors depend on private routes, such as explicit input selection. Record them separately from public operations and decide each feature's first-release implementation deliberately.
+The private, bodyless `POST /streams/{name}/inputs/{index}/select` route is implemented for explicit input selection. It requires Edit credentials, returns an empty 204 on success, uses the effective stream/template input list, and changes the runtime preference without saving configuration. An active or static stream restarts on the selected input; a load-balancer node records the preference without starting a local worker. Invalid, disabled or publisher-only inputs fail, and editing the input list clears a stale preference. The tested behavior does not establish every reference error or failover edge case.
 
 ### Semantics that must be implemented explicitly
 
