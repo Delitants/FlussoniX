@@ -259,8 +259,38 @@ impl Args {
     }
 }
 
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: Set the process umask before Tokio starts threads or any daemon
+    // worker/FFmpeg child can create media files.
+    #[cfg(unix)]
+    unsafe {
+        libc::umask(0o077);
+    }
+    run()
+}
+
+fn secure_media_root(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = std::fs::symlink_metadata(path)?;
+        // SAFETY: Reading the effective UID has no side effects.
+        let owner = unsafe { libc::geteuid() };
+        if !metadata.is_dir()
+            || metadata.uid() != owner
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
+            return Err(std::io::Error::other(
+                "media directory must belong to the daemon account and have mode 0700; fix permissions before starting",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -374,6 +404,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         drain: a.drain,
         fxlink_features,
     };
+    secure_media_root(&a.media_dir)?;
     let app = App::new(a.config, a.media_dir, options)?;
     if let Some(pool) = &app.iptv_ha_pool {
         pool.verify_startup().await?;
