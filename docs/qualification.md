@@ -38,6 +38,22 @@ a maximum near 5.26 seconds. That soak cannot yet establish uninterrupted
 playback. Power-loss sequence continuity, the remaining full CI gate, and
 the separately tracked SRT/RTP and release-security work remain open.
 
+A final lifecycle review found that synchronous sequence-state I/O could stall
+the async runtime, idle cleanup could retire a newer worker, and cancellation
+could release the per-stream fence before old media was removed. The follow-up
+runtime patch at `2088e29` moves durable operations to blocking workers, keeps
+retirement and media cleanup in an independently owned task. It rechecks worker
+identity and idle eligibility under the stream gate. Deterministic cancellation
+tests paused old worker completion and media removal. A single-thread runtime
+test stalled one stream's state write while another stream started. The 54
+media unit cases, both real-FFmpeg HLS recovery cases, warning-denied
+all-target Clippy, and
+the full library suite (847 passed, one ignored) passed after the patch. Raw-HLS
+replacement and subtitle-policy integration regressions also passed. The
+archive and upgrade results above belong to the earlier `1917a8b` runtime;
+they do not qualify this follow-up runtime. An exact-head package smoke, the
+remaining integration suite, and the separate release gates remain open.
+
 ## Isolated FXLink v9 two-stream loss probe (2026-11-07)
 
 The exact `9b56379` release binary (SHA-256
