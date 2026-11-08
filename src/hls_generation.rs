@@ -57,6 +57,7 @@ impl Epoch {
         if let Some(hook) = &self.before_write {
             hook(name);
         }
+        sync_state_parents(&self.root)?;
         write_record(&state, &record, name, floor)?;
         Ok(start)
     }
@@ -111,6 +112,23 @@ fn ensure_state_dir(path: &Path) -> Result<(), String> {
     {
         return Err("unsafe HLS sequence state directory".into());
     }
+    Ok(())
+}
+
+/// Persist directory entries for a newly created media root and its sequence
+/// directory before publishing a record that playback will rely on after a
+/// power loss. This runs once per worker generation, not on each segment.
+fn sync_state_parents(root: &Path) -> Result<(), String> {
+    let parent = root
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| "cannot sync HLS media root parent")?;
+    File::open(root)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| "cannot sync HLS media root")?;
     Ok(())
 }
 
