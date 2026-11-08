@@ -3,6 +3,7 @@ pub(crate) mod authority;
 mod bootstrap;
 pub mod flussonic;
 pub(crate) mod m4f_session;
+mod origin_pin;
 pub(crate) mod records;
 use crate::{
     m4s::{Decoder, Event, PackedGop, Track},
