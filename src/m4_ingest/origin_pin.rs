@@ -35,10 +35,6 @@ where
     Ok(addresses)
 }
 
-pub(super) async fn resolve(origin: &Url) -> Result<Vec<SocketAddr>, String> {
-    resolve_with(origin, lookup).await
-}
-
 pub(super) async fn lookup(host: String, port: u16) -> Result<Vec<SocketAddr>, String> {
     tokio::net::lookup_host((host.as_str(), port))
         .await
