@@ -54,6 +54,13 @@ The HTTP client disables proxies and all redirects, including same-origin
 redirects and M4F segment redirects. No Basic/native fallback or credential
 probe is attempted. HTTPS verifies trust, identity and validity before HTTP
 headers are sent. A supplied CA replaces public roots and requires HTTPS.
+The client resolves the configured hostname once when its input generation
+starts and retains at most eight initial addresses for control reconnects and
+M4F segment GETs. A new input generation resolves again. DNS changes during a
+generation cannot redirect those requests; HTTPS continues to verify the
+configured hostname. Initial addresses are not screened for private networks,
+so provision only trusted origin names and DNS answers.
+
 Control and every segment require HTTP 200 and exactly one `cluster-auth: yes`
 response header. Missing, negative, differently cased, combined or duplicate
 values fail before metadata, media writes or segment publication. Header names

@@ -304,6 +304,8 @@ HLS input fetches require bounded playlist/segment state, live sliding-window ha
 
 For HTTP(S) HLS and continuous MPEG-TS inputs, FlussoniX resolves the configured hostname once per input generation and uses only that initial address set for playlists, media, keys and same-origin redirects. A later DNS change takes effect when the input restarts. The initial answer is not screened for private addresses, so only configure origins whose initial DNS answer you trust.
 
+Configured M4F/M4S inputs also resolve their origin once per input generation, retaining at most eight initial addresses. M4S control reconnects and M4F control reconnects and segment GETs use that pinned set; restarting the input generation refreshes DNS. HTTPS still verifies the configured hostname against the server certificate. The initial M4 address set is not screened for private addresses, so configure only trusted origins.
+
 ## M4F/M4S implementation plan
 
 Documented M4F behavior includes source/edge time alignment, stable segment ordering, preservation of payloads, segment availability notifications and origin DVR metadata. M4S is documented as a persistent inter-server protocol and supports redirects on publishing. [Cluster restreaming](https://flussonic.com/doc/fms/cluster/restreaming/), [stream pushing](https://flussonic.com/doc/fms/play/push/)
