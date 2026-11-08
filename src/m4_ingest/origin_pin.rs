@@ -36,13 +36,14 @@ where
 }
 
 pub(super) async fn resolve(origin: &Url) -> Result<Vec<SocketAddr>, String> {
-    resolve_with(origin, |host, port| async move {
-        tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .map(|answers| answers.collect())
-            .map_err(|_| "M4 origin DNS failed".into())
-    })
-    .await
+    resolve_with(origin, lookup).await
+}
+
+pub(super) async fn lookup(host: String, port: u16) -> Result<Vec<SocketAddr>, String> {
+    tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map(|answers| answers.collect())
+        .map_err(|_| "M4 origin DNS failed".into())
 }
 
 pub(super) fn pin(

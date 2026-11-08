@@ -36,6 +36,182 @@ pub struct Notification {
 mod peer_transport_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn native_m4f_control_and_segment_stay_on_first_generation_address() {
+        use axum::{Router, body::Body, extract::OriginalUri, response::Response, routing::get};
+        use std::{
+            net::{IpAddr, Ipv4Addr, SocketAddr},
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+        };
+        fn route(hits: Arc<AtomicUsize>, segment: Vec<u8>) -> Router {
+            Router::new().fallback(get(move |OriginalUri(uri): OriginalUri| {
+                let hits = hits.clone();
+                let segment = segment.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    if uri.path() == "/owned/m4f" {
+                        Response::new(Body::from("1 2026/10/17/00/00/00-2000\n"))
+                    } else {
+                        assert_eq!(uri.path(), "/owned/2026/10/17/00/00/00.m4f");
+                        Response::new(Body::from(segment))
+                    }
+                }
+            }))
+        }
+        let track = Track {
+            id: 1,
+            codec: "mp3".into(),
+            config: vec![],
+        };
+        let segment = crate::m4f::pack(
+            std::slice::from_ref(&track),
+            &[crate::m4f::Frame {
+                track_id: 1,
+                dts: 90_000,
+                pts_offset: 0,
+                key: true,
+                body: include_bytes!("../tests/fixtures/codecs/mp3.bin").to_vec(),
+            }],
+            180_000,
+        )
+        .unwrap();
+        let first_hits = Arc::new(AtomicUsize::new(0));
+        let second_hits = Arc::new(AtomicUsize::new(0));
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = first.local_addr().unwrap().port();
+        let second = tokio::net::TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), port))
+            .await
+            .unwrap();
+        let first_router = route(first_hits.clone(), segment.clone());
+        let second_router = route(second_hits.clone(), segment);
+        let first_server =
+            tokio::spawn(async move { axum::serve(first, first_router).await.unwrap() });
+        let second_server =
+            tokio::spawn(async move { axum::serve(second, second_router).await.unwrap() });
+        let input = format!("m4f://media.invalid:{port}/owned");
+        for (address, own, other) in [
+            (Ipv4Addr::LOCALHOST, &first_hits, &second_hits),
+            (Ipv4Addr::new(127, 0, 0, 2), &second_hits, &first_hits),
+        ] {
+            let endpoint = SocketAddr::new(IpAddr::V4(address), port);
+            let before = own.load(Ordering::SeqCst);
+            let other_before = other.load(Ordering::SeqCst);
+            let mut output = Vec::new();
+            let _ = pull_inner_with_resolve(
+                &input,
+                None,
+                &mut output,
+                None,
+                None,
+                PullOptions::default(),
+                move |host, requested_port| async move {
+                    assert_eq!(host, "media.invalid");
+                    assert_eq!(requested_port, port);
+                    Ok(vec![endpoint])
+                },
+            )
+            .await;
+            assert!(!output.is_empty(), "selected origin did not provide media");
+            assert_eq!(own.load(Ordering::SeqCst) - before, 2);
+            assert_eq!(other.load(Ordering::SeqCst), other_before);
+        }
+        first_server.abort();
+        second_server.abort();
+        let _ = first_server.await;
+        let _ = second_server.await;
+    }
+
+    #[tokio::test]
+    async fn native_m4s_pins_control_and_preserves_basic_and_peer_key_headers() {
+        use axum::{Router, body::Body, http::HeaderMap, response::Response, routing::get};
+        use std::{
+            net::{IpAddr, Ipv4Addr, SocketAddr},
+            sync::{
+                Arc, Mutex,
+                atomic::{AtomicUsize, Ordering},
+            },
+        };
+        let observed = Arc::new(Mutex::new(Vec::<(Option<String>, Option<String>)>::new()));
+        let recorded = observed.clone();
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = first.local_addr().unwrap().port();
+        let second = tokio::net::TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), port))
+            .await
+            .unwrap();
+        let wrong_hits = Arc::new(AtomicUsize::new(0));
+        let wrong = wrong_hits.clone();
+        let first_server = tokio::spawn(async move {
+            let router = Router::new().route(
+                "/owned/m4s",
+                get(move |headers: HeaderMap| {
+                    let recorded = recorded.clone();
+                    async move {
+                        let header = |name| {
+                            headers
+                                .get(name)
+                                .map(|value| value.to_str().unwrap().to_owned())
+                        };
+                        recorded
+                            .lock()
+                            .unwrap()
+                            .push((header("authorization"), header("x-flussonix-peer")));
+                        Response::new(Body::empty())
+                    }
+                }),
+            );
+            axum::serve(first, router).await.unwrap()
+        });
+        let second_server = tokio::spawn(async move {
+            let router = Router::new().fallback(get(move || {
+                wrong.fetch_add(1, Ordering::SeqCst);
+                async { Response::new(Body::empty()) }
+            }));
+            axum::serve(second, router).await.unwrap()
+        });
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let basic = format!("m4s://alice:secret@media.invalid:{port}/owned");
+        let mut output = Vec::new();
+        let _ = pull_inner_with_resolve(
+            &basic,
+            None,
+            &mut output,
+            None,
+            None,
+            PullOptions::default(),
+            move |_, _| async move { Ok(vec![address]) },
+        )
+        .await;
+        let keyed = format!("m4s://media.invalid:{port}/owned");
+        let _ = pull_inner_with_resolve(
+            &keyed,
+            Some("owned-peer-key"),
+            &mut output,
+            None,
+            None,
+            PullOptions {
+                allow_insecure_peer_http: true,
+                ..PullOptions::default()
+            },
+            move |_, _| async move { Ok(vec![address]) },
+        )
+        .await;
+        assert_eq!(wrong_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            &[
+                (Some("Basic YWxpY2U6c2VjcmV0".into()), None),
+                (None, Some("owned-peer-key".into())),
+            ]
+        );
+        first_server.abort();
+        second_server.abort();
+        let _ = first_server.await;
+        let _ = second_server.await;
+    }
+
     // Break caught: M4 media fetches can send the native key over remote HTTP.
     #[tokio::test]
     async fn keyed_remote_m4s_input_requires_secure_transport_by_default() {
@@ -244,6 +420,32 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
     metadata: Option<oneshot::Sender<Vec<Track>>>,
     subtitles: PullOptions<'_>,
 ) -> Result<(), String> {
+    pull_inner_with_resolve(
+        input,
+        key,
+        stdin,
+        hub,
+        metadata,
+        subtitles,
+        origin_pin::lookup,
+    )
+    .await
+}
+
+async fn pull_inner_with_resolve<W, F, Fut>(
+    input: &str,
+    key: Option<&str>,
+    stdin: &mut W,
+    hub: Option<&Hub>,
+    metadata: Option<oneshot::Sender<Vec<Track>>>,
+    subtitles: PullOptions<'_>,
+    lookup: F,
+) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+    F: FnOnce(String, u16) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<std::net::SocketAddr>, String>>,
+{
     let ca = subtitles.ca;
     let is_m4f = input.starts_with("m4f");
     let suffix = if is_m4f { "/m4f" } else { "/m4s" };
@@ -306,6 +508,8 @@ async fn pull_inner<W: AsyncWrite + Unpin>(
     if scheme == "https" {
         client = client.use_preconfigured_tls((*crate::tls_input::client(ca)?).clone());
     }
+    let addresses = origin_pin::resolve_with(&base, lookup).await?;
+    client = origin_pin::pin(client, &base, &addresses);
     let client = client.build().map_err(|_| "cannot build input client")?;
     let requests = Requests {
         client,
