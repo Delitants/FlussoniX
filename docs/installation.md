@@ -98,8 +98,9 @@ For a separate viewer-facing LB, start a node with `--role lb` and configure
 its source servers and CDN peers under **Cluster**. **Cluster → Balancers** adds
 optional named HTTP playback paths such as `/lb0/channel/index.m3u8`. A
 country-scoped balancer also needs a local Country or City MaxMindDB file
-selected at startup with `--geoip-db /absolute/path/country.mmdb`; the UI shows
-whether it loaded. Named URLs do not accept publishing POSTs. See the
+selected at startup with `--geoip-db /absolute/path/country.mmdb`; use an
+absolute path so restarts find the same file. The UI shows whether it loaded.
+Named URLs do not accept publishing POSTs. See the
 [cluster guide](cluster-loadbalancing.md#named-http-balancers) for placement
 limits and the separate CDN admission behavior.
 

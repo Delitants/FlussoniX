@@ -193,9 +193,11 @@ make a peer ineligible. A failed native CDN reservation tries the next eligible
 peer within the existing placement deadline. Vendor CDNs use guarded telemetry
 and local capacity holds instead of the native reservation RPC.
 
-Country rules require a locally provisioned MaxMindDB Country or City file and
-`--geoip-db /absolute/path/country.mmdb` when starting the LB. No database is
-bundled or fetched at runtime. A match uses the direct viewer socket address;
+Country rules require a locally provisioned MaxMindDB Country or City file.
+Start the LB with `--geoip-db /absolute/path/country.mmdb` so the file stays the
+same across service restarts. Relative paths are accepted and resolve from the
+daemon's working directory. No database is bundled or fetched at runtime.
+A match uses the direct viewer socket address;
 untrusted `X-Forwarded-For` is ignored. When no country matches or lookup is
 unavailable, only rows explicitly marked **Default country fallback** qualify.
 Changing the balancer's GeoIP file requires an LB restart. The Cluster screen
