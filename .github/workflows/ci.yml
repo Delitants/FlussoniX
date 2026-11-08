@@ -168,3 +168,12 @@ jobs:
             --no-same-owner --no-same-permissions
           TMPDIR="$package_dir" python3 scripts/smoke-cold-upgrade.py \
             --previous "$package_dir/previous" --current "$package_dir/current" --media
+          cp -- "${archives[0]}" "$GITHUB_WORKSPACE/flussonix-pr-package.tar.gz"
+      - name: Retain exact tested archive for isolated qualification
+        uses: actions/upload-artifact@v7
+        with:
+          name: flussonix-candidate-${{ github.sha }}
+          path: flussonix-pr-package.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
