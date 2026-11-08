@@ -662,7 +662,7 @@ async fn fmp4_profile(kind: &str, protocol: &str) {
     let media_dirs: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()
         .filter_map(Result::ok)
-        .filter(|e| e.path().is_dir())
+        .filter(|e| e.path().is_dir() && e.file_name() != ".hls-sequences")
         .collect();
     assert_eq!(media_dirs.len(), 1);
     assert!(

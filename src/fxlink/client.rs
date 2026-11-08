@@ -20,6 +20,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
+#[derive(Clone)]
 struct Key {
     host: String,
     port: u16,
@@ -53,8 +54,69 @@ impl Drop for Peer {
 }
 #[derive(Default)]
 pub struct ClientPool {
-    peers: Mutex<Vec<Peer>>,
+    inner: Arc<PoolInner>,
     features: Features,
+}
+#[derive(Default)]
+struct PoolInner {
+    state: Mutex<PoolState>,
+    #[cfg(test)]
+    setup_gate: std::sync::Mutex<Option<Arc<SetupGate>>>,
+    #[cfg(test)]
+    reserve_gate: std::sync::Mutex<Option<Arc<SetupGate>>>,
+    #[cfg(test)]
+    retirement_gate: std::sync::Mutex<Option<Arc<SetupGate>>>,
+}
+#[cfg(test)]
+struct SetupGate {
+    host: String,
+    port: u16,
+    entered: tokio::sync::Notify,
+    release: CancellationToken,
+    starts: std::sync::atomic::AtomicUsize,
+}
+#[cfg(test)]
+async fn pause_setup(inner: &PoolInner, address: &Address) {
+    let gate = inner.setup_gate.lock().unwrap().clone();
+    pause_matching(gate, address).await;
+}
+#[cfg(test)]
+async fn pause_matching(gate: Option<Arc<SetupGate>>, address: &Address) {
+    if let Some(gate) = gate.filter(|g| g.host == address.host && g.port == address.port) {
+        gate.starts.fetch_add(1, Ordering::SeqCst);
+        gate.entered.notify_one();
+        gate.release.cancelled().await;
+    }
+}
+#[derive(Default)]
+struct PoolState {
+    peers: Vec<Peer>,
+    pending: Vec<Arc<Pending>>,
+    epoch: u64,
+}
+struct Pending {
+    host: String,
+    port: u16,
+    key: Key,
+    epoch: u64,
+    cancel: CancellationToken,
+    result: tokio::sync::watch::Sender<Option<Result<(), String>>>,
+    task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    waiters: std::sync::atomic::AtomicUsize,
+}
+struct PendingWaiter(Arc<Pending>);
+impl Drop for PendingWaiter {
+    fn drop(&mut self) {
+        if self.0.waiters.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.cancel.cancel();
+        }
+    }
+}
+struct ConnectedPeer {
+    endpoint: quinn::Endpoint,
+    connection: quinn::Connection,
+    budget: Budget,
+    queues: super::Reservation,
 }
 struct Start {
     name: String,
@@ -128,7 +190,7 @@ impl Drop for Subscription {
 impl ClientPool {
     pub fn with_features(features: Features) -> Self {
         Self {
-            peers: Mutex::new(Vec::new()),
+            inner: Arc::new(PoolInner::default()),
             features,
         }
     }
@@ -160,12 +222,9 @@ impl ClientPool {
         {
             return Err("FXLink credential/name limit".into());
         }
-        let mut peers = self.peers.lock().await;
-        let mut setup = global()
-            .reserve(4 * 1024 * 1024)
-            .map_err(|e| e.to_string())?;
         // Hash the same parsed CA bytes used for this connection; no path-only trust reuse or TOCTOU reload.
         let (tls, trust) = client_tls(ca, self.features)?;
+        let tls = Arc::new(tls);
         let key = Key {
             host: address.host.clone(),
             port: address.port,
@@ -174,94 +233,103 @@ impl ClientPool {
             settings: settings.clone(),
             features: self.features,
         };
-        let mut i = 0;
-        while i < peers.len() {
-            if peers[i].task.as_ref().unwrap().is_finished()
-                || peers[i].connection.close_reason().is_some()
-            {
-                let p = peers.remove(i);
-                p.cancel.cancel();
-                let Taken { task } = take_peer(p);
+        let (commands, connection, setup_charge) = loop {
+            let retired = {
+                let mut state = self.inner.state.lock().await;
+                take_stale(&mut state.peers)
+            };
+            for Taken { task } in retired {
                 let _ = task.await;
-            } else {
-                i += 1
             }
-        }
-        let index = if let Some(index) = peers.iter().position(|p| p.key == key) {
-            let peer_setup = peer_budget(peers[index].connection.remote_address().ip())
-                .and_then(|budget| budget.reserve(4 * 1024 * 1024))
-                .map_err(|e| e.to_string())?;
-            // Reserve under the peer before releasing pre-identity scratch.
-            drop(std::mem::replace(&mut setup, peer_setup));
-            index
-        } else {
-            if peers.len() >= 16 {
-                return Err("FXLink peer limit".into());
+            enum Action {
+                Peer(mpsc::Sender<Start>, quinn::Connection),
+                Wait(Arc<Pending>, bool),
+                Retiring(Arc<Pending>),
             }
-            let remote = tokio::time::timeout(
-                SETUP,
-                tokio::net::lookup_host((address.host.as_str(), address.port)),
-            )
-            .await
-            .map_err(|_| "FXLink DNS timeout")?
-            .map_err(|_| "FXLink DNS failed")?
-            .next()
-            .ok_or("FXLink DNS empty")?;
-            let local: SocketAddr = if remote.is_ipv4() {
-                "0.0.0.0:0"
-            } else {
-                "[::]:0"
+            let action = {
+                let mut state = self.inner.state.lock().await;
+                if let Some(peer) = state.peers.iter().find(|p| p.key == key) {
+                    Action::Peer(peer.commands.clone(), peer.connection.clone())
+                } else if let Some(pending) = state
+                    .pending
+                    .iter()
+                    .find(|p| p.host == address.host && p.port == address.port)
+                {
+                    if pending.cancel.is_cancelled() {
+                        Action::Retiring(pending.clone())
+                    } else {
+                        pending.waiters.fetch_add(1, Ordering::AcqRel);
+                        Action::Wait(pending.clone(), false)
+                    }
+                } else {
+                    if state.peers.len() + state.pending.len() >= 16 {
+                        return Err("FXLink peer limit".into());
+                    }
+                    let (result, _) = tokio::sync::watch::channel(None);
+                    let pending = Arc::new(Pending {
+                        host: address.host.clone(),
+                        port: address.port,
+                        key: key.clone(),
+                        epoch: state.epoch,
+                        cancel: CancellationToken::new(),
+                        result,
+                        task: std::sync::Mutex::new(None),
+                        waiters: std::sync::atomic::AtomicUsize::new(1),
+                    });
+                    state.pending.push(pending.clone());
+                    Action::Wait(pending, true)
+                }
+            };
+            match action {
+                Action::Peer(commands, connection) => {
+                    let budget =
+                        peer_budget(connection.remote_address().ip()).map_err(|e| e.to_string())?;
+                    let setup = budget.reserve(4 * 1024 * 1024).map_err(|e| e.to_string())?;
+                    break (commands, connection, setup);
+                }
+                Action::Wait(pending, new) => {
+                    let _waiter = PendingWaiter(pending.clone());
+                    let mut result = pending.result.subscribe();
+                    if new {
+                        #[cfg(test)]
+                        {
+                            let gate = self.inner.reserve_gate.lock().unwrap().clone();
+                            pause_matching(gate, &address).await;
+                        }
+                        let cleanup = SetupCleanup::new(self.inner.clone(), pending.clone());
+                        let task = match global().reserve(4 * 1024 * 1024) {
+                            Ok(setup) => tokio::spawn(setup_peer(
+                                self.inner.clone(),
+                                pending.clone(),
+                                address.clone(),
+                                (*tls).clone(),
+                                setup,
+                                cleanup,
+                            )),
+                            Err(e) => tokio::spawn(finish_failed_setup(cleanup, e.to_string())),
+                        };
+                        *pending.task.lock().unwrap() = Some(task);
+                    }
+                    while result.borrow().is_none() {
+                        result.changed().await.map_err(|_| "FXLink setup closed")?;
+                    }
+                    let outcome = result.borrow().clone().unwrap();
+                    if pending.key == key {
+                        outcome?;
+                    }
+                }
+                Action::Retiring(pending) => {
+                    let mut result = pending.result.subscribe();
+                    while result.borrow().is_none() {
+                        result.changed().await.map_err(|_| "FXLink setup closed")?;
+                    }
+                }
             }
-            .parse()
-            .unwrap();
-            let mut endpoint = quinn::Endpoint::client(local).map_err(|_| "FXLink client bind")?;
-            let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
-                .map_err(|_| "FXLink TLS 1.3 required")?;
-            let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-            config.transport_config(super::transport::config());
-            endpoint.set_default_client_config(config);
-            let budget = peer_budget(remote.ip()).map_err(|e| e.to_string())?;
-            let peer_setup = budget.reserve(4 * 1024 * 1024).map_err(|e| e.to_string())?;
-            // Keep continuous global accounting while transferring known-IP setup.
-            drop(std::mem::replace(&mut setup, peer_setup));
-            let queues = budget.reserve(QUEUE_BYTES).map_err(|e| e.to_string())?;
-            let connecting = endpoint
-                .connect(remote, &address.host)
-                .map_err(|_| "FXLink connect failed")?;
-            let connection = tokio::time::timeout(SETUP, connecting)
-                .await
-                .map_err(|_| "FXLink TLS connection timeout")?
-                .map_err(|_| "FXLink TLS connection failed")?;
-            if connection
-                .max_datagram_size()
-                .is_none_or(|n| n < super::packet::HEADER_LEN + settings.shard_size)
-            {
-                return Err("FXLink datagram MTU too small".into());
-            }
-            let (tx, rx) = mpsc::channel(16);
-            let stop = CancellationToken::new();
-            let task = tokio::spawn(router(
-                endpoint,
-                connection.clone(),
-                rx,
-                budget,
-                queues,
-                stop.clone(),
-            ));
-            peers.push(Peer {
-                key,
-                connection,
-                commands: tx,
-                cancel: stop,
-                task: Some(task),
-            });
-            peers.len() - 1
         };
-        let peer = &peers[index];
         let state = Arc::new(State::new(cancel.child_token()));
         let guard = state.cancel.clone().drop_guard();
         let (ready, ack) = oneshot::channel();
-        peer.commands
+        commands
             .try_send(Start {
                 name: address.stream.unwrap(),
                 peer_key: peer_key.into(),
@@ -271,15 +339,31 @@ impl ClientPool {
                 ready,
             })
             .map_err(|_| "FXLink subscription limit")?;
-        let connection = peer.connection.clone();
-        drop(peers);
         ack.await.map_err(|_| "FXLink setup closed")??;
+        drop(setup_charge);
         // Transfer synchronous retirement ownership to the returned Subscription.
         guard.disarm();
         Ok(Subscription { state, connection })
     }
     pub async fn close(&self) {
-        let peers = std::mem::take(&mut *self.peers.lock().await);
+        let (peers, pending) = {
+            let mut state = self.inner.state.lock().await;
+            state.epoch = state.epoch.wrapping_add(1);
+            (
+                std::mem::take(&mut state.peers),
+                std::mem::take(&mut state.pending),
+            )
+        };
+        let mut tasks = Vec::new();
+        for setup in pending {
+            setup.cancel.cancel();
+            setup
+                .result
+                .send_replace(Some(Err("FXLink setup closed".into())));
+            if let Some(task) = setup.task.lock().unwrap().take() {
+                tasks.push(task);
+            }
+        }
         for peer in &peers {
             peer.cancel.cancel();
             peer.connection.close(0u32.into(), b"shutdown");
@@ -288,7 +372,191 @@ impl ClientPool {
             let Taken { task } = take_peer(peer);
             let _ = task.await;
         }
+        for task in tasks {
+            let _ = task.await;
+        }
     }
+}
+async fn finish_setup(inner: &PoolInner, pending: &Arc<Pending>, outcome: Result<(), String>) {
+    let mut state = inner.state.lock().await;
+    if let Some(index) = state.pending.iter().position(|p| Arc::ptr_eq(p, pending)) {
+        state.pending.remove(index);
+    }
+    pending.result.send_replace(Some(outcome));
+}
+struct SetupCleanup {
+    inner: Arc<PoolInner>,
+    pending: Arc<Pending>,
+    completed: bool,
+}
+impl SetupCleanup {
+    fn new(inner: Arc<PoolInner>, pending: Arc<Pending>) -> Self {
+        Self {
+            inner,
+            pending,
+            completed: false,
+        }
+    }
+}
+impl Drop for SetupCleanup {
+    fn drop(&mut self) {
+        if !self.completed {
+            let inner = self.inner.clone();
+            let pending = self.pending.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    finish_setup(&inner, &pending, Err("FXLink setup closed".into())).await;
+                });
+            }
+        }
+    }
+}
+async fn finish_failed_setup(mut cleanup: SetupCleanup, error: String) {
+    finish_setup(&cleanup.inner, &cleanup.pending, Err(error)).await;
+    cleanup.completed = true;
+}
+async fn setup_peer(
+    inner: Arc<PoolInner>,
+    pending: Arc<Pending>,
+    address: Address,
+    tls: tokio_rustls::rustls::ClientConfig,
+    mut setup: super::Reservation,
+    mut cleanup: SetupCleanup,
+) {
+    let result = tokio::select! {
+        biased;
+        _ = pending.cancel.cancelled() => Err("FXLink setup closed".into()),
+        result = async {
+            #[cfg(test)]
+            pause_setup(&inner, &address).await;
+            connect_peer(&address, tls, &mut setup, &pending.key.settings).await
+        } => result,
+    };
+    #[cfg(test)]
+    if pending.cancel.is_cancelled() {
+        let gate = inner.retirement_gate.lock().unwrap().clone();
+        pause_matching(gate, &address).await;
+    }
+    let mut state = inner.state.lock().await;
+    let current = state.epoch == pending.epoch
+        && !pending.cancel.is_cancelled()
+        && pending.waiters.load(Ordering::Acquire) > 0
+        && state.pending.iter().any(|p| Arc::ptr_eq(p, &pending));
+    if !current {
+        if let Some(index) = state.pending.iter().position(|p| Arc::ptr_eq(p, &pending)) {
+            state.pending.remove(index);
+        }
+        if let Ok(connected) = result {
+            connected.connection.close(0u32.into(), b"stale setup");
+        }
+        pending
+            .result
+            .send_replace(Some(Err("FXLink setup closed".into())));
+        cleanup.completed = true;
+        return;
+    }
+    let index = state
+        .pending
+        .iter()
+        .position(|p| Arc::ptr_eq(p, &pending))
+        .unwrap();
+    state.pending.remove(index);
+    match result {
+        Ok(connected) => {
+            let (tx, rx) = mpsc::channel(16);
+            let stop = CancellationToken::new();
+            let task = tokio::spawn(router(
+                connected.endpoint,
+                connected.connection.clone(),
+                rx,
+                connected.budget,
+                connected.queues,
+                stop.clone(),
+            ));
+            state.peers.push(Peer {
+                key: pending.key.clone(),
+                connection: connected.connection,
+                commands: tx,
+                cancel: stop,
+                task: Some(task),
+            });
+            pending.result.send_replace(Some(Ok(())));
+        }
+        Err(error) => {
+            pending.result.send_replace(Some(Err(error)));
+        }
+    }
+    cleanup.completed = true;
+}
+async fn connect_peer(
+    address: &Address,
+    tls: tokio_rustls::rustls::ClientConfig,
+    setup: &mut super::Reservation,
+    settings: &Settings,
+) -> Result<ConnectedPeer, String> {
+    let remote = tokio::time::timeout(
+        SETUP,
+        tokio::net::lookup_host((address.host.as_str(), address.port)),
+    )
+    .await
+    .map_err(|_| "FXLink DNS timeout")?
+    .map_err(|_| "FXLink DNS failed")?
+    .next()
+    .ok_or("FXLink DNS empty")?;
+    let local: SocketAddr = if remote.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    }
+    .parse()
+    .unwrap();
+    let mut endpoint = quinn::Endpoint::client(local).map_err(|_| "FXLink client bind")?;
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
+        .map_err(|_| "FXLink TLS 1.3 required")?;
+    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+    config.transport_config(super::transport::config());
+    endpoint.set_default_client_config(config);
+    let budget = peer_budget(remote.ip()).map_err(|e| e.to_string())?;
+    let peer_setup = budget.reserve(4 * 1024 * 1024).map_err(|e| e.to_string())?;
+    drop(std::mem::replace(setup, peer_setup));
+    let queues = budget.reserve(QUEUE_BYTES).map_err(|e| e.to_string())?;
+    let connecting = endpoint
+        .connect(remote, &address.host)
+        .map_err(|_| "FXLink connect failed")?;
+    let connection = tokio::time::timeout(SETUP, connecting)
+        .await
+        .map_err(|_| "FXLink TLS connection timeout")?
+        .map_err(|_| "FXLink TLS connection failed")?;
+    if connection
+        .max_datagram_size()
+        .is_none_or(|n| n < super::packet::HEADER_LEN + settings.shard_size)
+    {
+        connection.close(0u32.into(), b"MTU too small");
+        return Err("FXLink datagram MTU too small".into());
+    }
+    Ok(ConnectedPeer {
+        endpoint,
+        connection,
+        budget,
+        queues,
+    })
+}
+fn take_stale(peers: &mut Vec<Peer>) -> Vec<Taken> {
+    let mut retired = Vec::new();
+    let mut i = 0;
+    while i < peers.len() {
+        if peers[i].task.as_ref().unwrap().is_finished()
+            || peers[i].connection.close_reason().is_some()
+        {
+            let p = peers.remove(i);
+            p.cancel.cancel();
+            p.connection.close(0u32.into(), b"retired");
+            retired.push(take_peer(p));
+        } else {
+            i += 1;
+        }
+    }
+    retired
 }
 // Moving a JoinHandle out of a Drop type uses a small owned wrapper instead of detaching it.
 struct Taken {
@@ -2065,3 +2333,7 @@ mod bootstrap_geometry_tests;
 #[cfg(test)]
 #[path = "geometry/clock_tests.rs"]
 mod geometry_clock_tests;
+
+#[cfg(test)]
+#[path = "pool_setup_tests.rs"]
+mod pool_setup_tests;

@@ -30,6 +30,79 @@ async fn get(app: Arc<App>, path: &str, credentials: &str) -> Value {
 }
 
 #[tokio::test]
+async fn view_node_status_hides_private_iptv_authority_origins_but_keeps_health() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = App::new(
+        directory.path().join("config.json"),
+        directory.path().join("media"),
+        Options {
+            admin_password: "edit-password".into(),
+            view_user: Some("viewer".into()),
+            view_password: Some("view-password".into()),
+            peer_key: "node-peer-secret".into(),
+            role: "cdn".into(),
+            iptv_public_origin: Some(url::Url::parse("https://tv.public.example/").unwrap()),
+            iptv_authority: Some(url::Url::parse("https://primary.private.example:8443/").unwrap()),
+            iptv_authority_secondary: Some(
+                url::Url::parse("https://backup.private.example:8443/").unwrap(),
+            ),
+            iptv_authority_cluster_id: Some(
+                uuid::Uuid::parse_str("a3192376-6df5-4b76-a15c-43942fd3d466").unwrap(),
+            ),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let view = get(
+        app.clone(),
+        "/flussonix/api/v1/node",
+        "viewer:view-password",
+    )
+    .await;
+    assert_eq!(view["iptv_public_origin"], "https://tv.public.example/");
+    assert_eq!(view["management_role"], "view");
+    let origins = view["iptv_cluster"]["origins"].as_array().unwrap();
+    assert_eq!(origins.len(), 2);
+    for origin in origins {
+        assert_eq!(origin["origin"], "https://[redacted]");
+        assert_eq!(origin["ready"], false);
+        assert_eq!(origin["reachable"], false);
+        assert_eq!(origin["refused"], false);
+    }
+
+    let edit = get(app.clone(), "/flussonix/api/v1/node", "admin:edit-password").await;
+    assert_eq!(
+        edit["iptv_cluster"]["origins"][0]["origin"],
+        "https://primary.private.example:8443/"
+    );
+    assert_eq!(
+        edit["iptv_cluster"]["origins"][1]["origin"],
+        "https://backup.private.example:8443/"
+    );
+
+    let response = router(app)
+        .oneshot(
+            Request::builder()
+                .uri("/flussonix/api/v1/node")
+                .header("x-flussonix-peer", "node-peer-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 100_000)
+        .await
+        .unwrap();
+    let peer: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        peer["iptv_cluster"]["origins"][0]["origin"],
+        "https://primary.private.example:8443/"
+    );
+}
+
+#[tokio::test]
 async fn view_management_reads_hide_inherited_and_nested_credentials() {
     let directory = tempfile::tempdir().unwrap();
     let options = Options {
@@ -162,4 +235,77 @@ async fn view_management_reads_hide_inherited_and_nested_credentials() {
         search["estimated_count"], 0,
         "secret search became an oracle"
     );
+}
+
+#[tokio::test]
+async fn view_management_hides_elementary_srtp_track_key_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = App::new(
+        directory.path().join("config.json"),
+        directory.path().join("media"),
+        Options {
+            admin_user: "admin".into(),
+            admin_password: "edit-password".into(),
+            view_user: Some("viewer".into()),
+            view_password: Some("view-password".into()),
+            peer_key: "node-peer-secret".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    app.config
+        .replace(json!({
+            "templates": [{
+                "name": "secure",
+                "inputs": [{
+                    "url": "srtp://127.0.0.1:40100",
+                    "flussonix_rtp": {
+                        "profile": "elementary",
+                        "sdp_file": "/tmp/secure.sdp",
+                        "track_key_files": ["/tmp/track-a-private.key", "/tmp/track-b-private.key"]
+                    }
+                }],
+                "flussonix_rtp_outputs": [{
+                    "url": "srtp://127.0.0.1:40200",
+                    "flussonix_rtp": {
+                        "profile": "elementary",
+                        "track_keys": [{
+                            "track_id": 7, "media": "audio", "encoding": "MPEG4-GENERIC/48000/2",
+                            "key_file": "/tmp/output-private.key"
+                        }]
+                    }
+                }]
+            }],
+            "streams": [{"name": "secure-stream", "template": "secure"}]
+        }))
+        .unwrap();
+
+    let edit = get(
+        app.clone(),
+        "/streamer/api/v3/config?full=true",
+        "admin:edit-password",
+    )
+    .await;
+    assert!(edit.to_string().contains("track-a-private.key"));
+
+    for path in [
+        "/streamer/api/v3/config?full=true",
+        "/streamer/api/v3/templates/secure",
+        "/streamer/api/v3/streams/secure-stream",
+    ] {
+        let view = get(app.clone(), path, "viewer:view-password").await;
+        let body = view.to_string();
+        assert!(
+            !body.contains("track-a-private.key"),
+            "View leaked first SRTP key path at {path}"
+        );
+        assert!(
+            !body.contains("track-b-private.key"),
+            "View leaked second SRTP key path at {path}"
+        );
+        assert!(
+            !body.contains("output-private.key"),
+            "View leaked output SRTP key path at {path}"
+        );
+    }
 }

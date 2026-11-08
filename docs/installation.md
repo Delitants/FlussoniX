@@ -6,7 +6,9 @@ The archive contains the server, web interface, installation guides, an optional
 service helper and a file manifest.
 It contains no configuration, credentials, media, FFmpeg or Flussonic components.
 Use Linux with the archive's CPU architecture; libc and CPU requirements depend
-on the supplied binary's build.
+on the supplied binary's build. The current x86-64 release-candidate binary
+requires glibc 2.39 and has been checked on Ubuntu 24.04. Older glibc hosts
+cannot run that binary; inspect another archive's requirements separately.
 
 ## Before starting
 
@@ -21,6 +23,9 @@ glibc build passed encrypted SRT playback on the same hosts.
 Direct SRTP receivers also need an explicitly initialized owner-only key history;
 see [direct SRTP setup](direct-srtp.md). The optional service helper renders a
 stable history path but never initializes or resets it.
+Optional DVB bitmap subtitle conversion needs the Tesseract executable and the
+language models selected for the stream (for example, `tesseract-ocr-eng` on
+Ubuntu).
 
 Download the preview archive and its matching `.sha256` file into the same
 directory. Set `package` to the downloaded filename without `.tar.gz`, then run:
@@ -41,9 +46,14 @@ mkdir -p "$flussonix_data"
 chmod 700 "$flussonix_data"
 ```
 
-The media directory must belong to the daemon account and must not be writable
-by another account. HLS delivery rejects symlinked or foreign-owned generated
-files and media directories; keep `--media-dir` under this private state path.
+The media directory must belong to the daemon account and have mode `0700`.
+The daemon creates a new media directory privately and refuses an existing
+directory with broader permissions or a symlink. For an older installation,
+stop it and run `chmod 700 "$flussonix_data/media"` before upgrading. HLS
+delivery also rejects symlinked or foreign-owned generated files and media
+directories; keep `--media-dir` under this private state path.
+The daemon also needs read access to every parent directory of `--media-dir`
+so it can durably sync newly created directory entries before publishing HLS.
 
 Choose an admin password and create a cluster peer key once with
 `openssl rand -hex 32`. Save both in your password manager and reuse them after

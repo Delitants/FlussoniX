@@ -1,6 +1,60 @@
 //! Public HTTPS control-plane issuance of short-lived, tokenless SRT IDs.
 use super::*;
 
+pub(super) struct BodyGate {
+    slots: tokio::sync::Semaphore,
+    by_ip: std::sync::Mutex<HashMap<std::net::IpAddr, usize>>,
+}
+
+impl BodyGate {
+    pub(super) fn new() -> Self {
+        Self {
+            slots: tokio::sync::Semaphore::new(16),
+            by_ip: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn acquire(&self, ip: std::net::IpAddr) -> Option<BodyLease<'_>> {
+        let permit = self.slots.try_acquire().ok()?;
+        let ip = match ip {
+            std::net::IpAddr::V6(address) => address
+                .to_ipv4_mapped()
+                .map(std::net::IpAddr::V4)
+                .unwrap_or(ip),
+            _ => ip,
+        };
+        let mut by_ip = self.by_ip.lock().unwrap_or_else(|e| e.into_inner());
+        let count = by_ip.entry(ip).or_default();
+        if *count >= 8 {
+            return None;
+        }
+        *count += 1;
+        Some(BodyLease {
+            gate: self,
+            ip,
+            _permit: permit,
+        })
+    }
+}
+
+struct BodyLease<'a> {
+    gate: &'a BodyGate,
+    ip: std::net::IpAddr,
+    _permit: tokio::sync::SemaphorePermit<'a>,
+}
+
+impl Drop for BodyLease<'_> {
+    fn drop(&mut self) {
+        let mut by_ip = self.gate.by_ip.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = by_ip.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                by_ip.remove(&self.ip);
+            }
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IssueBody {
@@ -22,6 +76,15 @@ pub(super) async fn issue(State(app): State<Arc<App>>, request: Request) -> Resp
         "cache-control",
         "private, no-store".parse().expect("static cache header"),
     );
+    if matches!(
+        response.status(),
+        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+    ) {
+        response.headers_mut().insert(
+            "connection",
+            "close".parse().expect("static connection header"),
+        );
+    }
     response
 }
 
@@ -47,6 +110,7 @@ async fn issue_inner(app: &Arc<App>, request: Request) -> Result<Value, u16> {
     if header(request.headers(), "content-type") != Some("application/json") {
         return Err(415);
     }
+    let body_lease = app.ticket_body_gate.acquire(peer.ip()).ok_or(429u16)?;
     let user_agent = header(request.headers(), "user-agent")
         .unwrap_or("")
         .to_owned();
@@ -54,9 +118,14 @@ async fn issue_inner(app: &Arc<App>, request: Request) -> Result<Value, u16> {
         .unwrap_or("")
         .to_owned();
     let host = header(request.headers(), "host").unwrap_or("").to_owned();
-    let bytes = axum::body::to_bytes(request.into_body(), 4096)
-        .await
-        .map_err(|_| 400u16)?;
+    let bytes = tokio::time::timeout(
+        Duration::from_secs(5),
+        axum::body::to_bytes(request.into_body(), 4096),
+    )
+    .await
+    .map_err(|_| 408u16)?
+    .map_err(|_| 400u16)?;
+    drop(body_lease);
     let body: IssueBody = serde_json::from_slice(&bytes).map_err(|_| 400u16)?;
     if !matches!(body.encryption.as_deref(), None | Some("required")) {
         return Err(400);

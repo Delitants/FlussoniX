@@ -112,6 +112,10 @@ impl PgServer {
             .tempdir_in("/tmp")
             .unwrap();
         chown_for_database(dir.path());
+        let ca_file = dir.path().join("ca.pem");
+        fs::copy(&certs.ca, &ca_file).unwrap();
+        fs::set_permissions(&ca_file, fs::Permissions::from_mode(0o600)).unwrap();
+        chown_for_database(&ca_file);
         let password_file = dir.path().join("password");
         fs::write(&password_file, "owned-test-secret\n").unwrap();
         fs::set_permissions(&password_file, fs::Permissions::from_mode(0o600)).unwrap();
@@ -193,7 +197,11 @@ impl PgServer {
         self.port
     }
 
-    pub fn backup(&self, certs: &super::tls_fixture::Certificates) -> PathBuf {
+    fn ca_path(&self) -> PathBuf {
+        self.dir.path().join("ca.pem")
+    }
+
+    pub fn backup(&self) -> PathBuf {
         let (bin, _) = binaries().unwrap();
         let path = self.dir.path().join("owner-only-backup.dump");
         fs::File::create(&path).unwrap();
@@ -207,7 +215,7 @@ impl PgServer {
             .env("HOME", self.dir.path())
             .env("PGPASSWORD", "owned-test-secret")
             .env("PGSSLMODE", "verify-full")
-            .env("PGSSLROOTCERT", &certs.ca)
+            .env("PGSSLROOTCERT", self.ca_path())
             .output()
             .unwrap();
         assert!(
@@ -218,7 +226,7 @@ impl PgServer {
         path
     }
 
-    pub fn restore(&self, certs: &super::tls_fixture::Certificates, backup: &Path) {
+    pub fn restore(&self, backup: &Path) {
         let (bin, _) = binaries().unwrap();
         let output = owned_command(&bin.join("pg_restore"))
             .args(["-h", "127.0.0.1", "-p"])
@@ -237,7 +245,7 @@ impl PgServer {
             .env("HOME", self.dir.path())
             .env("PGPASSWORD", "owned-test-secret")
             .env("PGSSLMODE", "verify-full")
-            .env("PGSSLROOTCERT", &certs.ca)
+            .env("PGSSLROOTCERT", self.ca_path())
             .output()
             .unwrap();
         assert!(
@@ -315,7 +323,7 @@ impl PgReplica {
             .env("HOME", dir.path())
             .env("PGPASSWORD", "owned-test-secret")
             .env("PGSSLMODE", "verify-full")
-            .env("PGSSLROOTCERT", &certs.ca)
+            .env("PGSSLROOTCERT", primary.ca_path())
             .output()
             .unwrap();
         assert!(
@@ -326,7 +334,7 @@ impl PgReplica {
         let recovery = format!(
             "primary_conninfo = 'host=127.0.0.1 port={} user=ha_test password=owned-test-secret application_name=ha_standby sslmode=verify-full sslrootcert={}'\n",
             primary.port,
-            certs.ca.display()
+            primary.ca_path().display()
         );
         fs::OpenOptions::new()
             .append(true)

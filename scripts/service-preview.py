@@ -95,6 +95,16 @@ def traverse(path, account, groups):
             raise ValueError('service account cannot traverse a selected directory')
 
 
+def trusted_runtime_ancestors(path, account):
+    operator = os.geteuid()
+    for parent in path.parents:
+        info = parent.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0, operator, account.pw_uid}:
+            raise ValueError('runtime path has an untrusted ancestor')
+        if info.st_mode & 0o022 and not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX):
+            raise ValueError('runtime path has a writable ancestor')
+
+
 def trusted_install_path(path):
     operator = os.geteuid()
     for component in [path, *path.parents]:
@@ -168,6 +178,7 @@ def runtime_file(raw: str, account, groups: list[int], *, private: bool, max_byt
     path = absolute(raw)
     _, info = read_regular(path, max_bytes)
     traverse(path.parent, account, groups)
+    trusted_runtime_ancestors(path, account)
     if not can_access(path, account, groups, 4):
         raise ValueError('service account cannot read a selected runtime file')
     if private:
@@ -310,6 +321,7 @@ def render(args):
     if not state.is_dir() or state.stat().st_uid != account.pw_uid or state.stat().st_mode & 0o077:
         raise ValueError('state directory must belong to the service account with mode 0700')
     traverse(state, account, groups)
+    trusted_runtime_ancestors(state, account)
     if not can_access(state, account, groups, 7):
         raise ValueError('service account needs read/write access to state')
     srtp_ledger = srtp_receiver_history(state, account)
@@ -319,6 +331,7 @@ def render(args):
         if info.st_uid != account.pw_uid or info.st_mode & 0o077 or not can_access(config, account, groups, 6):
             raise ValueError('existing config must be private and readable/writable by the service account')
     data, info = read_regular(secret, 32 * 1024)
+    trusted_runtime_ancestors(secret, account)
     if info.st_uid not in [0, account.pw_uid] or info.st_mode & 0o077:
         raise ValueError('credentials must be owner-only and belong to root or the service account')
     if not data:

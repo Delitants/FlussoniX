@@ -28,6 +28,7 @@ pub mod wire;
 
 pub mod m4_ingest;
 pub mod media_queue;
+mod origin_pin;
 
 pub mod peer_hls;
 

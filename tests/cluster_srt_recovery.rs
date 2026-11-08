@@ -35,8 +35,64 @@ async fn lookup(client: &reqwest::Client, lb: &Daemon, token: &str) -> reqwest::
         .await
         .unwrap()
 }
+async fn node_diagnostic(client: &reqwest::Client, node: &Daemon) -> Value {
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(Duration::from_secs(2), async {
+        client
+            .get(format!("{}/flussonix/api/v1/node", node.url))
+            .header("X-Flussonix-Peer", &node.key)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json::<Value>()
+            .await
+            .ok()
+    })
+    .await;
+    let Ok(Some(value)) = response else {
+        return json!({"node_probe":"unavailable","probe_ms":started.elapsed().as_millis()});
+    };
+    let stream = value["streams"]
+        .as_array()
+        .and_then(|streams| streams.iter().find(|stream| stream["name"] == STREAM))
+        .map(|stream| &stream["stats"])
+        .unwrap_or(&Value::Null);
+    json!({
+        "role":value["role"],"cpu":value["cpu"],"ram":value["ram"],
+        "uplink":value["uplink"],"uplink_mbps":value["uplink_mbps"],
+        "reserved_mbps":value["reserved_mbps"],"age_ms":value["age_ms"],
+        "active":value["active"],"reserved":value["reserved"],
+        "limit":value["limit"],"drain":value["drain"],
+        "probe_ms":started.elapsed().as_millis(),
+        "srt_enabled":value["srt_playback"]["enabled"],
+        "srt_encrypted":value["srt_playback"]["encrypted"],
+        "srt_clients":value["srt_playback"]["clients"],
+        "srt_reserved":value["srt_playback"]["reserved"],
+        "srt_client_limit":value["srt_playback"]["client_limit"],
+        "srt_listener_ready":value["srt_playback"]["listener_id"].is_string(),
+        "stream_ready":stream["ready"],
+        "source_available":stream["source_available"],
+        "stream_status":stream["status"],
+        "stream_bitrate_mbps":value["stream_bitrates"][STREAM]["mbps"],
+        "stream_bitrate_age_ms":value["stream_bitrates"][STREAM]["age_ms"],
+    })
+}
 async fn fresh(client: &reqwest::Client, lb: &Daemon, cdn: &Daemon) -> Value {
+    let started = std::time::Instant::now();
     let response = lookup(client, lb, TOKEN).await;
+    let lookup_ms = started.elapsed().as_millis();
+    if response.status() != 200 {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let (lb_state, cdn_state) =
+            tokio::join!(node_diagnostic(client, lb), node_diagnostic(client, cdn));
+        panic!(
+            "fresh SRT lookup {status}: {body}; diagnostic: {}",
+            json!({"lookup_ms":lookup_ms,"lb":lb_state,"cdn":cdn_state})
+        );
+    }
     assert_eq!(
         response.status(),
         200,

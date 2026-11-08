@@ -24,7 +24,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::Command,
-    sync::{Mutex, Semaphore, oneshot},
+    sync::{Mutex, OwnedMutexGuard, Semaphore, oneshot},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -62,7 +62,24 @@ pub struct Engine {
     pub rtsp_push_egress: Arc<AtomicU64>,
     pub http_push_egress: Arc<AtomicU64>,
     srtp_receiver_ledger: Option<Arc<crate::direct_rtp::key_ledger::Ledger>>,
+    #[cfg(test)]
+    hls_prepare_test_hook: Option<Arc<HlsPrepareHook>>,
+    #[cfg(test)]
+    before_remove_test_hook: Option<Arc<BeforeRemoveHook>>,
 }
+#[cfg(test)]
+type BeforeRemoveHook =
+    dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync;
+#[cfg(test)]
+type HlsPrepareHook = dyn Fn(
+        String,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<crate::peer_hls::PreparedOrigin, String>>
+                + Send,
+        >,
+    > + Send
+    + Sync;
 #[derive(Clone, Copy)]
 struct InputPreference {
     index: usize,
@@ -276,7 +293,7 @@ impl Engine {
             root: root.as_ref().into(),
             ffmpeg: ffmpeg.into(),
             tesseract: tesseract.into(),
-            hls_epoch: crate::hls_generation::Epoch::new(),
+            hls_epoch: crate::hls_generation::Epoch::for_root(root.as_ref()),
             workers: Mutex::new(HashMap::new()),
             input_preferences: Mutex::new(HashMap::new()),
             startup_gates: std::sync::Mutex::new(HashMap::new()),
@@ -288,7 +305,18 @@ impl Engine {
             rtsp_push_egress: Arc::new(AtomicU64::new(0)),
             http_push_egress: Arc::new(AtomicU64::new(0)),
             srtp_receiver_ledger: None,
+            #[cfg(test)]
+            hls_prepare_test_hook: None,
+            #[cfg(test)]
+            before_remove_test_hook: None,
         }
+    }
+    async fn prepare_hls(&self, input: &str) -> Result<crate::peer_hls::PreparedOrigin, String> {
+        #[cfg(test)]
+        if let Some(hook) = &self.hls_prepare_test_hook {
+            return hook(input.to_owned()).await;
+        }
+        crate::peer_hls::prepare(input).await
     }
     pub fn set_srtp_receiver_ledger(
         &mut self,
@@ -365,7 +393,7 @@ impl Engine {
             return Err("publisher input cannot be selected".into());
         }
         let fingerprint = input_fingerprint(cfg).ok_or("stream has no input")?;
-        let _startup = self.startup_gate(name).lock_owned().await;
+        let startup = self.startup_gate(name).lock_owned().await;
         if !current.await {
             return Err("media route changed".into());
         }
@@ -401,6 +429,23 @@ impl Engine {
             && workers
                 .get(name)
                 .is_some_and(|worker| worker.input_index == index);
+        if same {
+            self.input_preferences.lock().await.insert(
+                name.to_owned(),
+                InputPreference {
+                    index,
+                    inputs: fingerprint,
+                },
+            );
+            return Ok(false);
+        }
+        let retired = workers.remove(name);
+        drop(workers);
+        let _startup = if let Some(worker) = retired {
+            self.retire_owned(name, worker, startup).await?
+        } else {
+            startup
+        };
         self.input_preferences.lock().await.insert(
             name.to_owned(),
             InputPreference {
@@ -408,14 +453,6 @@ impl Engine {
                 inputs: fingerprint,
             },
         );
-        if same {
-            return Ok(false);
-        }
-        let retired = workers.remove(name);
-        drop(workers);
-        if let Some(worker) = retired {
-            self.stop_worker(name, worker).await;
-        }
         Ok(active || retry_demand)
     }
     pub async fn publish_guarded(
@@ -542,7 +579,7 @@ impl Engine {
         {
             return Err("HLS caption conversion requires a real H.264/HEVC video source; GPU conversion is not qualified".into());
         }
-        let _startup = self.startup_gate(name).lock_owned().await;
+        let startup = self.startup_gate(name).lock_owned().await;
         let preferred_input = if publishing.is_none() && shared.is_none() {
             self.preferred_input(name, cfg).await
         } else {
@@ -659,6 +696,110 @@ impl Engine {
         } else {
             None
         };
+        // The per-stream gate keeps this selection stable against another
+        // startup. DNS must run before taking the shared worker-map lock.
+        let hls_candidate = if publishing.is_none()
+            && cfg["disabled"] != true
+            && !shared.as_ref().is_some_and(|s| s.input.is_none())
+        {
+            let workers = self.workers.lock().await;
+            let signature = media_signature(cfg);
+            let existing = workers.get(name);
+            let running = existing.is_some_and(|w| {
+                w.alive.load(Ordering::Relaxed)
+                    && !w.is_closed()
+                    && w.signature == signature
+                    && w.shared_generation == shared_generation
+            });
+            let index = existing
+                .filter(|w| {
+                    !running && w.signature == signature && w.shared_generation == shared_generation
+                })
+                .map_or(preferred_input.unwrap_or(0), |w| w.input_index + 1);
+            if running {
+                None
+            } else {
+                cfg["inputs"]
+                    .as_array()
+                    .filter(|inputs| !inputs.is_empty())
+                    .and_then(|inputs| {
+                        let selected_index = index % inputs.len();
+                        let input = inputs[selected_index]["url"].as_str()?;
+                        [
+                            "hls://",
+                            "hlss://",
+                            "tshttp://",
+                            "tshttps://",
+                            "http://",
+                            "https://",
+                        ]
+                        .iter()
+                        .any(|prefix| input.starts_with(prefix))
+                        .then(|| (selected_index, input.to_owned()))
+                    })
+            }
+        } else {
+            None
+        };
+        let hls_start_index = hls_candidate.as_ref().map(|(index, _)| *index);
+        let mut selected_hls_index = None;
+        let mut prepared_hls = None;
+        if let Some((first_index, _)) = hls_candidate {
+            let inputs = cfg["inputs"].as_array().ok_or("stream has no input")?;
+            let mut candidate = first_index;
+            let mut first_dns_error = None;
+            loop {
+                let input = inputs[candidate]["url"]
+                    .as_str()
+                    .ok_or("input URL required")?;
+                if ![
+                    "hls://",
+                    "hlss://",
+                    "tshttp://",
+                    "tshttps://",
+                    "http://",
+                    "https://",
+                ]
+                .iter()
+                .any(|prefix| input.starts_with(prefix))
+                {
+                    selected_hls_index = Some(candidate);
+                    break;
+                }
+                let translated = translate_input(input)?;
+                let result = if cfg["flussonix_peer_key"].is_string() {
+                    crate::peer_hls::prepare_peer(
+                        &translated,
+                        cfg["flussonix_allow_insecure_peer_http"] == true,
+                    )
+                    .await
+                } else {
+                    self.prepare_hls(&translated).await
+                };
+                match result {
+                    Ok(prepared) => {
+                        selected_hls_index = Some(candidate);
+                        prepared_hls = Some((candidate, input.to_owned(), prepared));
+                        break;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.as_str(),
+                            "peer media DNS failed"
+                                | "peer media DNS timeout"
+                                | "peer media DNS returned no addresses"
+                        ) =>
+                    {
+                        first_dns_error.get_or_insert(error);
+                        candidate = (candidate + 1) % inputs.len();
+                        if candidate == first_index {
+                            return Err(first_dns_error.unwrap());
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
         let mut workers = self.workers.lock().await;
         // Recheck after waiting for another stream startup/replacement. A stale
         // route must not cancel an already-published replacement worker.
@@ -711,10 +852,6 @@ impl Engine {
                 restart_count = w.restart_count.saturating_add(1);
                 streak = recovery.next_streak();
             }
-            w.cancel.cancel();
-            if let Some(done) = w.done.lock().await.take() {
-                let _ = done.await;
-            }
         }
         if shared.as_ref().is_some_and(|s| s.input.is_none()) {
             return Err("shared input startup owner required".into());
@@ -724,7 +861,33 @@ impl Engine {
             .filter(|a| !a.is_empty())
             .ok_or("stream has no input")?;
         index %= inputs.len();
+        if let Some(start_index) = hls_start_index {
+            if index != start_index {
+                return Err("media route changed".into());
+            }
+            index = selected_hls_index.ok_or("media route changed")?;
+        }
         let input = inputs[index]["url"].as_str().ok_or("input URL required")?;
+        let mut prepared_hls = if [
+            "hls://",
+            "hlss://",
+            "tshttp://",
+            "tshttps://",
+            "http://",
+            "https://",
+        ]
+        .iter()
+        .any(|prefix| input.starts_with(prefix))
+        {
+            let (prepared_index, prepared_input, prepared) =
+                prepared_hls.ok_or("media route changed")?;
+            if prepared_index != index || prepared_input != input {
+                return Err("media route changed".into());
+            }
+            Some(prepared)
+        } else {
+            None
+        };
         if native_captions
             && !["m4f://", "m4fs://", "m4s://", "m4ss://", "fxlink://"]
                 .iter()
@@ -745,14 +908,14 @@ impl Engine {
             return Err("waiting for publisher".into());
         }
         let dir = self.directory(name);
-        let replaced = workers.contains_key(name);
-        let sequence = self.hls_epoch.next(&dir).await?;
+        let retired = workers.remove(name);
+        let replaced = retired.is_some();
+        drop(workers);
+        // The task owns the stream gate through join, durable allocation, and
+        // deletion even if the requesting viewer disconnects.
+        let (_startup, sequence) = self.prepare_generation(name, retired, startup).await?;
         let generation = uuid::Uuid::new_v4().simple().to_string();
         let discontinuity = if replaced { "+discont_start" } else { "" };
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(dir.join("fmp4"))
-            .await
-            .map_err(|e| e.to_string())?;
         let caption_listener = if caption_services.is_empty() || native_captions {
             None
         } else {
@@ -950,8 +1113,8 @@ impl Engine {
                 let ca = inputs[index]["flussonix_tls_ca"]
                     .as_str()
                     .map(std::path::Path::new);
-                let proxy = crate::peer_hls::PeerHls::start_inspected(
-                    &translated,
+                let proxy = crate::peer_hls::PeerHls::start_inspected_prepared(
+                    prepared_hls.take().ok_or("media route changed")?,
                     key,
                     ca,
                     allow_insecure_peer_http,
@@ -981,8 +1144,8 @@ impl Engine {
                     || ((input.starts_with("https://") || input.starts_with("http://"))
                         && !url::Url::parse(&translated)
                             .is_ok_and(|u| u.path().ends_with(".m3u8")));
-                let proxy = crate::peer_hls::PeerHls::start_external(
-                    &translated,
+                let proxy = crate::peer_hls::PeerHls::start_external_prepared(
+                    prepared_hls.take().ok_or("media route changed")?,
                     inputs[index]["flussonix_tls_ca"].as_str().map(Path::new),
                     live,
                 )
@@ -1303,7 +1466,21 @@ impl Engine {
             .as_str()
             .unwrap_or("")
             .to_owned();
+        let mut workers = self.workers.lock().await;
+        if workers.contains_key(name)
+            || workers
+                .values()
+                .filter(|w| w.alive.load(Ordering::Relaxed))
+                .count()
+                >= 256
+        {
+            return Err("worker limit reached".into());
+        }
+        if shared.as_ref().is_some_and(|s| !s.feed.current()) {
+            return Err("media route changed".into());
+        }
         workers.insert(name.into(), worker.clone());
+        drop(workers);
         let w = worker.clone();
         let tesseract = self.tesseract.clone();
         let push_tasks: Vec<_> = worker
@@ -1851,25 +2028,152 @@ impl Engine {
         }
         Ok(Bytes::from(data))
     }
-    async fn stop_worker(&self, name: &str, w: Arc<Worker>) {
+    async fn join_and_commit(
+        epoch: crate::hls_generation::Epoch,
+        name: String,
+        directory: PathBuf,
+        w: Arc<Worker>,
+    ) -> Result<(), String> {
         w.cancel.cancel();
         if let Some(done) = w.done.lock().await.take() {
             let _ = done.await;
         }
-        let _ = self.hls_epoch.observe(&self.directory(name)).await;
-        let _ = tokio::fs::remove_dir_all(self.directory(name)).await;
+        tokio::task::spawn_blocking(move || epoch.commit_observed(&name, &directory))
+            .await
+            .map_err(|_| "HLS sequence commit task failed".to_owned())?
+    }
+    async fn remove_media(directory: &Path) -> Result<(), String> {
+        match tokio::fs::remove_dir_all(directory).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err("cannot remove retired HLS media".into()),
+        }
+    }
+    async fn retire_owned(
+        &self,
+        name: &str,
+        worker: Arc<Worker>,
+        guard: OwnedMutexGuard<()>,
+    ) -> Result<OwnedMutexGuard<()>, String> {
+        let name = name.to_owned();
+        let directory = self.directory(&name);
+        let epoch = self.hls_epoch.clone();
+        #[cfg(test)]
+        let before_remove = self.before_remove_test_hook.clone();
+        tokio::spawn(async move {
+            let guard = guard;
+            let result: Result<(), String> = async {
+                Self::join_and_commit(epoch, name.clone(), directory.clone(), worker).await?;
+                #[cfg(test)]
+                if let Some(hook) = before_remove {
+                    hook(&name).await;
+                }
+                Self::remove_media(&directory).await
+            }
+            .await;
+            if let Err(error) = &result {
+                tracing::warn!(stream = name, error = %error, "detached media retirement failed");
+            }
+            result?;
+            Ok(guard)
+        })
+        .await
+        .map_err(|_| "HLS retirement task failed".to_owned())?
+    }
+    async fn prepare_generation(
+        &self,
+        name: &str,
+        retired: Option<Arc<Worker>>,
+        guard: OwnedMutexGuard<()>,
+    ) -> Result<(OwnedMutexGuard<()>, u64), String> {
+        let name = name.to_owned();
+        let directory = self.directory(&name);
+        let epoch = self.hls_epoch.clone();
+        #[cfg(test)]
+        let before_remove = self.before_remove_test_hook.clone();
+        tokio::spawn(async move {
+            let guard = guard;
+            let result: Result<u64, String> = async {
+                if let Some(worker) = retired {
+                    Self::join_and_commit(epoch.clone(), name.clone(), directory.clone(), worker)
+                        .await?;
+                }
+                let sequence = tokio::task::spawn_blocking({
+                    let directory = directory.clone();
+                    let name = name.clone();
+                    move || epoch.next_for(&name, &directory)
+                })
+                .await
+                .map_err(|_| "HLS sequence allocation task failed".to_owned())??;
+                #[cfg(test)]
+                if let Some(hook) = before_remove {
+                    hook(&name).await;
+                }
+                Self::remove_media(&directory).await?;
+                tokio::fs::create_dir_all(directory.join("fmp4"))
+                    .await
+                    .map_err(|_| "cannot create HLS media directory".to_owned())?;
+                Ok(sequence)
+            }
+            .await;
+            if let Err(error) = &result {
+                tracing::warn!(stream = name, error = %error, "detached HLS generation failed");
+            }
+            let sequence = result?;
+            Ok((guard, sequence))
+        })
+        .await
+        .map_err(|_| "HLS generation task failed".to_owned())?
     }
     pub async fn stop(&self, name: &str) {
-        let mut workers = self.workers.lock().await;
-        if let Some(w) = workers.remove(name) {
-            self.stop_worker(name, w).await;
+        let startup = self.startup_gate(name).lock_owned().await;
+        let retired = self.workers.lock().await.remove(name);
+        if let Some(w) = retired {
+            if let Err(error) = self.retire_owned(name, w, startup).await {
+                tracing::warn!(
+                    stream = name,
+                    error = error,
+                    "failed to retire media worker"
+                );
+            }
         }
     }
     pub async fn stop_if_current(&self, name: &str, expected: &Arc<Worker>) {
-        let mut workers = self.workers.lock().await;
-        if workers.get(name).is_some_and(|w| Arc::ptr_eq(w, expected)) {
-            let worker = workers.remove(name).unwrap();
-            self.stop_worker(name, worker).await;
+        let startup = self.startup_gate(name).lock_owned().await;
+        let retired = {
+            let mut workers = self.workers.lock().await;
+            workers
+                .get(name)
+                .is_some_and(|worker| Arc::ptr_eq(worker, expected))
+                .then(|| workers.remove(name).unwrap())
+        };
+        if let Some(worker) = retired {
+            if let Err(error) = self.retire_owned(name, worker, startup).await {
+                tracing::warn!(
+                    stream = name,
+                    error = error,
+                    "failed to retire media worker"
+                );
+            }
+        }
+    }
+    pub async fn stop_if_idle_current(&self, name: &str, expected: &Arc<Worker>) {
+        let startup = self.startup_gate(name).lock_owned().await;
+        let retired = {
+            let mut workers = self.workers.lock().await;
+            workers
+                .get(name)
+                .is_some_and(|worker| Arc::ptr_eq(worker, expected) && Self::idle_worker(worker))
+                .then(|| workers.remove(name).unwrap())
+        };
+        if let Some(worker) = retired
+            && let Err(error) = self.retire_owned(name, worker, startup).await
+        {
+            tracing::warn!(
+                stream = name,
+                error = error,
+                "failed to retire idle media worker"
+            );
         }
     }
     pub async fn stop_all(&self) {
@@ -1985,22 +2289,30 @@ impl Engine {
             .collect()
     }
 
-    pub async fn idle(&self) -> Vec<String> {
+    fn idle_worker(worker: &Worker) -> bool {
+        !worker.publication
+            && !worker.active_pushes
+            && worker.idle_seconds() >= 60
+            && worker.viewers.load(Ordering::Relaxed) == 0
+            && !worker
+                .shared_static_demand
+                .as_ref()
+                .is_some_and(|demand| demand())
+    }
+    pub async fn idle_workers(&self) -> Vec<(String, Arc<Worker>)> {
         self.workers
             .lock()
             .await
             .iter()
-            .filter(|(_, w)| {
-                !w.publication
-                    && !w.active_pushes
-                    && w.idle_seconds() >= 60
-                    && w.viewers.load(Ordering::Relaxed) == 0
-                    && !w
-                        .shared_static_demand
-                        .as_ref()
-                        .is_some_and(|demand| demand())
-            })
-            .map(|(n, _)| n.clone())
+            .filter(|(_, worker)| Self::idle_worker(worker))
+            .map(|(name, worker)| (name.clone(), worker.clone()))
+            .collect()
+    }
+    pub async fn idle(&self) -> Vec<String> {
+        self.idle_workers()
+            .await
+            .into_iter()
+            .map(|(name, _)| name)
             .collect()
     }
 }
@@ -2875,6 +3187,62 @@ mod input_selection_lock_tests {
     use super::*;
 
     #[tokio::test]
+    async fn explicit_stop_waiting_for_worker_does_not_hold_the_global_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(dir.path(), "ffmpeg"));
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        let victim = engine.ensure("victim", &config).await.unwrap();
+        engine.ensure("unrelated", &config).await.unwrap();
+        let hold_completion = victim.done.lock().await;
+        let stopping = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.stop("victim").await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !victim.cancel.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let unrelated = tokio::time::timeout(Duration::from_secs(1), engine.count()).await;
+        drop(hold_completion);
+        stopping.await.unwrap();
+        engine.stop_all().await;
+        assert_eq!(
+            unrelated.expect("stop held the worker map across a join"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_stop_waiting_for_worker_does_not_hold_the_global_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(dir.path(), "ffmpeg"));
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        let victim = engine.ensure("victim", &config).await.unwrap();
+        engine.ensure("unrelated", &config).await.unwrap();
+        let hold_completion = victim.done.lock().await;
+        let stopping = {
+            let engine = engine.clone();
+            let victim = victim.clone();
+            tokio::spawn(async move { engine.stop_if_current("victim", &victim).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !victim.cancel.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let unrelated = tokio::time::timeout(Duration::from_secs(1), engine.count()).await;
+        drop(hold_completion);
+        stopping.await.unwrap();
+        engine.stop_all().await;
+        assert_eq!(unrelated.expect("conditional stop held the worker map"), 1);
+    }
+
+    #[tokio::test]
     async fn selection_teardown_does_not_block_unrelated_worker_queries() {
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::new(dir.path(), "ffmpeg"));
@@ -2907,9 +3275,627 @@ mod input_selection_lock_tests {
 }
 
 #[cfg(test)]
+mod hls_retirement_tests {
+    use super::*;
+    use crate::server::{App, Options};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn replacement_join_does_not_block_unrelated_worker_queries() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(root.path(), "ffmpeg"));
+        let original = json!({"inputs":[{"url":"testsrc://"}]});
+        let changed = json!({"inputs":[{"url":"testsrc://"}],"flussonix_hls_subtitles":"drop"});
+        let old = engine.ensure("owned", &original).await.unwrap();
+        engine.ensure("unrelated", &original).await.unwrap();
+        let hold_completion = old.done.lock().await;
+        let replacing = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.ensure("owned", &changed).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !old.cancel.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let unrelated = tokio::time::timeout(Duration::from_secs(1), engine.count()).await;
+        drop(hold_completion);
+        let replacement = replacing.await.unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&old, &replacement));
+        engine.stop_all().await;
+        assert!(
+            unrelated.is_ok(),
+            "replacement held the map while joining the old worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_commit_preserves_old_media_and_publishes_no_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::new(root.path(), "ffmpeg");
+        let original = json!({"inputs":[{"url":"testsrc://"}]});
+        let changed = json!({"inputs":[{"url":"testsrc://"}],"flussonix_hls_subtitles":"drop"});
+        engine.ensure("owned", &original).await.unwrap();
+        let media = engine.directory("owned");
+        std::fs::write(media.join("recovery-marker"), b"old generation").unwrap();
+        let record = root.path().join(".hls-sequences").join(format!(
+            "{}.json",
+            media.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(record, b"{").unwrap();
+
+        let result = engine.ensure("owned", &changed).await;
+
+        assert!(result.is_err(), "replacement concealed a corrupt floor");
+        assert!(engine.workers.lock().await.get("owned").is_none());
+        assert!(
+            media.join("recovery-marker").exists(),
+            "replacement lost recovery media"
+        );
+    }
+
+    #[tokio::test]
+    async fn obsolete_conditional_stop_does_not_delete_replacement_media() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::new(root.path(), "ffmpeg");
+        let original = json!({"inputs":[{"url":"testsrc://"}]});
+        let changed = json!({"inputs":[{"url":"testsrc://"}],"flussonix_hls_subtitles":"drop"});
+        let old = engine.ensure("owned", &original).await.unwrap();
+        let current = engine.ensure("owned", &changed).await.unwrap();
+        let marker = engine.directory("owned").join("new-generation");
+        std::fs::write(&marker, b"current generation").unwrap();
+
+        engine.stop_if_current("owned", &old).await;
+
+        assert!(Arc::ptr_eq(
+            engine.workers.lock().await.get("owned").unwrap(),
+            &current
+        ));
+        assert!(marker.exists(), "obsolete stop deleted replacement media");
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_stop_keeps_stream_fenced_until_old_worker_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(root.path(), "ffmpeg"));
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        let old = engine.ensure("owned", &config).await.unwrap();
+        let hold_completion = old.done.lock().await;
+        let stopping = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.stop("owned").await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), old.cancel.cancelled())
+            .await
+            .unwrap();
+        stopping.abort();
+        let _ = stopping.await;
+        let starting = {
+            let engine = engine.clone();
+            let config = config.clone();
+            tokio::spawn(async move { engine.ensure("owned", &config).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), async {
+                while !starting.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "replacement ran before detached worker finished"
+        );
+        drop(hold_completion);
+        starting.await.unwrap().unwrap();
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_startup_keeps_stream_fenced_during_old_worker_join() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(root.path(), "ffmpeg"));
+        let original = json!({"inputs":[{"url":"testsrc://"}]});
+        let changed = json!({"inputs":[{"url":"testsrc://"}],"flussonix_hls_subtitles":"drop"});
+        let old = engine.ensure("owned", &original).await.unwrap();
+        let hold_completion = old.done.lock().await;
+        let replacing = {
+            let engine = engine.clone();
+            let changed = changed.clone();
+            tokio::spawn(async move { engine.ensure("owned", &changed).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), old.cancel.cancelled())
+            .await
+            .unwrap();
+        replacing.abort();
+        let _ = replacing.await;
+        let next = {
+            let engine = engine.clone();
+            let changed = changed.clone();
+            tokio::spawn(async move { engine.ensure("owned", &changed).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), async {
+                while !next.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "replacement ran before cancelled startup finished retirement"
+        );
+        drop(hold_completion);
+        next.await.unwrap().unwrap();
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_stop_keeps_stream_fenced_during_media_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(root.path(), "ffmpeg");
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        engine.ensure("owned", &config).await.unwrap();
+        let entered = Arc::new(AtomicU64::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        engine.before_remove_test_hook = Some(Arc::new({
+            let entered = entered.clone();
+            let release = release.clone();
+            move |_| {
+                let entered = entered.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    if entered.fetch_add(1, Ordering::SeqCst) == 0 {
+                        release.notified().await;
+                    }
+                })
+            }
+        }));
+        let engine = Arc::new(engine);
+        let stopping = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.stop("owned").await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while entered.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        stopping.abort();
+        let _ = stopping.await;
+        let starting = {
+            let engine = engine.clone();
+            let config = config.clone();
+            tokio::spawn(async move { engine.ensure("owned", &config).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), async {
+                while !starting.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "replacement ran while cancelled removal was pending"
+        );
+        release.notify_one();
+        starting.await.unwrap().unwrap();
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn idle_snapshot_cannot_retire_replacement_or_renewed_viewer() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::new(root.path(), "ffmpeg");
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        let old = engine.ensure("owned", &config).await.unwrap();
+        *old.last_access.lock().unwrap() = Instant::now() - Duration::from_secs(61);
+        let snapshot = engine.idle().await;
+        assert_eq!(snapshot.len(), 1);
+        old.touch();
+        engine.stop_if_idle_current("owned", &old).await;
+        assert!(Arc::ptr_eq(
+            engine.workers.lock().await.get("owned").unwrap(),
+            &old
+        ));
+
+        *old.last_access.lock().unwrap() = Instant::now() - Duration::from_secs(61);
+        let changed = json!({"inputs":[{"url":"testsrc://"}],"flussonix_hls_subtitles":"drop"});
+        let replacement = engine.ensure("owned", &changed).await.unwrap();
+        engine.stop_if_idle_current("owned", &old).await;
+        assert!(Arc::ptr_eq(
+            engine.workers.lock().await.get("owned").unwrap(),
+            &replacement
+        ));
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn stop_all_waiting_for_one_join_keeps_other_stream_observable() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(root.path(), "ffmpeg"));
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        let old = engine.ensure("owned", &config).await.unwrap();
+        engine.ensure("other", &config).await.unwrap();
+        let hold_completion = old.done.lock().await;
+        let stopping = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.stop_all().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !old.cancel.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(1), engine.count()).await;
+        drop(hold_completion);
+        stopping.await.unwrap();
+        assert!(
+            observed.is_ok(),
+            "stop-all held the global map across a join"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_reconcile_commits_floor_before_removing_media() {
+        let root = tempfile::tempdir().unwrap();
+        let app = App::new(
+            root.path().join("config.json"),
+            root.path().join("media"),
+            Options {
+                admin_password: "owned-idle-admin".into(),
+                peer_key: "owned-idle-peer".into(),
+                uplink_interface: "process".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let config = json!({"static":false,"inputs":[{"url":"testsrc://"}]});
+        app.config.put("streams", "owned", config.clone()).unwrap();
+        let worker = app.media.ensure("owned", &config).await.unwrap();
+        *worker.last_access.lock().unwrap() = Instant::now() - Duration::from_secs(61);
+        let media = app.media.directory("owned");
+        let record = root.path().join("media/.hls-sequences").join(format!(
+            "{}.json",
+            media.file_name().unwrap().to_string_lossy()
+        ));
+
+        app.reconcile().await;
+
+        assert!(worker.is_closed());
+        assert!(app.media.workers.lock().await.get("owned").is_none());
+        assert!(record.is_file(), "idle cleanup discarded the durable floor");
+        assert!(!media.exists(), "idle cleanup retained retired media");
+        app.media.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn startup_reserves_a_durable_floor_before_publishing_a_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::new(root.path(), "ffmpeg");
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        engine.ensure("owned", &config).await.unwrap();
+        let record = root.path().join(".hls-sequences").join(format!(
+            "{}.json",
+            engine
+                .directory("owned")
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+        ));
+        let saved = record.is_file();
+        engine.stop_all().await;
+        assert!(saved, "startup published a worker without a durable floor");
+    }
+
+    #[tokio::test]
+    async fn failed_floor_commit_preserves_old_media_for_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::new(root.path(), "ffmpeg");
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        let worker = engine.ensure("owned", &config).await.unwrap();
+        let media = engine.directory("owned");
+        std::fs::write(media.join("recovery-marker"), b"old generation").unwrap();
+        let state = root.path().join(".hls-sequences");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let record = state.join(format!(
+            "{}.json",
+            media.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&record, b"{").unwrap();
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        engine.stop("owned").await;
+
+        assert!(worker.is_closed());
+        assert!(
+            media.join("recovery-marker").exists(),
+            "failed commit discarded recovery media"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_selection_commit_preserves_media_and_does_not_change_preference() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::new(root.path(), "ffmpeg");
+        let config = json!({"inputs":[{"url":"testsrc://"},{"url":"testsrc://"}]});
+        engine.ensure("owned", &config).await.unwrap();
+        let media = engine.directory("owned");
+        std::fs::write(media.join("recovery-marker"), b"old generation").unwrap();
+        let state = root.path().join(".hls-sequences");
+        let record = state.join(format!(
+            "{}.json",
+            media.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&record, b"{").unwrap();
+
+        let selection = engine
+            .select_input_guarded("owned", &config, 1, std::future::ready(true))
+            .await;
+
+        assert!(selection.is_err(), "selection hid the failed floor commit");
+        assert!(
+            media.join("recovery-marker").exists(),
+            "failed selection lost recovery media"
+        );
+        assert_eq!(engine.preferred_input("owned", &config).await, None);
+    }
+}
+
+#[cfg(test)]
 #[path = "media/ts_diagnostics_tests.rs"]
 mod ts_diagnostics_tests;
 
 #[cfg(test)]
 #[path = "media/rtsp_startup_tests.rs"]
 mod rtsp_startup_tests;
+
+#[cfg(test)]
+mod hls_startup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn surviving_public_playlists_raise_the_startup_floor() {
+        let root = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(root.path(), "ffmpeg");
+        engine.hls_epoch = crate::hls_generation::Epoch::with_clock(root.path(), 1000);
+        let media = engine.directory("owned");
+        std::fs::create_dir_all(media.join("fmp4")).unwrap();
+        std::fs::write(
+            media.join("index.m3u8"),
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:5000\na.ts\nb.ts\n",
+        )
+        .unwrap();
+        std::fs::write(
+            media.join("fmp4/index.m3u8"),
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:7000\na.m4s\nb.m4s\n",
+        )
+        .unwrap();
+        std::fs::write(
+            media.join("passthrough.m3u8"),
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:999999\nprivate.ts\n",
+        )
+        .unwrap();
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+
+        engine.ensure("owned", &config).await.unwrap();
+
+        let record = root.path().join(".hls-sequences").join(format!(
+            "{}.json",
+            media.file_name().unwrap().to_string_lossy()
+        ));
+        let saved: Value = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+        assert_eq!(saved["next_sequence"], 7003);
+        assert!(!media.join("passthrough.m3u8").exists());
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_or_exhausted_floor_preserves_recovery_media() {
+        for bad in [
+            "{",
+            &format!(
+                "{{\"version\":1,\"name\":\"owned\",\"next_sequence\":{}}}",
+                i64::MAX - 1
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let engine = Engine::new(root.path(), "ffmpeg");
+            let media = engine.directory("owned");
+            std::fs::create_dir(&media).unwrap();
+            std::fs::write(media.join("recovery-marker"), b"old media").unwrap();
+            let state = root.path().join(".hls-sequences");
+            std::fs::create_dir(&state).unwrap();
+            std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let record = state.join(format!(
+                "{}.json",
+                media.file_name().unwrap().to_string_lossy()
+            ));
+            std::fs::write(&record, bad).unwrap();
+            std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+            assert!(
+                engine
+                    .ensure("owned", &json!({"inputs":[{"url":"testsrc://"}]}))
+                    .await
+                    .is_err()
+            );
+            assert!(engine.workers.lock().await.is_empty());
+            assert!(media.join("recovery-marker").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_floor_write_for_one_stream_does_not_delay_another() {
+        let root = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(root.path(), "ffmpeg");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        engine.hls_epoch.before_write_for_test(move |name| {
+            if name == "slow" {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+        });
+        let engine = Arc::new(engine);
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        let slow = {
+            let engine = engine.clone();
+            let config = config.clone();
+            tokio::spawn(async move { engine.ensure("slow", &config).await })
+        };
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(3)))
+            .await
+            .unwrap()
+            .unwrap();
+        let fast =
+            tokio::time::timeout(Duration::from_secs(3), engine.ensure("fast", &config)).await;
+        let heartbeat = tokio::time::timeout(Duration::from_millis(100), async {
+            tokio::task::yield_now().await;
+        })
+        .await;
+        release_tx.send(()).unwrap();
+        slow.await.unwrap().unwrap();
+        assert!(
+            fast.is_ok_and(|result| result.is_ok()),
+            "slow floor write blocked a different stream"
+        );
+        assert!(
+            heartbeat.is_ok(),
+            "slow state write blocked the async runtime"
+        );
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn failed_hls_dns_moves_to_healthy_backup_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path(), "ffmpeg");
+        engine.hls_prepare_test_hook = Some(Arc::new(|input: String| {
+            Box::pin(async move {
+                assert!(input.contains("unresolvable.invalid"));
+                Err("peer media DNS failed".into())
+            })
+        }));
+        let config = json!({"inputs":[
+            {"url":"http://unresolvable.invalid/entry.m3u8"},
+            {"url":"testsrc://"}
+        ]});
+        let worker = engine.ensure("fallback", &config).await.unwrap();
+        assert_eq!(worker.input_index, 1);
+        assert!(worker.alive.load(Ordering::Relaxed));
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn hls_prepare_does_not_hold_global_worker_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path(), "ffmpeg");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        engine.hls_prepare_test_hook = Some(Arc::new({
+            let started = started.clone();
+            let release = release.clone();
+            move |input: String| {
+                let started = started.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                    crate::peer_hls::prepare(&input).await
+                })
+            }
+        }));
+        let engine = Arc::new(engine);
+        let config = json!({"inputs":[{"url":"http://127.0.0.1:1/entry.m3u8"}]});
+        let waiting = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.ensure("waiting", &config).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), engine.count())
+                .await
+                .is_ok()
+        );
+        let other = json!({"inputs":[{"url":"testsrc://"}]});
+        tokio::time::timeout(Duration::from_secs(3), engine.ensure("unrelated", &other))
+            .await
+            .unwrap()
+            .unwrap();
+        release.notify_one();
+        let _ = waiting.await.unwrap();
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn stale_hls_preparation_cannot_publish_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path(), "ffmpeg");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        engine.hls_prepare_test_hook = Some(Arc::new({
+            let started = started.clone();
+            let release = release.clone();
+            move |input: String| {
+                let started = started.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                    crate::peer_hls::prepare(&input).await
+                })
+            }
+        }));
+        let engine = Arc::new(engine);
+        let current = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let config = json!({"inputs":[{"url":"http://127.0.0.1:1/entry.m3u8"}]});
+        let waiting = {
+            let engine = engine.clone();
+            let current = current.clone();
+            tokio::spawn(async move {
+                engine
+                    .ensure_guarded("stale", &config, true, async move {
+                        current.load(Ordering::SeqCst)
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        current.store(false, Ordering::SeqCst);
+        release.notify_one();
+        assert_eq!(
+            waiting.await.unwrap().err().as_deref(),
+            Some("media route changed")
+        );
+        assert!(engine.workers.lock().await.get("stale").is_none());
+        let cancelled = {
+            let engine = engine.clone();
+            let config = json!({"inputs":[{"url":"http://127.0.0.1:1/entry.m3u8"}]});
+            tokio::spawn(async move { engine.ensure("cancelled", &config).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        cancelled.abort();
+        assert!(cancelled.await.is_err());
+        assert!(engine.workers.lock().await.get("cancelled").is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        engine.stop_all().await;
+    }
+}

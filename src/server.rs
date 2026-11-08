@@ -208,6 +208,7 @@ pub struct App {
     pub(crate) publishers: Arc<tokio::sync::Semaphore>,
     iptv_peer_admission: iptv_peer::Admission,
     source_lookups: Mutex<HashMap<String, origin_resolution::Ticket>>,
+    ticket_body_gate: srt_ticket_issue::BodyGate,
 }
 impl App {
     fn srtp_ledger_capability(&self) -> Value {
@@ -524,6 +525,7 @@ impl App {
             publishers: Arc::new(tokio::sync::Semaphore::new(64)),
             iptv_peer_admission: iptv_peer::Admission::new(),
             source_lookups: Mutex::new(HashMap::new()),
+            ticket_body_gate: srt_ticket_issue::BodyGate::new(),
         });
         let weak = Arc::downgrade(&app.playback_auth);
         app.iptv.set_on_change(Box::new(move |revision| {
@@ -726,13 +728,13 @@ impl App {
     pub async fn reconcile(&self) {
         self.refresh_source_activation().await;
         // Retirement comes first: a background retry must not extend demand.
-        for name in self.media.idle().await {
+        for (name, worker) in self.media.idle_workers().await {
             let static_demand = match self.config.effective(&name) {
                 Some(config) => config["static"] != false,
                 None => self.source_is_warm(&name).await,
             };
             if !static_demand {
-                self.media.stop(&name).await;
+                self.media.stop_if_idle_current(&name, &worker).await;
             }
         }
         self.refresh_sources().await;
@@ -1154,6 +1156,7 @@ fn redact_view_value(value: &mut Value) {
                         | "token"
                         | "streamid"
                         | "key_file"
+                        | "track_key_files"
                         | "sdp_file"
                         | "flussonix_tls_ca"
                         | "flussonix_media_tls_ca"
@@ -1163,7 +1166,7 @@ fn redact_view_value(value: &mut Value) {
                     *field = Value::String("[redacted]".into());
                 } else if matches!(
                     key.as_str(),
-                    "url" | "endpoint" | "upstream_source" | "source"
+                    "url" | "endpoint" | "upstream_source" | "source" | "origin"
                 ) || key.ends_with("_url")
                 {
                     *field = match field.as_str() {

@@ -49,7 +49,7 @@ The separate owner-only `iptv.json` stores tokens outside `/config`. Use exact `
 
 The current HLS limit groups requests with the same stream, IP address and token on one node, so multiple players behind a shared IP may count as one session. Continuous playback connections are counted separately. The [transport guide](iptv-transport.md) describes this limit; strict per-player HLS counting is not yet claimed.
 
-Some UI behaviors depend on private routes, such as explicit input selection. Record them separately from public operations and decide each feature's first-release implementation deliberately.
+The private, bodyless `POST /streams/{name}/inputs/{index}/select` route is implemented for explicit input selection. It requires Edit credentials, returns an empty 204 on success, uses the effective stream/template input list, and changes the runtime preference without saving configuration. An active or static stream restarts on the selected input; a load-balancer node records the preference without starting a local worker. Invalid, disabled or publisher-only inputs fail, and editing the input list clears a stale preference. The tested behavior does not establish every reference error or failover edge case.
 
 ### Semantics that must be implemented explicitly
 
@@ -301,6 +301,12 @@ Standalone secure output is mandatory: the daemon must serve HLS, MPEG-TS, M4F a
 M4F and M4S are **not equivalent to generic fMP4 packaging or a .m4s filename extension**. A standards-only HLS/DASH implementation cannot satisfy inter-server compatibility.
 
 HLS input fetches require bounded playlist/segment state, live sliding-window handling, discontinuities, changing init data, multitrack/variant selection and relative URL resolution. Distinguish HLS encryption from authentication; encrypted input support is a separately recorded capability. First playback paths include `index.m3u8`, `index.ts.m3u8`, `index.fmp4.m3u8` and track playlists; LL-HLS is an explicit extension rather than an implied promise.
+
+The exact live `index.ts.m3u8` and `index.fmp4.m3u8` URLs return a one-rendition master linked to the current authorized TS or fMP4 media playlist, with supported converted subtitles. The reference `video.m3u8` all-track URL and `tracks-{tracks}/mono.m3u8` track-selection URL have no exact handlers yet. These aliases do not establish multi-language single-playlist behavior, VOD/DVR, separate audio or complete HLS query-option parity.
+
+For HTTP(S) HLS and continuous MPEG-TS inputs, FlussoniX resolves the configured hostname once per input generation and uses only that initial address set for playlists, media, keys and same-origin redirects. A later DNS change takes effect when the input restarts. The initial answer is not screened for private addresses, so only configure origins whose initial DNS answer you trust.
+
+Configured M4F/M4S inputs also resolve their origin once per input generation, retaining at most eight initial addresses. Control requests and M4F segment GETs use that pinned set, including M4F control reconnects within the same generation; restarting the input generation refreshes DNS. HTTPS still verifies the configured hostname against the server certificate. The initial M4 address set is not screened for private addresses, so configure only trusted origins.
 
 ## M4F/M4S implementation plan
 

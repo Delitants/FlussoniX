@@ -247,6 +247,16 @@ async fn distinct_keys_reject_captured_cross_lane_packet_before_first_media() {
         .send_to(&b_cipher, ("127.0.0.1", port + 2))
         .await
         .unwrap();
+    // RTCP is admitted only after this track's first authenticated RTP packet.
+    // The two public UDP sockets can be polled in either order, so wait for
+    // track B's RTP admission before sending its RTCP report.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while stats.packets.load(Ordering::Relaxed) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("both RTP lanes must authenticate before RTCP reports");
     for (id, tx, offset) in [(101, &mut a_tx, 1), (202, &mut b_tx, 3)] {
         let mut report = sr(id);
         tx.protect(&mut report, true).unwrap();

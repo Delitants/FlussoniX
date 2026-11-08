@@ -1,6 +1,7 @@
 """A cold upgrade must wait for media from the newly started worker."""
 
 import importlib.util
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import shutil
@@ -20,6 +21,15 @@ SPEC.loader.exec_module(SMOKE)
 
 
 class ColdUpgradeMediaTests(unittest.TestCase):
+    def test_existing_preview_media_root_is_hardened_before_upgrade(self):
+        with tempfile.TemporaryDirectory(prefix='flussonix-upgrade-test-') as temp:
+            lab = SMOKE.Lab(Path(temp))
+            media_root = lab.state / 'media'
+            media_root.mkdir(mode=0o755)
+            os.chmod(media_root, 0o755)
+            lab.prepare_private_media_root()
+            self.assertEqual(media_root.stat().st_mode & 0o777, 0o700)
+
     def _fast_deadline(self):
         ticks = iter(range(0, 100, 10))
         return patch.object(SMOKE, 'time', SimpleNamespace(

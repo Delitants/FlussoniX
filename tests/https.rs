@@ -256,9 +256,20 @@ async fn slow_or_plaintext_handshakes_do_not_block_verified_clients_and_cancel_c
         .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .await
         .unwrap();
+    let other_peer = "127.0.0.2".parse::<std::net::IpAddr>().unwrap();
+    let verified_client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .local_address(other_peer)
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(&std::fs::read(&f.cert.ca).unwrap()).unwrap(),
+        )
+        .build()
+        .unwrap();
     let healthy = tokio::time::timeout(
         Duration::from_secs(2),
-        client(&f.cert).get(format!("{}/health", f.url)).send(),
+        verified_client.get(format!("{}/health", f.url)).send(),
     )
     .await
     .expect("idle handshakes cannot serialize healthy clients")
@@ -267,6 +278,7 @@ async fn slow_or_plaintext_handshakes_do_not_block_verified_clients_and_cancel_c
     assert!(
         reqwest::Client::builder()
             .no_proxy()
+            .local_address(other_peer)
             .build()
             .unwrap()
             .get(format!("{}/health", f.url))
@@ -277,6 +289,7 @@ async fn slow_or_plaintext_handshakes_do_not_block_verified_clients_and_cancel_c
     );
     let wrong_name = reqwest::Client::builder()
         .no_proxy()
+        .local_address(other_peer)
         .add_root_certificate(
             reqwest::Certificate::from_pem(&std::fs::read(&f.cert.ca).unwrap()).unwrap(),
         )

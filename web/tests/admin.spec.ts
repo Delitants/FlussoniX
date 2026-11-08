@@ -178,6 +178,25 @@ test('IPTV HA client shows each authority state without local catalog edits',asy
  await expect(page.getByRole('region',{name:'IPTV authority origins'})).toContainText('authority-two.example');
  await expect(page.getByRole('button',{name:'Add package',exact:true})).toHaveCount(0);
 });
+test('View IPTV health distinguishes hidden authority slots without exposing URLs',async({page})=>{
+ const duplicateKeys:string[]=[];
+ page.on('console',message=>{if(message.type()==='error'&&message.text().includes('same key'))duplicateKeys.push(message.text())});
+ await page.route('**/flussonix/api/v1/node',async route=>{
+  const response=await route.fetch();const node=await response.json();
+  node.management_role='view';
+  node.iptv_cluster={mode:'client',configured:true,ready:true,connected:true,origins:[
+   {origin:'https://[redacted]',reachable:false,ready:false,refused:false},
+   {origin:'https://[redacted]',reachable:true,ready:true,refused:false}
+  ]};await route.fulfill({response,json:node});
+ });
+ await page.getByRole('button',{name:'Config',exact:true}).click();await page.getByRole('button',{name:'IPTV',exact:true}).click();
+ const health=page.getByRole('region',{name:'IPTV authority origins'});
+ await expect(health.locator('p')).toHaveCount(2);
+ await expect(health.locator('p').nth(0)).toContainText('Authority 1 · Unreachable');
+ await expect(health.locator('p').nth(1)).toContainText('Authority 2 · Ready');
+ await expect(health).not.toContainText('https://[redacted]');
+ expect(duplicateKeys).toEqual([]);
+});
 test('status strip reports the running server version and follows node status updates',async({page,request})=>{
  const health=await(await request.get('/health')).json();
  expect(typeof health.version).toBe('string');expect(health.version.length).toBeGreaterThan(0);
@@ -332,6 +351,69 @@ test('Config displays validation details returned by the server',async({page})=>
  await page.getByRole('button',{name:'Config',exact:true}).click();
  await page.getByRole('button',{name:'Validate',exact:true}).click();
  await expect(page.getByRole('alert')).toContainText('unsupported_feature');
+});
+test('Config validation error survives a background refresh that finishes afterward',async({page})=>{
+ const initial=page.waitForResponse(response=>response.url().includes('/streamer/api/v3/config?full=true')&&response.request().method()==='GET');
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await initial;
+ let beginRefresh!:()=>void;
+ let releaseRefresh!:()=>void;
+ const refreshing=new Promise<void>(resolve=>{beginRefresh=resolve});
+ const held=new Promise<void>(resolve=>{releaseRefresh=resolve});
+ await page.route('**/streamer/api/v3/config*',async route=>{
+  if(route.request().method()==='POST'){
+   await route.fulfill({status:400,contentType:'application/json',body:JSON.stringify({error:'unknown_key',detail:'server option unsupported_feature is not implemented'})});
+  }else{
+   const response=await route.fetch();
+   beginRefresh();
+   await held;
+   await route.fulfill({response});
+  }
+ });
+ await refreshing;
+ await page.getByRole('button',{name:'Validate',exact:true}).click();
+ await expect(page.getByRole('alert')).toContainText('unsupported_feature');
+ const finished=page.waitForResponse(response=>response.url().includes('/streamer/api/v3/config?full=true')&&response.request().method()==='GET');
+ releaseRefresh();
+ await finished;
+ await page.waitForTimeout(250);
+ await expect(page.getByRole('alert')).toContainText('unsupported_feature');
+});
+test('Config shows refresh errors beneath action errors and dismisses each source',async({page})=>{
+ const initial=page.waitForResponse(response=>response.url().includes('/streamer/api/v3/config?full=true')&&response.request().method()==='GET');
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await initial;
+ await page.route('**/streamer/api/v3/config*',async route=>{
+  if(route.request().method()==='POST'){
+   await route.fulfill({status:400,contentType:'application/json',body:JSON.stringify({detail:'server option unsupported_feature is not implemented'})});
+  }else{
+   await route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({detail:'refresh unavailable'})});
+  }
+ });
+ await page.waitForResponse(response=>response.url().includes('/streamer/api/v3/config?full=true')&&response.request().method()==='GET'&&response.status()===503);
+ await expect(page.getByRole('alert')).toContainText('refresh unavailable');
+ await page.getByRole('button',{name:'Validate',exact:true}).click();
+ await expect(page.getByRole('alert')).toContainText('unsupported_feature');
+ await expect(page.getByRole('alert')).toHaveCount(1);
+ await page.getByRole('button',{name:'Dismiss error'}).click();
+ await expect(page.getByRole('alert')).toContainText('refresh unavailable');
+ await page.getByRole('navigation').getByRole('button',{name:/^Media/}).click();
+ await expect(page.getByRole('alert')).toHaveCount(0);
+});
+test('Config clears an old validation error when a later validation succeeds',async({page})=>{
+ let attempts=0;
+ await page.route('**/streamer/api/v3/config*',async route=>{
+  if(route.request().method()==='POST'&&++attempts===1){
+   await route.fulfill({status:400,contentType:'application/json',body:JSON.stringify({detail:'server option unsupported_feature is not implemented'})});
+  }else await route.continue();
+ });
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await page.getByRole('button',{name:'Validate',exact:true}).click();
+ await expect(page.getByRole('alert')).toContainText('unsupported_feature');
+ await page.getByRole('button',{name:'Validate',exact:true}).click();
+ await expect(page.getByRole('status')).toContainText('Configuration is valid');
+ await expect(page.getByRole('alert')).toHaveCount(0);
+ expect(attempts).toBe(2);
 });
 test('cluster and template screens use configured data',async({page})=>{await page.getByRole('button',{name:'Templates',exact:true}).click();await expect(page.getByRole('heading',{name:'Templates',exact:true})).toBeVisible();await page.getByRole('button',{name:'Cluster',exact:true}).click();await expect(page.getByText('Viewer entry point',{exact:true})).toBeVisible();await page.getByRole('button',{name:'Source servers',exact:true}).click();await expect(page.getByText('No sources configured')).toBeVisible();await page.screenshot({path:'../.runtime/screenshots/cluster.png',fullPage:true});});
 test('editing a title preserves template inheritance',async({page,request})=>{
