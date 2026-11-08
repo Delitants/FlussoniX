@@ -24,7 +24,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::Command,
-    sync::{Mutex, Semaphore, oneshot},
+    sync::{Mutex, OwnedMutexGuard, Semaphore, oneshot},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -64,7 +64,12 @@ pub struct Engine {
     srtp_receiver_ledger: Option<Arc<crate::direct_rtp::key_ledger::Ledger>>,
     #[cfg(test)]
     hls_prepare_test_hook: Option<Arc<HlsPrepareHook>>,
+    #[cfg(test)]
+    before_remove_test_hook: Option<Arc<BeforeRemoveHook>>,
 }
+#[cfg(test)]
+type BeforeRemoveHook =
+    dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync;
 #[cfg(test)]
 type HlsPrepareHook = dyn Fn(
         String,
@@ -302,6 +307,8 @@ impl Engine {
             srtp_receiver_ledger: None,
             #[cfg(test)]
             hls_prepare_test_hook: None,
+            #[cfg(test)]
+            before_remove_test_hook: None,
         }
     }
     async fn prepare_hls(&self, input: &str) -> Result<crate::peer_hls::PreparedOrigin, String> {
@@ -386,7 +393,7 @@ impl Engine {
             return Err("publisher input cannot be selected".into());
         }
         let fingerprint = input_fingerprint(cfg).ok_or("stream has no input")?;
-        let _startup = self.startup_gate(name).lock_owned().await;
+        let startup = self.startup_gate(name).lock_owned().await;
         if !current.await {
             return Err("media route changed".into());
         }
@@ -434,9 +441,11 @@ impl Engine {
         }
         let retired = workers.remove(name);
         drop(workers);
-        if let Some(worker) = retired {
-            self.retire_detached(name, worker).await?;
-        }
+        let _startup = if let Some(worker) = retired {
+            self.retire_owned(name, worker, startup).await?
+        } else {
+            startup
+        };
         self.input_preferences.lock().await.insert(
             name.to_owned(),
             InputPreference {
@@ -570,7 +579,7 @@ impl Engine {
         {
             return Err("HLS caption conversion requires a real H.264/HEVC video source; GPU conversion is not qualified".into());
         }
-        let _startup = self.startup_gate(name).lock_owned().await;
+        let startup = self.startup_gate(name).lock_owned().await;
         let preferred_input = if publishing.is_none() && shared.is_none() {
             self.preferred_input(name, cfg).await
         } else {
@@ -902,17 +911,11 @@ impl Engine {
         let retired = workers.remove(name);
         let replaced = retired.is_some();
         drop(workers);
-        if let Some(old) = retired {
-            self.join_and_commit(name, old).await?;
-        }
-        // Reserve the next sequence before discarding the last public playlists.
-        let sequence = self.hls_epoch.next_for(name, &dir)?;
+        // The task owns the stream gate through join, durable allocation, and
+        // deletion even if the requesting viewer disconnects.
+        let (_startup, sequence) = self.prepare_generation(name, retired, startup).await?;
         let generation = uuid::Uuid::new_v4().simple().to_string();
         let discontinuity = if replaced { "+discont_start" } else { "" };
-        Self::remove_media(&dir).await?;
-        tokio::fs::create_dir_all(dir.join("fmp4"))
-            .await
-            .map_err(|e| e.to_string())?;
         let caption_listener = if caption_services.is_empty() || native_captions {
             None
         } else {
@@ -2025,13 +2028,19 @@ impl Engine {
         }
         Ok(Bytes::from(data))
     }
-    async fn join_and_commit(&self, name: &str, w: Arc<Worker>) -> Result<(), String> {
+    async fn join_and_commit(
+        epoch: crate::hls_generation::Epoch,
+        name: String,
+        directory: PathBuf,
+        w: Arc<Worker>,
+    ) -> Result<(), String> {
         w.cancel.cancel();
         if let Some(done) = w.done.lock().await.take() {
             let _ = done.await;
         }
-        let directory = self.directory(name);
-        self.hls_epoch.commit_observed(name, &directory)
+        tokio::task::spawn_blocking(move || epoch.commit_observed(&name, &directory))
+            .await
+            .map_err(|_| "HLS sequence commit task failed".to_owned())?
     }
     async fn remove_media(directory: &Path) -> Result<(), String> {
         match tokio::fs::remove_dir_all(directory).await {
@@ -2040,15 +2049,87 @@ impl Engine {
             Err(_) => Err("cannot remove retired HLS media".into()),
         }
     }
-    async fn retire_detached(&self, name: &str, w: Arc<Worker>) -> Result<(), String> {
-        self.join_and_commit(name, w).await?;
-        Self::remove_media(&self.directory(name)).await
+    async fn retire_owned(
+        &self,
+        name: &str,
+        worker: Arc<Worker>,
+        guard: OwnedMutexGuard<()>,
+    ) -> Result<OwnedMutexGuard<()>, String> {
+        let name = name.to_owned();
+        let directory = self.directory(&name);
+        let epoch = self.hls_epoch.clone();
+        #[cfg(test)]
+        let before_remove = self.before_remove_test_hook.clone();
+        tokio::spawn(async move {
+            let guard = guard;
+            let result: Result<(), String> = async {
+                Self::join_and_commit(epoch, name.clone(), directory.clone(), worker).await?;
+                #[cfg(test)]
+                if let Some(hook) = before_remove {
+                    hook(&name).await;
+                }
+                Self::remove_media(&directory).await
+            }
+            .await;
+            if let Err(error) = &result {
+                tracing::warn!(stream = name, error = %error, "detached media retirement failed");
+            }
+            result?;
+            Ok(guard)
+        })
+        .await
+        .map_err(|_| "HLS retirement task failed".to_owned())?
+    }
+    async fn prepare_generation(
+        &self,
+        name: &str,
+        retired: Option<Arc<Worker>>,
+        guard: OwnedMutexGuard<()>,
+    ) -> Result<(OwnedMutexGuard<()>, u64), String> {
+        let name = name.to_owned();
+        let directory = self.directory(&name);
+        let epoch = self.hls_epoch.clone();
+        #[cfg(test)]
+        let before_remove = self.before_remove_test_hook.clone();
+        tokio::spawn(async move {
+            let guard = guard;
+            let result: Result<u64, String> = async {
+                if let Some(worker) = retired {
+                    Self::join_and_commit(epoch.clone(), name.clone(), directory.clone(), worker)
+                        .await?;
+                }
+                let sequence = tokio::task::spawn_blocking({
+                    let directory = directory.clone();
+                    let name = name.clone();
+                    move || epoch.next_for(&name, &directory)
+                })
+                .await
+                .map_err(|_| "HLS sequence allocation task failed".to_owned())??;
+                #[cfg(test)]
+                if let Some(hook) = before_remove {
+                    hook(&name).await;
+                }
+                Self::remove_media(&directory).await?;
+                tokio::fs::create_dir_all(directory.join("fmp4"))
+                    .await
+                    .map_err(|_| "cannot create HLS media directory".to_owned())?;
+                Ok(sequence)
+            }
+            .await;
+            if let Err(error) = &result {
+                tracing::warn!(stream = name, error = %error, "detached HLS generation failed");
+            }
+            let sequence = result?;
+            Ok((guard, sequence))
+        })
+        .await
+        .map_err(|_| "HLS generation task failed".to_owned())?
     }
     pub async fn stop(&self, name: &str) {
-        let _startup = self.startup_gate(name).lock_owned().await;
+        let startup = self.startup_gate(name).lock_owned().await;
         let retired = self.workers.lock().await.remove(name);
         if let Some(w) = retired {
-            if let Err(error) = self.retire_detached(name, w).await {
+            if let Err(error) = self.retire_owned(name, w, startup).await {
                 tracing::warn!(
                     stream = name,
                     error = error,
@@ -2058,7 +2139,7 @@ impl Engine {
         }
     }
     pub async fn stop_if_current(&self, name: &str, expected: &Arc<Worker>) {
-        let _startup = self.startup_gate(name).lock_owned().await;
+        let startup = self.startup_gate(name).lock_owned().await;
         let retired = {
             let mut workers = self.workers.lock().await;
             workers
@@ -2067,13 +2148,32 @@ impl Engine {
                 .then(|| workers.remove(name).unwrap())
         };
         if let Some(worker) = retired {
-            if let Err(error) = self.retire_detached(name, worker).await {
+            if let Err(error) = self.retire_owned(name, worker, startup).await {
                 tracing::warn!(
                     stream = name,
                     error = error,
                     "failed to retire media worker"
                 );
             }
+        }
+    }
+    pub async fn stop_if_idle_current(&self, name: &str, expected: &Arc<Worker>) {
+        let startup = self.startup_gate(name).lock_owned().await;
+        let retired = {
+            let mut workers = self.workers.lock().await;
+            workers
+                .get(name)
+                .is_some_and(|worker| Arc::ptr_eq(worker, expected) && Self::idle_worker(worker))
+                .then(|| workers.remove(name).unwrap())
+        };
+        if let Some(worker) = retired
+            && let Err(error) = self.retire_owned(name, worker, startup).await
+        {
+            tracing::warn!(
+                stream = name,
+                error = error,
+                "failed to retire idle media worker"
+            );
         }
     }
     pub async fn stop_all(&self) {
@@ -2189,22 +2289,30 @@ impl Engine {
             .collect()
     }
 
-    pub async fn idle(&self) -> Vec<String> {
+    fn idle_worker(worker: &Worker) -> bool {
+        !worker.publication
+            && !worker.active_pushes
+            && worker.idle_seconds() >= 60
+            && worker.viewers.load(Ordering::Relaxed) == 0
+            && !worker
+                .shared_static_demand
+                .as_ref()
+                .is_some_and(|demand| demand())
+    }
+    pub async fn idle_workers(&self) -> Vec<(String, Arc<Worker>)> {
         self.workers
             .lock()
             .await
             .iter()
-            .filter(|(_, w)| {
-                !w.publication
-                    && !w.active_pushes
-                    && w.idle_seconds() >= 60
-                    && w.viewers.load(Ordering::Relaxed) == 0
-                    && !w
-                        .shared_static_demand
-                        .as_ref()
-                        .is_some_and(|demand| demand())
-            })
-            .map(|(n, _)| n.clone())
+            .filter(|(_, worker)| Self::idle_worker(worker))
+            .map(|(name, worker)| (name.clone(), worker.clone()))
+            .collect()
+    }
+    pub async fn idle(&self) -> Vec<String> {
+        self.idle_workers()
+            .await
+            .into_iter()
+            .map(|(name, _)| name)
             .collect()
     }
 }
@@ -3250,6 +3358,162 @@ mod hls_retirement_tests {
     }
 
     #[tokio::test]
+    async fn cancelled_stop_keeps_stream_fenced_until_old_worker_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(root.path(), "ffmpeg"));
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        let old = engine.ensure("owned", &config).await.unwrap();
+        let hold_completion = old.done.lock().await;
+        let stopping = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.stop("owned").await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), old.cancel.cancelled())
+            .await
+            .unwrap();
+        stopping.abort();
+        let _ = stopping.await;
+        let starting = {
+            let engine = engine.clone();
+            let config = config.clone();
+            tokio::spawn(async move { engine.ensure("owned", &config).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), async {
+                while !starting.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "replacement ran before detached worker finished"
+        );
+        drop(hold_completion);
+        starting.await.unwrap().unwrap();
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_startup_keeps_stream_fenced_during_old_worker_join() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(root.path(), "ffmpeg"));
+        let original = json!({"inputs":[{"url":"testsrc://"}]});
+        let changed = json!({"inputs":[{"url":"testsrc://"}],"flussonix_hls_subtitles":"drop"});
+        let old = engine.ensure("owned", &original).await.unwrap();
+        let hold_completion = old.done.lock().await;
+        let replacing = {
+            let engine = engine.clone();
+            let changed = changed.clone();
+            tokio::spawn(async move { engine.ensure("owned", &changed).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), old.cancel.cancelled())
+            .await
+            .unwrap();
+        replacing.abort();
+        let _ = replacing.await;
+        let next = {
+            let engine = engine.clone();
+            let changed = changed.clone();
+            tokio::spawn(async move { engine.ensure("owned", &changed).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), async {
+                while !next.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "replacement ran before cancelled startup finished retirement"
+        );
+        drop(hold_completion);
+        next.await.unwrap().unwrap();
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_stop_keeps_stream_fenced_during_media_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(root.path(), "ffmpeg");
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        engine.ensure("owned", &config).await.unwrap();
+        let entered = Arc::new(AtomicU64::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        engine.before_remove_test_hook = Some(Arc::new({
+            let entered = entered.clone();
+            let release = release.clone();
+            move |_| {
+                let entered = entered.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    if entered.fetch_add(1, Ordering::SeqCst) == 0 {
+                        release.notified().await;
+                    }
+                })
+            }
+        }));
+        let engine = Arc::new(engine);
+        let stopping = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.stop("owned").await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while entered.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        stopping.abort();
+        let _ = stopping.await;
+        let starting = {
+            let engine = engine.clone();
+            let config = config.clone();
+            tokio::spawn(async move { engine.ensure("owned", &config).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), async {
+                while !starting.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "replacement ran while cancelled removal was pending"
+        );
+        release.notify_one();
+        starting.await.unwrap().unwrap();
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn idle_snapshot_cannot_retire_replacement_or_renewed_viewer() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::new(root.path(), "ffmpeg");
+        let config = json!({"inputs":[{"url":"testsrc://"}]});
+        let old = engine.ensure("owned", &config).await.unwrap();
+        *old.last_access.lock().unwrap() = Instant::now() - Duration::from_secs(61);
+        let snapshot = engine.idle().await;
+        assert_eq!(snapshot.len(), 1);
+        old.touch();
+        engine.stop_if_idle_current("owned", &old).await;
+        assert!(Arc::ptr_eq(
+            engine.workers.lock().await.get("owned").unwrap(),
+            &old
+        ));
+
+        *old.last_access.lock().unwrap() = Instant::now() - Duration::from_secs(61);
+        let changed = json!({"inputs":[{"url":"testsrc://"}],"flussonix_hls_subtitles":"drop"});
+        let replacement = engine.ensure("owned", &changed).await.unwrap();
+        engine.stop_if_idle_current("owned", &old).await;
+        assert!(Arc::ptr_eq(
+            engine.workers.lock().await.get("owned").unwrap(),
+            &replacement
+        ));
+        engine.stop_all().await;
+    }
+
+    #[tokio::test]
     async fn stop_all_waiting_for_one_join_keeps_other_stream_observable() {
         let root = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::new(root.path(), "ffmpeg"));
@@ -3467,7 +3731,7 @@ mod hls_startup_tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn stalled_floor_write_for_one_stream_does_not_delay_another() {
         let root = tempfile::tempdir().unwrap();
         let mut engine = Engine::new(root.path(), "ffmpeg");
@@ -3497,11 +3761,19 @@ mod hls_startup_tests {
             .unwrap();
         let fast =
             tokio::time::timeout(Duration::from_secs(3), engine.ensure("fast", &config)).await;
+        let heartbeat = tokio::time::timeout(Duration::from_millis(100), async {
+            tokio::task::yield_now().await;
+        })
+        .await;
         release_tx.send(()).unwrap();
         slow.await.unwrap().unwrap();
         assert!(
             fast.is_ok_and(|result| result.is_ok()),
             "slow floor write blocked a different stream"
+        );
+        assert!(
+            heartbeat.is_ok(),
+            "slow state write blocked the async runtime"
         );
         engine.stop_all().await;
     }

@@ -726,13 +726,13 @@ impl App {
     pub async fn reconcile(&self) {
         self.refresh_source_activation().await;
         // Retirement comes first: a background retry must not extend demand.
-        for name in self.media.idle().await {
+        for (name, worker) in self.media.idle_workers().await {
             let static_demand = match self.config.effective(&name) {
                 Some(config) => config["static"] != false,
                 None => self.source_is_warm(&name).await,
             };
             if !static_demand {
-                self.media.stop(&name).await;
+                self.media.stop_if_idle_current(&name, &worker).await;
             }
         }
         self.refresh_sources().await;

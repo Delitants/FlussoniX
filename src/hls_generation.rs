@@ -10,6 +10,7 @@ use std::{
 };
 #[cfg(test)]
 type BeforeWriteHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+#[derive(Clone)]
 pub struct Epoch {
     root: PathBuf,
     clock: Option<u64>,
