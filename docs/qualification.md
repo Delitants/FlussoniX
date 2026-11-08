@@ -14,6 +14,25 @@ evidence for that head. Later product changes require fresh exact-head checks,
 tracked on [PR #51](https://github.com/Delitants/FlussoniX/pull/51). It does
 not close the 24-hour soak, live migration or full API-compatibility gates.
 
+## Completed 24-hour HTTP soak — failed gap gate (2026-11-08 UTC)
+
+The isolated two-stream/eight-viewer run on revision `9b56379e2499c25ec1f4a2998d1970399c3f21f8`
+completed its full 86,400-second window with 1,440 samples and 88.82 GiB delivered.
+The unchanged `scripts/assess-sustained-http.py` gate returned `fail`:
+`media_gap_exceeded` and `reconnect_gap_exceeded`. All eight viewers saw two
+synchronized media gaps; the largest was 5,262.2 ms, above the 3,000 ms limit.
+One churn viewer reached a 4,268.53 ms reconnect gap. The matching owned source
+observations reached 5,212 and 5,167 ms of media age. No viewer decode-sync
+errors, source-observation errors, early daemon exit or OOM were recorded.
+Service-cgroup memory peaked at 125.69 MiB. The runner and its two FFmpeg
+children exited, and the report remains owner-only.
+
+The gap window coincided with a separate heavy local build and elevated host
+disk writes/I/O wait. That supports a contention hypothesis, not a proved
+cause or a passing playback result. A clean run on the final immutable binary,
+without competing heavy local builds, remains mandatory. This failed run is
+historical evidence for its stated revision; it cannot qualify later source.
+
 ## Durable HLS sequence recovery candidate (2026-11-07)
 
 Runtime commit `1917a8b54ca388e41980ccf259a0163a2c782350` persists a
