@@ -26,6 +26,44 @@ use tokio_util::sync::CancellationToken;
 const PUBLIC: &str = "OPTIONS, DESCRIBE, SETUP, PLAY, ANNOUNCE, RECORD, GET_PARAMETER, TEARDOWN";
 const MAX_PREAUTH_CONNECTIONS: usize = 64;
 const MAX_PREAUTH_PER_IP: usize = 16;
+const MAX_CONNECTIONS_PER_IP: usize = 64;
+struct ConnectionGate {
+    by_ip: Mutex<HashMap<IpAddr, usize>>,
+}
+impl ConnectionGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            by_ip: Mutex::new(HashMap::new()),
+        })
+    }
+    fn acquire(self: &Arc<Self>, ip: IpAddr) -> Option<ConnectionLease> {
+        let mut by_ip = self.by_ip.lock().unwrap_or_else(|e| e.into_inner());
+        let count = by_ip.entry(ip).or_default();
+        if *count >= MAX_CONNECTIONS_PER_IP {
+            return None;
+        }
+        *count += 1;
+        Some(ConnectionLease {
+            gate: self.clone(),
+            ip,
+        })
+    }
+}
+struct ConnectionLease {
+    gate: Arc<ConnectionGate>,
+    ip: IpAddr,
+}
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        let mut by_ip = self.gate.by_ip.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = by_ip.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                by_ip.remove(&self.ip);
+            }
+        }
+    }
+}
 struct PreAuthGate {
     slots: Arc<Semaphore>,
     by_ip: Mutex<HashMap<IpAddr, usize>>,
@@ -202,6 +240,26 @@ async fn serve_connections(
     rate: f64,
     tls: Option<tokio_rustls::TlsAcceptor>,
 ) -> std::io::Result<()> {
+    serve_connections_with_gate(
+        listener,
+        app,
+        cancel,
+        pool,
+        rate,
+        tls,
+        ConnectionGate::new(),
+    )
+    .await
+}
+async fn serve_connections_with_gate(
+    listener: TcpListener,
+    app: Arc<App>,
+    cancel: CancellationToken,
+    pool: Option<Arc<udp::Pool>>,
+    rate: f64,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    connection_gate: Arc<ConnectionGate>,
+) -> std::io::Result<()> {
     udp::Pacer::new(rate).map_err(std::io::Error::other)?;
     let udp = pool.map(|pool| UdpOptions { pool, rate });
     let permits = Arc::new(Semaphore::new(256));
@@ -220,6 +278,9 @@ async fn serve_connections(
                 let Ok(permit) = permits.clone().try_acquire_owned() else {
                     continue;
                 };
+                let Some(connection_lease) = connection_gate.acquire(peer.ip()) else {
+                    continue;
+                };
                 let Some(preauth_lease) = preauth.acquire(peer.ip()) else {
                     continue;
                 };
@@ -229,6 +290,7 @@ async fn serve_connections(
                 let tls = tls.clone();
                 clients.spawn(async move {
                     let _permit = permit;
+                    let _connection_lease = connection_lease;
                     if socket.set_nodelay(true).is_err() {
                         return;
                     }
@@ -1085,6 +1147,120 @@ fn live_range(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_gate_limits_one_ip_without_spending_another_ips_capacity() {
+        let gate = ConnectionGate::new();
+        let first: IpAddr = "127.0.0.1".parse().unwrap();
+        let second: IpAddr = "127.0.0.2".parse().unwrap();
+        let mut held = (0..MAX_CONNECTIONS_PER_IP)
+            .map(|_| gate.acquire(first).expect("first peer slot"))
+            .collect::<Vec<_>>();
+        assert!(gate.acquire(first).is_none());
+        let other = gate.acquire(second).expect("another peer remains admitted");
+        drop(held.pop());
+        let replacement = gate.acquire(first).expect("released peer slot is reusable");
+        drop(replacement);
+        drop(held);
+        drop(other);
+        assert!(gate.by_ip.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn listener_rejects_saturated_ip_but_admits_another_and_released_peer() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpSocket,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            crate::server::Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.config
+            .put(
+                "streams",
+                "owned",
+                serde_json::json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+            )
+            .unwrap();
+        let gate = ConnectionGate::new();
+        let first: IpAddr = "127.0.0.1".parse().unwrap();
+        let held = (0..MAX_CONNECTIONS_PER_IP)
+            .map(|_| gate.acquire(first).unwrap())
+            .collect::<Vec<_>>();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = CancellationToken::new();
+        let observed = gate.clone();
+        let task = tokio::spawn(serve_connections_with_gate(
+            listener,
+            app.clone(),
+            stop.clone(),
+            None,
+            100.0,
+            None,
+            gate,
+        ));
+        let request = b"OPTIONS rtsp://127.0.0.1/owned RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+        let mut rejected = tokio::net::TcpStream::connect(address).await.unwrap();
+        if rejected.write_all(request).await.is_ok() {
+            let mut byte = [0];
+            let result = tokio::time::timeout(Duration::from_secs(2), rejected.read(&mut byte))
+                .await
+                .expect("saturated peer socket stayed open");
+            assert!(matches!(result, Ok(0) | Err(_)));
+        }
+
+        let second = TcpSocket::new_v4().unwrap();
+        second.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+        let mut other = second.connect(address).await.unwrap();
+        other
+            .write_all(b"DESCRIBE rtsp://127.0.0.1/owned RTSP/1.0\r\nCSeq: 2\r\nAccept: application/sdp\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = [0; 512];
+        let n = tokio::time::timeout(Duration::from_secs(10), other.read(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response[..n].starts_with(b"RTSP/1.0 200"));
+        assert_eq!(
+            observed
+                .by_ip
+                .lock()
+                .unwrap()
+                .get(&"127.0.0.2".parse().unwrap()),
+            Some(&1),
+            "admitted DESCRIBE must retain its connection lease"
+        );
+        drop(other);
+
+        drop(held);
+        let mut returned = tokio::net::TcpStream::connect(address).await.unwrap();
+        returned.write_all(request).await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), returned.read(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response[..n].starts_with(b"RTSP/1.0 200"));
+        drop(returned);
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(observed.by_ip.lock().unwrap().is_empty());
+        app.media.stop_all().await;
+    }
 
     #[tokio::test]
     async fn expired_preauth_lease_interrupts_stalled_describe_admission() {
