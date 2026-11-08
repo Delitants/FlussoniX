@@ -179,6 +179,53 @@ impl Engine {
     where
         F: FnOnce(Bytes) -> Result<Bytes, SharedPackagingFailure>,
     {
+        let bytes = self.read_shared_unaccounted(playback, file).await?;
+        let bytes = transform(bytes)?;
+        playback.current()?;
+        if !self.is_shared_current(playback).await {
+            return Err(SharedPackagingFailure::Closed);
+        }
+        playback.current()?;
+        playback.inner.source.add_bytes(bytes.len());
+        Ok(bytes)
+    }
+    pub(crate) async fn read_shared_selected_hls(
+        &self,
+        playback: &PackagedPlayback,
+        file: &str,
+        selector: crate::hls_ts_select::Selector,
+    ) -> Result<Bytes, SharedPackagingFailure> {
+        playback.current()?;
+        if !self.is_shared_current(playback).await {
+            return Err(SharedPackagingFailure::Closed);
+        }
+        if let Some(bytes) = self.cached_selected_hls(&playback.inner.worker, file, selector) {
+            playback.current()?;
+            if !self.is_shared_current(playback).await {
+                return Err(SharedPackagingFailure::Closed);
+            }
+            playback.inner.source.add_bytes(bytes.len());
+            playback.inner.worker.touch();
+            return Ok(bytes);
+        }
+        let worker = playback.inner.worker.clone();
+        self.read_shared_mapped(playback, file, |source| {
+            let selected = crate::hls_ts_select::filter(&source, selector)
+                .map(Bytes::from)
+                .map_err(|_| SharedPackagingFailure::Unavailable)?;
+            self.remember_selected_hls(&worker, file, selector, selected.clone());
+            Ok(selected)
+        })
+        .await
+    }
+    /// Read an internal HLS dependency under the same generation fence without
+    /// charging bytes that will not be sent to this viewer. The final mapped
+    /// response is charged by `read_shared_mapped` after its transform.
+    pub(crate) async fn read_shared_unaccounted(
+        &self,
+        playback: &PackagedPlayback,
+        file: &str,
+    ) -> Result<Bytes, SharedPackagingFailure> {
         playback.current()?;
         if !self.is_shared_current(playback).await {
             return Err(SharedPackagingFailure::Closed);
@@ -191,13 +238,11 @@ impl Engine {
             )
             .await
             .map_err(|_| SharedPackagingFailure::Unavailable)?;
-        let bytes = transform(bytes)?;
         playback.current()?;
         if !self.is_shared_current(playback).await {
             return Err(SharedPackagingFailure::Closed);
         }
         playback.current()?;
-        playback.inner.source.add_bytes(bytes.len());
         Ok(bytes)
     }
     async fn is_shared_current(&self, playback: &PackagedPlayback) -> bool {

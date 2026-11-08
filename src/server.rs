@@ -2606,6 +2606,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     let path = percent_encoding::percent_decode_str(raw_path.trim_start_matches('/'))
         .decode_utf8_lossy()
         .to_string();
+    let track_route = crate::hls_ts_select::route(&path);
     let special = if path.ends_with(".m4f") {
         let p = path.rsplitn(7, '/').collect::<Vec<_>>();
         if p.len() == 7 {
@@ -2627,6 +2628,14 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         (n, "m4s")
     } else if let Some(n) = path.strip_suffix("/mpegts") {
         (n, "mpegts")
+    } else if let Some(route) = track_route {
+        match route {
+            crate::hls_ts_select::Route::Master { stream } => (stream, "video.m3u8"),
+            crate::hls_ts_select::Route::Playlist { stream, .. }
+            | crate::hls_ts_select::Route::Segment { stream, .. } => {
+                (stream, &path[stream.len() + 1..])
+            }
+        }
     } else if let Some((n, _f)) = path.split_once("/fmp4/") {
         (n, &path[n.len() + 1..])
     } else if let Some((n, f)) = path.rsplit_once('/') {
@@ -3035,6 +3044,9 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         )
             .into_response();
     }
+    if let Some(route) = track_route {
+        return serve_selected_hls(&app, name, route, &worker, &grant, &query).await;
+    }
     let alias = crate::hls_master_alias::Alias::from_file(file);
     let read_file = alias.map_or(file, |alias| alias.underlying_file());
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -3099,6 +3111,189 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     )
         .into_response()
 }
+async fn serve_selected_hls(
+    app: &Arc<App>,
+    name: &str,
+    route: crate::hls_ts_select::Route<'_>,
+    worker: &Arc<Worker>,
+    grant: &Grant,
+    query: &HashMap<String, String>,
+) -> Response {
+    use crate::hls_ts_select::{Route, Selector};
+    let mut child_query = query.clone();
+    child_query.remove("flussonix_ticket");
+    child_query.remove("flussonix_handoff");
+    let suffix = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(child_query.iter())
+        .finish();
+    let read_file = match route {
+        Route::Master { .. } | Route::Playlist { .. } => "index.m3u8",
+        Route::Segment { file, .. } => file,
+    };
+    let cached = match route {
+        Route::Segment { selector, file, .. } => {
+            app.media.cached_selected_hls(worker, file, selector)
+        }
+        _ => None,
+    };
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let initial = if cached.is_some() {
+        None
+    } else {
+        Some(loop {
+            if grant.is_cancelled() || worker.is_closed() {
+                return error(StatusCode::FORBIDDEN, "playback revoked");
+            }
+            match app.media.read(name, read_file).await {
+                Ok(bytes) => break bytes,
+                Err(_) if read_file.ends_with(".m3u8") && Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "HLS media unavailable"),
+            }
+        })
+    };
+    let (bytes, content_type) = match route {
+        Route::Segment { selector, file, .. } => {
+            let bytes = if let Some(cached) = cached {
+                cached
+            } else {
+                let source = initial.expect("uncached segment was read");
+                let filtered = tokio::task::spawn_blocking(move || {
+                    crate::hls_ts_select::filter(&source, selector)
+                })
+                .await;
+                let Ok(Ok(filtered)) = filtered else {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "selected HLS segment unavailable",
+                    );
+                };
+                let bytes = Bytes::from(filtered);
+                app.media
+                    .remember_selected_hls(worker, file, selector, bytes.clone());
+                bytes
+            };
+            (bytes, "video/mp2t")
+        }
+        Route::Master { .. } | Route::Playlist { .. } => {
+            let initial = initial.expect("HLS index was read");
+            let media_file = match crate::hls_ts_select::source_media_file(&initial) {
+                Ok(file) => file,
+                Err(_) => {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "HLS media playlist unavailable",
+                    );
+                }
+            };
+            let media = if media_file == "index.m3u8" {
+                initial.clone()
+            } else {
+                match app.media.read(name, media_file).await {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "HLS media playlist unavailable",
+                        );
+                    }
+                }
+            };
+            let playlist = match crate::hls_ts_select::media_playlist(&media) {
+                Ok(playlist) => playlist,
+                Err(_) => {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "HLS media playlist unavailable",
+                    );
+                }
+            };
+            let Some(sample_name) = crate::hls_ts_select::latest_segment(&playlist) else {
+                return error(StatusCode::SERVICE_UNAVAILABLE, "HLS segment unavailable");
+            };
+            let (video, audio) = if let Some(profile) = worker.hls_track_profile() {
+                profile
+            } else {
+                let sample = match app.media.read(name, sample_name).await {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return error(StatusCode::SERVICE_UNAVAILABLE, "HLS segment unavailable");
+                    }
+                };
+                let profile = match crate::hls_ts_select::available(&sample) {
+                    Ok(counts) => counts,
+                    Err(_) => {
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "HLS track metadata unavailable",
+                        );
+                    }
+                };
+                worker.remember_hls_track_profile(profile);
+                profile
+            };
+            let body = match route {
+                Route::Master { .. } => {
+                    let selector = Selector {
+                        video: (video > 0).then_some(1),
+                        audio: (audio > 0).then_some(1),
+                    };
+                    if selector.video.is_none() && selector.audio.is_none() {
+                        return error(StatusCode::SERVICE_UNAVAILABLE, "HLS tracks unavailable");
+                    }
+                    let alias = crate::hls_master_alias::render(
+                        crate::hls_master_alias::Alias::Ts,
+                        &initial,
+                        worker.output_bitrate(),
+                        &suffix,
+                    );
+                    let Ok(alias) = alias else {
+                        return error(StatusCode::SERVICE_UNAVAILABLE, "HLS master unavailable");
+                    };
+                    match crate::hls_ts_select::master_child(&alias, selector, &suffix) {
+                        Ok(body) => body,
+                        Err(_) => {
+                            return error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "HLS master unavailable",
+                            );
+                        }
+                    }
+                }
+                Route::Playlist { selector, .. } => {
+                    if selector.video.is_some_and(|n| n > video)
+                        || selector.audio.is_some_and(|n| n > audio)
+                    {
+                        return error(StatusCode::NOT_FOUND, "HLS track absent");
+                    }
+                    rewrite_playlist(&playlist, &suffix)
+                }
+                Route::Segment { .. } => unreachable!(),
+            };
+            (Bytes::from(body), "application/vnd.apple.mpegurl")
+        }
+    };
+    if grant.is_cancelled()
+        || worker.is_closed()
+        || !app.media_config(name).await.is_some_and(|(cfg, _)| {
+            cfg["disabled"] != true && crate::media::media_signature(&cfg) == worker.signature()
+        })
+    {
+        return error(StatusCode::FORBIDDEN, "playback revoked");
+    }
+    grant.add_bytes(bytes.len());
+    app.egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    (
+        [
+            ("content-type", content_type),
+            ("cache-control", "no-store"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 struct ViewerGuard(Arc<Worker>, #[allow(dead_code)] Grant);
 impl Drop for ViewerGuard {
     fn drop(&mut self) {

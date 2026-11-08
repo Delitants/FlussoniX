@@ -6,7 +6,7 @@ const PACKET: usize = 188;
 const MAX_SEGMENT: usize = 32 * 1024 * 1024;
 const MAX_SECTION: usize = 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct Selector {
     pub video: Option<usize>,
     pub audio: Option<usize>,
@@ -71,6 +71,33 @@ pub(crate) enum Route<'a> {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FileRoute<'a> {
+    Master,
+    Playlist(Selector),
+    Segment(Selector, &'a str),
+}
+
+pub(crate) fn file_route(file: &str) -> Option<FileRoute<'_>> {
+    if file == "video.m3u8" {
+        return Some(FileRoute::Master);
+    }
+    let rest = file.strip_prefix("tracks-")?;
+    let (selector, leaf) = rest.split_once('/')?;
+    let selector = Selector::parse(selector)?;
+    if leaf == "mono.m3u8" {
+        return Some(FileRoute::Playlist(selector));
+    }
+    let valid_segment = leaf.len() < 128
+        && leaf.starts_with('g')
+        && leaf.ends_with(".ts")
+        && !leaf.contains("..")
+        && leaf
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'));
+    valid_segment.then_some(FileRoute::Segment(selector, leaf))
+}
+
 pub(crate) fn route(path: &str) -> Option<Route<'_>> {
     if let Some(stream) = path.strip_suffix("/video.m3u8") {
         return (!stream.is_empty()).then_some(Route::Master { stream });
@@ -108,6 +135,13 @@ pub(crate) fn media_playlist(source: &[u8]) -> Result<String, &'static str> {
         || text
             .lines()
             .any(|line| line.starts_with("#EXT-X-STREAM-INF:"))
+        || text.lines().any(|line| {
+            line.contains("URI=")
+                || line.starts_with("#EXT-X-ENDLIST")
+                || line.starts_with("#EXT-X-PLAYLIST-TYPE:VOD")
+                || line.starts_with("#EXT-X-BYTERANGE")
+                || line.starts_with("#EXT-X-I-FRAMES-ONLY")
+        })
     {
         return Err("HLS media playlist unavailable");
     }
@@ -134,10 +168,11 @@ pub(crate) fn media_playlist(source: &[u8]) -> Result<String, &'static str> {
     Ok(format!("{}\n", text.trim_end_matches(['\r', '\n'])))
 }
 
-pub(crate) fn first_segment(playlist: &str) -> Option<&str> {
+pub(crate) fn latest_segment(playlist: &str) -> Option<&str> {
     playlist
         .lines()
-        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .last()
 }
 
 pub(crate) fn source_media_file(index: &[u8]) -> Result<&'static str, &'static str> {
@@ -568,6 +603,18 @@ mod tests {
                 file: "g123_45.ts",
             })
         );
+        assert_eq!(file_route("video.m3u8"), Some(FileRoute::Master));
+        assert_eq!(
+            file_route("tracks-v1a2/mono.m3u8"),
+            Some(FileRoute::Playlist(Selector::parse("v1a2").unwrap()))
+        );
+        assert_eq!(
+            file_route("tracks-a1/g123_45.ts"),
+            Some(FileRoute::Segment(
+                Selector::parse("a1").unwrap(),
+                "g123_45.ts"
+            ))
+        );
         for invalid in [
             "x/tracks-v0/mono.m3u8",
             "x/tracks-v1/../g1.ts",
@@ -578,6 +625,7 @@ mod tests {
         ] {
             assert!(route(invalid).is_none(), "{invalid}");
         }
+        assert!(file_route("tracks-v1/../g1.ts").is_none());
     }
 
     #[test]
@@ -591,11 +639,13 @@ mod tests {
             "#EXTM3U\n#EXTINF:2,\nhttps://other.invalid/segment.ts\n",
             "#EXTM3U\n#EXTINF:2,\n../g1.ts\n",
             "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\ng1.ts\n",
+            "#EXTM3U\n#EXTINF:2,\ng1.ts\n#EXT-X-ENDLIST\n",
+            "#EXTM3U\n#EXT-X-KEY:URI=\"https://key.invalid\"\n#EXTINF:2,\ng1.ts\n",
         ] {
             assert!(media_playlist(bad.as_bytes()).is_err(), "{bad}");
         }
         assert_eq!(
-            first_segment(std::str::from_utf8(source).unwrap()),
+            latest_segment(std::str::from_utf8(source).unwrap()),
             Some("g12_100.ts")
         );
     }

@@ -1935,6 +1935,88 @@ async fn fmp4_hls_child_segments_are_guarded_and_decode_with_init() {
 }
 
 #[tokio::test]
+async fn vendor_audio_only_track_urls_remain_authorized_and_decode_mp3() {
+    use sha2::{Digest, Sha256};
+    let hash = format!("{:x}", Sha256::digest(b"track-viewer"));
+    let f = Fixture::new(json!({"flussonix_token_sha256": hash})).await;
+    let denied = [
+        f.get("/owned/video.m3u8?token=wrong").await.status(),
+        f.get("/owned/tracks-a1/mono.m3u8?token=wrong")
+            .await
+            .status(),
+        f.get("/owned/tracks-a1/g1_1.ts?token=wrong").await.status(),
+    ];
+    let master_response = f.get("/owned/video.m3u8?token=track-viewer").await;
+    let master_status = master_response.status();
+    let master = String::from_utf8(bytes(master_response).await.to_vec()).unwrap();
+    let child = master
+        .lines()
+        .find(|line| line.starts_with("tracks-a1/mono.m3u8"))
+        .unwrap_or("")
+        .to_owned();
+    let child_response = f.get(&format!("/owned/{child}")).await;
+    let child_status = child_response.status();
+    let playlist = String::from_utf8(bytes(child_response).await.to_vec()).unwrap();
+    let segment = playlist
+        .lines()
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .unwrap_or("")
+        .to_owned();
+    let segment_response = f.get(&format!("/owned/tracks-a1/{segment}")).await;
+    let segment_status = segment_response.status();
+    let segment_bytes = bytes(segment_response).await;
+    let file = f._dir.path().join("selected-vendor-a1.ts");
+    std::fs::write(&file, segment_bytes.as_ref()).unwrap();
+    let invalid = f
+        .get("/owned/tracks-a2/mono.m3u8?token=track-viewer")
+        .await
+        .status();
+    f.stop().await;
+    assert_eq!(denied, [StatusCode::FORBIDDEN; 3]);
+    assert_eq!(master_status, StatusCode::OK, "{master}");
+    assert!(
+        child.starts_with("tracks-a1/mono.m3u8?token=track-viewer"),
+        "{master}"
+    );
+    assert_eq!(child_status, StatusCode::OK, "{playlist}");
+    assert!(segment.ends_with(".ts?token=track-viewer"), "{playlist}");
+    assert_eq!(segment_status, StatusCode::OK);
+    assert!(!segment_bytes.is_empty());
+    assert_ne!(
+        invalid,
+        StatusCode::OK,
+        "unknown audio track must not be advertised"
+    );
+    let probe = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new("ffprobe")
+            .kill_on_drop(true)
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_name,codec_type",
+                "-of",
+                "json",
+            ])
+            .arg(&file)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        probe.status.success(),
+        "{}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    let streams: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+    assert_eq!(streams["streams"].as_array().unwrap().len(), 1);
+    assert_eq!(streams["streams"][0]["codec_name"], "mp3");
+    assert_eq!(streams["streams"][0]["codec_type"], "audio");
+}
+
+#[tokio::test]
 async fn vendor_hls_master_aliases_preserve_authorized_child_playback() {
     use sha2::{Digest, Sha256};
     let hash = format!("{:x}", Sha256::digest(b"alias-viewer"));

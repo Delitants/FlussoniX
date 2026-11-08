@@ -77,7 +77,16 @@ async fn request(app: &Arc<App>, method: &str, uri: &str, body: Body) -> StatusC
 #[tokio::test]
 async fn named_http_paths_use_the_underlying_stream_and_never_start_an_lb_worker() {
     let (_dir, app) = fixture();
-    for suffix in ["index.m3u8", "mpegts", "m4s", "m4f", "fmp4/seg.m4f"] {
+    for suffix in [
+        "index.m3u8",
+        "video.m3u8",
+        "tracks-v1a1/mono.m3u8",
+        "tracks-v1a1/g1_1.ts",
+        "mpegts",
+        "m4s",
+        "m4f",
+        "fmp4/seg.m4f",
+    ] {
         let uri = format!("/lb0/channel/{suffix}?token=viewer&x=%2B");
         assert_eq!(
             request(&app, "GET", &uri, Body::empty()).await,
@@ -100,6 +109,16 @@ async fn named_http_paths_use_the_underlying_stream_and_never_start_an_lb_worker
             &app,
             "GET",
             "/lb0/channel/index.m3u8?token=wrong",
+            Body::empty()
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/lb0/channel/tracks-v1a1/mono.m3u8?token=wrong",
             Body::empty()
         )
         .await,

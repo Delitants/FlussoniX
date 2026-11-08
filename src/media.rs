@@ -13,10 +13,10 @@ pub use shared::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -52,6 +52,7 @@ pub struct Engine {
     tesseract: String,
     hls_epoch: crate::hls_generation::Epoch,
     workers: Mutex<HashMap<String, Arc<Worker>>>,
+    selected_hls_cache: std::sync::Mutex<SelectedHlsCache>,
     input_preferences: Mutex<HashMap<String, InputPreference>>,
     startup_gates: std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     rtsp_probe_slots: Semaphore,
@@ -66,6 +67,160 @@ pub struct Engine {
     hls_prepare_test_hook: Option<Arc<HlsPrepareHook>>,
     #[cfg(test)]
     before_remove_test_hook: Option<Arc<BeforeRemoveHook>>,
+}
+const SELECTED_HLS_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const SELECTED_HLS_CACHE_ENTRIES: usize = 512;
+
+#[derive(Default)]
+struct SelectedHlsCache {
+    entries: VecDeque<SelectedHlsEntry>,
+    bytes: usize,
+}
+struct SelectedHlsEntry {
+    generation: Weak<()>,
+    file: String,
+    selector: crate::hls_ts_select::Selector,
+    data: Bytes,
+}
+impl SelectedHlsCache {
+    fn get(
+        &mut self,
+        generation: &Arc<()>,
+        file: &str,
+        selector: crate::hls_ts_select::Selector,
+    ) -> Option<Bytes> {
+        let at = self.entries.iter().position(|entry| {
+            entry.file == file
+                && entry.selector == selector
+                && entry
+                    .generation
+                    .upgrade()
+                    .is_some_and(|owned| Arc::ptr_eq(&owned, generation))
+        })?;
+        let entry = self.entries.remove(at)?;
+        let data = entry.data.clone();
+        self.entries.push_back(entry);
+        Some(data)
+    }
+    fn insert(
+        &mut self,
+        generation: &Arc<()>,
+        file: &str,
+        selector: crate::hls_ts_select::Selector,
+        data: Bytes,
+    ) {
+        self.insert_bounded(
+            generation,
+            file,
+            selector,
+            data,
+            SELECTED_HLS_CACHE_BYTES,
+            SELECTED_HLS_CACHE_ENTRIES,
+        );
+    }
+    fn insert_bounded(
+        &mut self,
+        generation: &Arc<()>,
+        file: &str,
+        selector: crate::hls_ts_select::Selector,
+        data: Bytes,
+        max_bytes: usize,
+        max_entries: usize,
+    ) {
+        if data.len() > max_bytes / 4 {
+            return;
+        }
+        let mut removed_bytes = 0;
+        self.entries.retain(|entry| {
+            let keep = entry.generation.upgrade().is_some_and(|owned| {
+                !(Arc::ptr_eq(&owned, generation)
+                    && entry.file == file
+                    && entry.selector == selector)
+            });
+            if !keep {
+                removed_bytes += entry.data.len();
+            }
+            keep
+        });
+        self.bytes = self.bytes.saturating_sub(removed_bytes);
+        self.bytes += data.len();
+        self.entries.push_back(SelectedHlsEntry {
+            generation: Arc::downgrade(generation),
+            file: file.to_owned(),
+            selector,
+            data,
+        });
+        while self.bytes > max_bytes || self.entries.len() > max_entries {
+            if let Some(old) = self.entries.pop_front() {
+                self.bytes -= old.data.len();
+            }
+        }
+    }
+    fn remove_generation(&mut self, generation: &Arc<()>) {
+        let mut removed_bytes = 0;
+        self.entries.retain(|entry| {
+            let keep = entry
+                .generation
+                .upgrade()
+                .is_some_and(|owned| !Arc::ptr_eq(&owned, generation));
+            if !keep {
+                removed_bytes += entry.data.len();
+            }
+            keep
+        });
+        self.bytes = self.bytes.saturating_sub(removed_bytes);
+    }
+}
+#[cfg(test)]
+mod selected_hls_cache_tests {
+    use super::*;
+
+    #[test]
+    fn cache_evicts_lru_and_dead_generations_with_small_limits() {
+        let selector = crate::hls_ts_select::Selector::parse("v1a1").unwrap();
+        let first = Arc::new(());
+        let second = Arc::new(());
+        let mut cache = SelectedHlsCache::default();
+        for file in ["a.ts", "b.ts", "c.ts", "d.ts"] {
+            cache.insert_bounded(&first, file, selector, Bytes::from_static(b"four"), 20, 4);
+        }
+        assert_eq!(
+            cache.get(&first, "a.ts", selector).unwrap(),
+            Bytes::from_static(b"four")
+        );
+        cache.insert_bounded(&first, "e.ts", selector, Bytes::from_static(b"four"), 20, 4);
+        assert!(cache.get(&first, "b.ts", selector).is_none());
+        assert!(cache.get(&first, "a.ts", selector).is_some());
+        assert!(cache.get(&second, "a.ts", selector).is_none());
+        drop(first);
+        cache.insert_bounded(
+            &second,
+            "a.ts",
+            selector,
+            Bytes::from_static(b"four"),
+            20,
+            4,
+        );
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.bytes, 4);
+        assert!(cache.get(&second, "a.ts", selector).is_some());
+        cache.insert_bounded(
+            &second,
+            "large.ts",
+            selector,
+            Bytes::from_static(b"123456"),
+            20,
+            4,
+        );
+        assert_eq!(
+            cache.entries.len(),
+            1,
+            "oversize entry must not be retained"
+        );
+        cache.remove_generation(&second);
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.entries.is_empty());
+    }
 }
 #[cfg(test)]
 type BeforeRemoveHook =
@@ -129,6 +284,8 @@ pub struct Worker {
     recovery: std::sync::Mutex<crate::recovery::Recovery>,
     pub bytes: AtomicU64,
     output_rate: std::sync::Mutex<crate::media_rate::OutputRate>,
+    hls_track_profile: std::sync::Mutex<Option<(usize, usize)>>,
+    selected_hls_token: Arc<()>,
     pub viewers: Arc<AtomicU64>,
     pub alive: std::sync::atomic::AtomicBool,
     pub wire: Arc<Hub>,
@@ -263,8 +420,44 @@ impl Worker {
         }
         self.output_rate.lock().unwrap().snapshot(Instant::now())
     }
+    pub(crate) fn hls_track_profile(&self) -> Option<(usize, usize)> {
+        *self.hls_track_profile.lock().unwrap()
+    }
+    pub(crate) fn remember_hls_track_profile(&self, profile: (usize, usize)) {
+        *self.hls_track_profile.lock().unwrap() = Some(profile);
+    }
 }
 impl Engine {
+    /// Cache media bytes only. Every HTTP request must perform its own viewer
+    /// admission and current-generation checks before using this cache.
+    pub(crate) fn cached_selected_hls(
+        &self,
+        worker: &Arc<Worker>,
+        file: &str,
+        selector: crate::hls_ts_select::Selector,
+    ) -> Option<Bytes> {
+        self.selected_hls_cache
+            .lock()
+            .unwrap()
+            .get(&worker.selected_hls_token, file, selector)
+    }
+    pub(crate) fn remember_selected_hls(
+        &self,
+        worker: &Arc<Worker>,
+        file: &str,
+        selector: crate::hls_ts_select::Selector,
+        data: Bytes,
+    ) {
+        if worker.is_closed() || !worker.alive.load(Ordering::Relaxed) {
+            return;
+        }
+        self.selected_hls_cache.lock().unwrap().insert(
+            &worker.selected_hls_token,
+            file,
+            selector,
+            data,
+        );
+    }
     pub fn new(root: impl AsRef<Path>, ffmpeg: &str) -> Self {
         Self::new_with_fxlink(root, ffmpeg, crate::fxlink::Features::default())
     }
@@ -295,6 +488,7 @@ impl Engine {
             tesseract: tesseract.into(),
             hls_epoch: crate::hls_generation::Epoch::for_root(root.as_ref()),
             workers: Mutex::new(HashMap::new()),
+            selected_hls_cache: std::sync::Mutex::new(SelectedHlsCache::default()),
             input_preferences: Mutex::new(HashMap::new()),
             startup_gates: std::sync::Mutex::new(HashMap::new()),
             rtsp_probe_slots: Semaphore::new(32),
@@ -1430,6 +1624,8 @@ impl Engine {
             recovery: std::sync::Mutex::new(crate::recovery::Recovery::new(streak)),
             bytes: AtomicU64::new(0),
             output_rate: std::sync::Mutex::new(crate::media_rate::OutputRate::default()),
+            hls_track_profile: std::sync::Mutex::new(None),
+            selected_hls_token: Arc::new(()),
             viewers,
             alive: std::sync::atomic::AtomicBool::new(true),
             wire: if profile.full_copy() {
@@ -2055,6 +2251,10 @@ impl Engine {
         worker: Arc<Worker>,
         guard: OwnedMutexGuard<()>,
     ) -> Result<OwnedMutexGuard<()>, String> {
+        self.selected_hls_cache
+            .lock()
+            .unwrap()
+            .remove_generation(&worker.selected_hls_token);
         let name = name.to_owned();
         let directory = self.directory(&name);
         let epoch = self.hls_epoch.clone();
@@ -2086,6 +2286,12 @@ impl Engine {
         retired: Option<Arc<Worker>>,
         guard: OwnedMutexGuard<()>,
     ) -> Result<(OwnedMutexGuard<()>, u64), String> {
+        if let Some(worker) = retired.as_ref() {
+            self.selected_hls_cache
+                .lock()
+                .unwrap()
+                .remove_generation(&worker.selected_hls_token);
+        }
         let name = name.to_owned();
         let directory = self.directory(&name);
         let epoch = self.hls_epoch.clone();
