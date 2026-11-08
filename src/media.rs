@@ -2130,6 +2130,30 @@ impl Engine {
     pub async fn read(&self, name: &str, file: &str) -> Result<Bytes, String> {
         self.read_mode(name, file, true).await
     }
+    pub(crate) async fn is_current_worker(&self, name: &str, worker: &Arc<Worker>) -> bool {
+        self.workers
+            .lock()
+            .await
+            .get(name)
+            .is_some_and(|current| Arc::ptr_eq(current, worker))
+    }
+    /// A generated HLS segment may be replaced while its file is being read.
+    /// Selected output is tied to the exact worker that admitted this viewer.
+    pub(crate) async fn read_current_worker(
+        &self,
+        name: &str,
+        file: &str,
+        worker: &Arc<Worker>,
+    ) -> Result<Bytes, String> {
+        if !self.is_current_worker(name, worker).await || worker.is_closed() {
+            return Err("HLS worker changed".into());
+        }
+        let bytes = self.read_mode(name, file, true).await?;
+        if !self.is_current_worker(name, worker).await || worker.is_closed() {
+            return Err("HLS worker changed".into());
+        }
+        Ok(bytes)
+    }
     async fn read_mode(&self, name: &str, file: &str, touch_demand: bool) -> Result<Bytes, String> {
         if self
             .workers

@@ -3144,7 +3144,7 @@ async fn serve_selected_hls(
             if grant.is_cancelled() || worker.is_closed() {
                 return error(StatusCode::FORBIDDEN, "playback revoked");
             }
-            match app.media.read(name, read_file).await {
+            match app.media.read_current_worker(name, read_file, worker).await {
                 Ok(bytes) => break bytes,
                 Err(_) if read_file.ends_with(".m3u8") && Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3190,7 +3190,11 @@ async fn serve_selected_hls(
             let media = if media_file == "index.m3u8" {
                 initial.clone()
             } else {
-                match app.media.read(name, media_file).await {
+                match app
+                    .media
+                    .read_current_worker(name, media_file, worker)
+                    .await
+                {
                     Ok(bytes) => bytes,
                     Err(_) => {
                         return error(
@@ -3215,7 +3219,11 @@ async fn serve_selected_hls(
             let (video, audio) = if let Some(profile) = worker.hls_track_profile() {
                 profile
             } else {
-                let sample = match app.media.read(name, sample_name).await {
+                let sample = match app
+                    .media
+                    .read_current_worker(name, sample_name, worker)
+                    .await
+                {
                     Ok(bytes) => bytes,
                     Err(_) => {
                         return error(StatusCode::SERVICE_UNAVAILABLE, "HLS segment unavailable");
@@ -3276,6 +3284,7 @@ async fn serve_selected_hls(
     };
     if grant.is_cancelled()
         || worker.is_closed()
+        || !app.media.is_current_worker(name, worker).await
         || !app.media_config(name).await.is_some_and(|(cfg, _)| {
             cfg["disabled"] != true && crate::media::media_signature(&cfg) == worker.signature()
         })
