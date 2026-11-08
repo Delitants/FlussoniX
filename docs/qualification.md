@@ -2,6 +2,16 @@
 
 ## Exact product-source CI (2026-11-08 UTC)
 
+[GitHub Actions run 42467348754](https://github.com/Delitants/FlussoniX/actions/runs/42467348754)
+completed successfully on PR #51 head
+`74cbd0f691118bbc87ed769372ac27630a365b10`. Its `verify` job passed
+formatting, warning-denied all-target Clippy, the full serial locked Rust
+suite with owned media fixtures, IPTV authority load smokes, UI build, and
+live browser checks. Its `release_package_smoke` job passed the independently
+packaged daemon and upgrade checks. This qualifies that exact source head for
+those checks; later commits require their own verification. The failed
+24-hour soak and remaining migration/release gates below are unchanged.
+
 [GitHub Actions run 42444739064](https://github.com/Delitants/FlussoniX/actions/runs/42444739064)
 completed successfully on PR #51 head
 `283584309636e626a74ea1ac5355ccfa77161c4e`. Its `verify` job ran
