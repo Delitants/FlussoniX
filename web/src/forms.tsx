@@ -6,8 +6,8 @@ import {GPUReadiness} from './gpuReadiness';
 import {RTPInputFields,DirectOutputFields,directRTP,rtpError,rtpSummary,withoutSRTP} from './rtpFields';
 import {PushFields,pushSummary,pushError} from './srtPushFields';
 export type Item = Record<string, any>;
-export type Kind = 'streams' | 'templates' | 'sources' | 'peers' | 'auth_backends';
-export const kindLabel: Record<Kind,string> = {streams:'stream',templates:'template',sources:'source',peers:'peer',auth_backends:'auth backend'};
+export type Kind = 'streams' | 'templates' | 'sources' | 'peers' | 'balancers' | 'auth_backends';
+export const kindLabel: Record<Kind,string> = {streams:'stream',templates:'template',sources:'source',peers:'peer',balancers:'balancer',auth_backends:'auth backend'};
 const owns=(v:Item,k:string)=>Object.prototype.hasOwnProperty.call(v,k);
 const plainRTSP=(url:string)=>url.startsWith('rtsp://')||url.startsWith('rtsp-udp://')||url.startsWith('rtsp2://');
 const rtspInput=(url:string)=>plainRTSP(url)||url.startsWith('rtsps://');
@@ -16,7 +16,38 @@ export function Field({label,help,children}:{label:string,help?:string,children:
  const id=React.useId();
  return <div className="field"><label htmlFor={id}>{label}</label>{React.isValidElement(children)?React.cloneElement(children as React.ReactElement<{id:string;'aria-describedby'?:string}>,{id,'aria-describedby':help?id+'-help':undefined}):children}{help&&<small id={id+'-help'} className="field-help">{help}</small>}</div>;
 }
-export function ConfigurationFields({kind,value,onChange,templates,backends,locked=false,publication={},capabilities={},currentTracks=[] }:{kind:Kind,value:Item,onChange:(v:Item)=>void,templates:Item[],backends:Item[],locked?:boolean,publication?:Item,capabilities?:Item,currentTracks?:Item[]}) {
+function BalancerFields({value,onChange,peers,locked,geoipConfigured}:{value:Item,onChange:(v:Item)=>void,peers:Item[],locked:boolean,geoipConfigured:boolean}) {
+ const servers:Item[]=Array.isArray(value.servers)?value.servers:[];
+ const updateServer=(i:number,change:Item)=>onChange({...value,servers:servers.map((row,n)=>n===i?change:row)});
+ const available=peers.filter(peer=>typeof peer.hostname==='string'&&typeof peer.public_payload_url==='string'&&/^https?:\/\//.test(peer.public_payload_url));
+ return <>
+  <div className="form-grid"><Field label="Balancer name" help="The name becomes the first part of the viewer URL, for example /lb0/channel/index.m3u8."><input required readOnly={locked} maxLength={128} value={value.name||''} onChange={e=>onChange({...value,name:e.target.value})}/></Field>
+   <Field label="Selection mode" help="Choose the measurement used to order eligible CDNs. Health and admission checks always apply."><select value={value.mode||'bitrate'} onChange={e=>onChange({...value,mode:e.target.value})}><option value="bitrate">Lowest output bitrate</option><option value="usage">Lowest uplink usage</option><option value="clients">Fewest viewers</option><option value="streams">Fewest configured streams</option></select></Field></div>
+  <fieldset><legend>CDN servers</legend><p className="muted">Select registered CDN peers with public HTTP or HTTPS delivery URLs. The balancer redirects viewers; publish directly to a source or ingest node.</p>
+   {servers.map((row,i)=><div className="balancer-server-row" key={i}>
+    <Field label={`CDN server ${i+1}`}><select value={row.name||''} onChange={e=>updateServer(i,{...row,name:e.target.value})}><option value="">Choose CDN peer</option>{available.map(peer=><option key={peer.hostname} value={peer.hostname}>{peer.hostname}</option>)}</select></Field>
+    <Field label={`Maximum bitrate ${i+1}`} help="Optional ceiling in bit/s; leave blank for no extra ceiling. Zero blocks peers with positive output."><input type="number" min="0" step="1" value={row.max_bitrate??''} onChange={e=>{const next={...row};if(e.target.value==='')delete next.max_bitrate;else next.max_bitrate=Number(e.target.value);updateServer(i,next)}}/></Field>
+    <Field label={`Countries ${i+1}`} help="Optional two-letter country codes, separated by commas or spaces."><input value={(row.countries||[]).join(', ')} placeholder="SE, NO" onChange={e=>{const next={...row};const codes=e.target.value.toUpperCase().split(/[\s,]+/).filter(Boolean);if(codes.length)next.countries=codes;else delete next.countries;updateServer(i,next)}}/></Field>
+    <label className="balancer-default"><input type="checkbox" checked={row.countries_default===true} onChange={e=>{const next={...row};if(e.target.checked)next.countries_default=true;else delete next.countries_default;updateServer(i,next)}}/><span>{`Default country fallback ${i+1}`}</span></label>
+    <button type="button" aria-label={`Remove CDN server ${i+1}`} disabled={servers.length<=1} onClick={()=>onChange({...value,servers:servers.filter((_,n)=>n!==i)})}>Remove</button>
+   </div>)}
+   <button type="button" disabled={servers.length>=64||!available.length} onClick={()=>onChange({...value,servers:[...servers,{name:''}]})}>Add CDN server</button>
+   {!available.length&&<p className="muted">Add a CDN peer with a public delivery URL before configuring this balancer.</p>}
+   {servers.some(row=>Array.isArray(row.countries)&&row.countries.length>0)&&!geoipConfigured&&<p className="muted" role="status">Country rules require a local GeoIP Country or City database configured at startup.</p>}
+  </fieldset>
+ </>;
+}
+function balancerError(value:Item):string|undefined {
+ if(!/^[A-Za-z0-9._-]{1,128}$/.test(value.name||''))return 'Balancer name needs 1 to 128 letters, digits, dots, underscores or hyphens.';
+ if(!['bitrate','usage','clients','streams'].includes(value.mode||'bitrate'))return 'Choose a supported selection mode.';
+ const rows=value.servers;if(!Array.isArray(rows)||rows.length<1||rows.length>64)return 'Choose 1 to 64 CDN servers.';
+ if(rows.some((row:Item)=>!row.name)||new Set(rows.map((row:Item)=>row.name)).size!==rows.length)return 'Choose distinct CDN peers.';
+ if(rows.some((row:Item)=>row.max_bitrate!==undefined&&(!Number.isSafeInteger(row.max_bitrate)||row.max_bitrate<0)))return 'Maximum bitrate must be a nonnegative whole number in bit/s.';
+ if(rows.some((row:Item)=>row.countries!==undefined&&(!Array.isArray(row.countries)||row.countries.length>256||row.countries.some((code:string)=>! /^[A-Z]{2}$/.test(code))||new Set(row.countries).size!==row.countries.length)))return 'Countries need distinct two-letter codes.';
+ return undefined;
+}
+export function ConfigurationFields({kind,value,onChange,templates,backends,peers=[],geoipConfigured=false,locked=false,publication={},capabilities={},currentTracks=[] }:{kind:Kind,value:Item,onChange:(v:Item)=>void,templates:Item[],backends:Item[],peers?:Item[],geoipConfigured?:boolean,locked?:boolean,publication?:Item,capabilities?:Item,currentTracks?:Item[]}) {
+ if(kind==='balancers')return <BalancerFields value={value} onChange={onChange} peers={peers} locked={locked} geoipConfigured={geoipConfigured}/>;
  const publicationURL=(scheme:string,address:unknown)=>{
   if(typeof address!=='string')return null;
   try{const u=new URL(scheme+'://'+address);if(['0.0.0.0','[::]'].includes(u.hostname))u.hostname=window.location.hostname;u.pathname='/'+(value.name||'stream_name').split('/').map(encodeURIComponent).join('/');return u.href}catch{return null}
@@ -157,6 +188,7 @@ export function ConfigurationFields({kind,value,onChange,templates,backends,lock
  </>;
 }
 export function validateFields(kind:Kind,value:Item):string|undefined {
+ if(kind==='balancers')return balancerError(value);
  const name=value.name||value.hostname;
  const urlSource=kind==='sources'&&Object.hasOwn(value,'url');
  if(kind==='sources'){const error=vendorSourceError(value);if(error)return error;}

@@ -1013,6 +1013,10 @@ impl App {
             .as_object_mut()
             .unwrap()
             .extend(node.as_object().unwrap().clone());
+        metrics["geoip"] = json!({
+            "configured": self.geoip.is_some(),
+            "revision": self.geoip.as_ref().map(named_balancer::GeoIp::revision)
+        });
         metrics["output_kbit"] = metrics["egress_mbps"]
             .as_f64()
             .filter(|n| n.is_finite() && *n >= 0.0)

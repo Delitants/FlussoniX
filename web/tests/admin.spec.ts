@@ -2,7 +2,118 @@ import {test,expect} from '@playwright/test';
 import dgram from 'node:dgram';
 import fs from 'node:fs';
 import path from 'node:path';
+
 test.beforeEach(async({page})=>{await page.goto('/admin/');await page.getByLabel('Username').fill(process.env.FLUSSONIX_ADMIN_USER||'admin');await page.getByLabel('Password',{exact:true}).fill(process.env.FLUSSONIX_ADMIN_PASSWORD!);await page.getByRole('button',{name:'Sign in',exact:true}).click();await expect(page.getByRole('heading',{name:'Streams',exact:true})).toBeVisible();});
+test('named balancers have friendly direct and staged Cluster controls',async({page})=>{
+ let balancers:any[]=[];
+ const peer={hostname:'ui-test-cdn',api_url:'https://api.example.invalid',public_payload_url:'https://cdn.example.invalid'};
+ await page.route('**/streamer/api/v3/config?full=true',async route=>{
+  await route.fulfill({status:200,json:{streams:[],templates:[],sources:[],peers:[peer],auth_backends:[],balancers}});
+ });
+ await page.route('**/streamer/api/v3/cluster/balancers**',async route=>{
+  const url=new URL(route.request().url()),method=route.request().method();
+  if(method==='GET')return route.fulfill({status:200,json:{balancers}});
+  const name=decodeURIComponent(url.pathname.split('/').at(-1)||'');
+  if(method==='PUT'){const row=route.request().postDataJSON();delete row.$reset;
+   balancers=[...balancers.filter(item=>item.name!==name),{...row,name}];
+   return route.fulfill({status:200,json:{...row,name}})}
+  if(method==='DELETE'){balancers=balancers.filter(item=>item.name!==name);return route.fulfill({status:204});}
+  return route.fulfill({status:405});
+ });
+ await page.route('**/streamer/api/v3/config',async route=>{
+  if(route.request().method()==='PUT')balancers=route.request().postDataJSON().balancers||[];
+  await route.fulfill({status:200,json:{}});
+ });
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();
+ await page.getByRole('button',{name:'Balancers',exact:true}).click();
+ await page.getByRole('button',{name:'Add balancer',exact:true}).click();
+ await page.getByLabel('Balancer name',{exact:true}).fill('lb-ui');
+ await page.getByLabel('Selection mode',{exact:true}).selectOption('usage');
+ await page.getByLabel('CDN server 1',{exact:true}).selectOption('ui-test-cdn');
+ await page.getByLabel('Maximum bitrate 1',{exact:true}).fill('41943040');
+ await expect(page.getByRole('dialog').locator('textarea')).toHaveCount(0);
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ await expect(page.getByRole('cell',{name:'lb-ui',exact:true})).toBeVisible();
+ await expect(page.getByRole('row').filter({has:page.getByRole('cell',{name:'lb-ui',exact:true})})).toContainText('Lowest uplink usage');
+ await expect(page.getByRole('region',{name:'Named HTTP routing'})).toContainText('Unavailable or stale peer measurements exclude that CDN');
+ expect(balancers[0]).toMatchObject({name:'lb-ui',mode:'usage',servers:[{name:'ui-test-cdn',max_bitrate:41943040}]});
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await page.getByRole('button',{name:'Balancers',exact:true}).click();
+ const row=page.getByRole('row').filter({has:page.getByRole('cell',{name:'lb-ui',exact:true})});
+ await row.getByRole('button',{name:'Edit',exact:true}).click();
+ await page.getByLabel('Selection mode',{exact:true}).selectOption('clients');
+ await page.getByLabel('Countries 1',{exact:true}).fill('SE');
+ await page.getByLabel('Default country fallback 1',{exact:true}).check();
+ await expect(page.getByText('Country rules require a local GeoIP Country or City database configured at startup.')).toBeVisible();
+ await page.getByRole('button',{name:'Stage changes',exact:true}).click();
+ expect(balancers[0].mode).toBe('usage');
+ await page.getByRole('button',{name:'Validate',exact:true}).click();
+ await page.getByRole('button',{name:'Save & apply',exact:true}).click();
+ await expect(page.locator('.notice[role=status]')).toContainText('saved and applied');
+ expect(balancers[0]).toMatchObject({mode:'clients',servers:[{countries:['SE'],countries_default:true}]});
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();
+ await page.getByRole('button',{name:'Balancers',exact:true}).click();
+ page.once('dialog',dialog=>dialog.accept());
+ await page.getByRole('row').filter({has:page.getByRole('cell',{name:'lb-ui',exact:true})}).getByRole('button',{name:'Delete',exact:true}).click();
+ await expect(page.getByRole('cell',{name:'lb-ui',exact:true})).toHaveCount(0);
+ expect(balancers).toEqual([]);
+});
+test('view role sees balancer policy without edit actions or peer keys',async({page})=>{
+ await page.route('**/flussonix/api/v1/node',async route=>{
+  await route.fulfill({status:200,json:{name:'owned-node',role:'lb',management_role:'view'}});
+ });
+ await page.route('**/streamer/api/v3/config?full=true',async route=>{
+  await route.fulfill({status:200,json:{streams:[],templates:[],sources:[],auth_backends:[],
+   peers:[{hostname:'ui-view-cdn',api_url:'https://api.example.invalid',public_payload_url:'https://cdn.example.invalid',cluster_key:'owned-private-peer-key'}],
+   balancers:[{name:'lb-view',mode:'clients',servers:[{name:'ui-view-cdn'}]}]}});
+ });
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();
+ await page.getByRole('button',{name:'Balancers',exact:true}).click();
+ await expect(page.getByRole('cell',{name:'lb-view',exact:true})).toBeVisible();
+ await expect(page.getByRole('button',{name:'Add balancer',exact:true})).toHaveCount(0);
+ await expect(page.getByRole('button',{name:'Edit',exact:true})).toHaveCount(0);
+ await expect(page.getByRole('button',{name:'Delete',exact:true})).toHaveCount(0);
+ await expect(page.locator('main')).not.toContainText('owned-private-peer-key');
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await page.getByRole('button',{name:'Balancers',exact:true}).click();
+ await expect(page.getByRole('cell',{name:'lb-view',exact:true})).toBeVisible();
+ await expect(page.getByRole('button',{name:'Add balancer',exact:true})).toHaveCount(0);
+ await expect(page.getByRole('button',{name:'Stage changes',exact:true})).toHaveCount(0);
+ await expect(page.getByRole('button',{name:'Save & apply',exact:true})).toHaveCount(0);
+ await expect(page.getByRole('button',{name:'Edit',exact:true})).toHaveCount(0);
+ await expect(page.getByRole('button',{name:'Remove',exact:true})).toHaveCount(0);
+});
+test('named balancer form persists through the real management API',async({page,request})=>{
+ const suffix=Date.now().toString(36),peer='ui-named-cdn-'+suffix,name='ui-named-lb-'+suffix;
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const peerUrl='/streamer/api/v3/cluster/peers/'+peer,balancerUrl='/streamer/api/v3/cluster/balancers/'+name;
+ try{
+  const created=await request.put(peerUrl,{headers,data:{$reset:true,api_url:'http://127.0.0.1:1',public_payload_url:'https://cdn.example.invalid'}});
+  expect(created.ok(),await created.text()).toBeTruthy();
+  await page.getByRole('button',{name:'Cluster',exact:true}).click();
+  await expect(page.getByRole('cell',{name:peer,exact:true})).toBeVisible();
+  await page.getByRole('button',{name:'Balancers',exact:true}).click();
+  await page.getByRole('button',{name:'Add balancer',exact:true}).click();
+  await page.getByLabel('Balancer name',{exact:true}).fill(name);
+  await page.getByLabel('Selection mode',{exact:true}).selectOption('usage');
+  await page.getByLabel('CDN server 1',{exact:true}).selectOption(peer);
+  await page.getByLabel('Maximum bitrate 1',{exact:true}).fill('0');
+  await expect(page.getByRole('dialog').locator('textarea')).toHaveCount(0);
+  await page.getByRole('button',{name:'Save',exact:true}).click();
+  await expect(page.getByRole('cell',{name,exact:true})).toBeVisible();
+  let saved=await(await request.get(balancerUrl,{headers})).json();
+  expect(saved).toMatchObject({name,mode:'usage',servers:[{name:peer,max_bitrate:0}]});
+  await page.getByRole('row').filter({has:page.getByRole('cell',{name,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+  await page.getByLabel('Selection mode',{exact:true}).selectOption('clients');
+  await page.getByRole('button',{name:'Save',exact:true}).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  saved=await(await request.get(balancerUrl,{headers})).json();
+  expect(saved.mode).toBe('clients');
+ }finally{
+  await request.delete(balancerUrl,{headers});
+  await request.delete(peerUrl,{headers});
+ }
+});
 test('IPTV forms create packages and subscribers without JSON fields',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
  const suffix=Date.now().toString(36),channel='ui-iptv-channel-'+suffix,pack='ui-iptv-package-'+suffix,subscriber='ui-iptv-subscriber-'+suffix;

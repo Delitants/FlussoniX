@@ -6,6 +6,7 @@ use axum::{
     extract::ConnectInfo,
     routing::{get, post},
 };
+use base64::Engine;
 use bytes::Bytes;
 use flussonix::server::{App, Options, router};
 use serde_json::json;
@@ -457,6 +458,33 @@ async fn country_rule_uses_direct_peer_ip_and_ignores_untrusted_forwarded_header
     b_task.abort();
     let _ = a_task.await;
     let _ = b_task.await;
+}
+
+#[tokio::test]
+async fn node_status_reports_local_geoip_readiness_without_exposing_a_database_path() {
+    let (_dir, app) = fixture_with_geoip(true);
+    let auth = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("admin:owned-admin")
+    );
+    let response = router(app)
+        .oneshot(
+            Request::builder()
+                .uri("/flussonix/api/v1/node")
+                .header("Authorization", auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 100_000)
+        .await
+        .unwrap();
+    let node: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(node["geoip"]["configured"], true);
+    assert_eq!(node["geoip"]["revision"].as_str().unwrap().len(), 16);
+    assert!(!String::from_utf8_lossy(&body).contains("country.mmdb"));
 }
 
 #[tokio::test]
