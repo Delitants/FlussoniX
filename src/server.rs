@@ -1383,6 +1383,9 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     } else {
         (resource, name)
     };
+    if kind == "balancers" && resource != "cluster" {
+        return error(StatusCode::NOT_FOUND, "API operation not implemented");
+    }
     if kind == "sessions" {
         if name == Some("reauth") && method == "POST" {
             let Some(stream) = query.get("name") else {

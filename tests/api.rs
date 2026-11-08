@@ -377,6 +377,186 @@ async fn api_auth_nested_names_persistence_and_validate_only() {
     );
     app.media.stop_all().await;
 }
+
+#[tokio::test]
+async fn named_balancer_v3_api_uses_cluster_routes_and_management_roles() {
+    let d = tempfile::tempdir().unwrap();
+    let app = App::new(
+        d.path().join("config.json"),
+        d.path().join("media"),
+        options(),
+    )
+    .unwrap();
+    app.config
+        .put(
+            "peers",
+            "cdn-a",
+            json!({
+                "api_url":"http://127.0.0.1:19001",
+                "public_payload_url":"https://cdn.example",
+                "cluster_key":"private-peer-key"
+            }),
+        )
+        .unwrap();
+    let call = |method: &str, path: &str, body: Value, credentials: Option<&str>| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("Content-Type", "application/json");
+        if let Some(credentials) = credentials {
+            request = request.header(
+                "Authorization",
+                format!("Basic {}", STANDARD.encode(credentials)),
+            );
+        }
+        request.body(Body::from(body.to_string())).unwrap()
+    };
+    let api = "/streamer/api/v3/cluster/balancers";
+    assert_eq!(
+        router(app.clone())
+            .oneshot(call("GET", api, json!(null), None))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        router(app.clone())
+            .oneshot(call(
+                "PUT",
+                &format!("{api}/lb0"),
+                json!({"servers":[{"name":"cdn-a"}]}),
+                Some("viewer:view-secret")
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let revision = app.config.revision();
+    let response = router(app.clone())
+        .oneshot(call(
+            "PUT",
+            &format!("{api}/lb0"),
+            json!({"mode":"usage","servers":[{"name":"cdn-a","max_bitrate":0}]}),
+            Some("admin:secret"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(app.config.revision() > revision);
+    let body = axum::body::to_bytes(response.into_body(), 100_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["name"],
+        "lb0"
+    );
+    for path in [
+        api.to_owned(),
+        format!("{api}/lb0"),
+        "/streamer/api/v3/config?full=true".to_owned(),
+    ] {
+        let response = router(app.clone())
+            .oneshot(call("GET", &path, json!(null), Some("viewer:view-secret")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let body = axum::body::to_bytes(response.into_body(), 100_000)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        if path == api {
+            assert_eq!(value["balancers"][0]["name"], "lb0");
+        } else if path.ends_with("/lb0") {
+            assert_eq!(value["servers"][0]["name"], "cdn-a");
+        } else {
+            assert_eq!(value["balancers"][0]["name"], "lb0");
+            assert_eq!(value["peers"][0]["cluster_key"], "[redacted]");
+        }
+        assert!(!String::from_utf8_lossy(&body).contains("private-peer-key"));
+    }
+    let revision = app.config.revision();
+    let response = router(app.clone())
+        .oneshot(call(
+            "PUT",
+            "/streamer/api/v3/config",
+            json!({"balancers":[{"name":"lb0","mode":"clients","servers":[{"name":"cdn-a"}]}]}),
+            Some("admin:secret"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(app.config.revision() > revision);
+    assert_eq!(app.config.snapshot()["balancers"][0]["mode"], "clients");
+    assert_eq!(
+        router(app.clone())
+            .oneshot(call(
+                "GET",
+                &format!("{api}/unknown"),
+                json!(null),
+                Some("viewer:view-secret")
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        router(app.clone())
+            .oneshot(call(
+                "PUT",
+                &format!("{api}/bad"),
+                json!({"servers":[{"name":"missing"}]}),
+                Some("admin:secret")
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        router(app.clone())
+            .oneshot(call(
+                "GET",
+                "/streamer/api/v3/balancers",
+                json!(null),
+                Some("admin:secret")
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        router(app.clone())
+            .oneshot(call(
+                "PUT",
+                "/streamer/api/v3/balancers/lb1",
+                json!({"servers":[{"name":"cdn-a"}]}),
+                Some("admin:secret")
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        router(app.clone())
+            .oneshot(call(
+                "DELETE",
+                &format!("{api}/lb0"),
+                json!(null),
+                Some("admin:secret")
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(app.config.snapshot()["balancers"], json!([]));
+    app.media.stop_all().await;
+}
 #[tokio::test]
 async fn text_config_accepts_streams_templates_without_mutation() {
     let d = tempfile::tempdir().unwrap();
