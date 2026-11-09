@@ -127,8 +127,8 @@ Both daemons, tunnels and temporary files were removed and port `28210` was
 verified free on each host afterward.
 
 A third bounded check used a temporary one-day CA and a certificate matching
-cdn5's private IP. The remote cdn4 LB queried and admitted cdn5 through
-`https://172.16.0.8:28213/` with `flussonix_tls_ca` and no plain-HTTP peer
+the CDN's private IP. The remote source-side LB queried and admitted the CDN through
+its private HTTPS management port with `flussonix_tls_ca` and no plain-HTTP peer
 exception. The viewer reached cdn5 through a verified HTTPS SSH tunnel. Its
 untrusted-certificate control failed verification; with the test CA, the
 placement/ticket/playlist/segment sequence returned 302/302/200/200 and a

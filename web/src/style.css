@@ -31,3 +31,13 @@ fieldset{border:1px solid #e2e8f0;border-radius:6px;padding:16px;margin:0 0 20px
 .iptv-http-warning{border:1px solid #e9c881;background:#fff8e8;border-radius:4px;color:#79520c;padding:10px 12px;font-size:12px}
 .iptv-ha-health{margin-bottom:16px}.iptv-ha-health h2{margin-top:0}.iptv-ha-health p{overflow-wrap:anywhere}.iptv-ha-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.iptv-ha-metrics span{display:flex;flex-direction:column;color:#5b6980;font-size:12px}.iptv-ha-metrics b{color:#162438;font-size:15px;margin-top:3px}.iptv-ha-health .iptv-http-warning{margin-bottom:0;margin-top:14px}@media(max-width:700px){.iptv-ha-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .balancer-server-row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:end;padding:14px;margin:12px 0;border:1px solid #e2e8f0;border-radius:5px}.balancer-server-row>.field{min-width:0}.balancer-default{display:flex;align-items:center;gap:8px;min-height:38px;color:#34445b}.balancer-default input{width:auto;flex:none}.balancer-server-row>button{justify-self:start}@media(max-width:560px){.balancer-server-row{grid-template-columns:1fr}}
+
+/* Long protocol examples must wrap inside narrow editor fields. */
+.field-help{overflow-wrap:anywhere}
+.table-wrap::before{content:none;display:block;position:sticky;left:0;width:max-content;max-width:100%;padding:7px 16px 5px;color:#5b6f8d;background:#f8fafc;font-size:11px;z-index:1}
+.status-strip::after{content:none;position:sticky;right:0;flex:0 0 24px;align-self:stretch;display:grid;place-items:center;color:#2563eb;background:linear-gradient(90deg,transparent,#fff 45%);pointer-events:none;z-index:1}
+@media(max-width:900px){
+ .table-wrap.has-table-overflow::before{content:"Swipe or scroll sideways for more columns →"}
+ .status-strip.has-inline-overflow::after{content:"→"}
+ .tabs.has-inline-overflow.mobile-cue-detail::after,.tabs.has-inline-overflow.mobile-cue-cluster::after{content:"→";position:sticky;right:0;flex:0 0 24px;align-self:stretch;display:grid;place-items:center;color:#2563eb;background:linear-gradient(90deg,transparent,#f3f5f8 45%);pointer-events:none;z-index:1}
+}
