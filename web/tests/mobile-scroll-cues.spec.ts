@@ -39,7 +39,7 @@ test('320px status strip and Cluster tabs indicate more content to the right',as
  await page.getByRole('button',{name:'Cluster',exact:true}).first().click();
  const tabs=page.locator('.tabs').first();
  expect(await tabs.evaluate(element=>element.scrollWidth>element.clientWidth)).toBe(true);
- expect(await tabs.evaluate(element=>getComputedStyle(element,'::after').content)).toContain('→');
+ await expect.poll(()=>tabs.evaluate(element=>getComputedStyle(element,'::after').content)).toContain('→');
  await expect(page.getByRole('region',{name:'Cluster table; use left and right arrows for more columns'})).toBeVisible();
 });
 
@@ -59,21 +59,64 @@ test('Configuration tabs wrap without a false horizontal-scroll cue',async({page
 });
 
 test('Cluster tabs do not show an arrow when they fit at wider mobile width',async({page})=>{
- await page.setViewportSize({width:436,height:760});
+ await page.setViewportSize({width:700,height:760});
  await page.getByRole('button',{name:'Cluster',exact:true}).first().click();
  const tabs=page.locator('.tabs').first();
- expect(await tabs.evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
- expect(await tabs.evaluate(element=>getComputedStyle(element,'::after').content)).toBe('none');
+ await expect.poll(()=>tabs.evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
+ await expect.poll(()=>tabs.evaluate(element=>getComputedStyle(element,'::after').content)).toBe('none');
+});
+
+test('Cluster tab cue follows content width when labels become wider',async({page})=>{
+ await page.setViewportSize({width:436,height:760});
+ await page.getByRole('button',{name:'Cluster',exact:true}).first().click();
+ const tabs=page.locator('.mobile-cue-cluster');
+ const wider=await page.addStyleTag({content:'.mobile-cue-cluster button:last-child{min-width:240px!important}'});
+ await expect.poll(()=>tabs.evaluate(element=>element.scrollWidth>element.clientWidth)).toBe(true);
+ await expect.poll(()=>tabs.evaluate(element=>getComputedStyle(element,'::after').content)).toContain('→');
+ await wider.evaluate(element=>element.remove());
+ const compact=await page.addStyleTag({content:'.mobile-cue-cluster button{font-size:9px!important}'});
+ await expect.poll(()=>tabs.evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
+ await expect.poll(()=>tabs.evaluate(element=>getComputedStyle(element,'::after').content)).toBe('none');
+ await compact.evaluate(element=>element.remove());
+});
+
+test('stream detail cue follows content width at a wider viewport',async({page})=>{
+ await page.getByRole('button',{name:stream}).click();
+ await page.setViewportSize({width:481,height:760});
+ const tabs=page.locator('.mobile-cue-detail');
+ const wider=await page.addStyleTag({content:'.mobile-cue-detail button{min-width:150px!important}'});
+ await expect.poll(()=>tabs.evaluate(element=>element.scrollWidth>element.clientWidth)).toBe(true);
+ await expect.poll(()=>tabs.evaluate(element=>getComputedStyle(element,'::after').content)).toContain('→');
+ await wider.evaluate(element=>element.remove());
+});
+
+test('status strip cue follows content width rather than a fixed breakpoint',async({page})=>{
+ const strip=page.locator('.status-strip');
+ await page.setViewportSize({width:776,height:760});
+ const compact=await page.addStyleTag({content:'.status-strip>span:last-child{display:none!important}'});
+ await expect.poll(()=>strip.evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
+ await expect.poll(()=>strip.evaluate(element=>getComputedStyle(element,'::after').content)).toBe('none');
+ await compact.evaluate(element=>element.remove());
+ await page.setViewportSize({width:777,height:760});
+ const wider=await page.addStyleTag({content:'.status-strip>span:last-child{min-width:260px!important}'});
+ await expect.poll(()=>strip.evaluate(element=>element.scrollWidth>element.clientWidth)).toBe(true);
+ await expect.poll(()=>strip.evaluate(element=>getComputedStyle(element,'::after').content)).toContain('→');
+ await wider.evaluate(element=>element.remove());
 });
 
 test('stream detail tabs show a cue only while content is hidden',async({page})=>{
  await page.getByRole('button',{name:'ui320-news'}).click();
  const tabs=page.locator('.mobile-cue-detail');
  expect(await tabs.evaluate(element=>element.scrollWidth>element.clientWidth)).toBe(true);
- expect(await tabs.evaluate(element=>getComputedStyle(element,'::after').content)).toContain('→');
+ await expect.poll(()=>tabs.evaluate(element=>getComputedStyle(element,'::after').content)).toContain('→');
  await page.setViewportSize({width:481,height:760});
- expect(await tabs.evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
- expect(await tabs.evaluate(element=>getComputedStyle(element,'::after').content)).toBe('none');
+ const withoutCue=await page.addStyleTag({content:'.tabs.mobile-cue-detail::after{content:none!important}'});
+ const overflowing=await tabs.evaluate(element=>element.scrollWidth>element.clientWidth+1);
+ await withoutCue.evaluate(element=>element.remove());
+ await expect.poll(()=>tabs.evaluate(element=>getComputedStyle(element,'::after').content)).toBe(overflowing?'"→"':'none');
+ await page.setViewportSize({width:700,height:760});
+ await expect.poll(()=>tabs.evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
+ await expect.poll(()=>tabs.evaluate(element=>getComputedStyle(element,'::after').content)).toBe('none');
 });
 
 test('desktop tables do not show a mobile swipe hint',async({page})=>{

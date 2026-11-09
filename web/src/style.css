@@ -38,13 +38,6 @@ fieldset{border:1px solid #e2e8f0;border-radius:6px;padding:16px;margin:0 0 20px
 .status-strip::after{content:none;position:sticky;right:0;flex:0 0 24px;align-self:stretch;display:grid;place-items:center;color:#2563eb;background:linear-gradient(90deg,transparent,#fff 45%);pointer-events:none;z-index:1}
 @media(max-width:900px){
  .table-wrap.has-table-overflow::before{content:"Swipe or scroll sideways for more columns →"}
-}
-@media(max-width:776px){
- .status-strip::after{content:"→"}
-}
-@media(max-width:480px){
- .tabs.mobile-cue-detail::after{content:"→";position:sticky;right:0;flex:0 0 24px;align-self:stretch;display:grid;place-items:center;color:#2563eb;background:linear-gradient(90deg,transparent,#f3f5f8 45%);pointer-events:none;z-index:1}
-}
-@media(max-width:435px){
- .tabs.mobile-cue-cluster::after{content:"→";position:sticky;right:0;flex:0 0 24px;align-self:stretch;display:grid;place-items:center;color:#2563eb;background:linear-gradient(90deg,transparent,#f3f5f8 45%);pointer-events:none;z-index:1}
+ .status-strip.has-inline-overflow::after{content:"→"}
+ .tabs.has-inline-overflow.mobile-cue-detail::after,.tabs.has-inline-overflow.mobile-cue-cluster::after{content:"→";position:sticky;right:0;flex:0 0 24px;align-self:stretch;display:grid;place-items:center;color:#2563eb;background:linear-gradient(90deg,transparent,#f3f5f8 45%);pointer-events:none;z-index:1}
 }
