@@ -90,10 +90,14 @@ async fn run(push: bool, digital: bool, hevc: bool, input: &[u8], expected: &BTr
             .await
             .expect("viewer must attach before early caption events");
         }
-        let feed = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(captions::paced(
-            publication.stdin.take().unwrap(),
-            input.to_vec(),
-        )));
+        let feed_progress =
+            std::sync::Arc::new(std::sync::Mutex::new(captions::PacingProgress::default()));
+        let mut feed_stdin = publication.stdin.take().unwrap();
+        let feed_input = input.to_vec();
+        let feed_observer = feed_progress.clone();
+        let feed = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            captions::paced_observed(&mut feed_stdin, feed_input, Some(feed_observer)).await;
+        }));
         // Data capture has no media timestamps. Stop through FFmpeg's normal
         // interactive quit after the paced fixture has supplied all cue events;
         // flush the untouched transport and require successful process exit.
@@ -103,8 +107,11 @@ async fn run(push: bool, digital: bool, hevc: bool, input: &[u8], expected: &BTr
             let log = std::fs::read_to_string(path.with_extension("log")).unwrap_or_default();
             let worker = app.media.stats("owned").await;
             panic!(
-                "SRT receiver exited before quit: {err}; status={status:?}; worker_status={}; worker_error={}; ffmpeg={log}",
-                worker["status"], worker["last_error"]
+                "SRT receiver exited before quit: {err}; status={status:?}; worker_status={}; worker_error={}; pushes={}; feed={}; ffmpeg={log}",
+                worker["status"],
+                worker["last_error"],
+                worker["flussonix_pushes"],
+                serde_json::to_string(&*feed_progress.lock().unwrap()).unwrap()
             );
         }
         let outcome = tokio::time::timeout(Duration::from_secs(3), receiver.wait()).await;
