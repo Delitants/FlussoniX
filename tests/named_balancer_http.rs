@@ -569,3 +569,74 @@ async fn config_edit_during_named_admission_suppresses_stale_redirect() {
     cdn.abort();
     let _ = cdn.await;
 }
+
+#[tokio::test]
+async fn named_callback_redirect_is_suppressed_after_balancer_edit() {
+    let (_dir, app) = fixture();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/auth", listener.local_addr().unwrap());
+    let entered_signal = entered.clone();
+    let release_signal = release.clone();
+    let callback = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().route(
+                "/auth",
+                get(move || {
+                    let entered = entered_signal.clone();
+                    let release = release_signal.clone();
+                    async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        (
+                            StatusCode::FOUND,
+                            [("location", "https://owned-billing.invalid/permission")],
+                        )
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    app.config
+        .put("streams", "channel", json!({"on_play":url}))
+        .unwrap();
+    let service = router(app.clone());
+    let pending = tokio::spawn(async move {
+        service
+            .oneshot(
+                Request::builder()
+                    .uri("/lb0/channel/index.m3u8?token=viewer")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    app.config
+        .put(
+            "balancers",
+            "lb0",
+            json!({"mode":"clients","servers":[{"name":"cdn-a"}]}),
+        )
+        .unwrap();
+    release.notify_one();
+    let response = tokio::time::timeout(Duration::from_secs(3), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    let status = response.status();
+    let redirected = response.headers().contains_key("location");
+    let workers = app.media.count().await;
+    callback.abort();
+    let _ = callback.await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!redirected);
+    assert_eq!(workers, 0);
+}

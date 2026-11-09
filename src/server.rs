@@ -2805,6 +2805,12 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             AuthOutcome::Allowed(g) => g,
             AuthOutcome::Denied => return error(StatusCode::FORBIDDEN, "playback denied"),
             AuthOutcome::Redirect(url) => {
+                if named.is_some() && app.config.revision() != named_revision {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "named balancer configuration changed",
+                    );
+                }
                 if secure && !url::Url::parse(&url).is_ok_and(|u| u.scheme() == "https") {
                     return error(
                         StatusCode::FORBIDDEN,

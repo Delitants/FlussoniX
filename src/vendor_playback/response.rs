@@ -132,6 +132,12 @@ impl Runtime {
             Ok(AdmissionOutcome::Allowed(a)) => a,
             Ok(AdmissionOutcome::Denied) => return error(StatusCode::FORBIDDEN, "playback denied"),
             Ok(AdmissionOutcome::Redirect(url)) => {
+                if named_revision.is_some_and(|expected| expected != app.config.revision()) {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "named balancer configuration changed",
+                    );
+                }
                 if secure && !url::Url::parse(&url).is_ok_and(|u| u.scheme() == "https") {
                     return error(
                         StatusCode::FORBIDDEN,
