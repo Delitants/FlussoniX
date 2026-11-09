@@ -18,9 +18,18 @@ async fn receiver(path: &Path, port: u16, secret: &str) -> tokio::process::Child
 }
 
 async fn receiver_at(path: &Path, authority: &str, secret: &str) -> tokio::process::Child {
+    receiver_at_timeout(path, authority, secret, 5_000_000).await
+}
+
+async fn receiver_at_timeout(
+    path: &Path,
+    authority: &str,
+    secret: &str,
+    timeout_micros: u64,
+) -> tokio::process::Child {
     let mut cmd = Command::new("ffmpeg");
     let url = format!(
-        "srt://{authority}?mode=listener&listen_timeout=15000000&timeout=5000000&enforced_encryption=1"
+        "srt://{authority}?mode=listener&listen_timeout=15000000&timeout={timeout_micros}&enforced_encryption=1"
     );
     cmd.args(["-passphrase", secret]);
     let log = std::fs::File::create(path.with_extension("log")).unwrap();
@@ -279,6 +288,46 @@ async fn configured_push_starts_on_demand_but_disabled_and_publication_wait() {
     assert_eq!(app.media.stats("disabled").await["status"], "waiting");
     assert_eq!(app.media.stats("publication").await["status"], "waiting");
     app.media.stop_all().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn connected_push_waits_for_delayed_mux_output_without_reconnecting() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = MEDIA_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let wrapper = dir.path().join("owned-ffmpeg-wrapper");
+    std::fs::write(
+        &wrapper,
+        "#!/usr/bin/python3\nimport os,sys,time\nif '-progress' in sys.argv: time.sleep(7)\nos.execv('/usr/bin/ffmpeg',['ffmpeg']+sys.argv[1:])\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = flussonix::media::Engine::new(dir.path().join("media"), wrapper.to_str().unwrap());
+    let port = unused_udp_port();
+    let path = dir.path().join("delayed.ts");
+    let mut listener = receiver_at_timeout(
+        &path,
+        &format!("127.0.0.1:{port}"),
+        "owned-secret-123",
+        20_000_000,
+    )
+    .await;
+    let worker = engine
+        .ensure(
+            "owned",
+            &json!({"inputs":[{"url":"testsrc://"}],"pushes":[{"url":format!("srt://127.0.0.1:{port}"),"passphrase":"owned-secret-123"}]}),
+        )
+        .await
+        .unwrap();
+    let sending = wait_push(&worker, 0, "sending").await;
+    assert_eq!(
+        sending["attempts"], 1,
+        "listener needed a reconnect: {sending}"
+    );
+    received(&mut listener, &path, "h264", "aac").await;
+    engine.stop_all().await;
+    assert_eq!(worker.stats()["flussonix_pushes"][0]["pid"], 0);
 }
 
 #[cfg(unix)]

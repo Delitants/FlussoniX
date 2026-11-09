@@ -153,7 +153,10 @@ fn parse(item: &Value) -> Result<Destination, String> {
         endpoint,
         disabled: item["disabled"] == true,
         retry_seconds,
-        startup_seconds: 5,
+        // FFmpeg 6 can complete a subtitle-preserving publication probe just
+        // after five seconds. Keep the accepted SRT socket through that
+        // bounded startup window rather than forcing a listener reconnect.
+        startup_seconds: 10,
         connect_seconds: connect,
         latency_millis: latency,
         streamid: streamid.to_owned(),
