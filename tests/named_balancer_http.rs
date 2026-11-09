@@ -61,7 +61,7 @@ fn fixture_with_geoip(use_geoip: bool) -> (tempfile::TempDir, Arc<App>) {
 }
 
 async fn request(app: &Arc<App>, method: &str, uri: &str, body: Body) -> StatusCode {
-    router(app.clone())
+    let response = router(app.clone())
         .oneshot(
             Request::builder()
                 .method(method)
@@ -70,14 +70,30 @@ async fn request(app: &Arc<App>, method: &str, uri: &str, body: Body) -> StatusC
                 .unwrap(),
         )
         .await
-        .unwrap()
-        .status()
+        .unwrap();
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND && uri.contains("tracks-") {
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        eprintln!("named track 404: {uri}: {}", String::from_utf8_lossy(&body));
+    }
+    status
 }
 
 #[tokio::test]
 async fn named_http_paths_use_the_underlying_stream_and_never_start_an_lb_worker() {
     let (_dir, app) = fixture();
-    for suffix in ["index.m3u8", "mpegts", "m4s", "m4f", "fmp4/seg.m4f"] {
+    for suffix in [
+        "index.m3u8",
+        "video.m3u8",
+        "tracks-v1a1/mono.m3u8",
+        "tracks-v1a1/g1_1.ts",
+        "mpegts",
+        "m4s",
+        "m4f",
+        "fmp4/seg.m4f",
+    ] {
         let uri = format!("/lb0/channel/{suffix}?token=viewer&x=%2B");
         assert_eq!(
             request(&app, "GET", &uri, Body::empty()).await,
@@ -100,6 +116,16 @@ async fn named_http_paths_use_the_underlying_stream_and_never_start_an_lb_worker
             &app,
             "GET",
             "/lb0/channel/index.m3u8?token=wrong",
+            Body::empty()
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/lb0/channel/tracks-v1a1/mono.m3u8?token=wrong",
             Body::empty()
         )
         .await,

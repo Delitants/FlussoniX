@@ -142,6 +142,49 @@ fn counted_filter(bytes: &mut [u8]) -> Result<usize, String> {
     ts(bytes)?;
     Ok(MAPPING_WORK.with(|work| work.get()))
 }
+fn two_video_transport(first: &[u8], second: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    table(
+        0,
+        vec![0, 0xb0, 13, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0],
+        &mut output,
+    );
+    table(
+        4096,
+        vec![
+            2, 0xb0, 23, 0, 1, 0xc1, 0, 0, 0xe1, 0, 0xf0, 0, 0x1b, 0xe1, 0, 0xf0, 0, 0x24, 0xe1, 1,
+            0xf0, 0,
+        ],
+        &mut output,
+    );
+    let (first_packets, _) = transport(false, &[first.to_vec()], false);
+    output.extend_from_slice(&first_packets[376..]);
+    let (mut second_packets, _) = transport(true, &[second.to_vec()], false);
+    for packet in second_packets[376..].chunks_exact_mut(188) {
+        packet[2] = 1;
+    }
+    output.extend_from_slice(&second_packets[376..]);
+    output
+}
+#[test]
+fn drops_captions_from_every_video_pid_without_touching_other_video_bytes() {
+    let (first, first_expected) = pes(false, 17, 2);
+    let (second, second_expected) = pes(true, 23, 2);
+    let mut bytes = two_video_transport(&first, &second);
+    let expected = two_video_transport(&first_expected, &second_expected);
+    ts(&mut bytes).unwrap();
+    assert_eq!(bytes, expected);
+
+    let mut malformed_second = second;
+    malformed_second[0] = 7;
+    let mut bytes = two_video_transport(&first, &malformed_second);
+    let unchanged = bytes.clone();
+    assert_eq!(ts(&mut bytes).unwrap_err(), "invalid caption PES");
+    assert_eq!(
+        bytes, unchanged,
+        "a later track error must not publish first-track patches"
+    );
+}
 #[test]
 fn dense_caption_ts_mapping_work_is_linear_and_byte_exact() {
     for hevc in [false, true] {

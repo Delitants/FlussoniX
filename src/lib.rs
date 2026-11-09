@@ -36,6 +36,7 @@ pub mod recovery;
 
 mod hls_generation;
 mod hls_master_alias;
+mod hls_ts_select;
 
 pub mod source_directory;
 

@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    media::{PackagedSubscription, SharedPackagingFailure},
+    media::{PackagedPlayback, PackagedSubscription, SharedPackagingFailure},
     playback_auth::ViewerRequest,
     server::{error, header, parse_query, rewrite_playlist},
     source_directory::modern_coordinator::AdmissionOutcome,
@@ -251,6 +251,9 @@ impl Runtime {
             };
             return continuous(subscription, app.egress.clone(), file);
         }
+        if let Some(route) = crate::hls_ts_select::file_route(file) {
+            return self.serve_selected_hls(app, route, &playback, &query).await;
+        }
         // Keep the normal read grace, but do not cut short a current worker's
         // configured startup allowance. The allowance belongs to its generation.
         let deadline = (Instant::now() + Duration::from_secs(8)).max(playback.startup_deadline());
@@ -316,6 +319,181 @@ impl Runtime {
             .into_response()
     }
 }
+impl Runtime {
+    async fn serve_selected_hls(
+        &self,
+        app: &Arc<App>,
+        route: crate::hls_ts_select::FileRoute<'_>,
+        playback: &PackagedPlayback,
+        query: &HashMap<String, String>,
+    ) -> Response {
+        use crate::hls_ts_select::{FileRoute, Selector};
+        let mut child_query = query.clone();
+        child_query.remove("flussonix_ticket");
+        child_query.remove("flussonix_handoff");
+        let suffix = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(child_query.iter())
+            .finish();
+        let deadline = (Instant::now() + Duration::from_secs(8)).max(playback.startup_deadline());
+        let bytes = match route {
+            FileRoute::Segment(selector, leaf) => {
+                let read = app.media.read_shared_selected_hls(playback, leaf, selector);
+                match tokio::select! {biased; _=self.closed.cancelled()=>return error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),result=read=>result}
+                {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "selected HLS segment unavailable",
+                        );
+                    }
+                }
+            }
+            FileRoute::Master | FileRoute::Playlist(_) => {
+                let index = loop {
+                    let read = tokio::select! {biased; _=self.closed.cancelled()=>return error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),result=app.media.read_shared_unaccounted(playback,"index.m3u8")=>result};
+                    match read {
+                        Ok(bytes) => break bytes,
+                        Err(_) if Instant::now() < deadline && playback.current().is_ok() => {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        Err(_) => {
+                            return error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "HLS media playlist unavailable",
+                            );
+                        }
+                    }
+                };
+                let media_file = match crate::hls_ts_select::source_media_file(&index) {
+                    Ok(file) => file,
+                    Err(_) => {
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "HLS media playlist unavailable",
+                        );
+                    }
+                };
+                let media = if media_file == "index.m3u8" {
+                    index.clone()
+                } else {
+                    match app
+                        .media
+                        .read_shared_unaccounted(playback, media_file)
+                        .await
+                    {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            return error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "HLS media playlist unavailable",
+                            );
+                        }
+                    }
+                };
+                let playlist = match crate::hls_ts_select::media_playlist(&media) {
+                    Ok(playlist) => playlist,
+                    Err(_) => {
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "HLS media playlist unavailable",
+                        );
+                    }
+                };
+                let Some(sample_name) =
+                    crate::hls_ts_select::latest_segment(&playlist).map(str::to_owned)
+                else {
+                    return error(StatusCode::SERVICE_UNAVAILABLE, "HLS segment unavailable");
+                };
+                let worker = playback.worker();
+                let output_rate = worker.output_bitrate();
+                let profile = match tokio::select! { biased;
+                    _ = self.closed.cancelled() => return error(StatusCode::SERVICE_UNAVAILABLE, "vendor playback stopped"),
+                    result = app.media.shared_hls_track_profile(playback, &sample_name) => result,
+                } {
+                    Ok(profile) => profile,
+                    Err(_) => {
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "HLS track metadata unavailable",
+                        );
+                    }
+                };
+                let rendered = (|| -> Result<Bytes, SharedPackagingFailure> {
+                    let (video, audio) = profile;
+                    let body = match route {
+                        FileRoute::Master => {
+                            let selector = Selector {
+                                video: (video > 0).then_some(1),
+                                audio: (audio > 0).then_some(1),
+                            };
+                            if selector.video.is_none() && selector.audio.is_none() {
+                                return Err(SharedPackagingFailure::Unavailable);
+                            }
+                            let alias = crate::hls_master_alias::render(
+                                crate::hls_master_alias::Alias::Ts,
+                                &index,
+                                output_rate,
+                                &suffix,
+                            )
+                            .map_err(|_| SharedPackagingFailure::Unavailable)?;
+                            crate::hls_ts_select::master_child(&alias, selector, &suffix)
+                                .map_err(|_| SharedPackagingFailure::Unavailable)?
+                        }
+                        FileRoute::Playlist(selector) => {
+                            if selector.video.is_some_and(|n| n > video)
+                                || selector.audio.is_some_and(|n| n > audio)
+                            {
+                                return Err(SharedPackagingFailure::Unavailable);
+                            }
+                            rewrite_playlist(&playlist, &suffix)
+                        }
+                        FileRoute::Segment(..) => unreachable!(),
+                    };
+                    Ok(Bytes::from(body))
+                })();
+                let rendered = match rendered {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "HLS track playlist unavailable",
+                        );
+                    }
+                };
+                let read = app.media.account_shared_generated(playback, rendered);
+                match tokio::select! {biased; _=self.closed.cancelled()=>return error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),result=read=>result}
+                {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "HLS track playlist unavailable",
+                        );
+                    }
+                }
+            }
+        };
+        if playback.current().is_err() {
+            return error(StatusCode::FORBIDDEN, "playback revoked");
+        }
+        app.egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        let content_type = if matches!(route, FileRoute::Segment(..)) {
+            "video/mp2t"
+        } else {
+            "application/vnd.apple.mpegurl"
+        };
+        (
+            [
+                ("content-type", content_type),
+                ("cache-control", "no-store"),
+            ],
+            bytes,
+        )
+            .into_response()
+    }
+}
+
 fn continuous(
     subscription: PackagedSubscription,
     egress: Arc<std::sync::atomic::AtomicU64>,

@@ -2653,6 +2653,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     let path = percent_encoding::percent_decode_str(raw_path.trim_start_matches('/'))
         .decode_utf8_lossy()
         .to_string();
+    let track_route = crate::hls_ts_select::route(&path);
     let special = if path.ends_with(".m4f") {
         let p = path.rsplitn(7, '/').collect::<Vec<_>>();
         if p.len() == 7 {
@@ -2674,6 +2675,14 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         (n, "m4s")
     } else if let Some(n) = path.strip_suffix("/mpegts") {
         (n, "mpegts")
+    } else if let Some(route) = track_route {
+        match route {
+            crate::hls_ts_select::Route::Master { stream } => (stream, "video.m3u8"),
+            crate::hls_ts_select::Route::Playlist { stream, .. }
+            | crate::hls_ts_select::Route::Segment { stream, .. } => {
+                (stream, &path[stream.len() + 1..])
+            }
+        }
     } else if let Some((n, _f)) = path.split_once("/fmp4/") {
         (n, &path[n.len() + 1..])
     } else if let Some((n, f)) = path.rsplit_once('/') {
@@ -3089,6 +3098,9 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         )
             .into_response();
     }
+    if let Some(route) = track_route {
+        return serve_selected_hls(&app, name, route, &worker, &grant, &query).await;
+    }
     let alias = crate::hls_master_alias::Alias::from_file(file);
     let read_file = alias.map_or(file, |alias| alias.underlying_file());
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -3153,6 +3165,291 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     )
         .into_response()
 }
+async fn serve_selected_hls(
+    app: &Arc<App>,
+    name: &str,
+    route: crate::hls_ts_select::Route<'_>,
+    worker: &Arc<Worker>,
+    grant: &Grant,
+    query: &HashMap<String, String>,
+) -> Response {
+    use crate::hls_ts_select::{Route, Selector};
+    let mut child_query = query.clone();
+    child_query.remove("flussonix_ticket");
+    child_query.remove("flussonix_handoff");
+    let suffix = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(child_query.iter())
+        .finish();
+    let read_file = match route {
+        Route::Master { .. } | Route::Playlist { .. } => "index.m3u8",
+        Route::Segment { file, .. } => file,
+    };
+    let mut cached = match route {
+        Route::Segment { selector, file, .. } => {
+            app.media.cached_selected_hls(worker, file, selector)
+        }
+        _ => None,
+    };
+    let mut miss_permit = None;
+    if matches!(route, Route::Segment { .. }) && cached.is_none() {
+        let permit = tokio::select! { biased;
+            _ = grant.cancelled() => return error(StatusCode::FORBIDDEN, "playback revoked"),
+            _ = worker.closed() => return error(StatusCode::FORBIDDEN, "playback revoked"),
+            result = app.media.selected_hls_miss_permit() => match result {
+                Ok(permit) => permit,
+                Err(()) => return error(StatusCode::SERVICE_UNAVAILABLE, "selected HLS admission unavailable"),
+            },
+        };
+        if grant.is_cancelled()
+            || worker.is_closed()
+            || !app.media.is_current_worker(name, worker).await
+        {
+            return error(StatusCode::FORBIDDEN, "playback revoked");
+        }
+        if let Route::Segment { selector, file, .. } = route {
+            cached = app.media.cached_selected_hls(worker, file, selector);
+        }
+        if cached.is_none() {
+            miss_permit = Some(permit);
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let initial = if cached.is_some() {
+        None
+    } else {
+        Some(loop {
+            if grant.is_cancelled() || worker.is_closed() {
+                return error(StatusCode::FORBIDDEN, "playback revoked");
+            }
+            let read = if let Some(permit) = miss_permit.take() {
+                match app
+                    .media
+                    .read_current_worker_selected_ts(name, read_file, worker, permit)
+                    .await
+                {
+                    Ok((permit, bytes)) => {
+                        miss_permit = Some(permit);
+                        Ok(bytes)
+                    }
+                    Err(err) => Err(err),
+                }
+            } else {
+                app.media.read_current_worker(name, read_file, worker).await
+            };
+            match read {
+                Ok(bytes) => break bytes,
+                Err(_) if read_file.ends_with(".m3u8") && Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "HLS media unavailable"),
+            }
+        })
+    };
+    let mut pending_cache = None;
+    let mut retained_permit = None;
+    let (bytes, content_type) = match route {
+        Route::Segment { selector, file, .. } => {
+            let bytes = if let Some(cached) = cached {
+                cached
+            } else {
+                let source = initial.expect("uncached segment was read");
+                if grant.is_cancelled()
+                    || worker.is_closed()
+                    || !app.media.is_current_worker(name, worker).await
+                {
+                    return error(StatusCode::FORBIDDEN, "playback revoked");
+                }
+                let permit = miss_permit.expect("uncached segment owns an admission slot");
+                let passthrough_subtitles = worker.hls_subtitles == "passthrough";
+                let filtered = tokio::task::spawn_blocking(move || {
+                    (
+                        permit,
+                        crate::hls_ts_select::filter(&source, selector, passthrough_subtitles),
+                    )
+                })
+                .await;
+                let Ok((permit, Ok(filtered))) = filtered else {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "selected HLS segment unavailable",
+                    );
+                };
+                retained_permit = Some(permit);
+                let bytes = Bytes::from(filtered);
+                pending_cache = Some((file, selector));
+                bytes
+            };
+            (bytes, "video/mp2t")
+        }
+        Route::Master { .. } | Route::Playlist { .. } => {
+            let initial = initial.expect("HLS index was read");
+            let media_file = match crate::hls_ts_select::source_media_file(&initial) {
+                Ok(file) => file,
+                Err(_) => {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "HLS media playlist unavailable",
+                    );
+                }
+            };
+            let media = if media_file == "index.m3u8" {
+                initial.clone()
+            } else {
+                match app
+                    .media
+                    .read_current_worker(name, media_file, worker)
+                    .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "HLS media playlist unavailable",
+                        );
+                    }
+                }
+            };
+            let playlist = match crate::hls_ts_select::media_playlist(&media) {
+                Ok(playlist) => playlist,
+                Err(_) => {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "HLS media playlist unavailable",
+                    );
+                }
+            };
+            let Some(sample_name) = crate::hls_ts_select::latest_segment(&playlist) else {
+                return error(StatusCode::SERVICE_UNAVAILABLE, "HLS segment unavailable");
+            };
+            let (video, audio) = if let Some(profile) = worker.hls_track_profile() {
+                profile
+            } else {
+                let permit = tokio::select! { biased;
+                    _ = grant.cancelled() => return error(StatusCode::FORBIDDEN, "playback revoked"),
+                    _ = worker.closed() => return error(StatusCode::FORBIDDEN, "playback revoked"),
+                    result = app.media.selected_hls_miss_permit() => match result {
+                        Ok(permit) => permit,
+                        Err(()) => return error(StatusCode::SERVICE_UNAVAILABLE, "HLS track admission unavailable"),
+                    },
+                };
+                if grant.is_cancelled()
+                    || worker.is_closed()
+                    || !app.media.is_current_worker(name, worker).await
+                {
+                    return error(StatusCode::FORBIDDEN, "playback revoked");
+                }
+                if let Some(profile) = worker.hls_track_profile() {
+                    drop(permit);
+                    profile
+                } else {
+                    let (permit, sample) = match app
+                        .media
+                        .read_current_worker_selected_ts(name, sample_name, worker, permit)
+                        .await
+                    {
+                        Ok(read) => read,
+                        Err(_) => {
+                            return error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "HLS segment unavailable",
+                            );
+                        }
+                    };
+                    if grant.is_cancelled()
+                        || worker.is_closed()
+                        || !app.media.is_current_worker(name, worker).await
+                    {
+                        return error(StatusCode::FORBIDDEN, "playback revoked");
+                    }
+                    let scanned = tokio::task::spawn_blocking(move || {
+                        (permit, crate::hls_ts_select::available(&sample))
+                    })
+                    .await;
+                    let Ok((permit, Ok(profile))) = scanned else {
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "HLS track metadata unavailable",
+                        );
+                    };
+                    if grant.is_cancelled()
+                        || worker.is_closed()
+                        || !app.media.is_current_worker(name, worker).await
+                    {
+                        return error(StatusCode::FORBIDDEN, "playback revoked");
+                    }
+                    let profile = worker.hls_track_profile().unwrap_or(profile);
+                    worker.remember_hls_track_profile(profile);
+                    drop(permit);
+                    profile
+                }
+            };
+            let body = match route {
+                Route::Master { .. } => {
+                    let selector = Selector {
+                        video: (video > 0).then_some(1),
+                        audio: (audio > 0).then_some(1),
+                    };
+                    if selector.video.is_none() && selector.audio.is_none() {
+                        return error(StatusCode::SERVICE_UNAVAILABLE, "HLS tracks unavailable");
+                    }
+                    let alias = crate::hls_master_alias::render(
+                        crate::hls_master_alias::Alias::Ts,
+                        &initial,
+                        worker.output_bitrate(),
+                        &suffix,
+                    );
+                    let Ok(alias) = alias else {
+                        return error(StatusCode::SERVICE_UNAVAILABLE, "HLS master unavailable");
+                    };
+                    match crate::hls_ts_select::master_child(&alias, selector, &suffix) {
+                        Ok(body) => body,
+                        Err(_) => {
+                            return error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "HLS master unavailable",
+                            );
+                        }
+                    }
+                }
+                Route::Playlist { selector, .. } => {
+                    if selector.video.is_some_and(|n| n > video)
+                        || selector.audio.is_some_and(|n| n > audio)
+                    {
+                        return error(StatusCode::NOT_FOUND, "HLS track absent");
+                    }
+                    rewrite_playlist(&playlist, &suffix)
+                }
+                Route::Segment { .. } => unreachable!(),
+            };
+            (Bytes::from(body), "application/vnd.apple.mpegurl")
+        }
+    };
+    if grant.is_cancelled()
+        || worker.is_closed()
+        || !app.media.is_current_worker(name, worker).await
+        || !app.media_config(name).await.is_some_and(|(cfg, _)| {
+            cfg["disabled"] != true && crate::media::media_signature(&cfg) == worker.signature()
+        })
+    {
+        return error(StatusCode::FORBIDDEN, "playback revoked");
+    }
+    if let Some((file, selector)) = pending_cache {
+        app.media
+            .remember_selected_hls(worker, file, selector, bytes.clone());
+    }
+    drop(retained_permit);
+    grant.add_bytes(bytes.len());
+    app.egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    (
+        [
+            ("content-type", content_type),
+            ("cache-control", "no-store"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 struct ViewerGuard(Arc<Worker>, #[allow(dead_code)] Grant);
 impl Drop for ViewerGuard {
     fn drop(&mut self) {
@@ -3225,6 +3522,184 @@ mod wire_delivery_tests {
         assert_eq!(egress.load(Ordering::Relaxed), 10);
         drop(viewer);
         engine.stop_all().await;
+    }
+}
+
+#[cfg(test)]
+mod selected_hls_admission_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    async fn get(app: &Arc<App>, path: &str) -> Response {
+        router(app.clone())
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn playlist(app: &Arc<App>, path: &str) -> String {
+        let response = get(app, path).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 2 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    fn first_uri(playlist: &str) -> &str {
+        playlist
+            .lines()
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cached_selected_segment_bypasses_saturated_miss_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.config
+            .put(
+                "streams",
+                "owned",
+                json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+            )
+            .unwrap();
+        let master = playlist(&app, "/owned/video.m3u8").await;
+        let child = first_uri(&master);
+        let media = playlist(&app, &format!("/owned/{child}")).await;
+        let segment = first_uri(&media);
+        let cached_path = format!("/owned/tracks-v1a1/{segment}");
+        assert_eq!(get(&app, &cached_path).await.status(), StatusCode::OK);
+
+        let first = app.media.selected_hls_miss_permit().await.unwrap();
+        let second = app.media.selected_hls_miss_permit().await.unwrap();
+        let cached = tokio::time::timeout(Duration::from_secs(2), get(&app, &cached_path))
+            .await
+            .expect("cached selected media waited for a miss slot");
+        assert_eq!(cached.status(), StatusCode::OK);
+        assert_eq!(app.media.selected_hls_waiters_for_test(), 0);
+
+        let uncached_path = format!("/owned/tracks-v1/{segment}");
+        let uncached = get(&app, &uncached_path);
+        tokio::pin!(uncached);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut uncached)
+                .await
+                .is_err(),
+            "an uncached selected segment bypassed the shared miss limit"
+        );
+        assert_eq!(app.media.selected_hls_waiters_for_test(), 1);
+        drop(first);
+        let response = tokio::time::timeout(Duration::from_secs(8), &mut uncached)
+            .await
+            .expect("uncached selected segment did not resume after admission");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(app.media.selected_hls_waiters_for_test(), 0);
+        drop(second);
+        app.media.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn cold_track_profile_waits_for_shared_miss_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.config
+            .put(
+                "streams",
+                "cold",
+                json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+            )
+            .unwrap();
+        let _index = playlist(&app, "/cold/index.m3u8").await;
+        let first = app.media.selected_hls_miss_permit().await.unwrap();
+        let second = app.media.selected_hls_miss_permit().await.unwrap();
+        let master = get(&app, "/cold/video.m3u8");
+        tokio::pin!(master);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut master)
+                .await
+                .is_err(),
+            "a cold profile read bypassed the shared miss limit"
+        );
+        assert_eq!(app.media.selected_hls_waiters_for_test(), 1);
+        drop(first);
+        let response = tokio::time::timeout(Duration::from_secs(8), &mut master)
+            .await
+            .expect("cold profile did not resume after admission");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(app.media.selected_hls_waiters_for_test(), 0);
+        drop(second);
+        app.media.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_selected_file_read_keeps_its_miss_slot_until_io_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.config
+            .put(
+                "streams",
+                "read-cancel-owned",
+                json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+            )
+            .unwrap();
+        let master = playlist(&app, "/read-cancel-owned/video.m3u8").await;
+        let media = playlist(&app, &format!("/read-cancel-owned/{}", first_uri(&master))).await;
+        let segment = first_uri(&media).to_owned();
+        let (entered, release) =
+            crate::media::file_reader::pause_once_for_test("read-cancel-owned", &segment);
+        let other = app.media.selected_hls_miss_permit().await.unwrap();
+        let path = format!("/read-cancel-owned/tracks-v1a1/{segment}");
+        let reading_app = app.clone();
+        let request = tokio::spawn(async move { get(&reading_app, &path).await });
+        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(5)).unwrap())
+            .await
+            .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+
+        let acquired = tokio::time::timeout(
+            Duration::from_millis(50),
+            app.media.selected_hls_miss_permit(),
+        )
+        .await;
+        release.send(()).unwrap();
+        drop(other);
+        app.media.stop_all().await;
+        assert!(
+            acquired.is_err(),
+            "a cancelled request freed its slot while the blocking file read continued"
+        );
     }
 }
 pub fn rewrite_playlist(text: &str, query: &str) -> String {

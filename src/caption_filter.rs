@@ -6,6 +6,59 @@ thread_local! {
     static MAPPING_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+struct TsPause {
+    marker: Vec<u8>,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static TS_PAUSE: std::sync::OnceLock<std::sync::Mutex<Option<TsPause>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static MP4_PAUSE: std::sync::OnceLock<std::sync::Mutex<Option<TsPause>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn pause_once_for_test(
+    marker: &[u8],
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let previous = TS_PAUSE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .replace(TsPause {
+            marker: marker.to_vec(),
+            entered: entered_tx,
+            release: release_rx,
+        });
+    assert!(previous.is_none(), "overlapping test caption-filter pauses");
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+pub(crate) fn pause_mp4_once_for_test(
+    marker: &[u8],
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let previous = MP4_PAUSE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .replace(TsPause {
+            marker: marker.to_vec(),
+            entered: entered_tx,
+            release: release_rx,
+        });
+    assert!(previous.is_none(), "overlapping test fMP4 filter pauses");
+    (entered_rx, release_tx)
+}
+
 fn number(b: &[u8], at: usize) -> Result<u32, String> {
     Ok(u32::from_be_bytes(
         b.get(at..at + 4)
@@ -135,7 +188,7 @@ fn ts_payload(p: &[u8]) -> Result<(u16, bool, usize), String> {
         if p[3] & 0x10 != 0 { offset } else { 188 },
     ))
 }
-fn video_pid(data: &[u8]) -> Result<Option<(u16, bool)>, String> {
+fn video_pids(data: &[u8]) -> Result<Vec<(u16, bool)>, String> {
     let mut pmt = None;
     let mut section: Vec<u8> = vec![];
     for p in data.chunks_exact(188) {
@@ -175,39 +228,74 @@ fn video_pid(data: &[u8]) -> Result<Option<(u16, bool)>, String> {
             continue;
         }
         let mut at = 12 + ((usize::from(section[10] & 15) << 8) | usize::from(section[11]));
+        let mut videos = Vec::new();
         while at + 5 <= n - 4 {
             let kind = section[at];
             let id = (u16::from(section[at + 1] & 31) << 8) | u16::from(section[at + 2]);
             if kind == 0x1b || kind == 0x24 {
-                return Ok(Some((id, kind == 0x24)));
+                if videos.len() >= 16 || videos.iter().any(|(seen, _)| *seen == id) {
+                    return Err("caption video PID limit or duplicate".into());
+                }
+                videos.push((id, kind == 0x24));
             }
             if kind == 2 || kind == 0x10 {
                 return Err("caption filtering requires H.264 or HEVC".into());
-            }
-            if !matches!(kind, 3 | 4 | 0x0f | 0x11) {
-                return Err("unsupported caption TS stream type".into());
             }
             at += 5 + ((usize::from(section[at + 3] & 15) << 8) | usize::from(section[at + 4]));
         }
         if at != n - 4 {
             return Err("invalid caption PMT entries".into());
         }
-        return Ok(None);
+        return Ok(videos);
     }
     Err("caption video metadata absent".into())
 }
 pub fn ts(data: &mut [u8]) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let pause = {
+            let mut pending = TS_PAUSE.get_or_init(Default::default).lock().unwrap();
+            if pending.as_ref().is_some_and(|pause| {
+                data.get(32..32 + pause.marker.len()) == Some(pause.marker.as_slice())
+            }) {
+                pending.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            let _ = pause.entered.send(());
+            let _ = pause
+                .release
+                .recv_timeout(std::time::Duration::from_secs(2));
+        }
+    }
     if data.len() % 188 != 0 {
         return Err("unaligned caption TS".into());
     }
-    let Some((pid, hevc)) = video_pid(data)? else {
+    let videos = video_pids(data)?;
+    if videos.is_empty() {
         return Ok(());
-    };
-    let mut pes = vec![];
-    let mut mapping: Vec<(usize, usize, usize)> = vec![];
+    }
+    struct VideoPes {
+        pid: u16,
+        hevc: bool,
+        pes: Vec<u8>,
+        mapping: Vec<(usize, usize, usize)>,
+    }
+    let mut videos: Vec<_> = videos
+        .into_iter()
+        .map(|(pid, hevc)| VideoPes {
+            pid,
+            hevc,
+            pes: vec![],
+            mapping: vec![],
+        })
+        .collect();
     let mut patches = vec![];
     let flush = |pes: &[u8],
                  mapping: &[(usize, usize, usize)],
+                 hevc: bool,
                  patches: &mut Vec<Patch>|
      -> Result<(), String> {
         if pes.is_empty() {
@@ -249,24 +337,31 @@ pub fn ts(data: &mut [u8]) -> Result<(), String> {
     };
     for (i, p) in data.chunks_exact(188).enumerate() {
         let (id, start, off) = ts_payload(p)?;
-        if id != pid || off == 188 {
+        if off == 188 {
             continue;
         }
+        let Some(video) = videos.iter_mut().find(|video| video.pid == id) else {
+            continue;
+        };
         if start {
-            flush(&pes, &mapping, &mut patches)?;
-            pes.clear();
-            mapping.clear();
+            flush(&video.pes, &video.mapping, video.hevc, &mut patches)?;
+            video.pes.clear();
+            video.mapping.clear();
         }
-        if pes.is_empty() && !start {
+        if video.pes.is_empty() && !start {
             return Err("partial caption PES".into());
         }
-        if pes.len() + 188 - off > 2 * 1024 * 1024 {
+        if video.pes.len() + 188 - off > 2 * 1024 * 1024 {
             return Err("caption PES exceeds limit".into());
         }
-        mapping.push((188 - off, i * 188 + off, pes.len()));
-        pes.extend(&p[off..]);
+        video
+            .mapping
+            .push((188 - off, i * 188 + off, video.pes.len()));
+        video.pes.extend(&p[off..]);
     }
-    flush(&pes, &mapping, &mut patches)?;
+    for video in &videos {
+        flush(&video.pes, &video.mapping, video.hevc, &mut patches)?;
+    }
     if patches.len() > 65536 {
         return Err("caption filter patch limit".into());
     }
@@ -322,6 +417,26 @@ fn video_id(init: &[u8]) -> Result<Option<(u32, bool, usize)>, String> {
     }
 }
 pub fn mp4(init: &[u8], data: &mut [u8]) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let pause = {
+            let mut pending = MP4_PAUSE.get_or_init(Default::default).lock().unwrap();
+            if pending
+                .as_ref()
+                .is_some_and(|pause| data.ends_with(&pause.marker))
+            {
+                pending.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            let _ = pause.entered.send(());
+            let _ = pause
+                .release
+                .recv_timeout(std::time::Duration::from_secs(2));
+        }
+    }
     let Some((id, hevc, width)) = video_id(init)? else {
         boxes(data)?;
         return Ok(());
