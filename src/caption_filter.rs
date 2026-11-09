@@ -188,7 +188,7 @@ fn ts_payload(p: &[u8]) -> Result<(u16, bool, usize), String> {
         if p[3] & 0x10 != 0 { offset } else { 188 },
     ))
 }
-fn video_pid(data: &[u8]) -> Result<Option<(u16, bool)>, String> {
+fn video_pids(data: &[u8]) -> Result<Vec<(u16, bool)>, String> {
     let mut pmt = None;
     let mut section: Vec<u8> = vec![];
     for p in data.chunks_exact(188) {
@@ -228,24 +228,25 @@ fn video_pid(data: &[u8]) -> Result<Option<(u16, bool)>, String> {
             continue;
         }
         let mut at = 12 + ((usize::from(section[10] & 15) << 8) | usize::from(section[11]));
+        let mut videos = Vec::new();
         while at + 5 <= n - 4 {
             let kind = section[at];
             let id = (u16::from(section[at + 1] & 31) << 8) | u16::from(section[at + 2]);
             if kind == 0x1b || kind == 0x24 {
-                return Ok(Some((id, kind == 0x24)));
+                if videos.len() >= 16 || videos.iter().any(|(seen, _)| *seen == id) {
+                    return Err("caption video PID limit or duplicate".into());
+                }
+                videos.push((id, kind == 0x24));
             }
             if kind == 2 || kind == 0x10 {
                 return Err("caption filtering requires H.264 or HEVC".into());
-            }
-            if !matches!(kind, 3 | 4 | 0x0f | 0x11) {
-                return Err("unsupported caption TS stream type".into());
             }
             at += 5 + ((usize::from(section[at + 3] & 15) << 8) | usize::from(section[at + 4]));
         }
         if at != n - 4 {
             return Err("invalid caption PMT entries".into());
         }
-        return Ok(None);
+        return Ok(videos);
     }
     Err("caption video metadata absent".into())
 }
@@ -272,14 +273,29 @@ pub fn ts(data: &mut [u8]) -> Result<(), String> {
     if data.len() % 188 != 0 {
         return Err("unaligned caption TS".into());
     }
-    let Some((pid, hevc)) = video_pid(data)? else {
+    let videos = video_pids(data)?;
+    if videos.is_empty() {
         return Ok(());
-    };
-    let mut pes = vec![];
-    let mut mapping: Vec<(usize, usize, usize)> = vec![];
+    }
+    struct VideoPes {
+        pid: u16,
+        hevc: bool,
+        pes: Vec<u8>,
+        mapping: Vec<(usize, usize, usize)>,
+    }
+    let mut videos: Vec<_> = videos
+        .into_iter()
+        .map(|(pid, hevc)| VideoPes {
+            pid,
+            hevc,
+            pes: vec![],
+            mapping: vec![],
+        })
+        .collect();
     let mut patches = vec![];
     let flush = |pes: &[u8],
                  mapping: &[(usize, usize, usize)],
+                 hevc: bool,
                  patches: &mut Vec<Patch>|
      -> Result<(), String> {
         if pes.is_empty() {
@@ -321,24 +337,31 @@ pub fn ts(data: &mut [u8]) -> Result<(), String> {
     };
     for (i, p) in data.chunks_exact(188).enumerate() {
         let (id, start, off) = ts_payload(p)?;
-        if id != pid || off == 188 {
+        if off == 188 {
             continue;
         }
+        let Some(video) = videos.iter_mut().find(|video| video.pid == id) else {
+            continue;
+        };
         if start {
-            flush(&pes, &mapping, &mut patches)?;
-            pes.clear();
-            mapping.clear();
+            flush(&video.pes, &video.mapping, video.hevc, &mut patches)?;
+            video.pes.clear();
+            video.mapping.clear();
         }
-        if pes.is_empty() && !start {
+        if video.pes.is_empty() && !start {
             return Err("partial caption PES".into());
         }
-        if pes.len() + 188 - off > 2 * 1024 * 1024 {
+        if video.pes.len() + 188 - off > 2 * 1024 * 1024 {
             return Err("caption PES exceeds limit".into());
         }
-        mapping.push((188 - off, i * 188 + off, pes.len()));
-        pes.extend(&p[off..]);
+        video
+            .mapping
+            .push((188 - off, i * 188 + off, video.pes.len()));
+        video.pes.extend(&p[off..]);
     }
-    flush(&pes, &mapping, &mut patches)?;
+    for video in &videos {
+        flush(&video.pes, &video.mapping, video.hevc, &mut patches)?;
+    }
     if patches.len() > 65536 {
         return Err("caption filter patch limit".into());
     }

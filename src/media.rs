@@ -1645,24 +1645,34 @@ impl Engine {
                 cmd.args(["-i", &translated]);
             }
         }
-        cmd.args([
-            "-map",
-            "0:v:0?",
-            "-map",
-            if synthetic {
-                "1:a:0?"
-            } else if m4s_input
-                || m4f_input
-                || fxlink_input
-                || publication
-                || peer_ts
-                || direct_input.is_some()
-            {
-                "0:a?"
-            } else {
-                "0:a:0?"
-            },
-        ]);
+        if proxy_hls_extensions {
+            // Preserve source ordinals for tracks-vNaM selectors. Keep the
+            // mapped set bounded by the public selector's 1..=16 range.
+            for kind in ['v', 'a'] {
+                for ordinal in 0..16 {
+                    cmd.args(["-map", &format!("0:{kind}:{ordinal}?")]);
+                }
+            }
+        } else {
+            cmd.args([
+                "-map",
+                "0:v:0?",
+                "-map",
+                if synthetic {
+                    "1:a:0?"
+                } else if m4s_input
+                    || m4f_input
+                    || fxlink_input
+                    || publication
+                    || peer_ts
+                    || direct_input.is_some()
+                {
+                    "0:a?"
+                } else {
+                    "0:a:0?"
+                },
+            ]);
+        }
         let profile = crate::transcoder::Profile::resolve_for_input(cfg, input)?;
         profile.apply(&mut cmd);
         if owned_input.is_some()
@@ -1694,6 +1704,10 @@ impl Engine {
             cmd.arg("-copyinkf:a");
         }
         let raw_hls = cfg["flussonix_hls_subtitles"] == "passthrough";
+        // The HLS muxer accepts only one video stream. Playlist inputs can
+        // expose several video ordinals, so publish their shared TS segments
+        // through the bounded segment-list path used by raw subtitle output.
+        let segmented_hls = raw_hls || proxy_hls_extensions;
         // Separate DVB/teletext tracks belong on TS-based delivery. Copy their
         // encoded PES; AV-only slaves below never receive incompatible codecs.
         if subtitle_tracks == "preserve" || raw_hls {
@@ -1722,7 +1736,12 @@ impl Engine {
         };
         let wire_output = if let Some(listener) = &av_listener {
             format!(
-                "|[select='v,a':f=mpegts:max_interleave_delta=100000]tcp://{}",
+                "|[select='{}':f=mpegts:max_interleave_delta=100000]tcp://{}",
+                if proxy_hls_extensions {
+                    "v\\:0,a"
+                } else {
+                    "v,a"
+                },
                 listener
                     .local_addr()
                     .map_err(|_| "worker AV address unavailable")?
@@ -1741,20 +1760,22 @@ impl Engine {
         } else {
             ""
         };
-        let fmp4_failure = if native_audio_copy || copy_publication || copy_peer_ts {
-            "onfail=ignore:"
-        } else {
-            ""
-        };
+        let fmp4_failure =
+            if native_audio_copy || copy_publication || copy_peer_ts || proxy_hls_extensions {
+                "onfail=ignore:"
+            } else {
+                ""
+            };
         // The nested live TS mux has its own interleave queue as well.
         let ts_interleave = if subtitle_tracks == "preserve" {
             ":max_interleave_delta=100000"
         } else {
             ""
         };
-        let ts_hls = if raw_hls {
+        let ts_hls = if segmented_hls {
             format!(
-                "[select='v,a,s':f=segment:max_interleave_delta=100000:segment_format=mpegts:segment_format_options=max_interleave_delta=100000:segment_time=2:segment_list_size=6:segment_list_flags=live:segment_list_type=m3u8:segment_list={}]{}",
+                "[select='{}':f=segment:max_interleave_delta=100000:segment_format=mpegts:segment_format_options=max_interleave_delta=100000:segment_time=2:segment_list_size=6:segment_list_flags=live:segment_list_type=m3u8:segment_list={}]{}",
+                if raw_hls { "v,a,s" } else { "v,a" },
                 dir.join("passthrough.m3u8").display(),
                 dir.join(format!("g{generation}_p%d.ts")).display()
             )
@@ -1767,11 +1788,21 @@ impl Engine {
         };
         let live_select = if subtitle_tracks == "preserve" {
             ""
+        } else if proxy_hls_extensions {
+            // The native M4S reconstruction accepts one video. TS-HLS still
+            // carries every selected source ordinal in the separate segment
+            // slave above.
+            "select='v\\:0,a':"
         } else {
             "select='v,a':"
         };
         let output = format!(
-            "{ts_hls}|[{fmp4_failure}select='v,a':f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_type=fmp4:hls_segment_filename={}:hls_fmp4_init_filename=g{generation}_init.mp4:hls_flags=delete_segments+temp_file{discontinuity}{fmp4_filter}]{}|[{live_select}f=mpegts{ts_interleave}]pipe:1{wire_output}",
+            "{ts_hls}|[{fmp4_failure}select='{}':f=hls:hls_time=2:hls_list_size=6:hls_delete_threshold=2:start_number={sequence}:hls_segment_type=fmp4:hls_segment_filename={}:hls_fmp4_init_filename=g{generation}_init.mp4:hls_flags=delete_segments+temp_file{discontinuity}{fmp4_filter}]{}|[{live_select}f=mpegts{ts_interleave}]pipe:1{wire_output}",
+            if proxy_hls_extensions {
+                "v\\:0,a\\:0"
+            } else {
+                "v,a"
+            },
             dir.join("fmp4")
                 .join(format!("g{generation}_%d.m4s"))
                 .display(),
@@ -2191,7 +2222,7 @@ impl Engine {
                     child
                 };
                 let hls_generation = generation.clone();
-                if raw_hls {
+                if segmented_hls {
                     let dir = dir.clone(); let c = cancel.clone(); let worker = w.clone();
                     tasks.push(tokio::spawn(async move {
                         if crate::raw_hls::watch(dir, generation, sequence, replaced, c.clone()).await.is_err() {
@@ -2202,7 +2233,7 @@ impl Engine {
                 {
                     let dir = dir.clone(); let c = cancel.clone(); let worker = w.clone(); let bytes_worker = w.clone();
                     tasks.push(tokio::spawn(async move {
-                        if let Err(reason) = crate::hls_budget::watch(dir, hls_generation, raw_hls, move || bytes_worker.bytes.load(Ordering::Relaxed), c.clone()).await
+                        if let Err(reason) = crate::hls_budget::watch(dir, hls_generation, segmented_hls, move || bytes_worker.bytes.load(Ordering::Relaxed), c.clone()).await
                             && !c.is_cancelled()
                         {
                             tracing::warn!(%reason, "HLS segment budget stopped worker");
