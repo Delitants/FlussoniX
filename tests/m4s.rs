@@ -1,4 +1,217 @@
 use flussonix::m4s::{Decoder, Event, atom};
+
+fn sparse_subtitle_track(id: u32) -> Vec<u8> {
+    let mut handler = vec![0; 4];
+    handler.extend_from_slice(&id.to_be_bytes());
+    handler.extend_from_slice(b"textsubtitle\0");
+    let mut shift = vec![0; 4];
+    shift.extend_from_slice(&90_000u32.to_be_bytes());
+    shift.extend_from_slice(&[0; 8]);
+    atom(
+        b"trak",
+        &[
+            atom(b"shft", &shift),
+            atom(b"hdlr", &handler),
+            atom(b"btrt", &[0; 8]),
+            atom(b"lang", b"eng"),
+            atom(b"mpeg", &[0; 14]),
+        ]
+        .concat(),
+    )
+}
+
+#[test]
+fn m4s_accepts_silent_subtitle_metadata_without_configuration() {
+    let mut handler = vec![0; 4];
+    handler.extend_from_slice(&1u32.to_be_bytes());
+    handler.extend_from_slice(b"sounaac\0");
+    let audio = atom(
+        b"trak",
+        &[
+            atom(b"hdlr", &handler),
+            atom(b"cnfg", &[0, 0, 0, 0, 0x12, 0x10]),
+        ]
+        .concat(),
+    );
+    let info = atom(b"MDin", &[audio.clone(), sparse_subtitle_track(9)].concat());
+    let packet = [(info.len() as u32).to_be_bytes().to_vec(), info].concat();
+    let events = Decoder::default().push(&packet).unwrap();
+    let Event::Info { tracks, wire } = &events[0] else {
+        panic!("expected media info");
+    };
+    assert_eq!(wire.as_ref(), packet.as_slice());
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[1].id, 9);
+    assert_eq!(tracks[1].codec, "subtitle");
+    assert!(tracks[1].config.is_empty());
+
+    let no_audio_config = atom(
+        b"MDin",
+        &[
+            atom(b"trak", &atom(b"hdlr", &handler)),
+            sparse_subtitle_track(9),
+        ]
+        .concat(),
+    );
+    let bad = [
+        (no_audio_config.len() as u32).to_be_bytes().to_vec(),
+        no_audio_config,
+    ]
+    .concat();
+    assert!(Decoder::default().push(&bad).is_err());
+}
+
+#[test]
+fn m4f_preserves_silent_subtitle_track_but_rejects_partial_tables() {
+    use flussonix::{
+        m4f::{Frame, pack, unpack},
+        m4s::{Track, boxes},
+    };
+    let audio = Track {
+        id: 1,
+        codec: "mp3".into(),
+        config: vec![],
+    };
+    let frame = Frame {
+        track_id: 1,
+        dts: 90_000,
+        pts_offset: 0,
+        key: true,
+        body: include_bytes!("fixtures/codecs/mp3.bin").to_vec(),
+    };
+    let packed = pack(std::slice::from_ref(&audio), &[frame], 90_000).unwrap();
+    let root = boxes(&packed).unwrap();
+    let moov = boxes(root[0].1).unwrap();
+    let sparse = sparse_subtitle_track(9);
+    let build = |extra: Vec<u8>| {
+        [
+            atom(b"moov", &[root[0].1, extra.as_slice()].concat()),
+            atom(b"mdat", root[1].1),
+        ]
+        .concat()
+    };
+    assert_eq!(moov.iter().filter(|(kind, _)| *kind == b"trak").count(), 1);
+    let sparse_segment = build(sparse.clone());
+    let (tracks, frames) = unpack(&sparse_segment).unwrap();
+    assert_eq!(
+        tracks,
+        vec![
+            audio,
+            Track {
+                id: 9,
+                codec: "subtitle".into(),
+                config: vec![]
+            }
+        ]
+    );
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].track_id, 1);
+
+    // M4S packed GOPs embed the same M4F body. This is the live source's
+    // media path after its separate MDin announcement.
+    let wire = flussonix::m4s::encode_gop(&flussonix::m4s::PackedGop {
+        utc: 1,
+        dts_ms: 1000.0,
+        sequence: 1,
+        duration_ms: 1000.0,
+        body: bytes::Bytes::from(sparse_segment),
+    })
+    .unwrap();
+    let events = Decoder::default().push(&wire).unwrap();
+    let Event::Gop { tracks, frames, .. } = &events[0] else {
+        panic!("expected packed GOP");
+    };
+    assert_eq!(tracks[1].codec, "subtitle");
+    assert_eq!(frames.len(), 1);
+
+    let body = boxes(&sparse).unwrap()[0].1;
+    let partial = atom(
+        b"trak",
+        &[body, atom(b"stsz", &[0; 12]).as_slice()].concat(),
+    );
+    assert!(unpack(&build(partial)).is_err());
+
+    // Sparse sample tables are a subtitle-only allowance. A silent audio
+    // track must not be mistaken for an acceptable vendor text declaration.
+    let audio_metadata = boxes(moov[1].1)
+        .unwrap()
+        .into_iter()
+        .filter(|(kind, _)| *kind == b"shft" || *kind == b"hdlr" || *kind == b"cnfg")
+        .flat_map(|(kind, value)| atom(kind.try_into().unwrap(), value))
+        .collect::<Vec<_>>();
+    let missing_audio_tables = [
+        atom(
+            b"moov",
+            &[
+                atom(b"segm", moov[0].1),
+                atom(b"trak", &audio_metadata),
+                sparse,
+            ]
+            .concat(),
+        ),
+        atom(b"mdat", root[1].1),
+    ]
+    .concat();
+    assert!(unpack(&missing_audio_tables).is_err());
+}
+
+#[test]
+fn m4f_fifteen_track_hevc_aac_segment_keeps_silent_text_and_builds_ts_muxer() {
+    use flussonix::{
+        m4f::{Frame, pack, unpack},
+        m4s::{Track, boxes},
+        worker_ts::Muxer,
+    };
+    let mut tracks = vec![Track {
+        id: 1,
+        codec: "hevc".into(),
+        config: include_bytes!("fixtures/codecs/hevc.hvcc").to_vec(),
+    }];
+    for id in 2..=8 {
+        tracks.push(Track {
+            id,
+            codec: "aac".into(),
+            config: vec![0x12, 0x10],
+        });
+    }
+    let frames = tracks
+        .iter()
+        .map(|track| Frame {
+            track_id: track.id,
+            dts: 90_000,
+            pts_offset: 0,
+            key: true,
+            body: if track.id == 1 {
+                include_bytes!("fixtures/codecs/hevc-00.bin").to_vec()
+            } else {
+                vec![0x11, 0x22, 0x33, 0x44]
+            },
+        })
+        .collect::<Vec<_>>();
+    let packed = pack(&tracks, &frames, 3600).unwrap();
+    let root = boxes(&packed).unwrap();
+    let silent = (9..=15)
+        .map(sparse_subtitle_track)
+        .collect::<Vec<_>>()
+        .concat();
+    let segment = [
+        atom(b"moov", &[root[0].1, silent.as_slice()].concat()),
+        atom(b"mdat", root[1].1),
+    ]
+    .concat();
+    let (parsed, samples) = unpack(&segment).unwrap();
+    assert_eq!(parsed.len(), 15);
+    assert_eq!(samples.len(), 8);
+    assert_eq!(
+        parsed
+            .iter()
+            .filter(|track| track.codec == "subtitle")
+            .count(),
+        7
+    );
+    assert!(!Muxer::new(&parsed).unwrap().tables().is_empty());
+}
+
 #[test]
 fn split_packets_and_avc_aac_headers_are_decoded_without_guessing_fmp4() {
     let mut handler = vec![0, 0, 0, 0];
