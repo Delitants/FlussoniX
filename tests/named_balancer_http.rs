@@ -61,7 +61,7 @@ fn fixture_with_geoip(use_geoip: bool) -> (tempfile::TempDir, Arc<App>) {
 }
 
 async fn request(app: &Arc<App>, method: &str, uri: &str, body: Body) -> StatusCode {
-    router(app.clone())
+    let response = router(app.clone())
         .oneshot(
             Request::builder()
                 .method(method)
@@ -70,8 +70,15 @@ async fn request(app: &Arc<App>, method: &str, uri: &str, body: Body) -> StatusC
                 .unwrap(),
         )
         .await
-        .unwrap()
-        .status()
+        .unwrap();
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND && uri.contains("tracks-") {
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        eprintln!("named track 404: {uri}: {}", String::from_utf8_lossy(&body));
+    }
+    status
 }
 
 #[tokio::test]

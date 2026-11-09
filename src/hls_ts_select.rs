@@ -18,7 +18,7 @@ impl Selector {
         let mut at = 0;
         let mut video = None;
         let mut audio = None;
-        for kind in [b'v', b'a'] {
+        for kind in *b"va" {
             if bytes.get(at) != Some(&kind) {
                 continue;
             }
@@ -171,8 +171,7 @@ pub(crate) fn media_playlist(source: &[u8]) -> Result<String, &'static str> {
 pub(crate) fn latest_segment(playlist: &str) -> Option<&str> {
     playlist
         .lines()
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .last()
+        .rfind(|line| !line.is_empty() && !line.starts_with('#'))
 }
 
 pub(crate) fn source_media_file(index: &[u8]) -> Result<&'static str, &'static str> {
@@ -353,6 +352,32 @@ struct Program {
     pmt: Vec<u8>,
     video: Vec<Entry>,
     audio: Vec<Entry>,
+    subtitles: Vec<Entry>,
+}
+
+fn subtitle_descriptor(entry: &[u8]) -> bool {
+    let descriptors = &entry[5..];
+    let mut at = 0;
+    let mut found = false;
+    while at < descriptors.len() {
+        let Some(&tag) = descriptors.get(at) else {
+            return false;
+        };
+        let Some(&length) = descriptors.get(at + 1) else {
+            return false;
+        };
+        let end = at + 2 + usize::from(length);
+        if end > descriptors.len() {
+            return false;
+        }
+        found |= match tag {
+            0x59 => length >= 8 && length % 8 == 0,
+            0x56 => length >= 5 && length % 5 == 0,
+            _ => false,
+        };
+        at = end;
+    }
+    found
 }
 
 fn first_program(data: &[u8]) -> Result<Program, &'static str> {
@@ -415,6 +440,7 @@ fn first_program(data: &[u8]) -> Result<Program, &'static str> {
     }
     let mut video = Vec::new();
     let mut audio = Vec::new();
+    let mut subtitles = Vec::new();
     while at < end {
         let header = pmt.get(at..at + 5).ok_or("invalid PMT entry")?;
         let size = 5 + (usize::from(header[3] & 15) << 8) + usize::from(header[4]);
@@ -426,6 +452,7 @@ fn first_program(data: &[u8]) -> Result<Program, &'static str> {
         match header[0] {
             2 | 0x10 | 0x1b | 0x24 => video.push(item),
             3 | 4 | 0x0f | 0x11 => audio.push(item),
+            6 if subtitle_descriptor(entry) => subtitles.push(item),
             _ => {}
         }
         at += size;
@@ -436,6 +463,7 @@ fn first_program(data: &[u8]) -> Result<Program, &'static str> {
         pmt,
         video,
         audio,
+        subtitles,
     })
 }
 
@@ -467,7 +495,11 @@ fn packetized_pmt(section: &[u8], cc: &mut u8, out: &mut Vec<u8>) {
     }
 }
 
-pub(crate) fn filter(data: &[u8], selector: Selector) -> Result<Vec<u8>, &'static str> {
+pub(crate) fn filter(
+    data: &[u8],
+    selector: Selector,
+    passthrough_subtitles: bool,
+) -> Result<Vec<u8>, &'static str> {
     if data.is_empty() || data.len() > MAX_SEGMENT || data.len() % PACKET != 0 {
         return Err("invalid TS segment size");
     }
@@ -489,6 +521,9 @@ pub(crate) fn filter(data: &[u8], selector: Selector) -> Result<Vec<u8>, &'stati
     }
     if selected.is_empty() {
         return Err("empty TS track selection");
+    }
+    if passthrough_subtitles {
+        selected.extend(program.subtitles.iter());
     }
     let mut section = program.pmt[..program.pmt.len() - 4].to_vec();
     let entries_at = 12 + (usize::from(section[10] & 15) << 8) + usize::from(section[11]);
@@ -723,11 +758,11 @@ mod tests {
     fn filters_selected_pids_and_preserves_audio_only_clock() {
         let input = fixture();
         assert_eq!(available(&input).unwrap(), (1, 2));
-        let selected = filter(&input, Selector::parse("v1a2").unwrap()).unwrap();
+        let selected = filter(&input, Selector::parse("v1a2").unwrap(), false).unwrap();
         let ids: Vec<_> = selected.chunks_exact(PACKET).map(pid).collect();
         assert!(ids.contains(&0x101) && ids.contains(&0x103));
         assert!(!ids.contains(&0x102));
-        let audio = filter(&input, Selector::parse("a1").unwrap()).unwrap();
+        let audio = filter(&input, Selector::parse("a1").unwrap(), false).unwrap();
         let ids: Vec<_> = audio.chunks_exact(PACKET).map(pid).collect();
         assert!(ids.contains(&0x102) && ids.contains(&0x101));
         assert_eq!(
@@ -738,14 +773,49 @@ mod tests {
                 & 0x30,
             0x20
         );
-        assert!(filter(&input, Selector::parse("a3").unwrap()).is_err());
+        assert!(filter(&input, Selector::parse("a3").unwrap(), false).is_err());
+    }
+    #[test]
+    fn selected_passthrough_keeps_dvb_and_teletext_but_not_unrelated_private_pids() {
+        let pat = section(vec![0, 0xb0, 0, 0, 1, 0xc1, 0, 0, 0, 1, 0xe1, 0]);
+        let pmt = section(vec![
+            2, 0xb0, 0, 0, 1, 0xc1, 0, 0, 0xe1, 1, 0xf0, 0, 0x1b, 0xe1, 1, 0xf0, 0, // H.264
+            0x0f, 0xe1, 2, 0xf0, 0, // AAC
+            0x06, 0xe1, 4, 0xf0, 10, 0x59, 8, b'e', b'n', b'g', 0x10, 0, 1, 0, 1, 0x06, 0xe1, 6,
+            0xf0, 7, 0x56, 5, b'g', b'e', b'r', 0x10, 1, 0x06, 0xe1, 5, 0xf0, 3, 0x52, 1,
+            1, // unrelated private data
+        ]);
+        let mut input = psi(0, &pat);
+        input.extend(psi(0x100, &pmt));
+        for id in [0x101, 0x102, 0x104, 0x106, 0x105] {
+            input.extend(media(id, id == 0x101));
+        }
+        assert_eq!(available(&input).unwrap(), (1, 1));
+        let output = filter(&input, Selector::parse("v1a1").unwrap(), true).unwrap();
+        let ids: BTreeSet<_> = output.chunks_exact(PACKET).map(pid).collect();
+        assert!(ids.contains(&0x104), "DVB subtitle PID was dropped");
+        assert!(ids.contains(&0x106), "teletext PID was dropped");
+        assert!(!ids.contains(&0x105), "unrelated private PID leaked");
+        let section = first_program(&output).unwrap().pmt;
+        assert!(section.windows(2).any(|bytes| bytes == [0x59, 8]));
+        assert!(section.windows(2).any(|bytes| bytes == [0x56, 5]));
+        let dropped = filter(&input, Selector::parse("v1a1").unwrap(), false).unwrap();
+        let ids: BTreeSet<_> = dropped.chunks_exact(PACKET).map(pid).collect();
+        assert!(!ids.contains(&0x104) && !ids.contains(&0x106));
     }
     #[test]
     fn rejects_corrupt_psi_and_unaligned_segments() {
         let mut input = fixture();
-        assert!(filter(&input[..input.len() - 1], Selector::parse("v1").unwrap()).is_err());
+        assert!(
+            filter(
+                &input[..input.len() - 1],
+                Selector::parse("v1").unwrap(),
+                false
+            )
+            .is_err()
+        );
         input[20] ^= 1;
-        assert!(filter(&input, Selector::parse("v1").unwrap()).is_err());
+        assert!(filter(&input, Selector::parse("v1").unwrap(), false).is_err());
         let input = fixture();
         assert!(
             filter(
@@ -753,7 +823,8 @@ mod tests {
                 Selector {
                     video: Some(0),
                     audio: None
-                }
+                },
+                false,
             )
             .is_err()
         );
@@ -763,7 +834,8 @@ mod tests {
                 Selector {
                     video: Some(17),
                     audio: None
-                }
+                },
+                false,
             )
             .is_err()
         );
@@ -778,7 +850,7 @@ mod tests {
         input.extend(psi(0x100, &section(pmt)));
         input.extend(media(0x101, true));
         input.extend(media(0x102, false));
-        let output = filter(&input, Selector::parse("v1a1").unwrap()).unwrap();
+        let output = filter(&input, Selector::parse("v1a1").unwrap(), false).unwrap();
         assert_eq!(available(&output).unwrap(), (1, 1));
         assert!(output.len() % PACKET == 0);
         assert!(output.len() <= input.len() + MAX_SECTION);
@@ -793,7 +865,7 @@ mod tests {
         let (video, audio) = available(&data).unwrap();
         assert!(video > 0 && audio > 0);
         for selector in ["v1a1", "v1", "a1"] {
-            let bytes = filter(&data, Selector::parse(selector).unwrap()).unwrap();
+            let bytes = filter(&data, Selector::parse(selector).unwrap(), false).unwrap();
             let (actual_video, actual_audio) = available(&bytes).unwrap();
             assert_eq!(actual_video, usize::from(selector.contains('v')));
             assert_eq!(actual_audio, usize::from(selector.contains('a')));

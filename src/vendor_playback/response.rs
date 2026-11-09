@@ -401,54 +401,61 @@ impl Runtime {
                 };
                 let worker = playback.worker();
                 let output_rate = worker.output_bitrate();
-                let cached_profile = worker.hls_track_profile();
-                let profile_read_file = if cached_profile.is_some() {
-                    media_file
-                } else {
-                    sample_name.as_str()
+                let profile = match tokio::select! { biased;
+                    _ = self.closed.cancelled() => return error(StatusCode::SERVICE_UNAVAILABLE, "vendor playback stopped"),
+                    result = app.media.shared_hls_track_profile(playback, &sample_name) => result,
+                } {
+                    Ok(profile) => profile,
+                    Err(_) => {
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "HLS track metadata unavailable",
+                        );
+                    }
                 };
-                let read = app
-                    .media
-                    .read_shared_mapped(playback, profile_read_file, |sample| {
-                        let (video, audio) = if let Some(profile) = cached_profile {
-                            profile
-                        } else {
-                            let profile = crate::hls_ts_select::available(&sample)
-                                .map_err(|_| SharedPackagingFailure::Unavailable)?;
-                            worker.remember_hls_track_profile(profile);
-                            profile
-                        };
-                        let body = match route {
-                            FileRoute::Master => {
-                                let selector = Selector {
-                                    video: (video > 0).then_some(1),
-                                    audio: (audio > 0).then_some(1),
-                                };
-                                if selector.video.is_none() && selector.audio.is_none() {
-                                    return Err(SharedPackagingFailure::Unavailable);
-                                }
-                                let alias = crate::hls_master_alias::render(
-                                    crate::hls_master_alias::Alias::Ts,
-                                    &index,
-                                    output_rate,
-                                    &suffix,
-                                )
-                                .map_err(|_| SharedPackagingFailure::Unavailable)?;
-                                crate::hls_ts_select::master_child(&alias, selector, &suffix)
-                                    .map_err(|_| SharedPackagingFailure::Unavailable)?
+                let rendered = (|| -> Result<Bytes, SharedPackagingFailure> {
+                    let (video, audio) = profile;
+                    let body = match route {
+                        FileRoute::Master => {
+                            let selector = Selector {
+                                video: (video > 0).then_some(1),
+                                audio: (audio > 0).then_some(1),
+                            };
+                            if selector.video.is_none() && selector.audio.is_none() {
+                                return Err(SharedPackagingFailure::Unavailable);
                             }
-                            FileRoute::Playlist(selector) => {
-                                if selector.video.is_some_and(|n| n > video)
-                                    || selector.audio.is_some_and(|n| n > audio)
-                                {
-                                    return Err(SharedPackagingFailure::Unavailable);
-                                }
-                                rewrite_playlist(&playlist, &suffix)
+                            let alias = crate::hls_master_alias::render(
+                                crate::hls_master_alias::Alias::Ts,
+                                &index,
+                                output_rate,
+                                &suffix,
+                            )
+                            .map_err(|_| SharedPackagingFailure::Unavailable)?;
+                            crate::hls_ts_select::master_child(&alias, selector, &suffix)
+                                .map_err(|_| SharedPackagingFailure::Unavailable)?
+                        }
+                        FileRoute::Playlist(selector) => {
+                            if selector.video.is_some_and(|n| n > video)
+                                || selector.audio.is_some_and(|n| n > audio)
+                            {
+                                return Err(SharedPackagingFailure::Unavailable);
                             }
-                            FileRoute::Segment(..) => unreachable!(),
-                        };
-                        Ok(Bytes::from(body))
-                    });
+                            rewrite_playlist(&playlist, &suffix)
+                        }
+                        FileRoute::Segment(..) => unreachable!(),
+                    };
+                    Ok(Bytes::from(body))
+                })();
+                let rendered = match rendered {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "HLS track playlist unavailable",
+                        );
+                    }
+                };
+                let read = app.media.account_shared_generated(playback, rendered);
                 match tokio::select! {biased; _=self.closed.cancelled()=>return error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),result=read=>result}
                 {
                     Ok(bytes) => bytes,
