@@ -305,6 +305,10 @@ rust: ipnet 2.12.2 (MIT OR Apache-2.0)
   third_party/licenses/rust/ipnet-2.12.2/LICENSE-APACHE
   third_party/licenses/rust/ipnet-2.12.2/LICENSE-MIT
 
+rust: ipnetwork 0.21.1 (MIT OR Apache-2.0)
+  third_party/licenses/rust/ipnetwork-0.21.1/LICENSE-APACHE.md
+  third_party/licenses/rust/ipnetwork-0.21.1/LICENSE-MIT.md
+
 rust: is_terminal_polyfill 1.70.2 (MIT OR Apache-2.0)
   third_party/licenses/rust/is_terminal_polyfill-1.70.2/LICENSE-APACHE
   third_party/licenses/rust/is_terminal_polyfill-1.70.2/LICENSE-MIT
@@ -352,6 +356,9 @@ rust: matchers 0.2.0 (MIT)
 rust: matchit 0.8.4 (MIT AND BSD-3-Clause)
   third_party/licenses/rust/matchit-0.8.4/LICENSE
   third_party/licenses/rust/matchit-0.8.4/LICENSE.httprouter
+
+rust: maxminddb 0.27.3 (ISC)
+  third_party/licenses/rust/maxminddb-0.27.3/LICENSE
 
 rust: md-5 0.10.6 (MIT OR Apache-2.0)
   third_party/licenses/rust/md-5-0.10.6/LICENSE-APACHE

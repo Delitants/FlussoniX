@@ -56,15 +56,13 @@ impl App {
         self: &Arc<Self>,
         owner: &ModernSourceCoordinator,
         admitted: &AdmittedCandidate,
-        path: &str,
-        query: &str,
-        secure: bool,
+        request: BalanceRequest<'_>,
     ) -> Response {
         if self.options.role != "lb" || owner.admitted_current(admitted).is_err() {
             return error(StatusCode::SERVICE_UNAVAILABLE, "vendor authority changed");
         }
         let (name, grant, revision) = admitted.control_route();
-        let response = balance(self, name, path, query, secure, grant, revision).await;
+        let response = balance(self, BalanceRequest { name, ..request }, grant, revision).await;
         // Placement awaits advisory telemetry and a CDN-owned capacity ticket.
         // Recheck source identity/lease as well as config and viewer authority
         // before exposing a redirect. Unused remote tickets expire normally.
@@ -166,7 +164,19 @@ mod tests {
             admitted_source(Duration::from_secs(2), "lb", Some(peer)).await;
         let owner = app.modern_sources.as_ref().unwrap().clone();
         let response = app
-            .balance_vendor(&owner, &viewer, "/owned/m4s", "", false)
+            .balance_vendor(
+                &owner,
+                &viewer,
+                BalanceRequest {
+                    name: "owned",
+                    path: "/owned/m4s",
+                    query: "",
+                    secure: false,
+                    named: None,
+                    client_ip: None,
+                    viewer_token: "",
+                },
+            )
             .await;
         let status = response.status();
         let location = response.headers().contains_key("location");
@@ -214,7 +224,19 @@ mod vendor_destination_tests {
         tokio::time::sleep(Duration::from_millis(1100)).await;
         let owner = app.modern_sources.as_ref().unwrap();
         let response = app
-            .balance_vendor(owner, &admitted, "/owned/m4s", "", false)
+            .balance_vendor(
+                owner,
+                &admitted,
+                BalanceRequest {
+                    name: "owned",
+                    path: "/owned/m4s",
+                    query: "",
+                    secure: false,
+                    named: None,
+                    client_ip: None,
+                    viewer_token: "",
+                },
+            )
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);

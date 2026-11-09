@@ -1,4 +1,5 @@
 mod diagnostic;
+mod named_balancers;
 mod stream_watch;
 mod text;
 pub(crate) mod vendor_peers;
@@ -18,7 +19,14 @@ use std::{
 pub(crate) use stream_watch::StreamWatch;
 pub(crate) use text::parse_text;
 
-pub const KINDS: &[&str] = &["streams", "templates", "peers", "sources", "auth_backends"];
+pub const KINDS: &[&str] = &[
+    "streams",
+    "templates",
+    "peers",
+    "sources",
+    "auth_backends",
+    "balancers",
+];
 const INPUT_FIELDS: &[&str] = &[
     "url",
     "rtp",
@@ -69,9 +77,9 @@ impl ConfigStore {
             serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?
         } else {
-            json!({"streams":[],"templates":[],"peers":[],"sources":[],"auth_backends":[]})
+            json!({"streams":[],"templates":[],"peers":[],"sources":[],"auth_backends":[],"balancers":[]})
         };
-        normalize_sources(&mut data)?;
+        normalize_root(&mut data)?;
         validate_root(&data)?;
         let source_lineages = data["sources"]
             .as_array()
@@ -142,7 +150,7 @@ impl ConfigStore {
     }
     pub fn validate(&self, patch: Value) -> Result<Value, String> {
         let mut next = merge(&self.snapshot(), &patch);
-        normalize_sources(&mut next)?;
+        normalize_root(&mut next)?;
         validate_root(&next)?;
         Ok(next)
     }
@@ -172,7 +180,7 @@ impl ConfigStore {
     pub fn replace(&self, patch: Value) -> Result<Value, String> {
         let mut data = self.data.lock().unwrap();
         let mut next = merge(&data, &patch);
-        normalize_sources(&mut next)?;
+        normalize_root(&mut next)?;
         validate_root(&next)?;
         self.save(&next)?;
         self.retire_stream_watches(&next);
@@ -217,7 +225,7 @@ impl ConfigStore {
         } else {
             items.push(item.clone())
         }
-        normalize_sources(&mut next)?;
+        normalize_root(&mut next)?;
         validate_root(&next)?;
         self.save(&next)?;
         self.retire_stream_watches(&next);
@@ -386,7 +394,11 @@ pub(crate) fn source_address(raw: &str) -> Result<(String, &'static str), String
     }
     Ok((endpoint.to_string(), transport))
 }
-fn normalize_sources(root: &mut Value) -> Result<(), String> {
+fn normalize_root(root: &mut Value) -> Result<(), String> {
+    root.as_object_mut()
+        .ok_or("configuration must be an object")?
+        .entry("balancers")
+        .or_insert_with(|| json!([]));
     for source in root
         .get_mut("sources")
         .and_then(Value::as_array_mut)
@@ -539,6 +551,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
                     "flussonix_media_tls_ca",
                 ],
                 "auth_backends" => &["name", "url"],
+                "balancers" => &["name", "mode", "servers"],
                 _ => &[],
             };
             for key in item.as_object().ok_or("item must be an object")?.keys() {
@@ -934,6 +947,7 @@ fn validate_root(root: &Value) -> Result<(), String> {
         }
     }
     vendor_sources::validate_groups(root)?;
+    named_balancers::validate(root)?;
     Ok(())
 }
 

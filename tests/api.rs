@@ -228,6 +228,13 @@ async fn status_endpoints_report_the_running_server_version_to_management_roles(
         options(),
     )
     .unwrap();
+    app.config
+        .put(
+            "streams",
+            "configured-but-idle",
+            json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
     let r = router(app);
     let health = r
         .clone()
@@ -271,7 +278,10 @@ async fn status_endpoints_report_the_running_server_version_to_management_roles(
                         .unwrap(),
                 )
                 .unwrap();
+                assert_eq!(status["total_streams_count"], 1);
+                assert!(status.get("bandwidth_usage").is_some());
                 if endpoint == "/flussonix/api/v1/node" {
+                    assert_eq!(status["streams"].as_array().unwrap().len(), 1);
                     assert_eq!(status["version"], health["version"]);
                     assert_eq!(
                         status["management_role"],
@@ -284,6 +294,8 @@ async fn status_endpoints_report_the_running_server_version_to_management_roles(
                 } else {
                     assert_eq!(status["server_version"], health["version"]);
                     assert!(status.get("management_role").is_none());
+                    assert_eq!(status["online_streams"], 0);
+                    assert_eq!(status["geoip"]["configured"], false);
                 }
             }
         }
@@ -376,6 +388,272 @@ async fn api_auth_nested_names_persistence_and_validate_only() {
         "region/news"
     );
     app.media.stop_all().await;
+}
+
+#[tokio::test]
+async fn named_balancer_v3_api_uses_cluster_routes_and_management_roles() {
+    let d = tempfile::tempdir().unwrap();
+    let app = App::new(
+        d.path().join("config.json"),
+        d.path().join("media"),
+        options(),
+    )
+    .unwrap();
+    app.config
+        .put(
+            "peers",
+            "cdn-a",
+            json!({
+                "api_url":"http://127.0.0.1:19001",
+                "public_payload_url":"https://cdn.example",
+                "cluster_key":"private-peer-key"
+            }),
+        )
+        .unwrap();
+    let call = |method: &str, path: &str, body: Value, credentials: Option<&str>| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("Content-Type", "application/json");
+        if let Some(credentials) = credentials {
+            request = request.header(
+                "Authorization",
+                format!("Basic {}", STANDARD.encode(credentials)),
+            );
+        }
+        request.body(Body::from(body.to_string())).unwrap()
+    };
+    let api = "/streamer/api/v3/cluster/balancers";
+    assert_eq!(
+        router(app.clone())
+            .oneshot(call("GET", api, json!(null), None))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        router(app.clone())
+            .oneshot(call(
+                "PUT",
+                &format!("{api}/lb0"),
+                json!({"servers":[{"name":"cdn-a"}]}),
+                Some("viewer:view-secret")
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let revision = app.config.revision();
+    let response = router(app.clone())
+        .oneshot(call(
+            "PUT",
+            &format!("{api}/lb0"),
+            json!({"mode":"usage","servers":[{"name":"cdn-a","max_bitrate":0}]}),
+            Some("admin:secret"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(app.config.revision() > revision);
+    let body = axum::body::to_bytes(response.into_body(), 100_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["name"],
+        "lb0"
+    );
+    for path in [
+        api.to_owned(),
+        format!("{api}/lb0"),
+        "/streamer/api/v3/config?full=true".to_owned(),
+    ] {
+        let response = router(app.clone())
+            .oneshot(call("GET", &path, json!(null), Some("viewer:view-secret")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let body = axum::body::to_bytes(response.into_body(), 100_000)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        if path == api {
+            assert_eq!(value["balancers"][0]["name"], "lb0");
+        } else if path.ends_with("/lb0") {
+            assert_eq!(value["servers"][0]["name"], "cdn-a");
+        } else {
+            assert_eq!(value["balancers"][0]["name"], "lb0");
+            assert_eq!(value["peers"][0]["cluster_key"], "[redacted]");
+        }
+        assert!(!String::from_utf8_lossy(&body).contains("private-peer-key"));
+    }
+    let revision = app.config.revision();
+    let response = router(app.clone())
+        .oneshot(call(
+            "PUT",
+            "/streamer/api/v3/config",
+            json!({"balancers":[{"name":"lb0","mode":"clients","servers":[{"name":"cdn-a"}]}]}),
+            Some("admin:secret"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(app.config.revision() > revision);
+    assert_eq!(app.config.snapshot()["balancers"][0]["mode"], "clients");
+    assert_eq!(
+        router(app.clone())
+            .oneshot(call(
+                "GET",
+                &format!("{api}/unknown"),
+                json!(null),
+                Some("viewer:view-secret")
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        router(app.clone())
+            .oneshot(call(
+                "PUT",
+                &format!("{api}/bad"),
+                json!({"servers":[{"name":"missing"}]}),
+                Some("admin:secret")
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        router(app.clone())
+            .oneshot(call(
+                "GET",
+                "/streamer/api/v3/balancers",
+                json!(null),
+                Some("admin:secret")
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        router(app.clone())
+            .oneshot(call(
+                "PUT",
+                "/streamer/api/v3/balancers/lb1",
+                json!({"servers":[{"name":"cdn-a"}]}),
+                Some("admin:secret")
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        router(app.clone())
+            .oneshot(call(
+                "DELETE",
+                &format!("{api}/lb0"),
+                json!(null),
+                Some("admin:secret")
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(app.config.snapshot()["balancers"], json!([]));
+    app.media.stop_all().await;
+}
+
+#[tokio::test]
+async fn named_balancer_country_rules_require_a_local_geoip_database() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("config.json");
+    let app = App::new(&path, d.path().join("media"), options()).unwrap();
+    app.config
+        .put(
+            "peers",
+            "cdn-a",
+            json!({
+                "api_url":"http://127.0.0.1:19001",
+                "public_payload_url":"https://cdn.example"
+            }),
+        )
+        .unwrap();
+    let row = json!({"name":"lb0","servers":[{"name":"cdn-a","countries":["US"]}]});
+    for (method, uri, body) in [
+        ("PUT", "/streamer/api/v3/cluster/balancers/lb0", row.clone()),
+        (
+            "POST",
+            "/streamer/api/v3/config",
+            json!({"balancers":[row.clone()]}),
+        ),
+        (
+            "PUT",
+            "/streamer/api/v3/config",
+            json!({"balancers":[row.clone()]}),
+        ),
+    ] {
+        let response = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(
+                        "Authorization",
+                        format!("Basic {}", STANDARD.encode("admin:secret")),
+                    )
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method} {uri}");
+        assert_eq!(app.config.snapshot()["balancers"], json!([]));
+    }
+    drop(app);
+    let store = flussonix::config::ConfigStore::open(&path).unwrap();
+    store.put("balancers", "lb0", row).unwrap();
+    drop(store);
+    assert!(App::new(&path, d.path().join("media"), options()).is_err());
+    let mut invalid = options();
+    invalid.geoip_db = Some(d.path().join("missing.mmdb"));
+    assert!(App::new(&path, d.path().join("media"), invalid).is_err());
+    let geoip_path = d.path().join("country.mmdb");
+    std::fs::write(
+        &geoip_path,
+        include_bytes!("fixtures/GeoIP2-Country-Test.mmdb"),
+    )
+    .unwrap();
+    let mut with_geoip = options();
+    with_geoip.geoip_db = Some(geoip_path);
+    let ready = App::new(&path, d.path().join("media"), with_geoip).unwrap();
+    let response = router(ready)
+        .oneshot(
+            Request::builder()
+                .uri("/streamer/api/v3/config/stats")
+                .header(
+                    "Authorization",
+                    format!("Basic {}", STANDARD.encode("admin:secret")),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 100_000)
+        .await
+        .unwrap();
+    let stats: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(stats["geoip"]["configured"], true);
+    assert_eq!(stats["geoip"]["revision"].as_str().unwrap().len(), 16);
 }
 #[tokio::test]
 async fn text_config_accepts_streams_templates_without_mutation() {

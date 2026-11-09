@@ -15,6 +15,8 @@ use bytes::Bytes;
 use std::net::SocketAddr;
 pub(crate) struct HttpRequest {
     raw_path: String,
+    named: Option<String>,
+    named_revision: Option<u64>,
     name: String,
     file: String,
     key: String,
@@ -30,7 +32,12 @@ impl HttpRequest {
         file: &str,
         key: String,
         revision: u64,
+        raw_media_path: &str,
+        named_route: Option<(&str, u64)>,
     ) -> Self {
+        let (named, named_revision) = named_route.map_or((None, None), |(name, revision)| {
+            (Some(name), Some(revision))
+        });
         let query = parse_query(request.uri().query());
         let hls = !matches!(file, "mpegts" | "m4s" | "m4f") && !file.ends_with(".m4f");
         let viewer = ViewerRequest {
@@ -58,7 +65,9 @@ impl HttpRequest {
             finite_media: file.ends_with(".m4f"),
         };
         Self {
-            raw_path: request.uri().path().to_owned(),
+            raw_path: raw_media_path.to_owned(),
+            named: named.map(str::to_owned),
+            named_revision,
             name: name.into(),
             file: file.into(),
             key,
@@ -72,10 +81,13 @@ impl HttpRequest {
         }
     }
 }
+
 impl Runtime {
     pub(crate) async fn serve(&self, app: &Arc<App>, request: HttpRequest) -> Response {
         let HttpRequest {
             raw_path,
+            named,
+            named_revision,
             name,
             file,
             key,
@@ -112,6 +124,7 @@ impl Runtime {
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "vendor source unavailable"),
         };
         let raw_viewer_query = viewer.qs.clone();
+        let client_ip = viewer.ip.parse().ok();
         let output_revision = candidate.config_revision();
         let output_key = candidate.source_key().to_owned();
         let outcome = tokio::select! {biased;_=self.closed.cancelled()=>return error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),outcome=self.admit_selection(candidate,&app.playback_auth,viewer)=>outcome};
@@ -119,6 +132,12 @@ impl Runtime {
             Ok(AdmissionOutcome::Allowed(a)) => a,
             Ok(AdmissionOutcome::Denied) => return error(StatusCode::FORBIDDEN, "playback denied"),
             Ok(AdmissionOutcome::Redirect(url)) => {
+                if named_revision.is_some_and(|expected| expected != app.config.revision()) {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "named balancer configuration changed",
+                    );
+                }
                 if secure && !url::Url::parse(&url).is_ok_and(|u| u.scheme() == "https") {
                     return error(
                         StatusCode::FORBIDDEN,
@@ -130,9 +149,15 @@ impl Runtime {
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "vendor authority changed"),
         };
         if app.options.role == "lb" {
+            if named_revision.is_some_and(|expected| expected != app.config.revision()) {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "named balancer configuration changed",
+                );
+            }
             return tokio::select! {biased;
                 _=self.closed.cancelled()=>error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),
-                response=app.balance_vendor(&self.owner,&admission,&raw_path,&raw_viewer_query,secure)=>response,
+                response=app.balance_vendor(&self.owner,&admission,crate::server::BalanceRequest { name, path: &raw_path, query: &raw_viewer_query, secure, named: named.as_deref(), client_ip, viewer_token: query.get("token").map(String::as_str).unwrap_or("") })=>response,
             };
         }
         let hls = !matches!(file, "mpegts" | "m4s" | "m4f") && !file.ends_with(".m4f");
@@ -317,4 +342,31 @@ fn continuous(
         Body::from_stream(stream),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod named_path_tests {
+    use super::*;
+
+    #[test]
+    fn vendor_http_request_uses_checked_named_media_path_and_revision() {
+        let request = Request::builder()
+            .uri("/lb0/channel/index.m3u8?token=viewer&x=%2B")
+            .body(Body::empty())
+            .unwrap();
+        let routed = HttpRequest::new(
+            &request,
+            "channel",
+            "index.m3u8",
+            "origin".into(),
+            17,
+            "/channel/index.m3u8",
+            Some(("lb0", 17)),
+        );
+        assert_eq!(routed.raw_path, "/channel/index.m3u8");
+        assert_eq!(routed.named.as_deref(), Some("lb0"));
+        assert_eq!(routed.named_revision, Some(17));
+        assert_eq!(routed.viewer.name, "channel");
+        assert_eq!(routed.viewer.qs, "token=viewer&x=%2B");
+    }
 }

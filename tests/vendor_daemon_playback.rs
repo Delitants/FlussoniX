@@ -1839,6 +1839,10 @@ async fn active_vendor_worker_is_visible_in_node_stream_inventory() {
         .unwrap()
         .iter()
         .any(|stream| stream["name"] == "owned");
+    assert_eq!(
+        node["total_streams_count"], 1,
+        "mirrored stream was omitted from native balancer load"
+    );
     drop(r);
     f.stop().await;
     assert!(visible, "active shared worker missing from node inventory");

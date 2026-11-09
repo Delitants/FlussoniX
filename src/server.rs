@@ -27,7 +27,7 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -60,6 +60,7 @@ pub struct Options {
     pub node_name: String,
     pub uplink_mbps: f64,
     pub uplink_interface: String,
+    pub geoip_db: Option<PathBuf>,
     pub client_limit: u64,
     pub web_dir: PathBuf,
     pub iptv_public_origin: Option<url::Url>,
@@ -115,6 +116,7 @@ impl Default for Options {
             node_name: "local".into(),
             uplink_mbps: 1000.0,
             uplink_interface: "auto".into(),
+            geoip_db: None,
             client_limit: 1000,
             web_dir: "web/dist".into(),
             iptv_public_origin: None,
@@ -190,7 +192,9 @@ pub struct App {
     http_handoffs: http_handoff::Registry,
     rtsp_routes: rtsp_balancer::Registry,
     http_routes: http_balancer::Registry,
+    geoip: Option<named_balancer::GeoIp>,
     routing_rotation: TieRotation,
+    named_affinity: std::sync::Mutex<named_balancer::Affinity>,
     pub egress: Arc<AtomicU64>,
     pub rtsp_egress: Arc<AtomicU64>,
     pub rtsp_udp_egress: Arc<AtomicU64>,
@@ -437,6 +441,14 @@ impl App {
             .as_secs();
         let iptv_leases = Arc::new(Ledger::new(started, 100_000, iptv.revision()));
         let config = Arc::new(ConfigStore::open(config_path)?);
+        let geoip = options
+            .geoip_db
+            .as_deref()
+            .map(named_balancer::GeoIp::open)
+            .transpose()?;
+        if geoip.is_none() && named_balancer::requires_geoip(&config.snapshot()) {
+            return Err("named balancer country rules require --geoip-db".into());
+        }
         let node_id = crate::node_identity::load_or_create(config_path)?;
         let modern_sources =
             crate::source_directory::modern_coordinator::ModernSourceCoordinator::new(
@@ -507,7 +519,9 @@ impl App {
             http_handoffs: http_handoff::Registry::default(),
             rtsp_routes: rtsp_balancer::Registry::default(),
             http_routes: http_balancer::Registry::default(),
+            geoip,
             routing_rotation: TieRotation::default(),
+            named_affinity: std::sync::Mutex::new(named_balancer::Affinity::default()),
             egress: Arc::new(AtomicU64::new(0)),
             rtsp_egress: Arc::new(AtomicU64::new(0)),
             rtsp_udp_egress: Arc::new(AtomicU64::new(0)),
@@ -824,9 +838,8 @@ impl App {
     async fn active(&self) -> u64 {
         self.playback_auth.active()
     }
-    async fn node(&self) -> Value {
+    async fn stream_inventory_names(&self) -> std::collections::BTreeSet<String> {
         let cfg = self.config.snapshot();
-        let mut streams = Vec::new();
         let mut names = cfg["streams"]
             .as_array()
             .unwrap()
@@ -843,11 +856,16 @@ impl App {
             )
             .collect::<std::collections::BTreeSet<_>>();
         names.extend(self.media.workers().await.into_iter().map(|(name, _)| name));
-        for name in names {
+        names
+    }
+    async fn node(&self) -> Value {
+        let mut streams = Vec::new();
+        for name in self.stream_inventory_names().await {
             streams.push(json!({"name":name,"ready":self.media.ready(&name).await,"stats":self.stream_stats(&name).await}));
         }
         let mut node = self.load_node().await;
         node["version"] = json!(env!("CARGO_PKG_VERSION"));
+        node["total_streams_count"] = json!(streams.len());
         node["streams"] = json!(streams);
         node
     }
@@ -889,10 +907,13 @@ impl App {
             "hostname":self.node_name,
             "uptime":self.started.elapsed().as_secs(),
             "total_streams":self.config.read(|root|root["streams"].as_array().map_or(0,Vec::len)),
+            "total_streams_count":self.stream_inventory_names().await.len(),
             "online_streams":online_streams,
             "total_clients":self.active().await,
             "total_bandwidth":(self.options.uplink_mbps*1_000_000.0).round() as u64,
             "output_kbit":output_kbit,
+            "bandwidth_usage":metrics["uplink"].as_f64().filter(|n|n.is_finite() && *n>=0.0 && *n<=100.0).map(|n|n*100.0),
+            "geoip":{"configured":self.geoip.is_some(),"revision":self.geoip.as_ref().map(named_balancer::GeoIp::revision)},
             "cpu_usage":percent("cpu"),
             "memory_usage":percent("ram")
         })
@@ -998,6 +1019,22 @@ impl App {
             .as_object_mut()
             .unwrap()
             .extend(node.as_object().unwrap().clone());
+        metrics["geoip"] = json!({
+            "configured": self.geoip.is_some(),
+            "revision": self.geoip.as_ref().map(named_balancer::GeoIp::revision)
+        });
+        metrics["output_kbit"] = metrics["egress_mbps"]
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .map(|n| json!((n * 1000.0).round() as u64))
+            .unwrap_or(Value::Null);
+        metrics["bandwidth_usage"] = metrics["uplink"]
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.0 && *n <= 100.0)
+            .map(|n| json!(n * 100.0))
+            .unwrap_or(Value::Null);
+        metrics["total_clients"] = metrics["active"].clone();
+        metrics["total_streams_count"] = json!(self.stream_inventory_names().await.len());
         metrics["stream_bitrates"] = stream_bitrates;
         metrics["source_activation"] = self.source_activation_status().await;
         if let Some(runtime) = &self.vendor_playback {
@@ -1354,7 +1391,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
             return management_read_response(role, result);
         }
         if method == "POST" {
-            return validate_config_request(&app.config, request).await;
+            return validate_config_request(&app, request).await;
         }
         let body = match read_json(request).await {
             Ok(b) => b,
@@ -1362,6 +1399,17 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         };
         if method != "PUT" {
             return error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+        }
+        if app.geoip.is_none()
+            && app
+                .config
+                .validate(body.clone())
+                .is_ok_and(|next| named_balancer::requires_geoip(&next))
+        {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "named balancer country rules require --geoip-db",
+            );
         }
         let result = app.config.replace(body);
         return match result {
@@ -1383,6 +1431,9 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     } else {
         (resource, name)
     };
+    if kind == "balancers" && resource != "cluster" {
+        return error(StatusCode::NOT_FOUND, "API operation not implemented");
+    }
     if kind == "sessions" {
         if name == Some("reauth") && method == "POST" {
             let Some(stream) = query.get("name") else {
@@ -1531,6 +1582,15 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
                 Ok(b) => b,
                 Err((code, message)) => return error(code, &message),
             };
+            if kind == "balancers"
+                && app.geoip.is_none()
+                && named_balancer::row_requires_geoip(&body)
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "named balancer country rules require --geoip-db",
+                );
+            }
             return match app.config.put(kind, name, body) {
                 Ok(mut v) => {
                     if matches!(kind, "streams" | "templates") {
@@ -1670,7 +1730,8 @@ async fn read_json(request: Request) -> Result<Value, (StatusCode, String)> {
         .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "body exceeds limit".into()))?;
     serde_json::from_slice(&bytes).map_err(|_| (StatusCode::BAD_REQUEST, "invalid JSON".into()))
 }
-async fn validate_config_request(config: &ConfigStore, request: Request) -> Response {
+async fn validate_config_request(app: &App, request: Request) -> Response {
+    let config = &app.config;
     let text_plain = request
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
@@ -1728,7 +1789,20 @@ async fn validate_config_request(config: &ConfigStore, request: Request) -> Resp
         }
     };
     match config.validate(patch.clone()) {
-        Ok(validated) => json_response(validated),
+        Ok(validated) => {
+            if app.geoip.is_none() && named_balancer::requires_geoip(&validated) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "error":"invalid_config","config":patch,
+                        "detail":"named balancer country rules require --geoip-db",
+                        "path":["server_config","balancers"]
+                    })),
+                )
+                    .into_response();
+            }
+            json_response(validated)
+        }
         Err(detail) => {
             let unknown = detail
                 .strip_prefix("server option ")
@@ -2168,41 +2242,115 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
     }
     error(StatusCode::NOT_FOUND, "operation not implemented")
 }
+#[derive(Clone, Copy)]
+pub(crate) struct BalanceRequest<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) path: &'a str,
+    pub(crate) query: &'a str,
+    pub(crate) secure: bool,
+    pub(crate) named: Option<&'a str>,
+    pub(crate) client_ip: Option<IpAddr>,
+    pub(crate) viewer_token: &'a str,
+}
+#[derive(Clone)]
+struct NamedPlacement {
+    scope: [u8; 32],
+    peer: String,
+}
+fn with_named_placement(mut response: Response, scope: Option<[u8; 32]>, peer: String) -> Response {
+    if let Some(scope) = scope {
+        response
+            .extensions_mut()
+            .insert(NamedPlacement { scope, peer });
+    }
+    response
+}
 async fn balance(
     app: &Arc<App>,
-    name: &str,
-    path: &str,
-    query: &str,
-    secure: bool,
+    request: BalanceRequest<'_>,
     grant: &Grant,
     revision: u64,
 ) -> Response {
-    let work = balance_inner(app, name, path, query, secure, grant, revision);
-    let response = tokio::select! { biased;
+    let work = balance_inner(app, request, grant, revision);
+    let mut response = tokio::select! { biased;
         _=grant.cancelled()=>error(StatusCode::FORBIDDEN,"playback policy changed"),
         result=tokio::time::timeout(Duration::from_secs(8),work)=>result.unwrap_or_else(|_|error(StatusCode::SERVICE_UNAVAILABLE,"placement deadline exceeded")),
     };
-    if response.status().is_redirection() && !app.playback_auth.release_redirect_lease(grant).await
-    {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "IPTV redirect lease release failed",
-        );
+    if response.status().is_redirection() {
+        if !app.playback_auth.release_redirect_lease(grant).await {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "IPTV redirect lease release failed",
+            );
+        }
+        if app.config.revision() != revision {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "routing configuration changed",
+            );
+        }
+        if let Some(placement) = response.extensions_mut().remove::<NamedPlacement>() {
+            app.named_affinity.lock().unwrap().remember(
+                placement.scope,
+                placement.peer,
+                Instant::now(),
+            );
+        }
     }
     response
 }
 async fn balance_inner(
     app: &Arc<App>,
-    name: &str,
-    path: &str,
-    query: &str,
-    secure: bool,
+    request: BalanceRequest<'_>,
     grant: &Grant,
     revision: u64,
 ) -> Response {
     use futures_util::StreamExt;
+    let BalanceRequest {
+        name,
+        path,
+        query,
+        secure,
+        named,
+        client_ip,
+        viewer_token,
+    } = request;
     let root = app.config.snapshot();
-    let peers = root["peers"].as_array().cloned().unwrap_or_default();
+    let named_policy = if let Some(named) = named {
+        let Some(row) = root["balancers"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == named))
+        else {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "named balancer configuration changed",
+            );
+        };
+        Some(row)
+    } else {
+        None
+    };
+    let allowed = named_policy.map(|row| {
+        row["servers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|server| server["name"].as_str())
+            .collect::<std::collections::HashSet<_>>()
+    });
+    let peers = root["peers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|peer| {
+            allowed.as_ref().is_none_or(|names| {
+                peer["hostname"]
+                    .as_str()
+                    .is_some_and(|name| names.contains(name))
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     if peers.len() > 64 || app.config.revision() != revision {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2249,6 +2397,7 @@ async fn balance_inner(
     drop(calls);
     let mut attempted = std::collections::HashSet::new();
     let mut turn = None;
+    let mut named_affinity_scope = None;
     loop {
         // A failed admission can consume the remaining sample lifetime. Reproject
         // every observed candidate, including those the previous cost excluded.
@@ -2321,7 +2470,51 @@ async fn balance_inner(
             };
             nodes.push(load)
         }
-        let Some(id) = app.routing_rotation.select(&nodes, 0.0, &mut turn) else {
+        let selected = if let Some(policy) = named_policy {
+            nodes.retain(|node| crate::cluster::select(std::slice::from_ref(node), 0.0).is_some());
+            let candidates = nodes
+                .iter()
+                .filter_map(|node| {
+                    let (snapshot, _, _) = observations.iter().find(|(_, peer, _)| {
+                        peer["hostname"].as_str() == Some(node.name.as_str())
+                    })?;
+                    Some(named_balancer::ObservedPeer {
+                        name: &node.name,
+                        output_kbit: snapshot.value["output_kbit"].as_u64(),
+                        bandwidth_usage: snapshot.value["bandwidth_usage"].as_f64(),
+                        clients: snapshot.value["total_clients"].as_u64(),
+                        total_streams_count: snapshot.value["total_streams_count"].as_u64(),
+                        age_ms: node.age_ms,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let ip = client_ip.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+            let country = if named_balancer::row_requires_geoip(policy) {
+                app.geoip.as_ref().and_then(|geoip| geoip.country(ip))
+            } else {
+                None
+            };
+            let ranked = named_balancer::rank(
+                policy,
+                &candidates,
+                ip,
+                country.as_deref(),
+                revision,
+                name,
+                viewer_token,
+            );
+            let scope = *named_affinity_scope.get_or_insert(ranked.scope);
+            let mut affinity = app.named_affinity.lock().unwrap();
+            let order = if scope == ranked.scope {
+                affinity.prefer(&ranked, Instant::now())
+            } else {
+                ranked.order
+            };
+            order.into_iter().next()
+        } else {
+            app.routing_rotation.select(&nodes, 0.0, &mut turn)
+        };
+        let Some(id) = selected else {
             break;
         };
         attempted.insert(id.clone());
@@ -2333,7 +2526,11 @@ async fn balance_inner(
             if let Some(location) = http_balancer::vendor_location(p, name, path, query)
                 && app.hold_vendor_http(p, selected, bitrate_mbps, revision)
             {
-                return (StatusCode::FOUND, [("location", location)]).into_response();
+                return with_named_placement(
+                    (StatusCode::FOUND, [("location", location)]).into_response(),
+                    named_affinity_scope,
+                    id,
+                );
             }
             continue;
         }
@@ -2377,7 +2574,11 @@ async fn balance_inner(
                             path.trim_start_matches('/'),
                             query
                         );
-                        return (StatusCode::FOUND, [("location", url)]).into_response();
+                        return with_named_placement(
+                            (StatusCode::FOUND, [("location", url)]).into_response(),
+                            named_affinity_scope,
+                            id,
+                        );
                     }
                 }
             }
@@ -2387,13 +2588,27 @@ async fn balance_inner(
 }
 async fn media_request(State(app): State<Arc<App>>, request: Request) -> Response {
     let activity = app.media.idle_memory.activity().await;
+    let post_named = (request.method() == "POST")
+        .then(|| named_balancer::http_path(&app.config.snapshot(), request.uri().path()));
     let mut response = if request.method() == "OPTIONS" {
         StatusCode::NO_CONTENT.into_response()
     } else if request.method() == "POST" {
-        if browser_management_write_allowed(&request, app.options.admin_public_origin.as_ref()) {
-            publication::receive(app, request).await
-        } else {
-            error(StatusCode::FORBIDDEN, "cross-origin publication request")
+        match post_named.expect("POST path was checked") {
+            Err(message) => error(StatusCode::BAD_REQUEST, message),
+            Ok(Some(_)) => error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "named balancer publishing is not supported",
+            ),
+            Ok(None) => {
+                if browser_management_write_allowed(
+                    &request,
+                    app.options.admin_public_origin.as_ref(),
+                ) {
+                    publication::receive(app, request).await
+                } else {
+                    error(StatusCode::FORBIDDEN, "cross-origin publication request")
+                }
+            }
         }
     } else {
         serve_media_request(app, request).await
@@ -2421,7 +2636,20 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     if request.method() != "GET" {
         return error(StatusCode::METHOD_NOT_ALLOWED, "playback requires GET");
     }
-    let raw_path = request.uri().path();
+    let named_revision = app.config.revision();
+    let named = match named_balancer::http_path(&app.config.snapshot(), request.uri().path()) {
+        Ok(named) => named,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
+    if named.is_some() && app.options.role != "lb" {
+        return error(StatusCode::NOT_FOUND, "named balancer path is unavailable");
+    }
+    if named.is_some() && !named_balancer::valid_admission_query(request.uri().query()) {
+        return error(StatusCode::BAD_REQUEST, "conflicting admission markers");
+    }
+    let raw_path = named
+        .as_ref()
+        .map_or(request.uri().path(), |route| route.media_path.as_str());
     let path = percent_encoding::percent_decode_str(raw_path.trim_start_matches('/'))
         .decode_utf8_lossy()
         .to_string();
@@ -2477,7 +2705,15 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
                         .serve(
                             &app,
                             crate::vendor_playback::HttpRequest::new(
-                                &request, name, file, key, revision,
+                                &request,
+                                name,
+                                file,
+                                key,
+                                revision,
+                                raw_path,
+                                named
+                                    .as_ref()
+                                    .map(|route| (route.balancer.as_str(), named_revision)),
                             ),
                         )
                         .await
@@ -2502,6 +2738,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         .get::<ConnectInfo<SocketAddr>>()
         .map(|v| v.0.ip().to_string())
         .unwrap_or_else(|| "127.0.0.1".into());
+    let client_ip = ip.parse::<IpAddr>().ok();
     app.http_handoffs.prune();
     if query.contains_key("flussonix_ticket") && query.contains_key("flussonix_handoff") {
         return error(StatusCode::BAD_REQUEST, "conflicting admission markers");
@@ -2615,6 +2852,12 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             AuthOutcome::Allowed(g) => g,
             AuthOutcome::Denied => return error(StatusCode::FORBIDDEN, "playback denied"),
             AuthOutcome::Redirect(url) => {
+                if named.is_some() && app.config.revision() != named_revision {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "named balancer configuration changed",
+                    );
+                }
                 if secure && !url::Url::parse(&url).is_ok_and(|u| u.scheme() == "https") {
                     return error(
                         StatusCode::FORBIDDEN,
@@ -2651,12 +2894,24 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         return error(StatusCode::FORBIDDEN, "playback policy changed");
     }
     if app.options.role == "lb" {
+        if named.is_some() && (named_revision != revision || app.config.revision() != revision) {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "named balancer configuration changed",
+            );
+        }
+        let viewer_query = App::http_viewer_query(request.uri().query().unwrap_or(""));
         return balance(
             &app,
-            name,
-            raw_path,
-            &App::http_viewer_query(request.uri().query().unwrap_or("")),
-            secure,
+            BalanceRequest {
+                name,
+                path: raw_path,
+                query: &viewer_query,
+                secure,
+                named: named.as_ref().map(|route| route.balancer.as_str()),
+                client_ip,
+                viewer_token: query.get("token").map(String::as_str).unwrap_or(""),
+            },
             &grant,
             revision,
         )
@@ -3130,6 +3385,7 @@ mod config_metrics;
 mod iptv_management;
 mod iptv_peer;
 mod iptv_playlist;
+mod named_balancer;
 mod native_ts_body;
 #[path = "origin_resolution.rs"]
 mod origin_resolution;

@@ -14,7 +14,7 @@ All paths below are relative to `/streamer/api/v3`.
 
 Config JSON reads distinguish the reference's compact and full profiles:
 `GET /config` (or `?full=false`) reports `server_id` and runtime `stats`,
-while `?full=true` also returns the five saved collections. `stats.id` equals
+while `?full=true` also returns the six saved collections. `stats.id` equals
 the UUID in `server_id`. `GET /config/stats` returns that stats object directly;
 FlussoniX-only diagnostics remain under `/flussonix/api/v1/node`. The UUID is stored in an owner-only
 `<config-file>.node-id` file; back it up with the configuration and keep it
@@ -37,7 +37,7 @@ reference behavior.
 | Templates | GET `/templates`; GET/PUT/DELETE `/templates/{name}` |
 | Config | GET/PUT/POST `/config`; GET `/config/stats`; associated first-release operational fields |
 | Cluster | GET `/cluster/peers`, GET/PUT/DELETE `/cluster/peers/{hostname}`; corresponding `sources` routes |
-| Cluster balancers | Bundled private-schema `/cluster/balancers` operations: explicitly versioned extension, not assumed public |
+| Cluster balancers | GET `/cluster/balancers`; GET/PUT/DELETE `/cluster/balancers/{name}` from the bundled private schema; HTTP playback profile only |
 | Authorization | GET `/auth_backends`; GET/PUT/DELETE `/auth_backends/{name}` |
 | Sessions | GET `/sessions`; GET/DELETE `/sessions/{id}`; POST `/sessions/reauth` |
 | IPTV compatibility | `/iptv`, `/iptv/packages`, `/iptv/subscribers` and their item operations |

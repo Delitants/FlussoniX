@@ -1,6 +1,218 @@
 use flussonix::config::{ConfigStore, merge};
 use serde_json::json;
 #[test]
+fn named_balancer_collection_defaults_and_persists_with_peer_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let store = ConfigStore::open(&path).unwrap();
+    assert_eq!(store.snapshot()["balancers"], json!([]));
+    store.put("peers", "cdn-a", json!({"api_url":"http://127.0.0.1:19001","public_payload_url":"http://127.0.0.1:19001"})).unwrap();
+    let revision = store.revision();
+    let saved = store
+        .put(
+            "balancers",
+            "lb0",
+            json!({"mode":"bitrate","servers":[{"name":"cdn-a"}]}),
+        )
+        .unwrap();
+    assert_eq!(saved["name"], "lb0");
+    assert_eq!(store.revision(), revision + 1);
+    drop(store);
+    let reopened = ConfigStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.snapshot()["balancers"],
+        json!([{"name":"lb0","mode":"bitrate","servers":[{"name":"cdn-a"}]}])
+    );
+}
+#[test]
+fn named_balancer_rejects_invalid_membership_and_policy_without_saving() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(dir.path().join("config.json")).unwrap();
+    store.put("peers", "cdn-a", json!({"api_url":"http://127.0.0.1:19001","public_payload_url":"http://127.0.0.1:19001"})).unwrap();
+    let before = store.snapshot();
+    for (name, row) in [
+        ("lb0", json!({"servers":[]})),
+        ("lb0", json!({"servers":[{"name":"missing"}]})),
+        (
+            "lb0",
+            json!({"servers":[{"name":"cdn-a"},{"name":"cdn-a"}]}),
+        ),
+        ("lb0", json!({"mode":"random","servers":[{"name":"cdn-a"}]})),
+        (
+            "lb0",
+            json!({"servers":[{"name":"cdn-a","max_bitrate":-1}]}),
+        ),
+        (
+            "lb0",
+            json!({"servers":[{"name":"cdn-a","max_bitrate":1.5}]}),
+        ),
+        (
+            "lb0",
+            json!({"servers":[{"name":"cdn-a","countries":["us"]}]}),
+        ),
+        (
+            "lb0",
+            json!({"servers":[{"name":"cdn-a","countries":["US","US"]}]}),
+        ),
+        (
+            "lb0",
+            json!({"servers":[{"name":"cdn-a","countries_default":"yes"}]}),
+        ),
+        (
+            "lb0",
+            json!({"servers":[{"name":"cdn-a","unexpected":true}]}),
+        ),
+        (
+            "lb0",
+            json!({"servers":[{"name":"cdn-a"}],"unexpected":true}),
+        ),
+        ("lb0/child", json!({"servers":[{"name":"cdn-a"}]})),
+    ] {
+        assert!(
+            store.put("balancers", name, row).is_err(),
+            "accepted invalid balancer {name}"
+        );
+        assert_eq!(store.snapshot(), before);
+    }
+}
+#[test]
+fn named_balancer_collisions_and_peer_removal_fail_at_save_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(dir.path().join("config.json")).unwrap();
+    store.put("peers", "cdn-a", json!({"api_url":"http://127.0.0.1:19001","public_payload_url":"http://127.0.0.1:19001"})).unwrap();
+    store
+        .put(
+            "streams",
+            "lb0/child",
+            json!({"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    assert!(
+        store
+            .put("balancers", "lb0", json!({"servers":[{"name":"cdn-a"}]}))
+            .is_err()
+    );
+    store.delete("streams", "lb0/child").unwrap();
+    store.put("balancers", "lb0", json!({"servers":[{"name":"cdn-a","max_bitrate":0,"countries":["US"],"countries_default":true}]})).unwrap();
+    let before = store.snapshot();
+    assert!(
+        store
+            .put(
+                "streams",
+                "lb0/child",
+                json!({"inputs":[{"url":"testsrc://"}]})
+            )
+            .is_err()
+    );
+    assert!(store.delete("peers", "cdn-a").is_err());
+    assert_eq!(store.snapshot(), before);
+}
+#[test]
+fn named_balancer_legacy_file_and_collection_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(
+            &json!({"streams":[],"templates":[],"peers":[],"sources":[],"auth_backends":[]}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let store = ConfigStore::open(&path).unwrap();
+    assert_eq!(store.snapshot()["balancers"], json!([]));
+    store.put("peers", "cdn-a", json!({"api_url":"http://127.0.0.1:19001","public_payload_url":"http://127.0.0.1:19001"})).unwrap();
+    let rows = (0..64)
+        .map(|index| json!({"name":format!("lb{index}"),"servers":[{"name":"cdn-a"}]}))
+        .collect::<Vec<_>>();
+    assert!(store.validate(json!({"balancers":rows})).is_ok());
+    let rows = (0..65)
+        .map(|index| json!({"name":format!("lb{index}"),"servers":[{"name":"cdn-a"}]}))
+        .collect::<Vec<_>>();
+    assert!(store.validate(json!({"balancers":rows})).is_err());
+    let servers = (0..65)
+        .map(|index| json!({"name":format!("cdn-{index}")}))
+        .collect::<Vec<_>>();
+    assert!(
+        store
+            .put("balancers", "lb0", json!({"servers":servers}))
+            .is_err()
+    );
+}
+#[test]
+fn named_balancer_all_modes_accept_optional_and_zero_bitrate_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(dir.path().join("config.json")).unwrap();
+    store.put("peers", "cdn-a", json!({"api_url":"http://127.0.0.1:19001","public_payload_url":"http://127.0.0.1:19001"})).unwrap();
+    for (index, mode) in ["bitrate", "usage", "clients", "streams"]
+        .iter()
+        .enumerate()
+    {
+        store
+            .put(
+                "balancers",
+                &format!("lb{index}"),
+                json!({"mode":mode,"servers":[{"name":"cdn-a"}]}),
+            )
+            .unwrap();
+        store
+            .put(
+                "balancers",
+                &format!("lb{index}"),
+                json!({"servers":[{"name":"cdn-a","max_bitrate":0}]}),
+            )
+            .unwrap();
+    }
+    store
+        .put(
+            "balancers",
+            "lb-default",
+            json!({"servers":[{"name":"cdn-a"}]}),
+        )
+        .unwrap();
+}
+#[test]
+fn named_balancer_requires_safe_public_delivery_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(dir.path().join("config.json")).unwrap();
+    store
+        .put(
+            "peers",
+            "cdn-a",
+            json!({"api_url":"http://127.0.0.1:19001"}),
+        )
+        .unwrap();
+    assert!(
+        store
+            .put("balancers", "lb0", json!({"servers":[{"name":"cdn-a"}]}))
+            .is_err()
+    );
+    store
+        .put(
+            "peers",
+            "cdn-a",
+            json!({"public_payload_url":"http://user:secret@127.0.0.1:19001"}),
+        )
+        .unwrap();
+    assert!(
+        store
+            .put("balancers", "lb0", json!({"servers":[{"name":"cdn-a"}]}))
+            .is_err()
+    );
+    store
+        .put(
+            "peers",
+            "cdn-a",
+            json!({"public_payload_url":"https://cdn.example/path?token=secret"}),
+        )
+        .unwrap();
+    assert!(
+        store
+            .put("balancers", "lb0", json!({"servers":[{"name":"cdn-a"}]}))
+            .is_err()
+    );
+}
+#[test]
 fn partial_update_keeps_omitted_values_and_null_removes_feature() {
     let old = json!({"title":"News","inputs":[{"url":"hls://example.net/live.m3u8"}],"transcoder":{"vb":800,"ab":64}});
     assert_eq!(

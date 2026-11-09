@@ -805,3 +805,63 @@ async fn successful_pagination_is_read_only_and_other_collections_keep_legacy_en
     );
     assert_eq!(app.media.count().await, 0);
 }
+
+#[tokio::test]
+async fn named_balancer_collection_paginates_without_changing_config() {
+    let (dir, app) = fixture();
+    app.config
+        .put(
+            "peers",
+            "cdn-a",
+            json!({
+                "api_url":"http://127.0.0.1:19001",
+                "public_payload_url":"https://cdn.example"
+            }),
+        )
+        .unwrap();
+    for name in ["lb-a", "lb-b", "lb-c"] {
+        app.config
+            .put("balancers", name, json!({"servers":[{"name":"cdn-a"}]}))
+            .unwrap();
+    }
+    let before = std::fs::read(dir.path().join("config.json")).unwrap();
+    let (status, first) = get(&app, "cluster/balancers", &[("limit", "2")], true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["estimated_count"], 3);
+    assert_eq!(first["balancers"][0]["name"], "lb-a");
+    assert_eq!(first["balancers"][1]["name"], "lb-b");
+    let (status, second) = get(
+        &app,
+        "cluster/balancers",
+        &[("limit", "2"), ("cursor", first["next"].as_str().unwrap())],
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["balancers"][0]["name"], "lb-c");
+    assert!(second["next"].is_null());
+    let (status, previous) = get(
+        &app,
+        "cluster/balancers",
+        &[("limit", "2"), ("cursor", second["prev"].as_str().unwrap())],
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(previous["balancers"], first["balancers"]);
+    let (status, past_end) = get(
+        &app,
+        "cluster/balancers",
+        &[("cursor", &token("%24position_gt=18446744073709551615"))],
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(past_end["balancers"], json!([]));
+    let (status, _) = get(&app, "cluster/balancers", &[("cursor", "invalid")], true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        std::fs::read(dir.path().join("config.json")).unwrap(),
+        before
+    );
+}

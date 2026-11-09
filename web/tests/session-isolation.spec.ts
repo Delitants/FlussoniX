@@ -43,8 +43,11 @@ test('signing in as View cannot reopen an earlier Edit user’s staged secrets',
  await page.getByRole('button',{name:'Config',exact:true}).click();
  await expect.poll(()=>viewerConfigReads).toBeGreaterThan(0);
  await page.getByRole('button',{name:'Source servers',exact:true}).first().click();
- await page.getByRole('row').filter({hasText:source}).getByRole('button',{name:'Edit',exact:true}).click();
- await expect(page.getByRole('dialog').getByLabel('Cluster key',{exact:true})).toHaveValue('[redacted]');
+ const sourceRow=page.getByRole('row').filter({hasText:source});
+ await expect(sourceRow).toBeVisible();
+ await expect(sourceRow.getByRole('button',{name:'Edit',exact:true})).toHaveCount(0);
+ await expect(sourceRow.getByRole('button',{name:'Remove',exact:true})).toHaveCount(0);
+ await expect(page.locator('body')).not.toContainText(secret);
 });
 
 test('a late unauthorized response from a prior login cannot sign out the next user',async({page})=>{
