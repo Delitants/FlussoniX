@@ -2250,6 +2250,7 @@ pub(crate) struct BalanceRequest<'a> {
     pub(crate) secure: bool,
     pub(crate) named: Option<&'a str>,
     pub(crate) client_ip: Option<IpAddr>,
+    pub(crate) viewer_token: &'a str,
 }
 #[derive(Clone)]
 struct NamedPlacement {
@@ -2282,6 +2283,12 @@ async fn balance(
                 "IPTV redirect lease release failed",
             );
         }
+        if app.config.revision() != revision {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "routing configuration changed",
+            );
+        }
         if let Some(placement) = response.extensions_mut().remove::<NamedPlacement>() {
             app.named_affinity.lock().unwrap().remember(
                 placement.scope,
@@ -2306,6 +2313,7 @@ async fn balance_inner(
         secure,
         named,
         client_ip,
+        viewer_token,
     } = request;
     let root = app.config.snapshot();
     let named_policy = if let Some(named) = named {
@@ -2493,7 +2501,7 @@ async fn balance_inner(
                 country.as_deref(),
                 revision,
                 name,
-                grant.session_identity().unwrap_or(""),
+                viewer_token,
             );
             let scope = *named_affinity_scope.get_or_insert(ranked.scope);
             let mut affinity = app.named_affinity.lock().unwrap();
@@ -2902,6 +2910,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
                 secure,
                 named: named.as_ref().map(|route| route.balancer.as_str()),
                 client_ip,
+                viewer_token: query.get("token").map(String::as_str).unwrap_or(""),
             },
             &grant,
             revision,

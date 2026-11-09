@@ -325,6 +325,102 @@ async fn named_bitrate_mode_overrides_native_pressure_without_bypassing_admissio
 }
 
 #[tokio::test]
+async fn returning_viewer_keeps_eligible_cdn_until_balancer_revision_changes() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let (_dir, app) = fixture();
+    let mut tasks = Vec::new();
+    let mut rates = Vec::new();
+    for (name, initial) in [("cdn-a", 100_u64), ("cdn-b", 200_u64)] {
+        let rate = Arc::new(AtomicU64::new(initial));
+        let observed = rate.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        tasks.push(tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new()
+                    .route(
+                        "/flussonix/api/v1/node",
+                        get(move || {
+                            let observed = observed.clone();
+                            async move {
+                                axum::Json(json!({"role":"cdn","uplink":0.1,"uplink_mbps":1000.0,
+                                    "cpu":0.1,"ram":0.1,"drain":false,"age_ms":0,"active":0,
+                                    "reserved":0,"reserved_mbps":0.0,"limit":1000,
+                                    "output_kbit":observed.load(Ordering::Relaxed),"bandwidth_usage":10.0,
+                                    "total_clients":0,"total_streams_count":1,
+                                    "streams":[{"name":"channel","ready":true}],
+                                    "stream_bitrates":{"channel":{"mbps":2.0,"age_ms":0}}}))
+                            }
+                        }),
+                    )
+                    .route(
+                        "/flussonix/api/v1/admit",
+                        post(|| async { axum::Json(json!({"ticket":"owned-cdn-ticket","expires_in":5})) }),
+                    ),
+            )
+            .await
+            .unwrap();
+        }));
+        app.config
+            .put(
+                "peers",
+                name,
+                json!({"api_url":api,"public_payload_url":format!("https://{name}.example"),
+                    "flussonix_allow_insecure_peer_http":true}),
+            )
+            .unwrap();
+        rates.push(rate);
+    }
+    app.config
+        .put(
+            "balancers",
+            "lb0",
+            json!({"mode":"bitrate","servers":[{"name":"cdn-a"},{"name":"cdn-b"}]}),
+        )
+        .unwrap();
+    let host = |response: axum::response::Response| {
+        assert_eq!(response.status(), StatusCode::FOUND);
+        url::Url::parse(response.headers()["location"].to_str().unwrap())
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_owned()
+    };
+    let path = "/lb0/channel/index.m3u8?token=viewer";
+    let first = router(app.clone())
+        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(host(first), "cdn-a.example");
+    rates[0].store(300, Ordering::Relaxed);
+    rates[1].store(200, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let repeated = router(app.clone())
+        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(host(repeated), "cdn-a.example");
+    app.config
+        .put(
+            "balancers",
+            "lb0",
+            json!({"mode":"bitrate","servers":[{"name":"cdn-a"},{"name":"cdn-b"}]}),
+        )
+        .unwrap();
+    let revised = router(app.clone())
+        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(host(revised), "cdn-b.example");
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+#[tokio::test]
 async fn named_balancer_retries_next_eligible_cdn_after_admission_refusal() {
     let (_dir, app) = fixture();
     let (a_url, a_task) = metric_peer(5_000, 0.05).await;

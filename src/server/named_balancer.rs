@@ -243,6 +243,13 @@ impl Affinity {
     }
 
     pub fn remember(&mut self, scope: [u8; 32], peer: String, now: Instant) {
+        if self
+            .entries
+            .get(&scope)
+            .is_some_and(|entry| entry.peer == peer && entry.expires > now)
+        {
+            return;
+        }
         if self.entries.len() >= MAX_AFFINITY_ENTRIES && !self.entries.contains_key(&scope) {
             self.entries.retain(|_, entry| entry.expires > now);
             if self.entries.len() >= MAX_AFFINITY_ENTRIES {
@@ -535,6 +542,11 @@ mod tests {
         assert_eq!(
             cache.prefer(&shifted_rank, started + Duration::from_secs(599))[0],
             "a"
+        );
+        cache.remember(
+            first_rank.scope,
+            "a".into(),
+            started + Duration::from_secs(599),
         );
         assert_eq!(
             cache.prefer(&shifted_rank, started + Duration::from_secs(600))[0],

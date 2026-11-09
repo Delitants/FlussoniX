@@ -157,7 +157,7 @@ impl Runtime {
             }
             return tokio::select! {biased;
                 _=self.closed.cancelled()=>error(StatusCode::SERVICE_UNAVAILABLE,"vendor playback stopped"),
-                response=app.balance_vendor(&self.owner,&admission,crate::server::BalanceRequest { name, path: &raw_path, query: &raw_viewer_query, secure, named: named.as_deref(), client_ip })=>response,
+                response=app.balance_vendor(&self.owner,&admission,crate::server::BalanceRequest { name, path: &raw_path, query: &raw_viewer_query, secure, named: named.as_deref(), client_ip, viewer_token: query.get("token").map(String::as_str).unwrap_or("") })=>response,
             };
         }
         let hls = !matches!(file, "mpegts" | "m4s" | "m4f") && !file.ends_with(".m4f");

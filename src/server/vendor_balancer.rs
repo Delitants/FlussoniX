@@ -174,6 +174,7 @@ mod tests {
                     secure: false,
                     named: None,
                     client_ip: None,
+                    viewer_token: "",
                 },
             )
             .await;
@@ -233,6 +234,7 @@ mod vendor_destination_tests {
                     secure: false,
                     named: None,
                     client_ip: None,
+                    viewer_token: "",
                 },
             )
             .await;
