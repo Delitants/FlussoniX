@@ -79,7 +79,7 @@ fn m4f_preserves_silent_subtitle_track_but_rejects_partial_tables() {
         key: true,
         body: include_bytes!("fixtures/codecs/mp3.bin").to_vec(),
     };
-    let packed = pack(&[audio.clone()], &[frame], 90_000).unwrap();
+    let packed = pack(std::slice::from_ref(&audio), &[frame], 90_000).unwrap();
     let root = boxes(&packed).unwrap();
     let moov = boxes(root[0].1).unwrap();
     let sparse = sparse_subtitle_track(9);
