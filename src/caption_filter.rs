@@ -6,6 +6,59 @@ thread_local! {
     static MAPPING_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+struct TsPause {
+    marker: Vec<u8>,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static TS_PAUSE: std::sync::OnceLock<std::sync::Mutex<Option<TsPause>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static MP4_PAUSE: std::sync::OnceLock<std::sync::Mutex<Option<TsPause>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn pause_once_for_test(
+    marker: &[u8],
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let previous = TS_PAUSE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .replace(TsPause {
+            marker: marker.to_vec(),
+            entered: entered_tx,
+            release: release_rx,
+        });
+    assert!(previous.is_none(), "overlapping test caption-filter pauses");
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+pub(crate) fn pause_mp4_once_for_test(
+    marker: &[u8],
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let previous = MP4_PAUSE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .replace(TsPause {
+            marker: marker.to_vec(),
+            entered: entered_tx,
+            release: release_rx,
+        });
+    assert!(previous.is_none(), "overlapping test fMP4 filter pauses");
+    (entered_rx, release_tx)
+}
+
 fn number(b: &[u8], at: usize) -> Result<u32, String> {
     Ok(u32::from_be_bytes(
         b.get(at..at + 4)
@@ -197,6 +250,25 @@ fn video_pid(data: &[u8]) -> Result<Option<(u16, bool)>, String> {
     Err("caption video metadata absent".into())
 }
 pub fn ts(data: &mut [u8]) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let pause = {
+            let mut pending = TS_PAUSE.get_or_init(Default::default).lock().unwrap();
+            if pending.as_ref().is_some_and(|pause| {
+                data.get(32..32 + pause.marker.len()) == Some(pause.marker.as_slice())
+            }) {
+                pending.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            let _ = pause.entered.send(());
+            let _ = pause
+                .release
+                .recv_timeout(std::time::Duration::from_secs(2));
+        }
+    }
     if data.len() % 188 != 0 {
         return Err("unaligned caption TS".into());
     }
@@ -322,6 +394,26 @@ fn video_id(init: &[u8]) -> Result<Option<(u32, bool, usize)>, String> {
     }
 }
 pub fn mp4(init: &[u8], data: &mut [u8]) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let pause = {
+            let mut pending = MP4_PAUSE.get_or_init(Default::default).lock().unwrap();
+            if pending
+                .as_ref()
+                .is_some_and(|pause| data.ends_with(&pause.marker))
+            {
+                pending.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            let _ = pause.entered.send(());
+            let _ = pause
+                .release
+                .recv_timeout(std::time::Duration::from_secs(2));
+        }
+    }
     let Some((id, hevc, width)) = video_id(init)? else {
         boxes(data)?;
         return Ok(());

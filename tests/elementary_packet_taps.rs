@@ -17,6 +17,28 @@ fn serialize_descriptors() -> MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
 }
+fn wait_for_sleep_exec(child: &mut std::process::Child) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if std::fs::read_link(format!("/proc/{}/exe", child.id()))
+            .ok()
+            .and_then(|path| path.file_name().map(|name| name == "sleep"))
+            == Some(true)
+        {
+            return;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "sleep exited before exec"
+        );
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("sleep did not exec");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
 fn packet(source: u16, destination: u16) -> Vec<u8> {
     let mut p = vec![0u8; 40];
     p[0] = 0x45;
@@ -102,6 +124,7 @@ fn sender_source_snapshot_uses_local_inodes_and_rejects_missing_or_foreign_socke
         .arg("10")
         .spawn()
         .unwrap();
+    wait_for_sleep_exec(&mut child);
     assert!(taps::Owner::sender(child.id(), 1).is_err());
     child.kill().unwrap();
     child.wait().unwrap();
@@ -181,6 +204,7 @@ fn private_capture_rejects_sockets_owned_by_another_process_before_activation() 
         .arg("10")
         .spawn()
         .unwrap();
+    wait_for_sleep_exec(&mut child);
     let result = taps::Tap::decoder(
         child.id(),
         &[socket.local_addr().unwrap().port()],

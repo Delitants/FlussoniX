@@ -1178,6 +1178,31 @@ fn multitrack_segment() -> Vec<u8> {
     frames.sort_by_key(|f| f.dts);
     flussonix::m4f::pack(&tracks, &frames, 360000).unwrap()
 }
+fn hevc_multitrack_segment() -> Vec<u8> {
+    let (mut tracks, mut frames) = flussonix::m4f::unpack(&multitrack_segment()).unwrap();
+    tracks.push(Track {
+        id: 205,
+        codec: "hevc".into(),
+        config: include_bytes!("fixtures/codecs/hevc.hvcc").to_vec(),
+    });
+    let timing: Vec<Value> =
+        serde_json::from_str(include_str!("fixtures/codecs/hevc-timing.json")).unwrap();
+    for cycle in 0..8u64 {
+        for (i, t) in timing.iter().enumerate() {
+            let d = t["dts"].as_i64().unwrap();
+            let p = t["pts"].as_i64().unwrap();
+            frames.push(Frame {
+                track_id: 205,
+                dts: 90000 + cycle * 43200 + ((d + 1024) * 90000 / 12800) as u64,
+                pts_offset: (p - d) * 90000 / 12800,
+                key: t["flags"].as_str().unwrap().contains('K'),
+                body: std::fs::read(format!("tests/fixtures/codecs/hevc-{i:02}.bin")).unwrap(),
+            });
+        }
+    }
+    frames.sort_by_key(|f| f.dts);
+    flussonix::m4f::pack(&tracks, &frames, 360000).unwrap()
+}
 fn text_segment() -> Vec<u8> {
     let (mut tracks, mut frames) = flussonix::m4f::unpack(&multitrack_segment()).unwrap();
     for i in 150..380 {
@@ -1939,6 +1964,320 @@ async fn fmp4_hls_child_segments_are_guarded_and_decode_with_init() {
 }
 
 #[tokio::test]
+async fn vendor_audio_only_track_urls_remain_authorized_and_decode_mp3() {
+    use sha2::{Digest, Sha256};
+    let hash = format!("{:x}", Sha256::digest(b"track-viewer"));
+    let f = Fixture::new(json!({"flussonix_token_sha256": hash})).await;
+    let denied = [
+        f.get("/owned/video.m3u8?token=wrong").await.status(),
+        f.get("/owned/tracks-a1/mono.m3u8?token=wrong")
+            .await
+            .status(),
+        f.get("/owned/tracks-a1/g1_1.ts?token=wrong").await.status(),
+    ];
+    let master_response = f.get("/owned/video.m3u8?token=track-viewer").await;
+    let master_status = master_response.status();
+    let master = String::from_utf8(bytes(master_response).await.to_vec()).unwrap();
+    let child = master
+        .lines()
+        .find(|line| line.starts_with("tracks-a1/mono.m3u8"))
+        .unwrap_or("")
+        .to_owned();
+    let child_response = f.get(&format!("/owned/{child}")).await;
+    let child_status = child_response.status();
+    let playlist = String::from_utf8(bytes(child_response).await.to_vec()).unwrap();
+    let segment = playlist
+        .lines()
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .unwrap_or("")
+        .to_owned();
+    let segment_response = f.get(&format!("/owned/tracks-a1/{segment}")).await;
+    let segment_status = segment_response.status();
+    let segment_bytes = bytes(segment_response).await;
+    let probe_dir = tempfile::tempdir().unwrap();
+    let file = probe_dir.path().join("selected-vendor-a1.ts");
+    std::fs::write(&file, segment_bytes.as_ref()).unwrap();
+    let invalid = f
+        .get("/owned/tracks-a2/mono.m3u8?token=track-viewer")
+        .await
+        .status();
+    f.stop().await;
+    assert_eq!(denied, [StatusCode::FORBIDDEN; 3]);
+    assert_eq!(master_status, StatusCode::OK, "{master}");
+    assert!(
+        child.starts_with("tracks-a1/mono.m3u8?token=track-viewer"),
+        "{master}"
+    );
+    assert_eq!(child_status, StatusCode::OK, "{playlist}");
+    assert!(segment.ends_with(".ts?token=track-viewer"), "{playlist}");
+    assert_eq!(segment_status, StatusCode::OK);
+    assert!(!segment_bytes.is_empty());
+    assert_ne!(
+        invalid,
+        StatusCode::OK,
+        "unknown audio track must not be advertised"
+    );
+    let probe = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new("ffprobe")
+            .kill_on_drop(true)
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_name,codec_type",
+                "-of",
+                "json",
+            ])
+            .arg(&file)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        probe.status.success(),
+        "{}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    let streams: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+    assert_eq!(streams["streams"].as_array().unwrap().len(), 1);
+    assert_eq!(streams["streams"][0]["codec_name"], "mp3");
+    assert_eq!(streams["streams"][0]["codec_type"], "audio");
+}
+
+#[tokio::test]
+async fn vendor_m4f_hls_selects_each_of_two_audio_codecs() {
+    let f = Fixture::variant(json!({"on_play":"true"}), "m4f", "standalone").await;
+    let master = f.get("/owned/video.m3u8").await;
+    assert_eq!(master.status(), StatusCode::OK);
+    let master = String::from_utf8(bytes(master).await.to_vec()).unwrap();
+    assert!(master.contains("tracks-a1/mono.m3u8"), "{master}");
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut results = Vec::new();
+    for (ordinal, expected_codec) in [(1, "mp3"), (2, "mp2")] {
+        let playlist = playlist(&f, &format!("/owned/tracks-a{ordinal}/mono.m3u8")).await;
+        let segment = playlist
+            .lines()
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .expect("selected audio segment");
+        let response = f.get(&format!("/owned/tracks-a{ordinal}/{segment}")).await;
+        let status = response.status();
+        let file = probe_dir.path().join(format!("selected-a{ordinal}.ts"));
+        std::fs::write(&file, bytes(response).await).unwrap();
+        results.push((ordinal, expected_codec, status, file));
+    }
+    let unavailable = f.get("/owned/tracks-a3/mono.m3u8").await.status();
+    f.stop().await;
+    assert_ne!(
+        unavailable,
+        StatusCode::OK,
+        "unknown audio track was admitted"
+    );
+    for (ordinal, expected_codec, status, file) in results {
+        assert_eq!(status, StatusCode::OK, "audio track {ordinal}");
+        let probe = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new("ffprobe")
+                .kill_on_drop(true)
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_name,codec_type",
+                    "-of",
+                    "json",
+                ])
+                .arg(&file)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            probe.status.success(),
+            "audio track {ordinal}: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        let streams: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+        let streams = streams["streams"].as_array().unwrap();
+        assert_eq!(streams.len(), 1, "audio track {ordinal}: {streams:?}");
+        assert_eq!(streams[0]["codec_type"], "audio");
+        assert_eq!(streams[0]["codec_name"], expected_codec);
+    }
+}
+
+#[tokio::test]
+async fn vendor_m4f_hls_selects_hevc_with_and_without_audio() {
+    let f = Fixture::variant(json!({"on_play":"true"}), "m4f", "standalone").await;
+    *f.segment.lock().unwrap() = hevc_multitrack_segment();
+    let master = f.get("/owned/video.m3u8").await;
+    assert_eq!(master.status(), StatusCode::OK);
+    let master = String::from_utf8(bytes(master).await.to_vec()).unwrap();
+    assert!(master.contains("tracks-v1a1/mono.m3u8"), "{master}");
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut selected = Vec::new();
+    for selector in ["v1a1", "v1"] {
+        let playlist = playlist(&f, &format!("/owned/tracks-{selector}/mono.m3u8")).await;
+        let segment = playlist
+            .lines()
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .expect("selected HEVC segment");
+        let response = f.get(&format!("/owned/tracks-{selector}/{segment}")).await;
+        assert_eq!(response.status(), StatusCode::OK, "{selector}");
+        let file = probe_dir.path().join(format!("selected-{selector}.ts"));
+        std::fs::write(&file, bytes(response).await).unwrap();
+        selected.push((selector, file));
+    }
+    f.stop().await;
+    for (selector, file) in selected {
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new("ffprobe")
+                .kill_on_drop(true)
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_name,codec_type",
+                    "-of",
+                    "json",
+                ])
+                .arg(&file)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{selector}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let streams = value["streams"].as_array().unwrap();
+        let codecs: Vec<_> = streams
+            .iter()
+            .map(|stream| stream["codec_name"].as_str().unwrap())
+            .collect();
+        assert!(codecs.contains(&"hevc"), "{selector}: {value}");
+        assert_eq!(
+            codecs.contains(&"mp3"),
+            selector == "v1a1",
+            "{selector}: {value}"
+        );
+        assert!(!codecs.contains(&"mp2"), "{selector}: {value}");
+        let decoded = tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio::process::Command::new("ffmpeg")
+                .kill_on_drop(true)
+                .args(["-nostdin", "-v", "error", "-threads", "1", "-i"])
+                .arg(&file)
+                .args(["-map", "0:v:0", "-t", "0.2", "-f", "null", "-"])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            decoded.status.success(),
+            "{selector}: {}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+    }
+}
+
+#[tokio::test]
+async fn vendor_selected_hls_master_keeps_converted_english_and_german_captions() {
+    use sha2::{Digest, Sha256};
+    let token_hash = format!("{:x}", Sha256::digest(b"caption-viewer"));
+    let f = Fixture::variant(
+        json!({"on_play":"true","flussonix_token_sha256":token_hash}),
+        "m4f",
+        "standalone",
+    )
+    .await;
+    *f.segment.lock().unwrap() = text_segment();
+    f.duration.store(10000, std::sync::atomic::Ordering::SeqCst);
+    f.app
+        .config
+        .put(
+            "templates",
+            "processing",
+            json!({
+                "flussonix_hls_subtitles":"convert",
+                "flussonix_hls_captions":[
+                    {"native_track":7,"language":"en","name":"English"},
+                    {"native_track":8,"language":"de","name":"Deutsch"}
+                ]
+            }),
+        )
+        .unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"processing"}),
+        )
+        .unwrap();
+    let master = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let response = f.get("/owned/video.m3u8?token=caption-viewer").await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let text = String::from_utf8(bytes(response).await.to_vec()).unwrap();
+            if text.contains("TYPE=SUBTITLES") {
+                break text;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        master.contains("English") && master.contains("Deutsch"),
+        "{master}"
+    );
+    for id in [7, 8] {
+        assert!(
+            master.contains(&format!("URI=\"nt{id}.m3u8?token=caption-viewer\"")),
+            "{master}"
+        );
+    }
+    let child = master
+        .lines()
+        .find(|line| line.starts_with("tracks-a1/mono.m3u8"))
+        .expect("selected audio child")
+        .to_owned();
+    let playlist = playlist(&f, &format!("/owned/{child}")).await;
+    let segment = playlist
+        .lines()
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .expect("selected audio segment");
+    let selected = f.get(&format!("/owned/tracks-a1/{segment}")).await;
+    assert_eq!(selected.status(), StatusCode::OK);
+    assert_eq!(
+        f.get("/owned/video.m3u8?token=wrong").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        f.get("/owned/tracks-a1/mono.m3u8?token=wrong")
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    for id in [7, 8] {
+        assert_eq!(
+            f.get(&format!("/owned/nt{id}.m3u8?token=caption-viewer"))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+    f.stop().await;
+}
+
+#[tokio::test]
 async fn vendor_hls_master_aliases_preserve_authorized_child_playback() {
     use sha2::{Digest, Sha256};
     let hash = format!("{:x}", Sha256::digest(b"alias-viewer"));
@@ -2096,29 +2435,7 @@ async fn automatic_m4f_static_startup_requires_no_viewer_and_decodes_hls() {
 #[tokio::test]
 async fn m4f_vendor_rtsp_decodes_hevc_mp3_and_mp2_with_independent_ffmpeg() {
     let f = Fixture::variant(json!({"on_play":"true","only":[]}), "m4f", "standalone").await;
-    let (mut tracks, mut frames) = flussonix::m4f::unpack(&multitrack_segment()).unwrap();
-    tracks.push(Track {
-        id: 205,
-        codec: "hevc".into(),
-        config: include_bytes!("fixtures/codecs/hevc.hvcc").to_vec(),
-    });
-    let timing: Vec<Value> =
-        serde_json::from_str(include_str!("fixtures/codecs/hevc-timing.json")).unwrap();
-    for cycle in 0..8u64 {
-        for (i, t) in timing.iter().enumerate() {
-            let d = t["dts"].as_i64().unwrap();
-            let p = t["pts"].as_i64().unwrap();
-            frames.push(Frame {
-                track_id: 205,
-                dts: 90000 + cycle * 43200 + ((d + 1024) * 90000 / 12800) as u64,
-                pts_offset: (p - d) * 90000 / 12800,
-                key: t["flags"].as_str().unwrap().contains('K'),
-                body: std::fs::read(format!("tests/fixtures/codecs/hevc-{i:02}.bin")).unwrap(),
-            });
-        }
-    }
-    frames.sort_by_key(|f| f.dts);
-    *f.segment.lock().unwrap() = flussonix::m4f::pack(&tracks, &frames, 360000).unwrap();
+    *f.segment.lock().unwrap() = hevc_multitrack_segment();
     let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
         "rtsp://{}/owned?token=owned-rtsp",

@@ -1,3 +1,6 @@
+#[cfg(test)]
+pub(crate) mod file_reader;
+#[cfg(not(test))]
 mod file_reader;
 mod shared;
 use crate::wire::Hub;
@@ -12,11 +15,13 @@ pub use shared::{
 };
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -24,7 +29,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::Command,
-    sync::{Mutex, OwnedMutexGuard, Semaphore, oneshot},
+    sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, oneshot},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -52,6 +57,11 @@ pub struct Engine {
     tesseract: String,
     hls_epoch: crate::hls_generation::Epoch,
     workers: Mutex<HashMap<String, Arc<Worker>>>,
+    selected_hls_cache: std::sync::Mutex<SelectedHlsCache>,
+    selected_hls_miss_slots: Arc<Semaphore>,
+    caption_filter_slots: Arc<Semaphore>,
+    #[cfg(test)]
+    selected_hls_waiters: AtomicUsize,
     input_preferences: Mutex<HashMap<String, InputPreference>>,
     startup_gates: std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     rtsp_probe_slots: Semaphore,
@@ -66,6 +76,356 @@ pub struct Engine {
     hls_prepare_test_hook: Option<Arc<HlsPrepareHook>>,
     #[cfg(test)]
     before_remove_test_hook: Option<Arc<BeforeRemoveHook>>,
+}
+const SELECTED_HLS_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const SELECTED_HLS_CACHE_ENTRIES: usize = 512;
+
+#[derive(Default)]
+struct SelectedHlsCache {
+    entries: VecDeque<SelectedHlsEntry>,
+    bytes: usize,
+}
+struct SelectedHlsEntry {
+    generation: Weak<()>,
+    file: String,
+    selector: crate::hls_ts_select::Selector,
+    data: Bytes,
+}
+impl SelectedHlsCache {
+    fn get(
+        &mut self,
+        generation: &Arc<()>,
+        file: &str,
+        selector: crate::hls_ts_select::Selector,
+    ) -> Option<Bytes> {
+        let at = self.entries.iter().position(|entry| {
+            entry.file == file
+                && entry.selector == selector
+                && entry
+                    .generation
+                    .upgrade()
+                    .is_some_and(|owned| Arc::ptr_eq(&owned, generation))
+        })?;
+        let entry = self.entries.remove(at)?;
+        let data = entry.data.clone();
+        self.entries.push_back(entry);
+        Some(data)
+    }
+    fn insert(
+        &mut self,
+        generation: &Arc<()>,
+        file: &str,
+        selector: crate::hls_ts_select::Selector,
+        data: Bytes,
+    ) {
+        self.insert_bounded(
+            generation,
+            file,
+            selector,
+            data,
+            SELECTED_HLS_CACHE_BYTES,
+            SELECTED_HLS_CACHE_ENTRIES,
+        );
+    }
+    fn insert_bounded(
+        &mut self,
+        generation: &Arc<()>,
+        file: &str,
+        selector: crate::hls_ts_select::Selector,
+        data: Bytes,
+        max_bytes: usize,
+        max_entries: usize,
+    ) {
+        if data.len() > max_bytes / 4 {
+            return;
+        }
+        let mut removed_bytes = 0;
+        self.entries.retain(|entry| {
+            let keep = entry.generation.upgrade().is_some_and(|owned| {
+                !(Arc::ptr_eq(&owned, generation)
+                    && entry.file == file
+                    && entry.selector == selector)
+            });
+            if !keep {
+                removed_bytes += entry.data.len();
+            }
+            keep
+        });
+        self.bytes = self.bytes.saturating_sub(removed_bytes);
+        self.bytes += data.len();
+        self.entries.push_back(SelectedHlsEntry {
+            generation: Arc::downgrade(generation),
+            file: file.to_owned(),
+            selector,
+            data,
+        });
+        while self.bytes > max_bytes || self.entries.len() > max_entries {
+            if let Some(old) = self.entries.pop_front() {
+                self.bytes -= old.data.len();
+            }
+        }
+    }
+    fn remove_generation(&mut self, generation: &Arc<()>) {
+        let mut removed_bytes = 0;
+        self.entries.retain(|entry| {
+            let keep = entry
+                .generation
+                .upgrade()
+                .is_some_and(|owned| !Arc::ptr_eq(&owned, generation));
+            if !keep {
+                removed_bytes += entry.data.len();
+            }
+            keep
+        });
+        self.bytes = self.bytes.saturating_sub(removed_bytes);
+    }
+}
+#[cfg(test)]
+mod selected_hls_cache_tests {
+    use super::*;
+
+    #[test]
+    fn cache_evicts_lru_and_dead_generations_with_small_limits() {
+        let selector = crate::hls_ts_select::Selector::parse("v1a1").unwrap();
+        let first = Arc::new(());
+        let second = Arc::new(());
+        let mut cache = SelectedHlsCache::default();
+        for file in ["a.ts", "b.ts", "c.ts", "d.ts"] {
+            cache.insert_bounded(&first, file, selector, Bytes::from_static(b"four"), 20, 4);
+        }
+        assert_eq!(
+            cache.get(&first, "a.ts", selector).unwrap(),
+            Bytes::from_static(b"four")
+        );
+        cache.insert_bounded(&first, "e.ts", selector, Bytes::from_static(b"four"), 20, 4);
+        assert!(cache.get(&first, "b.ts", selector).is_none());
+        assert!(cache.get(&first, "a.ts", selector).is_some());
+        assert!(cache.get(&second, "a.ts", selector).is_none());
+        drop(first);
+        cache.insert_bounded(
+            &second,
+            "a.ts",
+            selector,
+            Bytes::from_static(b"four"),
+            20,
+            4,
+        );
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.bytes, 4);
+        assert!(cache.get(&second, "a.ts", selector).is_some());
+        cache.insert_bounded(
+            &second,
+            "large.ts",
+            selector,
+            Bytes::from_static(b"123456"),
+            20,
+            4,
+        );
+        assert_eq!(
+            cache.entries.len(),
+            1,
+            "oversize entry must not be retained"
+        );
+        cache.remove_generation(&second);
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn selected_hls_misses_share_two_slots_and_cancel_waiters() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(dir.path(), "ffmpeg"));
+        let first = engine.selected_hls_miss_permit().await.unwrap();
+        let second = engine.selected_hls_miss_permit().await.unwrap();
+        let waiting_engine = engine.clone();
+        let mut third =
+            tokio::spawn(async move { waiting_engine.selected_hls_miss_permit().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut third)
+                .await
+                .is_err(),
+            "a third cache miss entered while two jobs were active"
+        );
+        assert_eq!(engine.selected_hls_waiters_for_test(), 1);
+        third.abort();
+        assert!(third.await.unwrap_err().is_cancelled());
+        assert_eq!(engine.selected_hls_waiters_for_test(), 0);
+        drop(first);
+        let replacement =
+            tokio::time::timeout(Duration::from_secs(1), engine.selected_hls_miss_permit())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(engine.selected_hls_miss_slots.available_permits(), 0);
+        drop(replacement);
+        drop(second);
+        assert_eq!(engine.selected_hls_miss_slots.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_filter_waits_for_blocking_job_before_releasing_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "ffmpeg");
+        let permit = engine.selected_hls_miss_permit().await.unwrap();
+        let other = engine.selected_hls_miss_permit().await.unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let job = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+        job.abort();
+        drop(other);
+        let next = engine.selected_hls_miss_permit().await.unwrap();
+        let blocked = engine.selected_hls_miss_permit();
+        tokio::pin!(blocked);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut blocked)
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        let recovered = tokio::time::timeout(Duration::from_secs(1), &mut blocked)
+            .await
+            .unwrap()
+            .unwrap();
+        job.await.unwrap();
+        drop(recovered);
+        drop(next);
+    }
+}
+#[cfg(test)]
+mod caption_scheduler_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn large_drop_caption_read_does_not_stall_unrelated_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "ffmpeg");
+        engine
+            .ensure(
+                "caption-scheduler-owned",
+                &json!({"inputs":[{"url":"testsrc://"}],"flussonix_hls_subtitles":"drop"}),
+            )
+            .await
+            .unwrap();
+
+        let mut media = Vec::with_capacity(31 * 1024 * 1024);
+        let mut pat = [0xff; 188];
+        pat[..5].copy_from_slice(&[0x47, 0x40, 0, 0x10, 0]);
+        pat[5..21].copy_from_slice(&[0, 0xb0, 13, 0, 1, 0xc1, 0, 0, 0, 1, 0xf0, 0, 0, 0, 0, 0]);
+        let marker = b"flussonix-caption-scheduler-owned";
+        pat[32..32 + marker.len()].copy_from_slice(marker);
+        media.extend_from_slice(&pat);
+        let mut pmt = [0xff; 188];
+        pmt[..5].copy_from_slice(&[0x47, 0x50, 0, 0x10, 0]);
+        pmt[5..26].copy_from_slice(&[
+            2, 0xb0, 18, 0, 1, 0xc1, 0, 0, 0xe1, 0, 0xf0, 0, 0x1b, 0xe1, 0, 0xf0, 0, 0, 0, 0, 0,
+        ]);
+        media.extend_from_slice(&pmt);
+        let mut null = [0xff; 188];
+        null[..4].copy_from_slice(&[0x47, 0x1f, 0xff, 0x10]);
+        while media.len() + 188 < 31 * 1024 * 1024 {
+            media.extend_from_slice(&null);
+        }
+        std::fs::write(
+            engine.directory("caption-scheduler-owned").join("owned.ts"),
+            media,
+        )
+        .unwrap();
+
+        let (entered, release) = crate::caption_filter::pause_once_for_test(marker);
+        let (timer_tx, timer_rx) = tokio::sync::oneshot::channel();
+        let runtime = tokio::runtime::Handle::current();
+        let controller = std::thread::spawn(move || {
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            let started = Instant::now();
+            runtime.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let _ = timer_tx.send(Instant::now());
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            release.send(()).unwrap();
+            started
+        });
+        let read = engine.read("caption-scheduler-owned", "owned.ts").await;
+        let started = controller.join().unwrap();
+        let delay = timer_rx.await.unwrap().duration_since(started);
+        engine.stop_all().await;
+        read.unwrap();
+        assert!(
+            delay < Duration::from_millis(25),
+            "caption filtering stalled the async runtime for {delay:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drop_caption_fmp4_read_does_not_stall_unrelated_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "ffmpeg");
+        engine
+            .ensure(
+                "caption-fmp4-owned",
+                &json!({"inputs":[{"url":"testsrc://"}],"flussonix_hls_subtitles":"drop"}),
+            )
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let segment = loop {
+            if let Ok(playlist) = engine.read("caption-fmp4-owned", "fmp4/index.m3u8").await {
+                let playlist = String::from_utf8(playlist.to_vec()).unwrap();
+                if let Some(segment) = playlist
+                    .lines()
+                    .find(|line| !line.starts_with('#') && line.ends_with(".m4s"))
+                {
+                    break segment.to_owned();
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fMP4 test segment did not arrive"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let path = engine
+            .directory("caption-fmp4-owned")
+            .join("fmp4")
+            .join(&segment);
+        let marker = b"flussonix-fmp4-caption-scheduler-owned";
+        let mut media = std::fs::read(&path).unwrap();
+        media.extend_from_slice(&crate::m4s::atom(b"free", marker));
+        std::fs::write(&path, media).unwrap();
+
+        let (entered, release) = crate::caption_filter::pause_mp4_once_for_test(marker);
+        let (timer_tx, timer_rx) = tokio::sync::oneshot::channel();
+        let runtime = tokio::runtime::Handle::current();
+        let controller = std::thread::spawn(move || {
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            let started = Instant::now();
+            runtime.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let _ = timer_tx.send(Instant::now());
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            release.send(()).unwrap();
+            started
+        });
+        let read = engine
+            .read("caption-fmp4-owned", &format!("fmp4/{segment}"))
+            .await;
+        let started = controller.join().unwrap();
+        let delay = timer_rx.await.unwrap().duration_since(started);
+        engine.stop_all().await;
+        read.unwrap();
+        assert!(
+            delay < Duration::from_millis(25),
+            "fMP4 caption filtering stalled the async runtime for {delay:?}"
+        );
+    }
 }
 #[cfg(test)]
 type BeforeRemoveHook =
@@ -116,7 +476,7 @@ pub struct Worker {
     input_index: usize,
     input_protocol: String,
     subtitle_tracks: &'static str,
-    hls_subtitles: &'static str,
+    pub(crate) hls_subtitles: &'static str,
     native_text_tracks: AtomicU64,
     fxlink_telemetry: std::sync::Mutex<Option<Arc<crate::fxlink::Telemetry>>>,
     captions: Option<Arc<crate::caption_hls::State>>,
@@ -129,6 +489,8 @@ pub struct Worker {
     recovery: std::sync::Mutex<crate::recovery::Recovery>,
     pub bytes: AtomicU64,
     output_rate: std::sync::Mutex<crate::media_rate::OutputRate>,
+    hls_track_profile: std::sync::Mutex<Option<(usize, usize)>>,
+    selected_hls_token: Arc<()>,
     pub viewers: Arc<AtomicU64>,
     pub alive: std::sync::atomic::AtomicBool,
     pub wire: Arc<Hub>,
@@ -263,8 +625,74 @@ impl Worker {
         }
         self.output_rate.lock().unwrap().snapshot(Instant::now())
     }
+    pub(crate) fn hls_track_profile(&self) -> Option<(usize, usize)> {
+        *self.hls_track_profile.lock().unwrap()
+    }
+    pub(crate) fn remember_hls_track_profile(&self, profile: (usize, usize)) {
+        *self.hls_track_profile.lock().unwrap() = Some(profile);
+    }
 }
 impl Engine {
+    #[cfg(test)]
+    pub(crate) fn selected_hls_waiters_for_test(&self) -> usize {
+        self.selected_hls_waiters.load(Ordering::Relaxed)
+    }
+
+    /// All selected HLS cache misses share this gate. Acquire before reading
+    /// source bytes, then move the permit into the blocking filter job so a
+    /// disconnected viewer cannot release the transient-memory budget early.
+    /// A saturated gate fails the request after the live HLS readiness window.
+    pub(crate) async fn selected_hls_miss_permit(&self) -> Result<OwnedSemaphorePermit, ()> {
+        #[cfg(test)]
+        let _waiting = {
+            struct Waiting<'a>(&'a AtomicUsize);
+            impl Drop for Waiting<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            self.selected_hls_waiters.fetch_add(1, Ordering::Relaxed);
+            Waiting(&self.selected_hls_waiters)
+        };
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            self.selected_hls_miss_slots.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+    }
+
+    /// Cache media bytes only. Every HTTP request must perform its own viewer
+    /// admission and current-generation checks before using this cache.
+    pub(crate) fn cached_selected_hls(
+        &self,
+        worker: &Arc<Worker>,
+        file: &str,
+        selector: crate::hls_ts_select::Selector,
+    ) -> Option<Bytes> {
+        self.selected_hls_cache
+            .lock()
+            .unwrap()
+            .get(&worker.selected_hls_token, file, selector)
+    }
+    pub(crate) fn remember_selected_hls(
+        &self,
+        worker: &Arc<Worker>,
+        file: &str,
+        selector: crate::hls_ts_select::Selector,
+        data: Bytes,
+    ) {
+        if worker.is_closed() || !worker.alive.load(Ordering::Relaxed) {
+            return;
+        }
+        self.selected_hls_cache.lock().unwrap().insert(
+            &worker.selected_hls_token,
+            file,
+            selector,
+            data,
+        );
+    }
     pub fn new(root: impl AsRef<Path>, ffmpeg: &str) -> Self {
         Self::new_with_fxlink(root, ffmpeg, crate::fxlink::Features::default())
     }
@@ -295,6 +723,11 @@ impl Engine {
             tesseract: tesseract.into(),
             hls_epoch: crate::hls_generation::Epoch::for_root(root.as_ref()),
             workers: Mutex::new(HashMap::new()),
+            selected_hls_cache: std::sync::Mutex::new(SelectedHlsCache::default()),
+            selected_hls_miss_slots: Arc::new(Semaphore::new(2)),
+            caption_filter_slots: Arc::new(Semaphore::new(2)),
+            #[cfg(test)]
+            selected_hls_waiters: AtomicUsize::new(0),
             input_preferences: Mutex::new(HashMap::new()),
             startup_gates: std::sync::Mutex::new(HashMap::new()),
             rtsp_probe_slots: Semaphore::new(32),
@@ -1430,6 +1863,8 @@ impl Engine {
             recovery: std::sync::Mutex::new(crate::recovery::Recovery::new(streak)),
             bytes: AtomicU64::new(0),
             output_rate: std::sync::Mutex::new(crate::media_rate::OutputRate::default()),
+            hls_track_profile: std::sync::Mutex::new(None),
+            selected_hls_token: Arc::new(()),
             viewers,
             alive: std::sync::atomic::AtomicBool::new(true),
             wire: if profile.full_copy() {
@@ -1934,6 +2369,82 @@ impl Engine {
     pub async fn read(&self, name: &str, file: &str) -> Result<Bytes, String> {
         self.read_mode(name, file, true).await
     }
+    pub(crate) async fn is_current_worker(&self, name: &str, worker: &Arc<Worker>) -> bool {
+        self.workers
+            .lock()
+            .await
+            .get(name)
+            .is_some_and(|current| Arc::ptr_eq(current, worker))
+    }
+    /// A generated HLS segment may be replaced while its file is being read.
+    /// Selected output is tied to the exact worker that admitted this viewer.
+    pub(crate) async fn read_current_worker(
+        &self,
+        name: &str,
+        file: &str,
+        worker: &Arc<Worker>,
+    ) -> Result<Bytes, String> {
+        if !self.is_current_worker(name, worker).await || worker.is_closed() {
+            return Err("HLS worker changed".into());
+        }
+        let bytes = self.read_mode(name, file, true).await?;
+        if !self.is_current_worker(name, worker).await || worker.is_closed() {
+            return Err("HLS worker changed".into());
+        }
+        Ok(bytes)
+    }
+    /// Selected TS media keeps its miss permit inside file I/O and caption
+    /// filtering, then returns it for the selection/filter/cache stage.
+    pub(crate) async fn read_current_worker_selected_ts(
+        &self,
+        name: &str,
+        file: &str,
+        worker: &Arc<Worker>,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<(OwnedSemaphorePermit, Bytes), String> {
+        if !self.is_current_worker(name, worker).await || worker.is_closed() {
+            return Err("HLS worker changed".into());
+        }
+        let result = self.read_selected_ts_mode(name, file, true, permit).await?;
+        if !self.is_current_worker(name, worker).await || worker.is_closed() {
+            return Err("HLS worker changed".into());
+        }
+        Ok(result)
+    }
+    async fn read_selected_ts_mode(
+        &self,
+        name: &str,
+        file: &str,
+        touch_demand: bool,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<(OwnedSemaphorePermit, Bytes), String> {
+        if !file.ends_with(".ts") || !valid_file(file) {
+            return Err("invalid media path".into());
+        }
+        let worker = self
+            .workers
+            .lock()
+            .await
+            .get(name)
+            .cloned()
+            .ok_or("media worker unavailable")?;
+        if !worker.alive.load(Ordering::Relaxed) || worker.is_closed() {
+            return Err("media worker unavailable".into());
+        }
+        if touch_demand {
+            worker.touch();
+        }
+        let (permit, data) = file_reader::read_ts_with_permit(
+            &self.root,
+            name,
+            file,
+            32 * 1024 * 1024,
+            worker.hls_subtitles == "drop",
+            permit,
+        )
+        .await?;
+        Ok((permit, Bytes::from(data)))
+    }
     async fn read_mode(&self, name: &str, file: &str, touch_demand: bool) -> Result<Bytes, String> {
         if self
             .workers
@@ -1986,46 +2497,37 @@ impl Engine {
         } else {
             return Err("media worker unavailable".into());
         }
-        let mut data = file_reader::read(&self.root, name, file, 32 * 1024 * 1024).await?;
         let drop_captions = self
             .workers
             .lock()
             .await
             .get(name)
             .is_some_and(|w| w.hls_subtitles == "drop");
-        if drop_captions {
-            if file.ends_with(".ts") {
-                crate::caption_filter::ts(&mut data)?;
-            } else if file.ends_with(".m4s") {
-                let prefix = if file.starts_with("fmp4/") {
-                    "fmp4/"
-                } else {
-                    ""
-                };
-                let list = file_reader::read(
+        if drop_captions && (file.ends_with(".ts") || file.ends_with(".m4s")) {
+            let permit = tokio::time::timeout(
+                Duration::from_secs(8),
+                self.caption_filter_slots.clone().acquire_owned(),
+            )
+            .await
+            .map_err(|_| "caption filter admission unavailable")?
+            .map_err(|_| "caption filter admission unavailable")?;
+            let (permit, data) = if file.ends_with(".ts") {
+                file_reader::read_ts_with_permit(
                     &self.root,
                     name,
-                    &format!("{prefix}index.m3u8"),
-                    2 * 1024 * 1024,
+                    file,
+                    32 * 1024 * 1024,
+                    true,
+                    permit,
                 )
-                .await?;
-                let list = String::from_utf8(list).map_err(|_| "media not ready")?;
-                let init = list
-                    .lines()
-                    .find_map(|l| l.strip_prefix("#EXT-X-MAP:URI=\""))
-                    .and_then(|l| l.split('"').next())
-                    .filter(|l| valid_file(l) && l.ends_with(".mp4"))
-                    .ok_or("caption initialization unavailable")?;
-                let init = file_reader::read(
-                    &self.root,
-                    name,
-                    &format!("{prefix}{init}"),
-                    2 * 1024 * 1024,
-                )
-                .await?;
-                crate::caption_filter::mp4(&init, &mut data)?;
-            }
+                .await?
+            } else {
+                file_reader::read_mp4_with_permit(&self.root, name, file, permit).await?
+            };
+            drop(permit);
+            return Ok(Bytes::from(data));
         }
+        let data = file_reader::read(&self.root, name, file, 32 * 1024 * 1024).await?;
         Ok(Bytes::from(data))
     }
     async fn join_and_commit(
@@ -2055,6 +2557,10 @@ impl Engine {
         worker: Arc<Worker>,
         guard: OwnedMutexGuard<()>,
     ) -> Result<OwnedMutexGuard<()>, String> {
+        self.selected_hls_cache
+            .lock()
+            .unwrap()
+            .remove_generation(&worker.selected_hls_token);
         let name = name.to_owned();
         let directory = self.directory(&name);
         let epoch = self.hls_epoch.clone();
@@ -2086,6 +2592,12 @@ impl Engine {
         retired: Option<Arc<Worker>>,
         guard: OwnedMutexGuard<()>,
     ) -> Result<(OwnedMutexGuard<()>, u64), String> {
+        if let Some(worker) = retired.as_ref() {
+            self.selected_hls_cache
+                .lock()
+                .unwrap()
+                .remove_generation(&worker.selected_hls_token);
+        }
         let name = name.to_owned();
         let directory = self.directory(&name);
         let epoch = self.hls_epoch.clone();
