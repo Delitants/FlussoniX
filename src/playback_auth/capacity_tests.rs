@@ -128,7 +128,7 @@ fn seed(auth: &PlaybackAuth, snapshot: &PolicySnapshot, count: usize, decision: 
                     cancel: CancellationToken::new(),
                     callback_lanes: HashMap::new(),
                 }),
-                flight: AsyncMutex::new(()),
+                flight: Arc::new(AsyncMutex::new(())),
                 remote: AsyncMutex::new(RemoteState::default()),
                 remote_notify: Notify::new(),
                 remote_epoch: Instant::now(),

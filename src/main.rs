@@ -507,6 +507,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tokio::select! { _=auth_cancel.cancelled()=>break, _=interval.tick()=>auth_app.playback_auth.renew_due().await }
         }
     });
+    let renewal_app = app.clone();
+    let renewal_cancel = cancel.clone();
+    let renewal = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = renewal_cancel.cancelled() => break,
+                _ = interval.tick() => renewal_app.playback_auth.schedule_due(),
+            }
+        }
+    });
     let iptv_probe = app.iptv_authority_client.clone().map(|client| {
         let probe_cancel = cancel.clone();
         tokio::spawn(async move {
@@ -570,6 +582,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     cancel.cancel();
     let _ = supervisor.await;
     let _ = authorization.await;
+    let _ = renewal.await;
     if let Some(task) = iptv_probe {
         let _ = task.await;
     }

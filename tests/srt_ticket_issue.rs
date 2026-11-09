@@ -11,7 +11,15 @@ use flussonix::{
 use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{net::SocketAddr, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tower::ServiceExt;
 #[path = "support/tls.rs"]
 mod tls_fixture;
@@ -301,6 +309,102 @@ async fn owned_https_listener_issues_without_exposing_the_original_token() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn https_srt_ticket_rejects_expired_callback_after_503() {
+    let lab = Lab::new(true, true);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let callback_calls = calls.clone();
+    let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let callback_url = format!("http://{}/auth", backend.local_addr().unwrap());
+    let callback_task = tokio::spawn(async move {
+        axum::serve(
+            backend,
+            axum::Router::new().route(
+                "/auth",
+                axum::routing::get(move || {
+                    let calls = callback_calls.clone();
+                    async move {
+                        let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                        (
+                            if first {
+                                StatusCode::OK
+                            } else {
+                                StatusCode::SERVICE_UNAVAILABLE
+                            },
+                            [("X-AuthDuration", "1")],
+                        )
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    lab.app
+        .config
+        .put(
+            "streams",
+            "owned",
+            json!({
+                "inputs":[{"url":"testsrc://"}], "on_play":callback_url
+            }),
+        )
+        .unwrap();
+    let certs = tls_fixture::Certificates::new();
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = tcp.local_addr().unwrap().port();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let app = lab.app.clone();
+    let stop = cancel.clone();
+    let tls = certs.server();
+    let task = tokio::spawn(async move { flussonix::http_tls::serve(tcp, tls, app, stop).await });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(&std::fs::read(&certs.ca).unwrap()).unwrap(),
+        )
+        .build()
+        .unwrap();
+    let endpoint = format!("https://localhost:{port}/flussonix/api/v1/srt-ticket");
+    let initial = client
+        .post(&endpoint)
+        .header("content-type", "application/json")
+        .body(BODY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(initial.status(), StatusCode::OK);
+    let initial_body = initial.text().await.unwrap();
+    assert!(initial_body.contains("flussonix_ticket="));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    lab.app.playback_auth.renew_due().await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "503 callback was not exercised"
+    );
+    let expired = client
+        .post(&endpoint)
+        .header("content-type", "application/json")
+        .body(BODY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(expired.status(), StatusCode::FORBIDDEN);
+    assert_eq!(expired.headers()["cache-control"], "private, no-store");
+    let expired_body = expired.text().await.unwrap();
+    assert!(!expired_body.contains("flussonix_ticket="));
+    assert!(!expired_body.contains("owned-secret"));
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    callback_task.abort();
+    let _ = callback_task.await;
 }
 
 #[tokio::test]

@@ -1074,6 +1074,15 @@ mod tests {
     #[tokio::test]
     async fn live_quic_datagram_erasure_reconstructs_exact_native_record() {
         let _serial = super::super::transport::test_lock().lock().await;
+        struct ResetDrop;
+        impl Drop for ResetDrop {
+            fn drop(&mut self) {
+                TEST_DROP.store(0, std::sync::atomic::Ordering::Release);
+                TEST_FIRST.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        // A failed assertion must not inject packet loss into later QUIC tests.
+        let _reset = ResetDrop;
         let cert = test_tls::Certificates::new();
         for mode in [1, 2, 3] {
             let settings = Settings {
@@ -1112,7 +1121,12 @@ mod tests {
             if mode == 2 {
                 assert!(result.is_err());
                 assert!(!sub.current());
-                assert_eq!(sub.stats().expired_records, 1);
+                assert_eq!(
+                    sub.stats().expired_records,
+                    1,
+                    "mode={mode}, recv={result:?}, telemetry={}",
+                    telemetry.snapshot()
+                );
             } else {
                 assert_eq!(result.unwrap(), record());
                 if mode == 1 {
@@ -1148,7 +1162,6 @@ mod tests {
                 assert!(egress.load(Ordering::Relaxed) > 0);
             }
         }
-        TEST_DROP.store(0, std::sync::atomic::Ordering::Release);
     }
 }
 

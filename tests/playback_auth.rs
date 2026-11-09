@@ -33,6 +33,7 @@ async fn callback(
     let status = match mode {
         1 => StatusCode::FORBIDDEN,
         2 => StatusCode::INTERNAL_SERVER_ERROR,
+        15 => StatusCode::SERVICE_UNAVAILABLE,
         3 => StatusCode::FOUND,
         5 if ["qs", "user_agent", "referer", "host"]
             .iter()
@@ -76,6 +77,17 @@ async fn callback(
     }
     if mode == 4 {
         headers.remove("x-authduration");
+    }
+    let long_lease = match mode {
+        5 => q.get("qs").is_some_and(|qs| qs.contains("plan=allowed")),
+        8 => q.get("qs").is_some_and(|qs| qs.contains("lane=second")),
+        13 => q.get("qs").is_some_and(|qs| qs.contains("profile=two")),
+        14 => q.get("qs").is_some_and(|qs| qs.contains("lane=long")),
+        16 => true,
+        _ => false,
+    };
+    if long_lease {
+        headers.insert("x-authduration", "30".parse().unwrap());
     }
     (status, headers)
 }
@@ -655,6 +667,32 @@ async fn renewal_denial_cancels_only_its_original_mpegts_viewer() {
         "another lane was cancelled by the denial"
     );
     assert_eq!(backend.calls.load(Ordering::SeqCst), 4);
+    app.media.stop_all().await;
+    task.abort();
+}
+
+#[tokio::test]
+async fn callback_503_expires_only_short_http_viewer_and_denies_reconnect() {
+    let (_dir, app, backend, task, _) = setup().await;
+    backend.mode.store(14, Ordering::SeqCst);
+    let short = media(&app, "/owned/mpegts?token=same&lane=short").await;
+    let long = media(&app, "/owned/mpegts?token=same&lane=long").await;
+    assert_eq!(short.status(), StatusCode::OK);
+    assert_eq!(long.status(), StatusCode::OK);
+    backend.mode.store(15, Ordering::SeqCst);
+    assert_eq!(app.playback_auth.force_reauth("owned"), 1);
+    app.playback_auth.renew_due().await;
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 4);
+    assert!(
+        closed(short).await,
+        "expired MPEG-TS viewer stayed connected"
+    );
+    let denied = media(&app, "/owned/mpegts?token=same&lane=short").await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !closed(long).await,
+        "longer-lived sibling or shared worker stopped"
+    );
     app.media.stop_all().await;
     task.abort();
 }
@@ -1384,7 +1422,8 @@ async fn review_concurrent_different_streams_preserve_user_limit() {
 async fn review_silent_m4_bodies_close_on_revocation() {
     use futures_util::StreamExt;
     for protocol in ["m4s", "m4f"] {
-        let (_d, app, _b, task, _) = setup().await;
+        let (_d, app, backend, task, _) = setup().await;
+        backend.mode.store(16, Ordering::SeqCst);
         let response = media(&app, &format!("/owned/{protocol}?token=silent")).await;
         assert_eq!(response.status(), 200);
         let id = session_id(&app).await;
