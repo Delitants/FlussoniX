@@ -24,6 +24,9 @@ pub(super) fn validate(root: &Value) -> Result<(), String> {
     for row in rows {
         let name = row["name"].as_str().ok_or("balancer name required")?;
         super::valid_identity(&row["name"])?;
+        if matches!(name, "admin" | "streamer" | "flussonix" | "tv") {
+            return Err("balancer name overlaps a reserved HTTP path".into());
+        }
         if streams.iter().any(|stream| {
             *stream == name
                 || stream
@@ -151,6 +154,22 @@ mod tests {
             assert!(
                 validate(&root).is_err(),
                 "accepted overlapping source prefix {prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_balancer_rejects_paths_owned_by_administration_and_iptv() {
+        for name in ["admin", "streamer", "flussonix", "tv"] {
+            let root = json!({
+                "balancers":[{"name":name,"servers":[{"name":"cdn-a"}]}],
+                "peers":[{"hostname":"cdn-a","public_payload_url":"https://cdn.example"}],
+                "streams":[],
+                "sources":[]
+            });
+            assert!(
+                validate(&root).is_err(),
+                "accepted reserved HTTP path {name}"
             );
         }
     }
