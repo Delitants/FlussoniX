@@ -3,13 +3,15 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering,
+    collections::HashMap,
     io::Read,
     net::IpAddr,
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 const MAX_GEOIP_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_AFFINITY_ENTRIES: usize = 20_000;
 
 pub(super) struct GeoIp {
     reader: maxminddb::Reader<Vec<u8>>,
@@ -206,6 +208,65 @@ pub(super) struct ObservedPeer<'a> {
     pub age_ms: u64,
 }
 
+pub(super) struct Ranked {
+    pub order: Vec<String>,
+    pub scope: [u8; 32],
+}
+
+#[derive(Default)]
+pub(super) struct Affinity {
+    entries: HashMap<[u8; 32], StoredAffinity>,
+}
+
+struct StoredAffinity {
+    peer: String,
+    expires: Instant,
+}
+
+impl Affinity {
+    pub fn prefer(&mut self, ranked: &Ranked, now: Instant) -> Vec<String> {
+        let mut order = ranked.order.clone();
+        if self
+            .entries
+            .get(&ranked.scope)
+            .is_some_and(|entry| entry.expires <= now)
+        {
+            self.entries.remove(&ranked.scope);
+        }
+        if let Some(peer) = self.entries.get(&ranked.scope).map(|entry| &entry.peer)
+            && let Some(position) = order.iter().position(|candidate| candidate == peer)
+        {
+            let selected = order.remove(position);
+            order.insert(0, selected);
+        }
+        order
+    }
+
+    pub fn remember(&mut self, scope: [u8; 32], peer: String, now: Instant) {
+        if self.entries.len() >= MAX_AFFINITY_ENTRIES && !self.entries.contains_key(&scope) {
+            self.entries.retain(|_, entry| entry.expires > now);
+            if self.entries.len() >= MAX_AFFINITY_ENTRIES {
+                let mut oldest = self
+                    .entries
+                    .iter()
+                    .map(|(key, entry)| (*key, entry.expires))
+                    .collect::<Vec<_>>();
+                oldest.sort_unstable_by_key(|(_, expires)| *expires);
+                for (key, _) in oldest.into_iter().take(MAX_AFFINITY_ENTRIES / 4) {
+                    self.entries.remove(&key);
+                }
+            }
+        }
+        self.entries.insert(
+            scope,
+            StoredAffinity {
+                peer,
+                expires: now + Duration::from_secs(600),
+            },
+        );
+    }
+}
+
 pub(super) fn rank(
     config: &Value,
     candidates: &[ObservedPeer<'_>],
@@ -214,11 +275,7 @@ pub(super) fn rank(
     revision: u64,
     stream: &str,
     affinity: &str,
-) -> Vec<String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+) -> Ranked {
     rank_at(
         config,
         candidates,
@@ -226,7 +283,6 @@ pub(super) fn rank(
         country,
         revision,
         (stream, affinity),
-        now,
     )
 }
 
@@ -252,11 +308,13 @@ fn rank_at(
     country: Option<&str>,
     revision: u64,
     session: (&str, &str),
-    now_seconds: u64,
-) -> Vec<String> {
+) -> Ranked {
     let (stream, affinity) = session;
     let Some(servers) = config["servers"].as_array() else {
-        return Vec::new();
+        return Ranked {
+            order: Vec::new(),
+            scope: [0; 32],
+        };
     };
     let scoped = servers.iter().any(|server| {
         server["countries"]
@@ -335,12 +393,11 @@ fn rank_at(
         scope.update(part.as_bytes());
     }
     scope.update(revision.to_be_bytes());
-    scope.update((now_seconds / 600).to_be_bytes());
     for name in membership {
         scope.update((name.len() as u64).to_be_bytes());
         scope.update(name.as_bytes());
     }
-    let scope = scope.finalize();
+    let scope: [u8; 32] = scope.finalize().into();
     let mut ranked = eligible
         .into_iter()
         .map(|(name, score)| {
@@ -356,7 +413,10 @@ fn rank_at(
             .then_with(|| left.2.cmp(&right.2))
             .then_with(|| left.0.cmp(&right.0))
     });
-    ranked.into_iter().map(|(name, _, _)| name).collect()
+    Ranked {
+        order: ranked.into_iter().map(|(name, _, _)| name).collect(),
+        scope,
+    }
 }
 
 #[cfg(test)]
@@ -394,6 +454,7 @@ mod tests {
             "channel",
             "viewer-1",
         )
+        .order
     }
 
     #[test]
@@ -456,6 +517,63 @@ mod tests {
         peers[0].bandwidth_usage = None;
         let config = json!({"name":"lb0","mode":"usage","servers":[{"name":"a"},{"name":"b"}]});
         assert_eq!(rank_names(config, &peers, None), ["b"]);
+    }
+
+    #[test]
+    fn returning_viewer_prefers_successful_peer_until_expiry_or_policy_change() {
+        let config = json!({"name":"lb0","mode":"bitrate","servers":[{"name":"a"},{"name":"b"}]});
+        let first = [peer("a", 100, 10.0, 1, 1), peer("b", 200, 10.0, 1, 1)];
+        let shifted = [peer("a", 300, 10.0, 1, 1), peer("b", 200, 10.0, 1, 1)];
+        let client = "198.51.100.8".parse().unwrap();
+        let started = Instant::now();
+        let first_rank = rank_at(&config, &first, client, None, 7, ("channel", "viewer"));
+        let shifted_rank = rank_at(&config, &shifted, client, None, 7, ("channel", "viewer"));
+        assert_eq!(first_rank.order[0], "a");
+        assert_eq!(shifted_rank.order[0], "b");
+        let mut cache = Affinity::default();
+        cache.remember(first_rank.scope, "a".into(), started);
+        assert_eq!(
+            cache.prefer(&shifted_rank, started + Duration::from_secs(599))[0],
+            "a"
+        );
+        assert_eq!(
+            cache.prefer(&shifted_rank, started + Duration::from_secs(600))[0],
+            "b"
+        );
+        cache.remember(first_rank.scope, "a".into(), started);
+        let revised = rank_at(&config, &shifted, client, None, 8, ("channel", "viewer"));
+        assert_eq!(cache.prefer(&revised, started)[0], "b");
+        let changed = json!({"name":"lb0","mode":"bitrate","servers":[{"name":"b"}]});
+        let narrowed = rank_at(&changed, &shifted, client, None, 7, ("channel", "viewer"));
+        assert_eq!(cache.prefer(&narrowed, started)[0], "b");
+    }
+
+    #[test]
+    fn affinity_preserves_fallback_rank_and_bounds_cache_memory() {
+        let config = json!({"name":"lb0","mode":"bitrate","servers":[{"name":"a"},{"name":"b"},{"name":"c"}]});
+        let peers = [
+            peer("a", 300, 1.0, 1, 1),
+            peer("b", 100, 1.0, 1, 1),
+            peer("c", 200, 1.0, 1, 1),
+        ];
+        let ranked = rank_at(
+            &config,
+            &peers,
+            "198.51.100.8".parse().unwrap(),
+            None,
+            7,
+            ("channel", "viewer"),
+        );
+        let now = Instant::now();
+        let mut cache = Affinity::default();
+        cache.remember(ranked.scope, "a".into(), now);
+        assert_eq!(cache.prefer(&ranked, now), ["a", "b", "c"]);
+        for value in 0_u64..(MAX_AFFINITY_ENTRIES as u64 + 1) {
+            let mut scope = [0_u8; 32];
+            scope[..8].copy_from_slice(&value.to_be_bytes());
+            cache.remember(scope, "b".into(), now);
+        }
+        assert!(cache.entries.len() <= MAX_AFFINITY_ENTRIES);
     }
 
     #[test]

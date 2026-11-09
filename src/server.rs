@@ -194,6 +194,7 @@ pub struct App {
     http_routes: http_balancer::Registry,
     geoip: Option<named_balancer::GeoIp>,
     routing_rotation: TieRotation,
+    named_affinity: std::sync::Mutex<named_balancer::Affinity>,
     pub egress: Arc<AtomicU64>,
     pub rtsp_egress: Arc<AtomicU64>,
     pub rtsp_udp_egress: Arc<AtomicU64>,
@@ -520,6 +521,7 @@ impl App {
             http_routes: http_balancer::Registry::default(),
             geoip,
             routing_rotation: TieRotation::default(),
+            named_affinity: std::sync::Mutex::new(named_balancer::Affinity::default()),
             egress: Arc::new(AtomicU64::new(0)),
             rtsp_egress: Arc::new(AtomicU64::new(0)),
             rtsp_udp_egress: Arc::new(AtomicU64::new(0)),
@@ -836,9 +838,8 @@ impl App {
     async fn active(&self) -> u64 {
         self.playback_auth.active()
     }
-    async fn node(&self) -> Value {
+    async fn stream_inventory_names(&self) -> std::collections::BTreeSet<String> {
         let cfg = self.config.snapshot();
-        let mut streams = Vec::new();
         let mut names = cfg["streams"]
             .as_array()
             .unwrap()
@@ -855,11 +856,16 @@ impl App {
             )
             .collect::<std::collections::BTreeSet<_>>();
         names.extend(self.media.workers().await.into_iter().map(|(name, _)| name));
-        for name in names {
+        names
+    }
+    async fn node(&self) -> Value {
+        let mut streams = Vec::new();
+        for name in self.stream_inventory_names().await {
             streams.push(json!({"name":name,"ready":self.media.ready(&name).await,"stats":self.stream_stats(&name).await}));
         }
         let mut node = self.load_node().await;
         node["version"] = json!(env!("CARGO_PKG_VERSION"));
+        node["total_streams_count"] = json!(streams.len());
         node["streams"] = json!(streams);
         node
     }
@@ -901,7 +907,7 @@ impl App {
             "hostname":self.node_name,
             "uptime":self.started.elapsed().as_secs(),
             "total_streams":self.config.read(|root|root["streams"].as_array().map_or(0,Vec::len)),
-            "total_streams_count":self.config.read(|root|root["streams"].as_array().map_or(0,Vec::len)),
+            "total_streams_count":self.stream_inventory_names().await.len(),
             "online_streams":online_streams,
             "total_clients":self.active().await,
             "total_bandwidth":(self.options.uplink_mbps*1_000_000.0).round() as u64,
@@ -1028,10 +1034,7 @@ impl App {
             .map(|n| json!(n * 100.0))
             .unwrap_or(Value::Null);
         metrics["total_clients"] = metrics["active"].clone();
-        metrics["total_streams_count"] = json!(
-            self.config
-                .read(|root| root["streams"].as_array().map_or(0, Vec::len))
-        );
+        metrics["total_streams_count"] = json!(self.stream_inventory_names().await.len());
         metrics["stream_bitrates"] = stream_bitrates;
         metrics["source_activation"] = self.source_activation_status().await;
         if let Some(runtime) = &self.vendor_playback {
@@ -2248,6 +2251,19 @@ pub(crate) struct BalanceRequest<'a> {
     pub(crate) named: Option<&'a str>,
     pub(crate) client_ip: Option<IpAddr>,
 }
+#[derive(Clone)]
+struct NamedPlacement {
+    scope: [u8; 32],
+    peer: String,
+}
+fn with_named_placement(mut response: Response, scope: Option<[u8; 32]>, peer: String) -> Response {
+    if let Some(scope) = scope {
+        response
+            .extensions_mut()
+            .insert(NamedPlacement { scope, peer });
+    }
+    response
+}
 async fn balance(
     app: &Arc<App>,
     request: BalanceRequest<'_>,
@@ -2255,16 +2271,24 @@ async fn balance(
     revision: u64,
 ) -> Response {
     let work = balance_inner(app, request, grant, revision);
-    let response = tokio::select! { biased;
+    let mut response = tokio::select! { biased;
         _=grant.cancelled()=>error(StatusCode::FORBIDDEN,"playback policy changed"),
         result=tokio::time::timeout(Duration::from_secs(8),work)=>result.unwrap_or_else(|_|error(StatusCode::SERVICE_UNAVAILABLE,"placement deadline exceeded")),
     };
-    if response.status().is_redirection() && !app.playback_auth.release_redirect_lease(grant).await
-    {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "IPTV redirect lease release failed",
-        );
+    if response.status().is_redirection() {
+        if !app.playback_auth.release_redirect_lease(grant).await {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "IPTV redirect lease release failed",
+            );
+        }
+        if let Some(placement) = response.extensions_mut().remove::<NamedPlacement>() {
+            app.named_affinity.lock().unwrap().remember(
+                placement.scope,
+                placement.peer,
+                Instant::now(),
+            );
+        }
     }
     response
 }
@@ -2365,6 +2389,7 @@ async fn balance_inner(
     drop(calls);
     let mut attempted = std::collections::HashSet::new();
     let mut turn = None;
+    let mut named_affinity_scope = None;
     loop {
         // A failed admission can consume the remaining sample lifetime. Reproject
         // every observed candidate, including those the previous cost excluded.
@@ -2461,7 +2486,7 @@ async fn balance_inner(
             } else {
                 None
             };
-            named_balancer::rank(
+            let ranked = named_balancer::rank(
                 policy,
                 &candidates,
                 ip,
@@ -2469,9 +2494,15 @@ async fn balance_inner(
                 revision,
                 name,
                 grant.session_identity().unwrap_or(""),
-            )
-            .into_iter()
-            .next()
+            );
+            let scope = *named_affinity_scope.get_or_insert(ranked.scope);
+            let mut affinity = app.named_affinity.lock().unwrap();
+            let order = if scope == ranked.scope {
+                affinity.prefer(&ranked, Instant::now())
+            } else {
+                ranked.order
+            };
+            order.into_iter().next()
         } else {
             app.routing_rotation.select(&nodes, 0.0, &mut turn)
         };
@@ -2487,7 +2518,11 @@ async fn balance_inner(
             if let Some(location) = http_balancer::vendor_location(p, name, path, query)
                 && app.hold_vendor_http(p, selected, bitrate_mbps, revision)
             {
-                return (StatusCode::FOUND, [("location", location)]).into_response();
+                return with_named_placement(
+                    (StatusCode::FOUND, [("location", location)]).into_response(),
+                    named_affinity_scope,
+                    id,
+                );
             }
             continue;
         }
@@ -2531,7 +2566,11 @@ async fn balance_inner(
                             path.trim_start_matches('/'),
                             query
                         );
-                        return (StatusCode::FOUND, [("location", url)]).into_response();
+                        return with_named_placement(
+                            (StatusCode::FOUND, [("location", url)]).into_response(),
+                            named_affinity_scope,
+                            id,
+                        );
                     }
                 }
             }
