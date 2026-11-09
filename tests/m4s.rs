@@ -24,7 +24,7 @@ fn sparse_subtitle_track(id: u32) -> Vec<u8> {
 fn m4s_accepts_silent_subtitle_metadata_without_configuration() {
     let mut handler = vec![0; 4];
     handler.extend_from_slice(&1u32.to_be_bytes());
-    handler.extend_from_slice(b"soun aac\0");
+    handler.extend_from_slice(b"sounaac\0");
     let audio = atom(
         b"trak",
         &[
