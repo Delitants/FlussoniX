@@ -98,13 +98,15 @@ async fn run(push: bool, digital: bool, hevc: bool, input: &[u8], expected: &BTr
         // interactive quit after the paced fixture has supplied all cue events;
         // flush the untouched transport and require successful process exit.
         tokio::time::sleep(Duration::from_secs(12)).await;
-        receiver
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(b"q\n")
-            .await
-            .unwrap();
+        if let Err(err) = receiver.stdin.take().unwrap().write_all(b"q\n").await {
+            let status = receiver.try_wait().unwrap();
+            let log = std::fs::read_to_string(path.with_extension("log")).unwrap_or_default();
+            let worker = app.media.stats("owned").await;
+            panic!(
+                "SRT receiver exited before quit: {err}; status={status:?}; worker_status={}; worker_error={}; ffmpeg={log}",
+                worker["status"], worker["last_error"]
+            );
+        }
         let outcome = tokio::time::timeout(Duration::from_secs(3), receiver.wait()).await;
         let words = if hls == "convert" {
             Some(converted_words(&app, if digital { "s1.m3u8" } else { "cc1.m3u8" }).await)
