@@ -1,6 +1,6 @@
 //! Sticky source selection and publication fencing. Lives beneath server to keep authority private.
 use super::*;
-use crate::source_directory::{LookupFailure, allows, query};
+use crate::source_directory::{LookupFailure, allows, control_timeout, query};
 use futures_util::{StreamExt, stream};
 enum OriginState {
     Ready,
@@ -59,6 +59,14 @@ impl App {
         revision: u64,
         activation_only: bool,
     ) -> Option<Lookup> {
+        let long_haul = root["sources"].as_array().is_some_and(|sources| {
+            sources.iter().any(|source| {
+                crate::source_directory::native_source(source)
+                    && source["flussonix_transport"] == "fxlink"
+                    && source["drain"] != true
+                    && allows(source, name)
+            })
+        });
         let mut tickets = self.source_lookups.lock().await;
         tickets.retain(|_, t| !*t.done.borrow());
         if tickets.len() >= 10000 && !tickets.contains_key(name) {
@@ -83,7 +91,8 @@ impl App {
             Lookup {
                 old,
                 ticket,
-                deadline: tokio::time::Instant::now() + Duration::from_secs(3),
+                deadline: tokio::time::Instant::now()
+                    + Duration::from_secs(if long_haul { 6 } else { 3 }),
                 activation_only,
             }
         })
@@ -136,7 +145,7 @@ impl App {
     }
 
     async fn query_source(&self, source: &Value, name: &str) -> Result<Value, LookupFailure> {
-        tokio::time::timeout(Duration::from_millis(750), async {
+        tokio::time::timeout(control_timeout(source), async {
             let _permit = self
                 .source_queries
                 .acquire()
@@ -1271,6 +1280,127 @@ mod cache_tests {
         );
         assert!(app.source_lookups.lock().await.len() < 10000);
         assert!(app.mirrors.lock().await.len() < 10000);
+    }
+}
+
+#[cfg(test)]
+mod longhaul_control_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fxlink_source_admission_and_selection_allow_bounded_long_haul_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-longhaul-admin".into(),
+                peer_key: "owned-longhaul-key".into(),
+                role: "cdn".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = axum::Router::new().route(
+            "/flussonix/api/v1/stream/owned",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                assert_eq!(headers["x-flussonix-peer"], "owned-longhaul-key");
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                axum::Json(json!({"name":"owned","disabled":false}))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        app.config
+            .put(
+                "sources",
+                "owned",
+                json!({"api_url":url.clone(),"flussonix_transport":"fxlink","flussonix_fxlink_url":"fxlink://127.0.0.1:55000"}),
+            )
+            .unwrap();
+        let root = app.config.snapshot();
+        let source = &root["sources"][0];
+        assert_eq!(
+            app.query_source(source, "owned").await,
+            Ok(json!({"name":"owned","disabled":false}))
+        );
+        let lookup = app
+            .begin_lookup("owned", &root, app.config.revision(), false)
+            .await
+            .unwrap();
+        assert!(
+            lookup.deadline.duration_since(tokio::time::Instant::now()) > Duration::from_secs(5)
+        );
+        drop(lookup);
+        let mut ordinary = source.clone();
+        ordinary["flussonix_transport"] = json!("m4s");
+        ordinary
+            .as_object_mut()
+            .unwrap()
+            .remove("flussonix_fxlink_url");
+        assert_eq!(
+            app.query_source(&ordinary, "owned").await,
+            Err(LookupFailure::Unavailable)
+        );
+        app.config
+            .put(
+                "sources",
+                "owned",
+                json!({"api_url":url,"flussonix_transport":"m4s","flussonix_fxlink_url":null}),
+            )
+            .unwrap();
+        let root = app.config.snapshot();
+        let ordinary_lookup = app
+            .begin_lookup("owned", &root, app.config.revision(), false)
+            .await
+            .unwrap();
+        let remaining = ordinary_lookup
+            .deadline
+            .duration_since(tokio::time::Instant::now());
+        assert!(remaining > Duration::from_secs(2) && remaining < Duration::from_secs(4));
+        drop(ordinary_lookup);
+        app.config
+            .put(
+                "sources",
+                "owned",
+                json!({"flussonix_transport":"fxlink","flussonix_fxlink_url":"fxlink://127.0.0.1:55000","drain":true}),
+            )
+            .unwrap();
+        let root = app.config.snapshot();
+        let draining = app
+            .begin_lookup("owned", &root, app.config.revision(), false)
+            .await
+            .unwrap();
+        assert!(
+            draining
+                .deadline
+                .duration_since(tokio::time::Instant::now())
+                < Duration::from_secs(4)
+        );
+        drop(draining);
+        app.config
+            .put(
+                "sources",
+                "owned",
+                json!({"drain":false,"except":["owned"]}),
+            )
+            .unwrap();
+        let root = app.config.snapshot();
+        let excluded = app
+            .begin_lookup("owned", &root, app.config.revision(), false)
+            .await
+            .unwrap();
+        assert!(
+            excluded
+                .deadline
+                .duration_since(tokio::time::Instant::now())
+                < Duration::from_secs(4)
+        );
+        drop(excluded);
+        server.abort();
+        let _ = server.await;
+        app.media.stop_all().await;
     }
 }
 

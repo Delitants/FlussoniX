@@ -2437,3 +2437,23 @@ IP after release. Cancellation emptied the gate and stopped the owned worker.
 The RTSP unit and RTSP/RTSPS authorization suites passed locally, as did
 formatting and warning-denied all-target Clippy on the isolated branch. The
 same-source full CI and release security review remain pending.
+
+## FXLink long-haul source discovery candidate
+
+An explicitly configured native FXLink source now has a 2.5-second limit for
+authenticated metadata query and static inventory, including waiting for a
+source-query permit. A lookup with an eligible, non-draining FXLink source has
+six seconds to select an origin. Ordinary sources retain their 750 ms request
+limit and three-second selection window. The existing 64 query permits,
+16 concurrent inventory refreshes, three-second HTTP client limit, response
+size bounds, authorization and stale-revision checks remain in place.
+
+Three loopback regressions first failed at the former 750 ms deadline, then
+passed with 900 ms authorized responses for FXLink while an ordinary source
+still timed out. The 19 source-directory, 20 resolver and five activation unit
+tests passed. All 16 source-failover integration tests passed in a serial run.
+An earlier four-thread run under a 60% CPU cap had four timing/media failures;
+the serial run with adequate CPU passed those same cases. Full exact-head CI
+and an all-traffic 500 ms RTT/1% loss cluster probe are still required. The
+earlier UDP-only FXLink media probe does not qualify management discovery or
+sustained WAN behavior.
