@@ -33,13 +33,19 @@ impl Lab {
     fn new(encrypted: bool, public_url: bool) -> Self {
         Self::with_direct_tokens(encrypted, public_url, false)
     }
+    fn with_listener_limit(limit: usize) -> Self {
+        Self::with_settings(true, true, false, limit)
+    }
     fn with_direct_tokens(encrypted: bool, public_url: bool, direct_tokens: bool) -> Self {
+        Self::with_settings(encrypted, public_url, direct_tokens, 8)
+    }
+    fn with_settings(encrypted: bool, public_url: bool, direct_tokens: bool, limit: usize) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let listener = Listener::bind(
             "127.0.0.1:0".parse().unwrap(),
             Settings::new(
                 120,
-                8,
+                limit,
                 if encrypted {
                     "owned-test-passphrase"
                 } else {
@@ -82,17 +88,7 @@ impl Lab {
         peer: Option<SocketAddr>,
         uri: &str,
     ) -> (StatusCode, Value, String) {
-        let mut request = Request::builder()
-            .method(Method::POST)
-            .uri(uri)
-            .header("content-type", "application/json")
-            .header("x-forwarded-for", "203.0.113.71")
-            .body(Body::from(body.to_owned()))
-            .unwrap();
-        if let Some(peer) = peer {
-            request.extensions_mut().insert(ConnectInfo(peer));
-        }
-        let response = router(self.app.clone()).oneshot(request).await.unwrap();
+        let response = self.response(body, peer, uri).await;
         let status = response.status();
         let cache = response
             .headers()
@@ -104,11 +100,115 @@ impl Lab {
         let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, value, cache)
     }
+    async fn response(
+        &self,
+        body: &str,
+        peer: Option<SocketAddr>,
+        uri: &str,
+    ) -> axum::response::Response {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("x-forwarded-for", "203.0.113.71")
+            .body(Body::from(body.to_owned()))
+            .unwrap();
+        if let Some(peer) = peer {
+            request.extensions_mut().insert(ConnectInfo(peer));
+        }
+        router(self.app.clone()).oneshot(request).await.unwrap()
+    }
 }
 const BODY: &str =
     r##"{"streamid":"#!::r=owned,m=request,u=owned-secret","encryption":"required"}"##;
 fn loopback() -> SocketAddr {
     "127.0.0.1:40111".parse().unwrap()
+}
+fn token_body(token: &str) -> String {
+    format!(r##"{{"streamid":"#!::r=owned,m=request,u={token}","encryption":"required"}}"##)
+}
+
+#[tokio::test]
+async fn one_token_cannot_fill_the_public_srt_listener() {
+    let lab = Lab::with_listener_limit(128);
+    let uri = "/flussonix/api/v1/srt-ticket";
+    let body = token_body("shared-secret");
+    for _ in 0..4 {
+        let (status, value, _) = lab.request(&body, Some(loopback()), uri).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+    }
+    let response = lab.response(&body, Some(loopback()), uri).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["cache-control"], "private, no-store");
+    assert_eq!(response.headers()["connection"], "close");
+    let denied = to_bytes(response.into_body(), 8192).await.unwrap();
+    assert!(
+        !denied
+            .windows(b"shared-secret".len())
+            .any(|part| part == b"shared-secret")
+    );
+    let (status, value, _) = lab
+        .request(
+            &token_body("other-secret"),
+            Some("127.0.0.2:40111".parse().unwrap()),
+            uri,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+}
+
+#[tokio::test]
+async fn one_peer_cannot_fill_the_public_srt_listener_with_rotated_tokens() {
+    let lab = Lab::with_listener_limit(128);
+    let uri = "/flussonix/api/v1/srt-ticket";
+    for index in 0..16 {
+        let (status, value, _) = lab
+            .request(
+                &token_body(&format!("token-{index}")),
+                Some(loopback()),
+                uri,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{index}: {value}");
+    }
+    let response = lab
+        .response(&token_body("token-16"), Some(loopback()), uri)
+        .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["cache-control"], "private, no-store");
+    assert_eq!(response.headers()["connection"], "close");
+    let (status, value, _) = lab
+        .request(
+            &token_body("token-16"),
+            Some("127.0.0.2:40111".parse().unwrap()),
+            uri,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+}
+
+#[tokio::test]
+async fn concurrent_issuance_cannot_exceed_one_tokens_four_pending_tickets() {
+    let lab = Lab::with_listener_limit(128);
+    let body = token_body("parallel-secret");
+    let responses = futures_util::future::join_all(
+        (0..12).map(|_| lab.response(&body, Some(loopback()), "/flussonix/api/v1/srt-ticket")),
+    )
+    .await;
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|response| response.status() == StatusCode::OK)
+            .count(),
+        4
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|response| response.status() == StatusCode::TOO_MANY_REQUESTS)
+            .count(),
+        8
+    );
 }
 
 #[tokio::test]
