@@ -15,13 +15,23 @@ pub fn port() -> u16 {
 }
 #[allow(dead_code)]
 pub async fn run(video: Option<&str>, secure: bool, fixture: Option<&Path>) {
-    run_profile(video, secure, fixture, false).await;
+    run_profile(video, secure, fixture, false, false).await;
 }
 #[allow(dead_code)]
 pub async fn run_cpu(secure: bool) {
-    run_profile(Some("libx264"), secure, None, true).await;
+    run_profile(Some("libx264"), secure, None, true, false).await;
 }
-async fn run_profile(video: Option<&str>, secure: bool, fixture: Option<&Path>, transcode: bool) {
+#[allow(dead_code)]
+pub async fn run_fmp4_copy(secure: bool) {
+    run_profile(Some("libx264"), secure, None, false, true).await;
+}
+async fn run_profile(
+    video: Option<&str>,
+    secure: bool,
+    fixture: Option<&Path>,
+    transcode: bool,
+    require_fmp4: bool,
+) {
     let d = tempfile::tempdir().unwrap();
     if secure {
         use std::os::unix::fs::PermissionsExt;
@@ -145,6 +155,13 @@ async fn run_profile(video: Option<&str>, secure: bool, fixture: Option<&Path>, 
                 tx.args(["-x265-params", "pools=1:frame-threads=1:log-level=error"]);
             }
         }
+        // Exercise AAC both before and after MPEG audio: the fMP4 filter
+        // must follow PMT order rather than assume AAC is the first audio.
+        let (first_audio, last_audio) = if require_fmp4 && !secure {
+            ("libmp3lame", "aac")
+        } else {
+            ("aac", "libmp3lame")
+        };
         tx.args([
             "-map",
             audio,
@@ -153,11 +170,11 @@ async fn run_profile(video: Option<&str>, secure: bool, fixture: Option<&Path>, 
             "-map",
             audio,
             "-c:a:0",
-            "aac",
+            first_audio,
             "-c:a:1",
             "mp2",
             "-c:a:2",
-            "libmp3lame",
+            last_audio,
             "-b:a",
             "96k",
         ]);
@@ -182,6 +199,11 @@ async fn run_profile(video: Option<&str>, secure: bool, fixture: Option<&Path>, 
     .kill_on_drop(true);
     let mut sender = tx.spawn().unwrap();
     let received = tokio::time::timeout(Duration::from_secs(22), receiver.wait()).await;
+    let fmp4 = if require_fmp4 {
+        Some(inspect_fmp4(&e, d.path()).await)
+    } else {
+        None
+    };
     let _ = sender.kill().await;
     let _ = sender.wait().await;
     if let Ok(path) = std::env::var("FLUSSONIX_DIRECT_ARTIFACT_DIR") {
@@ -191,7 +213,7 @@ async fn run_profile(video: Option<&str>, secure: bool, fixture: Option<&Path>, 
             if transcode { "-cpu" } else { "" }
         ));
         std::fs::create_dir_all(&out).unwrap();
-        for name in ["received.ts", "receiver.log", "sender.log"] {
+        for name in ["received.ts", "receiver.log", "sender.log", "sample.mp4"] {
             if d.path().join(name).is_file() {
                 std::fs::copy(d.path().join(name), out.join(name)).unwrap();
             }
@@ -204,6 +226,15 @@ async fn run_profile(video: Option<&str>, secure: bool, fixture: Option<&Path>, 
     }
     e.stop_all().await;
     assert_eq!(e.count().await, 0);
+    if let Some(result) = fmp4 {
+        result.unwrap_or_else(|error| {
+            panic!(
+                "fMP4 copy failed: {error}; sender: {}; worker: {}",
+                std::fs::read_to_string(d.path().join("sender.log")).unwrap_or_default(),
+                worker.stats()
+            )
+        });
+    }
     assert!(
         received.is_ok(),
         "receiver timeout; source {}",
@@ -281,6 +312,84 @@ async fn run_profile(video: Option<&str>, secure: bool, fixture: Option<&Path>, 
             .await
             .is_ok()
     );
+}
+async fn inspect_fmp4(engine: &Engine, directory: &Path) -> Result<(), String> {
+    let playlist = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Ok(data) = engine.read("owned", "fmp4/index.m3u8").await {
+                let text = String::from_utf8_lossy(&data);
+                if text.contains("#EXTINF:") {
+                    break text.into_owned();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_| "fMP4 playlist did not become ready".to_owned())?;
+    let init = playlist
+        .lines()
+        .find_map(|line| line.strip_prefix("#EXT-X-MAP:URI=\""))
+        .and_then(|uri| uri.split('"').next())
+        .ok_or_else(|| format!("fMP4 init absent: {playlist}"))?;
+    let segment = playlist
+        .lines()
+        .rfind(|line| !line.is_empty() && !line.starts_with('#'))
+        .ok_or_else(|| format!("fMP4 segment absent: {playlist}"))?;
+    let mut bytes = engine
+        .read("owned", &format!("fmp4/{init}"))
+        .await
+        .map_err(|error| error.to_string())?
+        .to_vec();
+    bytes.extend_from_slice(
+        &engine
+            .read("owned", &format!("fmp4/{segment}"))
+            .await
+            .map_err(|error| error.to_string())?,
+    );
+    let sample = directory.join("sample.mp4");
+    std::fs::write(&sample, bytes).map_err(|error| error.to_string())?;
+    let decoded = tokio::time::timeout(
+        Duration::from_secs(10),
+        Command::new("ffmpeg")
+            .kill_on_drop(true)
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-xerror",
+                "-err_detect",
+                "explode",
+                "-i",
+            ])
+            .arg(&sample)
+            .args([
+                "-map", "0:v:0", "-map", "0:a", "-threads", "1", "-f", "framemd5", "-",
+            ])
+            .output(),
+    )
+    .await
+    .map_err(|_| "fMP4 decode timed out".to_owned())?
+    .map_err(|error| error.to_string())?;
+    if !decoded.status.success() || !decoded.stderr.is_empty() {
+        return Err(format!(
+            "fMP4 decode failed: {}; playlist={playlist}",
+            String::from_utf8_lossy(&decoded.stderr)
+        ));
+    }
+    let frames = String::from_utf8_lossy(&decoded.stdout);
+    for stream in 0..4 {
+        let count = frames
+            .lines()
+            .filter(|line| line.starts_with(&format!("{stream},")))
+            .count();
+        if count < 20 {
+            return Err(format!(
+                "fMP4 stream {stream} has {count} decoded frames; playlist={playlist}; frames={frames}"
+            ));
+        }
+    }
+    Ok(())
 }
 fn frames(s: &Value) -> u64 {
     s["nb_read_frames"]
