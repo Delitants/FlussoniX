@@ -137,8 +137,21 @@ async fn delayed_accept_burst(field: &str, tls: bool, rtsp: bool) {
         })
         .await
         .unwrap();
+        // The HTTPS pre-TLS gate deliberately rejects excess same-IP
+        // handshakes. Keep the first queued socket as the protocol probe;
+        // a later arbitrary socket may be rejected while the burst drains.
+        let sentinel = if tls && !rtsp {
+            Some(
+                tokio::time::timeout(Duration::from_millis(750), TcpStream::connect(address))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
         let mut pending = JoinSet::new();
-        for _ in 0..256 {
+        for _ in 0..(256 - usize::from(sentinel.is_some())) {
             pending.spawn(async move {
                 tokio::time::timeout(Duration::from_millis(750), TcpStream::connect(address)).await
             });
@@ -150,7 +163,7 @@ async fn delayed_accept_burst(field: &str, tls: bool, rtsp: bool) {
             }
         }
         signal(&child, libc::SIGCONT);
-        let connected = clients.len();
+        let connected = clients.len() + usize::from(sentinel.is_some());
         if rtsp {
             let mut probes = JoinSet::new();
             for socket in clients {
@@ -179,7 +192,7 @@ async fn delayed_accept_burst(field: &str, tls: bool, rtsp: bool) {
                 }
             }
             assert!(served > 0, "no queued RTSP connection received a response");
-        } else if let Some(socket) = clients.pop() {
+        } else if let Some(socket) = sentinel.or_else(|| clients.pop()) {
             // Free the remaining handshake slots before the protocol probe.
             drop(clients);
             if tls {

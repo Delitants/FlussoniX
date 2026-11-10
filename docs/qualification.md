@@ -2437,3 +2437,36 @@ IP after release. Cancellation emptied the gate and stopped the owned worker.
 The RTSP unit and RTSP/RTSPS authorization suites passed locally, as did
 formatting and warning-denied all-target Clippy on the isolated branch. The
 same-source full CI and release security review remain pending.
+
+## FXLink long-haul source discovery candidate
+
+An explicitly configured native FXLink source now has a 2.5-second limit for
+authenticated metadata query and static inventory, including waiting for a
+source-query permit. A lookup with an eligible, non-draining FXLink source has
+six seconds to select an origin. Ordinary sources retain their 750 ms request
+limit and three-second selection window. The existing 64 query permits,
+16 concurrent inventory refreshes, three-second HTTP client limit, response
+size bounds, authorization and stale-revision checks remain in place.
+
+Three loopback regressions first failed at the former 750 ms deadline, then
+passed with 900 ms authorized responses for FXLink while an ordinary source
+still timed out. A slow primary control request followed by an authorized
+backup resolved after the ordinary three-second window, and an unrelated
+FXLink source group did not extend an ordinary mirror's deadline. The 19
+source-directory, 22 resolver and five activation unit tests passed. All 16
+source-failover integration tests passed in a serial run.
+An earlier four-thread run under a 60% CPU cap had four timing/media failures;
+the serial run with adequate CPU passed those same cases.
+
+The CI release-package job for runtime head `5526fc9` passed, and the extracted
+binary (`743a2b12e9d1985ec8918be6de3bfdc9568b91bad02ea65b112b1fbe1a5a7099`)
+passed a separate 90-second two-stream FXLink v9 probe in a disposable cdn5
+network namespace. Netem shaped all loopback traffic, including management
+HTTP and media UDP, to 250 ms each direction with 1% loss. Authenticated source
+discovery succeeded, both HLS playlists advanced across 12 samples, and the
+first and last segments strictly decoded as H.264/AAC. FXLink reported 500 ms
+RTT, 27/27 and 86/86 original losses recovered, and no expired records or
+queue drops. The namespace, daemons and FFmpeg children exited; the existing
+CDN test service remained active. Full CI verification is still pending. This
+short same-host impairment probe does not establish sustained WAN behavior,
+production capacity or full migration compatibility.

@@ -3,6 +3,7 @@ use super::{Vendor, app, request, tls_fixture};
 use flussonix::{rtsp, server::App};
 use serde_json::json;
 use std::{
+    process::Stdio,
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
@@ -448,35 +449,40 @@ async fn independent_decoder_follows_vendor_redirect_and_destination_checks_view
         roots.extend(std::fs::read(&cdn.cert.ca).unwrap());
         std::fs::write(&trust, roots).unwrap();
         // Trusting the LB alone cannot grant trust to the redirected destination.
-        let rejected = flussonix::tls_input::Bridge::prepare(
+        let rejected = flussonix::tls_input::Bridge::start(
             &format!("{}/local/news?token=allowed-on-cdn", lb.secure),
             Some(&lb.cert.ca),
         )
         .await
         .unwrap();
-        let failed = tokio::time::timeout(
-            Duration::from_secs(15),
-            tokio::process::Command::new("ffmpeg")
-                .args([
-                    "-nostdin",
-                    "-v",
-                    "error",
-                    "-rtsp_transport",
-                    "tcp",
-                    "-i",
-                    rejected.local_url(),
-                    "-t",
-                    "1",
-                    "-f",
-                    "null",
-                    "-",
-                ])
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let mut rejected_decoder = tokio::process::Command::new("ffmpeg");
+        rejected_decoder
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-rtsp_transport",
+                "tcp",
+                "-i",
+                rejected.local_url(),
+                "-t",
+                "1",
+                "-f",
+                "null",
+                "-",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let rejected_child = rejected_decoder.spawn().unwrap();
+        rejected
+            .authorize_pid(rejected_child.id().unwrap())
+            .unwrap();
+        let failed =
+            tokio::time::timeout(Duration::from_secs(15), rejected_child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
         rejected.close().await;
         assert!(!failed.status.success());
         assert_eq!(delivery.media.count().await, 0);
@@ -489,7 +495,7 @@ async fn independent_decoder_follows_vendor_redirect_and_destination_checks_view
             // The production bridge verifies every TLS hop and owns all loopback relays.
             let bridge = if secure {
                 Some(
-                    flussonix::tls_input::Bridge::prepare(&uri, Some(&trust))
+                    flussonix::tls_input::Bridge::start(&uri, Some(&trust))
                         .await
                         .unwrap(),
                 )
@@ -503,19 +509,21 @@ async fn independent_decoder_follows_vendor_redirect_and_destination_checks_view
                 .to_owned();
             let mut command = tokio::process::Command::new("ffmpeg");
             command.args(["-nostdin", "-v", "error", "-rtsp_transport", "tcp"]);
-            let output = tokio::time::timeout(
-                Duration::from_secs(30),
-                command
-                    .args([
-                        "-i", &input, "-t", "2", "-map", "0:v:0", "-map", "0:a:0", "-threads", "1",
-                        "-f", "framemd5", "-",
-                    ])
-                    .kill_on_drop(true)
-                    .output(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            command
+                .args([
+                    "-i", &input, "-t", "2", "-map", "0:v:0", "-map", "0:a:0", "-threads", "1",
+                    "-f", "framemd5", "-",
+                ])
+                .kill_on_drop(true);
+            let decoder = command.spawn().unwrap();
+            if let Some(bridge) = &bridge {
+                bridge.authorize_pid(decoder.id().unwrap()).unwrap();
+            }
+            let output = tokio::time::timeout(Duration::from_secs(30), decoder.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
             if let Some(bridge) = bridge {
                 bridge.close().await;
             }

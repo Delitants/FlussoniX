@@ -144,19 +144,21 @@ impl App {
                 .unwrap_or_default()
         };
         stream::iter(due.into_iter().map(|source| async move {
-            let result = tokio::time::timeout(Duration::from_millis(750), async {
-                let _permit = self
-                    .source_queries
-                    .acquire()
-                    .await
-                    .map_err(|_| crate::source_directory::LookupFailure::Unavailable)?;
-                let client = self
-                    .cluster_client(&source)
-                    .map_err(|_| crate::source_directory::LookupFailure::Unavailable)?;
-                crate::source_directory::inventory(&client, &source, &self.options.peer_key).await
-            })
-            .await
-            .unwrap_or(Err(crate::source_directory::LookupFailure::Unavailable));
+            let result =
+                tokio::time::timeout(crate::source_directory::control_timeout(&source), async {
+                    let _permit = self
+                        .source_queries
+                        .acquire()
+                        .await
+                        .map_err(|_| crate::source_directory::LookupFailure::Unavailable)?;
+                    let client = self
+                        .cluster_client(&source)
+                        .map_err(|_| crate::source_directory::LookupFailure::Unavailable)?;
+                    crate::source_directory::inventory(&client, &source, &self.options.peer_key)
+                        .await
+                })
+                .await
+                .unwrap_or(Err(crate::source_directory::LookupFailure::Unavailable));
             let mut state = self.source_activation.lock().await;
             self.config.at_revision(revision, |root| {
                 if !root["sources"].as_array().unwrap().contains(&source) {
@@ -248,6 +250,46 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fxlink_inventory_refresh_allows_bounded_long_haul_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-longhaul-admin".into(),
+                peer_key: "owned-longhaul-key".into(),
+                role: "cdn".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = axum::Router::new().route(
+            "/flussonix/api/v1/source-streams",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                assert_eq!(headers["x-flussonix-peer"], "owned-longhaul-key");
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                axum::Json(json!({"streams":[]}))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        app.config
+            .put(
+                "sources",
+                "owned",
+                json!({"api_url":url,"flussonix_transport":"fxlink","flussonix_fxlink_url":"fxlink://127.0.0.1:55000"}),
+            )
+            .unwrap();
+        app.refresh_source_activation().await;
+        let status = app.source_activation_status().await;
+        assert_eq!(status["sources"][0]["lease_valid"], true, "{status}");
+        server.abort();
+        let _ = server.await;
+        app.media.stop_all().await;
+    }
     // Break caught: stale source snapshots or expired leases retain static demand.
     #[test]
     fn expired_inventory_and_changed_source_cannot_keep_names_warm() {

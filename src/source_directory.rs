@@ -30,6 +30,16 @@ pub(crate) fn native_source(source: &Value) -> bool {
         .get("flussonix_source_kind")
         .is_none_or(|kind| kind.as_str() == Some("native"))
 }
+/// FXLink's media path can span a long-haul link. Give its authenticated
+/// source-discovery requests enough time for a cold management round trip,
+/// while retaining the normal limit for all other source types.
+pub(crate) fn control_timeout(source: &Value) -> Duration {
+    if native_source(source) && source["flussonix_transport"] == "fxlink" {
+        Duration::from_millis(2500)
+    } else {
+        Duration::from_millis(750)
+    }
+}
 /// Select a source namespace without renaming the upstream stream. Exclusions
 /// are relative to that namespace; without a prefix they use full stream names.
 /// A subtree pattern does not exclude its parent name or a similar sibling prefix.
@@ -64,7 +74,7 @@ pub async fn query(
     name: &str,
     default_key: &str,
 ) -> Result<Value, LookupFailure> {
-    tokio::time::timeout(Duration::from_millis(750), async {
+    tokio::time::timeout(control_timeout(source), async {
         if !native_source(source) {
             return Err(LookupFailure::Invalid);
         }
@@ -163,7 +173,7 @@ pub(crate) async fn inventory(
     source: &Value,
     default_key: &str,
 ) -> Result<Vec<String>, LookupFailure> {
-    tokio::time::timeout(Duration::from_millis(750), async {
+    tokio::time::timeout(control_timeout(source), async {
         if !native_source(source) {
             return Err(LookupFailure::Invalid);
         }
@@ -235,6 +245,61 @@ pub mod modern_coordinator;
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+    #[tokio::test]
+    async fn fxlink_management_query_and_inventory_allow_bounded_long_haul_response() {
+        let router = axum::Router::new()
+            .route(
+                "/flussonix/api/v1/stream/owned",
+                axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                    assert_eq!(headers["x-flussonix-peer"], "owned-longhaul-key");
+                    tokio::time::sleep(Duration::from_millis(900)).await;
+                    axum::Json(serde_json::json!({"name":"owned","disabled":false}))
+                }),
+            )
+            .route(
+                "/flussonix/api/v1/source-streams",
+                axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                    assert_eq!(headers["x-flussonix-peer"], "owned-longhaul-key");
+                    tokio::time::sleep(Duration::from_millis(900)).await;
+                    axum::Json(serde_json::json!({"streams":[
+                        {"name":"owned","static":true,"disabled":false}
+                    ]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let mut source = serde_json::json!({
+            "api_url":format!("http://{address}"),
+            "flussonix_transport":"fxlink",
+            "flussonix_fxlink_url":"fxlink://127.0.0.1:55000"
+        });
+        assert_eq!(
+            query(&client, &source, "owned", "owned-longhaul-key").await,
+            Ok(serde_json::json!({"name":"owned","disabled":false}))
+        );
+        assert_eq!(
+            inventory(&client, &source, "owned-longhaul-key").await,
+            Ok(vec!["owned".into()])
+        );
+        source["flussonix_transport"] = serde_json::json!("m4s");
+        source
+            .as_object_mut()
+            .unwrap()
+            .remove("flussonix_fxlink_url");
+        assert_eq!(
+            query(&client, &source, "owned", "owned-longhaul-key").await,
+            Err(LookupFailure::Unavailable)
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
     #[tokio::test]
     async fn inventory_blocks_remote_plaintext_key_unless_source_opts_in() {
         use std::sync::{

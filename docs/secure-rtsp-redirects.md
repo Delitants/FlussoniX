@@ -18,6 +18,12 @@ listener. FFmpeg repeats its handshake through that listener. Remote redirect
 responses are never forwarded to the decoder. Location supplies the destination
 path and query; the bridge adds no inherited token. The CDN still
 independently authorizes and consumes its bound admission ticket before media.
+On Linux, each loopback connection must belong to the actual decoder process
+(or the in-process RTSP probe). The bridge checks the connected TCP socket
+against that process's `/proc` descriptors before forwarding any bytes, including
+after redirects. A different local process cannot take the decoder's first
+connection. The service must be able to read its child process's `/proc` entries;
+if that check is unavailable, the input fails closed.
 
 Only absolute strict `rtsps` destinations are accepted. Plaintext, other schemes,
 userinfo, fragments, invalid URI escapes, port zero, unsupported 3xx and ambiguous
@@ -54,6 +60,7 @@ fallback/retry and shared-ingest ownership remain unchanged.
 
 Owned TLS tests cover target identity/trust/expiry rejection before application
 data, invalid URI/framing, credentialed inputs, established-session rejection,
+foreign local connectors at the initial and redirected listener,
 exact/changing-query cycles, cancellation during redirected TLS setup, unused
 handoff expiry and continued media beyond the initial routing deadline. No
 official Flussonic component is a runtime, build or test dependency. Sustained
