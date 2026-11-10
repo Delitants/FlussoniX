@@ -4040,6 +4040,6 @@
     "aarch64-unknown-linux-gnu"
   ],
   "vendor_quinn_manifest_sha256": "95aaf88c74814dd46a53d07ca82c0ec90bcb7275c57a739336d287a7478feb58",
-  "web_lock_sha256": "42d4958f94f5748d812f38a7c937b8eda799d8fc1e978c7b5e489469800ca034",
-  "web_manifest_sha256": "2f14576c9a253a6ca6e88beed897097c62a40afe829b4acc0f45cbb1f524bd73"
+  "web_lock_sha256": "7888a1ac324be5066cc6ec8317e45d6c80d921a18469c258e0c916ea4390def2",
+  "web_manifest_sha256": "b35cebabee984d2daf25bdcc226eff720091df5e35270f6aac38d8c485395917"
 }
