@@ -51,6 +51,14 @@ def qualified_run_evidence():
 
 
 class PublicationGuardTests(unittest.TestCase):
+    def test_qualified_ci_run_accepts_main_ref_workflow_path(self):
+        run, jobs, artifacts, artifact, archive = qualified_run_evidence()
+        run["path"] = ".github/workflows/ci.yml@main"
+        self.assertEqual((artifact, archive, archive + ".sha256"),
+                         guard.verify_ci_metadata(run, jobs, artifacts, 123,
+                                                  QUALIFIED_TAG, QUALIFIED_SHA,
+                                                  "Delitants/FlussoniX"))
+
     def test_qualified_ci_run_requires_matching_successful_main_build(self):
         run, jobs, artifacts, artifact, archive = qualified_run_evidence()
         self.assertEqual((artifact, archive, archive + ".sha256"),

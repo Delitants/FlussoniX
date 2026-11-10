@@ -241,7 +241,8 @@ def verify_ci_metadata(run,jobs,artifacts,run_id,tag,revision,repository):
  if (run.get('status')!='completed' or run.get('conclusion')!='success'
      or run.get('event')!='push' or run.get('head_branch')!='main'
      or run.get('head_sha')!=revision or run.get('name')!='check'
-     or run.get('path')!='.github/workflows/ci.yml'
+     or run.get('path') not in ('.github/workflows/ci.yml',
+                                '.github/workflows/ci.yml@main')
      or not isinstance(run.get('repository'),dict)
      or run['repository'].get('full_name')!=repository
      or type(run['repository'].get('id')) is not int):
