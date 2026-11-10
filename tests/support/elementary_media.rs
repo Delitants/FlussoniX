@@ -238,6 +238,11 @@ async fn qualify_inner(
                 secure_input,
                 secure_output
             );
+            let name = if require_fmp4 {
+                format!("{name}-fmp4")
+            } else {
+                name
+            };
             elementary_diagnostics::create_case_directory(Path::new(&base), &name).unwrap()
         });
     assert!(
