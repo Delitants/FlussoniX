@@ -225,6 +225,30 @@ def inspect_m4f_segment(media):
     return tracks
 
 
+def poll_hls_media(get, clean, cdn, same_origin, deadline):
+    """Retry transient local reads within the existing whole-probe deadline."""
+    timeouts = 0
+    while time.monotonic() < deadline:
+        try:
+            status, _, body = get(clean)
+            if status == 200:
+                segments = [
+                    line for line in body.decode("utf-8", "replace").splitlines()
+                    if line and not line.startswith("#")
+                ]
+                if segments:
+                    segment = urllib.parse.urljoin(clean, segments[0])
+                    if not same_origin(segment, cdn):
+                        raise RuntimeError("CDN playlist escaped the owned endpoint")
+                    status, _, body = get(segment, 20_000_000)
+                    if status == 200 and body:
+                        return body, timeouts
+        except TimeoutError:
+            timeouts += 1
+        time.sleep(0.25)
+    return None, timeouts
+
+
 def parse_m4f_announcement(line):
     parts = line.split()
     if len(parts) != 2 or not parts[0].isascii() or not parts[0].isdigit():
@@ -552,6 +576,7 @@ def topology_probe(args, root):
         m4f_segments = []
         m4f_lines = 0
         m4f_line_shapes = []
+        hls_request_timeouts = 0
         if args.output == "m4s":
             while time.monotonic() < deadline and not media_ok:
                 try:
@@ -628,22 +653,8 @@ def topology_probe(args, root):
                         event["duration_ms"] = round((time.monotonic() - control_started) * 1000)
                 time.sleep(0.25)
         else:
-            media = None
-            while time.monotonic() < deadline and media is None:
-                status, _, body = get(clean)
-                if status == 200:
-                    segments = [
-                        line for line in body.decode("utf-8", "replace").splitlines()
-                        if line and not line.startswith("#")
-                    ]
-                    if segments:
-                        segment = urllib.parse.urljoin(clean, segments[0])
-                        if not same_origin(segment, cdn):
-                            raise RuntimeError("CDN playlist escaped the owned endpoint")
-                        status, _, body = get(segment, 20_000_000)
-                        if status == 200 and body:
-                            media = body
-                time.sleep(0.25)
+            media, hls_request_timeouts = poll_hls_media(
+                get, clean, cdn, same_origin, deadline)
             if media is not None:
                 media_bytes = len(media)
                 streams, media_ok = inspect_media(root, media)
@@ -655,6 +666,8 @@ def topology_probe(args, root):
                     "m4f_segments": m4f_segments[-8:], "m4f_lines": m4f_lines,
                     "m4f_line_shapes": m4f_line_shapes, "m4f_events": m4f_events[-8:],
                     "cdn_worker": worker,
+                    **({"hls_request_timeouts": hls_request_timeouts}
+                       if args.output == "hls" else {}),
                     **(m4f_no_media_diagnostics(root / "owned-vendor-cdn.log", m4f_worker_samples)
                        if args.output == "m4f" else {})}, 2
         unauthorized_lb = get(f"{lb}/{path}/{suffix}")[0]
@@ -688,6 +701,8 @@ def topology_probe(args, root):
                            m4f_lines=m4f_lines,
                            m4f_line_shapes=m4f_line_shapes,
                            m4f_events=m4f_events[-8:])
+        elif args.output == "hls":
+            summary["hls_request_timeouts"] = hls_request_timeouts
         return summary, 0 if passed else 2
     finally:
         for daemon in reversed(children):
