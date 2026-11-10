@@ -472,9 +472,10 @@ gates.
 `scripts/assess-sustained-http.py` evaluates an owner-only completed report
 from the isolated two-stream, eight-viewer, 24-hour MPEG-TS HTTP soak. It
 requires continuous sampling, clean viewer and metadata checks, planned
-connection churn, per-viewer media volume, at most three-second delivery gaps,
-at most three seconds to first media after each connection and from the last
-media to the run deadline, and bounded service-cgroup memory and media disk use.
+connection churn, per-viewer media volume, and reported media gaps of at most
+three seconds between packets, from run start to first media, across reconnects,
+and from last media to the deadline. It also requires bounded service-cgroup
+memory and media disk use.
 The report's short revision is self-reported; binary/package provenance and
 all other release gates remain separate. A local loopback pass would not
 establish WAN or production-scale capacity.

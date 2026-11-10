@@ -435,7 +435,7 @@ def viewer(stream, index, port, started, deadline, stop, state, guard):
     last_media = None
     while not stop.is_set() and time.monotonic() < deadline:
         connection = http.client.HTTPConnection('127.0.0.1', port, timeout=8)
-        start = time.monotonic()
+        start = started if last_media is None else time.monotonic()
         first = True
         expected_churn = index == 0
         try:

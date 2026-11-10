@@ -186,6 +186,13 @@ class SustainedHttpGateTests(unittest.TestCase):
         self.assertEqual(run.returncode, 2)
         self.assertIn("invalid_report", result["issues"])
 
+    def test_last_media_after_report_end_is_invalid(self):
+        report = complete_report()
+        report["viewers"]["soak_b:2"]["last_media_elapsed"] = 86401
+        run, result = assess(report)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("invalid_report", result["issues"])
+
     def test_running_or_sparse_report_cannot_pass(self):
         report = complete_report()
         report["state"] = "running"

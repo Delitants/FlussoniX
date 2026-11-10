@@ -119,7 +119,7 @@ def assess(report, revision):
         if not isinstance(row, dict) or not all(number(row.get(field)) and row[field] >= 0 for field in (
             "bytes", "connections", "sync_errors", "media_gap_max_ms", "reconnect_gap_max_ms",
             "first_byte_max_ms", "last_media_elapsed"
-        )):
+        )) or (number(elapsed) and row["last_media_elapsed"] > elapsed):
             return {"result": "fail", "issues": issues + ["invalid_report"]}, 2
         total_bytes += row["bytes"]
         if not number(total_bytes):
