@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Keep local planning and reports out of source pushes and release uploads."""
-import argparse,fnmatch,json,pathlib,re,shutil,subprocess,sys,tarfile,tempfile
+import argparse,fnmatch,gzip,json,pathlib,re,shutil,subprocess,sys,tarfile,tempfile
 CONTROL='.github/publication/'
 CONTROL_FILES={CONTROL+'guard.py',CONTROL+'install-hooks.py',CONTROL+'policy.json'}
 PRIVATE_DIRS={'work','outputs','internal','reports','test-reports','evidence','acceptance','plans',
@@ -17,6 +17,7 @@ PACKAGE_DATA={'package.json','package-lock.json','composer.json','composer.lock'
 CODE_TYPES={'.go','.c','.h','.cc','.cpp','.cxx','.hpp','.swift','.py','.sh','.js','.ts','.php','.rs','.java','.m','.mm','.lua','.pl','.rb','.erl','.ex','.sql','.s','.asm'}
 MAX_TEXT=1048576
 MAX_ARCHIVE_MEMBERS=4096
+MAX_ARCHIVE_UNCOMPRESSED=512*1024*1024
 MAX_CHECKSUM=65536
 CHECKSUM_LINE=re.compile(r'[0-9a-fA-F]{64}  [A-Za-z0-9][A-Za-z0-9._+-]*\.tar\.gz(?:\.sha256)?')
 
@@ -151,6 +152,13 @@ def archive_errors(path):
      error=private_error(item.linkname)
      if error:errors.append(item.name+': unsafe or private archive link')
     entry(item.name+'/' if item.isdir() else item.name,item.size,(lambda i=item:tar.extractfile(i).read(MAX_TEXT+1)) if item.isfile() else None)
+  if not errors:
+   expanded=0
+   with gzip.open(path,'rb') as source:
+    while data:=source.read(65536):
+     expanded+=len(data)
+     if expanded>MAX_ARCHIVE_UNCOMPRESSED:
+      errors.append(str(path)+': archive exceeds uncompressed size limit');break
  except (OSError,ValueError,UnicodeError,RuntimeError,EOFError,tarfile.TarError) as e:errors.append(str(path)+': '+str(e))
  return errors
 

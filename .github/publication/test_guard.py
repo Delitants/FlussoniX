@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 import unittest
 import zipfile
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -267,6 +268,32 @@ class PublicationGuardTests(unittest.TestCase):
             archive = pathlib.Path(directory) / "flussonix-test-linux-x86_64.tar.gz"
             archive.write_bytes(b"not an archive")
             self.assertTrue(guard.archive_errors(archive))
+
+    def test_release_archive_rejects_missing_gzip_trailer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = pathlib.Path(directory) / "flussonix-test-linux-x86_64.tar.gz"
+            with tarfile.open(archive, "w:gz") as output:
+                output.addfile(tarfile.TarInfo("flussonix-test/"))
+            archive.write_bytes(archive.read_bytes()[:-8])
+            self.assertTrue(guard.archive_errors(archive))
+
+    def test_release_archive_rejects_corrupt_gzip_crc(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = pathlib.Path(directory) / "flussonix-test-linux-x86_64.tar.gz"
+            with tarfile.open(archive, "w:gz") as output:
+                output.addfile(tarfile.TarInfo("flussonix-test/"))
+            damaged = bytearray(archive.read_bytes())
+            damaged[-8] ^= 0xFF
+            archive.write_bytes(damaged)
+            self.assertTrue(guard.archive_errors(archive))
+
+    def test_release_archive_rejects_excessive_uncompressed_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = pathlib.Path(directory) / "flussonix-test-linux-x86_64.tar.gz"
+            with tarfile.open(archive, "w:gz") as output:
+                output.addfile(tarfile.TarInfo("flussonix-test/"))
+            with mock.patch.object(guard, "MAX_ARCHIVE_UNCOMPRESSED", 1024):
+                self.assertTrue(guard.archive_errors(archive))
 
     def test_release_archive_rejects_more_than_4096_members(self):
         with tempfile.TemporaryDirectory() as directory:
