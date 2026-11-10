@@ -16,7 +16,13 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y ffmpeg libsrtp2-1 tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu fonts-dejavu-core postgresql-16
+      - name: Install qualification dependencies
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i 's#http://azure.archive.ubuntu.com/ubuntu#https://archive.ubuntu.com/ubuntu#g' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2 update
+          sudo apt-get -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2 install -y ffmpeg libsrtp2-1 tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu fonts-dejavu-core postgresql-16
       - name: Verify vendor components are absent
         run: test ! -e /opt/flussonic
       - name: Preview package, service, credential and qualification regressions
@@ -127,7 +133,12 @@ jobs:
         with:
           persist-credentials: false
       - name: Install standalone media runtime dependencies
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg libsrt1.5-gnutls
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i 's#http://azure.archive.ubuntu.com/ubuntu#https://archive.ubuntu.com/ubuntu#g' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2 update
+          sudo apt-get -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2 install -y ffmpeg libsrt1.5-gnutls
       - name: Verify vendor components are absent
         run: test ! -e /opt/flussonic
       - name: Verify archive and upgrade smoke helpers
