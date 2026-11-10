@@ -49,7 +49,8 @@ pub(crate) fn decode_track(fields: &[BoxView<'_>]) -> Result<Track, String> {
     let (codec, kind) = input_codec(
         std::str::from_utf8(&h[12..h.len() - 1]).map_err(|_| "invalid native codec name")?,
     )?;
-    if &h[8..12] != kind.handler() {
+    // Flussonic also labels subtitle tracks as application data in live MDin.
+    if &h[8..12] != kind.handler() && !(kind == Codec::Subtitle && &h[8..12] == b"appl") {
         return Err("native handler/codec kind mismatch".into());
     }
     // Flussonic advertises silent text tracks in MDin/M4F metadata without a
