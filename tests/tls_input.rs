@@ -331,6 +331,110 @@ async fn worker_spawn_failure_and_stop_release_verified_upstream() {
     );
     assert_eq!(engine.count().await, 0);
 }
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn worker_closes_verified_listener_before_reaping_decoder() {
+    use std::{os::unix::fs::PermissionsExt, sync::atomic::Ordering};
+    let cert = Certificates::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(cert.server());
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let upstream = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = acceptor.accept(socket).await.unwrap();
+        let _ = ready_tx.send(());
+        let mut bytes = [0u8; 1];
+        socket.read(&mut bytes).await.unwrap_or(0)
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let local_url = dir.path().join("bridge-url");
+    let exiting = dir.path().join("decoder-exiting");
+    let executable = dir.path().join("short-decoder");
+    let sample = dir.path().join("sample.ts");
+    let output = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000",
+            "-t",
+            "0.5",
+            "-c:a",
+            "mp2",
+            "-f",
+            "mpegts",
+            "pipe:1",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    std::fs::write(&sample, output.stdout).unwrap();
+    std::fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nIFS= read -r header\nIFS= read -r source\ncase \"$source\" in\n  \"file 'rtsp://127.0.0.1:\"*)\n    source=${{source#file \\'}}\n    source=${{source%\\'}}\n    printf '%s' \"$source\" > '{}'\n    ;;\nesac\nsleep 0.3\ncat '{}'\nprintf 'exiting' > '{}'\n",
+            local_url.display(),
+            sample.display(),
+            exiting.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let engine =
+        flussonix::media::Engine::new(dir.path().join("media"), executable.to_str().unwrap());
+    let worker = engine
+        .ensure(
+            "owned",
+            &serde_json::json!({"inputs":[{"url":format!("rtsps://{address}/owned"),"flussonix_tls_ca":cert.ca,"flussonix_rtsp_startup":"conservative"}]}),
+        )
+        .await
+        .unwrap();
+    worker.viewers.store(1, Ordering::Relaxed);
+    let until = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !local_url.exists() {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "decoder URL was not published"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::timeout(Duration::from_secs(2), ready_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let port = url::Url::parse(&std::fs::read_to_string(&local_url).unwrap())
+        .unwrap()
+        .port()
+        .unwrap();
+    assert!(
+        TcpStream::connect(("127.0.0.1", port)).await.is_ok(),
+        "listener closed before decoder exit: url={:?} exiting={} upstream_finished={} worker={}",
+        std::fs::read_to_string(&local_url),
+        exiting.exists(),
+        upstream.is_finished(),
+        worker.stats()
+    );
+    while !exiting.exists() {
+        assert!(tokio::time::Instant::now() < until, "decoder did not exit");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        worker.alive.load(Ordering::Relaxed),
+        "viewer drain did not begin"
+    );
+    assert!(
+        TcpStream::connect(("127.0.0.1", port)).await.is_err(),
+        "verified bridge listener remained open after decoder exit"
+    );
+    engine.stop_all().await;
+    upstream.await.unwrap();
+}
 #[tokio::test]
 async fn upstream_tls_handshake_deadline_and_cancelled_prepare_do_not_leak() {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();

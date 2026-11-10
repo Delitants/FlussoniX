@@ -2250,6 +2250,9 @@ impl Engine {
                 }
                 let Some(mut stdout) = child.stdout.take() else {
                     w.failed("packaging_failed");
+                    if let Some(bridge) = tls_input.take() {
+                        bridge.close().await;
+                    }
                     let _ = child.kill().await;
                     let _ = child.wait().await;
                     return;
@@ -2353,6 +2356,9 @@ impl Engine {
                             let _ = w.tx.send(Bytes::copy_from_slice(&buffer[..n]));
                         }
                     }
+                }
+                if let Some(bridge) = tls_input.take() {
+                    bridge.close().await;
                 }
                 let _ = child.kill().await;
                 let _ = child.wait().await;
