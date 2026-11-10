@@ -155,6 +155,42 @@ async fn elementary_roundtrip_cpu_h264_hevc_and_all_audio_codecs_decode() {
     }
 }
 
+#[tokio::test]
+async fn direct_rtp_mp3_copy_delivers_fmp4_audio_and_video() {
+    support::qualify_fmp4(
+        Some("libx264"),
+        &["libmp3lame"],
+        json!({"encoder":"copy","acodec":"copy"}),
+        false,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn direct_rtp_aac_copy_delivers_fmp4_audio_and_video() {
+    support::qualify_fmp4(
+        Some("libx264"),
+        &["aac"],
+        json!({"encoder":"copy","acodec":"copy"}),
+        false,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn direct_rtp_mp2_copy_delivers_fmp4_audio_and_video() {
+    support::qualify_fmp4(
+        Some("libx264"),
+        &["mp2"],
+        json!({"encoder":"copy","acodec":"copy"}),
+        false,
+        false,
+    )
+    .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "isolated HEVC/MP3 intermittent-loss diagnostic; use a fresh evidence directory"]
 async fn diagnostic_hevc_mp3_plaintext_input_once() {

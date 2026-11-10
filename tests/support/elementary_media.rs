@@ -185,6 +185,27 @@ pub async fn qualify(
     secure_input: bool,
     secure_output: bool,
 ) {
+    qualify_inner(video, audio, profile, secure_input, secure_output, false).await;
+}
+
+pub async fn qualify_fmp4(
+    video: Option<&str>,
+    audio: &[&str],
+    profile: Value,
+    secure_input: bool,
+    secure_output: bool,
+) {
+    qualify_inner(video, audio, profile, secure_input, secure_output, true).await;
+}
+
+async fn qualify_inner(
+    video: Option<&str>,
+    audio: &[&str],
+    profile: Value,
+    secure_input: bool,
+    secure_output: bool,
+    require_fmp4: bool,
+) {
     let fixture_origin = std::time::Instant::now();
     let packet_taps = match std::env::var("FLUSSONIX_ELEMENTARY_PACKET_TAPS") {
         Err(std::env::VarError::NotPresent) => false,
@@ -659,6 +680,81 @@ pub async fn qualify(
     stage("media_delivery");
     let result = tokio::time::timeout(Duration::from_secs(15), receiver.wait()).await;
     stage("receiver_wait_complete");
+    if require_fmp4 {
+        let playlist = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Ok(data) = engine.read("owned", "fmp4/index.m3u8").await {
+                    let text = String::from_utf8(data.to_vec()).unwrap();
+                    if text.contains("#EXTINF:") {
+                        break text;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("direct RTP/SRTP fMP4 playlist readiness");
+        let init = playlist
+            .lines()
+            .find_map(|line| line.strip_prefix("#EXT-X-MAP:URI=\""))
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let segment = playlist
+            .lines()
+            .rfind(|line| !line.is_empty() && !line.starts_with('#'))
+            .unwrap();
+        let mut bytes = engine
+            .read("owned", &format!("fmp4/{init}"))
+            .await
+            .unwrap()
+            .to_vec();
+        bytes.extend_from_slice(
+            &engine
+                .read("owned", &format!("fmp4/{segment}"))
+                .await
+                .unwrap(),
+        );
+        let sample = d.path().join("fmp4-sample.mp4");
+        std::fs::write(&sample, bytes).unwrap();
+        let decoded = tokio::time::timeout(
+            Duration::from_secs(10),
+            Command::new("/usr/bin/ffmpeg")
+                .kill_on_drop(true)
+                .args([
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-xerror",
+                    "-err_detect",
+                    "explode",
+                    "-i",
+                ])
+                .arg(&sample)
+                .args([
+                    "-map", "0:v:0", "-map", "0:a:0", "-threads", "1", "-f", "framemd5", "-",
+                ])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            decoded.status.success() && decoded.stderr.is_empty(),
+            "direct RTP/SRTP fMP4 decode failed: {}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+        let frames = String::from_utf8(decoded.stdout).unwrap();
+        assert!(
+            frames.lines().filter(|line| line.starts_with("0,")).count() >= 25,
+            "direct RTP/SRTP fMP4 video missing: {playlist}; {frames}"
+        );
+        assert!(
+            frames.lines().filter(|line| line.starts_with("1,")).count() >= 25,
+            "direct RTP/SRTP fMP4 audio missing: {playlist}; {frames}"
+        );
+    }
     cancel.cancel();
     let mut captures = Vec::new();
     while let Some(result) = relay.join_next().await {

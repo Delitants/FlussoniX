@@ -1752,13 +1752,15 @@ impl Engine {
         } else {
             String::new()
         };
+        // Direct RTP can carry MPEG audio; forcing an AAC-only filter breaks
+        // fMP4. FFmpeg handles AAC conversion from its decoder here.
         let fmp4_filter = if native_audio_copy {
             "__NATIVE_FMP4_FILTER__"
         } else if copy_peer_ts {
             "__PEER_FMP4_FILTER__"
         } else if inspect_publication {
             "__PUBLICATION_FMP4_FILTER__"
-        } else if copy_publication {
+        } else if copy_publication && direct_input.is_none() {
             ":bsfs/a=aac_adtstoasc"
         } else {
             ""
