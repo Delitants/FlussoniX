@@ -1,4 +1,4 @@
-use std::{io, time::Duration};
+use std::{io, os::unix::ffi::OsStrExt, path::Path, time::Duration};
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
 
@@ -11,10 +11,24 @@ pub(super) struct Bridge {
 
 impl Bridge {
     pub(super) fn bind() -> io::Result<Self> {
-        let directory = tempfile::Builder::new()
-            .prefix("flussonix-bridge-")
-            .tempdir()?;
+        Self::bind_with_base(&std::env::temp_dir())
+    }
+
+    fn bind_with_base(base: &Path) -> io::Result<Self> {
+        let directory = tempfile::Builder::new().prefix("fxb-").tempdir_in(base)?;
         let path = directory.path().join("media.sock");
+        // Linux pathname Unix sockets have 108 bytes including the trailing
+        // NUL. A valid but long TMPDIR must not disable caption/AV workers.
+        if path.as_os_str().as_bytes().len() > 107 {
+            drop(directory);
+            if base == Path::new("/tmp") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bridge path too long",
+                ));
+            }
+            return Self::bind_with_base(Path::new("/tmp"));
+        }
         let listener = UnixListener::bind(&path)?;
         Ok(Self {
             listener,
@@ -174,5 +188,32 @@ mod tests {
             Some("wire_setup_failed")
         );
         assert!(!std::path::Path::new(target.strip_prefix("unix://").unwrap()).exists());
+    }
+
+    #[tokio::test]
+    async fn long_temp_directory_falls_back_to_a_short_private_path() {
+        let root = tempfile::tempdir().unwrap();
+        let long_base = root.path().join("l".repeat(90));
+        std::fs::create_dir(&long_base).unwrap();
+        let bridge = Bridge::bind_with_base(&long_base).unwrap();
+        let target = bridge.target();
+        let path = target.strip_prefix("unix://").unwrap();
+        assert!(!path.starts_with(long_base.to_str().unwrap()));
+        assert!(
+            std::os::unix::ffi::OsStrExt::as_bytes(std::path::Path::new(path).as_os_str()).len()
+                <= 107
+        );
+        let mut sender = tokio::net::UnixStream::connect(path).await.unwrap();
+        sender.write_all(b"authenticated").await.unwrap();
+        let cancel = CancellationToken::new();
+        let mut receiver = bridge
+            .accept(std::process::id(), Duration::from_secs(1), &cancel)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut data = [0; 13];
+        receiver.read_exact(&mut data).await.unwrap();
+        assert_eq!(&data, b"authenticated");
+        assert!(!std::path::Path::new(path).exists());
     }
 }

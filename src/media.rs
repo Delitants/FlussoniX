@@ -3607,9 +3607,9 @@ mod caption_sink_tests {
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("owned.ts");
         std::fs::write(&path, fixture::transport()).unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let target = format!("tcp://{}", listener.local_addr().unwrap());
-        drop(listener);
+        let bridge = ffmpeg_bridge::Bridge::bind().unwrap();
+        let target = bridge.target();
+        drop(bridge);
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-v", "error", "-re", "-i"]).arg(&path).args([
             "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-f", "mpegts", "pipe:1",
