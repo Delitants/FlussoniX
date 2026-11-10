@@ -1,3 +1,4 @@
+mod ffmpeg_bridge;
 #[cfg(test)]
 pub(crate) mod file_reader;
 #[cfg(not(test))]
@@ -1352,15 +1353,9 @@ impl Engine {
         let caption_listener = if caption_services.is_empty() || native_captions {
             None
         } else {
-            Some(
-                tokio::net::TcpListener::bind("127.0.0.1:0")
-                    .await
-                    .map_err(|_| "caption listener unavailable")?,
-            )
+            Some(ffmpeg_bridge::Bridge::bind().map_err(|_| "caption listener unavailable")?)
         };
-        let caption_target = caption_listener
-            .as_ref()
-            .map(|l| format!("tcp://{}", l.local_addr().unwrap()));
+        let caption_target = caption_listener.as_ref().map(ffmpeg_bridge::Bridge::target);
         let captions = shared
             .as_ref()
             .and_then(|s| s.feed.conversion())
@@ -1726,25 +1721,19 @@ impl Engine {
         // Original subtitle PES stays on stdout. The native decoder receives
         // only AV, either directly or through this owned tee connection.
         let av_listener = if subtitle_tracks == "preserve" && !native_copy {
-            Some(
-                tokio::net::TcpListener::bind("127.0.0.1:0")
-                    .await
-                    .map_err(|_| "cannot bind worker AV channel")?,
-            )
+            Some(ffmpeg_bridge::Bridge::bind().map_err(|_| "cannot bind worker AV channel")?)
         } else {
             None
         };
         let wire_output = if let Some(listener) = &av_listener {
             format!(
-                "|[select='{}':f=mpegts:max_interleave_delta=100000]tcp://{}",
+                "|[select='{}':f=mpegts:max_interleave_delta=100000]{}",
                 if proxy_hls_extensions {
                     "v\\:0,a"
                 } else {
                     "v,a"
                 },
-                listener
-                    .local_addr()
-                    .map_err(|_| "worker AV address unavailable")?
+                listener.target()
             )
         } else {
             String::new()
@@ -2250,7 +2239,7 @@ impl Engine {
                     }));
                     // FFmpeg opens this output after input probing. Allow the same
                     // bounded startup interval as the AV listener below.
-                    let c=cancel.clone();let drain_state=state.clone();tasks.push(tokio::spawn(async move {let Ok(Ok((mut socket,_)))=(tokio::select!{biased;_=c.cancelled()=>return,r=tokio::time::timeout(timeout+Duration::from_secs(1),listener.accept())=>r})else{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");return};let mut buffer=[0;16384];loop{let read=tokio::select!{biased;_=c.cancelled()=>break,r=socket.read(&mut buffer)=>r};match read{Ok(n)if n>0=>{if enqueue_caption(&sender,Bytes::copy_from_slice(&buffer[..n]),&c).await.is_err(){drain_state.failed.store(true,Ordering::Relaxed);break;}},_=>{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");break}}}}));
+                    let c=cancel.clone();let drain_state=state.clone();let child_pid=w.pid.load(Ordering::Relaxed);tasks.push(tokio::spawn(async move {let mut socket=match listener.accept(child_pid,timeout+Duration::from_secs(1),&c).await {Ok(Some(socket))=>socket,Ok(None)=>return,Err(_)=>{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");return}};let mut buffer=[0;16384];loop{let read=tokio::select!{biased;_=c.cancelled()=>break,r=socket.read(&mut buffer)=>r};match read{Ok(n)if n>0=>{if enqueue_caption(&sender,Bytes::copy_from_slice(&buffer[..n]),&c).await.is_err(){drain_state.failed.store(true,Ordering::Relaxed);break;}},_=>{drain_state.failed.store(true,Ordering::Relaxed);drain_state.decoder.lock().unwrap().error=Some("caption_input_closed");break}}}}));
                     for _ in 0..2{tasks.push(tokio::spawn(state.clone().ocr(tesseract.clone(),cancel.clone())));}
                 }
                 if let Some(state) = w.captions.clone() {
@@ -2282,8 +2271,7 @@ impl Engine {
                     let w=w.clone();let c=cancel.clone();let end=av_finished.clone();let (sender,receiver)=oneshot::channel();av_done=Some(receiver);
                     tasks.push(tokio::spawn(async move {
                         let result = async {
-                            let accepted=tokio::select! {biased;_=c.cancelled()=>return Ok(()), r=tokio::time::timeout(timeout+Duration::from_secs(1),listener.accept())=>r};
-                            let (mut socket,_)=accepted.map_err(|_|"startup_timeout")?.map_err(|_|"wire_setup_failed")?;
+                            let Some(mut socket)=listener.accept(w.pid.load(Ordering::Relaxed),timeout+Duration::from_secs(1),&c).await? else {return Ok(())};
                             let mut output=crate::worker_output::live::Forwarder::new(timeout);
                             let mut buffer=[0;188*64];
                             loop {
