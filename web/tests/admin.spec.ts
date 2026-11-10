@@ -746,9 +746,11 @@ test('Streams edit approved RTSPS redirects as origin rows and clear them on pro
   await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();
   await expect(page.getByText('Allowed RTSPS redirects',{exact:true})).toBeVisible();
   await page.getByRole('button',{name:'Add allowed RTSPS redirect',exact:true}).click();
-  const root=page.getByLabel('Allowed RTSPS redirect 1',{exact:true});await root.fill('rtsps://cdn.example/live');
-  await page.getByRole('button',{name:'Save',exact:true}).click();
-  await expect(page.getByText('Allowed RTSPS redirects must be RTSPS origin roots without paths or credentials.',{exact:true})).toBeVisible();
+  const root=page.getByLabel('Allowed RTSPS redirect 1',{exact:true});
+  for(const invalid of ['rtsps://cdn.example/live','rtsps://cdn.example/live/..','rtsps://cdn.example/%2e','rtsps://cdn.example?','rtsps://cdn.example#']){
+   await root.fill(invalid);await page.getByRole('button',{name:'Save',exact:true}).click();
+   await expect(page.getByText('Allowed RTSPS redirects must be RTSPS origin roots without paths or credentials.',{exact:true})).toBeVisible();
+  }
   await root.fill('rtsps://cdn.example:8322');await page.getByRole('button',{name:'Save',exact:true}).click();
   let saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(saved.config_on_disk.inputs[0].flussonix_rtsps_redirect_origins).toEqual(['rtsps://cdn.example:8322']);
   await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(root).toHaveValue('rtsps://cdn.example:8322');

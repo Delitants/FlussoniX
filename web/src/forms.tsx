@@ -47,7 +47,7 @@ function balancerError(value:Item):string|undefined {
  return undefined;
 }
 function rtspsOriginRoot(value:string):string|undefined {
- if(!value||/[\s\\@*\x00-\x1f\x7f]/.test(value))return;
+ if(!value||/[\s\\@*\x00-\x1f\x7f]/.test(value)||!/^rtsps:\/\/[^/?#]+\/?$/i.test(value))return;
  try{
   const url=new URL(value);
   if(url.protocol!=='rtsps:'||!url.hostname||url.port==='0'||(url.pathname!==''&&url.pathname!=='/')||url.search||url.hash||url.username||url.password)return;

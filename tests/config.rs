@@ -1238,6 +1238,10 @@ fn rtsps_redirect_origins_validate_and_inherit() {
     let before = store.snapshot();
     let invalid = [
         json!(["rtsps://cdn.example/a"]),
+        json!(["rtsps://cdn.example/live/.."]),
+        json!(["rtsps://cdn.example/%2e"]),
+        json!(["rtsps://cdn.example?"]),
+        json!(["rtsps://cdn.example#"]),
         json!(["rtsps://cdn.example?token=hidden"]),
         json!(["rtsps://cdn.example/#fragment"]),
         json!(["rtsps://user:secret@cdn.example"]),

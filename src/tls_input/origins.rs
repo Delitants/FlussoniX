@@ -33,6 +33,17 @@ impl RedirectOrigins {
                 {
                     return Err("invalid RTSPS redirect origin".into());
                 }
+                let raw_suffix = text
+                    .split_once("://")
+                    .and_then(|(_, remainder)| {
+                        remainder
+                            .find(|ch| matches!(ch, '/' | '?' | '#'))
+                            .map(|index| &remainder[index..])
+                    })
+                    .unwrap_or("");
+                if raw_suffix != "" && raw_suffix != "/" {
+                    return Err("invalid RTSPS redirect origin".into());
+                }
                 let parsed = url::Url::parse(text).map_err(|_| "invalid RTSPS redirect origin")?;
                 if parsed.scheme() != "rtsps"
                     || !["", "/"].contains(&parsed.path())
