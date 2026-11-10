@@ -7,8 +7,10 @@ use std::{
     },
     time::Duration,
 };
+mod origins;
 mod peer;
 mod redirect;
+pub use origins::RedirectOrigins;
 use tokio::{
     net::{TcpListener, TcpStream},
     task::JoinHandle,

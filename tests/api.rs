@@ -143,7 +143,7 @@ async fn config_post_reports_nested_input_paths_without_mutation() {
             json!({"streams":[{"name":"demo","inputs":[{"url":"testsrc://","extra":true}]}]}),
             "unknown_key",
             json!(["server_config", "streams", 0, "inputs", 0, "extra"]),
-            "supported input fields: url, RTSP rtp=udp and flussonix_rtsp_startup, verified TLS flussonix_tls_ca, direct RTP/SRTP flussonix_rtp, FXLink flussonix_fxlink/token",
+            "supported input fields: url, RTSP rtp=udp and flussonix_rtsp_startup, RTSPS flussonix_rtsps_redirect_origins, verified TLS flussonix_tls_ca, direct RTP/SRTP flussonix_rtp, FXLink flussonix_fxlink/token",
         ),
         (
             json!({"streams":[{"name":"demo","inputs":[{"url":"testsrc://"},{}]}]}),
@@ -161,7 +161,7 @@ async fn config_post_reports_nested_input_paths_without_mutation() {
             json!({"streams":[{"name":"demo","inputs":[false]}]}),
             "invalid_config",
             json!(["server_config", "streams", 0, "inputs", 0]),
-            "supported input fields: url, RTSP rtp=udp and flussonix_rtsp_startup, verified TLS flussonix_tls_ca, direct RTP/SRTP flussonix_rtp, FXLink flussonix_fxlink/token",
+            "supported input fields: url, RTSP rtp=udp and flussonix_rtsp_startup, RTSPS flussonix_rtsps_redirect_origins, verified TLS flussonix_tls_ca, direct RTP/SRTP flussonix_rtp, FXLink flussonix_fxlink/token",
         ),
         (
             json!({"streams":[{"name":"demo","inputs":[{"url":"unsupported://host"}]}]}),

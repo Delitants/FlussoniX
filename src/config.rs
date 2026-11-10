@@ -35,8 +35,9 @@ const INPUT_FIELDS: &[&str] = &[
     "flussonix_fxlink",
     "flussonix_fxlink_token",
     "flussonix_rtsp_startup",
+    "flussonix_rtsps_redirect_origins",
 ];
-const INPUT_FIELDS_DETAIL: &str = "supported input fields: url, RTSP rtp=udp and flussonix_rtsp_startup, verified TLS flussonix_tls_ca, direct RTP/SRTP flussonix_rtp, FXLink flussonix_fxlink/token";
+const INPUT_FIELDS_DETAIL: &str = "supported input fields: url, RTSP rtp=udp and flussonix_rtsp_startup, RTSPS flussonix_rtsps_redirect_origins, verified TLS flussonix_tls_ca, direct RTP/SRTP flussonix_rtp, FXLink flussonix_fxlink/token";
 
 pub fn merge(old: &Value, patch: &Value) -> Value {
     if let Some(p) = patch.as_object() {
@@ -824,6 +825,14 @@ fn validate_root(root: &Value) -> Result<(), String> {
                                 crate::media::translate_input(u)?
                             };
                             crate::media::validate_rtsp_input_url(&target)?;
+                        }
+                        if scheme == "rtsps" {
+                            crate::tls_input::RedirectOrigins::parse(
+                                u,
+                                input.get("flussonix_rtsps_redirect_origins"),
+                            )?;
+                        } else if input.get("flussonix_rtsps_redirect_origins").is_some() {
+                            return Err("RTSPS redirect origins require an RTSPS input".into());
                         }
                         if let Some(mode) = input.get("flussonix_rtsp_startup") {
                             if !["rtsp", "rtsp-udp", "rtsp2", "rtsps"].contains(&scheme)
