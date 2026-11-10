@@ -37,11 +37,11 @@ impl RedirectOrigins {
                     .split_once("://")
                     .and_then(|(_, remainder)| {
                         remainder
-                            .find(|ch| matches!(ch, '/' | '?' | '#'))
+                            .find(['/', '?', '#'])
                             .map(|index| &remainder[index..])
                     })
                     .unwrap_or("");
-                if raw_suffix != "" && raw_suffix != "/" {
+                if !raw_suffix.is_empty() && raw_suffix != "/" {
                     return Err("invalid RTSPS redirect origin".into());
                 }
                 let parsed = url::Url::parse(text).map_err(|_| "invalid RTSPS redirect origin")?;
