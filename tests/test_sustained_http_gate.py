@@ -30,6 +30,8 @@ def complete_report():
             "errors": {}, "sync_errors": 0,
             "media_gap_max_ms": 1000,
             "reconnect_gap_max_ms": 2000 if index == 0 else 0,
+            "first_byte_max_ms": 500,
+            "last_media_elapsed": 86399,
         }
         for stream in ("soak_a", "soak_b") for index in range(4)
     }
@@ -154,6 +156,35 @@ class SustainedHttpGateTests(unittest.TestCase):
         run, result = assess(report)
         self.assertEqual(run.returncode, 1)
         self.assertIn("media_gap_exceeded", result["issues"])
+
+    def test_initial_media_delay_fails_even_with_no_interpacket_gap(self):
+        report = complete_report()
+        report["viewers"]["soak_a:1"]["first_byte_max_ms"] = 3500
+        run, result = assess(report)
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("initial_media_gap_exceeded", result["issues"])
+
+    def test_media_stopping_before_deadline_fails_even_with_no_interpacket_gap(self):
+        report = complete_report()
+        report["viewers"]["soak_b:2"]["last_media_elapsed"] = 86396
+        run, result = assess(report)
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("final_media_gap_exceeded", result["issues"])
+
+    def test_media_at_exact_final_gap_limit_passes(self):
+        report = complete_report()
+        report["viewers"]["soak_b:2"]["last_media_elapsed"] = 86397
+        report["viewers"]["soak_a:1"]["first_byte_max_ms"] = 3000
+        run, result = assess(report)
+        self.assertEqual(run.returncode, 0)
+        self.assertEqual(result["issues"], [])
+
+    def test_missing_boundary_measurement_fails_closed(self):
+        report = complete_report()
+        del report["viewers"]["soak_b:2"]["last_media_elapsed"]
+        run, result = assess(report)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("invalid_report", result["issues"])
 
     def test_running_or_sparse_report_cannot_pass(self):
         report = complete_report()

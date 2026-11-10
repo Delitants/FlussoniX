@@ -111,11 +111,14 @@ def assess(report, revision):
         fail("viewer_set_incomplete")
     max_media_gap = 0
     max_reconnect_gap = 0
+    max_initial_media_gap = 0
+    max_final_media_gap = 0
     total_bytes = 0
     for name in EXPECTED_VIEWERS & set(viewers):
         row = viewers[name]
         if not isinstance(row, dict) or not all(number(row.get(field)) and row[field] >= 0 for field in (
-            "bytes", "connections", "sync_errors", "media_gap_max_ms", "reconnect_gap_max_ms"
+            "bytes", "connections", "sync_errors", "media_gap_max_ms", "reconnect_gap_max_ms",
+            "first_byte_max_ms", "last_media_elapsed"
         )):
             return {"result": "fail", "issues": issues + ["invalid_report"]}, 2
         total_bytes += row["bytes"]
@@ -123,6 +126,8 @@ def assess(report, revision):
             return {"result": "fail", "issues": issues + ["invalid_report"]}, 2
         max_media_gap = max(max_media_gap, row["media_gap_max_ms"])
         max_reconnect_gap = max(max_reconnect_gap, row["reconnect_gap_max_ms"])
+        max_initial_media_gap = max(max_initial_media_gap, row["first_byte_max_ms"])
+        max_final_media_gap = max(max_final_media_gap, max(0, DAY - row["last_media_elapsed"]) * 1000)
         if row["bytes"] < 4 * GIB:
             fail("viewer_media_incomplete")
         if row["connections"] < (1440 if name.endswith(":0") else 1):
@@ -138,6 +143,10 @@ def assess(report, revision):
         fail("media_gap_exceeded")
     if max_reconnect_gap > 3000:
         fail("reconnect_gap_exceeded")
+    if max_initial_media_gap > 3000:
+        fail("initial_media_gap_exceeded")
+    if max_final_media_gap > 3000:
+        fail("final_media_gap_exceeded")
 
     metadata = report.get("metadata_checks")
     if not isinstance(metadata, dict) or metadata.get("success") != len(samples) or metadata.get("errors") != {}:
@@ -149,6 +158,8 @@ def assess(report, revision):
         "viewer_gib": round(total_bytes / GIB, 2),
         "max_media_gap_ms": round(max_media_gap, 2),
         "max_reconnect_gap_ms": round(max_reconnect_gap, 2),
+        "max_initial_media_gap_ms": round(max_initial_media_gap, 2),
+        "max_final_media_gap_ms": round(max_final_media_gap, 2),
         "cgroup_memory_peak_mib": round(max(memory_peaks) / MIB, 2),
         "sampled_memory_growth_mib": round((memories[-1] - memories[0]) / MIB, 2),
     }

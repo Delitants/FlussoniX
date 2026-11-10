@@ -473,10 +473,11 @@ gates.
 from the isolated two-stream, eight-viewer, 24-hour MPEG-TS HTTP soak. It
 requires continuous sampling, clean viewer and metadata checks, planned
 connection churn, per-viewer media volume, at most three-second delivery gaps,
-and bounded service-cgroup memory and media disk use. The report's short
-revision is self-reported; binary/package provenance and all other release
-gates remain separate. A local loopback pass would not establish WAN or
-production-scale capacity.
+at most three seconds to first media after each connection and from the last
+media to the run deadline, and bounded service-cgroup memory and media disk use.
+The report's short revision is self-reported; binary/package provenance and
+all other release gates remain separate. A local loopback pass would not
+establish WAN or production-scale capacity.
 
 The versioned `scripts/run-sustained-http.py` creates the report in a fresh,
 private state directory. Run it in a separate cgroup-v2 scope limited to two
