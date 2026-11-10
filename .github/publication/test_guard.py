@@ -1,6 +1,7 @@
 """Behavioral regressions for the source and release publication guard."""
 
 import gzip
+import hashlib
 import importlib.util
 import io
 import json
@@ -349,6 +350,45 @@ class PublicationGuardTests(unittest.TestCase):
             sidecar = pathlib.Path(directory) / (PACKAGE_NAME + ".sha256")
             sidecar.write_text("a" * 64 + "  " + PACKAGE_NAME + "\n")
             self.assertEqual([], guard.release_errors(RELEASE_POLICY, "v1", [sidecar]))
+
+    def test_release_files_bind_uploaded_archive_to_its_checksum(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = pathlib.Path(directory) / PACKAGE_NAME
+            with tarfile.open(archive, "w:gz") as output:
+                output.addfile(tarfile.TarInfo("flussonix-test/"))
+            checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+            sidecar = pathlib.Path(str(archive) + ".sha256")
+            sidecar.write_text(f"{checksum}  {PACKAGE_NAME}\n")
+            self.assertEqual([], guard.release_errors(RELEASE_POLICY, "v1", [archive, sidecar]))
+
+            sidecar.write_text(f"{'0' * 64}  {PACKAGE_NAME}\n")
+            self.assertTrue(any("checksum mismatch" in error for error in
+                                guard.release_errors(RELEASE_POLICY, "v1", [archive, sidecar])))
+
+            sidecar.write_text(f"{checksum}  flussonix-other-linux-x86_64.tar.gz\n")
+            self.assertTrue(any("checksum" in error for error in
+                                guard.release_errors(RELEASE_POLICY, "v1", [archive, sidecar])))
+
+            self.assertTrue(any("checksum" in error for error in
+                                guard.release_errors(RELEASE_POLICY, "v1", [archive])))
+
+    def test_release_files_bind_sha256sums_to_uploaded_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = pathlib.Path(directory) / PACKAGE_NAME
+            with tarfile.open(archive, "w:gz") as output:
+                output.addfile(tarfile.TarInfo("flussonix-test/"))
+            checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+            sums = pathlib.Path(directory) / "SHA256SUMS"
+            sums.write_text(f"{checksum}  {PACKAGE_NAME}\n")
+            self.assertEqual([], guard.release_errors(RELEASE_POLICY, "v1", [archive, sums]))
+
+            sums.write_text(f"{'0' * 64}  {PACKAGE_NAME}\n")
+            self.assertTrue(any("checksum mismatch" in error for error in
+                                guard.release_errors(RELEASE_POLICY, "v1", [archive, sums])))
+
+            sums.write_text(f"{checksum}  {PACKAGE_NAME}\n{'0' * 64}  {PACKAGE_NAME}\n")
+            self.assertTrue(any("checksum" in error for error in
+                                guard.release_errors(RELEASE_POLICY, "v1", [archive, sums])))
 
     def test_release_files_accepts_multiple_checksum_lines(self):
         with tempfile.TemporaryDirectory() as directory:

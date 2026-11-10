@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Keep local planning and reports out of source pushes and release uploads."""
-import argparse,fnmatch,gzip,json,pathlib,re,shutil,subprocess,sys,tarfile,tempfile
+import argparse,fnmatch,gzip,hashlib,json,pathlib,re,shutil,subprocess,sys,tarfile,tempfile
 CONTROL='.github/publication/'
 CONTROL_FILES={CONTROL+'guard.py',CONTROL+'install-hooks.py',CONTROL+'policy.json'}
 PRIVATE_DIRS={'work','outputs','internal','reports','test-reports','evidence','acceptance','plans',
@@ -190,7 +190,7 @@ def release_errors(policy,tag,assets,notes=None):
  if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]*',tag):return ['Unsafe release tag']
  version=tag[1:] if tag.startswith('v') else tag
  patterns=[p.replace('{version}',version) for p in policy.get('release_assets',[])]
- errors=[];seen=set()
+ errors=[];seen=set();archives={};checksums={}
  for value in assets:
   p=pathlib.Path(value);name=p.name
   if name in seen:errors.append('Duplicated release asset: '+name)
@@ -199,12 +199,32 @@ def release_errors(policy,tag,assets,notes=None):
   if error:errors.append(name+': '+error);continue
   if not any(fnmatch.fnmatchcase(name,pattern) for pattern in patterns):errors.append(name+': not an approved release asset');continue
   if p.is_symlink() or not p.is_file():errors.append(name+': missing/unsafe asset');continue
-  if name.endswith('.tar.gz'):errors+=archive_errors(p)
-  elif name.endswith('.tar.gz.sha256') or name=='SHA256SUMS':errors+=checksum_errors(p)
+  if name.endswith('.tar.gz'):
+   archive_problems=archive_errors(p)
+   errors+=archive_problems
+   if not archive_problems:archives[name]=p
+  elif name.endswith('.tar.gz.sha256') or name=='SHA256SUMS':
+   checksum_problems=checksum_errors(p)
+   errors+=checksum_problems
+   if not checksum_problems:checksums[name]=p
   else:errors.append(name+': release asset type has no validator')
   if name.casefold() in USER_DOCS:
    if p.stat().st_size>MAX_TEXT:errors.append(name+': help exceeds size limit')
    else:errors+=text_errors(name,p.read_text(encoding='utf-8'))
+ for name,archive in archives.items():
+  sidecar=checksums.get(name+'.sha256')
+  manifest=checksums.get('SHA256SUMS')
+  if not sidecar and not manifest:
+   errors.append(name+': missing checksum sidecar or SHA256SUMS');continue
+  with archive.open('rb') as source:digest=hashlib.file_digest(source,'sha256').hexdigest()
+  for checksum_file in (sidecar,manifest):
+   if checksum_file is None:continue
+   lines=[line.split('  ',1) for line in checksum_file.read_text(encoding='ascii').splitlines()]
+   matching=[value for value,filename in lines if filename==name]
+   if len(matching)!=1:
+    errors.append(checksum_file.name+': checksum must name '+name+' exactly once')
+   elif matching[0].lower()!=digest:
+    errors.append(checksum_file.name+': checksum mismatch for '+name)
  if notes:
   p=pathlib.Path(notes)
   if p.is_symlink() or not p.is_file() or p.stat().st_size>MAX_TEXT:errors.append('Missing/unsafe release notes')
