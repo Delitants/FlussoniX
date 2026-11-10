@@ -74,7 +74,7 @@ async fn cross_origin_browser_cannot_stop_stream_with_cached_basic_credentials()
             Some("same-origin")
         )
         .await,
-        StatusCode::OK
+        StatusCode::NO_CONTENT
     );
     assert_eq!(app.media.count().await, 0);
     app.media.stop_all().await;
@@ -119,7 +119,7 @@ async fn configured_https_proxy_origin_allows_same_origin_admin_write() {
             Some("same-origin")
         )
         .await,
-        StatusCode::OK
+        StatusCode::NO_CONTENT
     );
     assert_eq!(app.media.count().await, 0);
     app.media.stop_all().await;
@@ -156,7 +156,7 @@ async fn browser_fetch_metadata_blocks_cross_site_mutation_without_origin_header
         StatusCode::FORBIDDEN
     );
     assert_eq!(app.media.count().await, 1);
-    assert_eq!(stop(app.clone(), None, None).await, StatusCode::OK);
+    assert_eq!(stop(app.clone(), None, None).await, StatusCode::NO_CONTENT);
     app.media.stop_all().await;
 }
 
