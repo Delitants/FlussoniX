@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Keep local planning and reports out of source pushes and release uploads."""
-import argparse,fnmatch,gzip,hashlib,json,pathlib,re,shutil,subprocess,sys,tarfile,tempfile
+import argparse,fnmatch,gzip,hashlib,json,pathlib,re,shutil,stat,subprocess,sys,tarfile,tempfile,zipfile
 from contextlib import contextmanager
 CONTROL='.github/publication/'
 CONTROL_FILES={CONTROL+'guard.py',CONTROL+'install-hooks.py',CONTROL+'policy.json'}
@@ -232,6 +232,124 @@ def release_errors(policy,tag,assets,notes=None):
   else:errors+=text_errors('Release notes',p.read_text(encoding='utf-8'))
  return errors
 
+def verify_ci_metadata(run,jobs,artifacts,run_id,tag,revision,repository):
+ if not all(isinstance(value,dict) for value in (run,jobs,artifacts)):
+  raise ValueError('Qualified CI metadata is invalid')
+ version=tag[1:] if tag.startswith('v') else tag
+ archive=f'flussonix-{version}-linux-x86_64-{revision[:12]}.tar.gz'
+ artifact_name=f'flussonix-candidate-{revision}'
+ if (run.get('status')!='completed' or run.get('conclusion')!='success'
+     or run.get('event')!='push' or run.get('head_branch')!='main'
+     or run.get('head_sha')!=revision or run.get('name')!='check'
+     or run.get('path') not in ('.github/workflows/ci.yml',
+                                '.github/workflows/ci.yml@main')
+     or not isinstance(run.get('repository'),dict)
+     or run['repository'].get('full_name')!=repository
+     or type(run['repository'].get('id')) is not int):
+  raise ValueError('Qualified CI run does not match the release source')
+ rows=jobs.get('jobs')
+ if (not isinstance(rows,list) or jobs.get('total_count')!=len(rows)
+     or len(rows)!=2 or {row.get('name') for row in rows if isinstance(row,dict)}
+     != {'verify','release_package_smoke'}
+     or any(not isinstance(row,dict) or row.get('status')!='completed'
+            or row.get('conclusion')!='success' for row in rows)):
+  raise ValueError('Qualified CI jobs did not both pass')
+ rows=artifacts.get('artifacts')
+ if not isinstance(rows,list) or artifacts.get('total_count')!=1 or len(rows)!=1:
+  raise ValueError('Qualified CI artifact is missing or ambiguous')
+ row=rows[0]
+ if (not isinstance(row,dict) or type(row.get('id')) is not int or row['id']<=0
+     or not isinstance(row.get('digest'),str)
+     or not re.fullmatch(r'sha256:[0-9a-f]{64}',row['digest'])
+     or row.get('name')!=artifact_name
+     or row.get('expired') is not False
+     or type(row.get('size_in_bytes')) is not int
+     or not 0<row['size_in_bytes']<=MAX_ARCHIVE_UNCOMPRESSED
+     or not isinstance(row.get('workflow_run'),dict)
+     or row['workflow_run'].get('id')!=run_id
+     or row['workflow_run'].get('head_sha')!=revision
+     or row['workflow_run'].get('repository_id')!=run['repository']['id']):
+  raise ValueError('Qualified CI artifact does not match the release run')
+ return artifact_name,archive,archive+'.sha256'
+
+def verify_ci_zip(downloaded,assets,archive,digest,size):
+ names={archive,archive+'.sha256'}
+ if len(assets)!=2 or {path.name for path in assets}!=names:
+  raise ValueError('Upload must contain the exact CI archive and checksum')
+ if (downloaded.is_symlink() or not downloaded.is_file()
+     or downloaded.stat().st_size!=size or size>MAX_ARCHIVE_UNCOMPRESSED):
+  raise ValueError('Qualified CI ZIP size differs from GitHub metadata')
+ with downloaded.open('rb') as source:
+  if 'sha256:'+hashlib.file_digest(source,'sha256').hexdigest()!=digest:
+   raise ValueError('Qualified CI ZIP digest differs from GitHub metadata')
+ try:
+  with zipfile.ZipFile(downloaded) as bundle:
+   entries=bundle.infolist()
+   if len(entries)!=2 or {item.filename for item in entries}!=names:
+    raise ValueError('Downloaded CI artifact has unexpected files')
+   for item in entries:
+    limit=MAX_CHECKSUM if item.filename.endswith('.sha256') else MAX_ARCHIVE_UNCOMPRESSED
+    mode=stat.S_IFMT(item.external_attr>>16)
+    if (item.is_dir() or item.flag_bits&1 or mode not in (0,stat.S_IFREG)
+        or item.file_size>limit):
+     raise ValueError('Qualified CI artifact contains unsafe files')
+    local=next(path for path in assets if path.name==item.filename)
+    if (local.is_symlink() or not local.is_file() or local.stat().st_size!=item.file_size):
+     raise ValueError('Upload differs from qualified CI artifact')
+    with bundle.open(item) as remote,local.open('rb') as source:
+     remote_hash=hashlib.sha256();total=0
+     while block:=remote.read(65536):
+      total+=len(block)
+      if total>limit:raise ValueError('Qualified CI entry exceeds size limit')
+      remote_hash.update(block)
+     if total!=item.file_size or remote_hash.digest()!=hashlib.file_digest(source,'sha256').digest():
+      raise ValueError('Upload differs from qualified CI artifact')
+ except (zipfile.BadZipFile,RuntimeError,EOFError) as error:
+  raise ValueError('Qualified CI ZIP is invalid') from error
+
+def github_json(repository,path):
+ return json.loads(subprocess.check_output(['gh','api',path]))
+
+def remote_tag_revision(repository,tag):
+ ref=github_json(repository,f'repos/{repository}/git/ref/tags/{tag}')
+ value=ref.get('object') if isinstance(ref,dict) else None
+ for _ in range(4):
+  if not isinstance(value,dict) or not re.fullmatch(r'[0-9a-f]{40}',str(value.get('sha',''))):
+   break
+  if value.get('type')=='commit':return value['sha']
+  if value.get('type')!='tag':break
+  tagged=github_json(repository,f'repos/{repository}/git/tags/{value["sha"]}')
+  value=tagged.get('object') if isinstance(tagged,dict) else None
+ raise ValueError('Remote release tag does not resolve to a commit')
+
+def download_ci_zip(repository,artifact_id,destination):
+ with destination.open('xb') as output:
+  subprocess.run(['gh','api',f'repos/{repository}/actions/artifacts/{artifact_id}/zip'],
+                 stdout=output,check=True)
+
+def verify_ci_provenance(repo,policy,tag,assets,run_id):
+ if (type(run_id) is not int or run_id<=0
+     or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]*',tag)):
+  raise ValueError('Qualified CI run ID or release tag is invalid')
+ repository=policy['repository']
+ revision=git(repo,'rev-parse','HEAD').decode().strip()
+ if not re.fullmatch(r'[0-9a-f]{40}',revision):
+  raise ValueError('Release checkout revision is invalid')
+ local_tag=git(repo,'rev-parse','--verify',f'refs/tags/{tag}^{{commit}}').decode().strip()
+ if local_tag!=revision or remote_tag_revision(repository,tag)!=revision:
+  raise ValueError('Release tag differs from qualified source revision')
+ root=f'repos/{repository}/actions/runs/{run_id}'
+ run=github_json(repository,root)
+ jobs=github_json(repository,root+'/jobs?per_page=100')
+ artifacts=github_json(repository,root+'/artifacts?per_page=100')
+ _,archive,_=verify_ci_metadata(run,jobs,artifacts,run_id,tag,revision,repository)
+ artifact=artifacts['artifacts'][0]
+ common=(pathlib.Path(repo)/git(repo,'rev-parse','--git-common-dir').decode().strip()).resolve()
+ with tempfile.TemporaryDirectory(prefix='publication-qualified-',dir=common) as temporary:
+  downloaded=pathlib.Path(temporary)/'artifact.zip'
+  download_ci_zip(repository,artifact['id'],downloaded)
+  verify_ci_zip(downloaded,assets,archive,artifact['digest'],artifact['size_in_bytes'])
+
 @contextmanager
 def upload_snapshot(repo,policy,tag,assets,notes):
  common=(pathlib.Path(repo)/git(repo,'rev-parse','--git-common-dir').decode().strip()).resolve()
@@ -258,6 +376,7 @@ def main():
  sub.add_parser('pre-push')
  for mode in ['release-files','upload']:
   r=sub.add_parser(mode);r.add_argument('--tag',required=True);r.add_argument('--asset',action='append',type=pathlib.Path,required=True);r.add_argument('--notes-file',type=pathlib.Path)
+  if mode=='upload':r.add_argument('--qualified-run',type=int)
  args=p.parse_args();repo=args.repository.resolve()
  try:
   policy=json.loads((args.policy or repo/(CONTROL+'policy.json')).read_text())
@@ -276,6 +395,7 @@ def main():
    if args.command=='upload':
     errors+=history_errors(repo,policy,'HEAD')
     if git(repo,'status','--porcelain').strip():errors.append('Upload requires a clean source checkout')
+   if args.qualified_run is None:errors.append('Qualified CI run ID required for upload')
   if errors:
    for error in errors:print('Publication blocked: '+error,file=sys.stderr)
    return 1
@@ -284,6 +404,7 @@ def main():
    origin=git(repo,'remote','get-url','origin').decode().removesuffix('\n')
    if not origin_matches_repository(origin,policy['repository']):raise ValueError('Upload repository identity differs')
    with upload_snapshot(repo,policy,args.tag,args.asset,args.notes_file) as (assets,notes):
+    verify_ci_provenance(repo,policy,args.tag,assets,args.qualified_run)
     release=json.loads(subprocess.check_output(['gh','api',f'repos/{policy["repository"]}/releases/tags/{args.tag}']))
     if text_errors('Release notes',release.get('body') or ''):raise ValueError('Existing release notes contain internal details')
     version=args.tag[1:] if args.tag.startswith('v') else args.tag

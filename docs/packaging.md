@@ -34,6 +34,14 @@ must ensure the supplied binary and UI were built from that revision; the
 packager cannot attest build provenance. No official Flussonic runtime files are
 collected or bundled.
 
+For a production GitHub release, use the archive and checksum retained by a
+successful `main` branch `check` run, then pass that run ID to
+`.github/publication/guard.py upload --qualified-run RUN_ID` with the tag and
+both asset paths. The guard requires the local and remote tag to point to the
+same commit as the CI run, and verifies the exact downloaded CI artifact bytes
+before upload. CI retains the candidate for one day; an expired artifact needs
+a fresh successful run. The separate release qualification gates still apply.
+
 The same input bytes, source revision, epoch and packaging toolchain produce the
 same archive bytes, regardless of source permissions or modification times.
 `SOURCE_DATE_EPOCH` or `--epoch` overrides the default source-commit timestamp.
