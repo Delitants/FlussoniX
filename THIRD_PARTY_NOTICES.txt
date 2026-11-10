@@ -171,6 +171,10 @@ rust: fallible-iterator 0.2.0 (MIT/Apache-2.0)
   third_party/licenses/rust/fallible-iterator-0.2.0/LICENSE-APACHE
   third_party/licenses/rust/fallible-iterator-0.2.0/LICENSE-MIT
 
+rust: fastrand 2.5.0 (Apache-2.0 OR MIT)
+  third_party/licenses/rust/fastrand-2.5.0/LICENSE-APACHE
+  third_party/licenses/rust/fastrand-2.5.0/LICENSE-MIT
+
 rust: find-msvc-tools 0.1.14 (MIT OR Apache-2.0)
   third_party/licenses/rust/find-msvc-tools-0.1.14/LICENSE-APACHE
   third_party/licenses/rust/find-msvc-tools-0.1.14/LICENSE-MIT
@@ -330,6 +334,12 @@ rust: libloading 0.8.9 (ISC)
 
 rust: libm 0.2.16 (MIT)
   third_party/licenses/rust/libm-0.2.16/LICENSE.txt
+
+rust: linux-raw-sys 0.12.1 (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT)
+  third_party/licenses/rust/linux-raw-sys-0.12.1/COPYRIGHT
+  third_party/licenses/rust/linux-raw-sys-0.12.1/LICENSE-APACHE
+  third_party/licenses/rust/linux-raw-sys-0.12.1/LICENSE-Apache-2.0_WITH_LLVM-exception
+  third_party/licenses/rust/linux-raw-sys-0.12.1/LICENSE-MIT
 
 rust: litemap 0.8.3 (Unicode-3.0)
   third_party/licenses/rust/litemap-0.8.3/LICENSE
@@ -498,6 +508,12 @@ rust: rustc-hash 2.1.3 (Apache-2.0 OR MIT)
   third_party/licenses/rust/rustc-hash-2.1.3/LICENSE-APACHE
   third_party/licenses/rust/rustc-hash-2.1.3/LICENSE-MIT
 
+rust: rustix 1.1.5 (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT)
+  third_party/licenses/rust/rustix-1.1.5/COPYRIGHT
+  third_party/licenses/rust/rustix-1.1.5/LICENSE-APACHE
+  third_party/licenses/rust/rustix-1.1.5/LICENSE-Apache-2.0_WITH_LLVM-exception
+  third_party/licenses/rust/rustix-1.1.5/LICENSE-MIT
+
 rust: rustls 0.23.46 (Apache-2.0 OR ISC OR MIT)
   third_party/licenses/rust/rustls-0.23.46/LICENSE-APACHE
   third_party/licenses/rust/rustls-0.23.46/LICENSE-ISC
@@ -611,6 +627,10 @@ rust: sync_wrapper 1.0.2 (Apache-2.0)
 
 rust: synstructure 0.14.0 (MIT)
   third_party/licenses/rust/synstructure-0.14.0/LICENSE
+
+rust: tempfile 3.27.0 (MIT OR Apache-2.0)
+  third_party/licenses/rust/tempfile-3.27.0/LICENSE-APACHE
+  third_party/licenses/rust/tempfile-3.27.0/LICENSE-MIT
 
 rust: thiserror 2.0.21 (MIT OR Apache-2.0)
   third_party/licenses/rust/thiserror-2.0.21/LICENSE-APACHE
