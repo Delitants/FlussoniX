@@ -377,28 +377,33 @@ async fn inspect_fmp4(engine: &Engine, directory: &Path, video: &str) -> Result<
     let streams = probe["streams"]
         .as_array()
         .ok_or_else(|| format!("fMP4 stream list absent: {probe}"))?;
-    let mut codecs: Vec<&str> = streams
+    let codecs: Vec<&str> = streams
         .iter()
         .filter_map(|stream| stream["codec_name"].as_str())
         .collect();
-    codecs.sort_unstable();
-    let mut expected = vec![
-        if video == "libx265" { "hevc" } else { "h264" },
-        "aac",
-        // FFmpeg's MP4 demuxer labels MPEG Layer II and III as mp3. The
-        // frame-header check below distinguishes their preserved payloads.
-        "mp3",
-        "mp3",
-    ];
-    expected.sort_unstable();
-    if codecs != expected {
+    let expected_video = if video == "libx265" { "hevc" } else { "h264" };
+    if codecs.len() != 4
+        || codecs
+            .iter()
+            .filter(|codec| **codec == expected_video)
+            .count()
+            != 1
+        || codecs.iter().filter(|codec| **codec == "aac").count() != 1
+        || codecs
+            .iter()
+            .filter(|codec| matches!(**codec, "mp2" | "mp3"))
+            .count()
+            != 2
+    {
         return Err(format!(
-            "fMP4 codecs {codecs:?}, expected {expected:?}; probe={probe}"
+            "fMP4 codecs {codecs:?}, expected {expected_video}, AAC and two MPEG audio tracks; probe={probe}"
         ));
     }
     let mpeg_streams: Vec<u64> = streams
         .iter()
-        .filter(|stream| stream["codec_name"] == "mp3")
+        // FFmpeg 7 labels both MPEG audio layers `mp3` in this MP4 container.
+        // Check payload layer bits below rather than depending on that label.
+        .filter(|stream| matches!(stream["codec_name"].as_str(), Some("mp2" | "mp3")))
         .filter_map(|stream| stream["index"].as_u64())
         .collect();
     let mut layers = Vec::new();
