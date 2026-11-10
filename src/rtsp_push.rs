@@ -240,13 +240,13 @@ impl State {
         };
         let connect_deadline =
             (Instant::now() + Duration::from_secs(self.destination.connect_seconds)).min(deadline);
-        let bridge = tokio::select! {biased;
+        let mut bridge = tokio::select! {biased;
             _=cancel.cancelled()=>return "push_stopped",
             _=tokio::time::sleep_until(tokio::time::Instant::from_std(connect_deadline))=>return "push_connect_failed",
             result=bridge::Bridge::prepare(&self.destination,self.egress.clone())=>match result{Ok(b)=>b,Err(_)=>return "push_connect_failed"}
         };
         let mut readers = tokio::task::JoinSet::new();
-        let result = tokio::select! {biased;_=cancel.cancelled()=>Err("push_stopped"),result=self.send(worker,&bridge,started,snapshot,&mut readers)=>result};
+        let result = tokio::select! {biased;_=cancel.cancelled()=>Err("push_stopped"),result=self.send(worker,&mut bridge,started,snapshot,&mut readers)=>result};
         readers.abort_all();
         while readers.join_next().await.is_some() {}
         bridge.close().await;
@@ -255,7 +255,7 @@ impl State {
     async fn send(
         &self,
         worker: &Arc<crate::media::Worker>,
-        bridge: &bridge::Bridge,
+        bridge: &mut bridge::Bridge,
         started: Instant,
         snapshot: crate::rtp::PlaySnapshot,
         readers: &mut tokio::task::JoinSet<()>,
