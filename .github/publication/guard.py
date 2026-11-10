@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Keep local planning and reports out of source pushes and release uploads."""
-import argparse,fnmatch,gzip,json,pathlib,re,shutil,subprocess,sys,tarfile,tempfile
+import argparse,fnmatch,gzip,hashlib,json,pathlib,re,shutil,subprocess,sys,tarfile,tempfile
+from contextlib import contextmanager
 CONTROL='.github/publication/'
 CONTROL_FILES={CONTROL+'guard.py',CONTROL+'install-hooks.py',CONTROL+'policy.json'}
 PRIVATE_DIRS={'work','outputs','internal','reports','test-reports','evidence','acceptance','plans',
@@ -190,7 +191,7 @@ def release_errors(policy,tag,assets,notes=None):
  if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]*',tag):return ['Unsafe release tag']
  version=tag[1:] if tag.startswith('v') else tag
  patterns=[p.replace('{version}',version) for p in policy.get('release_assets',[])]
- errors=[];seen=set()
+ errors=[];seen=set();archives={};checksums={}
  for value in assets:
   p=pathlib.Path(value);name=p.name
   if name in seen:errors.append('Duplicated release asset: '+name)
@@ -199,31 +200,55 @@ def release_errors(policy,tag,assets,notes=None):
   if error:errors.append(name+': '+error);continue
   if not any(fnmatch.fnmatchcase(name,pattern) for pattern in patterns):errors.append(name+': not an approved release asset');continue
   if p.is_symlink() or not p.is_file():errors.append(name+': missing/unsafe asset');continue
-  if name.endswith('.tar.gz'):errors+=archive_errors(p)
-  elif name.endswith('.tar.gz.sha256') or name=='SHA256SUMS':errors+=checksum_errors(p)
+  if name.endswith('.tar.gz'):
+   archive_problems=archive_errors(p)
+   errors+=archive_problems
+   if not archive_problems:archives[name]=p
+  elif name.endswith('.tar.gz.sha256') or name=='SHA256SUMS':
+   checksum_problems=checksum_errors(p)
+   errors+=checksum_problems
+   if not checksum_problems:checksums[name]=p
   else:errors.append(name+': release asset type has no validator')
   if name.casefold() in USER_DOCS:
    if p.stat().st_size>MAX_TEXT:errors.append(name+': help exceeds size limit')
    else:errors+=text_errors(name,p.read_text(encoding='utf-8'))
+ for name,archive in archives.items():
+  sidecar=checksums.get(name+'.sha256')
+  manifest=checksums.get('SHA256SUMS')
+  if not sidecar and not manifest:
+   errors.append(name+': missing checksum sidecar or SHA256SUMS');continue
+  with archive.open('rb') as source:digest=hashlib.file_digest(source,'sha256').hexdigest()
+  for checksum_file in (sidecar,manifest):
+   if checksum_file is None:continue
+   lines=[line.split('  ',1) for line in checksum_file.read_text(encoding='ascii').splitlines()]
+   matching=[value for value,filename in lines if filename==name]
+   if len(matching)!=1:
+    errors.append(checksum_file.name+': checksum must name '+name+' exactly once')
+   elif matching[0].lower()!=digest:
+    errors.append(checksum_file.name+': checksum mismatch for '+name)
  if notes:
   p=pathlib.Path(notes)
   if p.is_symlink() or not p.is_file() or p.stat().st_size>MAX_TEXT:errors.append('Missing/unsafe release notes')
   else:errors+=text_errors('Release notes',p.read_text(encoding='utf-8'))
  return errors
 
+@contextmanager
 def upload_snapshot(repo,policy,tag,assets,notes):
  common=(pathlib.Path(repo)/git(repo,'rev-parse','--git-common-dir').decode().strip()).resolve()
  stage=pathlib.Path(tempfile.mkdtemp(prefix='publication-upload-',dir=common));paths=[]
- for asset in assets:
-  destination=stage/pathlib.Path(asset).name
-  if destination.exists():raise ValueError('Duplicate upload filename')
-  shutil.copyfile(asset,destination,follow_symlinks=False);paths.append(destination)
- note=None
- if notes:
-  note=stage/'upload-notes.txt';shutil.copyfile(notes,note,follow_symlinks=False)
- errors=release_errors(policy,tag,paths,note)
- if errors:raise ValueError('; '.join(errors))
- return paths,note
+ try:
+  for asset in assets:
+   destination=stage/pathlib.Path(asset).name
+   if destination.exists():raise ValueError('Duplicate upload filename')
+   shutil.copyfile(asset,destination,follow_symlinks=False);paths.append(destination)
+  note=None
+  if notes:
+   note=stage/'upload-notes.txt';shutil.copyfile(notes,note,follow_symlinks=False)
+  errors=release_errors(policy,tag,paths,note)
+  if errors:raise ValueError('; '.join(errors))
+  yield paths,note
+ finally:
+  shutil.rmtree(stage)
 
 def main():
  p=argparse.ArgumentParser(description=__doc__)
@@ -258,14 +283,14 @@ def main():
    # Preserve existing project signing/qualification gates; this checks the upload only.
    origin=git(repo,'remote','get-url','origin').decode().removesuffix('\n')
    if not origin_matches_repository(origin,policy['repository']):raise ValueError('Upload repository identity differs')
-   assets,notes=upload_snapshot(repo,policy,args.tag,args.asset,args.notes_file)
-   release=json.loads(subprocess.check_output(['gh','api',f'repos/{policy["repository"]}/releases/tags/{args.tag}']))
-   if text_errors('Release notes',release.get('body') or ''):raise ValueError('Existing release notes contain internal details')
-   version=args.tag[1:] if args.tag.startswith('v') else args.tag
-   patterns=[p.replace('{version}',version) for p in policy.get('release_assets',[])]
-   for asset in release['assets']:
-    if private_error(asset['name']) or not any(fnmatch.fnmatchcase(asset['name'],p) for p in patterns):raise ValueError('Existing release has an unapproved attachment; review it before upload')
-   subprocess.run(['gh','release','upload',args.tag,*[str(x) for x in assets],'--repo',policy['repository']],check=True)
+   with upload_snapshot(repo,policy,args.tag,args.asset,args.notes_file) as (assets,notes):
+    release=json.loads(subprocess.check_output(['gh','api',f'repos/{policy["repository"]}/releases/tags/{args.tag}']))
+    if text_errors('Release notes',release.get('body') or ''):raise ValueError('Existing release notes contain internal details')
+    version=args.tag[1:] if args.tag.startswith('v') else args.tag
+    patterns=[p.replace('{version}',version) for p in policy.get('release_assets',[])]
+    for asset in release['assets']:
+     if private_error(asset['name']) or not any(fnmatch.fnmatchcase(asset['name'],p) for p in patterns):raise ValueError('Existing release has an unapproved attachment; review it before upload')
+    subprocess.run(['gh','release','upload',args.tag,*[str(x) for x in assets],'--repo',policy['repository']],check=True)
   return 0
  except (OSError,ValueError,UnicodeError,KeyError,TypeError,subprocess.CalledProcessError) as error:
   print('Publication blocked: '+str(error),file=sys.stderr);return 1
