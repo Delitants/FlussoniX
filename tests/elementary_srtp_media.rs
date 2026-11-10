@@ -3,6 +3,19 @@
 mod support;
 use serde_json::json;
 use support::qualify;
+
+#[tokio::test]
+async fn direct_srtp_mp3_copy_delivers_fmp4_audio_and_video() {
+    support::qualify_fmp4(
+        Some("libx264"),
+        &["libmp3lame"],
+        json!({"encoder":"copy","acodec":"copy"}),
+        true,
+        true,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn secure_elementary_source_h264_hevc_all_audio_decode() {
     for video in ["libx264", "libx265"] {
