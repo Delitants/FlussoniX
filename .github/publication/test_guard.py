@@ -247,6 +247,24 @@ class PublicationGuardTests(unittest.TestCase):
                 output.addfile(member, io.BytesIO(content))
             self.assertEqual([], guard.archive_errors(archive))
 
+    def test_release_archive_rejects_hidden_tar_after_end_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = pathlib.Path(directory) / "flussonix-test-linux-x86_64.tar.gz"
+            visible = io.BytesIO()
+            with tarfile.open(fileobj=visible, mode="w") as output:
+                output.addfile(tarfile.TarInfo("flussonix-test/"))
+            hidden = io.BytesIO()
+            with tarfile.open(fileobj=hidden, mode="w") as output:
+                content = b"private release material\n"
+                member = tarfile.TarInfo("private/notes.txt")
+                member.size = len(content)
+                output.addfile(member, io.BytesIO(content))
+            archive.write_bytes(gzip.compress(visible.getvalue() + hidden.getvalue()))
+            self.assertTrue(any(
+                "nonzero data after tar end marker" in error
+                for error in guard.archive_errors(archive)
+            ))
+
     def test_release_archive_rejects_zip_disguised_as_gzip_tar(self):
         with tempfile.TemporaryDirectory() as directory:
             archive = pathlib.Path(directory) / "flussonix-test-linux-x86_64.tar.gz"

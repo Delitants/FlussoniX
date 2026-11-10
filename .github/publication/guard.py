@@ -165,6 +165,12 @@ def archive_errors(path):
      error=private_error(item.linkname)
      if error:errors.append(item.name+': unsafe or private archive link')
     entry(item.name+'/' if item.isdir() else item.name,item.size,(lambda i=item:tar.extractfile(i).read(MAX_TEXT+1)) if item.isfile() else None)
+   tar_end=tar.offset
+  with gzip.open(path,'rb') as source:
+   source.seek(tar_end)
+   while data:=source.read(65536):
+    if any(data):
+     errors.append(str(path)+': archive has nonzero data after tar end marker');break
  except (OSError,ValueError,UnicodeError,RuntimeError,EOFError,tarfile.TarError) as e:errors.append(str(path)+': '+str(e))
  return errors
 
