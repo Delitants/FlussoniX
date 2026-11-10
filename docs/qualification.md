@@ -2450,8 +2450,11 @@ size bounds, authorization and stale-revision checks remain in place.
 
 Three loopback regressions first failed at the former 750 ms deadline, then
 passed with 900 ms authorized responses for FXLink while an ordinary source
-still timed out. The 19 source-directory, 20 resolver and five activation unit
-tests passed. All 16 source-failover integration tests passed in a serial run.
+still timed out. A slow primary control request followed by an authorized
+backup resolved after the ordinary three-second window, and an unrelated
+FXLink source group did not extend an ordinary mirror's deadline. The 19
+source-directory, 22 resolver and five activation unit tests passed. All 16
+source-failover integration tests passed in a serial run.
 An earlier four-thread run under a 60% CPU cap had four timing/media failures;
 the serial run with adequate CPU passed those same cases. Full exact-head CI
 and an all-traffic 500 ms RTT/1% loss cluster probe are still required. The

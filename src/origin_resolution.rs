@@ -59,14 +59,6 @@ impl App {
         revision: u64,
         activation_only: bool,
     ) -> Option<Lookup> {
-        let long_haul = root["sources"].as_array().is_some_and(|sources| {
-            sources.iter().any(|source| {
-                crate::source_directory::native_source(source)
-                    && source["flussonix_transport"] == "fxlink"
-                    && source["drain"] != true
-                    && allows(source, name)
-            })
-        });
         let mut tickets = self.source_lookups.lock().await;
         tickets.retain(|_, t| !*t.done.borrow());
         if tickets.len() >= 10000 && !tickets.contains_key(name) {
@@ -75,14 +67,32 @@ impl App {
         let mut mirrors = self.mirrors.lock().await;
         mirrors.retain(|_, m| m.known || m.when.elapsed() < Duration::from_secs(1));
         self.config.at_revision(revision, |_| {
+            let sources = root["sources"].as_array();
             let old = mirrors
                 .get(name)
-                .filter(|m| {
-                    root["sources"]
-                        .as_array()
-                        .is_some_and(|s| s.contains(&m.source))
-                })
+                .filter(|m| sources.is_some_and(|s| s.contains(&m.source)))
                 .cloned();
+            let eligible_fxlink = |source: &Value| {
+                crate::source_directory::native_source(source)
+                    && source["flussonix_transport"] == "fxlink"
+                    && source["drain"] != true
+                    && allows(source, name)
+            };
+            let long_haul = if let Some(m) = old.as_ref().filter(|m| m.known) {
+                eligible_fxlink(&m.source)
+                    || m.source["flussonix_source_group"].as_str().is_some()
+                        && m.config["flussonix_content_id"].as_str().is_some()
+                        && sources.is_some_and(|sources| {
+                            sources.iter().any(|source| {
+                                source != &m.source
+                                    && source["flussonix_source_group"]
+                                        == m.source["flussonix_source_group"]
+                                    && eligible_fxlink(source)
+                            })
+                        })
+            } else {
+                sources.is_some_and(|sources| sources.iter().any(eligible_fxlink))
+            };
             let ticket = Ticket {
                 id: uuid::Uuid::new_v4(),
                 done: tokio::sync::watch::channel(false).0,
@@ -1286,6 +1296,173 @@ mod cache_tests {
 #[cfg(test)]
 mod longhaul_control_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unrelated_fxlink_group_does_not_extend_an_ordinary_mirror_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-longhaul-admin".into(),
+                peer_key: "owned-longhaul-key".into(),
+                role: "cdn".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.config
+            .put(
+                "sources",
+                "ordinary",
+                json!({"api_url":"http://127.0.0.1:19996","flussonix_transport":"m4s","flussonix_source_group":"primary"}),
+            )
+            .unwrap();
+        app.config
+            .put(
+                "sources",
+                "fx",
+                json!({"api_url":"http://127.0.0.1:19997","flussonix_transport":"fxlink","flussonix_fxlink_url":"fxlink://127.0.0.1:55000","flussonix_source_group":"unrelated"}),
+            )
+            .unwrap();
+        let root = app.config.snapshot();
+        let ordinary = root["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["hostname"] == "ordinary")
+            .unwrap()
+            .clone();
+        app.mirrors.lock().await.insert(
+            "owned".into(),
+            Mirror {
+                when: Instant::now() - Duration::from_secs(11),
+                source: ordinary,
+                config: json!({"name":"owned","flussonix_content_id":"owned-content"}),
+                available: false,
+                denied: false,
+                known: true,
+                activation_only: false,
+                serial: 1,
+                switches: 0,
+            },
+        );
+        let lookup = app
+            .begin_lookup("owned", &root, app.config.revision(), false)
+            .await
+            .unwrap();
+        assert!(
+            lookup.deadline.duration_since(tokio::time::Instant::now()) < Duration::from_secs(4)
+        );
+        drop(lookup);
+
+        app.config
+            .put("sources", "fx", json!({"flussonix_source_group":"primary"}))
+            .unwrap();
+        let root = app.config.snapshot();
+        let eligible = app
+            .begin_lookup("owned", &root, app.config.revision(), false)
+            .await
+            .unwrap();
+        assert!(
+            eligible
+                .deadline
+                .duration_since(tokio::time::Instant::now())
+                > Duration::from_secs(5)
+        );
+        drop(eligible);
+        app.media.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn fxlink_failover_can_select_a_backup_after_a_slow_control_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-longhaul-admin".into(),
+                peer_key: "owned-longhaul-key".into(),
+                role: "cdn".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let slow_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_url = format!("http://{}", slow_listener.local_addr().unwrap());
+        let slow_router = axum::Router::new().route(
+            "/flussonix/api/v1/stream/owned",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                assert_eq!(headers["x-flussonix-peer"], "owned-longhaul-key");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                axum::Json(json!({"name":"owned"}))
+            }),
+        );
+        let slow_server =
+            tokio::spawn(async move { axum::serve(slow_listener, slow_router).await.unwrap() });
+        let backup_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backup_url = format!("http://{}", backup_listener.local_addr().unwrap());
+        let backup_router = axum::Router::new().route(
+            "/flussonix/api/v1/stream/owned",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                assert_eq!(headers["x-flussonix-peer"], "owned-longhaul-key");
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+                axum::Json(
+                    json!({"name":"owned","disabled":false,"flussonix_content_id":"owned-content"}),
+                )
+            }),
+        );
+        let backup_server =
+            tokio::spawn(async move { axum::serve(backup_listener, backup_router).await.unwrap() });
+        for (name, url, port) in [("slow", slow_url, 55001), ("backup", backup_url, 55002)] {
+            app.config
+                .put(
+                    "sources",
+                    name,
+                    json!({"api_url":url,"flussonix_transport":"fxlink","flussonix_fxlink_url":format!("fxlink://127.0.0.1:{port}"),"flussonix_source_group":"owned-group"}),
+                )
+                .unwrap();
+        }
+        let root = app.config.snapshot();
+        let slow_source = root["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["hostname"] == "slow")
+            .unwrap()
+            .clone();
+        app.mirrors.lock().await.insert(
+            "owned".into(),
+            Mirror {
+                when: Instant::now() - Duration::from_secs(11),
+                source: slow_source,
+                config: json!({"name":"owned","flussonix_content_id":"owned-content","static":false,"inputs":[{"url":"fxlink://127.0.0.1:55001/owned"}]}),
+                available: false,
+                denied: false,
+                known: true,
+                activation_only: false,
+                serial: 1,
+                switches: 0,
+            },
+        );
+        let started = tokio::time::Instant::now();
+        let resolved = tokio::time::timeout(Duration::from_secs(8), app.resolve("owned"))
+            .await
+            .expect("lookup must stay bounded")
+            .expect("backup must be selected");
+        let elapsed = started.elapsed();
+        assert!(elapsed > Duration::from_secs(3));
+        assert_eq!(resolved.config["flussonix_content_id"], "owned-content");
+        assert_eq!(
+            app.mirrors.lock().await["owned"].source["hostname"],
+            "backup"
+        );
+        slow_server.abort();
+        backup_server.abort();
+        let _ = slow_server.await;
+        let _ = backup_server.await;
+        app.media.stop_all().await;
+    }
 
     #[tokio::test]
     async fn fxlink_source_admission_and_selection_allow_bounded_long_haul_response() {
