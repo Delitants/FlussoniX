@@ -280,8 +280,9 @@ async fn fake_output(preserve: bool, clean_av_eof: bool) {
             r#"#!/usr/bin/python3
 import os,re,socket,sys,time
 if {preserve}:
-    host,port=re.search(r'tcp://([0-9.]+):(\d+)', ' '.join(sys.argv)).groups()
-    output=socket.create_connection((host,int(port)))
+    path=re.search(r'unix://(/[^|\s]+)', ' '.join(sys.argv)).group(1)
+    output=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+    output.connect(path)
     output.sendall(open({transport:?},'rb').read() if {clean} else bytes([0])*188)
     output.close()
 else:
