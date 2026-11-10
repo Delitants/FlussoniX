@@ -233,8 +233,10 @@ async fn independent_rtp_source_cpu_transcode_and_direct_output_decode() {
 #[path = "support/direct_media.rs"]
 mod matrix;
 #[tokio::test]
-async fn direct_mp2t_rtp_mixed_audio_fmp4_decodes() {
-    matrix::run_fmp4_copy(false).await;
+async fn direct_mp2t_rtp_mixed_audio_h264_hevc_fmp4_decodes() {
+    for video in ["libx264", "libx265"] {
+        matrix::run_fmp4_copy(video, false).await;
+    }
 }
 #[tokio::test]
 async fn independent_rtp_copy_codec_matrix_and_audio_only() {

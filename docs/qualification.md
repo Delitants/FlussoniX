@@ -2470,3 +2470,16 @@ queue drops. The namespace, daemons and FFmpeg children exited; the existing
 CDN test service remained active. Full CI verification is still pending. This
 short same-host impairment probe does not establish sustained WAN behavior,
 production capacity or full migration compatibility.
+
+## Direct RTP/SRTP fMP4 codec qualification
+
+The owned direct MP2T RTP and SRTP fMP4 copy tests now run both H.264 and HEVC
+with simultaneous AAC, MPEG Layer II and MPEG Layer III audio. Each case probes
+the produced fMP4 video codec, checks the actual MPEG audio frame headers for
+both Layer II and III, and independently decodes all four tracks. FFprobe labels
+both MPEG audio tracks `mp3` in this MP4 container, so its codec name alone does
+not distinguish the preserved layers. The focused plaintext and encrypted
+tests passed on the isolated Linux host. A separate secure elementary SRTP
+fMP4 matrix passed all six H.264/HEVC × AAC/MP2/MP3 cases. These tests do not
+explain the archived intermittent 38-picture HEVC input loss, establish browser
+support for every MPEG audio track, or replace exact-head full CI.
