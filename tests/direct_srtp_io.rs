@@ -300,13 +300,14 @@ async fn key_reference_change_replaces_worker_and_reopens_input_pair() {
         .ensure_guarded("owned", &cfg, true, std::future::ready(true))
         .await
         .unwrap();
-    assert_eq!(one.pid(), same.pid());
+    assert!(std::sync::Arc::ptr_eq(&one, &same));
     cfg["inputs"][0]["flussonix_rtp"]["key_file"] = json!(second);
     let two = engine
         .ensure_guarded("owned", &cfg, true, std::future::ready(true))
         .await
         .unwrap();
-    assert_ne!(one.pid(), two.pid());
+    assert!(!std::sync::Arc::ptr_eq(&one, &two));
+    assert_ne!(one.signature(), two.signature());
     assert_eq!(engine.count().await, 1);
     engine.stop_all().await;
     assert!(
