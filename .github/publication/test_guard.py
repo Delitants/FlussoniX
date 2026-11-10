@@ -1,5 +1,6 @@
 """Behavioral regressions for the source and release publication guard."""
 
+import gzip
 import importlib.util
 import io
 import json
@@ -292,8 +293,20 @@ class PublicationGuardTests(unittest.TestCase):
             archive = pathlib.Path(directory) / "flussonix-test-linux-x86_64.tar.gz"
             with tarfile.open(archive, "w:gz") as output:
                 output.addfile(tarfile.TarInfo("flussonix-test/"))
-            with mock.patch.object(guard, "MAX_ARCHIVE_UNCOMPRESSED", 1024):
-                self.assertTrue(guard.archive_errors(archive))
+            with mock.patch.object(guard, "MAX_ARCHIVE_UNCOMPRESSED", 1024), \
+                    mock.patch.object(guard.tarfile, "open", side_effect=AssertionError("tar parser reached")):
+                errors = guard.archive_errors(archive)
+            self.assertTrue(any("exceeds uncompressed size limit" in error for error in errors))
+
+    def test_release_archive_accepts_exact_uncompressed_size_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = pathlib.Path(directory) / "flussonix-test-linux-x86_64.tar.gz"
+            with tarfile.open(archive, "w:gz") as output:
+                output.addfile(tarfile.TarInfo("flussonix-test/"))
+            with gzip.open(archive, "rb") as source:
+                expanded_size = len(source.read())
+            with mock.patch.object(guard, "MAX_ARCHIVE_UNCOMPRESSED", expanded_size):
+                self.assertEqual([], guard.archive_errors(archive))
 
     def test_release_archive_rejects_more_than_4096_members(self):
         with tempfile.TemporaryDirectory() as directory:
