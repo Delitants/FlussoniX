@@ -495,9 +495,17 @@ async fn independent_decoder_follows_vendor_redirect_and_destination_checks_view
             // The production bridge verifies every TLS hop and owns all loopback relays.
             let bridge = if secure {
                 Some(
-                    flussonix::tls_input::Bridge::start(&uri, Some(&trust))
-                        .await
+                    flussonix::tls_input::Bridge::start_with_policy(
+                        &uri,
+                        Some(&trust),
+                        flussonix::tls_input::RedirectOrigins::parse(
+                            &uri,
+                            Some(&json!([&cdn.secure])),
+                        )
                         .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
                 )
             } else {
                 None

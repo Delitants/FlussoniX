@@ -1,4 +1,4 @@
-use flussonix::tls_input::Bridge;
+use flussonix::tls_input::{Bridge, RedirectOrigins};
 use std::{
     path::Path,
     sync::{
@@ -33,6 +33,15 @@ async fn reply_bridge(
     reply: Vec<u8>,
     userinfo: &str,
 ) -> (Bridge, AbortOnDropHandle<()>) {
+    reply_bridge_with_policy(c, ca, reply, userinfo, None).await
+}
+async fn reply_bridge_with_policy(
+    c: &Certificates,
+    ca: &Path,
+    reply: Vec<u8>,
+    userinfo: &str,
+    roots: Option<serde_json::Value>,
+) -> (Bridge, AbortOnDropHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let acceptor = tokio_rustls::TlsAcceptor::from(c.server());
@@ -42,12 +51,18 @@ async fn reply_bridge(
         assert!(header(&mut socket).await.starts_with(b"DESCRIBE "));
         let _ = socket.write_all(&reply).await;
     }));
-    let bridge = Bridge::prepare(
-        &format!("rtsps://{userinfo}{addr}/owned?token=initial"),
-        Some(ca),
-    )
-    .await
-    .unwrap();
+    let input = format!("rtsps://{userinfo}{addr}/owned?token=initial");
+    let bridge = if let Some(roots) = roots {
+        Bridge::prepare_with_policy(
+            &input,
+            Some(ca),
+            RedirectOrigins::parse(&input, Some(&roots)).unwrap(),
+        )
+        .await
+        .unwrap()
+    } else {
+        Bridge::prepare(&input, Some(ca)).await.unwrap()
+    };
     (bridge, task)
 }
 async fn send(url: &str, timeout: Duration) -> Vec<u8> {
@@ -79,6 +94,151 @@ fn local_target(bytes: &[u8]) -> String {
     assert!(url.username().is_empty());
     assert!(url.password().is_none());
     target.into()
+}
+#[tokio::test]
+async fn cross_origin_redirect_requires_explicit_policy() {
+    let c = Certificates::new();
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = target.local_addr().unwrap();
+    let wire = format!("RTSP/1.0 302 Moved\r\nCSeq: 1\r\nLocation: rtsps://{addr}/owned\r\n\r\n")
+        .into_bytes();
+    let (bridge, source) = reply_bridge(&c, &c.ca, wire, "").await;
+    let response = tokio::select! {
+        accepted = target.accept() => panic!("unapproved redirect connected: {accepted:?}"),
+        response = send(bridge.local_url(), Duration::from_secs(3)) => response,
+    };
+    assert!(response.is_empty(), "unapproved redirect reached decoder");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), target.accept())
+            .await
+            .is_err()
+    );
+    bridge.close().await;
+    source.await.unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(c.server());
+    let target_task = AbortOnDropHandle::new(tokio::spawn(async move {
+        let (socket, _) = target.accept().await.unwrap();
+        let mut socket = acceptor.accept(socket).await.unwrap();
+        assert!(header(&mut socket).await.starts_with(b"DESCRIBE "));
+        socket
+            .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+    }));
+    let wire = format!("RTSP/1.0 302 Moved\r\nCSeq: 1\r\nLocation: rtsps://{addr}/owned\r\n\r\n")
+        .into_bytes();
+    let (bridge, source) = reply_bridge_with_policy(
+        &c,
+        &c.ca,
+        wire,
+        "",
+        Some(serde_json::json!([format!("rtsps://{addr}")])),
+    )
+    .await;
+    let local = local_target(&send(bridge.local_url(), Duration::from_secs(3)).await);
+    assert!(
+        send(&local, Duration::from_secs(3))
+            .await
+            .starts_with(b"RTSP/1.0 200 OK")
+    );
+    bridge.close().await;
+    source.await.unwrap();
+    target_task.await.unwrap();
+}
+#[tokio::test]
+async fn bridge_rejects_policy_for_another_source() {
+    let policy = RedirectOrigins::parse(
+        "rtsps://first.example/live",
+        Some(&serde_json::json!(["rtsps://cdn.example"])),
+    )
+    .unwrap();
+    assert!(
+        Bridge::prepare_with_policy("rtsps://second.example/live", None, policy)
+            .await
+            .is_err()
+    );
+    let policy = RedirectOrigins::parse(
+        "rtsps://first.example/live",
+        Some(&serde_json::json!(["rtsps://cdn.example"])),
+    )
+    .unwrap();
+    assert!(
+        Bridge::start_with_policy("rtsps://user:secret@first.example/live", None, policy)
+            .await
+            .is_err()
+    );
+}
+#[tokio::test]
+async fn later_unlisted_redirect_never_connects() {
+    let c = Certificates::new();
+    let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first_addr = first.local_addr().unwrap();
+    let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second_addr = second.local_addr().unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(c.server());
+    let first_task = AbortOnDropHandle::new(tokio::spawn(async move {
+        let (socket, _) = first.accept().await.unwrap();
+        let mut socket = acceptor.accept(socket).await.unwrap();
+        assert!(header(&mut socket).await.starts_with(b"DESCRIBE "));
+        socket
+            .write_all(
+                format!(
+                    "RTSP/1.0 302 Moved\r\nCSeq: 1\r\nLocation: rtsps://{second_addr}/final\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    }));
+    let wire =
+        format!("RTSP/1.0 302 Moved\r\nCSeq: 1\r\nLocation: rtsps://{first_addr}/next\r\n\r\n")
+            .into_bytes();
+    let (bridge, source) = reply_bridge_with_policy(
+        &c,
+        &c.ca,
+        wire,
+        "",
+        Some(serde_json::json!([format!("rtsps://{first_addr}")])),
+    )
+    .await;
+    let first_local = local_target(&send(bridge.local_url(), Duration::from_secs(3)).await);
+    let response = tokio::select! {
+        accepted = second.accept() => panic!("later unapproved redirect connected: {accepted:?}"),
+        response = send(&first_local, Duration::from_secs(3)) => response,
+    };
+    assert!(response.is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), second.accept())
+            .await
+            .is_err()
+    );
+    bridge.close().await;
+    source.await.unwrap();
+    first_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn credentialed_source_does_not_delegate_to_approved_origin() {
+    let c = Certificates::new();
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = target.local_addr().unwrap();
+    let wire = format!("RTSP/1.0 302 Moved\r\nCSeq: 1\r\nLocation: rtsps://{addr}/owned\r\n\r\n")
+        .into_bytes();
+    let (bridge, source) = reply_bridge_with_policy(
+        &c,
+        &c.ca,
+        wire,
+        "user:private-password@",
+        Some(serde_json::json!([format!("rtsps://{addr}")])),
+    )
+    .await;
+    let response = tokio::select! {
+        accepted = target.accept() => panic!("credentialed redirect delegated: {accepted:?}"),
+        response = send(bridge.local_url(), Duration::from_secs(3)) => response,
+    };
+    assert!(response.is_empty());
+    bridge.close().await;
+    source.await.unwrap();
 }
 #[tokio::test]
 async fn invalid_redirects_and_cross_origin_credentials_never_connect_or_escape() {
@@ -187,7 +347,14 @@ async fn redirected_identity_trust_and_expiry_reject_before_application_bytes() 
         }
         std::fs::write(&trust, roots).unwrap();
         let wire = format!("RTSP/1.0 302 Moved\r\nCSeq: 1\r\nLocation: rtsps://{addr}/owned?token=target-secret\r\n\r\n").into_bytes();
-        let (bridge, task) = reply_bridge(&original, &trust, wire, "").await;
+        let (bridge, task) = reply_bridge_with_policy(
+            &original,
+            &trust,
+            wire,
+            "",
+            Some(serde_json::json!([format!("rtsps://{addr}")])),
+        )
+        .await;
         assert!(
             send(bridge.local_url(), Duration::from_secs(3))
                 .await
@@ -301,7 +468,14 @@ async fn closing_during_redirected_handshake_releases_target_and_decoder() {
         bytes
     }));
     let wire = format!("RTSP/1.0 302 Moved\r\nCSeq: 1\r\nLocation: rtsps://{addr}/owned?token=target-secret\r\n\r\n").into_bytes();
-    let (bridge, task) = reply_bridge(&c, &c.ca, wire, "").await;
+    let (bridge, task) = reply_bridge_with_policy(
+        &c,
+        &c.ca,
+        wire,
+        "",
+        Some(serde_json::json!([format!("rtsps://{addr}")])),
+    )
+    .await;
     let u = url::Url::parse(bridge.local_url()).unwrap();
     let mut local = TcpStream::connect(("127.0.0.1", u.port().unwrap()))
         .await
@@ -354,7 +528,14 @@ async fn redirected_unused_endpoint_expires_and_close_releases_handoff() {
             "RTSP/1.0 301 Moved\r\nCSeq: 1\r\nLocation: rtsps://{addr}/next?token=explicit\r\n\r\n"
         )
         .into_bytes();
-        let (bridge, task) = reply_bridge(&c, &c.ca, wire, "").await;
+        let (bridge, task) = reply_bridge_with_policy(
+            &c,
+            &c.ca,
+            wire,
+            "",
+            Some(serde_json::json!([format!("rtsps://{addr}")])),
+        )
+        .await;
         let location = local_target(&send(bridge.local_url(), Duration::from_secs(3)).await);
         let next = url::Url::parse(&location).unwrap();
         if close {

@@ -7,8 +7,10 @@ use std::{
     },
     time::Duration,
 };
+mod origins;
 mod peer;
 mod redirect;
+pub use origins::RedirectOrigins;
 use tokio::{
     net::{TcpListener, TcpStream},
     task::JoinHandle,
@@ -89,11 +91,23 @@ pub struct Bridge {
 }
 impl Bridge {
     pub async fn prepare(input: &str, ca: Option<&Path>) -> Result<Self, String> {
+        Self::prepare_with_policy(input, ca, RedirectOrigins::parse(input, None)?).await
+    }
+    pub async fn prepare_with_policy(
+        input: &str,
+        ca: Option<&Path>,
+        policy: RedirectOrigins,
+    ) -> Result<Self, String> {
+        let url = source(input)?;
+        if !policy.matches_source(&url) {
+            return Err("RTSPS redirect policy does not match input".into());
+        }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         let upstream = connect(input, ca).await?;
         Self::bind(
-            source(input)?,
+            url,
             ca.map(Path::to_owned),
+            policy,
             deadline,
             async move { Ok(upstream) },
             Arc::new(AtomicU32::new(std::process::id())),
@@ -104,7 +118,17 @@ impl Bridge {
     /// worker task, so failure retains retry/fallback state and never holds
     /// the global worker map while waiting for an upstream handshake.
     pub async fn start(input: &str, ca: Option<&Path>) -> Result<Self, String> {
+        Self::start_with_policy(input, ca, RedirectOrigins::parse(input, None)?).await
+    }
+    pub async fn start_with_policy(
+        input: &str,
+        ca: Option<&Path>,
+        policy: RedirectOrigins,
+    ) -> Result<Self, String> {
         let url = source(input)?;
+        if !policy.matches_source(&url) {
+            return Err("RTSPS redirect policy does not match input".into());
+        }
         let input = input.to_owned();
         let ca = ca.map(Path::to_owned);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -112,6 +136,7 @@ impl Bridge {
         Self::bind(
             url,
             trust,
+            policy,
             deadline,
             async move { connect(&input, ca.as_deref()).await },
             Arc::new(AtomicU32::new(0)),
@@ -121,6 +146,7 @@ impl Bridge {
     async fn bind(
         url: url::Url,
         ca: Option<std::path::PathBuf>,
+        policy: RedirectOrigins,
         deadline: tokio::time::Instant,
         upstream: impl std::future::Future<
             Output = Result<tokio_rustls::client::TlsStream<TcpStream>, String>,
@@ -141,7 +167,7 @@ impl Bridge {
             let Ok(Ok(upstream)) = tokio::time::timeout_at(deadline, upstream).await else {
                 return;
             };
-            let _ = redirect::relay(url, listener, upstream, ca, deadline, expected).await;
+            let _ = redirect::relay(url, listener, upstream, ca, policy, deadline, expected).await;
         });
         Ok(Self {
             url: local_url,

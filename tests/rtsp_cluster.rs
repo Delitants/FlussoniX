@@ -629,6 +629,38 @@ async fn explicit_h264_rtsps_relay_decodes_with_one_upstream_admission() {
 async fn rtsps_fallback_uses_selected_input_startup_mode() {
     configured_rtsps_relay_decodes_native_lb_cdn_source_chain_profile(Some("h264"), true).await;
 }
+#[tokio::test]
+async fn unlisted_rtsps_cdn_is_not_admitted_by_relay() {
+    let mut lab = Lab::new(1000).await;
+    let mut relay = Node::new("standalone", 1000).await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let private = lab.source.secure_media().await;
+        for node in [&lab.lb, &lab.cdn] {
+            node.app.config.put("sources", "origin", json!({"private_payload_url":private,"flussonix_media_tls_ca":lab.source.cert.ca})).unwrap();
+        }
+        let trust = relay._dir.path().join("cluster-ca.pem");
+        let mut roots = std::fs::read(&lab.lb.cert.ca).unwrap();
+        roots.extend_from_slice(&std::fs::read(&lab.cdn.cert.ca).unwrap());
+        std::fs::write(&trust, roots).unwrap();
+        relay.app.config.put("streams", "relay", json!({"static":false,"inputs":[{
+            "url":format!("{}/region/owned?{QS}", lab.lb.tls),
+            "flussonix_tls_ca":trust,
+            "flussonix_rtsp_startup":"conservative"
+        }]})).unwrap();
+        let playback = format!("{}/relay/fmp4/index.m3u8", relay.http);
+        let response = client().get(&playback).send().await.unwrap();
+        assert!(!response.status().is_success());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(lab.cdn.probe.admits.load(Ordering::SeqCst) >= 1, "LB did not select its CDN");
+        assert_eq!(lab.cdn.app.media.count().await, 0, "unlisted CDN received a media pull");
+        assert_eq!(lab.source.app.media.count().await, 0);
+    }).catch_unwind().await;
+    relay.stop().await;
+    lab.stop().await;
+    if let Err(p) = result {
+        std::panic::resume_unwind(p)
+    }
+}
 async fn configured_rtsps_relay_decodes_native_lb_cdn_source_chain_profile(
     startup: Option<&str>,
     fallback: bool,
@@ -650,7 +682,11 @@ async fn configured_rtsps_relay_decodes_native_lb_cdn_source_chain_profile(
         let mut roots = std::fs::read(&lab.lb.cert.ca).unwrap();
         roots.extend_from_slice(&std::fs::read(&lab.cdn.cert.ca).unwrap());
         std::fs::write(&trust, roots).unwrap();
-        let mut input = json!({"url":format!("{}/region/owned?{QS}", lab.lb.tls),"flussonix_tls_ca":trust});
+        let mut input = json!({
+            "url":format!("{}/region/owned?{QS}", lab.lb.tls),
+            "flussonix_tls_ca":trust,
+            "flussonix_rtsps_redirect_origins":[lab.cdn.tls]
+        });
         if let Some(startup) = startup { input["flussonix_rtsp_startup"] = json!(startup); }
         let inputs = if fallback {
             vec![
@@ -694,6 +730,22 @@ async fn configured_rtsps_relay_decodes_native_lb_cdn_source_chain_profile(
         }
         assert!(!lab.cdn.probe.bad_key.load(Ordering::SeqCst));
         assert!(!lab.source.probe.bad_key.load(Ordering::SeqCst));
+        if startup.is_none() && !fallback {
+            let original = relay.app.media.ensure("relay", &relay.app.config.effective("relay").unwrap()).await.unwrap();
+            assert!(original.alive.load(Ordering::SeqCst));
+            relay.app.config.put("streams", "relay", json!({"inputs":[{
+                "url":format!("{}/region/owned?{QS}", lab.lb.tls),
+                "flussonix_tls_ca":trust
+            }]})).unwrap();
+            let updated = relay.app.media.ensure("relay", &relay.app.config.effective("relay").unwrap()).await.unwrap();
+            assert!(!Arc::ptr_eq(&original, &updated), "policy edit must replace the worker generation");
+            assert!(!original.alive.load(Ordering::SeqCst), "retired worker stayed alive");
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while updated.alive.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.expect("worker with removed CDN origin did not fail closed");
+        }
     }).catch_unwind().await;
     relay.stop().await;
     lab.stop().await;

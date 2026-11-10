@@ -12,7 +12,11 @@ pub(crate) enum VideoCodec {
 }
 
 /// Unknown responses retain the conservative copied-video startup filter.
-pub(crate) async fn video_codec(input: &str, ca: Option<&Path>) -> Option<VideoCodec> {
+pub(crate) async fn video_codec(
+    input: &str,
+    ca: Option<&Path>,
+    policy: Option<crate::tls_input::RedirectOrigins>,
+) -> Option<VideoCodec> {
     let checked = if input.starts_with("rtsps://") {
         input.to_owned()
     } else {
@@ -21,7 +25,16 @@ pub(crate) async fn video_codec(input: &str, ca: Option<&Path>) -> Option<VideoC
     crate::media::validate_rtsp_input_url(&checked).ok()?;
     tokio::time::timeout(Duration::from_secs(3), async {
         if input.starts_with("rtsps://") {
-            let bridge = crate::tls_input::Bridge::start(input, ca).await.ok()?;
+            let bridge = crate::tls_input::Bridge::start_with_policy(
+                input,
+                ca,
+                match policy {
+                    Some(policy) => policy,
+                    None => crate::tls_input::RedirectOrigins::parse(input, None).ok()?,
+                },
+            )
+            .await
+            .ok()?;
             bridge.authorize_pid(std::process::id()).ok()?;
             let result = describe(bridge.local_url(), true).await;
             bridge.close().await;
@@ -231,7 +244,7 @@ mod tests {
             socket.write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Type: application/sdp\r\nContent-Length: 65537\r\n\r\n").await.unwrap();
         });
         let url = format!("rtsp://{address}/stream");
-        assert_eq!(video_codec(&url, None).await, None);
+        assert_eq!(video_codec(&url, None, None).await, None);
         server.await.unwrap();
     }
 }

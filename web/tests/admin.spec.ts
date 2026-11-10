@@ -738,6 +738,50 @@ test('RTSPS trust uses a friendly CA path field and clears it when changing prot
  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await ca.fill(process.env.FLUSSONIX_TEST_CA_FILE!);await page.getByLabel('Input URL',{exact:true}).fill('hls://example.net/camera/index.m3u8');await expect(ca).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_tls_ca).toBeUndefined();await expect(page.locator('textarea')).toHaveCount(0);await request.delete('/streamer/api/v3/streams/'+name,{headers});
 });
 
+test('Streams edit approved RTSPS redirects as origin rows and clear them on protocol change',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-rtsps-redirect-'+Date.now();
+ try{
+  expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,static:false,inputs:[{url:'rtsps://localhost:19990/camera'}]}})).ok()).toBeTruthy();
+  await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+  await expect(page.getByText('Allowed RTSPS redirects',{exact:true})).toBeVisible();
+  await page.getByRole('button',{name:'Add allowed RTSPS redirect',exact:true}).click();
+  const root=page.getByLabel('Allowed RTSPS redirect 1',{exact:true});
+  for(const invalid of ['rtsps://cdn.example/live','rtsps://cdn.example/live/..','rtsps://cdn.example/%2e','rtsps://cdn.example?','rtsps://cdn.example#']){
+   await root.fill(invalid);await page.getByRole('button',{name:'Save',exact:true}).click();
+   await expect(page.getByText('Allowed RTSPS redirects must be RTSPS origin roots without paths or credentials.',{exact:true})).toBeVisible();
+  }
+  await root.fill('rtsps://cdn.example:8322');await page.getByRole('button',{name:'Save',exact:true}).click();
+  let saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(saved.config_on_disk.inputs[0].flussonix_rtsps_redirect_origins).toEqual(['rtsps://cdn.example:8322']);
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(root).toHaveValue('rtsps://cdn.example:8322');
+  await page.getByRole('button',{name:'Remove allowed RTSPS redirect 1',exact:true}).click();await page.getByRole('button',{name:'Save',exact:true}).click();
+  saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(saved.config_on_disk.inputs[0].flussonix_rtsps_redirect_origins).toBeUndefined();
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByRole('button',{name:'Add allowed RTSPS redirect',exact:true}).click();await root.fill('rtsps://cdn.example:8322');
+  await page.getByLabel('Input URL',{exact:true}).fill('hls://example.net/camera/index.m3u8');await expect(page.getByText('Allowed RTSPS redirects',{exact:true})).toHaveCount(0);
+  await page.getByRole('button',{name:'Save',exact:true}).click();saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(saved.config_on_disk.inputs[0].flussonix_rtsps_redirect_origins).toBeUndefined();
+  await expect(page.locator('textarea')).toHaveCount(0);
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});}
+});
+
+test('Templates persist approved RTSPS redirects for inheriting streams',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const template='ui-rtsps-redirect-template-'+Date.now(),name='ui-rtsps-redirect-child-'+Date.now();
+ try{
+  expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{$reset:true,inputs:[{url:'rtsps://localhost:19990/camera'}]}})).ok()).toBeTruthy();
+  await page.getByRole('button',{name:'Templates',exact:true}).click();await page.getByRole('row').filter({has:page.getByRole('cell',{name:template,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+  await page.getByRole('button',{name:'Add allowed RTSPS redirect',exact:true}).click();await page.getByLabel('Allowed RTSPS redirect 1',{exact:true}).fill('rtsps://cdn.example:8322');
+  await page.getByRole('button',{name:'Save',exact:true}).click();
+  const saved=await(await request.get('/streamer/api/v3/templates/'+template,{headers})).json();expect(saved.inputs[0].flussonix_rtsps_redirect_origins).toEqual(['rtsps://cdn.example:8322']);
+  expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,template,static:false}})).ok()).toBeTruthy();
+  const child=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(child.inputs[0].flussonix_rtsps_redirect_origins).toEqual(['rtsps://cdn.example:8322']);
+  await page.getByRole('row').filter({has:page.getByRole('cell',{name:template,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+  await expect(page.getByLabel('Allowed RTSPS redirect 1',{exact:true})).toHaveValue('rtsps://cdn.example:8322');
+  await page.getByRole('button',{name:'Remove allowed RTSPS redirect 1',exact:true}).click();await page.getByRole('button',{name:'Save',exact:true}).click();
+  const cleared=await(await request.get('/streamer/api/v3/templates/'+template,{headers})).json();expect(cleared.inputs[0].flussonix_rtsps_redirect_origins).toBeUndefined();
+  await expect(page.locator('textarea')).toHaveCount(0);
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});await request.delete('/streamer/api/v3/templates/'+template,{headers});}
+});
+
 test('publication forms expose masked publisher credentials and preserve template inheritance',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
  const template='ui-publish-template',name='ui-publish-stream';

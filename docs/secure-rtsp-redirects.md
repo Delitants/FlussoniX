@@ -12,6 +12,23 @@ field to an absolute PEM bundle containing the trust roots for every participati
 TLS server. The input CA setting is `flussonix_tls_ca`. Server identity is verified
 at every hop; certificate checking cannot be disabled.
 
+An RTSPS input follows redirects to its original hostname and port by default.
+For an LB that redirects to CDN listeners, add each trusted CDN origin in
+**Allowed RTSPS redirects** beneath that input. Enter roots such as
+`rtsps://cdn.example:322`, without a stream path, query, fragment, wildcard or
+credentials. The API field is `flussonix_rtsps_redirect_origins`, an array of up
+to 16 such roots. The original origin is always allowed and need not be listed.
+Hostnames compare without case and the default RTSPS port is 322. A DNS alias or
+different port needs its own entry. Changing the list replaces the stream's
+worker; a removed destination cannot continue through the old bridge.
+
+An input URL containing username or password may redirect only within its
+original hostname and port, even if other origins are listed. Put approved
+roots on the specific Stream or Template input used by the receiving node;
+this does not configure another node or grant it credentials. Include each
+participating server's trust root in the input CA bundle when using private
+certificates.
+
 The worker owns a loopback RTSP bridge. It intercepts an initial 301/302, verifies
 the next TLS connection, then constructs a new redirect to a fresh owned loopback
 listener. FFmpeg repeats its handshake through that listener. Remote redirect
@@ -27,10 +44,8 @@ if that check is unavailable, the input fails closed.
 
 Only absolute strict `rtsps` destinations are accepted. Plaintext, other schemes,
 userinfo, fragments, invalid URI escapes, port zero, unsupported 3xx and ambiguous
-headers fail closed. An input containing username/password can follow redirects
-only to its original normalized hostname and effective port (default 322).
-Changing either is rejected before connecting, including a DNS alias pointing to
-the same server. After verifying the target TLS connection, the bridge copies
+headers fail closed. An unapproved hostname or port is rejected before DNS or
+TCP connection on every redirect hop. After verifying the target TLS connection, the bridge copies
 only the originally configured userinfo into the owned loopback handoff. Remote
 Location userinfo remains rejected. URL-cycle comparison excludes credentials.
 

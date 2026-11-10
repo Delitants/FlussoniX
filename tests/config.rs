@@ -1202,6 +1202,123 @@ fn rtsp_input_urls_reject_malformed_targets_before_saving() {
 }
 
 #[test]
+fn rtsps_redirect_origins_validate_and_inherit() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(dir.path().join("redirects.json")).unwrap();
+    let approved = json!(["rtsps://CDN.example:322", "rtsps://backup.example:8322/"]);
+    store
+        .put(
+            "templates",
+            "camera",
+            json!({"inputs":[{"url":"rtsps://lb.example/live","flussonix_rtsps_redirect_origins":approved}]}),
+        )
+        .unwrap();
+    store
+        .put(
+            "streams",
+            "owned",
+            json!({"template":"camera","static":false}),
+        )
+        .unwrap();
+    assert_eq!(
+        store.effective("owned").unwrap()["inputs"][0]["flussonix_rtsps_redirect_origins"],
+        approved
+    );
+    store
+        .put(
+            "streams",
+            "owned",
+            json!({"inputs":[{"url":"rtsps://lb.example/live","flussonix_rtsps_redirect_origins":["rtsps://override.example:9443"]}]}),
+        )
+        .unwrap();
+    assert_eq!(
+        store.effective("owned").unwrap()["inputs"][0]["flussonix_rtsps_redirect_origins"],
+        json!(["rtsps://override.example:9443"])
+    );
+    let before = store.snapshot();
+    let invalid = [
+        json!(["rtsps://cdn.example/a"]),
+        json!(["rtsps://cdn.example/live/.."]),
+        json!(["rtsps://cdn.example/%2e"]),
+        json!(["rtsps://cdn.example?"]),
+        json!(["rtsps://cdn.example#"]),
+        json!(["rtsps://cdn.example?token=hidden"]),
+        json!(["rtsps://cdn.example/#fragment"]),
+        json!(["rtsps://user:secret@cdn.example"]),
+        json!(["rtsps://@cdn.example"]),
+        json!(["rtsp://cdn.example"]),
+        json!(["rtsps://*.example"]),
+        json!(["rtsps://cdn.example:0"]),
+        json!(["rtsps://cdn.example", "rtsps://CDN.example:322/"]),
+        json!(
+            (0..17)
+                .map(|n| format!("rtsps://cdn{n}.example"))
+                .collect::<Vec<_>>()
+        ),
+        json!("rtsps://cdn.example"),
+        json!([42]),
+    ];
+    for roots in invalid {
+        let error = store
+            .put(
+                "streams",
+                "owned",
+                json!({"inputs":[{"url":"rtsps://lb.example/live","flussonix_rtsps_redirect_origins":roots}]}),
+            )
+            .unwrap_err();
+        assert!(!error.contains("secret"));
+        assert_eq!(store.snapshot(), before);
+    }
+    assert!(store
+        .put(
+            "streams",
+            "owned",
+            json!({"inputs":[{"url":"rtsp://lb.example/live","flussonix_rtsps_redirect_origins":[]}]}),
+        )
+        .is_err());
+    assert_eq!(store.snapshot(), before);
+}
+
+#[test]
+fn redirect_origin_policy_normalizes_and_scopes() {
+    use flussonix::tls_input::RedirectOrigins;
+    let policy = RedirectOrigins::parse(
+        "rtsps://lb.example/live",
+        Some(&json!([
+            "rtsps://CDN.example:322/",
+            "rtsps://backup.example:8322"
+        ])),
+    )
+    .unwrap();
+    for allowed in [
+        "rtsps://LB.example:322/other",
+        "rtsps://cdn.example/other",
+        "rtsps://backup.example:8322/other",
+    ] {
+        assert!(
+            policy.permits(&url::Url::parse(allowed).unwrap()),
+            "{allowed}"
+        );
+    }
+    for denied in [
+        "rtsps://cdn.example:323/other",
+        "rtsps://unknown.example/other",
+    ] {
+        assert!(
+            !policy.permits(&url::Url::parse(denied).unwrap()),
+            "{denied}"
+        );
+    }
+    let credentialed = RedirectOrigins::parse(
+        "rtsps://user:secret@lb.example/live",
+        Some(&json!(["rtsps://cdn.example"])),
+    )
+    .unwrap();
+    assert!(credentialed.permits(&url::Url::parse("rtsps://lb.example/other").unwrap()));
+    assert!(!credentialed.permits(&url::Url::parse("rtsps://cdn.example/other").unwrap()));
+}
+
+#[test]
 fn rtsp_udp_alias_is_inherited_persisted_and_rejects_incompatible_options() {
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("alias.json");
