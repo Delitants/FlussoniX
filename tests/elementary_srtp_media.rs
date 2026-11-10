@@ -5,15 +5,19 @@ use serde_json::json;
 use support::qualify;
 
 #[tokio::test]
-async fn direct_srtp_mp3_copy_delivers_fmp4_audio_and_video() {
-    support::qualify_fmp4(
-        Some("libx264"),
-        &["libmp3lame"],
-        json!({"encoder":"copy","acodec":"copy"}),
-        true,
-        true,
-    )
-    .await;
+async fn direct_srtp_h264_hevc_all_audio_copy_delivers_fmp4() {
+    for video in ["libx264", "libx265"] {
+        for audio in ["aac", "mp2", "libmp3lame"] {
+            support::qualify_fmp4(
+                Some(video),
+                &[audio],
+                json!({"encoder":"copy","acodec":"copy"}),
+                true,
+                true,
+            )
+            .await;
+        }
+    }
 }
 
 #[tokio::test]

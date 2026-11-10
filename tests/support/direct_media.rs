@@ -22,8 +22,8 @@ pub async fn run_cpu(secure: bool) {
     run_profile(Some("libx264"), secure, None, true, false).await;
 }
 #[allow(dead_code)]
-pub async fn run_fmp4_copy(secure: bool) {
-    run_profile(Some("libx264"), secure, None, false, true).await;
+pub async fn run_fmp4_copy(video: &str, secure: bool) {
+    run_profile(Some(video), secure, None, false, true).await;
 }
 async fn run_profile(
     video: Option<&str>,
@@ -200,7 +200,7 @@ async fn run_profile(
     let mut sender = tx.spawn().unwrap();
     let received = tokio::time::timeout(Duration::from_secs(22), receiver.wait()).await;
     let fmp4 = if require_fmp4 {
-        Some(inspect_fmp4(&e, d.path()).await)
+        Some(inspect_fmp4(&e, d.path(), video.expect("fMP4 fixture video codec")).await)
     } else {
         None
     };
@@ -313,7 +313,7 @@ async fn run_profile(
             .is_ok()
     );
 }
-async fn inspect_fmp4(engine: &Engine, directory: &Path) -> Result<(), String> {
+async fn inspect_fmp4(engine: &Engine, directory: &Path, video: &str) -> Result<(), String> {
     let playlist = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             if let Ok(data) = engine.read("owned", "fmp4/index.m3u8").await {
@@ -349,6 +349,97 @@ async fn inspect_fmp4(engine: &Engine, directory: &Path) -> Result<(), String> {
     );
     let sample = directory.join("sample.mp4");
     std::fs::write(&sample, bytes).map_err(|error| error.to_string())?;
+    let probed = tokio::time::timeout(
+        Duration::from_secs(10),
+        Command::new("ffprobe")
+            .kill_on_drop(true)
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=index,codec_name",
+                "-of",
+                "json",
+            ])
+            .arg(&sample)
+            .output(),
+    )
+    .await
+    .map_err(|_| "fMP4 codec probe timed out".to_owned())?
+    .map_err(|error| error.to_string())?;
+    if !probed.status.success() || !probed.stderr.is_empty() {
+        return Err(format!(
+            "fMP4 codec probe failed: {}",
+            String::from_utf8_lossy(&probed.stderr)
+        ));
+    }
+    let probe: Value = serde_json::from_slice(&probed.stdout).map_err(|error| error.to_string())?;
+    let streams = probe["streams"]
+        .as_array()
+        .ok_or_else(|| format!("fMP4 stream list absent: {probe}"))?;
+    let mut codecs: Vec<&str> = streams
+        .iter()
+        .filter_map(|stream| stream["codec_name"].as_str())
+        .collect();
+    codecs.sort_unstable();
+    let mut expected = vec![
+        if video == "libx265" { "hevc" } else { "h264" },
+        "aac",
+        // FFmpeg's MP4 demuxer labels MPEG Layer II and III as mp3. The
+        // frame-header check below distinguishes their preserved payloads.
+        "mp3",
+        "mp3",
+    ];
+    expected.sort_unstable();
+    if codecs != expected {
+        return Err(format!(
+            "fMP4 codecs {codecs:?}, expected {expected:?}; probe={probe}"
+        ));
+    }
+    let mpeg_streams: Vec<u64> = streams
+        .iter()
+        .filter(|stream| stream["codec_name"] == "mp3")
+        .filter_map(|stream| stream["index"].as_u64())
+        .collect();
+    let mut layers = Vec::new();
+    for index in mpeg_streams {
+        let packet = tokio::time::timeout(
+            Duration::from_secs(10),
+            Command::new("ffmpeg")
+                .kill_on_drop(true)
+                .args(["-nostdin", "-v", "error", "-i"])
+                .arg(&sample)
+                .args([
+                    "-map",
+                    &format!("0:{index}"),
+                    "-c",
+                    "copy",
+                    "-frames:a",
+                    "1",
+                    "-f",
+                    "data",
+                    "-",
+                ])
+                .output(),
+        )
+        .await
+        .map_err(|_| format!("fMP4 MPEG audio packet {index} timed out"))?
+        .map_err(|error| error.to_string())?;
+        if !packet.status.success() || !packet.stderr.is_empty() || packet.stdout.len() < 4 {
+            return Err(format!("fMP4 MPEG audio packet {index} unavailable"));
+        }
+        let header = u32::from_be_bytes(packet.stdout[..4].try_into().unwrap());
+        if (header >> 21) & 0x7ff != 0x7ff {
+            return Err(format!("fMP4 MPEG audio packet {index} lacks frame sync"));
+        }
+        layers.push((header >> 17) & 3);
+    }
+    layers.sort_unstable();
+    if layers != [1, 2] {
+        return Err(format!(
+            "fMP4 MPEG audio layers {layers:?}, expected III and II"
+        ));
+    }
     let decoded = tokio::time::timeout(
         Duration::from_secs(10),
         Command::new("ffmpeg")
