@@ -22,6 +22,7 @@ pub(crate) async fn video_codec(input: &str, ca: Option<&Path>) -> Option<VideoC
     tokio::time::timeout(Duration::from_secs(3), async {
         if input.starts_with("rtsps://") {
             let bridge = crate::tls_input::Bridge::start(input, ca).await.ok()?;
+            bridge.authorize_pid(std::process::id()).ok()?;
             let result = describe(bridge.local_url(), true).await;
             bridge.close().await;
             result

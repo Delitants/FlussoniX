@@ -1,5 +1,14 @@
 //! The root input task owns the entire verified redirect chain.
-use std::{collections::HashSet, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
@@ -39,16 +48,37 @@ pub(super) async fn relay(
     mut upstream: TlsStream<TcpStream>,
     ca: Option<PathBuf>,
     deadline: tokio::time::Instant,
+    decoder_pid: Arc<AtomicU32>,
 ) -> Result<(), String> {
     let credentials = !source.username().is_empty() || source.password().is_some();
     let mut visited = HashSet::from([identity(&source)]);
     let mut redirects = 0;
     loop {
         let expires = (tokio::time::Instant::now() + Duration::from_secs(8)).min(deadline);
-        let (downstream, _) = tokio::time::timeout_at(expires, listener.accept())
-            .await
-            .map_err(|_| "RTSPS decoder connection timed out")?
-            .map_err(|_| "RTSPS decoder connection failed")?;
+        let downstream = loop {
+            let (candidate, _) = tokio::time::timeout_at(expires, listener.accept())
+                .await
+                .map_err(|_| "RTSPS decoder connection timed out")?
+                .map_err(|_| "RTSPS decoder connection failed")?;
+            let owned = loop {
+                let pid = decoder_pid.load(Ordering::Acquire);
+                if pid != 0 {
+                    break tokio::time::timeout_at(expires, super::peer::belongs(pid, &candidate))
+                        .await
+                        .map_err(|_| "RTSPS decoder peer check timed out")?
+                        .map_err(String::from)?;
+                }
+                if tokio::time::Instant::now() >= expires {
+                    return Err("RTSPS decoder PID timed out".into());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            if owned {
+                break candidate;
+            }
+            // A foreign local process cannot consume this bridge or refresh
+            // the absolute startup deadline.
+        };
         drop(listener);
         let _ = downstream.set_nodelay(true);
         let (mut request, mut response) = downstream.into_split();

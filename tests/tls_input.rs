@@ -1,7 +1,7 @@
 use flussonix::tls_input::Bridge;
 use std::time::Duration;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 #[path = "support/tls.rs"]
@@ -81,6 +81,28 @@ async fn verified_redirect_uses_owned_loopback_and_delivers_final_tls_response()
     assert_ne!(next.port(), Some(edge_addr.port()));
     assert_eq!(next.path(), "/second");
     assert_eq!(next.query(), Some("token=edge-only&client=owned"));
+    // A redirect opens a fresh local listener. A foreign process must not
+    // consume that handoff before the same decoder follows Location.
+    let mut foreign = tokio::process::Command::new("python3")
+        .args([
+            "-c",
+            "import socket,sys,time; s=socket.create_connection(('127.0.0.1',int(sys.argv[1]))); print('ready',flush=True); time.sleep(5)",
+            &next.port().unwrap().to_string(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::BufReader::new(foreign.stdout.take().unwrap()).read_line(&mut ready),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ready, "ready\n");
+    tokio::time::sleep(Duration::from_millis(30)).await;
     let mut socket = TcpStream::connect(("127.0.0.1", next.port().unwrap()))
         .await
         .unwrap();
@@ -97,6 +119,8 @@ async fn verified_redirect_uses_owned_loopback_and_delivers_final_tls_response()
         received,
         b"RTSP/1.0 200 OK\r\nCSeq: 8\r\nContent-Length: 4\r\n\r\nPONG"
     );
+    foreign.kill().await.unwrap();
+    foreign.wait().await.unwrap();
     bridge.close().await;
     initial_task.await.unwrap();
     edge_task.await.unwrap();
@@ -207,6 +231,66 @@ async fn verified_bridge_forwards_original_path_and_guard_closes_both_sockets() 
             || matches!(closed,Err(ref e) if e.kind()==std::io::ErrorKind::ConnectionReset)
     );
     assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+}
+#[tokio::test]
+async fn foreign_local_connector_cannot_take_the_verified_decoder_session() {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let cert = Certificates::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(cert.server());
+    let upstream = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = acceptor.accept(socket).await.unwrap();
+        let mut bytes = [0; 4];
+        socket.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"PING");
+        socket
+            .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 4\r\n\r\nPONG")
+            .await
+            .unwrap();
+    });
+    let bridge = Bridge::start(&format!("rtsps://{address}/owned"), Some(&cert.ca))
+        .await
+        .unwrap();
+    let port = url::Url::parse(bridge.local_url()).unwrap().port().unwrap();
+    let mut foreign = tokio::process::Command::new("python3")
+        .args([
+            "-c",
+            "import socket,sys,time; s=socket.create_connection(('127.0.0.1',int(sys.argv[1]))); print('ready',flush=True); time.sleep(5)",
+            &port.to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        BufReader::new(foreign.stdout.take().unwrap()).read_line(&mut ready),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ready, "ready\n");
+    bridge.authorize_pid(std::process::id()).unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let mut decoder = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    decoder.write_all(b"PING").await.unwrap();
+    let mut bytes = [0; 51];
+    tokio::time::timeout(Duration::from_secs(2), decoder.read_exact(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        &bytes,
+        b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 4\r\n\r\nPONG"
+    );
+    bridge.close().await;
+    foreign.kill().await.unwrap();
+    foreign.wait().await.unwrap();
+    upstream.await.unwrap();
 }
 #[tokio::test]
 async fn worker_spawn_failure_and_stop_release_verified_upstream() {

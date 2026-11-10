@@ -11,6 +11,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
+    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -40,6 +41,20 @@ struct Lab {
     audio: bool,
     pool: Option<Arc<rtsp::udp::Pool>>,
     audio_expected: std::collections::HashMap<u32, Vec<f64>>,
+}
+async fn decoder_output(
+    mut command: tokio::process::Command,
+    bridge: Option<&flussonix::tls_input::Bridge>,
+) -> std::process::Output {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = command.spawn().unwrap();
+    if let Some(bridge) = bridge {
+        bridge.authorize_pid(child.id().unwrap()).unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(25), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap()
 }
 async fn fixture_profile(transport: &str, video: bool, audio: &str) -> Lab {
     let selected = [audio];
@@ -527,10 +542,7 @@ async fn playback_profile(transport: &str, video: bool, audio: &str) {
     }
     cmd.args(["-threads", "1", "-f", "framemd5", "-"])
         .kill_on_drop(true);
-    let out = tokio::time::timeout(Duration::from_secs(25), cmd.output())
-        .await
-        .unwrap()
-        .unwrap();
+    let out = decoder_output(cmd, bridge.as_ref()).await;
     assert!(
         out.status.success() && out.stderr.is_empty(),
         "decode {}",
@@ -1090,10 +1102,7 @@ async fn multitrack_playback(transport: &str, video: bool, audios: &[&str]) {
                 ])
                 .arg(lab._dir.path().join(format!("delivered-{index}.pcm")));
         }
-        let output = tokio::time::timeout(Duration::from_secs(25), command.output())
-            .await
-            .unwrap()
-            .unwrap();
+        let output = decoder_output(command, bridge.as_ref()).await;
         assert!(
             output.status.success() && output.stderr.is_empty(),
             "strict multitrack decode: {}",

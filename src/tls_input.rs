@@ -1,5 +1,13 @@
 //! Verified RTSPS input. FFmpeg receives only a worker-owned loopback RTSP URL.
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
+mod peer;
 mod redirect;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -76,6 +84,7 @@ async fn connect(
 }
 pub struct Bridge {
     url: String,
+    decoder_pid: Arc<AtomicU32>,
     task: Option<JoinHandle<()>>,
 }
 impl Bridge {
@@ -87,6 +96,7 @@ impl Bridge {
             ca.map(Path::to_owned),
             deadline,
             async move { Ok(upstream) },
+            Arc::new(AtomicU32::new(std::process::id())),
         )
         .await
     }
@@ -99,9 +109,13 @@ impl Bridge {
         let ca = ca.map(Path::to_owned);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         let trust = ca.clone();
-        Self::bind(url, trust, deadline, async move {
-            connect(&input, ca.as_deref()).await
-        })
+        Self::bind(
+            url,
+            trust,
+            deadline,
+            async move { connect(&input, ca.as_deref()).await },
+            Arc::new(AtomicU32::new(0)),
+        )
         .await
     }
     async fn bind(
@@ -112,6 +126,7 @@ impl Bridge {
             Output = Result<tokio_rustls::client::TlsStream<TcpStream>, String>,
         > + Send
         + 'static,
+        decoder_pid: Arc<AtomicU32>,
     ) -> Result<Self, String> {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -120,20 +135,33 @@ impl Bridge {
             .local_addr()
             .map_err(|_| "RTSPS input bridge address unavailable")?;
         let local_url = redirect::loopback(&url, local)?;
+        let expected = decoder_pid.clone();
         let task = tokio::spawn(async move {
             // The root task owns every hop; no application data precedes TLS verification.
             let Ok(Ok(upstream)) = tokio::time::timeout_at(deadline, upstream).await else {
                 return;
             };
-            let _ = redirect::relay(url, listener, upstream, ca, deadline).await;
+            let _ = redirect::relay(url, listener, upstream, ca, deadline, expected).await;
         });
         Ok(Self {
             url: local_url,
+            decoder_pid,
             task: Some(task),
         })
     }
     pub fn local_url(&self) -> &str {
         &self.url
+    }
+    /// Bind an asynchronously started worker bridge to its actual decoder.
+    /// A prepared in-process bridge is already bound to its creating process.
+    pub fn authorize_pid(&self, pid: u32) -> Result<(), &'static str> {
+        if pid == 0 {
+            return Err("RTSPS decoder PID unavailable");
+        }
+        self.decoder_pid
+            .compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| "RTSPS decoder PID already bound")
     }
     pub async fn close(mut self) {
         if let Some(task) = self.task.take() {
@@ -154,6 +182,7 @@ enum Frame {
     Data(bool),
     Redirect(url::Url, String),
 }
+
 /// Only the supervisor receives a validated remote redirect. It constructs a
 /// local response after verification; remote 3xx bytes never reach the decoder.
 async fn forward_responses<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
@@ -300,5 +329,47 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
             Some((url, cseq)) => Frame::Redirect(url, cseq),
             None => Frame::Data(established),
         })
+    }
+}
+
+#[cfg(test)]
+mod owned_peer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn only_the_actual_decoder_process_owns_the_accepted_tcp_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let foreign = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (foreign_server, _) = listener.accept().await.unwrap();
+        let mut child = tokio::process::Command::new("python3")
+            .args([
+                "-c",
+                "import socket,sys,time; s=socket.create_connection(('127.0.0.1',int(sys.argv[1]))); time.sleep(5)",
+                &port.to_string(),
+            ])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        assert!(!peer::belongs(pid, &foreign_server).await.unwrap());
+        assert!(
+            peer::belongs(std::process::id(), &foreign_server)
+                .await
+                .unwrap()
+        );
+        let (owned_server, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(peer::belongs(pid, &owned_server).await.unwrap());
+        assert!(
+            !peer::belongs(std::process::id(), &owned_server)
+                .await
+                .unwrap()
+        );
+        drop(foreign);
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
     }
 }

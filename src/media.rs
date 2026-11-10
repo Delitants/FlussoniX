@@ -1818,6 +1818,9 @@ impl Engine {
             )
         };
         let pid = child.as_ref().and_then(|c| c.id()).unwrap_or(0);
+        if let Some(bridge) = &tls_input {
+            bridge.authorize_pid(pid).map_err(String::from)?;
+        }
         let tx = ts_channel();
         let mut stdin = child.as_mut().and_then(|c| c.stdin.take());
         // Reserve the publisher immediately, but bound metadata collection before
