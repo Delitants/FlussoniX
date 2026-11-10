@@ -7,6 +7,7 @@ use axum::{
 use flussonix::playback_auth::{AuthOutcome, PlaybackAuth, Policy, ViewerRequest};
 use flussonix::server::{App, Options, router};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{
@@ -826,6 +827,36 @@ async fn session_id(app: &Arc<App>) -> String {
         .as_str()
         .unwrap()
         .into()
+}
+#[tokio::test]
+async fn view_session_reads_hide_token_derived_user_id() {
+    let (_d, app, _backend, task, _) = setup().await;
+    let digest = format!("{:x}", Sha256::digest(b"short-pin"));
+    app.config
+        .put(
+            "streams",
+            "owned",
+            json!({"on_play": null, "flussonix_token_sha256": digest}),
+        )
+        .unwrap();
+    let live = media(&app, "/owned/mpegts?token=short-pin").await;
+    assert_eq!(live.status(), StatusCode::OK);
+    let edit = value(api(&app, "GET", "sessions", json!(null), false).await).await;
+    assert_eq!(edit["sessions"][0]["user_id"], digest);
+    let id = edit["sessions"][0]["id"].as_str().unwrap();
+
+    let view = value(api(&app, "GET", "sessions", json!(null), true).await).await;
+    assert_eq!(view["estimated_count"], 1);
+    assert_eq!(view["sessions"][0]["id"], id);
+    assert_eq!(view["sessions"][0]["user_id"], "[redacted]");
+    assert!(!view.to_string().contains(&digest));
+    let detail = value(api(&app, "GET", &format!("sessions/{id}"), json!(null), true).await).await;
+    assert_eq!(detail["user_id"], "[redacted]");
+    assert!(!detail.to_string().contains(&digest));
+
+    drop(live);
+    app.media.stop_all().await;
+    task.abort();
 }
 async fn closed(response: axum::response::Response) -> bool {
     use futures_util::StreamExt;

@@ -1191,6 +1191,7 @@ fn redact_view_value(value: &mut Value) {
                         | "flussonix_fxlink_token"
                         | "flussonix_token_sha256"
                         | "token"
+                        | "user_id"
                         | "streamid"
                         | "key_file"
                         | "track_key_files"
