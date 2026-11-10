@@ -997,6 +997,8 @@ async fn in_flight_approval_cannot_restore_manual_revoke() {
 #[tokio::test]
 async fn metadata_edit_keeps_identity_but_changed_policy_revokes_live_grant() {
     let (_d, app, b, task, _) = setup().await;
+    // This test is about config edits, not the first short-lease renewal at 100 ms.
+    b.mode.store(16, Ordering::SeqCst);
     let first = media(&app, "/owned/mpegts?token=metadata").await;
     let id = session_id(&app).await;
     assert_eq!(
