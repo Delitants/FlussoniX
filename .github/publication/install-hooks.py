@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Install persistent publication hooks while retaining existing custom hooks."""
-import json,os,pathlib,re,shlex,shutil,subprocess
+import json,os,pathlib,shlex,shutil,subprocess
+from guard import origin_matches_repository
 
-def git(*args):return subprocess.check_output(['git',*args],text=True).strip()
+def git(*args):return subprocess.check_output(['git',*args],text=True).removesuffix('\n')
 def config(key):
  result=subprocess.run(['git','config','--get',key],capture_output=True,text=True)
  return result.stdout.strip() if result.returncode==0 else ''
@@ -11,8 +12,7 @@ root=pathlib.Path(git('rev-parse','--show-toplevel')).resolve()
 control=pathlib.Path(__file__).resolve().parent
 policy=json.loads((control/'policy.json').read_text())
 origin=git('remote','get-url','origin')
-match=re.search(r'github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$',origin,re.I)
-if not match or match[1].casefold()!=policy['repository'].casefold():raise SystemExit('Repository identity differs from publication policy')
+if not origin_matches_repository(origin,policy['repository']):raise SystemExit('Repository identity differs from publication policy')
 common=pathlib.Path(git('rev-parse','--git-common-dir')).resolve();target=common/'publication-safety-hooks'
 previous=config('core.hooksPath');global_hooks=config('publication.safeGlobalHooksPath')
 if previous and pathlib.Path(previous).resolve()==target:

@@ -400,6 +400,98 @@ class PublicationGuardTests(unittest.TestCase):
             self.assertIn("Publication blocked", result.stderr)
             self.assertFalse(marker.exists())
 
+    def test_upload_requires_authentic_github_origin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "tracked").write_text("baseline\n")
+            subprocess.run(["git", "-C", str(repo), "add", "tracked"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "baseline"], check=True)
+            baseline = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            policy = root / "policy.json"
+            policy.write_text(json.dumps({**RELEASE_POLICY, "baseline": baseline,
+                                          "repository": "Delitants/FlussoniX"}))
+            sidecar = root / (PACKAGE_NAME + ".sha256")
+            sidecar.write_text("a" * 64 + "  " + PACKAGE_NAME + "\n")
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            marker = root / "github-was-called"
+            fake_gh = fake_bin / "gh"
+            fake_gh.write_text("#!/bin/sh\nprintf called > \"$GH_MARKER\"\n"
+                               "if [ \"$1\" = api ]; then printf '{\"body\":\"\",\"assets\":[]}'; fi\n")
+            fake_gh.chmod(0o755)
+            for origin in (
+                "https://evil.example/github.com/Delitants/FlussoniX.git",
+                "https://github.com@evil.example/github.com/Delitants/FlussoniX.git",
+                "https://gıthub.com/Delitants/FlussoniX.git",
+                "https://github.com/Delitants/FlussoniX.git ",
+            ):
+                with self.subTest(origin=origin):
+                    subprocess.run(["git", "-C", str(repo), "remote", "remove", "origin"],
+                                   check=False, capture_output=True)
+                    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", origin], check=True)
+                    marker.unlink(missing_ok=True)
+                    result = subprocess.run(
+                        [sys.executable, "-B", str(ROOT / ".github/publication/guard.py"),
+                         "--repository", str(repo), "--policy", str(policy), "upload",
+                         "--tag", "v1", "--asset", str(sidecar)],
+                        capture_output=True, text=True,
+                        env={**os.environ, "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+                             "GH_MARKER": str(marker)},
+                    )
+                    self.assertEqual(1, result.returncode, result.stderr)
+                    self.assertFalse(marker.exists())
+            for origin in (
+                "https://github.com/Delitants/FlussoniX.git",
+                "https://GitHub.com/Delitants/FlussoniX.git",
+                "https://alice@github.com/Delitants/FlussoniX.git",
+                "https://alice:test-token@github.com/Delitants/FlussoniX.git",
+                "git@github.com:Delitants/FlussoniX.git",
+                "ssh://git@github.com/Delitants/FlussoniX.git",
+            ):
+                with self.subTest(origin=origin):
+                    subprocess.run(["git", "-C", str(repo), "remote", "set-url", "origin", origin], check=True)
+                    marker.unlink(missing_ok=True)
+                    result = subprocess.run(
+                        [sys.executable, "-B", str(ROOT / ".github/publication/guard.py"),
+                         "--repository", str(repo), "--policy", str(policy), "upload",
+                         "--tag", "v1", "--asset", str(sidecar)],
+                        capture_output=True, text=True,
+                        env={**os.environ, "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+                             "GH_MARKER": str(marker)},
+                    )
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertTrue(marker.exists())
+
+    def test_hook_installer_requires_authentic_github_origin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = pathlib.Path(directory)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
+                            "https://evil.example/github.com/Delitants/FlussoniX.git"], check=True)
+            for origin in ("https://evil.example/github.com/Delitants/FlussoniX.git",
+                           "https://github.com/Delitants/FlussoniX.git "):
+                with self.subTest(origin=origin):
+                    subprocess.run(["git", "-C", str(repo), "remote", "set-url", "origin", origin], check=True)
+                    result = subprocess.run(
+                        [sys.executable, "-B", str(ROOT / ".github/publication/install-hooks.py")],
+                        cwd=repo, capture_output=True, text=True,
+                    )
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertFalse((repo / ".git/publication-safety-hooks").exists())
+            subprocess.run(["git", "-C", str(repo), "remote", "set-url", "origin",
+                            "git@github.com:Delitants/FlussoniX.git"], check=True)
+            result = subprocess.run(
+                [sys.executable, "-B", str(ROOT / ".github/publication/install-hooks.py")],
+                cwd=repo, capture_output=True, text=True,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertTrue((repo / ".git/publication-safety-hooks").is_dir())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,13 @@ MAX_ARCHIVE_MEMBERS=4096
 MAX_ARCHIVE_UNCOMPRESSED=512*1024*1024
 MAX_CHECKSUM=65536
 CHECKSUM_LINE=re.compile(r'[0-9a-fA-F]{64}  [A-Za-z0-9][A-Za-z0-9._+-]*\.tar\.gz(?:\.sha256)?')
+GITHUB_ORIGIN=re.compile(
+ r'(?:https://(?:[^@/?#\s]+@)?github\.com/|git@github\.com:|ssh://git@github\.com/)'
+ r'([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?',re.I|re.ASCII)
+
+def origin_matches_repository(origin,repository):
+ match=GITHUB_ORIGIN.fullmatch(origin)
+ return bool(match and match[1].casefold()==repository.casefold())
 
 def private_error(name,policy=None):
  p=pathlib.PurePosixPath(name)
@@ -244,9 +251,8 @@ def main():
    return 1
   if args.command=='upload':
    # Preserve existing project signing/qualification gates; this checks the upload only.
-   origin=git(repo,'remote','get-url','origin').decode().strip()
-   identity=re.search(r'github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$',origin,re.I)
-   if not identity or identity[1].casefold()!=policy['repository'].casefold():raise ValueError('Upload repository identity differs')
+   origin=git(repo,'remote','get-url','origin').decode().removesuffix('\n')
+   if not origin_matches_repository(origin,policy['repository']):raise ValueError('Upload repository identity differs')
    assets,notes=upload_snapshot(repo,policy,args.tag,args.asset,args.notes_file)
    release=json.loads(subprocess.check_output(['gh','api',f'repos/{policy["repository"]}/releases/tags/{args.tag}']))
    if text_errors('Release notes',release.get('body') or ''):raise ValueError('Existing release notes contain internal details')
