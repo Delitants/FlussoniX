@@ -65,6 +65,11 @@ impl RedirectOrigins {
         };
         next == self.original || !self.credentialed && self.approved.contains(&next)
     }
+
+    pub(crate) fn matches_source(&self, source: &url::Url) -> bool {
+        origin(source).is_some_and(|value| value == self.original)
+            && self.credentialed == (!source.username().is_empty() || source.password().is_some())
+    }
 }
 
 fn origin(url: &url::Url) -> Option<(String, u16)> {
