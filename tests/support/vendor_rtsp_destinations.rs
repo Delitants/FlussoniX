@@ -493,9 +493,15 @@ async fn independent_decoder_follows_vendor_redirect_and_destination_checks_view
             );
             // Older FFmpeg RTSP demuxers cannot pass TLS verification options.
             // The production bridge verifies every TLS hop and owns all loopback relays.
+            // The LB-to-CDN hop is a different origin and must be approved locally.
             let bridge = if secure {
+                let policy = flussonix::tls_input::RedirectOrigins::parse(
+                    &uri,
+                    Some(&json!([cdn.secure.as_str()])),
+                )
+                .unwrap();
                 Some(
-                    flussonix::tls_input::Bridge::start(&uri, Some(&trust))
+                    flussonix::tls_input::Bridge::start_with_policy(&uri, Some(&trust), policy)
                         .await
                         .unwrap(),
                 )
