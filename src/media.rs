@@ -1062,6 +1062,7 @@ impl Engine {
                                 selected["flussonix_rtsp_startup"]
                                     .as_str()
                                     .map(str::to_owned),
+                                selected.get("flussonix_rtsps_redirect_origins").cloned(),
                             )
                         })
                     })
@@ -1074,7 +1075,7 @@ impl Engine {
         // the remote probe. The final worker-map check remains authoritative.
         let _probe_slot = if rtsp_candidate
             .as_ref()
-            .is_some_and(|(_, _, mode)| mode.is_none())
+            .is_some_and(|(_, _, mode, _)| mode.is_none())
         {
             let slot = self
                 .rtsp_probe_slots
@@ -1104,7 +1105,7 @@ impl Engine {
         // because the file or its permissions can change after this check.
         if rtsp_candidate
             .as_ref()
-            .is_some_and(|(_, _, mode)| mode.is_none())
+            .is_some_and(|(_, _, mode, _)| mode.is_none())
             && self.ffmpeg.contains('/')
         {
             let executable =
@@ -1117,12 +1118,21 @@ impl Engine {
                 return Err("cannot start FFmpeg: executable path is not executable".into());
             }
         }
-        let h264_input = if let Some((input, ca, mode)) = rtsp_candidate {
+        let h264_input = if let Some((input, ca, mode, redirect_origins)) = rtsp_candidate {
             let h264 = match mode.as_deref() {
                 Some("h264") => true,
                 Some("conservative") => false,
                 _ => {
-                    crate::rtsp_probe::video_codec(&input, ca.as_deref()).await
+                    let policy = input
+                        .starts_with("rtsps://")
+                        .then(|| {
+                            crate::tls_input::RedirectOrigins::parse(
+                                &input,
+                                redirect_origins.as_ref(),
+                            )
+                        })
+                        .transpose()?;
+                    crate::rtsp_probe::video_codec(&input, ca.as_deref(), policy).await
                         == Some(crate::rtsp_probe::VideoCodec::H264)
                 }
             };
@@ -1523,9 +1533,13 @@ impl Engine {
             cmd.stdin(std::process::Stdio::piped());
         } else {
             let mut translated = if input.starts_with("rtsps://") {
-                let bridge = crate::tls_input::Bridge::start(
+                let bridge = crate::tls_input::Bridge::start_with_policy(
                     input,
                     inputs[index]["flussonix_tls_ca"].as_str().map(Path::new),
+                    crate::tls_input::RedirectOrigins::parse(
+                        input,
+                        inputs[index].get("flussonix_rtsps_redirect_origins"),
+                    )?,
                 )
                 .await?;
                 let local = bridge.local_url().to_owned();

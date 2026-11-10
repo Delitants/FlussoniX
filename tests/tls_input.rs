@@ -1,4 +1,4 @@
-use flussonix::tls_input::Bridge;
+use flussonix::tls_input::{Bridge, RedirectOrigins};
 use std::time::Duration;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt},
@@ -44,12 +44,15 @@ async fn verified_redirect_uses_owned_loopback_and_delivers_final_tls_response()
             .await
             .unwrap();
     }));
-    let bridge = Bridge::prepare(
-        &format!("rtsps://{initial_addr}/first?token=initial"),
-        Some(&c.ca),
+    let input = format!("rtsps://{initial_addr}/first?token=initial");
+    let policy = RedirectOrigins::parse(
+        &input,
+        Some(&serde_json::json!([format!("rtsps://{edge_addr}")])),
     )
-    .await
     .unwrap();
+    let bridge = Bridge::prepare_with_policy(&input, Some(&c.ca), policy)
+        .await
+        .unwrap();
     let local = url::Url::parse(bridge.local_url()).unwrap();
     let mut socket = TcpStream::connect(("127.0.0.1", local.port().unwrap()))
         .await
