@@ -151,6 +151,12 @@ def archive_errors(path):
    if size>MAX_TEXT:errors.append(name+': help exceeds size limit')
    else:errors.extend(text_errors(name,reader().decode('utf-8')))
  try:
+  expanded=0
+  with gzip.open(path,'rb') as source:
+   while data:=source.read(65536):
+    expanded+=len(data)
+    if expanded>MAX_ARCHIVE_UNCOMPRESSED:
+     errors.append(str(path)+': archive exceeds uncompressed size limit');return errors
   with tarfile.open(path,'r:gz') as tar:
    for index,item in enumerate(tar):
     if index>=MAX_ARCHIVE_MEMBERS:
@@ -159,13 +165,6 @@ def archive_errors(path):
      error=private_error(item.linkname)
      if error:errors.append(item.name+': unsafe or private archive link')
     entry(item.name+'/' if item.isdir() else item.name,item.size,(lambda i=item:tar.extractfile(i).read(MAX_TEXT+1)) if item.isfile() else None)
-  if not errors:
-   expanded=0
-   with gzip.open(path,'rb') as source:
-    while data:=source.read(65536):
-     expanded+=len(data)
-     if expanded>MAX_ARCHIVE_UNCOMPRESSED:
-      errors.append(str(path)+': archive exceeds uncompressed size limit');break
  except (OSError,ValueError,UnicodeError,RuntimeError,EOFError,tarfile.TarError) as e:errors.append(str(path)+': '+str(e))
  return errors
 
