@@ -643,7 +643,7 @@ async fn explicit_stop_keeps_discovered_pull_stopped_until_new_playback() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 200);
+    assert_eq!(response.status(), 204);
     cdn.app.reconcile().await;
     let stopped = cdn.app.media.count().await;
     assert_eq!(

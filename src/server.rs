@@ -1553,7 +1553,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
             let name = name.trim_end_matches("/stop");
             app.playback_auth.stop_playback(name);
             app.media.stop(name).await;
-            return json_response(json!({"status":"stopped"}));
+            return StatusCode::NO_CONTENT.into_response();
         }
         if method == "GET" {
             let root = app.config.snapshot();
