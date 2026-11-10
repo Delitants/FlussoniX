@@ -7,6 +7,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+import zipfile
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -223,6 +224,57 @@ class PublicationGuardTests(unittest.TestCase):
                 member = tarfile.TarInfo("iptv-transport.md")
                 member.size = len(content)
                 output.addfile(member, io.BytesIO(content))
+            self.assertTrue(guard.archive_errors(archive))
+
+    def test_release_archive_accepts_nested_pax_gzip_tar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = pathlib.Path(directory) / "flussonix-test-linux-x86_64.tar.gz"
+            content = b"# Installation\n"
+            with tarfile.open(archive, "w:gz", format=tarfile.PAX_FORMAT) as output:
+                member = tarfile.TarInfo("flussonix-test/docs/installation.md")
+                member.size = len(content)
+                output.addfile(member, io.BytesIO(content))
+            self.assertEqual([], guard.archive_errors(archive))
+
+    def test_release_archive_rejects_zip_disguised_as_gzip_tar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = pathlib.Path(directory) / "flussonix-test-linux-x86_64.tar.gz"
+            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+                member = zipfile.ZipInfo("flussonix-test/docs/link")
+                member.create_system = 3
+                member.external_attr = 0o120777 << 16
+                output.writestr(member, "installation.md")
+            self.assertTrue(guard.archive_errors(archive))
+
+    def test_release_archive_rejects_plain_tar_disguised_as_gzip_tar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = pathlib.Path(directory) / "flussonix-test-linux-x86_64.tar.gz"
+            with tarfile.open(archive, "w") as output:
+                output.addfile(tarfile.TarInfo("flussonix-test/"))
+            self.assertTrue(guard.archive_errors(archive))
+
+    def test_release_archive_rejects_invalid_gzip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = pathlib.Path(directory) / "flussonix-test-linux-x86_64.tar.gz"
+            archive.write_bytes(b"not an archive")
+            self.assertTrue(guard.archive_errors(archive))
+
+    def test_release_archive_rejects_more_than_4096_members(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = pathlib.Path(directory) / "flussonix-test-linux-x86_64.tar.gz"
+            with tarfile.open(archive, "w:gz") as output:
+                for index in range(4097):
+                    output.addfile(tarfile.TarInfo(f"flussonix-test/f{index:04d}.bin"))
+            self.assertTrue(guard.archive_errors(archive))
+
+    def test_release_archive_rejects_private_tar_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = pathlib.Path(directory) / "flussonix-test-linux-x86_64.tar.gz"
+            with tarfile.open(archive, "w:gz") as output:
+                member = tarfile.TarInfo("flussonix-test/docs/link")
+                member.type = tarfile.SYMTYPE
+                member.linkname = "work/private.log"
+                output.addfile(member)
             self.assertTrue(guard.archive_errors(archive))
 
 

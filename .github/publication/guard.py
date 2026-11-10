@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Keep local planning and reports out of source pushes and release uploads."""
-import argparse,fnmatch,json,pathlib,re,shutil,stat,subprocess,sys,tarfile,tempfile,zipfile
+import argparse,fnmatch,json,pathlib,re,shutil,subprocess,sys,tarfile,tempfile
 CONTROL='.github/publication/'
 CONTROL_FILES={CONTROL+'guard.py',CONTROL+'install-hooks.py',CONTROL+'policy.json'}
 PRIVATE_DIRS={'work','outputs','internal','reports','test-reports','evidence','acceptance','plans',
@@ -16,6 +16,7 @@ PUBLIC_GUIDE_TYPES={'.md','.rst','.txt','.html'}
 PACKAGE_DATA={'package.json','package-lock.json','composer.json','composer.lock','tsconfig.json','Cargo.lock'}
 CODE_TYPES={'.go','.c','.h','.cc','.cpp','.cxx','.hpp','.swift','.py','.sh','.js','.ts','.php','.rs','.java','.m','.mm','.lua','.pl','.rb','.erl','.ex','.sql','.s','.asm'}
 MAX_TEXT=1048576
+MAX_ARCHIVE_MEMBERS=4096
 
 def private_error(name,policy=None):
  p=pathlib.PurePosixPath(name)
@@ -140,23 +141,15 @@ def archive_errors(path):
    if size>MAX_TEXT:errors.append(name+': help exceeds size limit')
    else:errors.extend(text_errors(name,reader().decode('utf-8')))
  try:
-  if zipfile.is_zipfile(path):
-   with zipfile.ZipFile(path) as z:
-    for item in z.infolist():
-     if stat.S_ISLNK(item.external_attr>>16):
-      target=z.read(item).decode('utf-8')
-      if private_error(target):errors.append(item.filename+': unsafe or private archive link')
-     entry(item.filename,item.file_size,None if item.is_dir() else lambda i=item:z.read(i))
-  elif tarfile.is_tarfile(path):
-   with tarfile.open(path,'r:*') as tar:
-    for item in tar:
-     if item.issym() or item.islnk():
-      error=private_error(item.linkname)
-      if error:errors.append(item.name+': unsafe or private archive link')
-     entry(item.name+'/' if item.isdir() else item.name,item.size,(lambda i=item:tar.extractfile(i).read(MAX_TEXT+1)) if item.isfile() else None)
-  elif str(path).lower().endswith(('.zip','.tar','.tar.gz','.tgz','.tar.xz','.tar.bz2')):
-   errors.append(str(path)+': unreadable archive')
- except (OSError,ValueError,UnicodeError,RuntimeError,zipfile.BadZipFile,tarfile.TarError) as e:errors.append(str(path)+': '+str(e))
+  with tarfile.open(path,'r:gz') as tar:
+   for index,item in enumerate(tar):
+    if index>=MAX_ARCHIVE_MEMBERS:
+     errors.append(str(path)+': archive has too many members');break
+    if item.issym() or item.islnk():
+     error=private_error(item.linkname)
+     if error:errors.append(item.name+': unsafe or private archive link')
+    entry(item.name+'/' if item.isdir() else item.name,item.size,(lambda i=item:tar.extractfile(i).read(MAX_TEXT+1)) if item.isfile() else None)
+ except (OSError,ValueError,UnicodeError,RuntimeError,EOFError,tarfile.TarError) as e:errors.append(str(path)+': '+str(e))
  return errors
 
 def release_errors(policy,tag,assets,notes=None):
