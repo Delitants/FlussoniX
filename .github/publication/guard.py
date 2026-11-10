@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Keep local planning and reports out of source pushes and release uploads."""
 import argparse,fnmatch,gzip,hashlib,json,pathlib,re,shutil,subprocess,sys,tarfile,tempfile
+from contextlib import contextmanager
 CONTROL='.github/publication/'
 CONTROL_FILES={CONTROL+'guard.py',CONTROL+'install-hooks.py',CONTROL+'policy.json'}
 PRIVATE_DIRS={'work','outputs','internal','reports','test-reports','evidence','acceptance','plans',
@@ -231,19 +232,23 @@ def release_errors(policy,tag,assets,notes=None):
   else:errors+=text_errors('Release notes',p.read_text(encoding='utf-8'))
  return errors
 
+@contextmanager
 def upload_snapshot(repo,policy,tag,assets,notes):
  common=(pathlib.Path(repo)/git(repo,'rev-parse','--git-common-dir').decode().strip()).resolve()
  stage=pathlib.Path(tempfile.mkdtemp(prefix='publication-upload-',dir=common));paths=[]
- for asset in assets:
-  destination=stage/pathlib.Path(asset).name
-  if destination.exists():raise ValueError('Duplicate upload filename')
-  shutil.copyfile(asset,destination,follow_symlinks=False);paths.append(destination)
- note=None
- if notes:
-  note=stage/'upload-notes.txt';shutil.copyfile(notes,note,follow_symlinks=False)
- errors=release_errors(policy,tag,paths,note)
- if errors:raise ValueError('; '.join(errors))
- return paths,note
+ try:
+  for asset in assets:
+   destination=stage/pathlib.Path(asset).name
+   if destination.exists():raise ValueError('Duplicate upload filename')
+   shutil.copyfile(asset,destination,follow_symlinks=False);paths.append(destination)
+  note=None
+  if notes:
+   note=stage/'upload-notes.txt';shutil.copyfile(notes,note,follow_symlinks=False)
+  errors=release_errors(policy,tag,paths,note)
+  if errors:raise ValueError('; '.join(errors))
+  yield paths,note
+ finally:
+  shutil.rmtree(stage)
 
 def main():
  p=argparse.ArgumentParser(description=__doc__)
@@ -278,14 +283,14 @@ def main():
    # Preserve existing project signing/qualification gates; this checks the upload only.
    origin=git(repo,'remote','get-url','origin').decode().removesuffix('\n')
    if not origin_matches_repository(origin,policy['repository']):raise ValueError('Upload repository identity differs')
-   assets,notes=upload_snapshot(repo,policy,args.tag,args.asset,args.notes_file)
-   release=json.loads(subprocess.check_output(['gh','api',f'repos/{policy["repository"]}/releases/tags/{args.tag}']))
-   if text_errors('Release notes',release.get('body') or ''):raise ValueError('Existing release notes contain internal details')
-   version=args.tag[1:] if args.tag.startswith('v') else args.tag
-   patterns=[p.replace('{version}',version) for p in policy.get('release_assets',[])]
-   for asset in release['assets']:
-    if private_error(asset['name']) or not any(fnmatch.fnmatchcase(asset['name'],p) for p in patterns):raise ValueError('Existing release has an unapproved attachment; review it before upload')
-   subprocess.run(['gh','release','upload',args.tag,*[str(x) for x in assets],'--repo',policy['repository']],check=True)
+   with upload_snapshot(repo,policy,args.tag,args.asset,args.notes_file) as (assets,notes):
+    release=json.loads(subprocess.check_output(['gh','api',f'repos/{policy["repository"]}/releases/tags/{args.tag}']))
+    if text_errors('Release notes',release.get('body') or ''):raise ValueError('Existing release notes contain internal details')
+    version=args.tag[1:] if args.tag.startswith('v') else args.tag
+    patterns=[p.replace('{version}',version) for p in policy.get('release_assets',[])]
+    for asset in release['assets']:
+     if private_error(asset['name']) or not any(fnmatch.fnmatchcase(asset['name'],p) for p in patterns):raise ValueError('Existing release has an unapproved attachment; review it before upload')
+    subprocess.run(['gh','release','upload',args.tag,*[str(x) for x in assets],'--repo',policy['repository']],check=True)
   return 0
  except (OSError,ValueError,UnicodeError,KeyError,TypeError,subprocess.CalledProcessError) as error:
   print('Publication blocked: '+str(error),file=sys.stderr);return 1

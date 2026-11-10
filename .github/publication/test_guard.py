@@ -437,6 +437,29 @@ class PublicationGuardTests(unittest.TestCase):
                 output.addfile(tarfile.TarInfo("flussonix-test/"))
             self.assertTrue(guard.release_errors(RELEASE_POLICY, "v1", [sidecar]))
 
+    def test_upload_snapshot_removes_stage_after_success_and_rejection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / ".git").mkdir()
+            sidecar = root / (PACKAGE_NAME + ".sha256")
+            sidecar.write_text("a" * 64 + "  " + PACKAGE_NAME + "\n")
+            with mock.patch.object(guard, "git", return_value=b".git\n"):
+                with guard.upload_snapshot(root, RELEASE_POLICY, "v1", [sidecar], None) as (assets, _):
+                    self.assertEqual(1, len(assets))
+                    self.assertTrue(assets[0].exists())
+                self.assertEqual([], list((root / ".git").iterdir()))
+
+                with self.assertRaisesRegex(RuntimeError, "upload failed"):
+                    with guard.upload_snapshot(root, RELEASE_POLICY, "v1", [sidecar], None):
+                        raise RuntimeError("upload failed")
+                self.assertEqual([], list((root / ".git").iterdir()))
+
+                sidecar.write_text("bad checksum\n")
+                with self.assertRaises(ValueError):
+                    with guard.upload_snapshot(root, RELEASE_POLICY, "v1", [sidecar], None):
+                        pass
+                self.assertEqual([], list((root / ".git").iterdir()))
+
     def test_invalid_asset_never_reaches_github_upload(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
