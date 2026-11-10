@@ -17,6 +17,8 @@ PACKAGE_DATA={'package.json','package-lock.json','composer.json','composer.lock'
 CODE_TYPES={'.go','.c','.h','.cc','.cpp','.cxx','.hpp','.swift','.py','.sh','.js','.ts','.php','.rs','.java','.m','.mm','.lua','.pl','.rb','.erl','.ex','.sql','.s','.asm'}
 MAX_TEXT=1048576
 MAX_ARCHIVE_MEMBERS=4096
+MAX_CHECKSUM=65536
+CHECKSUM_LINE=re.compile(r'[0-9a-fA-F]{64}  [A-Za-z0-9][A-Za-z0-9._+-]*\.tar\.gz(?:\.sha256)?')
 
 def private_error(name,policy=None):
  p=pathlib.PurePosixPath(name)
@@ -152,6 +154,18 @@ def archive_errors(path):
  except (OSError,ValueError,UnicodeError,RuntimeError,EOFError,tarfile.TarError) as e:errors.append(str(path)+': '+str(e))
  return errors
 
+def checksum_errors(path):
+ try:
+  if path.stat().st_size>MAX_CHECKSUM:return [str(path)+': checksum file exceeds size limit']
+  with path.open('rb') as source:data=source.read(MAX_CHECKSUM+1)
+  if len(data)>MAX_CHECKSUM:return [str(path)+': checksum file exceeds size limit']
+  text=data.decode('ascii')
+  lines=text.removesuffix('\n').split('\n')
+  if not text or not all(CHECKSUM_LINE.fullmatch(line) for line in lines):
+   return [str(path)+': invalid checksum lines']
+  return []
+ except (OSError,UnicodeError) as error:return [str(path)+': '+str(error)]
+
 def release_errors(policy,tag,assets,notes=None):
  if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]*',tag):return ['Unsafe release tag']
  version=tag[1:] if tag.startswith('v') else tag
@@ -165,7 +179,9 @@ def release_errors(policy,tag,assets,notes=None):
   if error:errors.append(name+': '+error);continue
   if not any(fnmatch.fnmatchcase(name,pattern) for pattern in patterns):errors.append(name+': not an approved release asset');continue
   if p.is_symlink() or not p.is_file():errors.append(name+': missing/unsafe asset');continue
-  errors+=archive_errors(p)
+  if name.endswith('.tar.gz'):errors+=archive_errors(p)
+  elif name.endswith('.tar.gz.sha256') or name=='SHA256SUMS':errors+=checksum_errors(p)
+  else:errors.append(name+': release asset type has no validator')
   if name.casefold() in USER_DOCS:
    if p.stat().st_size>MAX_TEXT:errors.append(name+': help exceeds size limit')
    else:errors+=text_errors(name,p.read_text(encoding='utf-8'))

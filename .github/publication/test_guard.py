@@ -2,8 +2,11 @@
 
 import importlib.util
 import io
+import json
+import os
 import pathlib
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -16,6 +19,12 @@ SPEC = importlib.util.spec_from_file_location(
 )
 guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
+RELEASE_POLICY = {"release_assets": [
+    "flussonix-*-linux-x86_64*.tar.gz",
+    "flussonix-*-linux-x86_64*.tar.gz.sha256",
+    "SHA256SUMS",
+]}
+PACKAGE_NAME = "flussonix-1-linux-x86_64-abc.tar.gz"
 
 
 class PublicationGuardTests(unittest.TestCase):
@@ -276,6 +285,93 @@ class PublicationGuardTests(unittest.TestCase):
                 member.linkname = "work/private.log"
                 output.addfile(member)
             self.assertTrue(guard.archive_errors(archive))
+
+    def test_release_files_accepts_packager_checksum_sidecar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sidecar = pathlib.Path(directory) / (PACKAGE_NAME + ".sha256")
+            sidecar.write_text("a" * 64 + "  " + PACKAGE_NAME + "\n")
+            self.assertEqual([], guard.release_errors(RELEASE_POLICY, "v1", [sidecar]))
+
+    def test_release_files_accepts_multiple_checksum_lines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sums = pathlib.Path(directory) / "SHA256SUMS"
+            sums.write_text(
+                "a" * 64 + "  " + PACKAGE_NAME + "\n"
+                + "b" * 64 + "  flussonix-1-linux-x86_64-def.tar.gz\n"
+            )
+            self.assertEqual([], guard.release_errors(RELEASE_POLICY, "v1", [sums]))
+
+    def test_checksum_manifest_may_list_a_release_sidecar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sums = pathlib.Path(directory) / "SHA256SUMS"
+            sums.write_text("a" * 64 + "  " + PACKAGE_NAME + ".sha256\n")
+            self.assertEqual([], guard.release_errors(RELEASE_POLICY, "v1", [sums]))
+
+    def test_release_files_rejects_zip_bytes_in_checksum_sidecar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sidecar = pathlib.Path(directory) / (PACKAGE_NAME + ".sha256")
+            with zipfile.ZipFile(sidecar, "w") as output:
+                output.writestr("anything", "contents")
+            self.assertTrue(guard.release_errors(RELEASE_POLICY, "v1", [sidecar]))
+
+    def test_release_files_rejects_oversized_checksum_sidecar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sidecar = pathlib.Path(directory) / (PACKAGE_NAME + ".sha256")
+            sidecar.write_bytes(b"a" * 65537)
+            self.assertTrue(guard.release_errors(RELEASE_POLICY, "v1", [sidecar]))
+
+    def test_release_files_rejects_invalid_checksum_lines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sidecar = pathlib.Path(directory) / (PACKAGE_NAME + ".sha256")
+            for value in [
+                "", "not-hex" + "a" * 57 + "  " + PACKAGE_NAME + "\n",
+                "a" * 64 + "  ../private.tar.gz\n",
+                "a" * 64 + "  not-a-release.txt\n",
+            ]:
+                with self.subTest(value=value):
+                    sidecar.write_text(value)
+                    self.assertTrue(guard.release_errors(RELEASE_POLICY, "v1", [sidecar]))
+
+    def test_release_files_rejects_tar_content_in_checksum_sidecar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sidecar = pathlib.Path(directory) / (PACKAGE_NAME + ".sha256")
+            with tarfile.open(sidecar, "w:gz") as output:
+                output.addfile(tarfile.TarInfo("flussonix-test/"))
+            self.assertTrue(guard.release_errors(RELEASE_POLICY, "v1", [sidecar]))
+
+    def test_invalid_asset_never_reaches_github_upload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "tracked").write_text("baseline\n")
+            subprocess.run(["git", "-C", str(repo), "add", "tracked"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "baseline"], check=True)
+            baseline = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            policy = root / "policy.json"
+            policy.write_text(json.dumps({**RELEASE_POLICY, "baseline": baseline}))
+            sidecar = root / (PACKAGE_NAME + ".sha256")
+            sidecar.write_text("bad checksum\n")
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            marker = root / "github-was-called"
+            fake_gh = fake_bin / "gh"
+            fake_gh.write_text("#!/bin/sh\nprintf called > \"$GH_MARKER\"\n")
+            fake_gh.chmod(0o755)
+            result = subprocess.run(
+                [sys.executable, "-B", str(ROOT / ".github/publication/guard.py"),
+                 "--repository", str(repo), "--policy", str(policy), "upload",
+                 "--tag", "v1", "--asset", str(sidecar)],
+                capture_output=True, text=True,
+                env={**os.environ, "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+                     "GH_MARKER": str(marker)},
+            )
+            self.assertEqual(1, result.returncode)
+            self.assertIn("Publication blocked", result.stderr)
+            self.assertFalse(marker.exists())
 
 
 if __name__ == "__main__":
