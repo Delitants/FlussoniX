@@ -28,9 +28,162 @@ RELEASE_POLICY = {"release_assets": [
     "SHA256SUMS",
 ]}
 PACKAGE_NAME = "flussonix-1-linux-x86_64-abc.tar.gz"
+QUALIFIED_SHA = "a" * 40
+QUALIFIED_TAG = "v1.2.3"
+
+
+def qualified_run_evidence():
+    archive = f"flussonix-1.2.3-linux-x86_64-{QUALIFIED_SHA[:12]}.tar.gz"
+    artifact = f"flussonix-candidate-{QUALIFIED_SHA}"
+    run = {"status": "completed", "conclusion": "success", "event": "push",
+           "head_branch": "main", "head_sha": QUALIFIED_SHA, "name": "check",
+           "path": ".github/workflows/ci.yml",
+           "repository": {"full_name": "Delitants/FlussoniX", "id": 42}}
+    jobs = {"total_count": 2, "jobs": [
+        {"name": name, "status": "completed", "conclusion": "success"}
+        for name in ("verify", "release_package_smoke")]}
+    artifacts = {"total_count": 1, "artifacts": [{
+        "id": 77, "name": artifact, "expired": False, "size_in_bytes": 100,
+        "digest": "sha256:" + "c" * 64,
+        "workflow_run": {"id": 123, "repository_id": 42,
+                         "head_sha": QUALIFIED_SHA}}]}
+    return run, jobs, artifacts, artifact, archive
 
 
 class PublicationGuardTests(unittest.TestCase):
+    def test_qualified_ci_run_requires_matching_successful_main_build(self):
+        run, jobs, artifacts, artifact, archive = qualified_run_evidence()
+        self.assertEqual((artifact, archive, archive + ".sha256"),
+                         guard.verify_ci_metadata(run, jobs, artifacts, 123,
+                                                  QUALIFIED_TAG, QUALIFIED_SHA,
+                                                  "Delitants/FlussoniX"))
+        for field, value in (("head_sha", "b" * 40), ("head_branch", "feature"),
+                             ("event", "pull_request"), ("conclusion", "failure"),
+                             ("path", ".github/workflows/other.yml")):
+            with self.subTest(field=field):
+                changed = {**run, field: value}
+                with self.assertRaises(ValueError):
+                    guard.verify_ci_metadata(changed, jobs, artifacts, 123,
+                                             QUALIFIED_TAG, QUALIFIED_SHA,
+                                             "Delitants/FlussoniX")
+        jobs["jobs"][0]["conclusion"] = "skipped"
+        with self.assertRaises(ValueError):
+            guard.verify_ci_metadata(run, jobs, artifacts, 123,
+                                     QUALIFIED_TAG, QUALIFIED_SHA,
+                                     "Delitants/FlussoniX")
+
+    def test_qualified_ci_artifact_rejects_expired_or_wrong_run(self):
+        run, jobs, artifacts, _, _ = qualified_run_evidence()
+        for change in ({"expired": True}, {"workflow_run": {"id": 124,
+                         "repository_id": 42, "head_sha": QUALIFIED_SHA}}):
+            changed = {"total_count": 1, "artifacts": [{**artifacts["artifacts"][0], **change}]}
+            with self.assertRaises(ValueError):
+                guard.verify_ci_metadata(run, jobs, changed, 123,
+                                         QUALIFIED_TAG, QUALIFIED_SHA,
+                                         "Delitants/FlussoniX")
+
+    def test_qualified_ci_files_must_be_exact_regular_byte_matches(self):
+        _, _, _, _, archive = qualified_run_evidence()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            local = root / "local"
+            downloaded = root / "downloaded.zip"
+            local.mkdir()
+            (local / archive).write_bytes(b"archive bytes")
+            (local / (archive + ".sha256")).write_bytes(b"sidecar bytes")
+            with zipfile.ZipFile(downloaded, "w") as bundle:
+                bundle.writestr(archive, b"archive bytes")
+                bundle.writestr(archive + ".sha256", b"sidecar bytes")
+            files = list(local.iterdir())
+            digest = "sha256:" + hashlib.sha256(downloaded.read_bytes()).hexdigest()
+            guard.verify_ci_zip(downloaded, files, archive, digest,
+                                downloaded.stat().st_size)
+            (local / archive).write_bytes(b"altered")
+            with self.assertRaises(ValueError):
+                guard.verify_ci_zip(downloaded, files, archive, digest,
+                                    downloaded.stat().st_size)
+            (local / archive).write_bytes(b"archive bytes")
+            with zipfile.ZipFile(downloaded, "a") as bundle:
+                bundle.writestr("extra.txt", b"extra")
+            with self.assertRaises(ValueError):
+                guard.verify_ci_zip(downloaded, files, archive,
+                                    "sha256:" + hashlib.sha256(downloaded.read_bytes()).hexdigest(),
+                                    downloaded.stat().st_size)
+            with self.assertRaises(ValueError):
+                guard.verify_ci_zip(downloaded, files, archive, digest,
+                                    downloaded.stat().st_size)
+            with zipfile.ZipFile(downloaded, "w") as bundle:
+                bundle.writestr(archive, b"archive bytes")
+                bundle.writestr(archive + ".sha256", b"sidecar bytes")
+            (local / archive).unlink()
+            (local / archive).symlink_to(root / "other")
+            with self.assertRaises(ValueError):
+                guard.verify_ci_zip(downloaded, files, archive,
+                                    "sha256:" + hashlib.sha256(downloaded.read_bytes()).hexdigest(),
+                                    downloaded.stat().st_size)
+
+    def test_qualified_ci_provenance_binds_tag_run_and_exact_artifact(self):
+        run, jobs, artifacts, _, archive = qualified_run_evidence()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / ".git").mkdir()
+            local = root / "local"
+            local.mkdir()
+            (local / archive).write_bytes(b"archive bytes")
+            (local / (archive + ".sha256")).write_bytes(b"sidecar bytes")
+            bundle = root / "owned-ci.zip"
+            with zipfile.ZipFile(bundle, "w") as compressed:
+                compressed.writestr(archive, b"archive bytes")
+                compressed.writestr(archive + ".sha256", b"sidecar bytes")
+            artifacts["artifacts"][0]["size_in_bytes"] = bundle.stat().st_size
+            artifacts["artifacts"][0]["digest"] = (
+                "sha256:" + hashlib.sha256(bundle.read_bytes()).hexdigest())
+            remote_tag = {"object": {"type": "commit", "sha": QUALIFIED_SHA}}
+            responses = {
+                f"repos/Delitants/FlussoniX/git/ref/tags/{QUALIFIED_TAG}": remote_tag,
+                "repos/Delitants/FlussoniX/actions/runs/123": run,
+                "repos/Delitants/FlussoniX/actions/runs/123/jobs?per_page=100": jobs,
+                "repos/Delitants/FlussoniX/actions/runs/123/artifacts?per_page=100": artifacts,
+            }
+
+            def fake_git(_repo, *args):
+                if args == ("rev-parse", "--git-common-dir"):
+                    return b".git\n"
+                if args in (("rev-parse", "HEAD"),
+                            ("rev-parse", "--verify", f"refs/tags/{QUALIFIED_TAG}^{{commit}}")):
+                    return (QUALIFIED_SHA + "\n").encode()
+                self.fail(f"unexpected git call: {args}")
+
+            def fake_download(_repo, _artifact_id, destination):
+                destination.write_bytes(bundle.read_bytes())
+
+            with mock.patch.object(guard, "git", side_effect=fake_git), \
+                 mock.patch.object(guard, "github_json", side_effect=lambda _repo, path: responses[path]), \
+                 mock.patch.object(guard, "download_ci_zip", side_effect=fake_download) as download:
+                guard.verify_ci_provenance(root, {"repository": "Delitants/FlussoniX"},
+                                           QUALIFIED_TAG, list(local.iterdir()), 123)
+                self.assertEqual(download.call_count, 1)
+                self.assertEqual(list((root / ".git").iterdir()), [])
+                responses[f"repos/Delitants/FlussoniX/git/ref/tags/{QUALIFIED_TAG}"] = {
+                    "object": {"type": "commit", "sha": "b" * 40}}
+                with self.assertRaises(ValueError):
+                    guard.verify_ci_provenance(root, {"repository": "Delitants/FlussoniX"},
+                                               QUALIFIED_TAG, list(local.iterdir()), 123)
+                self.assertEqual(download.call_count, 1)
+
+    def test_remote_annotated_tag_resolves_to_release_commit(self):
+        tag_object = "b" * 40
+        responses = {
+            f"repos/Delitants/FlussoniX/git/ref/tags/{QUALIFIED_TAG}": {
+                "object": {"type": "tag", "sha": tag_object}},
+            f"repos/Delitants/FlussoniX/git/tags/{tag_object}": {
+                "object": {"type": "commit", "sha": QUALIFIED_SHA}},
+        }
+        with mock.patch.object(guard, "github_json",
+                               side_effect=lambda _repo, path: responses[path]):
+            self.assertEqual(QUALIFIED_SHA,
+                             guard.remote_tag_revision("Delitants/FlussoniX", QUALIFIED_TAG))
+
     def test_explicit_public_guide_survives_report_filename_filter(self):
         policy = {"public_docs": ["docs/qualification.md"]}
         self.assertIsNone(guard.private_error("docs/qualification.md", policy))
@@ -460,6 +613,102 @@ class PublicationGuardTests(unittest.TestCase):
                         pass
                 self.assertEqual([], list((root / ".git").iterdir()))
 
+    def test_upload_requires_qualified_run_before_github_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / ".git").mkdir()
+            policy = root / "policy.json"
+            policy.write_text(json.dumps({**RELEASE_POLICY,
+                                          "repository": "Delitants/FlussoniX"}))
+            sidecar = root / (PACKAGE_NAME + ".sha256")
+            sidecar.write_text("a" * 64 + "  " + PACKAGE_NAME + "\n")
+            args = ["guard.py", "--repository", str(root), "--policy", str(policy),
+                    "upload", "--tag", "v1", "--asset", str(sidecar)]
+            with mock.patch.object(sys, "argv", args), \
+                 mock.patch.object(guard, "release_errors", return_value=[]), \
+                 mock.patch.object(guard, "history_errors", return_value=[]), \
+                 mock.patch.object(guard, "git", return_value=b""), \
+                 mock.patch.object(guard.subprocess, "check_output") as github, \
+                 mock.patch.object(sys, "stderr", io.StringIO()) as errors:
+                self.assertEqual(guard.main(), 1)
+                github.assert_not_called()
+                self.assertIn("Qualified CI run", errors.getvalue())
+
+    def test_upload_does_not_call_github_when_qualified_artifact_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / ".git").mkdir()
+            policy = root / "policy.json"
+            policy.write_text(json.dumps({**RELEASE_POLICY,
+                                          "repository": "Delitants/FlussoniX"}))
+            sidecar = root / (PACKAGE_NAME + ".sha256")
+            sidecar.write_text("a" * 64 + "  " + PACKAGE_NAME + "\n")
+
+            def fake_git(_repo, *args):
+                return {("status", "--porcelain"): b"",
+                        ("remote", "get-url", "origin"):
+                            b"https://github.com/Delitants/FlussoniX.git\n",
+                        ("rev-parse", "--git-common-dir"): b".git\n"}[args]
+
+            args = ["guard.py", "--repository", str(root), "--policy", str(policy),
+                    "upload", "--tag", "v1", "--asset", str(sidecar),
+                    "--qualified-run", "123"]
+            with mock.patch.object(sys, "argv", args), \
+                 mock.patch.object(guard, "release_errors", return_value=[]), \
+                 mock.patch.object(guard, "history_errors", return_value=[]), \
+                 mock.patch.object(guard, "git", side_effect=fake_git), \
+                 mock.patch.object(guard, "verify_ci_provenance",
+                                   side_effect=ValueError("unqualified")) as provenance, \
+                 mock.patch.object(guard.subprocess, "check_output") as github, \
+                 mock.patch.object(guard.subprocess, "run") as upload, \
+                 mock.patch.object(sys, "stderr", io.StringIO()):
+                self.assertEqual(guard.main(), 1)
+                provenance.assert_called_once()
+                github.assert_not_called()
+                upload.assert_not_called()
+
+    def test_upload_uses_qualified_snapshot_before_release_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / ".git").mkdir()
+            policy = root / "policy.json"
+            policy.write_text(json.dumps({**RELEASE_POLICY,
+                                          "repository": "Delitants/FlussoniX"}))
+            sidecar = root / (PACKAGE_NAME + ".sha256")
+            sidecar.write_text("a" * 64 + "  " + PACKAGE_NAME + "\n")
+
+            def fake_git(_repo, *args):
+                return {("status", "--porcelain"): b"",
+                        ("remote", "get-url", "origin"):
+                            b"https://github.com/Delitants/FlussoniX.git\n",
+                        ("rev-parse", "--git-common-dir"): b".git\n"}[args]
+
+            args = ["guard.py", "--repository", str(root), "--policy", str(policy),
+                    "upload", "--tag", "v1", "--asset", str(sidecar),
+                    "--qualified-run", "123"]
+            order = []
+
+            def qualified(_repo, _policy, _tag, assets, _run):
+                self.assertEqual([PACKAGE_NAME + ".sha256"], [path.name for path in assets])
+                order.append("qualified")
+
+            def release(_args):
+                order.append("release")
+                return b'{"body":"","assets":[]}'
+
+            with mock.patch.object(sys, "argv", args), \
+                 mock.patch.object(guard, "release_errors", return_value=[]), \
+                 mock.patch.object(guard, "history_errors", return_value=[]), \
+                 mock.patch.object(guard, "git", side_effect=fake_git), \
+                 mock.patch.object(guard, "verify_ci_provenance", side_effect=qualified), \
+                 mock.patch.object(guard.subprocess, "check_output", side_effect=release), \
+                 mock.patch.object(guard.subprocess, "run") as upload:
+                self.assertEqual(guard.main(), 0)
+                self.assertEqual(order, ["qualified", "release"])
+                self.assertEqual(upload.call_args.args[0][:3],
+                                 ["gh", "release", "upload"])
+                self.assertEqual(list((root / ".git").iterdir()), [])
+
     def test_invalid_asset_never_reaches_github_upload(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -558,8 +807,11 @@ class PublicationGuardTests(unittest.TestCase):
                         env={**os.environ, "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
                              "GH_MARKER": str(marker)},
                     )
-                    self.assertEqual(0, result.returncode, result.stderr)
-                    self.assertTrue(marker.exists())
+                    self.assertTrue(guard.origin_matches_repository(
+                        origin, "Delitants/FlussoniX"))
+                    self.assertEqual(1, result.returncode, result.stderr)
+                    self.assertIn("Qualified CI run", result.stderr)
+                    self.assertFalse(marker.exists())
 
     def test_hook_installer_requires_authentic_github_origin(self):
         with tempfile.TemporaryDirectory() as directory:
