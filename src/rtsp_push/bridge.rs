@@ -8,11 +8,10 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream},
+    net::TcpStream,
     task::JoinHandle,
 };
 use tokio_rustls::{TlsConnector, rustls::pki_types::ServerName};
@@ -36,6 +35,7 @@ struct Session {
 pub(super) struct Bridge {
     url: String,
     route: Route,
+    client: Option<DuplexStream>,
     task: Option<JoinHandle<()>>,
     bytes: Arc<AtomicU64>,
     pub peer: std::net::IpAddr,
@@ -92,12 +92,13 @@ impl Bridge {
         } else {
             Box::new(socket)
         };
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        // The publisher and forwarder run in this process. Keep the RTSP URL
+        // solely as a routing identity; no local listener is exposed.
+        let (client, downstream) = tokio::io::duplex(64 * 1024);
         let mut url = destination.url.clone();
         url.set_scheme("rtsp").map_err(|_| bad())?;
         url.set_host(Some("127.0.0.1")).map_err(|_| bad())?;
-        url.set_port(Some(listener.local_addr()?.port()))
-            .map_err(|_| bad())?;
+        url.set_port(Some(0)).map_err(|_| bad())?;
         let local_origin = url[..url::Position::BeforePath].to_string();
         let remote_origin = destination.url[..url::Position::BeforePath].to_string();
         let route = Route {
@@ -111,13 +112,7 @@ impl Bridge {
         let udp = destination.udp;
         let aggregate = egress.clone();
         let task = tokio::spawn(async move {
-            let accepted = tokio::time::timeout(Duration::from_secs(8), listener.accept()).await;
-            drop(listener);
-            let Ok(Ok((downstream, _))) = accepted else {
-                return;
-            };
-            let _ = downstream.set_nodelay(true);
-            let (read_local, mut write_local) = downstream.into_split();
+            let (read_local, mut write_local) = tokio::io::split(downstream);
             let (read_remote, mut write_remote) = tokio::io::split(upstream);
             let state = Arc::new(Mutex::new(Session::default()));
             let mut read_local = BufReader::new(read_local);
@@ -130,6 +125,7 @@ impl Bridge {
         Ok(Self {
             url: url.to_string(),
             route,
+            client: Some(client),
             task: Some(task),
             bytes,
             peer,
@@ -143,6 +139,9 @@ impl Bridge {
     }
     pub fn local_url(&self) -> &str {
         &self.url
+    }
+    pub fn take_client(&mut self) -> Option<DuplexStream> {
+        self.client.take()
     }
     pub fn rtp_bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
@@ -466,6 +465,8 @@ async fn responses<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
     #[tokio::test]
     async fn authentication_challenges_can_repeat_without_allowing_duplicate_framing_headers() {
         let wire = b"RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\nWWW-Authenticate: Basic realm=\"owned\"\r\nWWW-Authenticate: Digest realm=\"owned\", nonce=\"n\"\r\nContent-Length: 0\r\n\r\n";
@@ -490,22 +491,19 @@ mod tests {
             assert!(frame(&mut wire.as_bytes()).await.is_err());
         }
     }
-    async fn lab() -> (Bridge, TcpStream, TcpStream) {
+    async fn lab() -> (Bridge, tokio::io::DuplexStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let destination=Destination::parse(&serde_json::json!({"url":format!("rtsp://127.0.0.1:{port}/owned?password=test-secret")})).unwrap();
-        let bridge = Bridge::prepare(&destination, Arc::new(AtomicU64::new(0)))
+        let mut bridge = Bridge::prepare(&destination, Arc::new(AtomicU64::new(0)))
             .await
             .unwrap();
         let (remote, _) = listener.accept().await.unwrap();
-        let u = url::Url::parse(bridge.local_url()).unwrap();
-        let local = TcpStream::connect(("127.0.0.1", u.port().unwrap()))
-            .await
-            .unwrap();
+        let local = bridge.take_client().expect("owned in-process handoff");
         (bridge, local, remote)
     }
     async fn reply(
-        local: &mut TcpStream,
+        local: &mut tokio::io::DuplexStream,
         remote: &mut TcpStream,
         url: &str,
         method: &str,
@@ -538,6 +536,24 @@ mod tests {
         };
         assert_eq!(response.cseq().unwrap(), seq);
         start
+    }
+    #[tokio::test]
+    async fn push_handoff_has_no_connectable_loopback_listener() {
+        let (bridge, mut local, mut remote) = lab().await;
+        let url = url::Url::parse(bridge.local_url()).unwrap();
+        assert_eq!(url.port(), Some(0));
+        assert!(TcpStream::connect(("127.0.0.1", 0)).await.is_err());
+        local
+            .write_all(
+                format!("OPTIONS {} RTSP/1.0\r\nCSeq: 1\r\n\r\n", bridge.local_url()).as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            frame(&mut remote).await.unwrap(),
+            Frame::Control(_)
+        ));
+        bridge.close().await;
     }
     #[tokio::test]
     async fn translated_authority_retains_track_and_query_and_only_recorded_rtp_counts() {
