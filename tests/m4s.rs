@@ -21,6 +21,56 @@ fn sparse_subtitle_track(id: u32) -> Vec<u8> {
 }
 
 #[test]
+fn m4s_accepts_vendor_application_subtitle_handler_without_configuration() {
+    let audio = atom(
+        b"trak",
+        &[
+            atom(
+                b"hdlr",
+                &[&[0; 4][..], &1u32.to_be_bytes(), b"sounaac\0"].concat(),
+            ),
+            atom(b"cnfg", &[0, 0, 0, 0, 0x11, 0x90]),
+        ]
+        .concat(),
+    );
+    let subtitle = atom(
+        b"trak",
+        &atom(
+            b"hdlr",
+            &[&[0; 4][..], &9u32.to_be_bytes(), b"applsubtitle\0"].concat(),
+        ),
+    );
+    let info = atom(b"MDin", &[audio, subtitle].concat());
+    let packet = [(info.len() as u32).to_be_bytes().to_vec(), info].concat();
+    let events = Decoder::default().push(&packet).unwrap();
+    let Event::Info { tracks, .. } = &events[0] else {
+        panic!("expected media info");
+    };
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[1].id, 9);
+    assert_eq!(tracks[1].codec, "subtitle");
+    assert!(tracks[1].config.is_empty());
+
+    let wrong_kind = atom(
+        b"trak",
+        &[
+            atom(
+                b"hdlr",
+                &[&[0; 4][..], &1u32.to_be_bytes(), b"applaac\0"].concat(),
+            ),
+            atom(b"cnfg", &[0, 0, 0, 0, 0x11, 0x90]),
+        ]
+        .concat(),
+    );
+    let info = atom(b"MDin", &wrong_kind);
+    let packet = [(info.len() as u32).to_be_bytes().to_vec(), info].concat();
+    assert_eq!(
+        Decoder::default().push(&packet).unwrap_err(),
+        "native handler/codec kind mismatch"
+    );
+}
+
+#[test]
 fn m4s_accepts_silent_subtitle_metadata_without_configuration() {
     let mut handler = vec![0; 4];
     handler.extend_from_slice(&1u32.to_be_bytes());
