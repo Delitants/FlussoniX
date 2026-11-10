@@ -99,6 +99,53 @@ class M4fAnnouncementTests(unittest.TestCase):
                 self.assertIsNone(PROBE.parse_m4f_announcement(line))
 
 
+class HlsMediaPollingTests(unittest.TestCase):
+    def test_playlist_and_segment_timeouts_retry_within_probe_deadline(self):
+        clean = "http://127.0.0.1:1234/live/index.m3u8?token=owned"
+        cdn = "http://127.0.0.1:1234"
+        calls = []
+
+        def get(url, limit=512_000):
+            calls.append(url)
+            if len(calls) in (1, 3):
+                raise TimeoutError("owned transient timeout")
+            if url == clean:
+                return 200, {}, b"#EXTM3U\nsegment.ts\n"
+            self.assertEqual(url, "http://127.0.0.1:1234/live/segment.ts")
+            self.assertEqual(limit, 20_000_000)
+            return 200, {}, b"owned MPEG-TS segment"
+
+        self.assertTrue(callable(getattr(PROBE, "poll_hls_media", None)))
+        with patch.object(PROBE.time, "sleep", return_value=None):
+            media, timeouts = PROBE.poll_hls_media(
+                get, clean, cdn,
+                lambda url, base: url.startswith(base + "/"),
+                PROBE.time.monotonic() + 1,
+            )
+        self.assertEqual(media, b"owned MPEG-TS segment")
+        self.assertEqual(timeouts, 2)
+        self.assertEqual(len(calls), 5)
+
+    def test_playlist_escape_still_fails_even_after_a_timeout(self):
+        clean = "http://127.0.0.1:1234/live/index.m3u8"
+        calls = 0
+
+        def get(url, limit=512_000):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise TimeoutError("owned transient timeout")
+            return 200, {}, b"#EXTM3U\nhttps://elsewhere.invalid/segment.ts\n"
+
+        with patch.object(PROBE.time, "sleep", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "escaped the owned endpoint"):
+                PROBE.poll_hls_media(
+                    get, clean, "http://127.0.0.1:1234",
+                    lambda url, base: url.startswith(base + "/"),
+                    PROBE.time.monotonic() + 1,
+                )
+
+
 class WorkerSnapshotTests(unittest.TestCase):
     def test_snapshot_exposes_only_requested_worker_and_bounded_status_fields(self):
         node = {
