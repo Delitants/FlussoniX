@@ -98,10 +98,11 @@ def smoke(destination):
     state = destination.parent / 'state'
     state.mkdir(mode=0o700)
     password = secrets.token_hex(24)
-    env = dict(os.environ, FLUSSONIX_ADMIN_USER='admin',
-               FLUSSONIX_ADMIN_PASSWORD=password,
-               FLUSSONIX_PEER_KEY=secrets.token_hex(32),
-               FLUSSONIX_SRT_PLAY_PASSPHRASE=secrets.token_hex(24))
+    env = {'PATH': os.defpath, 'LANG': 'C', 'HOME': str(state),
+           'TMPDIR': str(state), 'FLUSSONIX_ADMIN_USER': 'admin',
+           'FLUSSONIX_ADMIN_PASSWORD': password,
+           'FLUSSONIX_PEER_KEY': secrets.token_hex(32),
+           'FLUSSONIX_SRT_PLAY_PASSPHRASE': secrets.token_hex(24)}
     command = [str(destination / 'bin/flussonix'), '--listen', '127.0.0.1:0',
                '--rtsp-listen', '127.0.0.1:0', '--srt-play-listen', '127.0.0.1:0',
                '--config', str(state / 'config.json'), '--media-dir', str(state / 'media'),
