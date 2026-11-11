@@ -97,7 +97,10 @@ inherit through Templates. The explicit choice bypasses the extra probe;
 an incorrect H.264 choice can make HEVC startup fail. The option is accepted
 only on RTSP, RTSP-UDP, RTSP2 and RTSPS inputs.
 
-RTSPS, direct RTP, SRTP, RTSP publication/push, multicast, Basic/Digest viewer authentication, RTSP LB redirects, retransmission and migration/large-scale performance qualification remain pending.
+At the v0.7 stage, RTSPS, direct RTP, SRTP, RTSP publication/push, multicast,
+Basic/Digest viewer authentication, RTSP LB redirects, retransmission and
+migration/large-scale performance qualification remained pending. Later sections
+record subsequent implementation; their qualification limits still apply.
 
 
 ## v0.8 encrypted TCP profile

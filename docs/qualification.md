@@ -748,7 +748,7 @@ Owned projection, config, replica, CDN, load-balancer and browser tests cover ex
 
 This milestone is an executable subset of the product design, not complete Flussonic parity. Baseline reference: installed Flussonic 26.04.1. The native cluster uses FlussoniX peer authentication and source discovery; a mixed Flussonic cluster is not qualified.
 
-## Evidence
+## Early preview evidence (historical)
 
 - Rust tests exercise deep partial/reset/null merge, template inheritance across restart, validation without mutation, disk-write failure rollback and rejection of unsupported options.
 - Management tests exercise edit/view roles, Basic and base64 Bearer credentials, multi-segment stream names, auth before any media worker, and preserving unrelated workers on metadata changes.
@@ -761,17 +761,21 @@ This milestone is an executable subset of the product design, not complete Fluss
 - Browser tests cover stream creation/persistence, config validation without saving, Templates and Cluster views, and preserving template inheritance after a title edit.
 - Review regressions cover bounded SIGTERM shutdown with an open MPEG-TS response, portable named source auth backends, clean CDN playlist reload URLs, strict auth policy validation and keeping live bodies in admission accounting.
 
-## Limits
+## Early preview limits (historical)
 
-M4F currently supports up to two uniquely identified H.264/AAC tracks with one contiguous chunk each, 90 kHz normalization, at most 100,000 decoded samples and 32 MiB of aggregate decoded payload per segment. M4S supports observed MDin/FRam AVC/AAC frames and Fgop packed AVC/AAC segments. HEVC, subtitles, SCTE/ad metadata semantics and full legacy control behavior remain unqualified. Unknown records can be forwarded live as opaque bytes without executing them. Generated audio-only M4F output and subsecond GOP timestamp-path reuse remain unqualified. These modes must be qualified separately before migration.
+The limits in this section describe the initial HTTP-only preview. Later dated
+sections above and below record HTTPS and expanded transport/codec support;
+none of these stage results alone qualifies the current release candidate.
 
-CPU encoding uses libx264 plus AAC. NVIDIA configuration is exposed, but no GPU success is claimed without a real supported device and decoder test. v0.6 adds the explicitly tested RTSP TCP playback profile below. FFmpeg adapters and this profile do not establish full RTSP or SRT serving/publishing parity. RTSPS, direct RTP/SRTP and push roles are not implemented.
+This preview's M4F supported up to two uniquely identified H.264/AAC tracks with one contiguous chunk each, 90 kHz normalization, at most 100,000 decoded samples and 32 MiB of aggregate decoded payload per segment. M4S supported observed MDin/FRam AVC/AAC frames and Fgop packed AVC/AAC segments. HEVC, subtitles, SCTE/ad metadata semantics and full legacy control behavior remained unqualified at that stage. Unknown records could be forwarded live as opaque bytes without executing them. Generated audio-only M4F output and subsecond GOP timestamp-path reuse remained unqualified. These modes require separate qualification before migration.
 
-HLS and M4 windows are bounded; live subscribers use bounded shared queues and disconnect on lag. There is a 256-worker implementation limit. This build has not been benchmarked for production stream/viewer counts. v0.2 samples Linux CPU/RAM and aggregate TX bytes on the selected interface independently of management requests. HTTP media egress is reported separately; explicit process mode is available. Unknown/warmup/reset/stale metrics exclude new admissions. Balancing applies resource headroom and authoritative CDN reservations; it does not promise perfect uplink prediction.
+CPU encoding used libx264 plus AAC. NVIDIA configuration was exposed, but no GPU success was claimed without a real supported device and decoder test. v0.6 added the explicitly tested RTSP TCP playback profile below. FFmpeg adapters and that profile did not establish full RTSP or SRT serving/publishing parity. RTSPS, direct RTP/SRTP and push roles were not implemented in this preview.
+
+HLS and M4 windows were bounded; live subscribers used bounded shared queues and disconnected on lag. There was a 256-worker implementation limit. This build had not been benchmarked for production stream/viewer counts. v0.2 sampled Linux CPU/RAM and aggregate TX bytes on the selected interface independently of management requests. HTTP media egress was reported separately; explicit process mode was available. Unknown/warmup/reset/stale metrics excluded new admissions. Balancing applied resource headroom and authoritative CDN reservations; it did not promise perfect uplink prediction.
 
 API compatibility is a subset. Collection default ordering is by name; composite scalar sorting, literal substring `q`, nested `select`, scalar filtering and the documented value-based cursor profile for Streams/Templates collections are implemented. Complete filter/schema coverage, reference default ordering, full vendor cursor parity, selection on other collections/items, configuration-text formats and many operations remain open. API credentials/listeners/resource limits are startup settings rather than the complete vendor config contract. Unknown saved options fail validation. Viewer session counts expire after 30 seconds of inactivity when no continuous response remains open; global cross-node session ownership remains open.
 
-For testing, keep management endpoints on a trusted interface or reach them through SSH forwarding. The daemon currently serves HTTP, so HTTPS delivery requires a separately configured TLS terminator. The dedicated test instances must use separate directories, accounts, units and unused ports; never replace or restart existing Flussonic services.
+For that preview test, management endpoints stayed on a trusted interface or were reached through SSH forwarding. The daemon then served HTTP, so HTTPS delivery required a separately configured TLS terminator. The dedicated test instances used separate directories, accounts, units and unused ports; existing Flussonic services were not replaced or restarted.
 
 ## CDN test deployment
 
