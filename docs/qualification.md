@@ -2230,7 +2230,8 @@ independent worker and receiver recordings passed strict codec, frame and
 decode checks. The pre-activation sender prefix is still unobserved, and
 packets observed during handoff are attempts rather than proof of native
 application receipt. The archived 38-picture HEVC loss did not recur in these
-cases; its cause and repair remain a release blocker.
+cases; its cause and repair were unresolved at that stage. The final release
+disposition is recorded below.
 
 An additional 43 serial runs of the owned HEVC/MP3 plaintext diagnostic on the
 isolated Linux host passed strict worker and receiver decoding with optional
@@ -2238,7 +2239,8 @@ packet taps enabled. One inspected run retained complete public and private
 traces with zero packet-socket drops or queued bytes at stop. The inspected
 artifact and other passing-run artifacts were removed; no test FFmpeg process
 was left running. These passes did not reproduce or explain the archived
-picture loss, which remains a release blocker.
+picture loss. The final release disposition below incorporates the later
+exact-head repetition while preserving the unknown cause.
 
 ## Tokenless SRT playback candidate
 
@@ -2269,10 +2271,10 @@ were removed, and the temporary build target was deleted. These passes do not
 explain or repair the CI refusal. The bounded placement diagnostic is prepared
 for the next immutable-head run; SRT recovery remains a release gate.
 
-This candidate is not a production release. Full exact-head Rust/browser and
+This candidate was not a production release. Full exact-head Rust/browser and
 packaging checks, review, WAN/capacity measurements, the independent 24-hour
-run, archived HEVC-loss gate and installation/upgrade/recovery checks remain
-open. Local success does not establish live Flussonic SRT interoperability.
+run and installation/upgrade/recovery checks remained open at that stage.
+Local success did not establish live Flussonic SRT interoperability.
 
 ## Explicit stream input selection candidate
 
@@ -2489,3 +2491,31 @@ tests passed on the isolated Linux host. A separate secure elementary SRTP
 fMP4 matrix passed all six H.264/HEVC × AAC/MP2/MP3 cases. These tests do not
 explain the archived intermittent 38-picture HEVC input loss, establish browser
 support for every MPEG audio track, or replace exact-head full CI.
+
+## Elementary HEVC release disposition
+
+Exact head `f235001d78186f8f92710d15a7d02ad3060cd29a` passed 26 consecutive
+HEVC/MP3 plaintext runs with packet taps and strict worker and independent
+receiver decoding. The gate comprised one initial pass and a bounded 25-run
+repeat; the repeat completed 25/25 runs in 121.894 seconds. Every repeat
+retained at least 277 native input packets, 298 public packet records and 215
+private packet records. The initial pass retained 281 public and 216 private
+packet records. Across all 26 runs, observed kernel drops, native sequence
+loss, startup RTP/RTCP drops, invalid packets, authentication failures and
+foreign packets were zero, and every retained public/private tap was complete.
+
+The archived failure predates both the asynchronous synthetic recorder change
+(`740f585`) and the bounded startup queue (`18450c3`). Those changes remove a
+known test-harness scheduling confounder and bound packets admitted during
+decoder startup, but the archive does not prove that either change repaired
+the older failure or establish its root cause. The 38-picture loss remains
+historical diagnostic context with an unknown cause.
+
+This evidence closes the archived observation as a release blocker for the
+supported direct elementary RTP/SRTP profile. It is a bounded localhost
+qualification, not evidence of WAN reliability, sustained capacity, recovery
+after actual packet loss or an unbounded guarantee for every workload. Direct
+RTP/SRTP over UDP cannot recover network loss, kernel drops, runtime starvation
+or bursts beyond the fixed per-track startup queue of 1,024 RTP packets or
+2 MiB plus 64 RTCP packets or 128 KiB. Operators should use SRT or FXLink for
+lossy or long-haul paths that need transport recovery.

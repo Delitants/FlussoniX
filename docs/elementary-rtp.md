@@ -53,6 +53,34 @@ fixed: that specific failure did not recur, and the packet taps in that run
 began after private decoder readiness. The queue cannot recover network loss,
 packets discarded before its reader starts, or a burst beyond its fixed cap.
 
+### Elementary HEVC release disposition
+
+Exact head `f235001d78186f8f92710d15a7d02ad3060cd29a` passed 26 consecutive
+HEVC/MP3 plaintext runs with packet taps and strict worker and independent
+receiver decoding: one initial run followed by a 25-run repeat completed in
+121.894 seconds. Every repeat retained at least 277 native input packets, 298
+public packet records and 215 private packet records; the initial run retained
+281 public and 216 private packet records. Across the gate, observed kernel
+drops, native sequence loss, startup RTP/RTCP drops, invalid packets,
+authentication failures and foreign packets were zero, and the retained tap
+evidence was complete.
+
+This bounded localhost result closes the archived observation as a release
+blocker for the supported direct elementary RTP/SRTP profile. The archived
+38-picture loss remains historical diagnostic context: its cause is unknown,
+and non-reproduction does not assign a root cause or prove that a particular
+change repaired it. The gate does not establish WAN reliability, sustained
+capacity, recovery after actual packet loss or an unbounded guarantee for
+every host and workload.
+
+Direct RTP/SRTP over UDP cannot recover packets lost in the network, discarded
+by the kernel, delayed by runtime starvation or delivered in a burst beyond
+the per-track startup queue. The fixed limits remain 1,024 admitted RTP
+packets or 2 MiB and 64 authenticated RTCP packets or 128 KiB per track;
+`startup_dropped_packets`, `startup_dropped_rtcp_packets`, native sequence-loss
+statistics and socket-drop observations remain the operator signals. Use SRT
+or FXLink for lossy or long-haul links that need transport recovery.
+
 ## Investigating intermittent media loss
 
 The independent elementary fixtures can retain private evidence with
