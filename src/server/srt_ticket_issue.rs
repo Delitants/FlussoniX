@@ -341,6 +341,59 @@ mod tests {
             .split_once("flussonix_ticket=")
             .unwrap()
             .1;
+        let denied = issue(State(app.clone()), request()).await;
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(denied.headers()["cache-control"], "private, no-store");
+        assert_eq!(denied.headers()["connection"], "close");
+        let denied_body = axum::body::to_bytes(denied.into_body(), 4096)
+            .await
+            .unwrap();
+        assert!(
+            !denied_body
+                .windows(b"owned-secret".len())
+                .any(|part| part == b"owned-secret")
+        );
+
+        app.discard_srt_credential(ticket).await;
+        let after_discard = issue(State(app.clone()), request()).await;
+        assert_eq!(after_discard.status(), StatusCode::OK);
+        let old_listener = app.srt_listener_id();
+        app.set_srt_playback(Some(&listener));
+        assert_ne!(app.srt_listener_id(), old_listener);
+        let after_restart = issue(State(app.clone()), request()).await;
+        assert_eq!(after_restart.status(), StatusCode::OK);
+        let restarted_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(after_restart.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let restarted_ticket = restarted_body["streamid"]
+            .as_str()
+            .unwrap()
+            .split_once("flussonix_ticket=")
+            .unwrap()
+            .1;
+        app.reservations
+            .lock()
+            .await
+            .get_mut(restarted_ticket)
+            .unwrap()
+            .expires = Instant::now() - Duration::from_millis(1);
+        let after_expiry = issue(State(app.clone()), request()).await;
+        assert_eq!(after_expiry.status(), StatusCode::OK);
+        let current_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(after_expiry.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let ticket = current_body["streamid"]
+            .as_str()
+            .unwrap()
+            .split_once("flussonix_ticket=")
+            .unwrap()
+            .1;
         app.config.delete("sources", &key).unwrap();
         assert!(
             app.srt_ticket_viewer(

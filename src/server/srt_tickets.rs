@@ -4,6 +4,51 @@ use crate::source_directory::modern_coordinator::{
     AdmittedCandidate, ModernSourceCoordinator, ReservedCandidate,
 };
 use std::net::IpAddr;
+fn canonical_peer_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        _ => ip,
+    }
+}
+fn private_ticket_quota_reached(
+    reservations: &HashMap<String, Reservation>,
+    listener_id: &str,
+    token_hash: &str,
+    peer_ip: IpAddr,
+    listener_limit: usize,
+) -> bool {
+    let per_eighth = (listener_limit / 8).max(1);
+    let token_limit = per_eighth.min(4);
+    let peer_limit = per_eighth.min(16);
+    let peer_ip = canonical_peer_ip(peer_ip);
+    let now = Instant::now();
+    let mut token_pending = 0;
+    let mut peer_pending = 0;
+    for reservation in reservations.values() {
+        let Some(binding) = reservation.srt.as_ref().filter(|binding| {
+            binding.listener_id == listener_id
+                && binding.viewer.is_some()
+                && binding.peer_ip.is_some()
+                && reservation.expires > now
+        }) else {
+            continue;
+        };
+        if matches!(&reservation.kind, rtsp_balancer::Kind::Srt { token_hash: saved, .. } if saved == token_hash)
+        {
+            token_pending += 1;
+        }
+        if binding
+            .peer_ip
+            .is_some_and(|saved| canonical_peer_ip(saved) == peer_ip)
+        {
+            peer_pending += 1;
+        }
+        if token_pending >= token_limit || peer_pending >= peer_limit {
+            return true;
+        }
+    }
+    false
+}
 #[derive(Clone)]
 pub(super) struct Binding {
     pub listener_id: String,
@@ -164,6 +209,7 @@ impl App {
         let listener_id = listener["listener_id"].as_str().ok_or(503u16)?.to_owned();
         let peer_ip = viewer.ip.parse::<IpAddr>().map_err(|_| 503u16)?;
         viewer.ip = peer_ip.to_string();
+        let token_hash = rtsp_balancer::token_hash(&viewer);
         let binding = Binding {
             listener_id: listener_id.clone(),
             revision,
@@ -196,8 +242,23 @@ impl App {
                 .filter(|r| r.srt.as_ref().is_some_and(|b| b.viewer.is_some()))
                 .count()
                 >= 4096
-            || !self.reservation_capacity(&reservations, Some(&binding), bitrate_mbps)
         {
+            return Err(503);
+        }
+        let listener_limit = listener["client_limit"]
+            .as_u64()
+            .and_then(|limit| usize::try_from(limit).ok())
+            .unwrap_or(0);
+        if private_ticket_quota_reached(
+            &reservations,
+            &listener_id,
+            &token_hash,
+            peer_ip,
+            listener_limit,
+        ) {
+            return Err(429);
+        }
+        if !self.reservation_capacity(&reservations, Some(&binding), bitrate_mbps) {
             return Err(503);
         }
         let id = uuid::Uuid::new_v4().to_string();
@@ -212,7 +273,7 @@ impl App {
             vendor: vendor.clone(),
             kind: rtsp_balancer::Kind::Srt {
                 encrypted: true,
-                token_hash: rtsp_balancer::token_hash(&viewer),
+                token_hash,
             },
             bitrate_mbps,
             stream: viewer.name,
@@ -329,6 +390,128 @@ impl App {
 mod tests {
     use super::*;
     use std::net::IpAddr;
+    #[tokio::test]
+    async fn private_ticket_token_cap_is_shared_across_streams() {
+        let (_d, app, mut viewer, _grant, _signature) = native().await;
+        app.config
+            .put("streams", "other", json!({"inputs":[{"url":"testsrc://"}]}))
+            .unwrap();
+        app.srt_playback.lock().unwrap()["client_limit"] = json!(128);
+        viewer.ip = "127.0.0.1".into();
+        viewer.token = "same-token".into();
+        for index in 0..4 {
+            viewer.name = if index % 2 == 0 { "owned" } else { "other" }.into();
+            assert!(
+                app.reserve_srt_credential(viewer.clone(), 5.0)
+                    .await
+                    .is_ok()
+            );
+        }
+        assert_eq!(
+            app.reserve_srt_credential(viewer.clone(), 5.0).await,
+            Err(429)
+        );
+        viewer.token = "different-token".into();
+        viewer.ip = "127.0.0.2".into();
+        assert!(app.reserve_srt_credential(viewer, 5.0).await.is_ok());
+    }
+    #[tokio::test]
+    async fn private_ticket_peer_cap_combines_ipv4_and_mapped_ipv6() {
+        let (_d, app, mut viewer, _grant, _signature) = native().await;
+        app.srt_playback.lock().unwrap()["client_limit"] = json!(128);
+        for index in 0..16 {
+            viewer.token = format!("unique-token-{index}");
+            viewer.ip = if index % 2 == 0 {
+                "127.0.0.1"
+            } else {
+                "::ffff:127.0.0.1"
+            }
+            .into();
+            assert!(
+                app.reserve_srt_credential(viewer.clone(), 5.0)
+                    .await
+                    .is_ok()
+            );
+        }
+        viewer.token = "next-token".into();
+        assert_eq!(
+            app.reserve_srt_credential(viewer.clone(), 5.0).await,
+            Err(429)
+        );
+        viewer.ip = "127.0.0.2".into();
+        assert!(app.reserve_srt_credential(viewer, 5.0).await.is_ok());
+    }
+    #[tokio::test]
+    async fn small_srt_listeners_bound_private_tickets_without_blocking_first() {
+        for (limit, allowed) in [(1, 1), (7, 1), (8, 1), (32, 4)] {
+            let (_d, app, mut viewer, _grant, _signature) = native().await;
+            app.reservations.lock().await.remove("owned-ticket");
+            app.srt_playback.lock().unwrap()["client_limit"] = json!(limit);
+            viewer.ip = "127.0.0.1".into();
+            for _ in 0..allowed {
+                assert!(
+                    app.reserve_srt_credential(viewer.clone(), 5.0)
+                        .await
+                        .is_ok(),
+                    "limit={limit}"
+                );
+            }
+            assert_eq!(
+                app.reserve_srt_credential(viewer, 5.0).await,
+                Err(429),
+                "limit={limit}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn expired_public_and_previous_listener_tickets_do_not_spend_identity_quota() {
+        let (_d, app, mut viewer, _grant, _signature) = native().await;
+        app.reservations.lock().await.remove("owned-ticket");
+        app.srt_playback.lock().unwrap()["client_limit"] = json!(128);
+        viewer.ip = "127.0.0.1".into();
+        viewer.token = "quota-with-stale-records".into();
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            ids.push(
+                app.reserve_srt_credential(viewer.clone(), 5.0)
+                    .await
+                    .unwrap(),
+            );
+        }
+        {
+            let mut ledger = app.reservations.lock().await;
+            ledger.get_mut(&ids[0]).unwrap().expires = Instant::now() - Duration::from_millis(1);
+            ledger
+                .get_mut(&ids[1])
+                .unwrap()
+                .srt
+                .as_mut()
+                .unwrap()
+                .viewer = None;
+            ledger
+                .get_mut(&ids[1])
+                .unwrap()
+                .srt
+                .as_mut()
+                .unwrap()
+                .peer_ip = None;
+            ledger
+                .get_mut(&ids[2])
+                .unwrap()
+                .srt
+                .as_mut()
+                .unwrap()
+                .listener_id = "old-listener".into();
+        }
+        for _ in 0..3 {
+            assert!(
+                app.reserve_srt_credential(viewer.clone(), 5.0)
+                    .await
+                    .is_ok()
+            );
+        }
+        assert_eq!(app.reserve_srt_credential(viewer, 5.0).await, Err(429));
+    }
     #[tokio::test]
     async fn private_ticket_restores_original_callback_identity_only_for_observed_peer_ip() {
         let (_d, app, _legacy, _grant, _signature) = native().await;
@@ -572,12 +755,15 @@ mod tests {
             token: "owned-token".into(),
             ..Default::default()
         };
+        let mut existing_viewer = viewer.clone();
+        existing_viewer.ip = "127.0.0.2".into();
+        existing_viewer.token = "other-token".into();
         let binding = Binding {
             listener_id: "owned-listener".into(),
             revision: app.config.revision(),
             signature: None,
-            viewer: Some(viewer.clone()),
-            peer_ip: Some("127.0.0.1".parse().unwrap()),
+            viewer: Some(existing_viewer.clone()),
+            peer_ip: Some("127.0.0.2".parse().unwrap()),
         };
         let mut ledger = app.reservations.lock().await;
         for index in 0..4096 {
@@ -589,7 +775,7 @@ mod tests {
                     vendor: None,
                     kind: rtsp_balancer::Kind::Srt {
                         encrypted: true,
-                        token_hash: rtsp_balancer::token_hash(&viewer),
+                        token_hash: rtsp_balancer::token_hash(&existing_viewer),
                     },
                     bitrate_mbps: 0.0,
                     stream: "owned".into(),
