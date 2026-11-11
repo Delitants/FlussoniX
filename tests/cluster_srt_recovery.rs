@@ -79,6 +79,19 @@ async fn node_diagnostic(client: &reqwest::Client, node: &Daemon) -> Value {
         "stream_bitrate_age_ms":value["stream_bitrates"][STREAM]["age_ms"],
     })
 }
+fn recent_lookup_diagnostics(node: &Daemon) -> Vec<String> {
+    std::fs::read_to_string(node.directory.path().join("daemon.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("srt_lookup_diag"))
+        .rev()
+        .take(16)
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
 async fn fresh(client: &reqwest::Client, lb: &Daemon, cdn: &Daemon, phase: &str) -> Value {
     fresh_with_startup(client, lb, cdn, phase, None).await
 }
@@ -100,7 +113,8 @@ async fn fresh_with_startup(
             tokio::join!(node_diagnostic(client, lb), node_diagnostic(client, cdn));
         panic!(
             "fresh SRT lookup {status}: {body}; diagnostic: {}",
-            json!({"phase":phase,"lookup_ms":lookup_ms,"startup":startup,"lb":lb_state,"cdn":cdn_state})
+            json!({"phase":phase,"lookup_ms":lookup_ms,"startup":startup,"lb":lb_state,"cdn":cdn_state,
+                "lb_lookup_trace":recent_lookup_diagnostics(lb),"cdn_lookup_trace":recent_lookup_diagnostics(cdn)})
         );
     }
     assert_eq!(

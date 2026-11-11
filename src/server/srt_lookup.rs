@@ -7,6 +7,11 @@ struct Query {
     selection: crate::srt_playback::Selection,
     encrypted: bool,
 }
+fn qualification_diag(stage: &str, detail: Value) {
+    if std::env::var_os("FLUSSONIX_QUALIFICATION_SRT_DIAGNOSTICS").is_some() {
+        eprintln!("srt_lookup_diag {}", json!({"stage":stage,"detail":detail}));
+    }
+}
 fn decode(raw: &str) -> Option<String> {
     let bytes = raw.as_bytes();
     for (i, b) in bytes.iter().enumerate() {
@@ -168,6 +173,13 @@ impl App {
         let result = self
             .srt_place(&viewer, streamid, mode, &grant, resolved.revision)
             .await;
+        if let Err(status) = &result {
+            qualification_diag(
+                "placement_rejected",
+                json!({"status":status,"revision_current":self.config.revision()==resolved.revision,
+                    "grant_cancelled":grant.is_cancelled()}),
+            );
+        }
         let result = self
             .config
             .at_revision(resolved.revision, |_| {
@@ -290,6 +302,16 @@ impl App {
             }
         }
         drop(calls);
+        qualification_diag(
+            "observations",
+            json!({"count":observations.len(),"peers":observations.iter().map(|(snapshot,peer,_,_,_)| json!({
+                "hostname":peer["hostname"],"age_ms":snapshot.value["age_ms"],
+                "cpu":snapshot.value["cpu"],"ram":snapshot.value["ram"],
+                "uplink":snapshot.value["uplink"],"active":snapshot.value["active"],
+                "reserved":snapshot.value["reserved"],
+                "srt_playback":snapshot.value["srt_playback"]
+            })).collect::<Vec<_>>() }),
+        );
         let mut attempted = std::collections::HashSet::new();
         let mut turn = None;
         loop {
@@ -347,6 +369,10 @@ impl App {
                 })
                 .collect::<Vec<_>>();
             let Some(id) = self.routing_rotation.select(&nodes, 0.0, &mut turn) else {
+                qualification_diag(
+                    "no_eligible_node",
+                    json!({"valid":valid.len(),"nodes":nodes}),
+                );
                 return Err(503);
             };
             attempted.insert(id.clone());
@@ -400,9 +426,14 @@ impl App {
                 };
                 let response = request.timeout(Duration::from_secs(4)).send().await;
                 let Ok(response) = response else {
+                    qualification_diag("admission_transport_failed", json!({"node":id}));
                     continue;
                 };
                 if !response.status().is_success() {
+                    qualification_diag(
+                        "admission_rejected",
+                        json!({"node":id,"status":response.status().as_u16()}),
+                    );
                     continue;
                 }
                 let Some(body) = super::admission::read_json(response).await else {
