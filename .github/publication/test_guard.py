@@ -642,6 +642,26 @@ class PublicationGuardTests(unittest.TestCase):
                 github.assert_not_called()
                 self.assertIn("Qualified CI run", errors.getvalue())
 
+    def test_release_files_validation_does_not_require_upload_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            policy = root / "policy.json"
+            policy.write_text(json.dumps(RELEASE_POLICY))
+            asset = root / PACKAGE_NAME
+            asset.write_bytes(b"test archive")
+            args = ["guard.py", "--repository", str(root), "--policy", str(policy),
+                    "release-files", "--tag", "v1", "--asset", str(asset)]
+            with mock.patch.object(sys, "argv", args), \
+                 mock.patch.object(guard, "release_errors", return_value=[]) as validation, \
+                 mock.patch.object(guard, "history_errors") as history, \
+                 mock.patch.object(guard, "git") as git_call, \
+                 mock.patch.object(guard.subprocess, "check_output") as github:
+                self.assertEqual(guard.main(), 0)
+                validation.assert_called_once()
+                history.assert_not_called()
+                git_call.assert_not_called()
+                github.assert_not_called()
+
     def test_upload_does_not_call_github_when_qualified_artifact_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

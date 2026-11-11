@@ -395,7 +395,7 @@ def main():
    if args.command=='upload':
     errors+=history_errors(repo,policy,'HEAD')
     if git(repo,'status','--porcelain').strip():errors.append('Upload requires a clean source checkout')
-   if args.qualified_run is None:errors.append('Qualified CI run ID required for upload')
+    if args.qualified_run is None:errors.append('Qualified CI run ID required for upload')
   if errors:
    for error in errors:print('Publication blocked: '+error,file=sys.stderr)
    return 1
