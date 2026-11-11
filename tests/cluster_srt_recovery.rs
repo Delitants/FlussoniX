@@ -80,6 +80,15 @@ async fn node_diagnostic(client: &reqwest::Client, node: &Daemon) -> Value {
     })
 }
 async fn fresh(client: &reqwest::Client, lb: &Daemon, cdn: &Daemon) -> Value {
+    fresh_with_startup(client, lb, cdn, None).await
+}
+
+async fn fresh_with_startup(
+    client: &reqwest::Client,
+    lb: &Daemon,
+    cdn: &Daemon,
+    startup: Option<&Value>,
+) -> Value {
     let started = std::time::Instant::now();
     let response = lookup(client, lb, TOKEN).await;
     let lookup_ms = started.elapsed().as_millis();
@@ -90,7 +99,7 @@ async fn fresh(client: &reqwest::Client, lb: &Daemon, cdn: &Daemon) -> Value {
             tokio::join!(node_diagnostic(client, lb), node_diagnostic(client, cdn));
         panic!(
             "fresh SRT lookup {status}: {body}; diagnostic: {}",
-            json!({"lookup_ms":lookup_ms,"lb":lb_state,"cdn":cdn_state})
+            json!({"lookup_ms":lookup_ms,"startup":startup,"lb":lb_state,"cdn":cdn_state})
         );
     }
     assert_eq!(
@@ -305,17 +314,23 @@ async fn run(
         403
     );
     assert!(nodes.iter().all(|n| n.owned_encoders().is_empty()));
-    tokio::time::timeout(Duration::from_secs(12), async {
-        while !nodes[2].node(&client).await["cpu"]
-            .as_f64()
-            .is_some_and(|n| n < 0.9)
-        {
+    let startup = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let node = nodes[2].node(&client).await;
+            if node["cpu"].as_f64().is_some_and(|n| n < 0.9) {
+                break json!({
+                    "cdn_source_available":stats(&node)["source_available"],
+                    "cdn_stream_status":stats(&node)["status"],
+                    "cdn_srt_enabled":node["srt_playback"]["enabled"],
+                    "cdn_sample_age_ms":node["age_ms"]
+                });
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
     .unwrap();
-    let first = fresh(&client, &nodes[3], &nodes[2]).await;
+    let first = fresh_with_startup(&client, &nodes[3], &nodes[2], Some(&startup)).await;
     assert!(
         nodes.iter().all(|n| n.owned_encoders().is_empty()),
         "lookup must reserve only"
