@@ -1,12 +1,14 @@
-# Install or upgrade a Linux preview
+# Install or upgrade FlussoniX on Linux
 
-FlussoniX is a development preview. Use a test host and an unused port.
+Check a new installation on a test host and an unused port before moving live
+traffic. Confirm that every required protocol, codec and authorization profile
+is listed in the source repository's compatibility guide.
 
 The archive contains the server, web interface, installation guides, an optional
 service helper and a file manifest.
 It contains no configuration, credentials, media, FFmpeg or Flussonic components.
 Use Linux with the archive's CPU architecture; libc and CPU requirements depend
-on the supplied binary's build. The current x86-64 release-candidate binary
+on the supplied binary's build. The current x86-64 release binary
 requires glibc 2.39 and has been checked on Ubuntu 24.04. Older glibc hosts
 cannot run that binary; inspect another archive's requirements separately.
 
@@ -27,7 +29,7 @@ Optional DVB bitmap subtitle conversion needs the Tesseract executable and the
 language models selected for the stream (for example, `tesseract-ocr-eng` on
 Ubuntu).
 
-Download the preview archive and its matching `.sha256` file into the same
+Download the release archive and its matching `.sha256` file into the same
 directory. Set `package` to the downloaded filename without `.tar.gz`, then run:
 
 ```bash

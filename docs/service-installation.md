@@ -1,4 +1,4 @@
-# Run a preview as a Linux service
+# Run FlussoniX as a Linux service
 
 Use this optional workflow after checking the archive on a test host. It requires
 systemd, Python 3.11+ and independently installed FFmpeg/FFprobe. The packaged
@@ -17,9 +17,9 @@ uses a private temporary directory.
 Create a dedicated account if it does not already exist:
 
 ```bash
-sudo useradd --system --user-group --home-dir /var/lib/flussonix-preview \
+sudo useradd --system --user-group --home-dir /var/lib/flussonix \
   --no-create-home --shell /usr/sbin/nologin flussonix
-sudo install -d -o flussonix -g flussonix -m 700 /var/lib/flussonix-preview
+sudo install -d -o flussonix -g flussonix -m 700 /var/lib/flussonix
 ```
 
 For an existing instance, stop it and back up its state first. Copy its saved
@@ -35,7 +35,7 @@ cluster peer key when prompted:
 
 ```bash
 sudo python3 ./bin/flussonix-service credentials \
-  --output /etc/flussonix-preview.env
+  --output /etc/flussonix.env
 ```
 
 This creates a mode-0600 file and refuses to overwrite an existing file. The
@@ -52,17 +52,17 @@ to the absolute path of your extracted release:
 ```bash
 flussonix_release=/opt/flussonix/releases/flussonix-VERSION-linux-ARCH-REVISION
 sudo python3 ./bin/flussonix-service render \
-  --instance preview --user flussonix \
+  --instance main --user flussonix \
   --release-dir "$flussonix_release" \
-  --state-dir /var/lib/flussonix-preview \
-  --credentials /etc/flussonix-preview.env \
+  --state-dir /var/lib/flussonix \
+  --credentials /etc/flussonix.env \
   --listen 127.0.0.1:18210 --ffmpeg /usr/bin/ffmpeg \
-  --output "$PWD/flussonix-preview.service"
-systemd-analyze verify --man=no ./flussonix-preview.service
-cat ./flussonix-preview.service
+  --output "$PWD/flussonix.service"
+systemd-analyze verify --man=no ./flussonix.service
+cat ./flussonix.service
 ```
 
-The command above renders a standalone HTTP preview. To render an HTTPS CDN,
+The command above renders a standalone HTTP service. To render an HTTPS CDN,
 prepare its own private state directory and credentials file, then use a
 separate instance name and unused ports:
 
@@ -131,7 +131,7 @@ before starting the unit:
 
 ```bash
 sudo -u flussonix "$flussonix_release/bin/flussonix" \
-  --init-srtp-receiver-ledger /var/lib/flussonix-preview/srtp-receiver-ledger
+  --init-srtp-receiver-ledger /var/lib/flussonix/srtp-receiver-ledger
 ```
 
 The helper rejects unsafe existing history or lock files. Keep both files
@@ -143,11 +143,11 @@ does not already belong to another instance:
 
 ```bash
 sudo sh -c 'umask 022; set -C; cat "$1" > "$2"' sh \
-  ./flussonix-preview.service /etc/systemd/system/flussonix-preview.service &&
+  ./flussonix.service /etc/systemd/system/flussonix.service &&
 sudo systemctl daemon-reload &&
-sudo systemctl start flussonix-preview.service
-sudo systemctl status flussonix-preview.service
-sudo journalctl -u flussonix-preview.service -n 50 --no-pager
+sudo systemctl start flussonix.service
+sudo systemctl status flussonix.service
+sudo journalctl -u flussonix.service -n 50 --no-pager
 ```
 
 The installation command refuses an existing destination; activation runs only
@@ -155,7 +155,7 @@ if the new unit was written successfully. Inspect any failure before continuing.
 
 Open [the local admin interface](http://127.0.0.1:18210/admin/), sign in and check
 actual playback. Use an SSH tunnel for remote access. Once validated, optionally
-enable startup at boot with `sudo systemctl enable flussonix-preview.service`.
+enable startup at boot with `sudo systemctl enable flussonix.service`.
 Remote HTTP media can remain public, but management requires HTTPS or a local
 tunnel. The shipped UI refuses remote HTTP login even if the legacy
 `--allow-insecure-remote-management` API override is enabled.
@@ -197,8 +197,8 @@ compatibility only and weakens restart replay protection.
 To remove only this service registration:
 
 ```bash
-sudo systemctl disable --now flussonix-preview.service
-sudo rm /etc/systemd/system/flussonix-preview.service
+sudo systemctl disable --now flussonix.service
+sudo rm /etc/systemd/system/flussonix.service
 sudo systemctl daemon-reload
 ```
 

@@ -298,7 +298,7 @@ def main():
     try:
         print(json.dumps(package(args), sort_keys=True))
     except (ValueError, OSError, subprocess.SubprocessError) as error:
-        parser.exit(1, f'Cannot package preview: {error}\n')
+        parser.exit(1, f'Cannot package release: {error}\n')
 
 
 if __name__ == '__main__':

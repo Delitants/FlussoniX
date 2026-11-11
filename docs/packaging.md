@@ -1,4 +1,4 @@
-# Build a Linux preview archive
+# Build a Linux release archive
 
 The packager requires Python 3.11+ and uses only its standard library. Build the
 server and UI from the revision being packaged, using the pinned Rust toolchain
@@ -14,7 +14,7 @@ python3 scripts/package-preview.py \
 ```
 
 For cross-compiled artifacts, pass the corresponding executable with `--binary`.
-The current x86-64 release-candidate binary links glibc and requires GLIBC 2.39;
+The current x86-64 release binary links glibc and requires GLIBC 2.39;
 it is checked on Ubuntu 24.04. The packager checks ELF64 x86_64/aarch64 headers;
 it does not establish libc, CPU, optional media-library or target-host
 compatibility. Run the extracted archive on its target host before
@@ -55,7 +55,7 @@ Run archive regression checks with:
 python3 -m unittest discover -s tests -p 'test_*preview.py' -v
 ```
 
-For a release-candidate cold-upgrade check, verify both archive checksums and
+For a cold-upgrade check, verify both archive checksums and
 extract the previous and candidate Linux packages into separate directories.
 Then run `python3 scripts/smoke-cold-upgrade.py --previous OLD_DIR --current NEW_DIR`.
 The smoke uses a temporary owner-only state directory and an unused loopback

@@ -25,7 +25,7 @@ jobs:
           sudo apt-get -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2 install -y ffmpeg libsrtp2-1 tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu fonts-dejavu-core postgresql-16
       - name: Verify vendor components are absent
         run: test ! -e /opt/flussonic
-      - name: Preview package, service, credential and qualification regressions
+      - name: Release package, service, credential and qualification regressions
         run: |
           python3 -m unittest discover -s tests -p 'test_*preview.py' -v
           python3 -m unittest discover -s tests -p 'test_generate_notices.py' -v
