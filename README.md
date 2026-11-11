@@ -1,8 +1,12 @@
 # FlussoniX
 
-FlussoniX is an independent Linux streaming server with a web admin interface, transcoding and cluster load balancing. It does not use official Flussonic components.
+FlussoniX is an independent Linux streaming server with a web admin interface,
+transcoding and cluster load balancing. It does not use official Flussonic
+components.
 
-**Development preview:** FlussoniX is not yet ready to replace Flussonic in production. API and mixed-cluster compatibility are still being qualified. Check the [current compatibility limits](docs/compatibility.md) before planning a migration.
+Support is qualified by protocol, direction, codec and authorization profile.
+Review the [compatibility guide](docs/compatibility.md) before migrating a live
+service.
 
 ## What it offers
 
@@ -14,11 +18,21 @@ FlussoniX is an independent Linux streaming server with a web admin interface, t
 
 Protocol directions, codecs and feature limits vary by profile; see [compatibility](docs/compatibility.md) for details.
 
-## Try a preview
+## Install
 
-Use a test machine and an unused port. The current x86-64 release-candidate binary has been checked on Ubuntu 24.04 and requires glibc 2.39. Install FFmpeg and FFprobe separately; the standard CPU profile needs libx264 and AAC support.
+The Linux x86-64 release is checked on Ubuntu 24.04 and requires glibc 2.39.
+Install FFmpeg and FFprobe separately; the standard CPU profile needs libx264
+and AAC support.
 
-[Download a Linux preview](https://github.com/Delitants/FlussoniX/releases), extract it and open a terminal in the extracted directory. Published previews may be older than the current source. Create private credentials and a data directory:
+[Download the latest release](https://github.com/Delitants/FlussoniX/releases)
+and its matching `.sha256` file. Verify the archive, extract it and open a
+terminal in the extracted directory:
+
+```bash
+sha256sum --check flussonix-*.tar.gz.sha256
+```
+
+Create private credentials and a data directory:
 
 ```bash
 umask 077
