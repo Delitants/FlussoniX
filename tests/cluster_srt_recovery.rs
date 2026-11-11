@@ -2,7 +2,12 @@
 use futures_util::FutureExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+    process::Stdio,
+    time::Duration,
+};
 #[path = "support/cluster_daemon.rs"]
 mod daemon;
 #[path = "support/tls.rs"]
@@ -80,8 +85,30 @@ async fn node_diagnostic(client: &reqwest::Client, node: &Daemon) -> Value {
     })
 }
 fn recent_lookup_diagnostics(node: &Daemon) -> Vec<String> {
-    std::fs::read_to_string(node.directory.path().join("daemon.log"))
-        .unwrap_or_default()
+    const MAX_LOG_TAIL: u64 = 64 * 1024;
+    let Ok(mut log) = std::fs::File::open(node.directory.path().join("daemon.log")) else {
+        return Vec::new();
+    };
+    let Ok(len) = log.metadata().map(|metadata| metadata.len()) else {
+        return Vec::new();
+    };
+    let offset = len.saturating_sub(MAX_LOG_TAIL);
+    if log.seek(SeekFrom::Start(offset)).is_err() {
+        return Vec::new();
+    }
+    let mut tail = Vec::new();
+    if log.take(MAX_LOG_TAIL).read_to_end(&mut tail).is_err() {
+        return Vec::new();
+    }
+    let tail = if offset > 0 {
+        tail.iter()
+            .position(|byte| *byte == b'\n')
+            .and_then(|index| tail.get(index + 1..))
+            .unwrap_or_default()
+    } else {
+        &tail
+    };
+    String::from_utf8_lossy(tail)
         .lines()
         .filter(|line| line.contains("srt_lookup_diag"))
         .rev()
@@ -91,6 +118,21 @@ fn recent_lookup_diagnostics(node: &Daemon) -> Vec<String> {
         .into_iter()
         .rev()
         .collect()
+}
+
+#[test]
+fn recent_lookup_diagnostics_ignores_invalid_old_log_bytes() {
+    let node = Daemon::new("diagnostic-tail");
+    let path = node.directory.path().join("daemon.log");
+    let mut log = vec![b'x'; 128 * 1024];
+    log[0] = 0xff;
+    log.extend_from_slice(b"\nlatest srt_lookup_diag lookup=unavailable\n");
+    std::fs::write(path, log).unwrap();
+
+    assert_eq!(
+        recent_lookup_diagnostics(&node),
+        vec!["latest srt_lookup_diag lookup=unavailable"]
+    );
 }
 async fn fresh(client: &reqwest::Client, lb: &Daemon, cdn: &Daemon, phase: &str) -> Value {
     fresh_with_startup(client, lb, cdn, phase, None).await

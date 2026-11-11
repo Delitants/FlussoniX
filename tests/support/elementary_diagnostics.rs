@@ -533,10 +533,11 @@ pub(super) fn final_public_udp_snapshot(pid: u32, ports: &[u16]) -> io::Result<V
         else {
             continue;
         };
-        if expected.contains(&port) && row["local_ip_hex"] == loopback {
-            if selected.insert(port, row).is_some() {
-                return Err(io::Error::other("ambiguous owned UDP socket"));
-            }
+        if expected.contains(&port)
+            && row["local_ip_hex"] == loopback
+            && selected.insert(port, row).is_some()
+        {
+            return Err(io::Error::other("ambiguous owned UDP socket"));
         }
     }
     if selected.len() != expected.len() {
