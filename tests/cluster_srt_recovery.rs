@@ -79,14 +79,15 @@ async fn node_diagnostic(client: &reqwest::Client, node: &Daemon) -> Value {
         "stream_bitrate_age_ms":value["stream_bitrates"][STREAM]["age_ms"],
     })
 }
-async fn fresh(client: &reqwest::Client, lb: &Daemon, cdn: &Daemon) -> Value {
-    fresh_with_startup(client, lb, cdn, None).await
+async fn fresh(client: &reqwest::Client, lb: &Daemon, cdn: &Daemon, phase: &str) -> Value {
+    fresh_with_startup(client, lb, cdn, phase, None).await
 }
 
 async fn fresh_with_startup(
     client: &reqwest::Client,
     lb: &Daemon,
     cdn: &Daemon,
+    phase: &str,
     startup: Option<&Value>,
 ) -> Value {
     let started = std::time::Instant::now();
@@ -99,7 +100,7 @@ async fn fresh_with_startup(
             tokio::join!(node_diagnostic(client, lb), node_diagnostic(client, cdn));
         panic!(
             "fresh SRT lookup {status}: {body}; diagnostic: {}",
-            json!({"lookup_ms":lookup_ms,"startup":startup,"lb":lb_state,"cdn":cdn_state})
+            json!({"phase":phase,"lookup_ms":lookup_ms,"startup":startup,"lb":lb_state,"cdn":cdn_state})
         );
     }
     assert_eq!(
@@ -330,7 +331,7 @@ async fn run(
     })
     .await
     .unwrap();
-    let first = fresh_with_startup(&client, &nodes[3], &nodes[2], Some(&startup)).await;
+    let first = fresh_with_startup(&client, &nodes[3], &nodes[2], "initial", Some(&startup)).await;
     assert!(
         nodes.iter().all(|n| n.owned_encoders().is_empty()),
         "lookup must reserve only"
@@ -342,7 +343,7 @@ async fn run(
     );
     decode(&capture, audio).await;
     let live = nodes[2].directory.path().join("active-at-failure.ts");
-    let active_ticket = fresh(&client, &nodes[3], &nodes[2]).await;
+    let active_ticket = fresh(&client, &nodes[3], &nodes[2], "active_caller").await;
     *active = Some(receiver(&active_ticket, &live, None));
     tokio::time::timeout(Duration::from_secs(12), async {
         loop {
@@ -406,7 +407,7 @@ async fn run(
     let replay = nodes[2].directory.path().join("spent.ts");
     assert!(!receive(&first, &replay).await);
     assert_eq!(std::fs::metadata(&replay).map(|m| m.len()).unwrap_or(0), 0);
-    let second = fresh(&client, &nodes[3], &nodes[2]).await;
+    let second = fresh(&client, &nodes[3], &nodes[2], "after_failover").await;
     assert_ne!(second["streamid"], first["streamid"]);
     let capture = nodes[2].directory.path().join("after.ts");
     assert!(
@@ -441,7 +442,7 @@ async fn run(
     assert!(nodes[2].owned_encoders().is_empty());
     nodes[1].start("b", "source").await;
     recovered(&client, &nodes[2], &after).await;
-    let restored = fresh(&client, &nodes[3], &nodes[2]).await;
+    let restored = fresh(&client, &nodes[3], &nodes[2], "after_blackout").await;
     let capture = nodes[2].directory.path().join("restored.ts");
     assert!(
         receive(&restored, &capture).await,
