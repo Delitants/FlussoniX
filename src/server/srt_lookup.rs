@@ -145,7 +145,10 @@ impl App {
         });
         match selection {
             crate::vendor_playback::Selection::Excluded => return Err(404),
-            crate::vendor_playback::Selection::Ambiguous => return Err(503),
+            crate::vendor_playback::Selection::Ambiguous => {
+                qualification_diag("ambiguous_route", json!({}));
+                return Err(503);
+            }
             crate::vendor_playback::Selection::Vendor { key, revision } => {
                 return match &self.vendor_playback {
                     Some(runtime) => {
@@ -180,16 +183,18 @@ impl App {
                     "grant_cancelled":grant.is_cancelled()}),
             );
         }
-        let result = self
-            .config
-            .at_revision(resolved.revision, |_| {
-                if grant.is_cancelled() {
-                    return Err(403);
-                }
-                result
-            })
-            .ok_or(503u16)?;
+        let result = self.config.at_revision(resolved.revision, |_| {
+            if grant.is_cancelled() {
+                return Err(403);
+            }
+            result
+        });
+        let Some(result) = result else {
+            qualification_diag("post_placement_revision_changed", json!({}));
+            return Err(503);
+        };
         if result.is_ok() && !self.playback_auth.release_redirect_lease(&grant).await {
+            qualification_diag("redirect_lease_release_failed", json!({}));
             return Err(503);
         }
         result
@@ -345,6 +350,7 @@ impl App {
                 })
                 .fold(crate::cluster::FALLBACK_MBPS, f64::max);
             if !bitrate.is_finite() || bitrate > crate::cluster::MAX_HINT_MBPS {
+                qualification_diag("bitrate_invalid", json!({"bitrate":bitrate}));
                 return Err(503);
             }
             let nodes = valid
@@ -380,6 +386,10 @@ impl App {
                 return Err(403);
             }
             if self.options.drain || self.config.revision() != revision {
+                qualification_diag(
+                    "pre_admission_revision_or_drain",
+                    json!({"drain":self.options.drain}),
+                );
                 return Err(503);
             }
             let (snapshot, peer, address, streamid, required) = observations
@@ -437,6 +447,7 @@ impl App {
                     continue;
                 }
                 let Some(body) = super::admission::read_json(response).await else {
+                    qualification_diag("admission_response_invalid", json!({"node":id}));
                     continue;
                 };
                 let Some(id) = body["ticket"].as_str().and_then(|id| {
@@ -446,6 +457,7 @@ impl App {
                         crate::srt_playback::ticket_only(&viewer.name, id)
                     }
                 }) else {
+                    qualification_diag("admission_ticket_invalid", json!({"node":id}));
                     continue;
                 };
                 id
@@ -454,6 +466,10 @@ impl App {
                 return Err(403);
             }
             if self.options.drain || self.config.revision() != revision {
+                qualification_diag(
+                    "post_admission_revision_or_drain",
+                    json!({"drain":self.options.drain}),
+                );
                 return Err(503);
             }
             return Ok(
