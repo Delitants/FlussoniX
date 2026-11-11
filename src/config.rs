@@ -35,6 +35,32 @@ fn check_save_fault(point: u8) -> std::io::Result<()> {
     Ok(())
 }
 
+fn replace_config_file(parent: &Path, path: &Path, value: &Value) -> std::io::Result<()> {
+    let tmp = parent.join(format!(".config-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(&serde_json::to_vec_pretty(value)?)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(tmp);
+    }
+    result
+}
+
+fn fail_stop_config_recovery(error: &std::io::Error) -> ! {
+    eprintln!("fatal: configuration rollback could not be made durable: {error}");
+    std::process::exit(74);
+}
+
 pub const KINDS: &[&str] = &[
     "streams",
     "templates",
@@ -171,41 +197,32 @@ impl ConfigStore {
         validate_root(&next)?;
         Ok(next)
     }
-    fn save(&self, value: &Value) -> Result<(), String> {
+    fn save(&self, previous: &Value, value: &Value) -> Result<(), String> {
         let parent = self
             .path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        let tmp = parent.join(format!(".config-{}.tmp", uuid::Uuid::new_v4()));
-        let result = (|| {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
+        let directory = fs::File::open(parent).map_err(|e| e.to_string())?;
+        replace_config_file(parent, &self.path, value).map_err(|e| e.to_string())?;
+        let commit = check_save_fault(1).and_then(|()| directory.sync_all());
+        if let Err(commit_error) = commit {
+            if let Err(rollback_error) = replace_config_file(parent, &self.path, previous)
+                .and_then(|()| directory.sync_all())
             {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
+                fail_stop_config_recovery(&rollback_error);
             }
-            let mut f = options.open(&tmp)?;
-            f.write_all(&serde_json::to_vec_pretty(value)?)?;
-            f.sync_all()?;
-            fs::rename(&tmp, &self.path)?;
-            check_save_fault(1)?;
-            fs::File::open(parent)?.sync_all()?;
-            Ok::<(), std::io::Error>(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(tmp);
+            return Err(commit_error.to_string());
         }
-        result.map_err(|e| e.to_string())
+        Ok(())
     }
     pub fn replace(&self, patch: Value) -> Result<Value, String> {
         let mut data = self.data.lock().unwrap();
         let mut next = merge(&data, &patch);
         normalize_root(&mut next)?;
         validate_root(&next)?;
-        self.save(&next)?;
+        self.save(&data, &next)?;
         self.retire_stream_watches(&next);
         self.refresh_source_lineages(&data, &next);
         *data = next.clone();
@@ -250,7 +267,7 @@ impl ConfigStore {
         }
         normalize_root(&mut next)?;
         validate_root(&next)?;
-        self.save(&next)?;
+        self.save(&data, &next)?;
         self.retire_stream_watches(&next);
         self.refresh_source_lineages(&data, &next);
         let item = next[kind]
@@ -277,7 +294,7 @@ impl ConfigStore {
         items.retain(|x| item_key(kind, x) != Some(name));
         let removed = items.len() != before;
         validate_root(&next)?;
-        self.save(&next)?;
+        self.save(&data, &next)?;
         self.retire_stream_watches(&next);
         self.refresh_source_lineages(&data, &next);
         *data = next;
@@ -1044,25 +1061,39 @@ mod persistence_tests {
     }
 
     #[test]
-    fn postrename_directory_sync_failure_keeps_memory_old_and_recovers_complete_disk_update() {
+    fn postrename_directory_sync_failure_rolls_back_before_serving_more_edits() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.json");
         let store = ConfigStore::open(&path).unwrap();
+        store
+            .replace(json!({
+                "streams": [{"name": "before", "inputs": [{"url": "testsrc://"}]}]
+            }))
+            .unwrap();
         let before = store.snapshot();
         let revision = store.revision();
 
         SAVE_FAULT_POINT.with(|fault| fault.set(1));
         let result = store.replace(json!({
-            "streams": [{"name": "durable", "inputs": [{"url": "testsrc://"}]}]
+            "streams": [{"name": "attempted", "inputs": [{"url": "testsrc://"}]}]
         }));
         SAVE_FAULT_POINT.with(|fault| fault.set(0));
 
         assert!(result.is_err());
         assert_eq!(store.snapshot(), before);
         assert_eq!(store.revision(), revision);
+        assert_eq!(ConfigStore::open(&path).unwrap().snapshot(), before);
 
-        let recovered = ConfigStore::open(&path).unwrap();
-        assert_eq!(recovered.snapshot()["streams"][0]["name"], "durable");
+        store
+            .replace(json!({
+                "streams": [{"name": "after", "inputs": [{"url": "testsrc://"}]}]
+            }))
+            .unwrap();
+        assert_eq!(store.revision(), revision + 1);
+        assert_eq!(
+            ConfigStore::open(&path).unwrap().snapshot()["streams"][0]["name"],
+            "after"
+        );
         assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
             !entry
                 .unwrap()
