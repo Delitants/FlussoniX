@@ -83,6 +83,8 @@ pub struct Engine {
     before_remove_test_hook: Option<Arc<BeforeRemoveHook>>,
     #[cfg(test)]
     before_reap_test_hook: Option<Arc<BeforeReapHook>>,
+    #[cfg(test)]
+    before_publish_test_hook: Option<Arc<BeforePublishHook>>,
 }
 const SELECTED_HLS_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const SELECTED_HLS_CACHE_ENTRIES: usize = 512;
@@ -441,6 +443,69 @@ type BeforeRemoveHook =
 type BeforeReapHook =
     dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync;
 #[cfg(test)]
+type BeforePublishHook = dyn Fn(&str, u32) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    + Send
+    + Sync;
+
+struct StartingGeneration {
+    child: Option<tokio::process::Child>,
+    slot: Option<OwnedSemaphorePermit>,
+    #[cfg(test)]
+    name: String,
+    #[cfg(test)]
+    before_reap: Option<Arc<BeforeReapHook>>,
+}
+
+impl StartingGeneration {
+    fn new(child: Option<tokio::process::Child>, slot: OwnedSemaphorePermit) -> Self {
+        Self {
+            child,
+            slot: Some(slot),
+            #[cfg(test)]
+            name: String::new(),
+            #[cfg(test)]
+            before_reap: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn observe_reaping(&mut self, name: &str, hook: Option<Arc<BeforeReapHook>>) {
+        self.name = name.to_owned();
+        self.before_reap = hook;
+    }
+
+    fn into_parts(mut self) -> (Option<tokio::process::Child>, OwnedSemaphorePermit) {
+        let child = self.child.take();
+        let slot = self.slot.take().expect("generation slot ownership");
+        (child, slot)
+    }
+}
+
+impl Drop for StartingGeneration {
+    fn drop(&mut self) {
+        let (Some(mut child), Some(slot)) = (self.child.take(), self.slot.take()) else {
+            return;
+        };
+        #[cfg(test)]
+        let name = std::mem::take(&mut self.name);
+        #[cfg(test)]
+        let before_reap = self.before_reap.take();
+        let cleanup = async move {
+            #[cfg(test)]
+            if let Some(hook) = before_reap {
+                hook(&name).await;
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            drop(slot);
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(cleanup);
+        }
+    }
+}
+
+#[cfg(test)]
 type HlsPrepareHook = dyn Fn(
         String,
     ) -> std::pin::Pin<
@@ -755,6 +820,8 @@ impl Engine {
             before_remove_test_hook: None,
             #[cfg(test)]
             before_reap_test_hook: None,
+            #[cfg(test)]
+            before_publish_test_hook: None,
         }
     }
     async fn prepare_hls(&self, input: &str) -> Result<crate::peer_hls::PreparedOrigin, String> {
@@ -1849,7 +1916,7 @@ impl Engine {
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let mut child = if native_input || peer_ts || inspect_publication || inspect_direct_mp2t {
+        let child = if native_input || peer_ts || inspect_publication || inspect_direct_mp2t {
             None
         } else {
             Some(
@@ -1857,12 +1924,15 @@ impl Engine {
                     .map_err(|e| format!("cannot start FFmpeg: {e}"))?,
             )
         };
-        let pid = child.as_ref().and_then(|c| c.id()).unwrap_or(0);
+        let mut starting = StartingGeneration::new(child, generation_slot);
+        #[cfg(test)]
+        starting.observe_reaping(name, self.before_reap_test_hook.clone());
+        let pid = starting.child.as_ref().and_then(|c| c.id()).unwrap_or(0);
         if let Some(bridge) = &tls_input {
             bridge.authorize_pid(pid).map_err(String::from)?;
         }
         let tx = ts_channel();
-        let mut stdin = child.as_mut().and_then(|c| c.stdin.take());
+        let mut stdin = starting.child.as_mut().and_then(|c| c.stdin.take());
         // Reserve the publisher immediately, but bound metadata collection before
         // spawning a copy packager whose fMP4 filters depend on the PMT codecs.
         let (publisher_stdin, publication_reader) = if inspect_publication {
@@ -1970,6 +2040,10 @@ impl Engine {
             .as_str()
             .unwrap_or("")
             .to_owned();
+        #[cfg(test)]
+        if let Some(hook) = &self.before_publish_test_hook {
+            hook(name, pid).await;
+        }
         let mut workers = self.workers.lock().await;
         if workers.contains_key(name)
             || workers
@@ -2015,6 +2089,7 @@ impl Engine {
         let before_reap = self.before_reap_test_hook.clone();
         #[cfg(test)]
         let reap_name = name.to_owned();
+        let (child, generation_slot) = starting.into_parts();
         tokio::spawn(async move {
             let mut tasks = Vec::new();
             let shared_startup_timeout = shared.as_ref().map(|s| s.feed.startup_timeout());

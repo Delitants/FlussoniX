@@ -214,3 +214,93 @@ async fn retired_unreaped_worker_keeps_capacity() {
     assert!(replacement_pid > 0);
     assert!(!std::path::Path::new(&format!("/proc/{replacement_pid}")).exists());
 }
+
+#[tokio::test]
+async fn cancelled_post_spawn_handoff_keeps_capacity_until_child_is_reaped() {
+    let root = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(root.path(), "ffmpeg");
+    engine.generation_slots = Arc::new(Semaphore::new(1));
+
+    let (spawned_tx, spawned) = oneshot::channel();
+    let spawned_tx = Arc::new(std::sync::Mutex::new(Some(spawned_tx)));
+    let (release_publish, publish_released) = oneshot::channel();
+    let publish_released = Arc::new(std::sync::Mutex::new(Some(publish_released)));
+    engine.before_publish_test_hook = Some(Arc::new({
+        let spawned_tx = spawned_tx.clone();
+        let publish_released = publish_released.clone();
+        move |_, pid| {
+            let spawned_tx = spawned_tx.lock().unwrap().take();
+            let publish_released = publish_released.lock().unwrap().take();
+            Box::pin(async move {
+                if let (Some(spawned_tx), Some(publish_released)) = (spawned_tx, publish_released) {
+                    spawned_tx.send(pid).ok();
+                    let _ = publish_released.await;
+                }
+            })
+        }
+    }));
+
+    let (reap_tx, reap_entered) = oneshot::channel();
+    let reap_tx = Arc::new(std::sync::Mutex::new(Some(reap_tx)));
+    let (release_reap, reap_released) = oneshot::channel();
+    let reap_released = Arc::new(std::sync::Mutex::new(Some(reap_released)));
+    engine.before_reap_test_hook = Some(Arc::new({
+        let reap_tx = reap_tx.clone();
+        let reap_released = reap_released.clone();
+        move |_| {
+            let reap_tx = reap_tx.lock().unwrap().take();
+            let reap_released = reap_released.lock().unwrap().take();
+            Box::pin(async move {
+                let (Some(reap_tx), Some(reap_released)) = (reap_tx, reap_released) else {
+                    return;
+                };
+                reap_tx.send(()).ok();
+                let _ = reap_released.await;
+            })
+        }
+    }));
+
+    let engine = Arc::new(engine);
+    let config = Arc::new(json!({"inputs":[{"url":"testsrc://"}]}));
+    let starting = {
+        let engine = engine.clone();
+        let config = config.clone();
+        tokio::spawn(async move { engine.ensure("cancelled", &config).await })
+    };
+    let pid = tokio::time::timeout(Duration::from_secs(5), spawned)
+        .await
+        .expect("worker did not reach post-spawn handoff")
+        .expect("post-spawn hook closed");
+    assert!(pid > 0);
+    let workers = engine.workers.lock().await;
+    release_publish.send(()).ok();
+    tokio::task::yield_now().await;
+    starting.abort();
+    drop(workers);
+    assert!(match starting.await {
+        Err(error) => error.is_cancelled(),
+        Ok(_) => false,
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), reap_entered)
+        .await
+        .expect("cancelled startup did not enter child reaping")
+        .expect("pre-reap hook closed");
+    assert_eq!(engine.generation_slots.available_permits(), 0);
+    assert_eq!(
+        error(engine.ensure("still-full", &config).await),
+        "worker limit reached"
+    );
+    assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+
+    release_reap.send(()).ok();
+    wait_for_available(&engine, 1).await;
+    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+
+    let replacement = engine.ensure("replacement", &config).await.unwrap();
+    let replacement_pid = replacement.pid();
+    engine.stop_all().await;
+    wait_for_available(&engine, 1).await;
+    assert!(replacement_pid > 0);
+    assert!(!std::path::Path::new(&format!("/proc/{replacement_pid}")).exists());
+}
