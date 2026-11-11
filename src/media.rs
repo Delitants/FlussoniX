@@ -4,6 +4,9 @@ pub(crate) mod file_reader;
 #[cfg(not(test))]
 mod file_reader;
 mod shared;
+#[cfg(test)]
+#[path = "media/worker_slots_tests.rs"]
+mod worker_slots_tests;
 use crate::wire::Hub;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -58,6 +61,7 @@ pub struct Engine {
     tesseract: String,
     hls_epoch: crate::hls_generation::Epoch,
     workers: Mutex<HashMap<String, Arc<Worker>>>,
+    generation_slots: Arc<Semaphore>,
     selected_hls_cache: std::sync::Mutex<SelectedHlsCache>,
     selected_hls_miss_slots: Arc<Semaphore>,
     caption_filter_slots: Arc<Semaphore>,
@@ -77,6 +81,10 @@ pub struct Engine {
     hls_prepare_test_hook: Option<Arc<HlsPrepareHook>>,
     #[cfg(test)]
     before_remove_test_hook: Option<Arc<BeforeRemoveHook>>,
+    #[cfg(test)]
+    before_reap_test_hook: Option<Arc<BeforeReapHook>>,
+    #[cfg(test)]
+    before_publish_test_hook: Option<Arc<BeforePublishHook>>,
 }
 const SELECTED_HLS_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const SELECTED_HLS_CACHE_ENTRIES: usize = 512;
@@ -432,6 +440,72 @@ mod caption_scheduler_tests {
 type BeforeRemoveHook =
     dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync;
 #[cfg(test)]
+type BeforeReapHook =
+    dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync;
+#[cfg(test)]
+type BeforePublishHook = dyn Fn(&str, u32) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    + Send
+    + Sync;
+
+struct StartingGeneration {
+    child: Option<tokio::process::Child>,
+    slot: Option<OwnedSemaphorePermit>,
+    #[cfg(test)]
+    name: String,
+    #[cfg(test)]
+    before_reap: Option<Arc<BeforeReapHook>>,
+}
+
+impl StartingGeneration {
+    fn new(child: Option<tokio::process::Child>, slot: OwnedSemaphorePermit) -> Self {
+        Self {
+            child,
+            slot: Some(slot),
+            #[cfg(test)]
+            name: String::new(),
+            #[cfg(test)]
+            before_reap: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn observe_reaping(&mut self, name: &str, hook: Option<Arc<BeforeReapHook>>) {
+        self.name = name.to_owned();
+        self.before_reap = hook;
+    }
+
+    fn into_parts(mut self) -> (Option<tokio::process::Child>, OwnedSemaphorePermit) {
+        let child = self.child.take();
+        let slot = self.slot.take().expect("generation slot ownership");
+        (child, slot)
+    }
+}
+
+impl Drop for StartingGeneration {
+    fn drop(&mut self) {
+        let (Some(mut child), Some(slot)) = (self.child.take(), self.slot.take()) else {
+            return;
+        };
+        #[cfg(test)]
+        let name = std::mem::take(&mut self.name);
+        #[cfg(test)]
+        let before_reap = self.before_reap.take();
+        let cleanup = async move {
+            #[cfg(test)]
+            if let Some(hook) = before_reap {
+                hook(&name).await;
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            drop(slot);
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(cleanup);
+        }
+    }
+}
+
+#[cfg(test)]
 type HlsPrepareHook = dyn Fn(
         String,
     ) -> std::pin::Pin<
@@ -724,6 +798,7 @@ impl Engine {
             tesseract: tesseract.into(),
             hls_epoch: crate::hls_generation::Epoch::for_root(root.as_ref()),
             workers: Mutex::new(HashMap::new()),
+            generation_slots: Arc::new(Semaphore::new(256)),
             selected_hls_cache: std::sync::Mutex::new(SelectedHlsCache::default()),
             selected_hls_miss_slots: Arc::new(Semaphore::new(2)),
             caption_filter_slots: Arc::new(Semaphore::new(2)),
@@ -743,6 +818,10 @@ impl Engine {
             hls_prepare_test_hook: None,
             #[cfg(test)]
             before_remove_test_hook: None,
+            #[cfg(test)]
+            before_reap_test_hook: None,
+            #[cfg(test)]
+            before_publish_test_hook: None,
         }
     }
     async fn prepare_hls(&self, input: &str) -> Result<crate::peer_hls::PreparedOrigin, String> {
@@ -1351,13 +1430,20 @@ impl Engine {
         if publication && publishing.is_none() {
             return Err("waiting for publisher".into());
         }
+        let generation_slot = self
+            .generation_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "worker limit reached")?;
         let dir = self.directory(name);
         let retired = workers.remove(name);
         let replaced = retired.is_some();
         drop(workers);
         // The task owns the stream gate through join, durable allocation, and
         // deletion even if the requesting viewer disconnects.
-        let (_startup, sequence) = self.prepare_generation(name, retired, startup).await?;
+        let (_startup, sequence, generation_slot) = self
+            .prepare_generation(name, retired, startup, generation_slot)
+            .await?;
         let generation = uuid::Uuid::new_v4().simple().to_string();
         let discontinuity = if replaced { "+discont_start" } else { "" };
         let caption_listener = if caption_services.is_empty() || native_captions {
@@ -1830,7 +1916,7 @@ impl Engine {
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let mut child = if native_input || peer_ts || inspect_publication || inspect_direct_mp2t {
+        let child = if native_input || peer_ts || inspect_publication || inspect_direct_mp2t {
             None
         } else {
             Some(
@@ -1838,12 +1924,15 @@ impl Engine {
                     .map_err(|e| format!("cannot start FFmpeg: {e}"))?,
             )
         };
-        let pid = child.as_ref().and_then(|c| c.id()).unwrap_or(0);
+        let mut starting = StartingGeneration::new(child, generation_slot);
+        #[cfg(test)]
+        starting.observe_reaping(name, self.before_reap_test_hook.clone());
+        let pid = starting.child.as_ref().and_then(|c| c.id()).unwrap_or(0);
         if let Some(bridge) = &tls_input {
             bridge.authorize_pid(pid).map_err(String::from)?;
         }
         let tx = ts_channel();
-        let mut stdin = child.as_mut().and_then(|c| c.stdin.take());
+        let mut stdin = starting.child.as_mut().and_then(|c| c.stdin.take());
         // Reserve the publisher immediately, but bound metadata collection before
         // spawning a copy packager whose fMP4 filters depend on the PMT codecs.
         let (publisher_stdin, publication_reader) = if inspect_publication {
@@ -1951,6 +2040,10 @@ impl Engine {
             .as_str()
             .unwrap_or("")
             .to_owned();
+        #[cfg(test)]
+        if let Some(hook) = &self.before_publish_test_hook {
+            hook(name, pid).await;
+        }
         let mut workers = self.workers.lock().await;
         if workers.contains_key(name)
             || workers
@@ -1992,6 +2085,11 @@ impl Engine {
             .as_ref()
             .filter(|s| s.feed.protocol() == "m4f")
             .map(|s| Arc::new(s.feed.local_failure()) as Arc<dyn Fn() + Send + Sync>);
+        #[cfg(test)]
+        let before_reap = self.before_reap_test_hook.clone();
+        #[cfg(test)]
+        let reap_name = name.to_owned();
+        let (child, generation_slot) = starting.into_parts();
         tokio::spawn(async move {
             let mut tasks = Vec::new();
             let shared_startup_timeout = shared.as_ref().map(|s| s.feed.startup_timeout());
@@ -2333,6 +2431,10 @@ impl Engine {
                     if let Some(bridge) = tls_input.take() {
                         bridge.close().await;
                     }
+                    #[cfg(test)]
+                    if let Some(hook) = &before_reap {
+                        hook(&reap_name).await;
+                    }
                     let _ = child.kill().await;
                     let _ = child.wait().await;
                     return;
@@ -2440,6 +2542,10 @@ impl Engine {
                 if let Some(bridge) = tls_input.take() {
                     bridge.close().await;
                 }
+                #[cfg(test)]
+                if let Some(hook) = &before_reap {
+                    hook(&reap_name).await;
+                }
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 if clean_end && !cancel.is_cancelled() {
@@ -2470,6 +2576,7 @@ impl Engine {
             // The process has been reaped; retained workers must not advertise its old PID.
             w.pid.store(0, Ordering::Relaxed);
             w.alive.store(false, Ordering::Relaxed);
+            drop(generation_slot);
             let _ = done_tx.send(());
         });
         Ok(worker)
@@ -2699,7 +2806,8 @@ impl Engine {
         name: &str,
         retired: Option<Arc<Worker>>,
         guard: OwnedMutexGuard<()>,
-    ) -> Result<(OwnedMutexGuard<()>, u64), String> {
+        generation_slot: OwnedSemaphorePermit,
+    ) -> Result<(OwnedMutexGuard<()>, u64, OwnedSemaphorePermit), String> {
         if let Some(worker) = retired.as_ref() {
             self.selected_hls_cache
                 .lock()
@@ -2713,6 +2821,7 @@ impl Engine {
         let before_remove = self.before_remove_test_hook.clone();
         tokio::spawn(async move {
             let guard = guard;
+            let generation_slot = generation_slot;
             let result: Result<u64, String> = async {
                 if let Some(worker) = retired {
                     Self::join_and_commit(epoch.clone(), name.clone(), directory.clone(), worker)
@@ -2740,7 +2849,7 @@ impl Engine {
                 tracing::warn!(stream = name, error = %error, "detached HLS generation failed");
             }
             let sequence = result?;
-            Ok((guard, sequence))
+            Ok((guard, sequence, generation_slot))
         })
         .await
         .map_err(|_| "HLS generation task failed".to_owned())?
