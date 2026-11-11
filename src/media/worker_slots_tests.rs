@@ -151,3 +151,66 @@ async fn reusing_running_worker_does_not_consume_another_generation_slot() {
     engine.stop_all().await;
     wait_for_available(&engine, 1).await;
 }
+
+#[tokio::test]
+async fn retired_unreaped_worker_keeps_capacity() {
+    let root = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(root.path(), "ffmpeg");
+    engine.generation_slots = Arc::new(Semaphore::new(1));
+    let (entered_tx, entered) = oneshot::channel();
+    let entered_tx = Arc::new(std::sync::Mutex::new(Some(entered_tx)));
+    let (release, released) = oneshot::channel();
+    let released = Arc::new(std::sync::Mutex::new(Some(released)));
+    engine.before_reap_test_hook = Some(Arc::new({
+        let entered_tx = entered_tx.clone();
+        let released = released.clone();
+        move |_| {
+            let entered_tx = entered_tx.lock().unwrap().take();
+            let released = released.lock().unwrap().take();
+            Box::pin(async move {
+                let (Some(entered_tx), Some(released)) = (entered_tx, released) else {
+                    return;
+                };
+                entered_tx.send(()).ok();
+                let _ = released.await;
+            })
+        }
+    }));
+    let engine = Arc::new(engine);
+    let config = Arc::new(json!({"inputs":[{"url":"testsrc://"}]}));
+    let first = engine.ensure("first", &config).await.unwrap();
+    let old_pid = first.pid();
+    assert!(old_pid > 0);
+    let stopping = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.stop("first").await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("worker did not reach pre-reap boundary")
+        .expect("pre-reap hook closed");
+
+    let map_count_during_reap = engine.count().await;
+    let denied = error(engine.ensure("second", &config).await);
+    release.send(()).ok();
+    tokio::time::timeout(Duration::from_secs(5), stopping)
+        .await
+        .expect("worker stop did not finish after releasing pre-reap hook")
+        .unwrap();
+    wait_for_available(&engine, 1).await;
+    let old_pid_absent = !std::path::Path::new(&format!("/proc/{old_pid}")).exists();
+
+    let replacement = engine.ensure("second", &config).await.unwrap();
+    let replacement_pid = replacement.pid();
+    engine.stop_all().await;
+    wait_for_available(&engine, 1).await;
+
+    assert_eq!(map_count_during_reap, 0);
+    assert_eq!(denied, "worker limit reached");
+    assert!(
+        old_pid_absent,
+        "retired FFmpeg child {old_pid} was not reaped"
+    );
+    assert!(replacement_pid > 0);
+    assert!(!std::path::Path::new(&format!("/proc/{replacement_pid}")).exists());
+}

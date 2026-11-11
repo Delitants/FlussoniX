@@ -81,6 +81,8 @@ pub struct Engine {
     hls_prepare_test_hook: Option<Arc<HlsPrepareHook>>,
     #[cfg(test)]
     before_remove_test_hook: Option<Arc<BeforeRemoveHook>>,
+    #[cfg(test)]
+    before_reap_test_hook: Option<Arc<BeforeReapHook>>,
 }
 const SELECTED_HLS_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const SELECTED_HLS_CACHE_ENTRIES: usize = 512;
@@ -436,6 +438,9 @@ mod caption_scheduler_tests {
 type BeforeRemoveHook =
     dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync;
 #[cfg(test)]
+type BeforeReapHook =
+    dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync;
+#[cfg(test)]
 type HlsPrepareHook = dyn Fn(
         String,
     ) -> std::pin::Pin<
@@ -748,6 +753,8 @@ impl Engine {
             hls_prepare_test_hook: None,
             #[cfg(test)]
             before_remove_test_hook: None,
+            #[cfg(test)]
+            before_reap_test_hook: None,
         }
     }
     async fn prepare_hls(&self, input: &str) -> Result<crate::peer_hls::PreparedOrigin, String> {
@@ -2004,6 +2011,10 @@ impl Engine {
             .as_ref()
             .filter(|s| s.feed.protocol() == "m4f")
             .map(|s| Arc::new(s.feed.local_failure()) as Arc<dyn Fn() + Send + Sync>);
+        #[cfg(test)]
+        let before_reap = self.before_reap_test_hook.clone();
+        #[cfg(test)]
+        let reap_name = name.to_owned();
         tokio::spawn(async move {
             let mut tasks = Vec::new();
             let shared_startup_timeout = shared.as_ref().map(|s| s.feed.startup_timeout());
@@ -2345,6 +2356,10 @@ impl Engine {
                     if let Some(bridge) = tls_input.take() {
                         bridge.close().await;
                     }
+                    #[cfg(test)]
+                    if let Some(hook) = &before_reap {
+                        hook(&reap_name).await;
+                    }
                     let _ = child.kill().await;
                     let _ = child.wait().await;
                     return;
@@ -2451,6 +2466,10 @@ impl Engine {
                 }
                 if let Some(bridge) = tls_input.take() {
                     bridge.close().await;
+                }
+                #[cfg(test)]
+                if let Some(hook) = &before_reap {
+                    hook(&reap_name).await;
                 }
                 let _ = child.kill().await;
                 let _ = child.wait().await;
