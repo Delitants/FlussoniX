@@ -19,6 +19,22 @@ use std::{
 pub(crate) use stream_watch::StreamWatch;
 pub(crate) use text::parse_text;
 
+#[cfg(test)]
+thread_local! {
+    static SAVE_FAULT_POINT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+fn check_save_fault(point: u8) -> std::io::Result<()> {
+    #[cfg(test)]
+    if SAVE_FAULT_POINT.with(|fault| fault.get() == point) {
+        return Err(std::io::Error::other(
+            "injected configuration persistence failure",
+        ));
+    }
+    let _ = point;
+    Ok(())
+}
+
 pub const KINDS: &[&str] = &[
     "streams",
     "templates",
@@ -156,7 +172,11 @@ impl ConfigStore {
         Ok(next)
     }
     fn save(&self, value: &Value) -> Result<(), String> {
-        let parent = self.path.parent().unwrap_or(Path::new("."));
+        let parent = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         let tmp = parent.join(format!(".config-{}.tmp", uuid::Uuid::new_v4()));
         let result = (|| {
@@ -171,6 +191,8 @@ impl ConfigStore {
             f.write_all(&serde_json::to_vec_pretty(value)?)?;
             f.sync_all()?;
             fs::rename(&tmp, &self.path)?;
+            check_save_fault(1)?;
+            fs::File::open(parent)?.sync_all()?;
             Ok::<(), std::io::Error>(())
         })();
         if result.is_err() {
@@ -1002,4 +1024,51 @@ fn fxlink_token(input: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[test]
+    fn relative_config_path_syncs_the_current_directory() {
+        let path = PathBuf::from(format!(".config-relative-{}.json", uuid::Uuid::new_v4()));
+        let store = ConfigStore::open(&path).unwrap();
+
+        let result = store.replace(json!({
+            "streams": [{"name": "relative", "inputs": [{"url": "testsrc://"}]}]
+        }));
+
+        let _ = fs::remove_file(&path);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn postrename_directory_sync_failure_keeps_memory_old_and_recovers_complete_disk_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let store = ConfigStore::open(&path).unwrap();
+        let before = store.snapshot();
+        let revision = store.revision();
+
+        SAVE_FAULT_POINT.with(|fault| fault.set(1));
+        let result = store.replace(json!({
+            "streams": [{"name": "durable", "inputs": [{"url": "testsrc://"}]}]
+        }));
+        SAVE_FAULT_POINT.with(|fault| fault.set(0));
+
+        assert!(result.is_err());
+        assert_eq!(store.snapshot(), before);
+        assert_eq!(store.revision(), revision);
+
+        let recovered = ConfigStore::open(&path).unwrap();
+        assert_eq!(recovered.snapshot()["streams"][0]["name"], "durable");
+        assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".config-")
+        }));
+    }
 }
