@@ -464,6 +464,30 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn redeemed_private_ticket_frees_the_one_pending_slot_for_the_next_viewer() {
+        let (_d, app, mut viewer, grant, signature) = native().await;
+        app.reservations.lock().await.remove("owned-ticket");
+        app.srt_playback.lock().unwrap()["client_limit"] = json!(8);
+        viewer.ip = "127.0.0.1".into();
+        let first = app
+            .reserve_srt_credential(viewer.clone(), 5.0)
+            .await
+            .unwrap();
+        let ticket = Ticket {
+            id: &first,
+            encrypted: true,
+            listener_id: "owned-listener",
+        };
+        assert!(
+            app.srt_consume(ticket, &viewer, &grant, &signature)
+                .await
+                .is_ok()
+        );
+        assert!(!app.reservations.lock().await.contains_key(&first));
+        let second = app.reserve_srt_credential(viewer, 5.0).await.unwrap();
+        assert_ne!(second, first);
+    }
+    #[tokio::test]
     async fn expired_public_and_previous_listener_tickets_do_not_spend_identity_quota() {
         let (_d, app, mut viewer, _grant, _signature) = native().await;
         app.reservations.lock().await.remove("owned-ticket");

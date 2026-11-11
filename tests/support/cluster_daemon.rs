@@ -85,6 +85,7 @@ impl Daemon {
                 .env("FLUSSONIX_PEER_KEY", &self.key)
                 // Only an explicit start_srt call enables SRT, never the shell.
                 .env("RUST_LOG", "error")
+                .env("FLUSSONIX_QUALIFICATION_SRT_DIAGNOSTICS", "1")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(std::fs::File::create(self.directory.path().join("daemon.log")).unwrap())

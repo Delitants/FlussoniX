@@ -502,6 +502,52 @@ fn observe(target: &Target) -> io::Result<(String, Vec<Value>, usize)> {
     }
     Ok((state, rows, races))
 }
+// Take the last public-socket drop witness while the native receiver still
+// owns every lane. The periodic observer can miss a socket that closes between
+// samples, so an unavailable or ambiguous witness must never look like zero.
+pub(super) fn final_public_udp_snapshot(pid: u32, ports: &[u16]) -> io::Result<Value> {
+    if ports.is_empty() || ports.len() > 8 || ports.contains(&0) {
+        return Err(io::Error::other("invalid owned UDP scope"));
+    }
+    let expected = ports
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if expected.len() != ports.len() {
+        return Err(io::Error::other("duplicate owned UDP port"));
+    }
+    let start_ticks = identity(pid)?.0;
+    let (state, rows, races) = observe(&Target {
+        pid,
+        start_ticks: Some(start_ticks),
+    })?;
+    if state == "Z" || races != 0 {
+        return Err(io::Error::other("owned UDP observation incomplete"));
+    }
+    let loopback = format!("{:08X}", u32::from_ne_bytes([127, 0, 0, 1]));
+    let mut selected = BTreeMap::new();
+    for row in rows {
+        let Some(port) = row["local_port"]
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+        else {
+            continue;
+        };
+        if expected.contains(&port)
+            && row["local_ip_hex"] == loopback
+            && selected.insert(port, row).is_some()
+        {
+            return Err(io::Error::other("ambiguous owned UDP socket"));
+        }
+    }
+    if selected.len() != expected.len() {
+        return Err(io::Error::other("owned UDP socket missing"));
+    }
+    Ok(
+        json!({"observation":"available","pid":pid,"start_ticks":start_ticks,
+        "udp":selected.into_values().collect::<Vec<_>>()}),
+    )
+}
 // Reuse the bounded observer and identity checks for capture-retention ownership.
 #[allow(
     dead_code,

@@ -7,6 +7,17 @@ struct Query {
     selection: crate::srt_playback::Selection,
     encrypted: bool,
 }
+fn qualification_diag(stage: &str, detail: impl FnOnce() -> Value) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED
+        .get_or_init(|| std::env::var_os("FLUSSONIX_QUALIFICATION_SRT_DIAGNOSTICS").is_some())
+    {
+        eprintln!(
+            "srt_lookup_diag {}",
+            json!({"stage":stage,"detail":detail()})
+        );
+    }
+}
 fn decode(raw: &str) -> Option<String> {
     let bytes = raw.as_bytes();
     for (i, b) in bytes.iter().enumerate() {
@@ -140,7 +151,10 @@ impl App {
         });
         match selection {
             crate::vendor_playback::Selection::Excluded => return Err(404),
-            crate::vendor_playback::Selection::Ambiguous => return Err(503),
+            crate::vendor_playback::Selection::Ambiguous => {
+                qualification_diag("ambiguous_route", || json!({}));
+                return Err(503);
+            }
             crate::vendor_playback::Selection::Vendor { key, revision } => {
                 return match &self.vendor_playback {
                     Some(runtime) => {
@@ -168,16 +182,24 @@ impl App {
         let result = self
             .srt_place(&viewer, streamid, mode, &grant, resolved.revision)
             .await;
-        let result = self
-            .config
-            .at_revision(resolved.revision, |_| {
-                if grant.is_cancelled() {
-                    return Err(403);
-                }
-                result
-            })
-            .ok_or(503u16)?;
+        if let Err(status) = &result {
+            qualification_diag("placement_rejected", || {
+                json!({"status":status,"revision_current":self.config.revision()==resolved.revision,
+                    "grant_cancelled":grant.is_cancelled()})
+            });
+        }
+        let result = self.config.at_revision(resolved.revision, |_| {
+            if grant.is_cancelled() {
+                return Err(403);
+            }
+            result
+        });
+        let Some(result) = result else {
+            qualification_diag("post_placement_revision_changed", || json!({}));
+            return Err(503);
+        };
         if result.is_ok() && !self.playback_auth.release_redirect_lease(&grant).await {
+            qualification_diag("redirect_lease_release_failed", || json!({}));
             return Err(503);
         }
         result
@@ -290,6 +312,20 @@ impl App {
             }
         }
         drop(calls);
+        qualification_diag("observations", || {
+            json!({"count":observations.len(),"peers":observations.iter().map(|(snapshot,peer,_,_,_)| json!({
+                "hostname":peer["hostname"],"age_ms":snapshot.value["age_ms"],
+                "cpu":snapshot.value["cpu"],"ram":snapshot.value["ram"],
+                "uplink":snapshot.value["uplink"],"active":snapshot.value["active"],
+                "reserved":snapshot.value["reserved"],
+                "srt_enabled":snapshot.value["srt_playback"]["enabled"],
+                "srt_encrypted":snapshot.value["srt_playback"]["encrypted"],
+                "srt_clients":snapshot.value["srt_playback"]["clients"],
+                "srt_reserved":snapshot.value["srt_playback"]["reserved"],
+                "srt_client_limit":snapshot.value["srt_playback"]["client_limit"],
+                "srt_listener_ready":snapshot.value["srt_playback"]["listener_id"].is_string()
+            })).collect::<Vec<_>>() })
+        });
         let mut attempted = std::collections::HashSet::new();
         let mut turn = None;
         loop {
@@ -323,6 +359,7 @@ impl App {
                 })
                 .fold(crate::cluster::FALLBACK_MBPS, f64::max);
             if !bitrate.is_finite() || bitrate > crate::cluster::MAX_HINT_MBPS {
+                qualification_diag("bitrate_invalid", || json!({"bitrate":bitrate}));
                 return Err(503);
             }
             let nodes = valid
@@ -347,6 +384,10 @@ impl App {
                 })
                 .collect::<Vec<_>>();
             let Some(id) = self.routing_rotation.select(&nodes, 0.0, &mut turn) else {
+                qualification_diag(
+                    "no_eligible_node",
+                    || json!({"valid":valid.len(),"nodes":nodes}),
+                );
                 return Err(503);
             };
             attempted.insert(id.clone());
@@ -354,6 +395,10 @@ impl App {
                 return Err(403);
             }
             if self.options.drain || self.config.revision() != revision {
+                qualification_diag(
+                    "pre_admission_revision_or_drain",
+                    || json!({"drain":self.options.drain}),
+                );
                 return Err(503);
             }
             let (snapshot, peer, address, streamid, required) = observations
@@ -400,12 +445,18 @@ impl App {
                 };
                 let response = request.timeout(Duration::from_secs(4)).send().await;
                 let Ok(response) = response else {
+                    qualification_diag("admission_transport_failed", || json!({"node":id}));
                     continue;
                 };
                 if !response.status().is_success() {
+                    qualification_diag(
+                        "admission_rejected",
+                        || json!({"node":id,"status":response.status().as_u16()}),
+                    );
                     continue;
                 }
                 let Some(body) = super::admission::read_json(response).await else {
+                    qualification_diag("admission_response_invalid", || json!({"node":id}));
                     continue;
                 };
                 let Some(id) = body["ticket"].as_str().and_then(|id| {
@@ -415,6 +466,7 @@ impl App {
                         crate::srt_playback::ticket_only(&viewer.name, id)
                     }
                 }) else {
+                    qualification_diag("admission_ticket_invalid", || json!({"node":id}));
                     continue;
                 };
                 id
@@ -423,6 +475,10 @@ impl App {
                 return Err(403);
             }
             if self.options.drain || self.config.revision() != revision {
+                qualification_diag(
+                    "post_admission_revision_or_drain",
+                    || json!({"drain":self.options.drain}),
+                );
                 return Err(503);
             }
             return Ok(
