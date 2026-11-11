@@ -320,6 +320,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("IPTV HA schema initialized");
         return Ok(());
     }
+    let mut shutdown_signals = ShutdownSignals::install()?;
     if a.allow_insecure_remote_management {
         eprintln!(
             "WARNING: insecure remote HTTP management is enabled; credentials may be exposed on the network"
@@ -463,9 +464,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cancel = tokio_util::sync::CancellationToken::new();
     let vendor_app = app.clone();
     let vendor_cancel = cancel.clone();
-    let vendor_playback =
-        tokio::spawn(async move { vendor_app.run_vendor_playback(vendor_cancel).await });
-    tokio::task::yield_now().await;
+    let (vendor_started, vendor_ready) = tokio::sync::oneshot::channel();
+    let vendor_playback = tokio::spawn(async move {
+        let driver = vendor_app.run_vendor_playback(vendor_cancel);
+        let _ = vendor_started.send(());
+        driver.await
+    });
+    vendor_ready.await?;
     let mut fxlink_task = fxlink_listener
         .map(|listener| tokio::spawn(listener.serve(app.fxlink_provider(), cancel.clone())));
     let mut srt_task = srt_listener.map(|listener| {
@@ -577,7 +582,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         result=async{match tls_task.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{tls_result=Some(result);None},
         result=async{match srt_task.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{srt_result=Some(result);None},
         result=async{match fxlink_task.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{fxlink_result=Some(result);None},
-        _=shutdown()=>None
+        _=shutdown_signals.wait()=>None
     };
     cancel.cancel();
     let _ = supervisor.await;
@@ -640,15 +645,40 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     vendor_result??;
     Ok(())
 }
-async fn shutdown() {
-    #[cfg(unix)]
-    {
-        let mut term =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-        tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
+
+#[cfg(unix)]
+struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn install() -> std::io::Result<Self> {
+        Ok(Self {
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
     }
-    #[cfg(not(unix))]
-    {
+
+    async fn wait(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {},
+            _ = self.terminate.recv() => {},
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ShutdownSignals;
+
+#[cfg(not(unix))]
+impl ShutdownSignals {
+    fn install() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn wait(&mut self) {
         let _ = tokio::signal::ctrl_c().await;
     }
 }
