@@ -1,5 +1,12 @@
 # Compatibility contract
 
+This guide retains dated implementation-stage records. A statement that a
+feature was disabled or pending in an earlier stage is not its current support
+status. For current vendor viewer placement and delivery limits, see
+[CDN placement](vendor-cdn-placement.md) and
+[vendor playback](vendor-daemon-playback.md); exact release claims still require
+qualification of the candidate being published.
+
 ## Meaning of compatibility
 
 Compatibility is measured per **reference version × feature × transport direction × codec × authorization mode**. There is no current claim of exact equivalence.

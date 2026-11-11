@@ -64,7 +64,7 @@ async fn source_with_basic(
     )
     .unwrap();
     app.config.put("streams","owned",json!({"static":false,"inputs":[{"url":"testsrc://"}],"transcoder":{"encoder":"libx264","vb":400},"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"owned-viewer"))})).unwrap();
-    let tcp = TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = tcp.local_addr().unwrap().port();
     let url = format!(
         "{}://127.0.0.1:{port}",
