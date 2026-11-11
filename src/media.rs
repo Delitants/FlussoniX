@@ -4,6 +4,9 @@ pub(crate) mod file_reader;
 #[cfg(not(test))]
 mod file_reader;
 mod shared;
+#[cfg(test)]
+#[path = "media/worker_slots_tests.rs"]
+mod worker_slots_tests;
 use crate::wire::Hub;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -58,6 +61,7 @@ pub struct Engine {
     tesseract: String,
     hls_epoch: crate::hls_generation::Epoch,
     workers: Mutex<HashMap<String, Arc<Worker>>>,
+    generation_slots: Arc<Semaphore>,
     selected_hls_cache: std::sync::Mutex<SelectedHlsCache>,
     selected_hls_miss_slots: Arc<Semaphore>,
     caption_filter_slots: Arc<Semaphore>,
@@ -724,6 +728,7 @@ impl Engine {
             tesseract: tesseract.into(),
             hls_epoch: crate::hls_generation::Epoch::for_root(root.as_ref()),
             workers: Mutex::new(HashMap::new()),
+            generation_slots: Arc::new(Semaphore::new(256)),
             selected_hls_cache: std::sync::Mutex::new(SelectedHlsCache::default()),
             selected_hls_miss_slots: Arc::new(Semaphore::new(2)),
             caption_filter_slots: Arc::new(Semaphore::new(2)),
@@ -1351,13 +1356,20 @@ impl Engine {
         if publication && publishing.is_none() {
             return Err("waiting for publisher".into());
         }
+        let generation_slot = self
+            .generation_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "worker limit reached")?;
         let dir = self.directory(name);
         let retired = workers.remove(name);
         let replaced = retired.is_some();
         drop(workers);
         // The task owns the stream gate through join, durable allocation, and
         // deletion even if the requesting viewer disconnects.
-        let (_startup, sequence) = self.prepare_generation(name, retired, startup).await?;
+        let (_startup, sequence, generation_slot) = self
+            .prepare_generation(name, retired, startup, generation_slot)
+            .await?;
         let generation = uuid::Uuid::new_v4().simple().to_string();
         let discontinuity = if replaced { "+discont_start" } else { "" };
         let caption_listener = if caption_services.is_empty() || native_captions {
@@ -2470,6 +2482,7 @@ impl Engine {
             // The process has been reaped; retained workers must not advertise its old PID.
             w.pid.store(0, Ordering::Relaxed);
             w.alive.store(false, Ordering::Relaxed);
+            drop(generation_slot);
             let _ = done_tx.send(());
         });
         Ok(worker)
@@ -2699,7 +2712,8 @@ impl Engine {
         name: &str,
         retired: Option<Arc<Worker>>,
         guard: OwnedMutexGuard<()>,
-    ) -> Result<(OwnedMutexGuard<()>, u64), String> {
+        generation_slot: OwnedSemaphorePermit,
+    ) -> Result<(OwnedMutexGuard<()>, u64, OwnedSemaphorePermit), String> {
         if let Some(worker) = retired.as_ref() {
             self.selected_hls_cache
                 .lock()
@@ -2713,6 +2727,7 @@ impl Engine {
         let before_remove = self.before_remove_test_hook.clone();
         tokio::spawn(async move {
             let guard = guard;
+            let generation_slot = generation_slot;
             let result: Result<u64, String> = async {
                 if let Some(worker) = retired {
                     Self::join_and_commit(epoch.clone(), name.clone(), directory.clone(), worker)
@@ -2740,7 +2755,7 @@ impl Engine {
                 tracing::warn!(stream = name, error = %error, "detached HLS generation failed");
             }
             let sequence = result?;
-            Ok((guard, sequence))
+            Ok((guard, sequence, generation_slot))
         })
         .await
         .map_err(|_| "HLS generation task failed".to_owned())?
