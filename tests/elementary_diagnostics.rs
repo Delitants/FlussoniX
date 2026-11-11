@@ -38,10 +38,17 @@ fn owned_udp_overflow_is_retained_with_queue_and_kernel_drop_counts() {
             .send_to(&[0; 512], socket.local_addr().unwrap())
             .unwrap();
     }
+    let port = socket.local_addr().unwrap().port();
+    let final_sample = diagnostics::final_public_udp_snapshot(std::process::id(), &[port]);
+    let final_sample = final_sample.unwrap();
+    assert_eq!(final_sample["observation"], "available");
+    assert_eq!(final_sample["udp"].as_array().unwrap().len(), 1);
+    assert_eq!(final_sample["udp"][0]["local_port"], port);
+    assert!(final_sample["udp"][0]["drops"].as_u64().unwrap() > 0);
+    assert!(final_sample["udp"][0]["rx_queue_bytes"].as_u64().unwrap() > 0);
     evidence.stage("overflow_observed");
     drop(evidence);
     let records = entries(artifact.path());
-    let port = socket.local_addr().unwrap().port();
     let rows: Vec<_> = records
         .iter()
         .flat_map(|r| r["processes"].as_array().into_iter().flatten())
@@ -55,6 +62,14 @@ fn owned_udp_overflow_is_retained_with_queue_and_kernel_drop_counts() {
         "{records:?}"
     );
     assert!(records.iter().any(|r| r["event"] == "finished"));
+}
+#[test]
+fn final_owned_udp_snapshot_rejects_ambiguous_or_missing_scope() {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    assert!(diagnostics::final_public_udp_snapshot(std::process::id(), &[port, port]).is_err());
+    drop(socket);
+    assert!(diagnostics::final_public_udp_snapshot(std::process::id(), &[port]).is_err());
 }
 #[test]
 fn unavailable_process_is_reported_instead_of_a_zero_drop_measurement() {

@@ -785,6 +785,25 @@ async fn qualify_inner(
             0
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(out) = &artifact {
+            use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt};
+            let public_ports = (0..lane)
+                .flat_map(|index| [input + index * 2, input + index * 2 + 1])
+                .collect::<Vec<_>>();
+            let snapshot = elementary_diagnostics::final_public_udp_snapshot(
+                std::process::id(),
+                &public_ports,
+            )
+            .unwrap_or_else(|error| json!({"observation":"unavailable","error":error.to_string()}));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(out.join("final-public-udp.json"))
+                .unwrap();
+            serde_json::to_writer_pretty(&mut file, &snapshot).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
     }
     #[cfg(target_os = "linux")]
     {
