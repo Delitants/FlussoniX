@@ -26,7 +26,7 @@ thread_local! {
 
 fn check_save_fault(point: u8) -> std::io::Result<()> {
     #[cfg(test)]
-    if SAVE_FAULT_POINT.with(|fault| fault.get() == point) {
+    if SAVE_FAULT_POINT.with(|fault| fault.get() & point != 0) {
         return Err(std::io::Error::other(
             "injected configuration persistence failure",
         ));
@@ -209,6 +209,7 @@ impl ConfigStore {
         let commit = check_save_fault(1).and_then(|()| directory.sync_all());
         if let Err(commit_error) = commit {
             if let Err(rollback_error) = replace_config_file(parent, &self.path, previous)
+                .and_then(|()| check_save_fault(2))
                 .and_then(|()| directory.sync_all())
             {
                 fail_stop_config_recovery(&rollback_error);
@@ -1046,6 +1047,37 @@ fn fxlink_token(input: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
+
+    const FAIL_STOP_CHILD: &str = "FLUSSONIX_CONFIG_FAIL_STOP_CHILD";
+
+    #[test]
+    fn rollback_sync_failure_exits_before_serving_split_state() {
+        if let Some(path) = std::env::var_os(FAIL_STOP_CHILD) {
+            let store = ConfigStore::open(PathBuf::from(path).join("config.json")).unwrap();
+            store
+                .replace(json!({
+                    "streams": [{"name": "before", "inputs": [{"url": "testsrc://"}]}]
+                }))
+                .unwrap();
+            SAVE_FAULT_POINT.with(|fault| fault.set(3));
+            let _ = store.replace(json!({
+                "streams": [{"name": "attempted", "inputs": [{"url": "testsrc://"}]}]
+            }));
+            panic!("configuration store continued after rollback sync failure");
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::persistence_tests::rollback_sync_failure_exits_before_serving_split_state",
+                "--nocapture",
+            ])
+            .env(FAIL_STOP_CHILD, directory.path())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(74));
+    }
 
     #[test]
     fn relative_config_path_syncs_the_current_directory() {
