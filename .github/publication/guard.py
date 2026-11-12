@@ -118,7 +118,7 @@ def workflow_pin_errors(name,text):
   match=re.fullmatch(r'\s*(?:-\s*)?uses\s*:\s*(.*?)\s*',code)
   ambiguous=(re.match(r'\s*(?:-\s*)?["\']uses["\']\s*:',code)
              or re.search(r'[{,]\s*(?:uses|["\']uses["\'])\s*:',code)
-             or re.match(r'\s*(?:-\s*)?\?\s*(?:uses|["\']uses["\'])\s*$',code)
+             or re.match(r'\s*(?:-\s*)?\?(?:\s|$)',code)
              or re.match(r'\s*(?:-\s*)?\*[A-Za-z0-9_.-]+\s*:',code)
              or re.match(r'\s*(?:-\s*)?[!&][^\s]+\s+(?:uses|["\']uses["\'])\s*:',code))
   if not match:

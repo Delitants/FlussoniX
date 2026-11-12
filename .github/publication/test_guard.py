@@ -365,6 +365,7 @@ class PublicationGuardTests(unittest.TestCase):
             f"jobs:\n  verify:\n    steps:\n      - uses: &checkout actions/checkout@{pinned}\n",
             "jobs:\n  verify:\n    steps:\n      - uses: |\n          actions/checkout@" + pinned + "\n",
             "jobs:\n  verify:\n    steps:\n      - ? uses\n        : actions/checkout@v7\n",
+            "jobs:\n  verify:\n    steps:\n      - ? >-\n          uses\n        : actions/checkout@v7\n",
             "jobs:\n  verify:\n    steps:\n      - *action_key: actions/checkout@v7\n",
             f"jobs:\n  verify:\n    steps:\n      - &action_key uses: actions/checkout@{pinned}\n",
         )
