@@ -95,6 +95,49 @@ def workflow_errors(name,text):
    errors.append(name+': upload-artifact action must use an explicit step and path')
  return errors
 
+def _yaml_code(line):
+ out=[];quote=None;escaped=False
+ for character in line:
+  if quote=='"':
+   out.append(character)
+   if escaped:escaped=False
+   elif character=='\\':escaped=True
+   elif character=='"':quote=None
+  elif quote=="'":
+   out.append(character)
+   if character=="'":quote=None
+  elif character in "'\"":quote=character;out.append(character)
+  elif character=='#':break
+  else:out.append(character)
+ return ''.join(out).rstrip()
+
+def workflow_pin_errors(name,text):
+ errors=[]
+ for line in text.splitlines():
+  code=_yaml_code(line)
+  match=re.fullmatch(r'\s*(?:-\s*)?uses\s*:\s*(.*?)\s*',code)
+  ambiguous=(re.match(r'\s*(?:-\s*)?["\']uses["\']\s*:',code)
+             or re.search(r'[{,]\s*(?:uses|["\']uses["\'])\s*:',code)
+             or re.match(r'\s*(?:-\s*)?\?\s*(?:uses|["\']uses["\'])\s*$',code)
+             or re.match(r'\s*(?:-\s*)?\*[A-Za-z0-9_.-]+\s*:',code)
+             or re.match(r'\s*(?:-\s*)?[!&][^\s]+\s+(?:uses|["\']uses["\'])\s*:',code))
+  if not match:
+   if ambiguous:errors.append(name+': workflow action must use a plain concrete uses key')
+   continue
+  value=match[1]
+  if (len(value)>=2 and value[0]==value[-1] and value[0] in "'\""):
+   value=value[1:-1]
+  if (not value or value.startswith(('*','&','|','>')) or '\\' in value
+      or '${{' in value or any(character.isspace() for character in value)):
+   errors.append(name+': workflow action must be a concrete literal');continue
+  if value.startswith('./'):
+   continue
+  if not re.fullmatch(
+      r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*@[0-9A-Fa-f]{40}',
+      value):
+   errors.append(name+': external workflow action must use a full commit SHA')
+ return errors
+
 def git(repo,*args):return subprocess.check_output(['git','-C',str(repo),*args],stderr=subprocess.PIPE)
 
 def exists_at(repo,revision,path):
@@ -130,7 +173,22 @@ def changed_errors(repo,policy,revision,index=False):
    else:errors+=text_errors(name,value.decode('utf-8'))
  return errors
 
-def index_errors(repo,policy):return changed_errors(repo,policy,None,index=True)
+def final_workflow_pin_errors(repo,revision=None,index=False):
+ if index:
+  names=git(repo,'ls-files','--cached','-z','--','.github/workflows')
+ else:
+  names=git(repo,'ls-tree','-r','--name-only','-z',revision,'--','.github/workflows')
+ errors=[]
+ for raw in names.split(b'\0'):
+  if not raw:continue
+  name=raw.decode('utf-8')
+  if pathlib.PurePosixPath(name).suffix.casefold() not in {'.yml','.yaml'}:continue
+  value=git(repo,'show',(':' if index else revision+':')+name).decode('utf-8')
+  errors+=workflow_pin_errors(name,value)
+ return errors
+
+def index_errors(repo,policy):
+ return changed_errors(repo,policy,None,index=True)+final_workflow_pin_errors(repo,index=True)
 
 def history_errors(repo,policy,revision):
  try:
@@ -140,6 +198,7 @@ def history_errors(repo,policy,revision):
   errors=[]
   for commit in git(repo,'rev-list',revision,'^'+base).decode().splitlines():
    errors += [commit[:12]+' '+e for e in changed_errors(repo,policy,commit)]
+  errors += final_workflow_pin_errors(repo,revision)
   return errors
  except (OSError,ValueError,UnicodeError,subprocess.CalledProcessError) as e:return ['Cannot verify source: '+str(e)]
 

@@ -16,7 +16,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install qualification dependencies
@@ -64,7 +64,7 @@ jobs:
         run: FLUSSONIX_IPTV_HA_LOAD_SECONDS=5 cargo test --locked --test iptv_ha_load -- --ignored --exact two_authorities_sustain_competing_channels_without_extra_grants --nocapture
       - name: IPTV HA real-daemon load smoke gate
         run: FLUSSONIX_IPTV_HA_DAEMON_LOAD_SECONDS=5 cargo test --locked --test iptv_ha_daemons two_real_authority_processes_sustain_competing_channels -- --ignored --exact --nocapture
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -133,7 +133,7 @@ jobs:
     env:
       CARGO_INCREMENTAL: '0'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install standalone media runtime dependencies
@@ -149,7 +149,7 @@ jobs:
         run: python3 -m unittest tests.test_release_archive_smoke tests.test_cold_upgrade_smoke -v
       - name: Build actual release daemon
         run: cargo build --locked --release
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -188,7 +188,7 @@ jobs:
           (cd "$GITHUB_WORKSPACE/release-candidate" && \
             sha256sum --check -- "$(basename -- "${archives[0]}.sha256")")
       - name: Retain exact tested archive and checksum for isolated qualification
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: flussonix-candidate-${{ github.sha }}
           path: release-candidate/

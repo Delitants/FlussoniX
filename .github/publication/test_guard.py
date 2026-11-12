@@ -321,6 +321,99 @@ class PublicationGuardTests(unittest.TestCase):
 """
         self.assertEqual([], guard.workflow_errors(".github/workflows/check.yml", workflow))
 
+    def test_external_actions_and_reusable_workflows_require_full_commit_sha(self):
+        pinned = "a" * 40
+        workflow = f"""jobs:
+  verify:
+    steps:
+      - uses: actions/checkout@{pinned} # v7.0.1
+  delegated:
+    uses: owner/repository/.github/workflows/check.yml@{pinned}
+"""
+        self.assertEqual(
+            [], guard.workflow_pin_errors(".github/workflows/check.yml", workflow)
+        )
+        for value in (
+            "actions/checkout@v7",
+            "actions/checkout@main",
+            "actions/checkout@" + "a" * 39,
+            "owner/repository/.github/workflows/check.yml@v7",
+        ):
+            with self.subTest(value=value):
+                changed = "jobs:\n  verify:\n    uses: " + value + "\n"
+                self.assertTrue(
+                    guard.workflow_pin_errors(".github/workflows/check.yml", changed)
+                )
+
+    def test_action_pin_policy_preserves_relative_local_actions_and_workflows(self):
+        workflow = """jobs:
+  verify:
+    steps:
+      - uses: ./actions/local
+  delegated:
+    uses: ./.github/workflows/local.yml
+"""
+        self.assertEqual(
+            [], guard.workflow_pin_errors(".github/workflows/check.yml", workflow)
+        )
+
+    def test_action_pin_policy_rejects_ambiguous_yaml_representations(self):
+        pinned = "a" * 40
+        workflows = (
+            f"jobs:\n  verify:\n    steps:\n      - {{uses: actions/checkout@{pinned}}}\n",
+            f"jobs:\n  verify:\n    steps:\n      - \"uses\": actions/checkout@{pinned}\n",
+            f"jobs:\n  verify:\n    steps:\n      - uses: &checkout actions/checkout@{pinned}\n",
+            "jobs:\n  verify:\n    steps:\n      - uses: |\n          actions/checkout@" + pinned + "\n",
+            "jobs:\n  verify:\n    steps:\n      - ? uses\n        : actions/checkout@v7\n",
+            "jobs:\n  verify:\n    steps:\n      - *action_key: actions/checkout@v7\n",
+            f"jobs:\n  verify:\n    steps:\n      - &action_key uses: actions/checkout@{pinned}\n",
+        )
+        for workflow in workflows:
+            with self.subTest(workflow=workflow):
+                self.assertTrue(
+                    guard.workflow_pin_errors(".github/workflows/check.yml", workflow)
+                )
+
+    def test_action_pin_policy_rejects_docker_actions_pending_digest_policy(self):
+        for value in (
+            "docker://alpine:latest",
+            "docker://alpine@sha256:" + "a" * 64,
+        ):
+            with self.subTest(value=value):
+                workflow = "jobs:\n  verify:\n    uses: " + value + "\n"
+                self.assertTrue(
+                    guard.workflow_pin_errors(".github/workflows/check.yml", workflow)
+                )
+
+    def test_final_tree_pin_policy_allows_legacy_history_but_rejects_legacy_head(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = pathlib.Path(directory)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            workflow = repo / ".github/workflows/check.yml"
+            workflow.parent.mkdir(parents=True)
+            (repo / "README.md").write_text("Public guide\n")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "baseline"], check=True)
+            baseline = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+            policy = {"baseline": baseline, "public_docs": [], "public_data": []}
+            workflow.write_text("jobs:\n  verify:\n    uses: actions/checkout@v7\n")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "legacy workflow"], check=True)
+            legacy = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+            self.assertTrue(guard.history_errors(repo, policy, legacy))
+            workflow.write_text(
+                "jobs:\n  verify:\n    uses: actions/checkout@" + "a" * 40 + "\n"
+            )
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "pin workflow"], check=True)
+            self.assertEqual([], guard.history_errors(repo, policy, "HEAD"))
+
     def test_source_history_rejects_internal_text_in_approved_guide(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = pathlib.Path(directory)
