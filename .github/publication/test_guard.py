@@ -432,6 +432,15 @@ class PublicationGuardTests(unittest.TestCase):
             policy = {"baseline": baseline, "public_docs": ["docs/iptv-transport.md"], "public_data": []}
             self.assertTrue(guard.history_errors(repo, policy, "HEAD"))
 
+    def test_repository_public_guides_have_no_internal_test_report_text(self):
+        policy = json.loads((ROOT / ".github/publication/policy.json").read_text())
+        errors = []
+        for name in policy["public_docs"]:
+            path = ROOT / name
+            if path.suffix.casefold() in guard.PUBLIC_GUIDE_TYPES:
+                errors.extend(guard.text_errors(name, path.read_text()))
+        self.assertEqual([], errors)
+
     def test_existing_unlisted_guide_is_checked_when_edited(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = pathlib.Path(directory)
