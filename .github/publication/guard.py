@@ -187,6 +187,16 @@ def final_workflow_pin_errors(repo,revision=None,index=False):
   errors+=workflow_pin_errors(name,value)
  return errors
 
+def final_public_guide_errors(repo,policy,revision):
+ errors=[]
+ for name in sorted(set(policy.get('public_docs',[]))):
+  path=pathlib.PurePosixPath(name)
+  if path.suffix.casefold() not in PUBLIC_GUIDE_TYPES or not exists_at(repo,revision,name):continue
+  value=git(repo,'show',revision+':'+name)
+  if len(value)>MAX_TEXT:errors.append(name+': help file exceeds size limit')
+  else:errors+=text_errors(name,value.decode('utf-8'))
+ return errors
+
 def index_errors(repo,policy):
  return changed_errors(repo,policy,None,index=True)+final_workflow_pin_errors(repo,index=True)
 
@@ -198,6 +208,7 @@ def history_errors(repo,policy,revision):
   errors=[]
   for commit in git(repo,'rev-list',revision,'^'+base).decode().splitlines():
    errors += [commit[:12]+' '+e for e in changed_errors(repo,policy,commit)]
+  errors += final_public_guide_errors(repo,policy,revision)
   errors += final_workflow_pin_errors(repo,revision)
   return errors
  except (OSError,ValueError,UnicodeError,subprocess.CalledProcessError) as e:return ['Cannot verify source: '+str(e)]

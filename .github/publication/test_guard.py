@@ -432,14 +432,33 @@ class PublicationGuardTests(unittest.TestCase):
             policy = {"baseline": baseline, "public_docs": ["docs/iptv-transport.md"], "public_data": []}
             self.assertTrue(guard.history_errors(repo, policy, "HEAD"))
 
-    def test_repository_public_guides_have_no_internal_test_report_text(self):
-        policy = json.loads((ROOT / ".github/publication/policy.json").read_text())
-        errors = []
-        for name in policy["public_docs"]:
-            path = ROOT / name
-            if path.suffix.casefold() in guard.PUBLIC_GUIDE_TYPES:
-                errors.extend(guard.text_errors(name, path.read_text()))
-        self.assertEqual([], errors)
+    def test_final_tree_public_guide_scan_rejects_unsafe_legacy_head(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = pathlib.Path(directory)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            guide = repo / "docs/guide.md"
+            guide.parent.mkdir()
+            guide.write_text("Public guide\n")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "baseline"], check=True)
+            baseline = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+            guide.write_text("107 tests passed\n")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "legacy guide"], check=True)
+            legacy = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+            policy = {"baseline": baseline, "public_docs": ["docs/guide.md"], "public_data": [],
+                      "historical_public_guide_exceptions": {legacy: ["docs/guide.md"]}}
+            self.assertTrue(guard.history_errors(repo, policy, legacy))
+            guide.write_text("Automated coverage exercises the supported path.\n")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "sanitize guide"], check=True)
+            self.assertEqual([], guard.history_errors(repo, policy, "HEAD"))
 
     def test_existing_unlisted_guide_is_checked_when_edited(self):
         with tempfile.TemporaryDirectory() as directory:
