@@ -497,7 +497,12 @@ binary, records bounded timestamps for media gaps over three seconds, checks
 media disk use at each sample, and caps the private daemon log at 1 MiB. It
 stops its owned cgroup children and removes media and config on exit. It leaves
 the private report and log for diagnosis; the supplied binary is never removed.
-The assessor's passing memory threshold remains 512 MiB, below the scope limit.
+The assessor applies its 512 MiB current-memory and high-water limits across the
+entire run. Its 64 MiB growth limit starts at the first valid sample at or after
+one hour, so normal startup allocation is reported without being treated as a
+leak. Results include both startup-to-end and post-warmup growth and identify the
+3,600-second warmup. A report without a post-warmup baseline fails closed. These
+rules do not relax the whole-run 512 MiB ceiling.
 
 For gap attribution, add `--observe-source` to the runner. It polls only the
 two owned synthetic streams every 500 ms and adds bounded source-age episodes
@@ -516,6 +521,13 @@ not the final candidate. A later run on `5256867` ended early when its
 temporary filesystem fell below the runner's free-space threshold; the
 exact-head 24-hour gate must be repeated after release fixes using a state
 directory on the root filesystem.
+
+A later isolated 24-hour run on commit `565c65c` also passed the current
+assessor: 1,440 samples, 88.82 GiB delivered, no gate issues, a 166.31 MiB
+cgroup peak, 79.4 MiB startup-to-end growth, and 55.27 MiB growth after the
+one-hour warmup. This validates the warmup calculation against a completed
+report, but it remains evidence for that earlier revision. The immutable final
+candidate still requires its own exact-revision 24-hour pass.
 
 ## Config OpenMetrics subset (2026-10-31)
 
