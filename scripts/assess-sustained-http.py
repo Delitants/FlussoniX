@@ -14,6 +14,8 @@ DAY = 86_400
 MIB = 1_048_576
 GIB = 1_073_741_824
 MAX_REPORT_BYTES = 8 * MIB
+MEMORY_GROWTH_WARMUP_SECONDS = 3_600
+MEMORY_GROWTH_LIMIT_BYTES = 64 * MIB
 EXPECTED_VIEWERS = {f"{stream}:{index}" for stream in ("soak_a", "soak_b") for index in range(4)}
 
 
@@ -95,9 +97,21 @@ def assess(report, revision):
         fail("samples_incomplete")
     if any(b <= a or b - a > 90 for a, b in zip(elapsed_samples, elapsed_samples[1:])):
         fail("samples_irregular")
+    memory_warmup_index = next((
+        index for index, sample_elapsed in enumerate(elapsed_samples)
+        if sample_elapsed >= MEMORY_GROWTH_WARMUP_SECONDS
+    ), None)
+    post_warmup_memory_growth = None
+    if memory_warmup_index is None:
+        fail("samples_incomplete")
+    else:
+        post_warmup_memory_growth = memories[-1] - memories[memory_warmup_index]
     if max(memories) > 512 * MIB or max(memory_peaks) > 512 * MIB:
         fail("memory_limit_exceeded")
-    if memories[-1] - memories[0] > 64 * MIB:
+    if (
+        post_warmup_memory_growth is not None
+        and post_warmup_memory_growth > MEMORY_GROWTH_LIMIT_BYTES
+    ):
         fail("memory_growth_exceeded")
     if max(media_sizes) > 512 * MIB:
         fail("media_disk_exceeded")
@@ -162,6 +176,11 @@ def assess(report, revision):
         "max_final_media_gap_ms": round(max_final_media_gap, 2),
         "cgroup_memory_peak_mib": round(max(memory_peaks) / MIB, 2),
         "sampled_memory_growth_mib": round((memories[-1] - memories[0]) / MIB, 2),
+        "post_warmup_memory_growth_mib": (
+            None if post_warmup_memory_growth is None
+            else round(post_warmup_memory_growth / MIB, 2)
+        ),
+        "memory_growth_warmup_seconds": MEMORY_GROWTH_WARMUP_SECONDS,
     }
     return result, 1 if issues else 0
 

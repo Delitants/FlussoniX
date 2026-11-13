@@ -92,7 +92,7 @@ class SustainedHttpGateTests(unittest.TestCase):
 
     def test_cgroup_high_water_exceeds_limit_even_when_samples_are_low(self):
         report = complete_report()
-        report["samples"][-1]["memory_peak_bytes"] = 700 * MIB
+        report["samples"][1]["memory_peak_bytes"] = 700 * MIB
         run, result = assess(report)
         self.assertEqual(run.returncode, 1)
         self.assertIn("memory_limit_exceeded", result["issues"])
@@ -103,6 +103,60 @@ class SustainedHttpGateTests(unittest.TestCase):
         run, result = assess(report)
         self.assertEqual(run.returncode, 1)
         self.assertIn("memory_limit_exceeded", result["issues"])
+
+    def test_startup_growth_is_reported_but_gate_uses_one_hour_baseline(self):
+        report = complete_report()
+        for sample in report["samples"]:
+            sample["memory_bytes"] = 96 * MIB
+            sample["memory_peak_bytes"] = 160 * MIB
+        report["samples"][0]["memory_bytes"] = 32 * MIB
+        report["samples"][-1]["memory_bytes"] = 160 * MIB
+
+        run, result = assess(report)
+
+        self.assertEqual(run.returncode, 0)
+        self.assertEqual(result["issues"], [])
+        self.assertEqual(result["sampled_memory_growth_mib"], 128.0)
+        self.assertEqual(result["post_warmup_memory_growth_mib"], 64.0)
+        self.assertEqual(result["memory_growth_warmup_seconds"], 3600)
+
+    def test_post_warmup_growth_above_limit_fails(self):
+        report = complete_report()
+        for sample in report["samples"]:
+            sample["memory_bytes"] = 96 * MIB
+            sample["memory_peak_bytes"] = 161 * MIB
+        report["samples"][-1]["memory_bytes"] = 160 * MIB + 1
+
+        run, result = assess(report)
+
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("memory_growth_exceeded", result["issues"])
+
+    def test_first_sample_after_warmup_is_the_baseline(self):
+        report = complete_report()
+        for sample in report["samples"]:
+            sample["memory_bytes"] = 100 * MIB
+            sample["memory_peak_bytes"] = 164 * MIB
+        report["samples"][59]["memory_bytes"] = 32 * MIB
+        report["samples"][60]["elapsed"] = 3601
+        report["samples"][-1]["memory_bytes"] = 164 * MIB
+
+        run, result = assess(report)
+
+        self.assertEqual(run.returncode, 0)
+        self.assertEqual(result["post_warmup_memory_growth_mib"], 64.0)
+
+    def test_missing_warmup_baseline_fails_closed(self):
+        report = complete_report()
+        for index, sample in enumerate(report["samples"]):
+            sample["elapsed"] = index * 2
+
+        run, result = assess(report)
+
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("samples_incomplete", result["issues"])
+        self.assertIsNone(result["post_warmup_memory_growth_mib"])
+        self.assertEqual(result["memory_growth_warmup_seconds"], 3600)
 
     def test_finite_viewer_counters_cannot_overflow_the_summary(self):
         report = complete_report()
