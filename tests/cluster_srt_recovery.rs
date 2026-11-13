@@ -2,7 +2,12 @@
 use futures_util::FutureExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+    process::Stdio,
+    time::Duration,
+};
 #[path = "support/cluster_daemon.rs"]
 mod daemon;
 #[path = "support/tls.rs"]
@@ -35,8 +40,125 @@ async fn lookup(client: &reqwest::Client, lb: &Daemon, token: &str) -> reqwest::
         .await
         .unwrap()
 }
-async fn fresh(client: &reqwest::Client, lb: &Daemon, cdn: &Daemon) -> Value {
+async fn node_diagnostic(client: &reqwest::Client, node: &Daemon) -> Value {
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(Duration::from_secs(2), async {
+        client
+            .get(format!("{}/flussonix/api/v1/node", node.url))
+            .header("X-Flussonix-Peer", &node.key)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json::<Value>()
+            .await
+            .ok()
+    })
+    .await;
+    let Ok(Some(value)) = response else {
+        return json!({"node_probe":"unavailable","probe_ms":started.elapsed().as_millis()});
+    };
+    let stream = value["streams"]
+        .as_array()
+        .and_then(|streams| streams.iter().find(|stream| stream["name"] == STREAM))
+        .map(|stream| &stream["stats"])
+        .unwrap_or(&Value::Null);
+    json!({
+        "role":value["role"],"cpu":value["cpu"],"ram":value["ram"],
+        "uplink":value["uplink"],"uplink_mbps":value["uplink_mbps"],
+        "reserved_mbps":value["reserved_mbps"],"age_ms":value["age_ms"],
+        "active":value["active"],"reserved":value["reserved"],
+        "limit":value["limit"],"drain":value["drain"],
+        "probe_ms":started.elapsed().as_millis(),
+        "srt_enabled":value["srt_playback"]["enabled"],
+        "srt_encrypted":value["srt_playback"]["encrypted"],
+        "srt_clients":value["srt_playback"]["clients"],
+        "srt_reserved":value["srt_playback"]["reserved"],
+        "srt_client_limit":value["srt_playback"]["client_limit"],
+        "srt_listener_ready":value["srt_playback"]["listener_id"].is_string(),
+        "stream_ready":stream["ready"],
+        "source_available":stream["source_available"],
+        "stream_status":stream["status"],
+        "stream_bitrate_mbps":value["stream_bitrates"][STREAM]["mbps"],
+        "stream_bitrate_age_ms":value["stream_bitrates"][STREAM]["age_ms"],
+    })
+}
+fn recent_lookup_diagnostics(node: &Daemon) -> Vec<String> {
+    const MAX_LOG_TAIL: u64 = 64 * 1024;
+    let Ok(mut log) = std::fs::File::open(node.directory.path().join("daemon.log")) else {
+        return Vec::new();
+    };
+    let Ok(len) = log.metadata().map(|metadata| metadata.len()) else {
+        return Vec::new();
+    };
+    let offset = len.saturating_sub(MAX_LOG_TAIL);
+    if log.seek(SeekFrom::Start(offset)).is_err() {
+        return Vec::new();
+    }
+    let mut tail = Vec::new();
+    if log.take(MAX_LOG_TAIL).read_to_end(&mut tail).is_err() {
+        return Vec::new();
+    }
+    let tail = if offset > 0 {
+        tail.iter()
+            .position(|byte| *byte == b'\n')
+            .and_then(|index| tail.get(index + 1..))
+            .unwrap_or_default()
+    } else {
+        &tail
+    };
+    String::from_utf8_lossy(tail)
+        .lines()
+        .filter(|line| line.contains("srt_lookup_diag"))
+        .rev()
+        .take(16)
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+#[test]
+fn recent_lookup_diagnostics_ignores_invalid_old_log_bytes() {
+    let node = Daemon::new("diagnostic-tail");
+    let path = node.directory.path().join("daemon.log");
+    let mut log = vec![b'x'; 128 * 1024];
+    log[0] = 0xff;
+    log.extend_from_slice(b"\nlatest srt_lookup_diag lookup=unavailable\n");
+    std::fs::write(path, log).unwrap();
+
+    assert_eq!(
+        recent_lookup_diagnostics(&node),
+        vec!["latest srt_lookup_diag lookup=unavailable"]
+    );
+}
+async fn fresh(client: &reqwest::Client, lb: &Daemon, cdn: &Daemon, phase: &str) -> Value {
+    fresh_with_startup(client, lb, cdn, phase, None).await
+}
+
+async fn fresh_with_startup(
+    client: &reqwest::Client,
+    lb: &Daemon,
+    cdn: &Daemon,
+    phase: &str,
+    startup: Option<&Value>,
+) -> Value {
+    let started = std::time::Instant::now();
     let response = lookup(client, lb, TOKEN).await;
+    let lookup_ms = started.elapsed().as_millis();
+    if response.status() != 200 {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let (lb_state, cdn_state) =
+            tokio::join!(node_diagnostic(client, lb), node_diagnostic(client, cdn));
+        panic!(
+            "fresh SRT lookup {status}: {body}; diagnostic: {}",
+            json!({"phase":phase,"lookup_ms":lookup_ms,"startup":startup,"lb":lb_state,"cdn":cdn_state,
+                "lb_lookup_trace":recent_lookup_diagnostics(lb),"cdn_lookup_trace":recent_lookup_diagnostics(cdn)})
+        );
+    }
     assert_eq!(
         response.status(),
         200,
@@ -48,8 +170,9 @@ async fn fresh(client: &reqwest::Client, lb: &Daemon, cdn: &Daemon) -> Value {
     assert_eq!(value["address"], cdn.srt_url.as_deref().unwrap());
     assert_eq!(value["encryption_required"], true);
     let id = value["streamid"].as_str().unwrap();
-    assert!(id.contains(&format!("u={TOKEN},")));
-    assert!(id.contains(",flussonix_ticket="));
+    assert!(id.starts_with(&format!("#!::r={STREAM},m=request,flussonix_ticket=")));
+    assert!(!id.contains(TOKEN));
+    assert!(!id.contains("a=opaque"));
     for secret in [lb.key.as_str(), cdn.key.as_str(), PASSPHRASE] {
         assert!(!value.to_string().contains(secret));
     }
@@ -248,17 +371,23 @@ async fn run(
         403
     );
     assert!(nodes.iter().all(|n| n.owned_encoders().is_empty()));
-    tokio::time::timeout(Duration::from_secs(12), async {
-        while !nodes[2].node(&client).await["cpu"]
-            .as_f64()
-            .is_some_and(|n| n < 0.9)
-        {
+    let startup = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let node = nodes[2].node(&client).await;
+            if node["cpu"].as_f64().is_some_and(|n| n < 0.9) {
+                break json!({
+                    "cdn_source_available":stats(&node)["source_available"],
+                    "cdn_stream_status":stats(&node)["status"],
+                    "cdn_srt_enabled":node["srt_playback"]["enabled"],
+                    "cdn_sample_age_ms":node["age_ms"]
+                });
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
     .unwrap();
-    let first = fresh(&client, &nodes[3], &nodes[2]).await;
+    let first = fresh_with_startup(&client, &nodes[3], &nodes[2], "initial", Some(&startup)).await;
     assert!(
         nodes.iter().all(|n| n.owned_encoders().is_empty()),
         "lookup must reserve only"
@@ -270,7 +399,7 @@ async fn run(
     );
     decode(&capture, audio).await;
     let live = nodes[2].directory.path().join("active-at-failure.ts");
-    let active_ticket = fresh(&client, &nodes[3], &nodes[2]).await;
+    let active_ticket = fresh(&client, &nodes[3], &nodes[2], "active_caller").await;
     *active = Some(receiver(&active_ticket, &live, None));
     tokio::time::timeout(Duration::from_secs(12), async {
         loop {
@@ -334,7 +463,7 @@ async fn run(
     let replay = nodes[2].directory.path().join("spent.ts");
     assert!(!receive(&first, &replay).await);
     assert_eq!(std::fs::metadata(&replay).map(|m| m.len()).unwrap_or(0), 0);
-    let second = fresh(&client, &nodes[3], &nodes[2]).await;
+    let second = fresh(&client, &nodes[3], &nodes[2], "after_failover").await;
     assert_ne!(second["streamid"], first["streamid"]);
     let capture = nodes[2].directory.path().join("after.ts");
     assert!(
@@ -369,7 +498,7 @@ async fn run(
     assert!(nodes[2].owned_encoders().is_empty());
     nodes[1].start("b", "source").await;
     recovered(&client, &nodes[2], &after).await;
-    let restored = fresh(&client, &nodes[3], &nodes[2]).await;
+    let restored = fresh(&client, &nodes[3], &nodes[2], "after_blackout").await;
     let capture = nodes[2].directory.path().join("restored.ts");
     assert!(
         receive(&restored, &capture).await,

@@ -520,7 +520,11 @@ impl Grid {
                 if !value.is_finite() || value <= 0.0 || value > 120.0 {
                     return Err("bad duration".into());
                 }
-                duration = Some((value * 90000.0).round() as u64);
+                let ticks = (value * 90000.0).round() as u64;
+                if ticks == 0 {
+                    return Err("bad duration".into());
+                }
+                duration = Some(ticks);
                 tags.push(line.to_owned());
             } else if line.starts_with("#EXT-X-DISCONTINUITY")
                 && !line.starts_with("#EXT-X-DISCONTINUITY-SEQUENCE")
@@ -658,6 +662,11 @@ fn mp4_clock_kind(init: &[u8], media: &[u8], audio_only: bool) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn segment_shorter_than_one_clock_tick_is_rejected() {
+        let playlist = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:0.000001,\ng1_1.ts\n";
+        assert!(Grid::parse(playlist).is_err());
+    }
     #[test]
     fn an_open_display_has_stable_cues_after_its_later_clear() {
         let open = Cue {

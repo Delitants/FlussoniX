@@ -1,5 +1,12 @@
 # Compatibility contract
 
+This guide retains dated implementation-stage records. A statement that a
+feature was disabled or pending in an earlier stage is not its current support
+status. For current vendor viewer placement and delivery limits, see
+[CDN placement](vendor-cdn-placement.md) and
+[vendor playback](vendor-daemon-playback.md); exact release claims still require
+qualification of the candidate being published.
+
 ## Meaning of compatibility
 
 Compatibility is measured per **reference version × feature × transport direction × codec × authorization mode**. There is no current claim of exact equivalence.
@@ -12,21 +19,44 @@ The local public management schema exposes 139 operations on 74 paths; its info 
 
 All paths below are relative to `/streamer/api/v3`.
 
+Config JSON reads distinguish the reference's compact and full profiles:
+`GET /config` (or `?full=false`) reports `server_id` and runtime `stats`,
+while `?full=true` also returns the six saved collections. `stats.id` equals
+the UUID in `server_id`. `GET /config/stats` returns that stats object directly;
+FlussoniX-only diagnostics remain under `/flussonix/api/v1/node`. The UUID is stored in an owner-only
+`<config-file>.node-id` file; back it up with the configuration and keep it
+unique per installation. The Config and Cluster screens request `full=true`
+and write only saved collections, so changing counters cannot create an edit
+conflict. Invalid `full` values return HTTP 400. Flussonic-only root options,
+and text/plain Config serialization remain unsupported. `GET /config` accepts
+`Accept: application/openmetrics-text` or `?format=openmetrics` for a measured
+server-metrics subset: startup time (Unix seconds), CPU and RAM use (percent),
+ready streams, local active clients, and output bitrate (kbit/s). Unavailable
+measurements are omitted, not reported as zero. Input bitrate, scheduler,
+partition, GPU, and full vendor OpenMetrics parity remain open. `/config/stats`
+still returns JSON even with an OpenMetrics Accept header. For mixed JSON and
+OpenMetrics Accept lists, the first recognized type wins, matching the observed
+reference behavior.
+
 | Area | Reference operations |
 |---|---|
 | Streams | GET `/streams`; GET/PUT/DELETE `/streams/{name}`; POST `/streams/{name}/stop` |
 | Templates | GET `/templates`; GET/PUT/DELETE `/templates/{name}` |
 | Config | GET/PUT/POST `/config`; GET `/config/stats`; associated first-release operational fields |
 | Cluster | GET `/cluster/peers`, GET/PUT/DELETE `/cluster/peers/{hostname}`; corresponding `sources` routes |
-| Cluster balancers | Bundled private-schema `/cluster/balancers` operations: explicitly versioned extension, not assumed public |
+| Cluster balancers | GET `/cluster/balancers`; GET/PUT/DELETE `/cluster/balancers/{name}` from the bundled private schema; HTTP playback profile only |
 | Authorization | GET `/auth_backends`; GET/PUT/DELETE `/auth_backends/{name}` |
 | Sessions | GET `/sessions`; GET/DELETE `/sessions/{id}`; POST `/sessions/reauth` |
 | IPTV compatibility | `/iptv`, `/iptv/packages`, `/iptv/subscribers` and their item operations |
 | Operational visibility | Applicable monitoring, configuration statistics and event integration |
 
-The demo demonstrates built-in IPTV authorization. Include this compatibility mode, while keeping its demonstration configuration separate from actual migration requirements. Public IPTV API routes are in the installed schema.
+FlussoniX now implements a local built-in IPTV subset independently of the installed reference. It accepts existing static subscriber tokens, manages packages and subscribers through dedicated API routes, issues protected playlists and checks current access on playback. Read-only comparison with installed Flussonic 26.04.1 covers the IPTV collection envelope, default position pages, explicit name sorting and selection. Full management and playlist response parity remains unqualified; the demonstration server is not migration data.
 
-Some UI behaviors depend on private routes, such as explicit input selection. Record them separately from public operations and decide each feature's first-release implementation deliberately.
+The separate owner-only `iptv.json` stores tokens outside `/config`. Use exact `on_play: "iptv://"` on a stream or template and set `--iptv-public-origin` for playlist links. Expiry and positive subscriber `max_sessions` are supported. Limits count viewers on one standalone node, or across FlussoniX nodes configured to use the same IPTV authority; viewers on existing Flussonic nodes are outside that count. Successful edits revoke local IPTV grants, while a failed save keeps the last committed data and grants. The web UI provides **Config → IPTV** forms. [Token carriers and shared-authority operation](iptv-transport.md) are documented separately.
+
+The current HLS limit groups requests with the same stream, IP address and token on one node, so multiple players behind a shared IP may count as one session. Continuous playback connections are counted separately. The [transport guide](iptv-transport.md) describes this limit; strict per-player HLS counting is not yet claimed.
+
+The private, bodyless `POST /streams/{name}/inputs/{index}/select` route is implemented for explicit input selection. It requires Edit credentials, returns an empty 204 on success, uses the effective stream/template input list, and changes the runtime preference without saving configuration. An active or static stream restarts on the selected input; a load-balancer node records the preference without starting a local worker. Invalid, disabled or publisher-only inputs fail, and editing the input list clears a stale preference. The tested behavior does not establish every reference error or failover edge case.
 
 ### Semantics that must be implemented explicitly
 
@@ -61,13 +91,16 @@ selected `config_on_disk` objects also retain their `name`, matching the
 reference schema's required identity fields. Wildcards and JSON
 path syntax are not supported. Overlapping parent/child selectors resolve in
 query order: a later parent selects the whole value; a later child narrows it.
+Collection selectors accept at most 16 KiB of decoded text and 256 comma-separated
+fields; larger requests return HTTP 400 before selector compilation. The same
+limit applies to IPTV package and subscriber collection selection.
 
 The contract is grounded in the installed 26.04.1 schema, read-only inspection
 of its collection selector, and the public
 [API design principles](https://flussonic.com/doc/fms/api/flussonic-api-design/#limiting-the-field-set-of-the-result).
 Unknown/non-object paths are handled without reproducing reference exceptions.
-The tests and implementation use no vendor components. Reference default
-ordering and full vendor cursor parity remain separate tasks.
+The tests and implementation use no vendor components. The observed default
+Streams position order is implemented; full vendor cursor parity remains open.
 
 ### Cluster collection field selection
 
@@ -78,6 +111,9 @@ Selection runs after the existing search, ordering and positional pagination,
 preserving counts, navigation and timing. Without `select`, full rows remain
 unchanged. Item GET ignores `select` as before. Both view and edit management
 credentials can read selected rows; projection does not replace authorization.
+Forward and backward Cluster pages use bounded Base64 position cursors;
+malformed cursors return HTTP 400. Positions refer to the current sorted
+collection, so concurrent edits can shift a page boundary.
 
 Empty or unknown-only selections return `{}` per row; cluster rows have no
 automatically retained identity. Scalar child paths are omitted. Whole values,
@@ -138,8 +174,10 @@ prefixed with `-`; the first differing field decides the order. Dotted paths
 traverse objects in the returned effective stream or saved template row.
 Ordering precedes pagination and `select`, so fields omitted from the response
 can still determine order. Filters, search and collection envelopes retain
-their existing behavior. Default ordering remains ascending `name`. Ascending
-`name` breaks ties unless explicitly requested, including explicit `-name`.
+their existing behavior. Streams without `sort` use ascending `position`, with
+ascending `name` breaking ties; Templates still default to ascending `name`.
+Explicit `sort=name` keeps name order, including when it differs from the
+Streams default.
 
 Integers compare numerically without loss of signed/unsigned 64-bit precision.
 Strings use case-sensitive UTF-8 lexical order; booleans sort `false` before
@@ -159,19 +197,22 @@ their existing behavior. Sorting neither saves configuration nor starts media.
 This independently implemented scalar profile follows the official
 [sorting design](https://flussonic.com/doc/fms/api/flussonic-api-design/#sorting-collections)
 and read-only inspection of the installed 26.04.1 collection comparator and
-[public handler](https://github.com/flussonic/openapi_handler). Vendor ordering
-of complete arrays/objects, implicit position/default-key parity and sort-key
-cursors across changing snapshots remain unqualified as vendor parity. The
+[public handler](https://github.com/flussonic/openapi_handler). A bounded,
+read-only reference check on 2026-10-24 confirmed position-ordered default
+Streams pages and position-only continuation bounds. Vendor ordering of complete
+arrays/objects, missing/noninteger positions and sort-key cursors across changing
+snapshots remain unqualified as vendor parity. The
 [independent value-based cursor profile](#implemented-value-based-collection-cursors)
 now continues the supported scalar order across insertions and deletions.
 
 ## Implemented value-based collection cursors
 
-Streams and Templates collections return opaque `next` and `prev` tokens.
+Streams, Templates and IPTV collections return opaque `next` and `prev` tokens.
 URL-encode a token as the next request's `cursor`; retain the collection, sort,
-filter and search arguments. `limit` and `select` may change. Omitted sort and
-explicit `sort=name` share the same context. Counts describe the current filtered
-collection before the cursor and page limit. Empty pages have null navigation.
+filter and search arguments. `limit` and `select` may change. Omitted Streams
+sort and explicit `sort=name` have different orders; Templates retain name order
+by default. Counts describe the current filtered collection before the cursor
+and page limit. Pages without a continuation omit that navigation field.
 Item GET and other collections keep their existing contracts.
 
 The independent native token is standard Base64 of a URL query containing one
@@ -192,14 +233,30 @@ across a boundary; snapshot isolation and exactly-once traversal during such
 changes are not promised. New rows before an already-passed boundary are not
 included in its forward continuation.
 
-Inbound legacy `$position_gt=<nonnegative integer>` tokens remain accepted,
-including safe exhaustion at the platform's maximum integer. For identity-only
-`name` or `-name` sorting, reference `name_gt` / `name_lt` bounds are accepted;
-backward bounds include `$reversed=true`. An optional reference `$position_gt`
-or `$position_lt` is validated and treated as redundant with the unique name.
+For default Streams pages with nonnegative integer positions, outgoing tokens
+use the reference's Base64-encoded `$position_gt` or `$position_lt` with
+`$reversed=true` for backward pages. A boundary that splits equal positions
+uses the native value-based token so no row is skipped. Pages with missing or
+noninteger positions also use native tokens. Incoming default-position bounds
+compare row positions, including safe exhaustion at the platform's maximum
+integer. Explicit `sort=name` accepts earlier positional-offset tokens. For
+explicit identity-only `name` or `-name` sorting, outgoing tokens use reference
+`name_gt` / `name_lt` bounds when adjacent names differ; those bounds are also
+accepted on input. Duplicate-name boundaries use native tokens. Reference
+name-bound tokens do not bind the collection or filters, so clients must retain
+their original query arguments. Backward bounds include `$reversed=true`. An
+optional reference `$position_gt` or `$position_lt` is validated and treated as
+redundant with the unique name.
 For example, Base64 of `$position_gt=2&name_gt=a1` continues ascending names
-strictly after `a1`. These incoming reference/legacy tokens lack native context
-binding. New responses always return the native profile, even after legacy input.
+strictly after `a1`. Reference and legacy tokens lack native context binding.
+New default Streams responses use reference position bounds when safe; IPTV
+default pages use positional bounds; other scalar sorts use the native profile.
+
+Collection responses omit `next` or `prev` when that page does not exist. For
+Streams with explicit `sort=name`, `estimated_count` is capped at one row beyond
+the requested limit, including on later pages; it is an estimate, not the full
+filtered total. Default position pages retain their full count. Other sort and
+mixed-origin count behavior still needs reference qualification.
 
 Malformed Base64, URL escapes or UTF-8; duplicate inner query keys; unsupported
 reference compound bounds; native schema/version/context/key mismatches; and
@@ -213,9 +270,10 @@ may require restarting from the first page because argument values are bound.
 This profile follows the official
 [cursor API design](https://flussonic.com/doc/fms/api/flussonic-api-design/#cursors)
 and read-only reference inspection, without a vendor build/runtime dependency.
-Full vendor compound-cursor serialization, implicit position/default ordering,
-and reference filtering quirks remain unqualified. Vendor clients that decode or
-construct other cursor dialects require further interoperability qualification.
+Full vendor compound-cursor serialization, positions assigned for streams that
+omit them, and reference filtering quirks remain unqualified. Vendor clients
+that decode or construct other cursor dialects require further interoperability
+qualification.
 
 ## Cluster and load-balancing contract
 
@@ -245,11 +303,17 @@ RTSP/RTSPS and RTP/SRTP support is mandatory in **both directions**. See the [de
 
 HLSS and TSHTTPS are the secure scheme variants in Flussonic configuration. End-user HTTPS delivery uses ordinary HTTPS URLs. The installed schema also recognizes selected HTTP/HTTPS aliases, SRT1/SRT2 aliases and HLS2 variants; implement those required by the profile, with explicit reporting for any deferred variant.
 
-Standalone secure output is mandatory: the daemon must serve HLS, MPEG-TS, M4F and M4S over TLS, with the same authorization as plaintext, secure public redirects and independently verified private source connections. M4F/M4S must support HEVC, MPEG audio Layer II (`m2a`) and MP3 in both directions; HEVC is required across all other requested inputs/outputs that support it. See the [secure-output and codec contract](secure-output-codecs.md) for the implementation boundaries and acceptance matrix. These requirements extend beyond the current H.264/AAC preview.
+Standalone secure output is mandatory: the daemon must serve HLS, MPEG-TS, M4F and M4S over TLS, with the same authorization as plaintext, secure public redirects and independently verified private source connections. M4F/M4S must support HEVC, MPEG audio Layer II (`m2a`) and MP3 in both directions; HEVC is required across all other requested inputs/outputs that support it. See the [secure-output and codec contract](secure-output-codecs.md) for the implementation boundaries and acceptance matrix. Selected codec and TLS profiles now have owned-media tests, but the full mixed-vendor, direction and variant matrix below remains unqualified.
 
 M4F and M4S are **not equivalent to generic fMP4 packaging or a .m4s filename extension**. A standards-only HLS/DASH implementation cannot satisfy inter-server compatibility.
 
 HLS input fetches require bounded playlist/segment state, live sliding-window handling, discontinuities, changing init data, multitrack/variant selection and relative URL resolution. Distinguish HLS encryption from authentication; encrypted input support is a separately recorded capability. First playback paths include `index.m3u8`, `index.ts.m3u8`, `index.fmp4.m3u8` and track playlists; LL-HLS is an explicit extension rather than an implied promise.
+
+The exact live `index.ts.m3u8` and `index.fmp4.m3u8` URLs return a one-rendition master linked to the current authorized TS or fMP4 media playlist, with supported converted subtitles. `video.m3u8` serves an authorized TS-HLS master, and `tracks-vNaM/mono.m3u8` selects the requested live video/audio ordinals (1–16) into a one-rendition TS playlist. HLS playlist inputs retain multiple video and audio tracks for these selectors; the ordinary TS playlist carries those tracks together. Selection is not yet available for fMP4 HLS, and these aliases do not establish VOD/DVR, separate audio renditions or complete HLS query-option parity.
+
+For HTTP(S) HLS and continuous MPEG-TS inputs, FlussoniX resolves the configured hostname once per input generation and uses only that initial address set for playlists, media, keys and same-origin redirects. A later DNS change takes effect when the input restarts. The initial answer is not screened for private addresses, so only configure origins whose initial DNS answer you trust.
+
+Configured M4F/M4S inputs also resolve their origin once per input generation, retaining at most eight initial addresses. Control requests and M4F segment GETs use that pinned set, including M4F control reconnects within the same generation; restarting the input generation refreshes DNS. HTTPS still verifies the configured hostname against the server certificate. The initial M4 address set is not screened for private addresses, so configure only trusted origins.
 
 ## M4F/M4S implementation plan
 
@@ -306,9 +370,11 @@ Support `X-AuthDuration`, `X-UserId`, `X-Max-Sessions` and applicable legacy `X-
 
 **Session lifecycle:** cache decisions per identity and use single-flight authorization for concurrent first-segment requests. Reauthorize on the configured schedule rather than once per media object. The documented baseline retains a previous decision on backend outage while new sessions without approval are denied unless configured fallback rules apply; verify exact timeouts and expiry interactions. [Authorization behavior](https://flussonic.com/doc/authorization/)
 
+For FlussoniX `on_play` callbacks, configurable `session_keys` still group viewers into one session and capacity slot. Cached callback permission is narrower: it is bound to the exact stream, protocol, IP, token, query string, user agent, referer and host sent to the callback. A change to any of these fields requires a fresh callback before media. Up to 16 such decisions are retained per session and 50,000 per server instance; oldest idle decisions are reclaimed in small batches under pressure, while a full cache of live or pending decisions denies new contexts. After a full scan finds none idle, a new context can be denied for up to 100 ms even if a viewer has just disconnected; retrying is safe. Existing grants are isolated from another context's denial and remain subject to session-wide operator revocation.
+
 **RTSP/RTP sessions:** authorize RTSP playback/publication before enabling media and preserve the reference's credential/token semantics. Direct RTP/SRTP uses an approved configured or negotiated endpoint/session; media packets do not carry an HTTP-style authorization callback. Bind the endpoint and, for SRTP, the key context to that decision.
 
-**IPTV:** implement subscriber/package authorization, existing token acceptance, expiration and channel permissions, plus the supporting management/playlists contracts. Do not infer a database layout or token algorithm from the demo's `iptv://` scheme alone.
+**IPTV:** the built-in local mode supports subscriber/package authorization, static token acceptance and generation, expiration, channel permissions and protected HLS playlists. The optional shared-authority profile centralizes subscriber data and session-limit reservations for FlussoniX viewer-serving nodes, with bounded leases after node failure. Existing Flussonic-node viewers are outside those reservations. The shared-authority profile remains under release qualification; mixed-version rolling upgrades and authority high availability are not established. Exact Flussonic management and playlist parity is pending a pinned independent reference comparison. Do not infer a vendor database layout or token algorithm from the demo's `iptv://` scheme alone.
 
 For horizontal operation, define session-limit scope and ownership explicitly. Account for reconnect races, duplicate requests and node failure; telemetry counts are not authoritative admission reservations. Any native cluster credentials or session tickets must remain outside the legacy wire adapter unless peers explicitly support them.
 
@@ -494,6 +560,14 @@ Native sources additionally accept the reference `url` primary key through `/str
 
 For example, PUT `/streamer/api/v3/cluster/sources/m4s%3A%2F%2Forigin.example%3A8080` with `{}` creates a source whose `url` is `m4s://origin.example:8080`, native `api_url` is `http://origin.example:8080/`, and native `flussonix_transport` is `m4s`. Secure variants infer HTTPS and retain certificate/identity verification. Explicit native management/private endpoints and transport settings override those defaults; their actual schemes determine TLS. The API returns and persists the inferred native fields. Null-removing an endpoint/transport override or resetting a row re-applies its address defaults. A conflicting body URL is rejected; the request identity stays fixed.
 
+The inferred `http://` address remains visible for API compatibility, but a remote native peer-key request to it is blocked by default. Use an `m4ss://`/`m4fs://` source, configure HTTPS management and private media endpoints, or explicitly set `flussonix_allow_insecure_peer_http: true` on this source for a trusted private HTTP link. The exception is scoped to that saved relationship; it does not change the protocol used by other sources or peers.
+
+For a native source stream protected by an HTTP(S) `on_play` callback, configure the exact callback URL in **Config → Auth backends** on each receiving CDN. The source's `auth://` alias is resolved before discovery; the CDN compares the resulting URL byte for byte, including its query. If it is absent or differs, the mirror remains unavailable and playback fails closed. Changing or deleting the local backend cancels existing mirrored viewer grants and blocks cached mirror playback, even while the source is unavailable. An `iptv://` policy uses the local IPTV authority; a stream without `on_play` retains its open-policy behavior. Source discovery ignores remote output destinations and never enables insecure peer HTTP unless the receiving CDN's own source relationship explicitly opts in.
+
+For the first release, callback `session_keys` must include `name`, `proto` and `token`. The default identity includes these keys. A callback object that groups different viewer tokens under one session is rejected during stream/template validation or native discovery, so existing token-free policies need an operator edit before use. Exact `iptv://` subscriber policy retains its separate identity rules.
+
+HTTP MPEG-TS publication accepts publisher Basic credentials from non-browser encoders. Cross-origin browser POSTs are rejected before publisher authorization or worker startup, even when the browser has cached those credentials. Same-origin browser publication and playback GET/OPTIONS retain their existing behavior.
+
 The same normalization applies to config validation, replacement and startup imports. Validation does not save; startup does not rewrite the file. Source updates retain configuration revision fencing, viewer authority invalidation and worker reconciliation. URL identities appear in source lists, selected fields, selected-origin telemetry and replica switch accounting. The source editor provides a Source identity selector and a fixed Source address field, alongside existing endpoint controls and staged Config editing.
 
 This closes the bounded native source identity/CRUD gap against the [reference API schema](https://flussonic.com/doc/api/reference/). Native static activation is described below. Vendor source inventory/metadata messages, group configuration and full source/schema interoperability remain pending. Installed Flussonic components remain reference material only.
@@ -645,7 +719,9 @@ ancestry or private endpoint identity. Automatic vendor routing remains disabled
 
 ## Explicit vendor HTTP source recovery
 
-Configured Flussonic HTTP sources now support [equivalent-origin failover](vendor-daemon-failover.md) with explicit local group/content identity, equal policies and processing, guarded native viewer admission, private rejection barriers and background shared-worker replacement. HLS discontinuities and continuous-response reconnects apply. Vendor-backed RTSP TCP/UDP and RTSPS playback on CDN/standalone nodes use the same guarded shared input, viewer admission and processing template. Owned tests independently decode HEVC/MP3/MP2 from M4F and cover TLS, UDP, revocation, static sharing and replica recovery. [Vendor RTSP/RTSPS placement](vendor-cdn-placement.md) uses the native load policy with exact source-only CDN reservations, transport/token binding and independent viewer authorization; the LB never pulls media. Vendor-backed SRT MPEG-TS playback on CDN/standalone nodes uses the existing optional encrypted listener with independent viewer authorization, shared processing, source-fenced writes and replica reconnects. Owned independent clients decode AVC/HEVC/MP3/MP2 and CPU AAC. Native UTF-8 subtitle preservation remains M4S/M4F-only; HLS WebVTT conversion is independent of SRT audio/video delivery. SRT LB placement, vendor CDN destinations and production mixed-cluster qualification remain pending.
+Configured Flussonic HTTP sources now support [equivalent-origin failover](vendor-daemon-failover.md) with explicit local group/content identity, equal policies and processing, guarded native viewer admission, private rejection barriers and background shared-worker replacement. HLS discontinuities and continuous-response reconnects apply. Vendor-backed RTSP TCP/UDP and RTSPS playback on CDN/standalone nodes use the same guarded shared input, viewer admission and processing template. Owned tests independently decode HEVC/MP3/MP2 from M4F and cover TLS, UDP, revocation, static sharing and replica recovery. [Vendor RTSP/RTSPS placement](vendor-cdn-placement.md) uses the native load policy with exact source-only CDN reservations, transport/token binding and independent viewer authorization; the LB never pulls media. Vendor-backed SRT MPEG-TS playback on CDN/standalone nodes uses the existing optional encrypted listener with independent viewer authorization, shared processing, source-fenced writes and replica reconnects. Owned independent clients decode AVC/HEVC/MP3/MP2 and CPU AAC. Native UTF-8 subtitle preservation remains M4S/M4F-only; HLS WebVTT conversion is independent of SRT audio/video delivery. [HTTPS SRT lookup](vendor-cdn-placement.md#srt-lookup-for-compatible-clients) supports native and mapped Flussonic CDN placement for clients that request a CDN address before connecting; a single-address SRT relay and production mixed-cluster qualification remain pending.
+
+When a Flussonic source has different viewer policies for different groups, approve each affected stream under **Cluster → Source servers → Approved stream groups** before sending viewers to it. Enter the exact playback name, including any source prefix, then select its locally configured group. A source inventory may confirm that membership but cannot choose another local viewer policy. An unpinned stream or a conflicting group claim is unavailable on both CDN and load balancer; existing viewers are retired after a pin or policy edit. Sources whose group policies all resolve to the same viewer policy need no pins. The static-source catalog panel reports counts of missing and mismatched approvals across its last complete, still-valid inventory, including on-demand entries; it does not show tokens, callbacks or Cluster credentials. Sources configured only for on-demand activation are not polled solely for diagnostics.
 
 ### Automatic vendor static activation
 

@@ -1028,10 +1028,21 @@ fn publisher_transport(
         "rtsp",
         "-rtsp_transport",
         transport,
-    ])
-    .arg(input_url)
-    .stderr(std::process::Stdio::piped())
-    .kill_on_drop(true);
+    ]);
+    if transport == "udp" {
+        // FFmpeg's default range overlaps both the server pool and OS ephemeral
+        // sockets. An RTCP collision can make its fallback advertise odd RTP.
+        // Reserve a separate range with room for its random starting offset.
+        let tracks = audio.len() + usize::from(video.is_some());
+        let (range, held) = udp_fixture::reserved(u16::try_from(4 * tracks).unwrap());
+        let range = range.to_string();
+        let (first, last) = range.split_once('-').unwrap();
+        cmd.args(["-min_port", first, "-max_port", last]);
+        drop(held);
+    }
+    cmd.arg(input_url)
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
     cmd.spawn().unwrap()
 }
 async fn qualify(video: Option<&str>, audio: &[&str], profile: serde_json::Value, tls: bool) {
@@ -1483,6 +1494,7 @@ async fn callback_denial_and_pending_renewal_never_admit_a_worker() {
         let first = rx.recv().await.unwrap();
         assert_eq!(first["proto"], "rtsp");
         assert_eq!(first["token"], "owned-token");
+        assert_eq!(first["qs"], "token=owned-token");
         assert_eq!(first["ip"], "127.0.0.1");
         assert_eq!(first["request_number"], 0);
         assert_eq!(first["request_type"], "new_session");
@@ -1495,6 +1507,7 @@ async fn callback_denial_and_pending_renewal_never_admit_a_worker() {
             assert_eq!(second["session_id"], first["session_id"]);
             assert_eq!(second["request_number"], 1);
             assert_eq!(second["request_type"], "update_session");
+            assert_eq!(second["qs"], "token=owned-token");
             let mut b = Vec::new();
             tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut b))
                 .await
@@ -1840,6 +1853,22 @@ async fn capabilities_describe_disabled_publication_listeners_without_assumed_po
     assert_eq!(j["rtsp_publication"]["enabled"], false);
     assert_eq!(j["rtsp_publication"]["rtsp"], serde_json::Value::Null);
     assert_eq!(j["rtsp_publication"]["rtsps"], serde_json::Value::Null);
+    for direction in ["input", "output"] {
+        let advertised = j[direction].as_array().unwrap();
+        for codec in ["m4s", "m4f"] {
+            assert!(
+                advertised.iter().any(|entry| {
+                    entry.as_str().is_some_and(|entry| {
+                        entry.starts_with(codec)
+                            && entry.contains("HEVC")
+                            && entry.contains("Layer II")
+                            && entry.contains("MP3")
+                    })
+                }),
+                "{direction} must advertise {codec} HEVC and MPEG audio support"
+            );
+        }
+    }
     l.end().await;
 }
 #[tokio::test]

@@ -2,6 +2,8 @@
 
 Delivered: native selectable plain-text 608 WebVTT, explicit raw DVB/teletext TS-HLS pass-through, and HLS subtitle filtering with friendly inherited controls. Original-track policy on other outputs is independent. No official vendor runtime or caption executable is used.
 
+Raw TS-HLS passthrough publishes only complete segments up to 32 MiB. Its watcher retains the live window even when the current list cannot be published, and checks active generation files about once per second. A segment over 64 MiB, more than 64 generation files, or over 256 MiB total generation bytes stops that media worker to protect the shared media filesystem. A source that repeatedly breaches these limits needs its bitrate, keyframe cadence, or subtitle mode corrected.
+
 One fresh-context whole-branch review found three Important issues: timestamp epochs, malformed caption reset, and regional TS-HLS loss. All were reproduced and fixed; final local checks pass304 Rust tests (one existing external opt-in ignored),22 browser cases, formatting, all-target warnings-denied Clippy and frontend build. No deferred minor findings. Tests qualify owned local sources and players, not a production migration or sustained scale.
 
 The decisions below are recorded in execution order. The narrower pre-review embedded-only pass-through decision is superseded by the explicit raw TS-HLS decision. Every cost remains stated; additional regional conversion, fMP4 raw carriage and broader migration qualification are pending.

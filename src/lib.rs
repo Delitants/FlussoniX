@@ -4,17 +4,23 @@ mod api_filter;
 mod api_select;
 mod api_sort;
 pub mod auth;
+mod child_process;
 pub mod cluster;
 pub mod config;
+pub mod fxlink;
 mod idle_memory;
+pub mod iptv;
 pub mod m4f;
 pub mod m4s;
 pub mod media;
 mod media_rate;
+mod node_identity;
+mod peer_transport;
 pub mod playback_auth;
 mod push;
 mod rtsp_push;
 pub mod server;
+mod srt_input;
 pub mod srt_playback;
 mod srt_push;
 pub mod telemetry;
@@ -22,12 +28,15 @@ pub mod wire;
 
 pub mod m4_ingest;
 pub mod media_queue;
+mod origin_pin;
 
 pub mod peer_hls;
 
 pub mod recovery;
 
 mod hls_generation;
+mod hls_master_alias;
+mod hls_ts_select;
 
 pub mod source_directory;
 
@@ -35,6 +44,7 @@ pub mod direct_rtp;
 pub mod rtp;
 
 pub mod rtsp;
+mod rtsp_probe;
 
 pub mod tls_input;
 
@@ -43,6 +53,7 @@ pub mod hevc;
 mod http_basic;
 mod http_push;
 pub mod http_tls;
+pub mod http_transport;
 pub mod mpeg_audio;
 pub mod publish;
 
@@ -59,6 +70,7 @@ extern crate self as flussonix;
 
 pub mod caption_filter;
 
+mod hls_budget;
 mod raw_hls;
 
 mod teletext;
@@ -86,3 +98,7 @@ mod vendor_playback;
 #[path = "../tests/vendor_daemon_failover/fixture.rs"]
 #[allow(dead_code)]
 pub(crate) mod vendor_test_fixture;
+
+#[cfg(test)]
+#[path = "../tests/support/tls.rs"]
+pub(crate) mod transport_tls_fixture;

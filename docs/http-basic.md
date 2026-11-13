@@ -22,6 +22,12 @@ Credentials are preemptive: no challenge is needed before sending them.
 Credentialed HLS and TS use an origin-scoped fetcher even over plaintext HTTP;
 FFmpeg receives only a local URL. Native M4 control/segment requests use the
 same credentials. Basic credentials cannot be combined with a native peer key.
+Uncredentialed HTTP-family inputs use the same fetcher. `hls://` and `hlss://`
+identify playlists, including URLs without a `.m3u8` suffix; ordinary HTTP(S)
+URLs ending in `.m3u8` are also playlists. `tshttp://`, `tshttps://`, and ordinary
+HTTP(S) URLs without that suffix are handled as continuous MPEG-TS. Use `hls://`
+or `hlss://` for an extensionless playlist. Nested HLS segment, key, and
+playlist URIs cannot leave the configured origin.
 Redirects and HLS URI references must remain on the same normalized HTTP(S)
 origin, with no substituted userinfo. At most three redirects are followed.
 HLS variant/media playlists, segments, keys and subtitle resources inherit the

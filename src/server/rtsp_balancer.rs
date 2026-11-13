@@ -186,7 +186,11 @@ impl App {
         revision: u64,
     ) -> Result<String, u16> {
         let work = self.rtsp_place_inner(viewer, source, secure, grant, revision);
-        tokio::select! { biased; _=grant.cancelled()=>Err(403), result=tokio::time::timeout(Duration::from_secs(8),work)=>result.map_err(|_|503u16)? }
+        let result = tokio::select! { biased; _=grant.cancelled()=>Err(403), result=tokio::time::timeout(Duration::from_secs(8),work)=>result.map_err(|_|503u16)? };
+        if result.is_ok() && !self.playback_auth.release_redirect_lease(grant).await {
+            return Err(503);
+        }
+        result
     }
     async fn rtsp_place_inner(
         &self,

@@ -234,6 +234,7 @@ async fn private_media_binds_canonical_names_and_preserves_codec_samples() {
             }
             if transport == Transport::M4s {
                 assert_eq!(captures.len(), 1);
+                assert!(!captures[0].1.contains_key("x-playback-session-id"));
                 assert_eq!(hub.m4s_subscribe().0.concat(), wanted_stream.as_ref());
             } else {
                 assert_eq!(captures.len(), 2);

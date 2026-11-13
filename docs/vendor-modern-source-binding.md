@@ -46,9 +46,12 @@ without starting detached discovery.
 
 A result exposes sorted literal `names()` and an observed `server_id()`. These
 remain inspectable facts after edits. `candidate(name)` produces an opaque
-`ModernBoundCandidate` only after the existing local-origin, explicit membership,
+`ModernBoundCandidate` only after the existing local-origin, membership-aware policy,
 prefix/exclusion/selection and local viewer-policy projection checks. Unknown
-groups remain unknown; remote/external provenance remains ineligible. Untrusted
+groups remain unknown. A modern configured-origin candidate may use the
+[policy-equivalence rule](vendor-group-membership.md) when every possible
+membership yields the same explicit local viewer policy. Otherwise unknown
+membership remains ineligible. Remote/external provenance remains ineligible. Untrusted
 inventory inputs, keys and viewer policy never override local configuration.
 
 `at_modern_current(candidate, closure)` checks the exact source/profile under the

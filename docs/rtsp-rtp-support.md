@@ -31,6 +31,8 @@ Implement shared packetization/depacketization for RTSP-controlled sessions and 
 
 Maintain per-source SSRC and sequence state, bounded reorder/jitter buffers, timestamp rollover handling, loss counters and RTCP sender/receiver reports. Map RTP timestamps to the encoded timeline and use sender reports for available wall-clock synchronization. Transmit with bounded pacing and MTU-aware packetization. [RTP/RTCP](https://www.rfc-editor.org/rfc/rfc3550.html)
 
+Direct RTP and SRTP input now offers an optional per-track public RTP socket receive buffer of 0.0625–32 MiB in Streams and Templates. The saved `flussonix_rtp.receive_buffer_bytes` value is in bytes; blank retains the host default. RTCP and output sockets are unaffected. The kernel must grant the request or the input fails startup with a receive-buffer error and releases its ports. On Linux, `net.core.rmem_max` may need adjustment. This setting does not establish the cause of the archived HEVC picture loss.
+
 Initial codec coverage follows the server's H.264/H.265/AAC core; add camera audio payload profiles as explicit tested capabilities. Unicast/multicast configuration includes bind interface, destination, RTP/RTCP ports and multicast scope. Raw RTP does not create an HTTP-style token exchange: authorization must bind an approved configured or negotiated session to its media endpoint.
 
 ## SRTP and SRTCP
@@ -66,7 +68,7 @@ An optional `--rtsp-listen ADDRESS:PORT` starts a separate listener; it is disab
 
 One packetizer per worker produces H.264 single NAL/FU-A and AAC-LC MPEG4-GENERIC, including fragmented AAC access units. H.264 AVCC length widths 1/2/4, SPS/PPS in SDP, signed composition offsets, clock/sequence wrapping, atomic late-join snapshots and RTP-Info are supported. At most one H.264 and one AAC-LC track are accepted. HEVC, HE-AAC, camera audio variants and vendor-specific SDP/control behavior remain unqualified. RTCP sender reports use shared media/wall-clock mapping and actual per-client packet/payload counts. Malformed codec metadata or access units suppress this RTSP profile; existing native relay is not rewritten.
 
-The shared live queue is bounded to 4096 immutable access-unit or packed-GOP batches/64 MiB, packet length to 1200 bytes, and bootstrap to 32 MiB/100000 records. Producer batches larger than 64 MiB invalidate the RTSP profile. Per-viewer iteration slices shared packet bytes. Bootstrap overflow delays new video joins until a fresh keyframe while established playback continues. Video joins begin at a keyframe; audio-only bootstrap rolls over two seconds. A slow client disconnects on lag or a two-second socket-write timeout. Control headers/body/interleaved input are limited to 16 KiB/64 KiB/8 KiB, at most 64 headers and eight queued requests. There are at most 256 control connections. Initial control, media readiness and established keepalive deadlines are 30, 8 and 60 seconds. Shutdown cancels listeners/clients and bounds connection drain. These are safety bounds, not performance qualification.
+The shared live queue is bounded to 4096 immutable access-unit or packed-GOP batches/64 MiB, packet length to 1200 bytes, and bootstrap to 32 MiB/100000 records. Producer batches larger than 64 MiB invalidate the RTSP profile. Per-viewer iteration slices shared packet bytes. Bootstrap overflow delays new video joins until a fresh keyframe while established playback continues. Video joins begin at a keyframe; audio-only bootstrap rolls over two seconds. A slow client disconnects on lag or a two-second socket-write timeout. Control headers/body/interleaved input are limited to 16 KiB/64 KiB/8 KiB, at most 64 headers and eight queued requests. There are at most 256 control connections per listener and 64 connections per peer IP, including publishers and viewers; clients sharing a NAT or proxy address share that limit. Initial control, media readiness and established keepalive deadlines are 30, 8 and 60 seconds. Shutdown cancels listeners/clients and bounds connection drain. These are safety bounds, not performance qualification.
 
 Viewer URL tokens and existing on_play callbacks run before worker startup with `proto=rtsp` and the remote IP. Existing local limits, callback renewal, grant revocation and source/worker generation guards apply. Worker or codec replacement ends current RTSP playback; clients must reconnect. RTSP egress has separate telemetry; process-mode capacity uses HTTP plus RTSP media bytes. LB-role playback returns 501; native source discovery/private pulls are reused by CDN output.
 
@@ -85,7 +87,20 @@ Shared RTP records retain decode timestamps outside the unchanged wire bytes. Ea
 
 RTSP input defaults to TCP. The normal input form selects TCP or UDP; UDP is saved as `{"url":"rtsp://...","rtp":"udp"}` and inherited through templates. Changing the URL to another protocol clears the option. The `rtsp-udp://` input alias also selects unicast UDP without an `rtp` option; a redundant `rtp:"udp"` is accepted. The saved URL and input statistics retain `rtsp-udp`, while the independent FFmpeg adapter receives `rtsp://` with explicit UDP transport. Only the scheme changes: userinfo, path and query bytes are retained. The friendly selector and inherited input summary recognize the alias. Selecting TCP replaces its scheme with `rtsp://` and removes `rtp`; switching away from plain RTSP clears the transport option. The alias is plaintext and does not accept a trusted CA setting. Independent FFmpeg UDP clients decode H.264 and AAC together; UDP input is repackaged to independently decoded HLS, and native M4S/M4F private CDN pulls feed UDP output without an additional encoder.
 
-RTSPS, direct RTP, SRTP, RTSP publication/push, multicast, Basic/Digest viewer authentication, RTSP LB redirects, retransmission and migration/large-scale performance qualification remain pending.
+For copied-video RTSP inputs, the friendly **RTSP startup** selector defaults
+to Auto-detect. On a cold start, Auto may make a separate short DESCRIBE
+request to identify H.264 when the URL has no credentials. Sources with single-use tokens or charged
+admissions can select **H.264 (no extra probe)** when the codec is known, or
+**Conservative (no extra probe)** for HEVC or unknown codecs. These save
+`flussonix_rtsp_startup: "h264"` or `"conservative"` on the input row and
+inherit through Templates. The explicit choice bypasses the extra probe;
+an incorrect H.264 choice can make HEVC startup fail. The option is accepted
+only on RTSP, RTSP-UDP, RTSP2 and RTSPS inputs.
+
+At the v0.7 stage, RTSPS, direct RTP, SRTP, RTSP publication/push, multicast,
+Basic/Digest viewer authentication, RTSP LB redirects, retransmission and
+migration/large-scale performance qualification remained pending. Later sections
+record subsequent implementation; their qualification limits still apply.
 
 
 ## v0.8 encrypted TCP profile

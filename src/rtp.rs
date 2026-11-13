@@ -46,6 +46,11 @@ struct PacketTrack {
     audio_end: Option<i128>,
     sequence: u16,
 }
+// Account for the producer limit even when no live receiver needs a copy.
+struct Batch {
+    bytes: Option<Vec<u8>>,
+    length: usize,
+}
 struct State {
     input: Vec<Track>,
     tracks: Vec<PacketTrack>,
@@ -244,13 +249,16 @@ impl Hub {
         }
     }
     pub fn clock(&self, id: u32) -> Option<u32> {
+        self.clock_at(id, Instant::now()).map(|ticks| ticks as u32)
+    }
+    pub(crate) fn clock_at(&self, id: u32, sample: Instant) -> Option<u128> {
         let s = self.state.lock().unwrap();
         let t = s.tracks.iter().find(|t| t.description.id == id)?;
         let (dts, at) = s.origin?;
         Some(
-            ((dts as u128 * t.description.clock as u128 / 90000)
-                + (at.elapsed().as_nanos() * t.description.clock as u128 / 1_000_000_000))
-                as u32,
+            (dts as u128 * t.description.clock as u128 / 90000)
+                + (sample.saturating_duration_since(at).as_nanos() * t.description.clock as u128
+                    / 1_000_000_000),
         )
     }
     pub fn frame(&self, f: &Frame) {
@@ -259,18 +267,23 @@ impl Hub {
     /// A packed GOP is one publication so packet bursts cannot evict their own beginning.
     pub fn frames(&self, frames: &[Frame]) {
         let mut s = self.state.lock().unwrap();
-        let mut batch = Vec::new();
+        // Joining also holds state before subscribing to q: a late receiver
+        // sees the completed bootstrap and cannot miss this decision's GOP.
+        let mut batch = Batch {
+            bytes: self.q.has_receivers().then(Vec::new),
+            length: 0,
+        };
         for f in frames {
             Self::packetize(&mut s, f, &mut batch);
             if s.error.is_some() {
                 return;
             }
         }
-        if !batch.is_empty() {
-            let _ = self.q.send(Bytes::from(batch));
+        if let Some(bytes) = batch.bytes.filter(|bytes| !bytes.is_empty()) {
+            let _ = self.q.send(Bytes::from(bytes));
         }
     }
-    fn packetize(s: &mut State, f: &Frame, batch: &mut Vec<u8>) {
+    fn packetize(s: &mut State, f: &Frame, batch: &mut Batch) {
         if s.error.is_some() {
             return;
         }
@@ -348,19 +361,24 @@ impl Hub {
             s.ready = false;
         }
         for (i, p) in packets.into_iter().enumerate() {
-            if batch.len() + 13 + p.len() > 64 * 1024 * 1024 {
+            if batch.length + 13 + p.len() > 64 * 1024 * 1024 {
                 s.error = Some("RTP producer batch exceeds 64 MiB".into());
                 s.generation = s.generation.wrapping_add(1);
                 s.bootstrap.clear();
                 s.bytes = 0;
                 s.ready = false;
-                batch.clear();
+                if let Some(bytes) = &mut batch.bytes {
+                    bytes.clear();
+                }
                 return;
             }
-            batch.extend((p.len() as u32).to_be_bytes());
-            batch.push(u8::from(video && f.key && i == 0));
-            batch.extend(f.dts.to_be_bytes());
-            batch.extend_from_slice(&p);
+            batch.length += 13 + p.len();
+            if let Some(bytes) = &mut batch.bytes {
+                bytes.extend((p.len() as u32).to_be_bytes());
+                bytes.push(u8::from(video && f.key && i == 0));
+                bytes.extend(f.dts.to_be_bytes());
+                bytes.extend_from_slice(&p);
+            }
             if s.ready {
                 s.bytes += p.len();
                 s.bootstrap.push_back((f.dts, p));
@@ -684,6 +702,36 @@ fn hevc_payloads(width: usize, body: &[u8]) -> Result<Vec<Vec<u8>>, String> {
 #[cfg(test)]
 mod queue_lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn one_clock_sample_keeps_tracks_aligned_across_delayed_reads() {
+        let hub = Hub::new_multitrack();
+        hub.configure(&[
+            Track {
+                id: 9,
+                codec: "aac".into(),
+                config: vec![0x11, 0x90],
+            },
+            Track {
+                id: 10,
+                codec: "m2a".into(),
+                config: vec![],
+            },
+        ]);
+        hub.frame(&Frame {
+            track_id: 9,
+            body: vec![11; 100],
+            key: true,
+            dts: 90_000,
+            pts_offset: 0,
+        });
+        let sample = Instant::now();
+        let aac = hub.clock_at(9, sample).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mpeg = hub.clock_at(10, sample).unwrap();
+        let skew = (aac as i128 * 90_000 - mpeg as i128 * 48_000).abs();
+        assert!(skew <= 90_000, "shared RTP sample skew: {skew}");
+    }
 
     fn audio_hub() -> Hub {
         let hub = Hub::new();

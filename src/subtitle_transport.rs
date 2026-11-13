@@ -7,8 +7,15 @@ const PES_LIMIT: usize = 65541;
 pub(crate) struct Psi {
     bytes: Vec<u8>,
     counter: Option<u8>,
+    allow_multiple_sections: bool,
 }
 impl Psi {
+    pub(crate) fn all_current_sections() -> Self {
+        Self {
+            allow_multiple_sections: true,
+            ..Self::default()
+        }
+    }
     pub(crate) fn push(&mut self, b: &[u8], start: bool, cc: u8) -> Vec<Vec<u8>> {
         let mut out = vec![];
         if !start && self.counter.is_some_and(|old| (old + 1) & 15 != cc) {
@@ -51,7 +58,11 @@ impl Psi {
                 break;
             }
             let section: Vec<_> = self.bytes.drain(..n).collect();
-            if crc(&section) == 0 && section[5] & 1 != 0 && section[6] == 0 && section[7] == 0 {
+            if crc(&section) == 0
+                && section[5] & 1 != 0
+                && section[6] <= section[7]
+                && (self.allow_multiple_sections || (section[6] == 0 && section[7] == 0))
+            {
                 out.push(section);
             }
         }

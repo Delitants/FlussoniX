@@ -1,0 +1,206 @@
+# Run FlussoniX as a Linux service
+
+Use this optional workflow after checking the archive on a test host. It requires
+systemd, Python 3.11+ and independently installed FFmpeg/FFprobe. The packaged
+`bin/flussonix-service` helper creates credentials and writes a service unit;
+it never starts, enables or replaces a service.
+
+## Prepare the directories
+
+Verify and extract the archive as described in [installation](installation.md).
+Keep its files together in a versioned directory such as
+`/opt/flussonix/releases/flussonix-VERSION-linux-ARCH-REVISION`. Make that release
+root-owned and readable by the service account. Use absolute paths without spaces
+or substitution characters. Do not deploy under `/tmp` or `/var/tmp`: the service
+uses a private temporary directory.
+
+Create a dedicated account if it does not already exist:
+
+```bash
+sudo useradd --system --user-group --home-dir /var/lib/flussonix \
+  --no-create-home --shell /usr/sbin/nologin flussonix
+sudo install -d -o flussonix -g flussonix -m 700 /var/lib/flussonix
+```
+
+For an existing instance, stop it and back up its state first. Copy its saved
+configuration and referenced files into the external state directory, assigning
+them to the service account with private permissions. Keep all parent directories
+traversable by that account and protected from replacement by other users. The
+helper rejects writable or untrusted ancestors of state and credential paths;
+root-owned sticky directories such as `/tmp` remain usable for isolated tests.
+It does not change ownership or copy data.
+
+From the extracted release directory, enter your **saved** admin password and
+cluster peer key when prompted:
+
+```bash
+sudo python3 ./bin/flussonix-service credentials \
+  --output /etc/flussonix.env
+```
+
+This creates a mode-0600 file and refuses to overwrite an existing file. The
+default admin username is `admin`; use `--admin-user` to choose another. Reuse the
+same credentials when moving an existing instance. This helper accepts printable
+ASCII credentials; the username cannot contain a colon. For a new cluster, generate
+its peer key once with `openssl rand -hex 32` and save it securely.
+
+## Review and start
+
+Choose an unused listener port, then generate the unit. Set `flussonix_release`
+to the absolute path of your extracted release:
+
+```bash
+flussonix_release=/opt/flussonix/releases/flussonix-VERSION-linux-ARCH-REVISION
+sudo python3 ./bin/flussonix-service render \
+  --instance main --user flussonix \
+  --release-dir "$flussonix_release" \
+  --state-dir /var/lib/flussonix \
+  --credentials /etc/flussonix.env \
+  --listen 127.0.0.1:18210 --ffmpeg /usr/bin/ffmpeg \
+  --output "$PWD/flussonix.service"
+systemd-analyze verify --man=no ./flussonix.service
+cat ./flussonix.service
+```
+
+The command above renders a standalone HTTP service. To render an HTTPS CDN,
+prepare its own private state directory and credentials file, then use a
+separate instance name and unused ports:
+
+```bash
+sudo python3 ./bin/flussonix-service render \
+  --instance cdn --user flussonix --release-dir "$flussonix_release" \
+  --state-dir /var/lib/flussonix-cdn --credentials /etc/flussonix-cdn.env \
+  --listen 127.0.0.1:18210 --https-listen 0.0.0.0:18443 \
+  --https-cert /etc/flussonix/tls/server.crt \
+  --https-key /etc/flussonix/tls/server.key \
+  --role cdn --node-name cdn1 --uplink-mbps 1000 --client-limit 5000 \
+  --iptv-authority https://authority.example.test \
+  --output "$PWD/flussonix-cdn.service"
+systemd-analyze verify --man=no ./flussonix-cdn.service
+```
+
+For an IPTV HA authority, prepare its PostgreSQL settings file and HTTPS
+certificate first. The authority origin must identify this node:
+
+```bash
+sudo python3 ./bin/flussonix-service render \
+  --instance authority --user flussonix --release-dir "$flussonix_release" \
+  --state-dir /var/lib/flussonix-authority --credentials /etc/flussonix-authority.env \
+  --listen 127.0.0.1:18210 --https-listen 0.0.0.0:18443 \
+  --https-cert /etc/flussonix/tls/server.crt \
+  --https-key /etc/flussonix/tls/server.key --https-only \
+  --role source --node-name authority1 --iptv-lease-authority \
+  --iptv-ha-db-config /etc/flussonix/ha-db.json \
+  --iptv-authority https://authority.example.test \
+  --output "$PWD/flussonix-authority.service"
+systemd-analyze verify --man=no ./flussonix-authority.service
+```
+
+Use distinct ports when these units share a host. `--listen` remains required
+by the helper even with `--https-only`; the daemon does not bind it in that
+mode. The TLS private key and HA database settings file must be owned by the
+service account, mode 0600, and readable through their parent directories.
+Certificates and a private authority CA must also be readable by that account.
+The helper checks file access and option combinations; the daemon validates
+certificate and database contents at startup. A custom `--iptv-data` file must
+stay inside the instance's writable state directory.
+
+Other named options include `--rtsp-listen`, the `--rtsps-listen`/`--rtsps-cert`/
+`--rtsps-key` trio, `--rtsp-udp-ports` with optional `--rtsp-udp-mbps`, the
+`--fxlink-listen`/`--fxlink-cert`/`--fxlink-key` trio, and
+`--srt-play-listen` with optional public URL, latency and client limit. SRT
+uses ticket-only playback by default; `--srt-play-allow-direct-token` is an
+explicit legacy setting. To encrypt SRT playback, create a new credentials
+file with `credentials --with-srt-passphrase` and enter the passphrase at the
+prompt. The passphrase stays in that owner-only file, never in the unit.
+For two IPTV authorities, add `--iptv-authority-secondary`, the shared
+`--iptv-authority-cluster-id`, and `--iptv-authority-ca` if using a private CA.
+Review the generated unit and run `systemd-analyze verify` before installation.
+
+The helper verifies the release manifest and requires a non-root account, a
+private state directory and a protected credentials file. It also checks that
+the release and FFmpeg paths cannot be replaced through writable files or
+directories. When run as root, these paths must be root-owned. Executable paths
+must refer to real files; resolve an FFmpeg symlink with `readlink -f` if needed.
+The unit references the credentials file without embedding its contents.
+
+The rendered unit also passes `--srtp-receiver-ledger` with a fixed path under
+this instance's state directory. Rendering does not create or reset that file.
+If you use direct SRTP input, initialize the history once as the service user
+before starting the unit:
+
+```bash
+sudo -u flussonix "$flussonix_release/bin/flussonix" \
+  --init-srtp-receiver-ledger /var/lib/flussonix/srtp-receiver-ledger
+```
+
+The helper rejects unsafe existing history or lock files. Keep both files
+owner-only and back them up with the rest of the state. Without an initialized
+history, ordinary direct SRTP inputs fail closed; other protocols still work.
+
+After reviewing the unit, install and start it explicitly. Ensure the destination
+does not already belong to another instance:
+
+```bash
+sudo sh -c 'umask 022; set -C; cat "$1" > "$2"' sh \
+  ./flussonix.service /etc/systemd/system/flussonix.service &&
+sudo systemctl daemon-reload &&
+sudo systemctl start flussonix.service
+sudo systemctl status flussonix.service
+sudo journalctl -u flussonix.service -n 50 --no-pager
+```
+
+The installation command refuses an existing destination; activation runs only
+if the new unit was written successfully. Inspect any failure before continuing.
+
+Open [the local admin interface](http://127.0.0.1:18210/admin/), sign in and check
+actual playback. Use an SSH tunnel for remote access. Once validated, optionally
+enable startup at boot with `sudo systemctl enable flussonix.service`.
+Remote HTTP media can remain public, but management requires HTTPS or a local
+tunnel. The shipped UI refuses remote HTTP login even if the legacy
+`--allow-insecure-remote-management` API override is enabled.
+
+The service writes only inside its state directory and temporary directory. Put
+certificates, keys and SDP files somewhere the account can read. GPU transcoding
+also requires device permissions for the service account; this helper does not
+install drivers or change group membership. Check GPU readiness in the UI.
+
+On Linux, direct media subprocesses have parent-death protection so a fatal
+daemon crash does not leave them running during the shutdown grace period.
+Normal cancellation and the unit's 15-second shutdown grace remain in place.
+Use ordinary FFmpeg and Tesseract executables: wrappers that fork or change
+credentials can lose this protection. Whole-service cgroup cleanup remains the
+fallback for those cases.
+
+## Upgrade or remove
+
+For a cold upgrade, stop the service, back up its state and current unit, then
+verify and extract the new release into a different directory. Render a new unit
+using the same state and credentials and the new release path. Review it, replace
+your saved service unit, run `systemctl daemon-reload`, then start and check
+playback. Keep the old release and unit for rollback. If the old release cannot
+read a changed configuration, restore the backed-up configuration before starting
+it; doing so reverts later configuration edits.
+
+When upgrading an existing direct SRTP receiver that used a static key, stop
+the receiver first, initialize the new history as above, and provision a **new**
+sender key and sender generation before admitting media. Update the receiver's
+key-file reference or contents while stopped. Check the capability status and
+playback after startup. In an isolated test stream, a second receiver start
+with the same key must fail with a reused-key error; another freshly provisioned
+key must work. Do not restore an older history snapshot while reusing keys
+claimed after that snapshot. If restoring old state is necessary, rotate every
+affected receiver key and restart its sender with a new SSRC/sequence epoch.
+The explicit “Allow reused SRTP receiver key” stream option is for legacy
+compatibility only and weakens restart replay protection.
+
+To remove only this service registration:
+
+```bash
+sudo systemctl disable --now flussonix.service
+sudo rm /etc/systemd/system/flussonix.service
+sudo systemctl daemon-reload
+```
+
+Keep the state, credentials, release directories and backups until you decide
+they are no longer needed. Removing the unit does not delete them.

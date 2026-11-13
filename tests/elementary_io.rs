@@ -2,24 +2,186 @@ use flussonix::direct_rtp::{config::Settings, elementary::input::Input, packet};
 use serde_json::json;
 use std::{
     net::{SocketAddr, UdpSocket},
-    sync::atomic::Ordering,
+    sync::atomic::{AtomicU16, Ordering},
     time::Duration,
 };
 use tokio::{io::AsyncReadExt, net::UdpSocket as AsyncUdp};
 use tokio_util::sync::CancellationToken;
 fn port() -> u16 {
-    loop {
-        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let p = s.local_addr().unwrap().port();
-        if p < 65520 && UdpSocket::bind(("127.0.0.1", p + 1)).is_ok() {
-            return p;
+    static NEXT_PORT: AtomicU16 = AtomicU16::new(10000);
+    let ephemeral = ephemeral_range();
+    for _ in 0..10000 {
+        let p = NEXT_PORT.fetch_add(4, Ordering::Relaxed);
+        assert!(p <= 65516, "test UDP port range exhausted");
+        if !outside_ephemeral(p, 2, ephemeral) {
+            continue;
+        }
+        if let Ok(first) = UdpSocket::bind(("127.0.0.1", p)) {
+            if let Ok(second) = UdpSocket::bind(("127.0.0.1", p + 1)) {
+                drop((first, second));
+                return p;
+            }
         }
     }
+    panic!("no non-ephemeral UDP pair available for test");
+}
+
+fn ephemeral_range() -> Option<(u16, u16)> {
+    std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|text| {
+            let mut fields = text.split_whitespace();
+            Some((
+                fields.next()?.parse::<u16>().ok()?,
+                fields.next()?.parse::<u16>().ok()?,
+            ))
+        })
+}
+
+fn outside_ephemeral(p: u16, span: u16, range: Option<(u16, u16)>) -> bool {
+    match range {
+        Some((first, last)) => p + span - 1 < first || p > last,
+        None => p <= 30000,
+    }
+}
+async fn assert_released(port: u16) {
+    for _ in 0..100 {
+        if UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    panic!("UDP port {port} remained busy after 200 ms");
 }
 fn rtp(seq: u16, ssrc: u32, payload: &[u8]) -> Vec<u8> {
     let mut b = packet::packet(seq, 0, ssrc, payload);
     b[1] = 96;
     b
+}
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires root in a fresh isolated network namespace; CI invokes explicitly"]
+async fn all_public_track_pairs_survive_private_ephemeral_allocation() {
+    // Never change the host's port range: the launcher must supply its namespace
+    // identity before entering the dedicated test namespace.
+    let parent = std::env::var("FLUSSONIX_BIND_PARENT_NETNS").expect("namespace launcher required");
+    assert!(parent.starts_with("net:[") && parent.ends_with(']'));
+    let current = std::fs::read_link("/proc/self/ns/net").unwrap();
+    assert_ne!(current.to_str().unwrap(), parent);
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    assert!(
+        std::process::Command::new("ip")
+            .args(["link", "set", "lo", "up"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write("/proc/sys/net/ipv4/ip_local_port_range", "40000 40127\n").unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let file = d.path().join("owned.sdp");
+    let ports = [35000, 40000, 40002, 40004, 40006, 40008, 40010, 40012];
+    let mut text = "v=0\no=- 0 0 IN IP4 127.0.0.1\ns=Owned\nc=IN IP4 127.0.0.1\nt=0 0\n".to_owned();
+    for p in ports {
+        text.push_str(&format!("m=audio {p} RTP/AVP 14\na=rtpmap:14 MPA/90000\n"));
+    }
+    std::fs::write(&file, text).unwrap();
+    let cfg = Settings::input(&json!({"url":"rtp://127.0.0.1:35000", "flussonix_rtp":{"profile":"elementary","sdp_file":file}})).unwrap().unwrap();
+    for iteration in 0..256 {
+        let input = Input::bind(&cfg).await.unwrap_or_else(|error| panic!("all public pairs must bind before ephemeral allocation, iteration {iteration}: {error}"));
+        for p in ports.into_iter().flat_map(|p| [p, p + 1]) {
+            assert!(
+                UdpSocket::bind(("127.0.0.1", p)).is_err(),
+                "public pair lost ownership: {p}"
+            );
+        }
+        drop(input);
+        for p in ports.into_iter().flat_map(|p| [p, p + 1]) {
+            assert!(
+                UdpSocket::bind(("127.0.0.1", p)).is_ok(),
+                "public pair leaked after drop: {p}"
+            );
+        }
+    }
+    // Exhaust only this namespace's remaining ephemeral ports. Failure to make
+    // a private pair must release every previously acquired public track pair.
+    let occupied: Vec<_> = (40000..=40127)
+        .filter(|p| {
+            !ports
+                .into_iter()
+                .any(|public| *p == public || *p == public + 1)
+        })
+        .map(|p| UdpSocket::bind(("127.0.0.1", p)).unwrap())
+        .collect();
+    assert_eq!(
+        Input::bind(&cfg).await.err().unwrap(),
+        "Private RTP reservation failed"
+    );
+    for p in ports.into_iter().flat_map(|p| [p, p + 1]) {
+        assert!(
+            UdpSocket::bind(("127.0.0.1", p)).is_ok(),
+            "public pair leaked after private allocation failure: {p}"
+        );
+    }
+    drop(occupied);
+    drop(Input::bind(&cfg).await.unwrap());
+}
+#[tokio::test]
+async fn busy_later_track_releases_earlier_public_pairs_without_reusing_foreign_socket() {
+    let d = tempfile::tempdir().unwrap();
+    let ephemeral = ephemeral_range();
+    for offset in [2, 3] {
+        // A port selected by bind(:0) can be reassigned to another parallel
+        // test when the non-foreign sockets are released below. Reserve a
+        // quartet outside the host's ephemeral range instead.
+        let (p, mut sockets) = (10000u16..=65516)
+            .rev()
+            .filter(|p| outside_ephemeral(*p, 4, ephemeral))
+            .find_map(|p| {
+                let sockets = (p..p + 4)
+                    .map(|port| UdpSocket::bind(("127.0.0.1", port)))
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()?;
+                Some((p, sockets))
+            })
+            .expect("no non-ephemeral four-port UDP span available");
+        let foreign = sockets.remove(offset);
+        let occupied = foreign.local_addr().unwrap();
+        let file = d.path().join("owned.sdp");
+        std::fs::write(&file, format!("v=0\no=- 0 0 IN IP4 127.0.0.1\ns=Owned\nc=IN IP4 127.0.0.1\nt=0 0\nm=audio {p} RTP/AVP 14\na=rtpmap:14 MPA/90000\nm=audio {} RTP/AVP 14\na=rtpmap:14 MPA/90000\n", p + 2)).unwrap();
+        let cfg = Settings::input(&json!({"url":format!("rtp://127.0.0.1:{p}"),"flussonix_rtp":{"profile":"elementary","sdp_file":file}})).unwrap().unwrap();
+        drop(sockets);
+        let error = Input::bind(&cfg)
+            .await
+            .err()
+            .expect("busy public track must fail");
+        assert_eq!(
+            error,
+            if offset == 2 {
+                "RTP input port unavailable"
+            } else {
+                "RTCP input port unavailable"
+            }
+        );
+        assert_eq!(foreign.local_addr().unwrap(), occupied);
+        for port in p..p + 4 {
+            if port == occupied.port() {
+                assert!(UdpSocket::bind(("127.0.0.1", port)).is_err());
+            } else {
+                assert_released(port).await;
+            }
+        }
+        drop(foreign);
+        let mut rebound = false;
+        for _ in 0..100 {
+            if let Ok(input) = Input::bind(&cfg).await {
+                drop(input);
+                rebound = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(rebound, "public pairs remained busy after 200 ms");
+    }
 }
 #[tokio::test]
 async fn sdp_pipe_failure_retains_the_specific_static_input_diagnostic() {
@@ -43,7 +205,7 @@ async fn sdp_pipe_failure_retains_the_specific_static_input_diagnostic() {
     );
     assert_eq!(stats.snapshot()["status"], "failed");
     for n in [p, p + 1] {
-        assert!(UdpSocket::bind(("127.0.0.1", n)).is_ok());
+        assert_released(n).await;
     }
 }
 #[tokio::test]
@@ -112,10 +274,10 @@ async fn engine_does_not_admit_media_to_sockets_owned_by_another_process() {
         !leaked,
         "port occupancy admitted media to a foreign decoder"
     );
-    assert_eq!(stats["direct_rtp_input"]["packets"], 0);
+    assert_eq!(stats["direct_rtp_input"]["packets"], 1);
     assert_eq!(stats["direct_rtp_input"]["status"], "starting");
     for n in [p, p + 1] {
-        assert!(UdpSocket::bind(("127.0.0.1", n)).is_ok());
+        assert_released(n).await;
     }
 }
 #[tokio::test]
@@ -137,7 +299,7 @@ async fn cancellation_before_private_decoder_binding_releases_every_public_pair(
         .unwrap()
         .unwrap();
     for n in [p, p + 1] {
-        assert!(UdpSocket::bind(("127.0.0.1", n)).is_ok());
+        assert_released(n).await;
     }
 }
 #[tokio::test]
@@ -331,8 +493,8 @@ async fn elementary_input_validates_before_pin_reorders_and_releases_ports() {
         .unwrap()
         .unwrap()
         .unwrap();
-    assert!(UdpSocket::bind(("127.0.0.1", p)).is_ok());
-    assert!(UdpSocket::bind(("127.0.0.1", p + 1)).is_ok());
+    assert_released(p).await;
+    assert_released(p + 1).await;
 }
 #[tokio::test]
 async fn elementary_rtcp_is_not_forwarded_before_pin_and_receiver_reports_return_to_owned_peer() {
@@ -368,9 +530,20 @@ async fn elementary_rtcp_is_not_forwarded_before_pin_and_receiver_reports_return
     })
     .await
     .unwrap();
-    let src = port();
-    let sender = AsyncUdp::bind(("127.0.0.1", src)).await.unwrap();
-    let sender_control = AsyncUdp::bind(("127.0.0.1", src + 1)).await.unwrap();
+    let (sender, sender_control) = {
+        let mut pair = None;
+        for _ in 0..128 {
+            let sender = AsyncUdp::bind("127.0.0.1:0").await.unwrap();
+            let src = sender.local_addr().unwrap().port();
+            if src < 65535 {
+                if let Ok(control) = AsyncUdp::bind(("127.0.0.1", src + 1)).await {
+                    pair = Some((sender, control));
+                    break;
+                }
+            }
+        }
+        pair.expect("no adjacent sender UDP pair available")
+    };
     let destination = SocketAddr::from(([127, 0, 0, 1], p));
     let target = SocketAddr::from(([127, 0, 0, 1], p + 1));
     let mut sr = vec![0x80, 200, 0, 6];

@@ -46,7 +46,9 @@ impl Hub {
     }
     pub fn new() -> Self {
         Self {
-            m4s: Channel::new(256, 16 * 1024 * 1024),
+            // Late joins use the separate bootstrap captured under state lock.
+            // An unused output has no consumer for its live fan-out history.
+            m4s: Channel::for_subscribers(256, 16 * 1024 * 1024),
             signals: Channel::new(16, 8192),
             rtp: crate::rtp::Hub::new_multitrack(),
             state: Mutex::new(State {
@@ -298,6 +300,9 @@ impl Hub {
     }
     pub fn has_info(&self) -> bool {
         self.state.lock().unwrap().info.is_some()
+    }
+    pub fn has_m4f_segment(&self) -> bool {
+        !self.state.lock().unwrap().segments.is_empty()
     }
     pub fn m4s_subscribe(&self) -> (Vec<Bytes>, Receiver) {
         let s = self.state.lock().unwrap();

@@ -1,12 +1,133 @@
 use flussonix::direct_rtp::{
+    config::Settings,
     crypto::{self, Session},
     packet,
 };
+use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 fn ts() -> Vec<u8> {
     let mut b = vec![0xff; 188];
     b[..4].copy_from_slice(&[0x47, 0x1f, 0xff, 0x10]);
     b
+}
+fn owned_key(dir: &std::path::Path, name: &str, value: u8) -> std::path::PathBuf {
+    let path = dir.join(name);
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [value; 30]);
+    std::fs::write(&path, encoded).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    path
+}
+fn elementary_settings(protection: serde_json::Value) -> Settings {
+    let mut options = protection;
+    options["profile"] = json!("elementary");
+    options["sdp_file"] = json!("/tmp/owned.sdp");
+    Settings::input(&json!({
+        "url":"srtp://127.0.0.1:20000",
+        "flussonix_rtp":options
+    }))
+    .unwrap()
+    .unwrap()
+}
+#[test]
+fn shared_key_receive_lanes_pin_expected_ssrc_before_first_media_or_control() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = owned_key(dir.path(), "shared", 0x31);
+    let settings = elementary_settings(json!({"key_file":key,"expected_ssrcs":[101,202]}));
+    let mut lanes = crypto::receive_track_sessions(&settings, &[Some(101), Some(202)]).unwrap();
+    assert_eq!(lanes.sessions.len(), 2);
+    assert_eq!(lanes.fingerprints.len(), 1);
+    let mut a_tx = Session::new([0x31; 30], Some(101)).unwrap();
+    let mut b_tx = Session::new([0x31; 30], Some(202)).unwrap();
+    let mut a = packet::packet(1, 0, 101, &ts());
+    let mut b = packet::packet(1, 0, 202, &ts());
+    a_tx.protect(&mut a, false).unwrap();
+    b_tx.protect(&mut b, false).unwrap();
+    assert!(
+        lanes.sessions[1]
+            .0
+            .unprotect(&mut a.clone(), false)
+            .is_err()
+    );
+    let mut a_valid = a.clone();
+    lanes.sessions[0].0.unprotect(&mut a_valid, false).unwrap();
+    assert_eq!(a_valid, packet::packet(1, 0, 101, &ts()));
+    lanes.sessions[1].0.unprotect(&mut b, false).unwrap();
+    let mut report = packet::receiver_report(101, 101, &packet::Reception::default());
+    a_tx.protect(&mut report, true).unwrap();
+    assert!(
+        lanes.sessions[1]
+            .0
+            .unprotect(&mut report.clone(), true)
+            .is_err()
+    );
+    lanes.sessions[0].0.unprotect(&mut report, true).unwrap();
+    let mut feedback = packet::receiver_report(303, 101, &packet::Reception::default());
+    lanes.sessions[0].1.protect(&mut feedback, true).unwrap();
+    Session::new([0x31; 30], None)
+        .unwrap()
+        .unprotect(&mut feedback, true)
+        .unwrap();
+}
+#[test]
+fn distinct_track_key_snapshots_reject_cross_lane_ciphertext_and_duplicate_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let a_path = owned_key(dir.path(), "track-a", 0x31);
+    let b_path = owned_key(dir.path(), "track-b", 0x32);
+    let settings = elementary_settings(json!({"track_key_files":[a_path,b_path]}));
+    let mut lanes = crypto::receive_track_sessions(&settings, &[None, None]).unwrap();
+    assert_eq!(lanes.fingerprints.len(), 2);
+    assert_ne!(lanes.fingerprints[0], lanes.fingerprints[1]);
+    let mut a_tx = Session::new([0x31; 30], Some(101)).unwrap();
+    let mut b_tx = Session::new([0x32; 30], Some(202)).unwrap();
+    let mut a = packet::packet(1, 0, 101, &ts());
+    let mut b = packet::packet(1, 0, 202, &ts());
+    a_tx.protect(&mut a, false).unwrap();
+    b_tx.protect(&mut b, false).unwrap();
+    assert!(
+        lanes.sessions[1]
+            .0
+            .unprotect(&mut a.clone(), false)
+            .is_err()
+    );
+    assert!(
+        lanes.sessions[0]
+            .0
+            .unprotect(&mut b.clone(), false)
+            .is_err()
+    );
+    lanes.sessions[0].0.unprotect(&mut a, false).unwrap();
+    lanes.sessions[1].0.unprotect(&mut b, false).unwrap();
+    let duplicate = owned_key(dir.path(), "duplicate", 0x31);
+    let settings =
+        elementary_settings(json!({"track_key_files":[dir.path().join("track-a"),duplicate]}));
+    assert!(crypto::receive_track_sessions(&settings, &[None, None]).is_err());
+}
+#[test]
+fn receive_track_sessions_fail_closed_for_count_or_key_errors_without_secret_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = owned_key(dir.path(), "single", 0x31);
+    let shared = elementary_settings(json!({"key_file":key,"expected_ssrcs":[101,202]}));
+    assert!(crypto::receive_track_sessions(&shared, &[Some(101)]).is_err());
+    assert!(crypto::receive_track_sessions(&shared, &[Some(101), Some(203)]).is_err());
+    let single = elementary_settings(json!({"key_file":key}));
+    assert_eq!(
+        crypto::receive_track_sessions(&single, &[None])
+            .unwrap()
+            .sessions
+            .len(),
+        1
+    );
+    assert!(crypto::receive_track_sessions(&single, &[None, None]).is_err());
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let error = crypto::receive_track_sessions(&single, &[None])
+        .err()
+        .unwrap();
+    assert!(!error.contains(key.to_str().unwrap()));
+    assert!(!error.contains("MTExMTEx"));
+    let missing = elementary_settings(
+        json!({"track_key_files":[dir.path().join("none"),dir.path().join("other")]}),
+    );
+    assert!(crypto::receive_track_sessions(&missing, &[None, None]).is_err());
 }
 #[test]
 fn confidential_authenticated_rtp_replay_tamper_plaintext_and_wrap() {

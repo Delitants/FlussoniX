@@ -6,12 +6,21 @@ pub(crate) struct Probe {
     pat: Psi,
     pmt: Psi,
     program: Option<(u16, u16)>,
+    single_program: bool,
+    pub filter_mapping_known: bool,
     pub audio: Option<Option<u8>>,
     pub audio_types: Vec<u8>,
     pub unsupported_tracks: bool,
     pub video: Option<u8>,
 }
 impl Probe {
+    pub(crate) fn for_publication() -> Self {
+        Self {
+            pat: Psi::all_current_sections(),
+            pmt: Psi::all_current_sections(),
+            ..Self::default()
+        }
+    }
     pub fn push(&mut self, bytes: &[u8]) {
         for part in bytes.chunks(188 * 64) {
             self.pending.extend(part);
@@ -53,6 +62,14 @@ impl Probe {
                 if s[0] != 0 || (s.len() - 12) % 4 != 0 {
                     continue;
                 }
+                self.single_program = s[5] & 1 != 0
+                    && s[6] == 0
+                    && s[7] == 0
+                    && s[8..s.len() - 4]
+                        .chunks_exact(4)
+                        .filter(|entry| u16::from_be_bytes([entry[0], entry[1]]) != 0)
+                        .count()
+                        == 1;
                 for entry in s[8..s.len() - 4].chunks_exact(4) {
                     let program = u16::from_be_bytes([entry[0], entry[1]]);
                     if program != 0 {
@@ -102,6 +119,11 @@ impl Probe {
                     self.audio = Some(audio);
                     self.audio_types = audio_types;
                     self.unsupported_tracks = unsupported_tracks;
+                    self.filter_mapping_known = self.single_program
+                        && !unsupported_tracks
+                        && s[5] & 1 != 0
+                        && s[6] == 0
+                        && s[7] == 0;
                     self.video = video;
                 }
             }

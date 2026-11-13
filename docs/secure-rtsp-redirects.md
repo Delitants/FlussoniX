@@ -12,19 +12,40 @@ field to an absolute PEM bundle containing the trust roots for every participati
 TLS server. The input CA setting is `flussonix_tls_ca`. Server identity is verified
 at every hop; certificate checking cannot be disabled.
 
+An RTSPS input follows redirects to its original hostname and port by default.
+For an LB that redirects to CDN listeners, add each trusted CDN origin in
+**Allowed RTSPS redirects** beneath that input. Enter roots such as
+`rtsps://cdn.example:322`, without a stream path, query, fragment, wildcard or
+credentials. The API field is `flussonix_rtsps_redirect_origins`, an array of up
+to 16 such roots. The original origin is always allowed and need not be listed.
+Hostnames compare without case and the default RTSPS port is 322. A DNS alias or
+different port needs its own entry. Changing the list replaces the stream's
+worker; a removed destination cannot continue through the old bridge.
+
+An input URL containing username or password may redirect only within its
+original hostname and port, even if other origins are listed. Put approved
+roots on the specific Stream or Template input used by the receiving node;
+this does not configure another node or grant it credentials. Include each
+participating server's trust root in the input CA bundle when using private
+certificates.
+
 The worker owns a loopback RTSP bridge. It intercepts an initial 301/302, verifies
 the next TLS connection, then constructs a new redirect to a fresh owned loopback
 listener. FFmpeg repeats its handshake through that listener. Remote redirect
 responses are never forwarded to the decoder. Location supplies the destination
 path and query; the bridge adds no inherited token. The CDN still
 independently authorizes and consumes its bound admission ticket before media.
+On Linux, each loopback connection must belong to the actual decoder process
+(or the in-process RTSP probe). The bridge checks the connected TCP socket
+against that process's `/proc` descriptors before forwarding any bytes, including
+after redirects. A different local process cannot take the decoder's first
+connection. The service must be able to read its child process's `/proc` entries;
+if that check is unavailable, the input fails closed.
 
 Only absolute strict `rtsps` destinations are accepted. Plaintext, other schemes,
 userinfo, fragments, invalid URI escapes, port zero, unsupported 3xx and ambiguous
-headers fail closed. An input containing username/password can follow redirects
-only to its original normalized hostname and effective port (default 322).
-Changing either is rejected before connecting, including a DNS alias pointing to
-the same server. After verifying the target TLS connection, the bridge copies
+headers fail closed. An unapproved hostname or port is rejected before DNS or
+TCP connection on every redirect hop. After verifying the target TLS connection, the bridge copies
 only the originally configured userinfo into the owned loopback handoff. Remote
 Location userinfo remains rejected. URL-cycle comparison excludes credentials.
 
@@ -54,6 +75,7 @@ fallback/retry and shared-ingest ownership remain unchanged.
 
 Owned TLS tests cover target identity/trust/expiry rejection before application
 data, invalid URI/framing, credentialed inputs, established-session rejection,
+foreign local connectors at the initial and redirected listener,
 exact/changing-query cycles, cancellation during redirected TLS setup, unused
 handoff expiry and continued media beyond the initial routing deadline. No
 official Flussonic component is a runtime, build or test dependency. Sustained

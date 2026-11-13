@@ -85,7 +85,11 @@ async fn get(
 }
 
 async fn names(app: &Arc<App>, kind: &str, pairs: &[(&str, &str)], expected: &[&str]) {
-    let (status, body) = get(app, kind, pairs, true).await;
+    let mut query = pairs.to_vec();
+    if kind == "streams" && !query.iter().any(|(key, _)| *key == "sort") {
+        query.push(("sort", "name"));
+    }
+    let (status, body) = get(app, kind, &query, true).await;
     assert_eq!(status, StatusCode::OK, "{pairs:?}: {body}");
     let actual = body[kind]
         .as_array()
@@ -95,6 +99,34 @@ async fn names(app: &Arc<App>, kind: &str, pairs: &[(&str, &str)], expected: &[&
         .collect::<Vec<_>>();
     assert_eq!(actual, expected, "{pairs:?}");
     assert_eq!(body["estimated_count"], expected.len(), "{pairs:?}");
+}
+
+#[tokio::test]
+async fn configured_stream_responses_identify_the_server_and_configuration_origin() {
+    let (_dir, app) = fixture();
+    let (config_status, config) = get(&app, "config", &[], true).await;
+    assert_eq!(config_status, StatusCode::OK);
+    let (status, list) = get(&app, "streams", &[], true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["server_id"], config["server_id"]);
+    for row in list["streams"].as_array().unwrap() {
+        assert_eq!(row["named_by"], "config");
+        assert!(row["config_on_disk"].get("named_by").is_none());
+    }
+
+    let (status, item) = get(&app, "streams/alpha", &[], true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(item["named_by"], "config");
+    assert!(item["config_on_disk"].get("named_by").is_none());
+
+    let (status, selected) = get(&app, "streams", &[("select", "name,named_by")], true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(selected["server_id"], config["server_id"]);
+    assert_eq!(selected["streams"].as_array().unwrap().len(), 4);
+    for row in selected["streams"].as_array().unwrap() {
+        assert_eq!(row.as_object().unwrap().len(), 2);
+        assert_eq!(row["named_by"], "config");
+    }
 }
 
 #[tokio::test]
@@ -286,7 +318,7 @@ async fn filtering_precedes_search_sort_cursor_limit_and_selection() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         first,
-        json!({"estimated_count":2,"prev":null,"timing":{},"next":first["next"],"streams":[{"name":"gamma","title":"News 100%_HD"}]})
+        json!({"estimated_count":2,"timing":{},"server_id":first["server_id"],"next":first["next"],"streams":[{"name":"gamma","title":"News 100%_HD"}]})
     );
     let cursor = first["next"].as_str().unwrap();
     let mut next = pairs.to_vec();
@@ -295,7 +327,7 @@ async fn filtering_precedes_search_sort_cursor_limit_and_selection() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         second,
-        json!({"estimated_count":2,"next":null,"prev":second["prev"],"timing":{},"streams":[{"name":"alpha","title":"News HD"}]})
+        json!({"estimated_count":2,"prev":second["prev"],"timing":{},"server_id":second["server_id"],"streams":[{"name":"alpha","title":"News HD"}]})
     );
     assert!(second["prev"].is_string());
     names(

@@ -1,6 +1,28 @@
 #[path = "support/decoder_readiness.rs"]
 mod readiness;
 use std::net::UdpSocket;
+fn wait_for_sleep_exec(child: &mut std::process::Child) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if std::fs::read_link(format!("/proc/{}/exe", child.id()))
+            .ok()
+            .and_then(|path| path.file_name().map(|name| name == "sleep"))
+            == Some(true)
+        {
+            return;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "sleep exited before exec"
+        );
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("sleep did not exec");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
 #[test]
 fn receiver_readiness_requires_its_actual_sockets_and_observes_without_binding() {
     let (first, second) = loop {
@@ -18,6 +40,7 @@ fn receiver_readiness_requires_its_actual_sockets_and_observes_without_binding()
         .arg("5")
         .spawn()
         .unwrap();
+    wait_for_sleep_exec(&mut child);
     let foreign = readiness::ready(child.id(), &ports);
     child.kill().unwrap();
     child.wait().unwrap();

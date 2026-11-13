@@ -1,6 +1,218 @@
 use flussonix::config::{ConfigStore, merge};
 use serde_json::json;
 #[test]
+fn named_balancer_collection_defaults_and_persists_with_peer_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let store = ConfigStore::open(&path).unwrap();
+    assert_eq!(store.snapshot()["balancers"], json!([]));
+    store.put("peers", "cdn-a", json!({"api_url":"http://127.0.0.1:19001","public_payload_url":"http://127.0.0.1:19001"})).unwrap();
+    let revision = store.revision();
+    let saved = store
+        .put(
+            "balancers",
+            "lb0",
+            json!({"mode":"bitrate","servers":[{"name":"cdn-a"}]}),
+        )
+        .unwrap();
+    assert_eq!(saved["name"], "lb0");
+    assert_eq!(store.revision(), revision + 1);
+    drop(store);
+    let reopened = ConfigStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.snapshot()["balancers"],
+        json!([{"name":"lb0","mode":"bitrate","servers":[{"name":"cdn-a"}]}])
+    );
+}
+#[test]
+fn named_balancer_rejects_invalid_membership_and_policy_without_saving() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(dir.path().join("config.json")).unwrap();
+    store.put("peers", "cdn-a", json!({"api_url":"http://127.0.0.1:19001","public_payload_url":"http://127.0.0.1:19001"})).unwrap();
+    let before = store.snapshot();
+    for (name, row) in [
+        ("lb0", json!({"servers":[]})),
+        ("lb0", json!({"servers":[{"name":"missing"}]})),
+        (
+            "lb0",
+            json!({"servers":[{"name":"cdn-a"},{"name":"cdn-a"}]}),
+        ),
+        ("lb0", json!({"mode":"random","servers":[{"name":"cdn-a"}]})),
+        (
+            "lb0",
+            json!({"servers":[{"name":"cdn-a","max_bitrate":-1}]}),
+        ),
+        (
+            "lb0",
+            json!({"servers":[{"name":"cdn-a","max_bitrate":1.5}]}),
+        ),
+        (
+            "lb0",
+            json!({"servers":[{"name":"cdn-a","countries":["us"]}]}),
+        ),
+        (
+            "lb0",
+            json!({"servers":[{"name":"cdn-a","countries":["US","US"]}]}),
+        ),
+        (
+            "lb0",
+            json!({"servers":[{"name":"cdn-a","countries_default":"yes"}]}),
+        ),
+        (
+            "lb0",
+            json!({"servers":[{"name":"cdn-a","unexpected":true}]}),
+        ),
+        (
+            "lb0",
+            json!({"servers":[{"name":"cdn-a"}],"unexpected":true}),
+        ),
+        ("lb0/child", json!({"servers":[{"name":"cdn-a"}]})),
+    ] {
+        assert!(
+            store.put("balancers", name, row).is_err(),
+            "accepted invalid balancer {name}"
+        );
+        assert_eq!(store.snapshot(), before);
+    }
+}
+#[test]
+fn named_balancer_collisions_and_peer_removal_fail_at_save_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(dir.path().join("config.json")).unwrap();
+    store.put("peers", "cdn-a", json!({"api_url":"http://127.0.0.1:19001","public_payload_url":"http://127.0.0.1:19001"})).unwrap();
+    store
+        .put(
+            "streams",
+            "lb0/child",
+            json!({"inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    assert!(
+        store
+            .put("balancers", "lb0", json!({"servers":[{"name":"cdn-a"}]}))
+            .is_err()
+    );
+    store.delete("streams", "lb0/child").unwrap();
+    store.put("balancers", "lb0", json!({"servers":[{"name":"cdn-a","max_bitrate":0,"countries":["US"],"countries_default":true}]})).unwrap();
+    let before = store.snapshot();
+    assert!(
+        store
+            .put(
+                "streams",
+                "lb0/child",
+                json!({"inputs":[{"url":"testsrc://"}]})
+            )
+            .is_err()
+    );
+    assert!(store.delete("peers", "cdn-a").is_err());
+    assert_eq!(store.snapshot(), before);
+}
+#[test]
+fn named_balancer_legacy_file_and_collection_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(
+            &json!({"streams":[],"templates":[],"peers":[],"sources":[],"auth_backends":[]}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let store = ConfigStore::open(&path).unwrap();
+    assert_eq!(store.snapshot()["balancers"], json!([]));
+    store.put("peers", "cdn-a", json!({"api_url":"http://127.0.0.1:19001","public_payload_url":"http://127.0.0.1:19001"})).unwrap();
+    let rows = (0..64)
+        .map(|index| json!({"name":format!("lb{index}"),"servers":[{"name":"cdn-a"}]}))
+        .collect::<Vec<_>>();
+    assert!(store.validate(json!({"balancers":rows})).is_ok());
+    let rows = (0..65)
+        .map(|index| json!({"name":format!("lb{index}"),"servers":[{"name":"cdn-a"}]}))
+        .collect::<Vec<_>>();
+    assert!(store.validate(json!({"balancers":rows})).is_err());
+    let servers = (0..65)
+        .map(|index| json!({"name":format!("cdn-{index}")}))
+        .collect::<Vec<_>>();
+    assert!(
+        store
+            .put("balancers", "lb0", json!({"servers":servers}))
+            .is_err()
+    );
+}
+#[test]
+fn named_balancer_all_modes_accept_optional_and_zero_bitrate_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(dir.path().join("config.json")).unwrap();
+    store.put("peers", "cdn-a", json!({"api_url":"http://127.0.0.1:19001","public_payload_url":"http://127.0.0.1:19001"})).unwrap();
+    for (index, mode) in ["bitrate", "usage", "clients", "streams"]
+        .iter()
+        .enumerate()
+    {
+        store
+            .put(
+                "balancers",
+                &format!("lb{index}"),
+                json!({"mode":mode,"servers":[{"name":"cdn-a"}]}),
+            )
+            .unwrap();
+        store
+            .put(
+                "balancers",
+                &format!("lb{index}"),
+                json!({"servers":[{"name":"cdn-a","max_bitrate":0}]}),
+            )
+            .unwrap();
+    }
+    store
+        .put(
+            "balancers",
+            "lb-default",
+            json!({"servers":[{"name":"cdn-a"}]}),
+        )
+        .unwrap();
+}
+#[test]
+fn named_balancer_requires_safe_public_delivery_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(dir.path().join("config.json")).unwrap();
+    store
+        .put(
+            "peers",
+            "cdn-a",
+            json!({"api_url":"http://127.0.0.1:19001"}),
+        )
+        .unwrap();
+    assert!(
+        store
+            .put("balancers", "lb0", json!({"servers":[{"name":"cdn-a"}]}))
+            .is_err()
+    );
+    store
+        .put(
+            "peers",
+            "cdn-a",
+            json!({"public_payload_url":"http://user:secret@127.0.0.1:19001"}),
+        )
+        .unwrap();
+    assert!(
+        store
+            .put("balancers", "lb0", json!({"servers":[{"name":"cdn-a"}]}))
+            .is_err()
+    );
+    store
+        .put(
+            "peers",
+            "cdn-a",
+            json!({"public_payload_url":"https://cdn.example/path?token=secret"}),
+        )
+        .unwrap();
+    assert!(
+        store
+            .put("balancers", "lb0", json!({"servers":[{"name":"cdn-a"}]}))
+            .is_err()
+    );
+}
+#[test]
 fn partial_update_keeps_omitted_values_and_null_removes_feature() {
     let old = json!({"title":"News","inputs":[{"url":"hls://example.net/live.m3u8"}],"transcoder":{"vb":800,"ab":64}});
     assert_eq!(
@@ -130,6 +342,87 @@ fn invalid_auth_settings_never_save_or_disable_inherited_protection() {
             assert_eq!(store.snapshot(), before);
         }
     }
+}
+
+#[test]
+fn iptv_policy_saves_exactly_and_rejects_suffixes_and_callback_fields() {
+    let d = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(d.path().join("c.json")).unwrap();
+    store
+        .put(
+            "templates",
+            "subscriber",
+            json!({"on_play":{"url":"iptv://"}}),
+        )
+        .unwrap();
+    store
+        .put(
+            "streams",
+            "news",
+            json!({"template":"subscriber","inputs":[{"url":"testsrc://"}]}),
+        )
+        .unwrap();
+    assert_eq!(
+        store.effective("news").unwrap()["on_play"]["url"],
+        "iptv://"
+    );
+    for policy in [
+        json!("iptv://suffix"),
+        json!({"url":"iptv://x"}),
+        json!({"url":"iptv://","session_keys":["name","proto"]}),
+        json!({"url":"iptv://","max_sessions":2}),
+    ] {
+        let before = store.snapshot();
+        assert!(
+            store
+                .put("streams", "bad", json!({"on_play":policy}))
+                .is_err()
+        );
+        assert_eq!(store.snapshot(), before);
+    }
+    assert!(
+        store
+            .put("auth_backends", "invalid", json!({"url":"iptv://"}))
+            .is_err()
+    );
+}
+
+#[test]
+fn iptv_policy_rejects_tokenless_outputs_even_when_inherited_or_added_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(dir.path().join("c.json")).unwrap();
+    store.put("streams", "news", json!({"inputs":[{"url":"testsrc://"}],"flussonix_rtp_outputs":[{"url":"rtp://127.0.0.1:39000"}]})).unwrap();
+    let before = store.snapshot();
+    assert!(
+        store
+            .put("streams", "news", json!({"on_play":"iptv://"}))
+            .is_err()
+    );
+    assert_eq!(store.snapshot(), before);
+    store
+        .put("templates", "subscriber", json!({"on_play":"iptv://"}))
+        .unwrap();
+    assert!(
+        store
+            .put("streams", "news", json!({"template":"subscriber"}))
+            .is_err()
+    );
+    store
+        .put(
+            "templates",
+            "push",
+            json!({"pushes":[{"url":"srt://127.0.0.1:39001"}]}),
+        )
+        .unwrap();
+    assert!(
+        store
+            .put(
+                "streams",
+                "new",
+                json!({"template":"push","on_play":"iptv://","inputs":[{"url":"testsrc://"}]})
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -346,6 +639,47 @@ fn native_content_identity_and_replica_groups_are_validated_and_inherited() {
 }
 
 #[test]
+fn vendor_group_pin_edits_validate_atomically() {
+    use serde_json::json;
+    let d = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(d.path().join("config.json")).unwrap();
+    let source = "m4s://owned-origin.invalid";
+    store
+        .put(
+            "sources",
+            source,
+            json!({
+                "flussonix_source_kind":"flussonic",
+                "cluster_key":"owned-cluster-key",
+                "on_play":"true",
+                "group_config":{"paid":{"flussonix_token_sha256":"a".repeat(64)}},
+                "flussonix_group_pins":{"region/news":["paid"]}
+            }),
+        )
+        .unwrap();
+    let before = store.snapshot();
+    let revision = store.revision();
+    for pins in [
+        json!([]),
+        json!({"region/*":["paid"]}),
+        json!({"region/news":[]}),
+        json!({"region/news":["unknown"]}),
+        json!({"region/news":["paid","paid"]}),
+        json!({"region/news":vec!["paid";65]}),
+    ] {
+        assert!(
+            store
+                .put("sources", source, json!({"flussonix_group_pins":pins}))
+                .is_err()
+        );
+        assert_eq!(store.snapshot(), before);
+        assert_eq!(store.revision(), revision);
+    }
+    let reopened = ConfigStore::open(d.path().join("config.json")).unwrap();
+    assert_eq!(reopened.snapshot(), before);
+}
+
+#[test]
 fn rtsp_udp_input_option_is_validated_inherited_and_persisted() {
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("c.json");
@@ -379,6 +713,54 @@ fn rtsp_udp_input_option_is_validated_inherited_and_persisted() {
     drop(store);
     let store = ConfigStore::open(path).unwrap();
     assert_eq!(store.effective("owned").unwrap()["inputs"][0]["rtp"], "udp");
+}
+
+#[test]
+fn rtsp_startup_mode_is_inherited_and_rejects_unrelated_inputs() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("c.json");
+    let store = ConfigStore::open(&path).unwrap();
+    store
+        .put(
+            "templates",
+            "camera",
+            json!({"inputs":[{"url":"rtsp://camera/live","flussonix_rtsp_startup":"h264"}]}),
+        )
+        .unwrap();
+    store
+        .put(
+            "streams",
+            "owned",
+            json!({"template":"camera","static":false}),
+        )
+        .unwrap();
+    assert_eq!(
+        store.effective("owned").unwrap()["inputs"][0]["flussonix_rtsp_startup"],
+        "h264"
+    );
+    store.put("templates", "camera", json!({"inputs":[{"url":"rtsps://camera/live","flussonix_rtsp_startup":"conservative"}]})).unwrap();
+    assert_eq!(
+        store.effective("owned").unwrap()["inputs"][0]["flussonix_rtsp_startup"],
+        "conservative"
+    );
+    for input in [
+        json!({"url":"rtsp://camera/live","flussonix_rtsp_startup":"unknown"}),
+        json!({"url":"rtsp://camera/live","flussonix_rtsp_startup":true}),
+        json!({"url":"hls://camera/live/index.m3u8","flussonix_rtsp_startup":"h264"}),
+        json!({"url":"publish://","flussonix_rtsp_startup":"h264"}),
+    ] {
+        assert!(
+            store
+                .put("streams", "owned", json!({"inputs":[input]}))
+                .is_err()
+        );
+    }
+    drop(store);
+    let reloaded = ConfigStore::open(path).unwrap();
+    assert_eq!(
+        reloaded.effective("owned").unwrap()["inputs"][0]["flussonix_rtsp_startup"],
+        "conservative"
+    );
 }
 
 #[test]
@@ -420,6 +802,41 @@ fn rtsps_ca_input_is_persisted_inherited_and_rejects_unsafe_options() {
                 .put("streams", "owned", json!({"inputs":[input]}))
                 .is_err()
         );
+        assert_eq!(store.snapshot(), saved);
+    }
+}
+
+#[test]
+fn srt_input_options_are_checked_before_a_stream_is_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(dir.path().join("c.json")).unwrap();
+    store
+        .put(
+            "streams",
+            "owned",
+            json!({"inputs":[{"url":"srt://127.0.0.1:9000#passphrase=owned#input-secret-123"}]}),
+        )
+        .unwrap();
+    store
+        .put(
+            "streams",
+            "owned",
+            json!({"inputs":[{"url":"srt://127.0.0.1:9000?mode=caller&passphrase=owned-input-secret&tsbpd=0&srt_streamid=owned-route"}]}),
+        )
+        .unwrap();
+    let saved = store.snapshot();
+    for url in [
+        "srt://127.0.0.1:9000?passphrase=owned-input-secret&unknown=1",
+        "srt://127.0.0.1:9000?passphrase=owned-input-secret&passphrase=other-secret",
+        "srt://127.0.0.1:9000?passphrase=owned-input-secret&pbkeylen=48",
+        "srt://127.0.0.1:9000?mode=rendezvous",
+        "srt://127.0.0.1:9000?mode=listener&streamid=misleading-id",
+        "srt://user:secret@127.0.0.1:9000",
+    ] {
+        let error = store
+            .put("streams", "owned", json!({"inputs":[{"url":url}]}))
+            .unwrap_err();
+        assert!(!error.contains("owned-input-secret"));
         assert_eq!(store.snapshot(), saved);
     }
 }
@@ -754,6 +1171,151 @@ fn nvidia_hevc_profile_preserves_independent_audio_and_template_inheritance() {
         s.effective("owned").unwrap()["transcoder"]["encoder"],
         "hevc_nvenc"
     );
+}
+
+#[test]
+fn rtsp_input_urls_reject_malformed_targets_before_saving() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(dir.path().join("rtsp.json")).unwrap();
+    store
+        .put(
+            "streams",
+            "owned",
+            json!({"inputs":[{"url":"rtsp://user:owned-secret@camera:554/live"}]}),
+        )
+        .unwrap();
+    let saved = store.snapshot();
+    for url in [
+        "rtsp://user:owned-secret@camera/live\nfile '/tmp/owned'",
+        "rtsp-udp://camera/live#redirect",
+        "rtsp2://:554/live",
+        "rtsps://camera/live\r",
+        "rtsp://camera/live?token=%GGowned-secret",
+        "rtsp://camera:0/live",
+    ] {
+        let error = store
+            .put("streams", "owned", json!({"inputs":[{"url":url}]}))
+            .unwrap_err();
+        assert!(!error.contains("owned-secret"));
+        assert_eq!(store.snapshot(), saved);
+    }
+}
+
+#[test]
+fn rtsps_redirect_origins_validate_and_inherit() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ConfigStore::open(dir.path().join("redirects.json")).unwrap();
+    let approved = json!(["rtsps://CDN.example:322", "rtsps://backup.example:8322/"]);
+    store
+        .put(
+            "templates",
+            "camera",
+            json!({"inputs":[{"url":"rtsps://lb.example/live","flussonix_rtsps_redirect_origins":approved}]}),
+        )
+        .unwrap();
+    store
+        .put(
+            "streams",
+            "owned",
+            json!({"template":"camera","static":false}),
+        )
+        .unwrap();
+    assert_eq!(
+        store.effective("owned").unwrap()["inputs"][0]["flussonix_rtsps_redirect_origins"],
+        approved
+    );
+    store
+        .put(
+            "streams",
+            "owned",
+            json!({"inputs":[{"url":"rtsps://lb.example/live","flussonix_rtsps_redirect_origins":["rtsps://override.example:9443"]}]}),
+        )
+        .unwrap();
+    assert_eq!(
+        store.effective("owned").unwrap()["inputs"][0]["flussonix_rtsps_redirect_origins"],
+        json!(["rtsps://override.example:9443"])
+    );
+    let before = store.snapshot();
+    let invalid = [
+        json!(["rtsps://cdn.example/a"]),
+        json!(["rtsps://cdn.example/live/.."]),
+        json!(["rtsps://cdn.example/%2e"]),
+        json!(["rtsps://cdn.example?"]),
+        json!(["rtsps://cdn.example#"]),
+        json!(["rtsps://cdn.example?token=hidden"]),
+        json!(["rtsps://cdn.example/#fragment"]),
+        json!(["rtsps://user:secret@cdn.example"]),
+        json!(["rtsps://@cdn.example"]),
+        json!(["rtsp://cdn.example"]),
+        json!(["rtsps://*.example"]),
+        json!(["rtsps://cdn.example:0"]),
+        json!(["rtsps://cdn.example", "rtsps://CDN.example:322/"]),
+        json!(
+            (0..17)
+                .map(|n| format!("rtsps://cdn{n}.example"))
+                .collect::<Vec<_>>()
+        ),
+        json!("rtsps://cdn.example"),
+        json!([42]),
+    ];
+    for roots in invalid {
+        let error = store
+            .put(
+                "streams",
+                "owned",
+                json!({"inputs":[{"url":"rtsps://lb.example/live","flussonix_rtsps_redirect_origins":roots}]}),
+            )
+            .unwrap_err();
+        assert!(!error.contains("secret"));
+        assert_eq!(store.snapshot(), before);
+    }
+    assert!(store
+        .put(
+            "streams",
+            "owned",
+            json!({"inputs":[{"url":"rtsp://lb.example/live","flussonix_rtsps_redirect_origins":[]}]}),
+        )
+        .is_err());
+    assert_eq!(store.snapshot(), before);
+}
+
+#[test]
+fn redirect_origin_policy_normalizes_and_scopes() {
+    use flussonix::tls_input::RedirectOrigins;
+    let policy = RedirectOrigins::parse(
+        "rtsps://lb.example/live",
+        Some(&json!([
+            "rtsps://CDN.example:322/",
+            "rtsps://backup.example:8322"
+        ])),
+    )
+    .unwrap();
+    for allowed in [
+        "rtsps://LB.example:322/other",
+        "rtsps://cdn.example/other",
+        "rtsps://backup.example:8322/other",
+    ] {
+        assert!(
+            policy.permits(&url::Url::parse(allowed).unwrap()),
+            "{allowed}"
+        );
+    }
+    for denied in [
+        "rtsps://cdn.example:323/other",
+        "rtsps://unknown.example/other",
+    ] {
+        assert!(
+            !policy.permits(&url::Url::parse(denied).unwrap()),
+            "{denied}"
+        );
+    }
+    let credentialed = RedirectOrigins::parse(
+        "rtsps://user:secret@lb.example/live",
+        Some(&json!(["rtsps://cdn.example"])),
+    )
+    .unwrap();
+    assert!(credentialed.permits(&url::Url::parse("rtsps://lb.example/other").unwrap()));
+    assert!(!credentialed.permits(&url::Url::parse("rtsps://cdn.example/other").unwrap()));
 }
 
 #[test]

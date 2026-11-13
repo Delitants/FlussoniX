@@ -3,7 +3,7 @@
 use serde_json::Value;
 use std::{net::SocketAddr, process::Stdio, time::Duration};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::TcpStream,
     process::{Child, Command},
     task::JoinSet,
@@ -45,6 +45,38 @@ fn signal(child: &Child, signal: i32) {
     assert_eq!(unsafe { libc::kill(child.id().unwrap() as i32, signal) }, 0);
 }
 
+async fn successful_exit(child: &mut Child, context: &str) {
+    let mut stderr = child.stderr.take().expect("owned daemon stderr");
+    let stderr = tokio::spawn(async move {
+        const LIMIT: usize = 16 * 1024;
+        let mut kept = Vec::new();
+        let mut chunk = [0; 1024];
+        loop {
+            let read = stderr.read(&mut chunk).await.unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            let remaining = LIMIT.saturating_sub(kept.len());
+            kept.extend_from_slice(&chunk[..read.min(remaining)]);
+        }
+        kept
+    });
+    let status = match tokio::time::timeout(Duration::from_secs(8), child.wait()).await {
+        Ok(status) => status.unwrap(),
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            panic!("{context}: owned daemon did not exit within eight seconds");
+        }
+    };
+    let stderr = stderr.await.unwrap();
+    assert!(
+        status.success(),
+        "{context}: owned daemon exited with {status:?}; bounded stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
 async fn response<S: AsyncRead + AsyncWrite + Unpin>(mut socket: S, rtsp: bool) {
     let request = if rtsp {
         "OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n"
@@ -62,6 +94,28 @@ async fn response<S: AsyncRead + AsyncWrite + Unpin>(mut socket: S, rtsp: bool) 
     .unwrap();
     let expected = if rtsp { "RTSP/1.0 200" } else { "HTTP/1.1 200" };
     assert!(line.starts_with(expected), "unexpected response: {line}");
+}
+
+// RTSP permits only a bounded number of unauthenticated sockets per IP. A
+// connection picked arbitrarily from the 256 queued handshakes may therefore
+// be rejected even when the listener backlog is healthy.
+async fn rtsp_probe<S: AsyncRead + AsyncWrite + Unpin>(mut socket: S) -> bool {
+    if socket
+        .write_all(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let mut line = String::new();
+    matches!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            BufReader::new(socket).read_line(&mut line)
+        )
+        .await,
+        Ok(Ok(n)) if n > 0
+    ) && line.starts_with("RTSP/1.0 200")
 }
 
 // A regression to the generic bind path (backlog 128) must fail: there are
@@ -115,8 +169,21 @@ async fn delayed_accept_burst(field: &str, tls: bool, rtsp: bool) {
         })
         .await
         .unwrap();
+        // The HTTPS pre-TLS gate deliberately rejects excess same-IP
+        // handshakes. Keep the first queued socket as the protocol probe;
+        // a later arbitrary socket may be rejected while the burst drains.
+        let sentinel = if tls && !rtsp {
+            Some(
+                tokio::time::timeout(Duration::from_millis(750), TcpStream::connect(address))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
         let mut pending = JoinSet::new();
-        for _ in 0..256 {
+        for _ in 0..(256 - usize::from(sentinel.is_some())) {
             pending.spawn(async move {
                 tokio::time::timeout(Duration::from_millis(750), TcpStream::connect(address)).await
             });
@@ -128,8 +195,36 @@ async fn delayed_accept_burst(field: &str, tls: bool, rtsp: bool) {
             }
         }
         signal(&child, libc::SIGCONT);
-        let connected = clients.len();
-        if let Some(socket) = clients.pop() {
+        let connected = clients.len() + usize::from(sentinel.is_some());
+        if rtsp {
+            let mut probes = JoinSet::new();
+            for socket in clients {
+                let client_config = tls.then(|| cert.client());
+                probes.spawn(async move {
+                    if let Some(client_config) = client_config {
+                        let connector = tokio_rustls::TlsConnector::from(client_config);
+                        match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            connector.connect("localhost".try_into().unwrap(), socket),
+                        )
+                        .await
+                        {
+                            Ok(Ok(socket)) => rtsp_probe(socket).await,
+                            _ => false,
+                        }
+                    } else {
+                        rtsp_probe(socket).await
+                    }
+                });
+            }
+            let mut served = 0;
+            while let Some(result) = probes.join_next().await {
+                if result.unwrap() {
+                    served += 1;
+                }
+            }
+            assert!(served > 0, "no queued RTSP connection received a response");
+        } else if let Some(socket) = sentinel.or_else(|| clients.pop()) {
             // Free the remaining handshake slots before the protocol probe.
             drop(clients);
             if tls {
@@ -147,13 +242,7 @@ async fn delayed_accept_burst(field: &str, tls: bool, rtsp: bool) {
             }
         }
         signal(&child, libc::SIGTERM);
-        assert!(
-            tokio::time::timeout(Duration::from_secs(8), child.wait())
-                .await
-                .unwrap()
-                .unwrap()
-                .success()
-        );
+        successful_exit(&mut child, &format!("{field} at {bind} after SIGTERM")).await;
         assert_eq!(
             connected, 256,
             "{field} at {bind}: accept queue lost burst connections"
@@ -176,6 +265,20 @@ async fn rtsp_queues_burst_while_accepts_are_paused() {
 #[tokio::test]
 async fn rtsps_queues_burst_while_accepts_are_paused() {
     delayed_accept_burst("rtsps_listen", true, true).await;
+}
+
+#[tokio::test]
+async fn sigint_immediately_after_readiness_uses_graceful_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = command(dir.path())
+        .args(["--listen", "127.0.0.1:0"])
+        .spawn()
+        .unwrap();
+    let status = startup(&mut child).await;
+    let address: SocketAddr = status["listen"].as_str().unwrap().parse().unwrap();
+    assert_ne!(address.port(), 0);
+    signal(&child, libc::SIGINT);
+    successful_exit(&mut child, "HTTP daemon after readiness-triggered SIGINT").await;
 }
 
 #[tokio::test]
@@ -214,12 +317,10 @@ async fn wildcard_ephemeral_binding_and_occupied_port_errors_are_preserved() {
             "second daemon hijacked an occupied listener"
         );
         signal(&child, libc::SIGTERM);
-        assert!(
-            tokio::time::timeout(Duration::from_secs(8), child.wait())
-                .await
-                .unwrap()
-                .unwrap()
-                .success()
-        );
+        successful_exit(
+            &mut child,
+            &format!("wildcard listener {bind} after SIGTERM"),
+        )
+        .await;
     }
 }

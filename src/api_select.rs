@@ -7,7 +7,15 @@ pub(crate) struct Selection<'a> {
 }
 
 impl<'a> Selection<'a> {
-    pub(crate) fn new(select: &'a str) -> Self {
+    pub(crate) fn new(select: &'a str) -> Result<Self, &'static str> {
+        const MAX_BYTES: usize = 16 * 1024;
+        const MAX_FIELDS: usize = 256;
+        if select.len() > MAX_BYTES {
+            return Err("select exceeds 16 KiB");
+        }
+        if select.split(',').take(MAX_FIELDS + 1).count() > MAX_FIELDS {
+            return Err("select exceeds 256 fields");
+        }
         let mut paths: Vec<Vec<&str>> = Vec::new();
         for field in select.split(',') {
             let path: Vec<_> = field.split('.').collect();
@@ -16,7 +24,7 @@ impl<'a> Selection<'a> {
             paths.retain(|old| !old.starts_with(&path) && !path.starts_with(old));
             paths.push(path);
         }
-        Self { paths }
+        Ok(Self { paths })
     }
 
     pub(crate) fn project(&self, row: &Value, stream: bool) -> Value {

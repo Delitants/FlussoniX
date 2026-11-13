@@ -10,6 +10,8 @@ The API extension `flussonix_rtp_outputs` accepts up to four destinations. Each 
 
 Output uses at most seven TS packets per datagram and flushes short aligned payloads after 10 ms. A bounded rate pacer, bounded broadcast subscription, cancellation and two-second write limits prevent a blocked destination from retaining a worker indefinitely. Invalid framing or queue overrun fails that destination; it does not silently discard part of a TS packet. Destination failures appear in stream status. An RTP sender has no delivery acknowledgement; packet counters confirm sends, not viewer reception.
 
+A configured MP2T destination remains active when a unicast receiver temporarily refuses UDP traffic. Refused media/report attempts increment `unreachable_packets`; status becomes `receiver_unavailable`, then returns to `sending` on a successful media send. The sender consumes and discards refused packets without saving or retransmitting old media. Attempts remain paced, the socket and SSRC stay stable, and cancellation still closes the destination. Other socket errors, stalled writes, invalid framing and queue overrun remain terminal. Send counters include only successful socket sends; they do not confirm receipt.
+
 Input validates RTP header versions, CSRC/extension/padding bounds, PT33 and complete TS packets. It pins the first valid media source address and SSRC for the generation, enforces an optional IP filter and reorders at most 64 packets. Gaps are released after the configured jitter delay; loss and duplicate counters remain visible. RTCP uses the consecutive port: periodic compound sender/receiver reports and SDES; feedback is sent only to the pinned media peer. Plain RTP does not authenticate a sender: use a source filter, protected network or SRTP.
 
 Original DVB and teletext track preservation follows Original subtitle tracks. Embedded CEA captions follow the existing copy/transcoding path. HLS subtitle conversion, pass-through and filtering remain independently controlled by HLS subtitles; RTP carries the processed TS output, not the separately filtered HLS variant.
@@ -23,3 +25,24 @@ On the qualification host, an independently extracted Intel iHD driver produced 
 A unicast input's interface setting must match its local bind address, or may restrict `0.0.0.0` to a concrete local IPv4 address. Multicast interface values cannot be wildcard, multicast or broadcast addresses. Multicast sender RTCP stays directed to the group; unicast receiver feedback is accepted on its source RTCP port and pins one valid participant (authenticated for SRTP). Multiple multicast receivers can consume media, while feedback counters summarize only that pinned participant.
 
 Multicast inputs bind their configured group address, so distinct groups may share RTP/RTCP ports and unrelated unicast cannot claim a multicast source. The parser checks TS adaptation occupancy and every flag-directed field length before source ownership or decoder writes. SDES feedback requires terminated, bounded, correctly aligned item lists.
+
+## Control-channel recovery qualification
+
+On Linux with libsrtp2 available, run the owned loopback qualification explicitly:
+
+```sh
+cargo test --locked --test direct_rtcp_recovery -- --ignored --test-threads=1 --nocapture
+```
+
+These two bounded tests keep RTP receiving while closing only the RTCP receiver,
+confirm a real pending ICMP error on the sender's own socket, and require a counted
+RTCP send refusal followed by media and control recovery. They also check retained
+SRTP/SRTCP authentication and replay state, cancellation, and socket release.
+They use synthetic null TS packets, so they do not qualify decoded media or throughput.
+
+The sender's report and error-receive branches race to consume the ICMP error.
+The tests fail if no send refusal is observed within eight attempts or the
+90-second case deadline. They are excluded from default CI because this finite
+probe cannot guarantee which branch wins. An observed SRTCP index gap does not
+identify the exact index of a refused packet. Fresh-receiver rollover setup
+remains subject to the limits in [the SRTP profile](direct-srtp.md).

@@ -81,6 +81,7 @@ pub(super) async fn admitted_source_with_limit(
                 user_agent: String::new(),
                 referer: String::new(),
                 host: String::new(),
+                finite_media: false,
             },
         )
         .await

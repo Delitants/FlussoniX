@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""Create credentials and render an optional FlussoniX systemd unit (Python 3.11+)."""
+import argparse
+import getpass
+import hashlib
+import ipaddress
+import json
+import math
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import uuid
+from urllib.parse import urlsplit
+
+
+def absolute(raw):
+    path = Path(raw)
+    resolved = path.resolve()
+    if any(not re.fullmatch(r'/[A-Za-z0-9_./:@+-]+', str(p)) for p in [path, resolved]) or path.is_symlink():
+        raise ValueError('use absolute, non-linked paths without spaces or substitution characters')
+    return resolved
+
+
+def read_regular(path, limit):
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC), 'rb') as f:
+        info = os.fstat(f.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise ValueError('input must be a bounded regular file')
+        data = f.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError('input exceeds size limit')
+        return data, info
+
+
+def create_file(path, data, mode):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+    identity = os.fstat(fd)
+    try:
+        with os.fdopen(fd, 'wb') as output:
+            os.fchmod(output.fileno(), mode)
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+    except BaseException:
+        try:
+            current = path.stat(follow_symlinks=False)
+            if (current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino):
+                path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def credentials(args):
+    if args.from_env:
+        user = os.environ.get('FLUSSONIX_ADMIN_USER', 'admin')
+        password = os.environ.get('FLUSSONIX_ADMIN_PASSWORD', '')
+        peer = os.environ.get('FLUSSONIX_PEER_KEY', '')
+    else:
+        user = args.admin_user
+        password = getpass.getpass('Saved admin password: ')
+        peer = getpass.getpass('Saved cluster peer key: ')
+    values = {'FLUSSONIX_ADMIN_USER': user, 'FLUSSONIX_ADMIN_PASSWORD': password, 'FLUSSONIX_PEER_KEY': peer}
+    if args.with_srt_passphrase:
+        srt_passphrase = (os.environ.get('FLUSSONIX_SRT_PLAY_PASSPHRASE', '')
+            if args.from_env else getpass.getpass('SRT playback passphrase: '))
+        if not 10 <= len(srt_passphrase) <= 79 or any(not 32 <= ord(c) <= 126 for c in srt_passphrase):
+            raise ValueError('SRT playback passphrase must be 10..79 printable ASCII characters')
+        values['FLUSSONIX_SRT_PLAY_PASSPHRASE'] = srt_passphrase
+    if any(not value or len(value) > 4096 or any(not 32 <= ord(c) <= 126 for c in value)
+           for value in values.values()) or len(peer) < 12 or ':' in user:
+        raise ValueError('credentials require printable ASCII; username cannot contain a colon; peer key needs at least 12 characters')
+    # EnvironmentFile double quotes preserve these characters when backslash escaped.
+    def quote(value):
+        for character in ['\\', '"', '`', '$']:
+            value = value.replace(character, '\\' + character)
+        return '"' + value + '"'
+    data = ''.join(f'{key}={quote(value)}\n' for key, value in values.items()).encode()
+    path = absolute(args.output)
+    create_file(path, data, 0o600)
+    print(f'Credentials saved to {path}')
+
+
+def can_access(path, account, groups, bits):
+    info = path.stat()
+    shift = 6 if info.st_uid == account.pw_uid else 3 if info.st_gid in groups else 0
+    return (info.st_mode >> shift) & bits == bits
+
+
+def traverse(path, account, groups):
+    for parent in [path, *path.parents]:
+        if not parent.is_dir() or not can_access(parent, account, groups, 1):
+            raise ValueError('service account cannot traverse a selected directory')
+
+
+def trusted_runtime_ancestors(path, account):
+    operator = os.geteuid()
+    for parent in path.parents:
+        info = parent.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0, operator, account.pw_uid}:
+            raise ValueError('runtime path has an untrusted ancestor')
+        if info.st_mode & 0o022 and not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX):
+            raise ValueError('runtime path has a writable ancestor')
+
+
+def trusted_install_path(path):
+    operator = os.geteuid()
+    for component in [path, *path.parents]:
+        info = component.stat(follow_symlinks=False)
+        if info.st_uid not in {0, operator} or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            raise ValueError('service executable path has an untrusted owner or file type')
+        if info.st_mode & 0o022 and not (
+                component != path and stat.S_ISDIR(info.st_mode) and
+                info.st_uid == 0 and info.st_mode & stat.S_ISVTX):
+            raise ValueError('service executable path is writable by another account')
+
+
+def verified_release(release, account, groups):
+    trusted_install_path(release)
+    trusted_install_path(release / 'manifest.json')
+    raw, _ = read_regular(release / 'manifest.json', 1024 * 1024)
+    manifest = json.loads(raw)
+    if not isinstance(manifest, dict) or manifest.get('format') != 1 or manifest.get('name') != 'FlussoniX':
+        raise ValueError('release requires a FlussoniX package manifest')
+    files = manifest.get('files')
+    if not isinstance(files, dict) or not {'bin/flussonix', 'web/index.html'} <= files.keys() or len(files) > 2048:
+        raise ValueError('release manifest is incomplete or exceeds limits')
+    total = 0
+    for name, row in files.items():
+        if not isinstance(row, dict) or type(row.get('bytes')) is not int or not isinstance(row.get('sha256'), str):
+            raise ValueError('invalid manifest payload metadata')
+        path = Path(name)
+        if path.is_absolute() or not path.parts or any(not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', p) for p in path.parts):
+            raise ValueError('invalid manifest payload path')
+        full = release / path
+        if any((release / Path(*path.parts[:i])).is_symlink() for i in range(1, len(path.parts) + 1)):
+            raise ValueError('release payload cannot contain links')
+        trusted_install_path(full)
+        data, _ = read_regular(full, 128 * 1024 * 1024)
+        total += len(data)
+        if total > 256 * 1024 * 1024 or len(data) != row['bytes'] or hashlib.sha256(data).hexdigest() != row['sha256']:
+            raise ValueError('release payload does not match its manifest')
+        traverse(full.parent, account, groups)
+        if not can_access(full, account, groups, 5 if name == 'bin/flussonix' else 4):
+            raise ValueError('service account cannot read or execute the release')
+    expected = set()
+    for name in files:
+        path = Path(name)
+        if path.parts[0] == 'web':
+            expected.add(path)
+            expected.update(parent for parent in path.parents if parent != Path('.'))
+    actual = {Path('web')}
+    for path in (release / 'web').rglob('*'):
+        if path.is_symlink() or len(actual) >= 2049 or not (path.is_file() or path.is_dir()):
+            raise ValueError('public web tree cannot contain links or unexpected entries')
+        actual.add(path.relative_to(release))
+    if actual != expected:
+        raise ValueError('public web tree must match the release manifest exactly')
+
+
+def listener(value):
+    match = re.fullmatch(r'(\[[0-9A-Fa-f:]+\]|[0-9.]+):([0-9]+)', value)
+    if not match:
+        raise ValueError('listener must be a literal IP address and port')
+    host, port = match.groups()
+    address = ipaddress.ip_address(host.strip('[]'))
+    if host.startswith('[') != (address.version == 6):
+        raise ValueError('use brackets only around IPv6 addresses')
+    port = int(port)
+    if address.is_multicast or not (port == 0 or 1024 <= port <= 65535):
+        raise ValueError('listener requires a unicast/wildcard IP and port 0 or 1024..65535')
+    return f'[{address}]:{port}' if address.version == 6 else f'{address}:{port}'
+
+
+def runtime_file(raw: str, account, groups: list[int], *, private: bool, max_bytes: int) -> Path:
+    path = absolute(raw)
+    _, info = read_regular(path, max_bytes)
+    traverse(path.parent, account, groups)
+    trusted_runtime_ancestors(path, account)
+    if not can_access(path, account, groups, 4):
+        raise ValueError('service account cannot read a selected runtime file')
+    if private:
+        if info.st_uid != account.pw_uid or info.st_mode & 0o077:
+            raise ValueError('private runtime file must be service-owned and owner-only')
+    elif info.st_uid not in (0, account.pw_uid) or info.st_mode & 0o022:
+        raise ValueError('runtime file has an unsafe owner or writable permissions')
+    return path
+
+
+def srtp_receiver_history(state: Path, account) -> Path:
+    """Check existing owner-only history names without creating or scanning them."""
+    ledger = state / 'srtp-receiver-ledger'
+    lock = state / 'srtp-receiver-ledger.lock'
+    present = [os.path.lexists(path) for path in (ledger, lock)]
+    if not any(present):
+        return ledger
+    if not all(present):
+        raise ValueError('SRTP receiver history and lock must both exist')
+    for path, limit in ((ledger, 8 + 65 * 1_000_000), (lock, 0)):
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC), 'rb') as file:
+            info = os.fstat(file.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != account.pw_uid
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                    or info.st_size > limit):
+                raise ValueError('SRTP receiver history or lock is unsafe')
+            if path == ledger:
+                if (info.st_size < 8 or (info.st_size - 8) % 65 != 0
+                        or file.read(8) != b'FXSRTP1\n'):
+                    raise ValueError('SRTP receiver history header is invalid')
+        current = path.stat(follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            raise ValueError('SRTP receiver history changed during validation')
+    return ledger
+
+
+def overlapping_bind(a: str, b: str) -> bool:
+    def split(value):
+        host, port = value.rsplit(':', 1)
+        return ipaddress.ip_address(host.strip('[]')), int(port)
+    first, first_port = split(a)
+    second, second_port = split(b)
+    if first_port == 0 or first_port != second_port:
+        return False
+    if first.version == second.version:
+        return first == second or first.is_unspecified or second.is_unspecified
+    return first.is_unspecified or second.is_unspecified
+
+
+def rtsp_ports(raw: str) -> str:
+    match = re.fullmatch(r'([0-9]{4,5})-([0-9]{4,5})', raw)
+    if not match:
+        raise ValueError('RTSP UDP ports require an inclusive even/odd range')
+    first, last = map(int, match.groups())
+    if first < 1024 or first % 2 or last > 65535 or last % 2 != 1 or not 2 <= last - first + 1 <= 256:
+        raise ValueError('RTSP UDP ports require 2..256 even/odd ports >=1024')
+    return raw
+
+
+def rtsp_mbps(raw: str) -> str:
+    if not re.fullmatch(r'[0-9]{1,5}(?:\.[0-9]{1,6})?', raw):
+        raise ValueError('RTSP UDP Mbps must be a decimal number')
+    value = float(raw)
+    if not math.isfinite(value) or not 1 <= value <= 10000:
+        raise ValueError('RTSP UDP Mbps must be within 1..10000')
+    return raw
+
+
+def srt_root(raw: str) -> str:
+    if len(raw) > 255 or not re.fullmatch(r'srt://(?:\[[0-9A-Fa-f:]+\]|[A-Za-z0-9.-]+):[0-9]{1,5}/?', raw):
+        raise ValueError('SRT public URL must be a credential-free listener root')
+    parsed = urlsplit(raw)
+    if parsed.scheme != 'srt' or not parsed.hostname or not parsed.port or parsed.path not in ('', '/'):
+        raise ValueError('SRT public URL requires a host and nonzero port')
+    host = parsed.hostname
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        if len(host) > 253 or any(not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label)
+                                 for label in host.split('.')):
+            raise ValueError('SRT public URL has an invalid hostname') from None
+    else:
+        if address.is_unspecified or address.is_multicast or address == ipaddress.ip_address('255.255.255.255'):
+            raise ValueError('SRT public URL requires a reachable host')
+    return raw
+
+
+def bounded_integer(raw: str, lower: int, upper: int, label: str) -> str:
+    if not re.fullmatch(r'[0-9]{1,5}', raw) or not lower <= int(raw) <= upper:
+        raise ValueError(f'{label} must be within {lower}..{upper}')
+    return raw
+
+
+def origin(raw: str, *, schemes: tuple[str, ...]) -> str:
+    if len(raw) > 255 or not re.fullmatch(r'https?://[A-Za-z0-9.\-\[\]:]+/?', raw):
+        raise ValueError('origin must be a credential-free HTTP(S) root')
+    value = urlsplit(raw)
+    if (value.scheme not in schemes or not value.hostname or value.port == 0
+            or value.username is not None or value.password is not None
+            or value.path not in ('', '/') or value.query or value.fragment):
+        raise ValueError('origin must be a credential-free HTTP(S) root')
+    host = value.hostname
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        if len(host) > 253 or any(not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label)
+                                 for label in host.split('.')):
+            raise ValueError('origin has an invalid hostname') from None
+    else:
+        if address.is_unspecified or address.is_multicast:
+            raise ValueError('origin requires a reachable host')
+    return raw
+
+
+def positive_decimal(raw: str) -> str:
+    if len(raw) > 400 or not re.fullmatch(r'(?:0|[1-9][0-9]*)(?:\.[0-9]+)?', raw):
+        raise ValueError('uplink Mbps must be a positive decimal number')
+    value = float(raw)
+    if not value > 0 or not math.isfinite(value):
+        raise ValueError('uplink Mbps must be positive and finite')
+    return raw
+
+
+def positive_u64(raw: str) -> str:
+    if len(raw) > 20 or not re.fullmatch(r'[1-9][0-9]*', raw) or int(raw) > 18446744073709551615:
+        raise ValueError('client limit must be a positive unsigned 64-bit integer')
+    return raw
+
+
+def render(args):
+    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,39}', args.instance):
+        raise ValueError('instance must contain lowercase letters, digits and hyphens')
+    account = pwd.getpwnam(args.user)
+    if account.pw_uid == 0:
+        raise ValueError('choose a non-root service account')
+    groups = os.getgrouplist(account.pw_name, account.pw_gid)
+    release, state, secret, ffmpeg = map(absolute, [args.release_dir, args.state_dir, args.credentials, args.ffmpeg])
+    if state.is_relative_to(release) or release.is_relative_to(state) or secret.is_relative_to(release):
+        raise ValueError('state and credentials must be separate from the release')
+    if not state.is_dir() or state.stat().st_uid != account.pw_uid or state.stat().st_mode & 0o077:
+        raise ValueError('state directory must belong to the service account with mode 0700')
+    traverse(state, account, groups)
+    trusted_runtime_ancestors(state, account)
+    if not can_access(state, account, groups, 7):
+        raise ValueError('service account needs read/write access to state')
+    srtp_ledger = srtp_receiver_history(state, account)
+    config = state / 'config.json'
+    if config.exists() or config.is_symlink():
+        _, info = read_regular(config, 16 * 1024 * 1024)
+        if info.st_uid != account.pw_uid or info.st_mode & 0o077 or not can_access(config, account, groups, 6):
+            raise ValueError('existing config must be private and readable/writable by the service account')
+    data, info = read_regular(secret, 32 * 1024)
+    trusted_runtime_ancestors(secret, account)
+    if info.st_uid not in [0, account.pw_uid] or info.st_mode & 0o077:
+        raise ValueError('credentials must be owner-only and belong to root or the service account')
+    if not data:
+        raise ValueError('credentials file is empty')
+    verified_release(release, account, groups)
+    if not ffmpeg.is_file() or not can_access(ffmpeg, account, groups, 5) or ffmpeg.is_relative_to('/opt/flussonic'):
+        raise ValueError('select an independently installed readable/executable FFmpeg')
+    trusted_install_path(ffmpeg)
+    traverse(ffmpeg.parent, account, groups)
+    listen = listener(args.listen)
+    secure = {}
+    for prefix in ('https', 'rtsps', 'fxlink'):
+        values = [getattr(args, prefix + suffix) for suffix in ('_listen', '_cert', '_key')]
+        if any(value is not None for value in values):
+            if not all(value is not None for value in values):
+                raise ValueError(f'{prefix.upper()} listener requires certificate and key')
+            secure[prefix] = (
+                listener(values[0]),
+                runtime_file(values[1], account, groups, private=False, max_bytes=1024 * 1024),
+                runtime_file(values[2], account, groups, private=True, max_bytes=1024 * 1024),
+            )
+    if args.https_only and 'https' not in secure:
+        raise ValueError('HTTPS-only requires an HTTPS listener')
+    rtsp_listen = listener(args.rtsp_listen) if args.rtsp_listen is not None else None
+    if args.rtsp_udp_ports is not None and rtsp_listen is None:
+        raise ValueError('RTSP UDP ports require an RTSP listener')
+    if args.rtsp_udp_mbps is not None and args.rtsp_udp_ports is None:
+        raise ValueError('RTSP UDP Mbps requires a port range')
+    udp_ports = rtsp_ports(args.rtsp_udp_ports) if args.rtsp_udp_ports is not None else None
+    udp_mbps = rtsp_mbps(args.rtsp_udp_mbps) if args.rtsp_udp_mbps is not None else None
+    tcp = ([] if args.https_only else [listen]) + [value for value in (
+        secure.get('https', (None,))[0], rtsp_listen, secure.get('rtsps', (None,))[0]) if value]
+    if any(overlapping_bind(a, b) for i, a in enumerate(tcp) for b in tcp[i + 1:]):
+        raise ValueError('TCP listeners overlap')
+    srt_listen = listener(args.srt_play_listen) if args.srt_play_listen is not None else None
+    if srt_listen is None and any((args.srt_play_public_url is not None, args.srt_play_latency is not None,
+                                  args.srt_play_client_limit is not None, args.srt_play_allow_direct_token)):
+        raise ValueError('SRT options require an SRT playback listener')
+    srt_public_url = srt_root(args.srt_play_public_url) if args.srt_play_public_url is not None else None
+    srt_latency = (bounded_integer(args.srt_play_latency, 1, 10000, 'SRT latency')
+                   if args.srt_play_latency is not None else None)
+    srt_limit = (bounded_integer(args.srt_play_client_limit, 1, 4096, 'SRT client limit')
+                 if args.srt_play_client_limit is not None else None)
+    if srt_listen is not None and 'fxlink' in secure and overlapping_bind(srt_listen, secure['fxlink'][0]):
+        raise ValueError('UDP listeners overlap')
+    if args.role is not None and args.role not in ('standalone', 'source', 'cdn', 'lb'):
+        raise ValueError('role must be standalone, source, cdn or lb')
+    if args.node_name is not None and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,62}', args.node_name):
+        raise ValueError('node name contains unsafe characters')
+    if args.uplink_interface is not None and not re.fullmatch(r'[A-Za-z0-9_.:-]{1,15}', args.uplink_interface):
+        raise ValueError('uplink interface contains unsafe characters')
+    uplink_mbps = positive_decimal(args.uplink_mbps) if args.uplink_mbps is not None else None
+    client_limit = positive_u64(args.client_limit) if args.client_limit is not None else None
+    iptv_data = None
+    if args.iptv_data is not None:
+        iptv_data = absolute(args.iptv_data)
+        if not iptv_data.is_relative_to(state) or iptv_data == state or not iptv_data.parent.is_dir():
+            raise ValueError('IPTV data must be inside the writable state directory')
+        traverse(iptv_data.parent, account, groups)
+        if not can_access(iptv_data.parent, account, groups, 7):
+            raise ValueError('service account cannot write the IPTV data directory')
+        if iptv_data.exists():
+            runtime_file(str(iptv_data), account, groups, private=True, max_bytes=64 * 1024 * 1024)
+            if not can_access(iptv_data, account, groups, 6):
+                raise ValueError('service account cannot update IPTV data')
+    iptv_public_origin = (origin(args.iptv_public_origin, schemes=('http', 'https'))
+                          if args.iptv_public_origin is not None else None)
+    iptv_authority = (origin(args.iptv_authority, schemes=('https',))
+                      if args.iptv_authority is not None else None)
+    iptv_secondary = (origin(args.iptv_authority_secondary, schemes=('https',))
+                      if args.iptv_authority_secondary is not None else None)
+    cluster_id = None
+    if args.iptv_authority_cluster_id is not None:
+        parsed_cluster_id = uuid.UUID(args.iptv_authority_cluster_id)
+        cluster_id = str(parsed_cluster_id)
+        if parsed_cluster_id.int == 0 or cluster_id != args.iptv_authority_cluster_id:
+            raise ValueError('IPTV cluster ID must use non-nil canonical UUID syntax')
+    if (iptv_secondary is None) != (cluster_id is None) or (iptv_secondary is not None and iptv_authority is None):
+        raise ValueError('second IPTV authority requires a primary origin and cluster ID')
+    if iptv_secondary is not None:
+        primary_url, secondary_url = urlsplit(iptv_authority), urlsplit(iptv_secondary)
+        def authority_endpoint(value):
+            host = value.hostname
+            try:
+                host = ipaddress.ip_address(host)
+            except ValueError:
+                pass
+            return host, value.port or 443
+        if authority_endpoint(primary_url) == authority_endpoint(secondary_url):
+            raise ValueError('IPTV authorities must have distinct origins')
+    if args.iptv_lease_authority and (iptv_authority is None or 'https' not in secure):
+        raise ValueError('IPTV lease authority requires an HTTPS listener and self origin')
+    if args.iptv_ha_db_config is not None and not args.iptv_lease_authority:
+        raise ValueError('IPTV HA database requires lease-authority mode')
+    ha_config = (runtime_file(args.iptv_ha_db_config, account, groups, private=True, max_bytes=16 * 1024)
+                 if args.iptv_ha_db_config is not None else None)
+    if args.iptv_authority_ca is not None and iptv_authority is None:
+        raise ValueError('IPTV authority CA requires an authority origin')
+    authority_ca = (runtime_file(args.iptv_authority_ca, account, groups, private=False, max_bytes=1024 * 1024)
+                    if args.iptv_authority_ca is not None else None)
+    name = 'flussonix-' + args.instance + '.service'
+    output = absolute(args.output)
+    if output.is_relative_to(release / 'web'):
+        raise ValueError('unit output cannot be inside the public web tree')
+    if output.name != name:
+        raise ValueError(f'output filename must be {name}')
+    command_args = [release / 'bin/flussonix', '--listen', listen,
+        '--config', state / 'config.json', '--media-dir', state / 'media', '--web-dir', release / 'web', '--ffmpeg', ffmpeg,
+        '--srtp-receiver-ledger', srtp_ledger]
+    for prefix in ('https', 'rtsps', 'fxlink'):
+        if prefix in secure:
+            for suffix, value in zip(('_listen', '_cert', '_key'), secure[prefix]):
+                command_args.extend(('--' + prefix + suffix.replace('_', '-'), value))
+    if rtsp_listen is not None:
+        command_args.extend(('--rtsp-listen', rtsp_listen))
+    if udp_ports is not None:
+        command_args.extend(('--rtsp-udp-ports', udp_ports))
+    if udp_mbps is not None:
+        command_args.extend(('--rtsp-udp-mbps', udp_mbps))
+    for name, value in (('srt_play_listen', srt_listen), ('srt_play_public_url', srt_public_url),
+                        ('srt_play_latency', srt_latency), ('srt_play_client_limit', srt_limit)):
+        if value is not None:
+            command_args.extend(('--' + name.replace('_', '-'), value))
+    if args.srt_play_allow_direct_token:
+        command_args.append('--srt-play-allow-direct-token')
+    for name, value in (('role', args.role), ('node_name', args.node_name),
+                        ('uplink_mbps', uplink_mbps), ('client_limit', client_limit),
+                        ('uplink_interface', args.uplink_interface), ('iptv_data', iptv_data),
+                        ('iptv_public_origin', iptv_public_origin), ('iptv_ha_db_config', ha_config),
+                        ('iptv_authority', iptv_authority), ('iptv_authority_secondary', iptv_secondary),
+                        ('iptv_authority_cluster_id', cluster_id), ('iptv_authority_ca', authority_ca)):
+        if value is not None:
+            command_args.extend(('--' + name.replace('_', '-'), value))
+    if args.drain:
+        command_args.append('--drain')
+    if args.iptv_lease_authority:
+        command_args.append('--iptv-lease-authority')
+    if args.https_only:
+        command_args.append('--https-only')
+    command = ' '.join('"' + str(value) + '"' for value in command_args)
+    unit = f'''# Generated by FlussoniX; instance={args.instance}
+[Unit]
+Description=FlussoniX ({args.instance})
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User={account.pw_name}
+Group={account.pw_gid}
+WorkingDirectory={release}
+EnvironmentFile={secret}
+ExecStart={command}
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths={state}
+LimitNOFILE=65536
+SyslogIdentifier=flussonix-{args.instance}
+
+[Install]
+WantedBy=multi-user.target
+'''
+    create_file(output, unit.encode(), 0o644)
+    print(f'Wrote {output}; review and install it explicitly with systemctl')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='command', required=True)
+    credential = commands.add_parser('credentials', help='create a new protected credentials file')
+    credential.add_argument('--output', required=True)
+    credential.add_argument('--admin-user', default='admin')
+    credential.add_argument('--from-env', action='store_true', help='read the three FLUSSONIX credential variables')
+    credential.add_argument('--with-srt-passphrase', action='store_true')
+    service = commands.add_parser('render', help='verify paths and write a unit; never starts/enables services')
+    for name in ['instance', 'release-dir', 'state-dir', 'credentials', 'user', 'listen', 'output']:
+        service.add_argument('--' + name, required=True)
+    service.add_argument('--ffmpeg', default='/usr/bin/ffmpeg')
+    for name in ('https-listen', 'https-cert', 'https-key', 'rtsp-listen', 'rtsps-listen',
+                 'rtsps-cert', 'rtsps-key', 'rtsp-udp-ports', 'rtsp-udp-mbps',
+                 'fxlink-listen', 'fxlink-cert', 'fxlink-key'):
+        service.add_argument('--' + name)
+    service.add_argument('--https-only', action='store_true')
+    for name in ('srt-play-listen', 'srt-play-public-url', 'srt-play-latency', 'srt-play-client-limit'):
+        service.add_argument('--' + name)
+    service.add_argument('--srt-play-allow-direct-token', action='store_true')
+    for name in ('role', 'node-name', 'uplink-mbps', 'client-limit', 'uplink-interface',
+                 'iptv-data', 'iptv-public-origin', 'iptv-ha-db-config', 'iptv-authority',
+                 'iptv-authority-secondary', 'iptv-authority-cluster-id', 'iptv-authority-ca'):
+        service.add_argument('--' + name)
+    service.add_argument('--drain', action='store_true')
+    service.add_argument('--iptv-lease-authority', action='store_true')
+    args = parser.parse_args()
+    try:
+        credentials(args) if args.command == 'credentials' else render(args)
+    except (ValueError, OSError, KeyError) as error:
+        parser.exit(1, f'Cannot prepare service: {error}\n')
+
+
+if __name__ == '__main__':
+    main()

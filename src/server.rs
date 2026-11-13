@@ -1,7 +1,16 @@
 use crate::{
     auth::{Credentials, Role},
     cluster::{NodeLoad, TieRotation},
-    config::{ConfigStore, KINDS, valid_name},
+    config::{ConfigStore, KINDS, nested_validation_path, parse_text, valid_name},
+    iptv::{
+        client::AuthorityClient,
+        ha::{
+            HaAuthority,
+            connection::{HaError, HaOptions, HaPool},
+        },
+        lease::Ledger,
+        store::IptvStore,
+    },
     media::{Engine, Worker},
     playback_auth::{
         AuthOutcome, Grant, PlaybackAuth, Policy, PolicySnapshot, RecoveryDemand, ViewerRequest,
@@ -14,53 +23,114 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
+
+#[derive(Clone, Copy)]
+pub(crate) enum SrtLookupMode {
+    Ticket,
+    Required,
+    Any,
+}
 
 #[derive(Clone)]
 pub struct Options {
     pub admin_user: String,
     pub admin_password: String,
+    pub admin_public_origin: Option<url::Url>,
+    pub srt_play_public_url: Option<url::Url>,
+    pub allow_insecure_remote_management: bool,
     pub view_user: Option<String>,
     pub view_password: Option<String>,
     pub peer_key: String,
     pub ffmpeg: String,
+    pub srtp_receiver_ledger: Option<PathBuf>,
     pub role: String,
     pub node_name: String,
     pub uplink_mbps: f64,
     pub uplink_interface: String,
+    pub geoip_db: Option<PathBuf>,
     pub client_limit: u64,
     pub web_dir: PathBuf,
+    pub iptv_public_origin: Option<url::Url>,
+    pub iptv_data: Option<PathBuf>,
+    pub iptv_lease_authority: bool,
+    pub iptv_ha: Option<HaOptions>,
+    pub iptv_peer_allow_insecure_loopback: bool,
+    pub iptv_authority: Option<url::Url>,
+    pub iptv_authority_secondary: Option<url::Url>,
+    pub iptv_authority_cluster_id: Option<uuid::Uuid>,
+    pub iptv_authority_ca: Option<PathBuf>,
+    pub iptv_authority_allow_insecure_loopback: bool,
     pub drain: bool,
+    pub fxlink_features: crate::fxlink::Features,
+}
+/// Validate an advertised SRT root independently of the HTTP Host header.
+pub fn validate_srt_public_url(raw: &str) -> Option<url::Url> {
+    let url = crate::config::vendor_peers::srt_root(raw)?;
+    // `srt` is a non-special URL scheme, so even a numeric host may parse as Domain.
+    let host = url
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(ip)
+                if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() =>
+            {
+                return None;
+            }
+            std::net::IpAddr::V6(ip) if ip.is_unspecified() || ip.is_multicast() => {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    Some(url)
 }
 impl Default for Options {
     fn default() -> Self {
         Self {
             admin_user: "admin".into(),
             admin_password: String::new(),
+            admin_public_origin: None,
+            srt_play_public_url: None,
+            allow_insecure_remote_management: false,
             view_user: None,
             view_password: None,
             peer_key: String::new(),
             ffmpeg: "ffmpeg".into(),
+            srtp_receiver_ledger: None,
             role: "standalone".into(),
             node_name: "local".into(),
             uplink_mbps: 1000.0,
             uplink_interface: "auto".into(),
+            geoip_db: None,
             client_limit: 1000,
             web_dir: "web/dist".into(),
+            iptv_public_origin: None,
+            iptv_data: None,
+            iptv_lease_authority: false,
+            iptv_ha: None,
+            iptv_peer_allow_insecure_loopback: false,
+            iptv_authority: None,
+            iptv_authority_secondary: None,
+            iptv_authority_cluster_id: None,
+            iptv_authority_ca: None,
+            iptv_authority_allow_insecure_loopback: false,
             drain: false,
+            fxlink_features: crate::fxlink::Features::default(),
         }
     }
 }
@@ -91,12 +161,24 @@ struct Resolved {
     policy: PolicySnapshot,
     revision: u64,
 }
+#[derive(Default)]
+struct SrtpLedgerHealth {
+    checked: Option<(Instant, bool)>,
+    probing: bool,
+}
 pub struct App {
     http_delivery: std::sync::Mutex<Value>,
     srt_playback: std::sync::Mutex<Value>,
+    fxlink: std::sync::Mutex<(Value, Arc<AtomicU64>)>,
     rtsp_publication: std::sync::Mutex<Value>,
     pub config: Arc<ConfigStore>,
+    pub iptv: Arc<IptvStore>,
+    pub iptv_leases: Arc<Ledger>,
+    pub iptv_ha_pool: Option<Arc<HaPool>>,
+    pub iptv_ha: Option<Arc<HaAuthority>>,
+    pub iptv_authority_client: Option<Arc<AuthorityClient>>,
     node_name: String,
+    node_id: uuid::Uuid,
     modern_sources:
         Option<Arc<crate::source_directory::modern_coordinator::ModernSourceCoordinator>>,
     vendor_playback: Option<crate::vendor_playback::Runtime>,
@@ -105,12 +187,14 @@ pub struct App {
     pub options: Options,
     client: reqwest::Client,
     cluster_clients: std::sync::Mutex<(u64, HashMap<String, reqwest::Client>)>,
-    pub playback_auth: PlaybackAuth,
+    pub playback_auth: Arc<PlaybackAuth>,
     reservations: Mutex<HashMap<String, Reservation>>,
     http_handoffs: http_handoff::Registry,
     rtsp_routes: rtsp_balancer::Registry,
     http_routes: http_balancer::Registry,
+    geoip: Option<named_balancer::GeoIp>,
     routing_rotation: TieRotation,
+    named_affinity: std::sync::Mutex<named_balancer::Affinity>,
     pub egress: Arc<AtomicU64>,
     pub rtsp_egress: Arc<AtomicU64>,
     pub rtsp_udp_egress: Arc<AtomicU64>,
@@ -118,14 +202,55 @@ pub struct App {
     pub(crate) srt_connections: AtomicU64,
     telemetry: crate::telemetry::Sampler,
     pub started: Instant,
-    mirrors: Mutex<HashMap<String, Mirror>>,
+    started_at_epoch_secs: u64,
+    readiness_ha: Mutex<Option<(Instant, bool)>>,
+    srtp_ledger_health: Arc<std::sync::Mutex<SrtpLedgerHealth>>,
+    mirrors: fxlink_access::Mirrors,
     source_queries: tokio::sync::Semaphore,
     source_activation: Mutex<source_activation::State>,
     source_activation_refresh: Mutex<()>,
     pub(crate) publishers: Arc<tokio::sync::Semaphore>,
+    iptv_peer_admission: iptv_peer::Admission,
     source_lookups: Mutex<HashMap<String, origin_resolution::Ticket>>,
+    ticket_body_gate: srt_ticket_issue::BodyGate,
 }
 impl App {
+    fn srtp_ledger_capability(&self) -> Value {
+        let Some(path) = self.options.srtp_receiver_ledger.clone() else {
+            return json!({"configured":false,"healthy":false,"verified":true});
+        };
+        let mut health = self.srtp_ledger_health.lock().unwrap();
+        let fresh = health
+            .checked
+            .as_ref()
+            .is_some_and(|(checked, _)| checked.elapsed() < Duration::from_secs(30));
+        if !fresh && !health.probing {
+            health.probing = true;
+            let status = self.srtp_ledger_health.clone();
+            tokio::spawn(async move {
+                let healthy = tokio::task::spawn_blocking(move || {
+                    crate::direct_rtp::key_ledger::Ledger::new(path)
+                        .probe()
+                        .is_ok()
+                })
+                .await
+                .unwrap_or(false);
+                let mut state = status.lock().unwrap();
+                state.checked = Some((Instant::now(), healthy));
+                state.probing = false;
+            });
+        }
+        if fresh {
+            let (checked, healthy) = health.checked.as_ref().unwrap();
+            json!({"configured":true,"healthy":healthy,"verified":true,"age_ms":checked.elapsed().as_millis().min(u128::from(u64::MAX)) as u64})
+        } else {
+            json!({"configured":true,"healthy":null,"verified":false,"age_ms":health.checked.as_ref().map(|(checked,_)|checked.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)})
+        }
+    }
+    fn owns_iptv_catalog(&self) -> bool {
+        self.options.iptv_lease_authority
+            || (self.options.role == "standalone" && self.options.iptv_authority.is_none())
+    }
     /// Caller owns/joins this one-shot driver; stopping it retires shared inputs.
     pub async fn run_vendor_playback(
         &self,
@@ -161,6 +286,78 @@ impl App {
         if options.admin_password.is_empty() || options.peer_key.len() < 12 {
             return Err("admin password required; peer key must be at least 12 characters".into());
         }
+        if options
+            .srt_play_public_url
+            .as_ref()
+            .is_some_and(|url| validate_srt_public_url(url.as_str()).is_none())
+        {
+            return Err("invalid public SRT playback URL".into());
+        }
+        if options.iptv_peer_allow_insecure_loopback && !options.iptv_lease_authority {
+            return Err("IPTV loopback peer exception requires IPTV lease authority".into());
+        }
+        if options.iptv_ha.is_some() && !options.iptv_lease_authority {
+            return Err("IPTV HA database requires lease authority mode".into());
+        }
+        if options.iptv_authority_secondary.is_some() != options.iptv_authority_cluster_id.is_some()
+        {
+            return Err("second IPTV authority requires a cluster ID".into());
+        }
+        if let Some(secondary) = &options.iptv_authority_secondary {
+            if options.iptv_authority.as_ref() == Some(secondary)
+                || secondary.scheme() != "https"
+                || secondary.host().is_none()
+                || !secondary.username().is_empty()
+                || secondary.password().is_some()
+                || secondary.path() != "/"
+                || secondary.query().is_some()
+                || secondary.fragment().is_some()
+            {
+                return Err(
+                    "second IPTV authority requires a distinct credential-free HTTPS origin".into(),
+                );
+            }
+        }
+        if let Some(url) = &options.iptv_authority {
+            let literal_loopback = matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback())
+                || matches!(url.host(), Some(url::Host::Ipv6(ip)) if ip.is_loopback());
+            if url.host().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.path() != "/"
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || !(url.scheme() == "https"
+                    || (url.scheme() == "http"
+                        && literal_loopback
+                        && options.iptv_authority_allow_insecure_loopback))
+            {
+                return Err("IPTV authority requires a credential-free HTTPS origin or explicit literal loopback HTTP".into());
+            }
+            if let Some(ca) = options.iptv_authority_ca.as_deref() {
+                if url.scheme() != "https" {
+                    return Err("IPTV authority CA requires HTTPS".into());
+                }
+                crate::tls_input::client(Some(ca))?;
+            }
+        } else if options.iptv_authority_ca.is_some()
+            || options.iptv_authority_allow_insecure_loopback
+        {
+            return Err("IPTV authority options require an authority URL".into());
+        }
+        if options.admin_public_origin.as_ref().is_some_and(|origin| {
+            origin.scheme() != "https"
+                || origin.host_str().is_none()
+                || origin.path() != "/"
+                || origin.query().is_some()
+                || origin.fragment().is_some()
+                || !origin.username().is_empty()
+                || origin.password().is_some()
+        }) {
+            return Err(
+                "admin public origin must be an HTTPS origin without path or credentials".into(),
+            );
+        }
         if !["standalone", "source", "cdn", "lb"].contains(&options.role.as_str()) {
             return Err("unknown node role".into());
         }
@@ -168,6 +365,17 @@ impl App {
             || options.client_limit == 0
         {
             return Err("positive uplink and client limit required".into());
+        }
+        if options.iptv_public_origin.as_ref().is_some_and(|origin| {
+            !matches!(origin.scheme(), "http" | "https")
+                || origin.host_str().is_none()
+                || !origin.username().is_empty()
+                || origin.password().is_some()
+                || origin.path() != "/"
+                || origin.query().is_some()
+                || origin.fragment().is_some()
+        }) {
+            return Err("IPTV public origin must be a plain HTTP(S) origin".into());
         }
         let credentials = Credentials::new(
             &options.admin_user,
@@ -178,7 +386,70 @@ impl App {
                 .zip(options.view_password.as_deref()),
             &options.peer_key,
         );
-        let config = Arc::new(ConfigStore::open(config)?);
+        let config_path = config.as_ref();
+        let iptv_path = options.iptv_data.clone().unwrap_or_else(|| {
+            config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("iptv.json")
+        });
+        let iptv = if options.iptv_ha.is_some() {
+            IptvStore::inert(iptv_path.clone())
+        } else {
+            IptvStore::open(iptv_path.clone())?
+        };
+        let iptv_ha_pool = options
+            .iptv_ha
+            .as_ref()
+            .map(HaPool::new)
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .map(Arc::new);
+        let iptv_ha = iptv_ha_pool
+            .as_ref()
+            .map(|pool| Arc::new(HaAuthority::new(pool.clone(), iptv_path)));
+        let iptv_authority_client = options
+            .iptv_authority
+            .as_ref()
+            .map(|origin| {
+                match (
+                    &options.iptv_authority_secondary,
+                    options.iptv_authority_cluster_id,
+                ) {
+                    (Some(secondary), Some(cluster)) => AuthorityClient::new_with_secondary(
+                        origin.clone(),
+                        secondary.clone(),
+                        cluster,
+                        options.peer_key.clone(),
+                        options.iptv_authority_ca.as_deref(),
+                        options.iptv_authority_allow_insecure_loopback,
+                    ),
+                    _ => AuthorityClient::new(
+                        origin.clone(),
+                        options.peer_key.clone(),
+                        options.iptv_authority_ca.as_deref(),
+                        options.iptv_authority_allow_insecure_loopback,
+                    ),
+                }
+                .map(Arc::new)
+            })
+            .transpose()?;
+        let started = Instant::now();
+        let started_at_epoch_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let iptv_leases = Arc::new(Ledger::new(started, 100_000, iptv.revision()));
+        let config = Arc::new(ConfigStore::open(config_path)?);
+        let geoip = options
+            .geoip_db
+            .as_deref()
+            .map(named_balancer::GeoIp::open)
+            .transpose()?;
+        if geoip.is_none() && named_balancer::requires_geoip(&config.snapshot()) {
+            return Err("named balancer country rules require --geoip-db".into());
+        }
+        let node_id = crate::node_identity::load_or_create(config_path)?;
         let modern_sources =
             crate::source_directory::modern_coordinator::ModernSourceCoordinator::new(
                 config.clone(),
@@ -189,6 +460,26 @@ impl App {
         let vendor_playback = modern_sources
             .as_ref()
             .map(|owner| crate::vendor_playback::Runtime::new(owner.clone()));
+        let playback_auth = Arc::new(
+            if options.role == "standalone"
+                && options.iptv_authority.is_none()
+                && !options.iptv_lease_authority
+            {
+                PlaybackAuth::with_iptv(options.client_limit as usize, iptv.clone())
+            } else if let Some(client) = &iptv_authority_client {
+                PlaybackAuth::with_remote_iptv(options.client_limit as usize, client.clone())
+            } else {
+                PlaybackAuth::new(options.client_limit as usize)
+            },
+        );
+        let mut media_engine =
+            Engine::new_with_fxlink(media, &options.ffmpeg, options.fxlink_features);
+        media_engine.set_srtp_receiver_ledger(
+            options
+                .srtp_receiver_ledger
+                .as_ref()
+                .map(|path| Arc::new(crate::direct_rtp::key_ledger::Ledger::new(path.clone()))),
+        );
         let app = Arc::new(Self {
             http_delivery: std::sync::Mutex::new(
                 json!({"http":null,"https":null,"https_only":false}),
@@ -199,11 +490,21 @@ impl App {
             srt_playback: std::sync::Mutex::new(
                 json!({"enabled":false,"listen":null,"encrypted":false}),
             ),
+            fxlink: std::sync::Mutex::new((
+                json!({"enabled":false,"listen":null,"encrypted":true,"latency_ms":1000,"min_latency_ms":500,"max_latency_ms":1500,"fec":{"data_shards":20,"parity_shards":4,"profiles":["20+2","20+4","20+6","1+1"]}}),
+                Arc::new(AtomicU64::new(0)),
+            )),
             config,
+            iptv: iptv.clone(),
+            iptv_leases: iptv_leases.clone(),
+            iptv_ha_pool,
+            iptv_ha,
+            iptv_authority_client,
             node_name: options.node_name.clone(),
+            node_id,
             modern_sources,
             vendor_playback,
-            media: Engine::new(media, &options.ffmpeg),
+            media: media_engine,
             credentials,
             options: options.clone(),
             client: reqwest::Client::builder()
@@ -213,26 +514,40 @@ impl App {
                 .build()
                 .map_err(|e| e.to_string())?,
             cluster_clients: std::sync::Mutex::new((0, HashMap::new())),
-            playback_auth: PlaybackAuth::new(options.client_limit as usize),
+            playback_auth,
             reservations: Mutex::new(HashMap::new()),
             http_handoffs: http_handoff::Registry::default(),
             rtsp_routes: rtsp_balancer::Registry::default(),
             http_routes: http_balancer::Registry::default(),
+            geoip,
             routing_rotation: TieRotation::default(),
+            named_affinity: std::sync::Mutex::new(named_balancer::Affinity::default()),
             egress: Arc::new(AtomicU64::new(0)),
             rtsp_egress: Arc::new(AtomicU64::new(0)),
             rtsp_udp_egress: Arc::new(AtomicU64::new(0)),
             srt_egress: Arc::new(AtomicU64::new(0)),
             srt_connections: AtomicU64::new(0),
             telemetry: crate::telemetry::Sampler::new(&options.uplink_interface)?,
-            started: Instant::now(),
-            mirrors: Mutex::new(HashMap::new()),
+            started,
+            started_at_epoch_secs,
+            readiness_ha: Mutex::new(None),
+            srtp_ledger_health: Arc::new(std::sync::Mutex::new(SrtpLedgerHealth::default())),
+            mirrors: fxlink_access::Mirrors::default(),
             source_queries: tokio::sync::Semaphore::new(64),
             source_activation: Mutex::new(source_activation::State::default()),
             source_activation_refresh: Mutex::new(()),
             publishers: Arc::new(tokio::sync::Semaphore::new(64)),
+            iptv_peer_admission: iptv_peer::Admission::new(),
             source_lookups: Mutex::new(HashMap::new()),
+            ticket_body_gate: srt_ticket_issue::BodyGate::new(),
         });
+        let weak = Arc::downgrade(&app.playback_auth);
+        app.iptv.set_on_change(Box::new(move |revision| {
+            iptv_leases.observe_revision(revision);
+            if let Some(auth) = weak.upgrade() {
+                auth.invalidate_iptv();
+            }
+        }));
         app.sample_metrics();
         Ok(app)
     }
@@ -255,12 +570,65 @@ impl App {
     pub fn set_srt_playback(&self, listener: Option<&crate::srt_playback::Listener>) {
         *self.srt_playback.lock().unwrap() = match listener {
             Some(l) => {
-                json!({"enabled":true,"listener_id":uuid::Uuid::new_v4().to_string(),"listen":l.address().to_string(),"encrypted":l.settings().encrypted(),"latency_ms":l.settings().latency_millis(),"client_limit":l.settings().client_limit()})
+                json!({"enabled":true,"listener_id":uuid::Uuid::new_v4().to_string(),"listen":l.address().to_string(),"encrypted":l.settings().encrypted(),"latency_ms":l.settings().latency_millis(),"client_limit":l.settings().client_limit(),"direct_tokens_allowed":l.settings().allow_direct_tokens(),"public_url":self.options.srt_play_public_url.as_ref().map(url::Url::as_str)})
             }
-            None => json!({"enabled":false,"listen":null,"encrypted":false}),
+            None => {
+                json!({"enabled":false,"listen":null,"encrypted":false,"direct_tokens_allowed":false,"public_url":null})
+            }
         };
     }
+    fn reservation_capacity(
+        &self,
+        reservations: &HashMap<String, Reservation>,
+        srt: Option<&srt_tickets::Binding>,
+        bitrate_mbps: f64,
+    ) -> bool {
+        let expected = bitrate_mbps / self.options.uplink_mbps;
+        let (n, window) = self
+            .telemetry
+            .snapshot_with_window(self.options.uplink_mbps);
+        let reserved_mbps: f64 = reservations.values().map(|r| r.bitrate_mbps).sum::<f64>()
+            + self
+                .http_handoffs
+                .unmeasured(window, n["http_egress_mbps"].as_f64());
+        let active = self.playback_auth.active();
+        let srt_full = srt.is_some_and(|binding| {
+            let listener = self.srt_playback.lock().unwrap();
+            let limit = listener["client_limit"].as_u64().unwrap_or(0);
+            let pending = reservations
+                .values()
+                .filter(|r| {
+                    r.srt
+                        .as_ref()
+                        .is_some_and(|b| b.listener_id == binding.listener_id)
+                })
+                .count() as u64;
+            self.srt_connections
+                .load(Ordering::Relaxed)
+                .saturating_add(pending)
+                >= limit
+        });
+        !srt_full
+            && !self.options.drain
+            && reservations.len() < 20000
+            && active.saturating_add(reservations.len() as u64) < self.options.client_limit
+            && n["uplink"].as_f64().unwrap_or(1.0)
+                + reserved_mbps / self.options.uplink_mbps
+                + expected
+                < 0.9
+            && n["cpu"].as_f64().unwrap_or(1.0) < 0.9
+            && n["ram"].as_f64().unwrap_or(1.0) < 0.95
+    }
     fn cluster_client(&self, node: &Value) -> Result<reqwest::Client, String> {
+        let endpoint = node["api_url"]
+            .as_str()
+            .and_then(|value| url::Url::parse(value).ok())
+            .ok_or("invalid cluster API URL")?;
+        crate::peer_transport::require(
+            &endpoint,
+            node["flussonix_allow_insecure_peer_http"] == true,
+        )
+        .map_err(str::to_owned)?;
         let Some(ca) = node.get("flussonix_tls_ca") else {
             return Ok(self.client.clone());
         };
@@ -374,13 +742,13 @@ impl App {
     pub async fn reconcile(&self) {
         self.refresh_source_activation().await;
         // Retirement comes first: a background retry must not extend demand.
-        for name in self.media.idle().await {
+        for (name, worker) in self.media.idle_workers().await {
             let static_demand = match self.config.effective(&name) {
                 Some(config) => config["static"] != false,
                 None => self.source_is_warm(&name).await,
             };
             if !static_demand {
-                self.media.stop(&name).await;
+                self.media.stop_if_idle_current(&name, &worker).await;
             }
         }
         self.refresh_sources().await;
@@ -452,28 +820,26 @@ impl App {
                 current
             });
             self.playback_auth.invalidate(|name| {
-                let cfg = crate::config::effective(root, name).or_else(|| {
-                    if crate::vendor_playback::reserved(root, name) {
-                        return None;
-                    }
-                    mirrors
-                        .get(name)
-                        .filter(|m| m.known && !m.denied)
-                        .map(|m| m.config.clone())
-                })?;
-                if cfg["disabled"] == true {
+                if let Some(cfg) = crate::config::effective(root, name) {
+                    return (cfg["disabled"] != true)
+                        .then(|| Policy::from_config(&cfg, root).ok())
+                        .flatten();
+                }
+                if crate::vendor_playback::reserved(root, name) {
                     return None;
                 }
-                Policy::from_config(&cfg, root).ok()
+                mirrors
+                    .get(name)
+                    .filter(|m| m.known && !m.denied && m.config["disabled"] != true)
+                    .and_then(|m| origin_resolution::approved_mirror_policy(&m.config, root))
             });
         });
     }
     async fn active(&self) -> u64 {
         self.playback_auth.active()
     }
-    async fn node(&self) -> Value {
+    async fn stream_inventory_names(&self) -> std::collections::BTreeSet<String> {
         let cfg = self.config.snapshot();
-        let mut streams = Vec::new();
         let mut names = cfg["streams"]
             .as_array()
             .unwrap()
@@ -490,12 +856,67 @@ impl App {
             )
             .collect::<std::collections::BTreeSet<_>>();
         names.extend(self.media.workers().await.into_iter().map(|(name, _)| name));
-        for name in names {
+        names
+    }
+    async fn node(&self) -> Value {
+        let mut streams = Vec::new();
+        for name in self.stream_inventory_names().await {
             streams.push(json!({"name":name,"ready":self.media.ready(&name).await,"stats":self.stream_stats(&name).await}));
         }
         let mut node = self.load_node().await;
+        node["version"] = json!(env!("CARGO_PKG_VERSION"));
+        node["total_streams_count"] = json!(streams.len());
         node["streams"] = json!(streams);
         node
+    }
+    async fn config_stats(&self) -> Value {
+        let (metrics, _) = self
+            .telemetry
+            .snapshot_with_window(self.options.uplink_mbps);
+        let percent = |field: &str| {
+            metrics[field]
+                .as_f64()
+                .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                .map(|v| (v * 100.0).round() as u64)
+        };
+        let output_kbit = metrics["egress_mbps"]
+            .as_f64()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map(|v| (v * 1000.0).round() as u64);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let online_streams = tokio::time::timeout(Duration::from_millis(250), async {
+            let mut ready = 0_u64;
+            for (name, _) in self.media.workers().await {
+                if self.media.ready(&name).await {
+                    ready += 1;
+                }
+            }
+            ready
+        })
+        .await
+        .ok();
+        json!({
+            "id":self.node_id.to_string(),
+            "now":now,
+            "started_at":self.started_at_epoch_secs,
+            "streamer_status":"running",
+            "server_version":env!("CARGO_PKG_VERSION"),
+            "hostname":self.node_name,
+            "uptime":self.started.elapsed().as_secs(),
+            "total_streams":self.config.read(|root|root["streams"].as_array().map_or(0,Vec::len)),
+            "total_streams_count":self.stream_inventory_names().await.len(),
+            "online_streams":online_streams,
+            "total_clients":self.active().await,
+            "total_bandwidth":(self.options.uplink_mbps*1_000_000.0).round() as u64,
+            "output_kbit":output_kbit,
+            "bandwidth_usage":metrics["uplink"].as_f64().filter(|n|n.is_finite() && *n>=0.0 && *n<=100.0).map(|n|n*100.0),
+            "geoip":{"configured":self.geoip.is_some(),"revision":self.geoip.as_ref().map(named_balancer::GeoIp::revision)},
+            "cpu_usage":percent("cpu"),
+            "memory_usage":percent("ram")
+        })
     }
     async fn load_node(&self) -> Value {
         // Worker setup can hold this mutex across network awaits. Obtain the
@@ -509,6 +930,7 @@ impl App {
         metrics["rtsp_udp_bytes_out"] = json!(self.rtsp_udp_egress.load(Ordering::Relaxed));
         metrics["direct_rtp_bytes_out"] = json!(self.media.direct_egress.load(Ordering::Relaxed));
         metrics["srt_bytes_out"] = json!(self.srt_egress.load(Ordering::Relaxed));
+        metrics["fxlink"] = self.fxlink.lock().unwrap().0.clone();
         let mut srt = self.srt_playback.lock().unwrap().clone();
         srt["clients"] = json!(self.srt_connections.load(Ordering::Relaxed));
         metrics["srt_playback"] = srt;
@@ -530,11 +952,89 @@ impl App {
                 .unmeasured(window, metrics["http_egress_mbps"].as_f64());
         drop(reservations);
         let rtsp_publication = self.rtsp_publication.lock().unwrap().clone();
-        let node = json!({"rtsp_publication":rtsp_publication,"name":self.node_name,"role":self.options.role,"uptime":self.started.elapsed().as_secs(),"reserved_mbps":reserved_mbps,"uplink_mbps":self.options.uplink_mbps,"active":self.active().await,"reserved":reserved,"limit":self.options.client_limit,"drain":self.options.drain,"http_delivery":self.http_delivery.lock().unwrap().clone()});
+        let iptv_cluster = if let Some(ha) = &self.iptv_ha {
+            let report = tokio::time::timeout(Duration::from_secs(2), async {
+                ha.pool.verify_startup().await?;
+                let snapshot = ha.catalog.load_current().await?;
+                let capacity = ha.ledger.capacity().await?;
+                Ok::<_, HaError>((snapshot, capacity))
+            })
+            .await;
+            match report {
+                Ok(Ok((snapshot, capacity))) => {
+                    let ready = snapshot.enabled() && capacity.available();
+                    let reason = if !snapshot.enabled() {
+                        Some("IPTV is disabled")
+                    } else if !capacity.available() {
+                        Some("IPTV authority lease capacity is full")
+                    } else {
+                        None
+                    };
+                    json!({"mode":"authority","backend":"postgresql","configured":true,
+                        "ready":ready,"database_ready":true,"reason":reason,
+                        "catalog_revision":snapshot.revision(),"capacity":capacity,
+                        "export_healthy":ha.catalog.export_healthy()})
+                }
+                _ => json!({"mode":"authority","backend":"postgresql","configured":true,
+                    "ready":false,"database_ready":false,"reason":"IPTV HA database unavailable",
+                    "catalog_revision":null,"capacity":null,
+                    "export_healthy":ha.catalog.export_healthy()}),
+            }
+        } else if self.options.role == "standalone"
+            && !self.options.iptv_lease_authority
+            && self.iptv_authority_client.is_none()
+        {
+            json!({"mode":"local","configured":false,"ready":true})
+        } else if self.options.iptv_lease_authority {
+            let enabled = self.iptv.snapshot().enabled();
+            let ready = enabled && self.iptv_leases.ready_for_new_leases(Instant::now());
+            let reason = if ready {
+                None
+            } else if !enabled {
+                Some("IPTV is disabled")
+            } else if !self.iptv_leases.accepting_new_leases(Instant::now()) {
+                Some("IPTV authority restart quarantine is active")
+            } else {
+                Some("IPTV authority lease capacity is full")
+            };
+            json!({"mode":"authority","configured":true,"ready":ready,"reason":reason})
+        } else if let Some(client) = &self.iptv_authority_client {
+            let ready = client.recently_ready();
+            let connected = client.recently_reachable();
+            let reason = if ready {
+                None
+            } else if connected && client.last_probe_refused() {
+                Some("IPTV authority is not accepting new leases")
+            } else if connected {
+                Some("IPTV authority readiness could not be verified")
+            } else {
+                Some("IPTV authority has not been verified recently")
+            };
+            json!({"mode":"client","configured":true,"ready":ready,"connected":connected,"reason":reason,"origins":client.origin_health()})
+        } else {
+            json!({"mode":"missing_authority","configured":false,"ready":false,"reason":"IPTV authority is required for cluster session limits"})
+        };
+        let node = json!({"rtsp_publication":rtsp_publication,"name":self.node_name,"role":self.options.role,"uptime":self.started.elapsed().as_secs(),"reserved_mbps":reserved_mbps,"uplink_mbps":self.options.uplink_mbps,"active":self.active().await,"reserved":reserved,"limit":self.options.client_limit,"drain":self.options.drain,"http_delivery":self.http_delivery.lock().unwrap().clone(),"iptv_public_origin":self.options.iptv_public_origin.as_ref().map(url::Url::as_str),"iptv_cluster":iptv_cluster});
         metrics
             .as_object_mut()
             .unwrap()
             .extend(node.as_object().unwrap().clone());
+        metrics["geoip"] = json!({
+            "configured": self.geoip.is_some(),
+            "revision": self.geoip.as_ref().map(named_balancer::GeoIp::revision)
+        });
+        metrics["output_kbit"] = metrics["egress_mbps"]
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .map(|n| json!((n * 1000.0).round() as u64))
+            .unwrap_or(Value::Null);
+        metrics["bandwidth_usage"] = metrics["uplink"]
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.0 && *n <= 100.0)
+            .map(|n| json!(n * 100.0))
+            .unwrap_or(Value::Null);
+        metrics["total_clients"] = metrics["active"].clone();
+        metrics["total_streams_count"] = json!(self.stream_inventory_names().await.len());
         metrics["stream_bitrates"] = stream_bitrates;
         metrics["source_activation"] = self.source_activation_status().await;
         if let Some(runtime) = &self.vendor_playback {
@@ -546,7 +1046,7 @@ impl App {
         let at = Instant::now();
         self.http_handoffs
             .sample(self.telemetry.last_sample_at(), at);
-        self.telemetry.sample_transports_at(
+        self.telemetry.sample_with_fxlink_at(
             at,
             self.egress
                 .load(Ordering::Relaxed)
@@ -556,7 +1056,13 @@ impl App {
                 .saturating_add(self.media.rtsp_push_egress.load(Ordering::Relaxed)),
             self.srt_egress.load(Ordering::Relaxed),
             self.media.direct_egress.load(Ordering::Relaxed),
+            self.fxlink.lock().unwrap().1.load(Ordering::Relaxed),
         );
+        // The one-second daemon tick also releases expired in-memory viewer
+        // credentials when no new admissions or node-status reads arrive.
+        if let Ok(mut reservations) = self.reservations.try_lock() {
+            reservations.retain(|_, reservation| reservation.expires > at);
+        }
     }
 
     fn resolved(&self, name: &str, config: Value, revision: u64) -> Option<Resolved> {
@@ -586,6 +1092,150 @@ pub(crate) fn error(code: StatusCode, message: &str) -> Response {
 fn json_response(value: Value) -> Response {
     axum::Json(value).into_response()
 }
+fn management_read_response(role: Role, mut value: Value) -> Response {
+    if role == Role::View {
+        redact_view_value(&mut value);
+    }
+    json_response(value)
+}
+fn browser_management_write_allowed(request: &Request, public_origin: Option<&url::Url>) -> bool {
+    if let Some(site) = request.headers().get("sec-fetch-site") {
+        if !matches!(site.to_str(), Ok("same-origin" | "none")) {
+            return false;
+        }
+    }
+    // Browsers can submit simple form POSTs without Origin or Fetch Metadata.
+    if request.method() == axum::http::Method::POST
+        && request.uri().path() != "/streamer/api/v3/config"
+        && request.headers().get("origin").is_none()
+        && request.headers().get("sec-fetch-site").is_none()
+        && request
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                matches!(
+                    value
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain"
+                )
+            })
+    {
+        return false;
+    }
+    let Some(origin) = request.headers().get("origin") else {
+        return true;
+    };
+    let Some(authority) = request
+        .uri()
+        .authority()
+        .map(|value| value.as_str())
+        .or_else(|| {
+            request
+                .headers()
+                .get("host")
+                .and_then(|value| value.to_str().ok())
+        })
+    else {
+        return false;
+    };
+    let scheme = if request
+        .extensions()
+        .get::<crate::http_tls::SecureHttp>()
+        .is_some()
+    {
+        "https"
+    } else {
+        "http"
+    };
+    let target = url::Url::parse(&format!("{scheme}://{authority}/"));
+    let supplied = origin
+        .to_str()
+        .ok()
+        .and_then(|value| url::Url::parse(value).ok());
+    match (target, supplied) {
+        (Ok(target), Some(supplied)) => {
+            supplied.path() == "/"
+                && supplied.query().is_none()
+                && supplied.fragment().is_none()
+                && supplied.username().is_empty()
+                && supplied.password().is_none()
+                && (supplied.origin() == target.origin()
+                    || public_origin.is_some_and(|public| {
+                        public.host_str() == target.host_str()
+                            && public.port() == target.port()
+                            && supplied.origin() == public.origin()
+                    }))
+        }
+        _ => false,
+    }
+}
+fn redact_view_value(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            for (key, field) in fields {
+                // Configuration appears both on disk and inherited in effective streams.
+                // Keep the shape for status readers, but never return credentials,
+                // callback destinations, key-file paths, or full endpoint URLs.
+                if matches!(
+                    key.as_str(),
+                    "password"
+                        | "passphrase"
+                        | "cluster_key"
+                        | "flussonix_peer_key"
+                        | "flussonix_fxlink_token"
+                        | "flussonix_token_sha256"
+                        | "token"
+                        | "user_id"
+                        | "streamid"
+                        | "key_file"
+                        | "track_key_files"
+                        | "sdp_file"
+                        | "flussonix_tls_ca"
+                        | "flussonix_media_tls_ca"
+                        | "on_play"
+                        | "on_publish"
+                ) {
+                    *field = Value::String("[redacted]".into());
+                } else if matches!(
+                    key.as_str(),
+                    "url" | "endpoint" | "upstream_source" | "source" | "origin"
+                ) || key.ends_with("_url")
+                {
+                    *field = match field.as_str() {
+                        Some("testsrc://" | "publish://") => field.clone(),
+                        Some(url) => match url.split_once("://") {
+                            Some((scheme, _))
+                                if scheme.len() <= 32
+                                    && !scheme.is_empty()
+                                    && scheme.bytes().all(|b| {
+                                        b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')
+                                    }) =>
+                            {
+                                Value::String(format!("{scheme}://[redacted]"))
+                            }
+                            _ => Value::String("[redacted]".into()),
+                        },
+                        None => Value::String("[redacted]".into()),
+                    };
+                } else {
+                    redact_view_value(field);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_view_value(item);
+            }
+        }
+        _ => {}
+    }
+}
 pub(crate) fn parse_query(q: Option<&str>) -> HashMap<String, String> {
     url::form_urlencoded::parse(q.unwrap_or("").as_bytes())
         .into_owned()
@@ -593,11 +1243,75 @@ pub(crate) fn parse_query(q: Option<&str>) -> HashMap<String, String> {
 }
 pub fn router(app: Arc<App>) -> Router {
     Router::new().route("/health",axum::routing::get(||async{axum::Json(json!({"status":"ok","service":"FlussoniX","version":env!("CARGO_PKG_VERSION")}))}))
+ .route("/streamer/api/v3/monitoring/liveness",axum::routing::get(monitoring_liveness))
+ .route("/streamer/api/v3/monitoring/readiness",axum::routing::get(monitoring_readiness))
  .route("/streamer/api/v3/{*tail}",axum::routing::any(management))
+ .route("/tv/playlists/{subscriber}",axum::routing::get(iptv_playlist_http))
+ .route("/flussonix/peer/v1/iptv/leases/status",axum::routing::post(iptv_peer::status))
+ .route("/flussonix/peer/v1/iptv/leases/acquire",axum::routing::post(iptv_peer::acquire))
+ .route("/flussonix/peer/v1/iptv/leases/commit",axum::routing::post(iptv_peer::commit))
+ .route("/flussonix/peer/v1/iptv/leases/renew",axum::routing::post(iptv_peer::renew))
+ .route("/flussonix/peer/v1/iptv/leases/release",axum::routing::post(iptv_peer::release))
+ .route("/flussonix/peer/v1/iptv/leases/rollback",axum::routing::post(iptv_peer::rollback))
  .route("/flussonix/api/v1/srt-lookup",axum::routing::any(srt_lookup::lookup))
+ .route("/flussonix/api/v1/srt-ticket",axum::routing::any(srt_ticket_issue::issue))
  .route("/flussonix/api/v1/{*tail}",axum::routing::any(native))
  .nest_service("/admin",tower_http::services::ServeDir::new(&app.options.web_dir).append_index_html_on_directories(true))
  .fallback(media_request).with_state(app).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024))
+}
+fn monitoring_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+async fn monitoring_liveness() -> impl IntoResponse {
+    axum::Json(json!({
+        "now": monitoring_now(),
+        "build": 0,
+        "server_version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+async fn monitoring_readiness(State(app): State<Arc<App>>) -> Response {
+    if let Some(pool) = &app.iptv_ha_pool {
+        // Coalesce concurrent probes and bound both database work and cache lifetime.
+        let mut cached = app.readiness_ha.lock().await;
+        let ready = match *cached {
+            Some((checked, ready)) if checked.elapsed() < Duration::from_secs(2) => ready,
+            _ => {
+                let ready = tokio::time::timeout(Duration::from_secs(9), pool.verify_startup())
+                    .await
+                    .is_ok_and(|result| result.is_ok());
+                *cached = Some((Instant::now(), ready));
+                ready
+            }
+        };
+        if !ready {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "Service is not ready");
+        }
+    }
+    axum::Json(json!({
+        "now": monitoring_now(),
+        "build": 0,
+        "started_at": app.started_at_epoch_secs,
+        "server_version": env!("CARGO_PKG_VERSION"),
+    }))
+    .into_response()
+}
+async fn iptv_playlist_http(
+    State(app): State<Arc<App>>,
+    axum::extract::Path(subscriber): axum::extract::Path<String>,
+    request: Request,
+) -> Response {
+    if !app.owns_iptv_catalog() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "IPTV catalog is managed by the authority",
+        );
+    }
+    iptv_playlist::get(app, request, &subscriber).await
 }
 async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     let role = app
@@ -615,6 +1329,11 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     if method != axum::http::Method::GET && role != Role::Edit {
         return error(StatusCode::FORBIDDEN, "edit credentials required");
     }
+    if method != axum::http::Method::GET
+        && !browser_management_write_allowed(&request, app.options.admin_public_origin.as_ref())
+    {
+        return error(StatusCode::FORBIDDEN, "cross-origin management request");
+    }
     let tail = percent_encoding::percent_decode_str(
         request.uri().path().trim_start_matches("/streamer/api/v3/"),
     )
@@ -624,33 +1343,81 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     let mut parts = tail.splitn(2, '/');
     let resource = parts.next().unwrap_or("");
     let name = parts.next();
+    if resource == "iptv" {
+        if !app.owns_iptv_catalog() {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "IPTV catalog is managed by the authority",
+            );
+        }
+        return iptv_management::dispatch(app, request, &tail, role).await;
+    }
     if resource == "config" {
         if name == Some("stats") && method == "GET" {
-            return json_response(app.node().await);
+            return management_read_response(role, app.config_stats().await);
         }
         if name.is_some() {
             return error(StatusCode::NOT_FOUND, "unknown config operation");
         }
         if method == "GET" {
-            return json_response(app.config.snapshot());
+            let full = match query.get("full").map(String::as_str) {
+                None | Some("false") => false,
+                Some("true") => true,
+                Some(_) => return error(StatusCode::BAD_REQUEST, "full must be true or false"),
+            };
+            let openmetrics = match query.get("format").map(String::as_str) {
+                Some("openmetrics") => true,
+                Some(_) => return error(StatusCode::BAD_REQUEST, "unsupported config format"),
+                None => header(request.headers(), "accept")
+                    .is_some_and(config_metrics::accepts_openmetrics),
+            };
+            if openmetrics {
+                let stats = app.config_stats().await;
+                return (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/openmetrics-text",
+                    )],
+                    config_metrics::render(app.node_id, &stats),
+                )
+                    .into_response();
+            }
+            let mut result = if full {
+                app.config.snapshot()
+            } else {
+                json!({})
+            };
+            result["server_id"] = json!(app.node_id.to_string());
+            result["stats"] = app.config_stats().await;
+            return management_read_response(role, result);
+        }
+        if method == "POST" {
+            return validate_config_request(&app, request).await;
         }
         let body = match read_json(request).await {
             Ok(b) => b,
             Err((code, message)) => return error(code, &message),
         };
-        let result = if method == "POST" {
-            app.config.validate(body)
-        } else if method == "PUT" {
-            app.config.replace(body)
-        } else {
+        if method != "PUT" {
             return error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
-        };
+        }
+        if app.geoip.is_none()
+            && app
+                .config
+                .validate(body.clone())
+                .is_ok_and(|next| named_balancer::requires_geoip(&next))
+        {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "named balancer country rules require --geoip-db",
+            );
+        }
+        let result = app.config.replace(body);
         return match result {
             Ok(v) => {
-                if method == "PUT" {
-                    app.invalidate_sessions().await;
-                    app.reconcile().await;
-                }
+                app.media.prune_input_preferences(&app.config).await;
+                app.invalidate_sessions().await;
+                app.reconcile().await;
                 json_response(v)
             }
             Err(e) => error(StatusCode::BAD_REQUEST, &e),
@@ -665,6 +1432,9 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     } else {
         (resource, name)
     };
+    if kind == "balancers" && resource != "cluster" {
+        return error(StatusCode::NOT_FOUND, "API operation not implemented");
+    }
     if kind == "sessions" {
         if name == Some("reauth") && method == "POST" {
             let Some(stream) = query.get("name") else {
@@ -685,7 +1455,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         if let Some(id) = name {
             if method == "GET" {
                 return match app.playback_auth.snapshot(id) {
-                    Some(s) => json_response(s),
+                    Some(s) => management_read_response(role, s),
                     None => error(StatusCode::NOT_FOUND, "session not found"),
                 };
             }
@@ -702,7 +1472,10 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
                 sessions.retain(|s| s["name"] == name.as_str());
             }
             sessions.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-            return json_response(json!({"estimated_count":sessions.len(),"sessions":sessions}));
+            return management_read_response(
+                role,
+                json!({"estimated_count":sessions.len(),"sessions":sessions}),
+            );
         }
         return error(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -713,11 +1486,74 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         return error(StatusCode::NOT_FOUND, "API operation not implemented");
     }
     if let Some(name) = name {
+        if kind == "streams" && method == "POST" && name.contains("/inputs/") {
+            let Some((stream, tail)) = name.rsplit_once("/inputs/") else {
+                return error(StatusCode::BAD_REQUEST, "invalid input selection path");
+            };
+            let Some(index) = tail.strip_suffix("/select") else {
+                return error(StatusCode::BAD_REQUEST, "invalid input selection path");
+            };
+            if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+                return error(StatusCode::BAD_REQUEST, "invalid input index");
+            }
+            let Ok(index) = index.parse::<usize>() else {
+                return error(StatusCode::BAD_REQUEST, "invalid input index");
+            };
+            if !matches!(
+                axum::body::to_bytes(request.into_body(), 1).await,
+                Ok(bytes) if bytes.is_empty()
+            ) {
+                return error(StatusCode::BAD_REQUEST, "input selection has no body");
+            }
+            let revision = app.config.revision();
+            let Some(config) = app
+                .config
+                .at_revision(revision, |root| crate::config::effective(root, stream))
+            else {
+                return error(StatusCode::BAD_REQUEST, "stream configuration changed");
+            };
+            let Some(config) = config else {
+                return error(StatusCode::NOT_FOUND, "stream not found");
+            };
+            if config["inputs"]
+                .as_array()
+                .is_none_or(|inputs| index >= inputs.len())
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "input is not found by the specified index",
+                );
+            }
+            let config_store = app.config.clone();
+            let result = app
+                .media
+                .select_input_guarded(stream, &config, index, async move {
+                    config_store.revision() == revision
+                })
+                .await;
+            if app.config.revision() != revision {
+                app.media.prune_input_preferences(&app.config).await;
+                return error(StatusCode::BAD_REQUEST, "stream configuration changed");
+            }
+            return match result {
+                Ok(was_active) => {
+                    if app.options.role != "lb" && (was_active || config["static"] != false) {
+                        let app = app.clone();
+                        let stream = stream.to_owned();
+                        tokio::spawn(async move {
+                            app.recover_current(&stream, &config, revision).await;
+                        });
+                    }
+                    StatusCode::NO_CONTENT.into_response()
+                }
+                Err(message) => error(StatusCode::BAD_REQUEST, &message),
+            };
+        }
         if kind == "streams" && method == "POST" && name.ends_with("/stop") {
             let name = name.trim_end_matches("/stop");
             app.playback_auth.stop_playback(name);
             app.media.stop(name).await;
-            return json_response(json!({"status":"stopped"}));
+            return StatusCode::NO_CONTENT.into_response();
         }
         if method == "GET" {
             let root = app.config.snapshot();
@@ -737,7 +1573,7 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
                     if kind == "streams" {
                         v["stats"] = app.stream_stats(name).await;
                     }
-                    json_response(v)
+                    management_read_response(role, v)
                 }
                 None => error(StatusCode::NOT_FOUND, "not found"),
             };
@@ -747,8 +1583,20 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
                 Ok(b) => b,
                 Err((code, message)) => return error(code, &message),
             };
+            if kind == "balancers"
+                && app.geoip.is_none()
+                && named_balancer::row_requires_geoip(&body)
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "named balancer country rules require --geoip-db",
+                );
+            }
             return match app.config.put(kind, name, body) {
                 Ok(mut v) => {
+                    if matches!(kind, "streams" | "templates") {
+                        app.media.prune_input_preferences(&app.config).await;
+                    }
                     app.invalidate_sessions().await;
                     if kind == "sources" {
                         app.invalidate_sessions().await;
@@ -770,6 +1618,9 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         if method == "DELETE" {
             return match app.config.delete(kind, name) {
                 Ok(true) => {
+                    if matches!(kind, "streams" | "templates") {
+                        app.media.prune_input_preferences(&app.config).await;
+                    }
                     app.invalidate_sessions().await;
                     if kind == "streams" {
                         app.media.stop(name).await;
@@ -789,6 +1640,18 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
     if method != "GET" {
         return error(StatusCode::METHOD_NOT_ALLOWED, "collection is read only");
     }
+    let selection = if matches!(kind, "streams" | "templates" | "peers" | "sources") {
+        match query
+            .get("select")
+            .map(|select| crate::api_select::Selection::new(select))
+            .transpose()
+        {
+            Ok(selection) => selection,
+            Err(reason) => return error(StatusCode::BAD_REQUEST, reason),
+        }
+    } else {
+        None
+    };
     let root = app.config.snapshot();
     let mut items = root[kind].as_array().cloned().unwrap_or_default();
     if kind == "streams" {
@@ -797,6 +1660,11 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
                 *item = app.config.effective(&name).unwrap_or(item.clone());
                 item["stats"] = app.stream_stats(&name).await;
             }
+        }
+    }
+    if role == Role::View {
+        for item in &mut items {
+            redact_view_value(item);
         }
     }
     if matches!(kind, "streams" | "templates") {
@@ -821,48 +1689,155 @@ async fn management(State(app): State<Arc<App>>, request: Request) -> Response {
         if query.get("sort").is_some_and(|s| s == "-name") {
             items.reverse()
         }
-        let offset = query
-            .get("cursor")
-            .and_then(|s| STANDARD.decode(s).ok())
-            .and_then(|b| String::from_utf8(b).ok())
-            .map(|s| parse_query(Some(&s)))
-            .and_then(|p| p.get("$position_gt").and_then(|v| v.parse::<usize>().ok()))
-            .map(|p| p.saturating_add(1))
-            .unwrap_or(0);
+        let page = match crate::api_cursor::paginate_positions(items, &query) {
+            Ok(page) => page,
+            Err(message) => return error(StatusCode::BAD_REQUEST, message),
+        };
+        (page.items, page.next, page.prev)
+    };
+    // The reference's explicit name scan counts only the requested page plus
+    // one look-ahead row. Default position pages retain their full count.
+    let estimated_count = if kind == "streams" && query.get("sort").is_some_and(|s| s == "name") {
         let limit = query
             .get("limit")
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(100)
             .clamp(1, 1000);
-        let page = items
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .collect::<Vec<_>>();
-        let next = if offset.saturating_add(page.len()) < total {
-            Some(STANDARD.encode(format!("%24position_gt={}", offset + page.len() - 1)))
-        } else {
-            None
-        };
-        (page, next, None)
+        total.min(limit.saturating_add(1))
+    } else {
+        total
     };
-    let mut result = json!({"estimated_count":total,"timing":{},"next":next,"prev":prev});
-    if matches!(kind, "streams" | "templates" | "peers" | "sources")
-        && let Some(select) = query.get("select")
-    {
-        let selection = crate::api_select::Selection::new(select);
+    let mut result = json!({"estimated_count":estimated_count,"timing":{}});
+    if kind == "streams" {
+        result["server_id"] = json!(app.node_id.to_string());
+    }
+    if let Some(next) = next {
+        result["next"] = json!(next);
+    }
+    if let Some(prev) = prev {
+        result["prev"] = json!(prev);
+    }
+    if let Some(selection) = selection.as_ref() {
         for row in &mut page {
             *row = selection.project(row, kind == "streams");
         }
     }
     result[kind] = json!(page);
-    json_response(result)
+    management_read_response(role, result)
 }
 async fn read_json(request: Request) -> Result<Value, (StatusCode, String)> {
     let bytes = axum::body::to_bytes(request.into_body(), 2 * 1024 * 1024)
         .await
         .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "body exceeds limit".into()))?;
     serde_json::from_slice(&bytes).map_err(|_| (StatusCode::BAD_REQUEST, "invalid JSON".into()))
+}
+async fn validate_config_request(app: &App, request: Request) -> Response {
+    let config = &app.config;
+    let text_plain = request
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/plain"));
+    let bytes = match axum::body::to_bytes(request.into_body(), 2 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "body exceeds limit"),
+    };
+    let patch: Value = if text_plain {
+        let body = match std::str::from_utf8(&bytes) {
+            Ok(body) => body,
+            Err(error) => {
+                let prefix = std::str::from_utf8(&bytes[..error.valid_up_to()])
+                    .expect("UTF-8 error prefix is valid");
+                let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+                let col = prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "error":"invalid_config", "config":{}, "detail":"text configuration must be UTF-8",
+                        "line":line, "col":col, "path":[]
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        match parse_text(body) {
+            Ok(patch) => patch,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "error":e.error, "config":e.config, "detail":e.detail,
+                        "line":e.line, "col":e.col, "path":[]
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match serde_json::from_slice(&bytes) {
+            Ok(patch) => patch,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "error":"invalid_json", "config":{}, "detail":e.to_string(),
+                        "line":e.line(), "col":e.column().max(1), "path":[]
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+    match config.validate(patch.clone()) {
+        Ok(validated) => {
+            if app.geoip.is_none() && named_balancer::requires_geoip(&validated) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "error":"invalid_config","config":patch,
+                        "detail":"named balancer country rules require --geoip-db",
+                        "path":["server_config","balancers"]
+                    })),
+                )
+                    .into_response();
+            }
+            json_response(validated)
+        }
+        Err(detail) => {
+            let unknown = detail
+                .strip_prefix("server option ")
+                .and_then(|rest| {
+                    rest.strip_suffix(
+                        " is not implemented; listener/auth/limits are startup options",
+                    )
+                })
+                .filter(|key| patch.get(*key).is_some());
+            let wrong_collection = detail
+                .strip_suffix(" must be an array")
+                .filter(|kind| KINDS.contains(kind) && patch.get(*kind).is_some());
+            let nested = (!text_plain)
+                .then(|| nested_validation_path(&patch, &detail))
+                .flatten();
+            let (code, path) = if let Some((code, path)) = nested {
+                (code, path)
+            } else if let Some(key) = unknown {
+                ("unknown_key".into(), json!(["server_config", key]))
+            } else if let Some(kind) = wrong_collection {
+                ("invalid_config".into(), json!(["server_config", kind]))
+            } else {
+                ("invalid_config".into(), json!([]))
+            };
+            let recoverable = if patch.is_object() { patch } else { json!({}) };
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "error":code, "config":recoverable, "detail":detail, "path":path
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
     let tail = percent_encoding::percent_decode_str(
@@ -962,13 +1937,18 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
     if tail == "node" && request.method() == "GET" {
         let mut node = app.node().await;
         node["idle_memory_cleanup"] = app.media.idle_memory.snapshot();
-        return json_response(node);
+        node["management_role"] = json!(if role == Some(Role::View) {
+            "view"
+        } else {
+            "edit"
+        });
+        return management_read_response(role.unwrap_or(Role::Edit), node);
     }
     if tail == "capabilities" && request.method() == "GET" {
         let (gpu_profiles, vaapi_profiles) =
             tokio::join!(app.media.gpu_capabilities(), app.media.vaapi_capabilities());
         return json_response(
-            json!({"rtsp_publication":app.rtsp_publication.lock().unwrap().clone(),"api":"Flussonic v3 subset","input":["hls","hlss","tshttp","tshttps","rtsp","rtsp-udp (unicast RTP/RTCP)","rtsp2 (RTSP/1.0 camera input, AAC audio default)","rtsps (verified TLS, interleaved TCP)","srt","rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","publish:// (HTTP MPEG-TS; RTSP TCP / opt-in unicast UDP; RTSPS TLS TCP receive; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)","testsrc"],"output":["rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","srt (caller push / global listener playback, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","http / https / tshttp / tshttps (native continuous MPEG-TS POST push, optional Basic; verified HTTPS TLS)","rtsp (TCP or unicast UDP publish push; TCP / opt-in unicast UDP playback; H264/HEVC/AAC-LC/MP2/MP3)","rtsps (verified TLS TCP publish push; opt-in TLS TCP playback; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/AAC frames and packed GOPs)","m4f (single-chunk H.264/AAC)"],"unimplemented":["SDP negotiation","DTLS-SRTP / automatic key negotiation","rtsp Basic / Digest viewer auth","dvr","push protocols beyond SRT/RTSP/RTSPS/HTTP MPEG-TS","srt publication policy / per-stream playback listeners"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA / VAAPI H.264 / HEVC; profile readiness check, no software fallback","gpu_profiles":gpu_profiles,"vaapi_profiles":vaapi_profiles},"direct_srtp":{"available":crate::direct_rtp::crypto::availability(),"profile":"AES_CM_128_HMAC_SHA1_80","library":"independent system libsrtp2"},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP/RTSP/RTSPS redirects"}),
+            json!({"fxlink":app.fxlink.lock().unwrap().0.clone(),"rtsp_publication":app.rtsp_publication.lock().unwrap().clone(),"api":"Flussonic v3 subset","input":["fxlink (verified QUIC TLS, original native records, FEC)","hls","hlss","tshttp","tshttps","rtsp","rtsp-udp (unicast RTP/RTCP)","rtsp2 (RTSP/1.0 camera input, AAC audio default)","rtsps (verified TLS, interleaved TCP)","srt","rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","publish:// (HTTP MPEG-TS; RTSP TCP / opt-in unicast UDP; RTSPS TLS TCP receive; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/HEVC video, AAC/Layer II/MP3 audio; frames and packed GOPs)","m4f (H.264/HEVC video, AAC/Layer II/MP3 audio; bounded segments)","testsrc"],"output":["rtp (MP2T or elementary H.264/HEVC/AAC/MP2/MP3 with static SDP, unicast and IPv4 multicast)","srtp (MP2T or elementary static SAVP / AES_CM_128_HMAC_SHA1_80, authenticated SRTCP)","srt (caller push / global listener playback, optional enforced encryption)","hls","mpegts","fmp4-hls","https (opt-in TLS delivery and MPEG-TS publication)","http / https / tshttp / tshttps (native continuous MPEG-TS POST push, optional Basic; verified HTTPS TLS)","rtsp (TCP or unicast UDP publish push; TCP / opt-in unicast UDP playback; H264/HEVC/AAC-LC/MP2/MP3)","rtsps (verified TLS TCP publish push; opt-in TLS TCP playback; H264/HEVC/AAC-LC/MP2/MP3)","m4s (H.264/HEVC video, AAC/Layer II/MP3 audio; frames and packed GOPs)","m4f (H.264/HEVC video, AAC/Layer II/MP3 audio; bounded segments)"],"unimplemented":["SDP negotiation","DTLS-SRTP / automatic key negotiation","rtsp Basic / Digest viewer auth","dvr","push protocols beyond SRT/RTSP/RTSPS/HTTP MPEG-TS","srt publication policy / per-stream playback listeners"],"transcoding":{"cpu":"H.264 / HEVC; independent AAC / MPEG Layer II / MP3 / copy audio","gpu":"NVIDIA / VAAPI H.264 / HEVC; profile readiness check, no software fallback","gpu_profiles":gpu_profiles,"vaapi_profiles":vaapi_profiles},"direct_srtp":{"available":crate::direct_rtp::crypto::availability(),"profile":"AES_CM_128_HMAC_SHA1_80","library":"independent system libsrtp2","receiver_ledger":app.srtp_ledger_capability()},"cluster":"native HLS/M4S/M4F source discovery and reserved HTTP/RTSP/RTSPS redirects"}),
         );
     }
     if let Some(name) = tail.strip_prefix("stream/") {
@@ -985,31 +1965,21 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
                                 );
                             }
                         };
-                        if value.is_object() {
-                            c["on_play"]["url"] = json!(policy.url);
-                        } else {
-                            c["on_play"] = json!(policy.url);
+                        if let Some(url) = policy.url {
+                            if value.is_object() {
+                                c["on_play"]["url"] = json!(url);
+                            } else {
+                                c["on_play"] = json!(url);
+                            }
                         }
                     }
                     // Discovery conveys playback policy and identity, never publisher
                     // credentials, source inputs or raw saved configuration.
-                    let fields = [
-                        "name",
-                        "title",
-                        "comment",
-                        "position",
-                        "disabled",
-                        "flussonix_content_id",
-                        "flussonix_input_timeout",
-                        "flussonix_subtitle_tracks",
-                        "flussonix_hls_captions",
-                        "flussonix_hls_subtitles",
-                        "on_play",
-                        "flussonix_token_sha256",
-                    ];
-                    let discovery = fields
-                        .into_iter()
-                        .filter_map(|key| c.get(key).cloned().map(|value| (key.to_owned(), value)))
+                    let discovery = crate::source_directory::NATIVE_DISCOVERY_FIELDS
+                        .iter()
+                        .filter_map(|key| {
+                            c.get(key).cloned().map(|value| ((*key).to_owned(), value))
+                        })
                         .collect();
                     json_response(Value::Object(discovery))
                 }
@@ -1018,9 +1988,32 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
         }
     }
     if tail == "admit" && request.method() == "POST" && peer {
-        let b = match read_json(request).await {
-            Ok(b) => b,
-            Err((code, message)) => return error(code, &message),
+        let socket_peer = request.extensions().get::<ConnectInfo<SocketAddr>>();
+        let secure_srt_peer = socket_peer.is_some_and(|peer| {
+            request
+                .extensions()
+                .get::<crate::http_tls::SecureHttp>()
+                .is_some()
+                || peer.0.ip().is_loopback()
+        });
+        if header(request.headers(), "x-flussonix-srt-credential").is_some() && !secure_srt_peer {
+            return error(
+                StatusCode::UPGRADE_REQUIRED,
+                "secure SRT admission required",
+            );
+        }
+        let bytes = match axum::body::to_bytes(request.into_body(), 4096).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "admission body exceeds limit",
+                );
+            }
+        };
+        let b: Value = match serde_json::from_slice(&bytes) {
+            Ok(body) => body,
+            Err(_) => return error(StatusCode::BAD_REQUEST, "invalid admission JSON"),
         };
         let Some(name) = b["name"].as_str() else {
             return error(StatusCode::BAD_REQUEST, "name required");
@@ -1047,6 +2040,25 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
             Ok(kind) => kind,
             Err(message) => return error(StatusCode::BAD_REQUEST, &message),
         };
+        let private_viewer = match admission::srt_viewer(&b, name) {
+            Ok(viewer) => viewer,
+            Err(status) => return error(status, "invalid SRT viewer"),
+        };
+        if let Some(viewer) = private_viewer {
+            if !secure_srt_peer {
+                return error(
+                    StatusCode::UPGRADE_REQUIRED,
+                    "secure SRT admission required",
+                );
+            }
+            return match app.reserve_srt_credential(viewer, hint).await {
+                Ok(ticket) => json_response(json!({"ticket":ticket,"expires_in":5})),
+                Err(status) => error(
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+                    "SRT admission unavailable",
+                ),
+            };
+        }
         let mut vendor = None;
         let mut srt = None;
         if let rtsp_balancer::Kind::Srt { encrypted, .. } = &kind {
@@ -1064,6 +2076,8 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
                 listener_id: listener["listener_id"].as_str().unwrap_or("").into(),
                 revision: app.config.revision(),
                 signature: None,
+                viewer: None,
+                peer_ip: None,
             });
         }
         if matches!(
@@ -1156,40 +2170,7 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
                 "stream cost exceeds admission bounds",
             );
         }
-        let expected = bitrate_mbps / app.options.uplink_mbps;
-        let (n, window) = app.telemetry.snapshot_with_window(app.options.uplink_mbps);
-        let reserved_mbps: f64 = reservations.values().map(|r| r.bitrate_mbps).sum::<f64>()
-            + app
-                .http_handoffs
-                .unmeasured(window, n["http_egress_mbps"].as_f64());
-        let active = app.playback_auth.active();
-        let srt_full = srt.as_ref().is_some_and(|binding| {
-            let listener = app.srt_playback.lock().unwrap();
-            let limit = listener["client_limit"].as_u64().unwrap_or(0);
-            let pending = reservations
-                .values()
-                .filter(|r| {
-                    r.srt
-                        .as_ref()
-                        .is_some_and(|b| b.listener_id == binding.listener_id)
-                })
-                .count() as u64;
-            app.srt_connections
-                .load(Ordering::Relaxed)
-                .saturating_add(pending)
-                >= limit
-        });
-        if srt_full
-            || app.options.drain
-            || reservations.len() >= 20000
-            || active + reservations.len() as u64 >= app.options.client_limit
-            || n["uplink"].as_f64().unwrap_or(1.0)
-                + reserved_mbps / app.options.uplink_mbps
-                + expected
-                >= 0.9
-            || n["cpu"].as_f64().unwrap_or(1.0) >= 0.9
-            || n["ram"].as_f64().unwrap_or(1.0) >= 0.95
-        {
+        if !app.reservation_capacity(&reservations, srt.as_ref(), bitrate_mbps) {
             return error(StatusCode::SERVICE_UNAVAILABLE, "node has no capacity");
         }
         let native_http = matches!(kind, rtsp_balancer::Kind::Http)
@@ -1262,33 +2243,115 @@ async fn native(State(app): State<Arc<App>>, request: Request) -> Response {
     }
     error(StatusCode::NOT_FOUND, "operation not implemented")
 }
+#[derive(Clone, Copy)]
+pub(crate) struct BalanceRequest<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) path: &'a str,
+    pub(crate) query: &'a str,
+    pub(crate) secure: bool,
+    pub(crate) named: Option<&'a str>,
+    pub(crate) client_ip: Option<IpAddr>,
+    pub(crate) viewer_token: &'a str,
+}
+#[derive(Clone)]
+struct NamedPlacement {
+    scope: [u8; 32],
+    peer: String,
+}
+fn with_named_placement(mut response: Response, scope: Option<[u8; 32]>, peer: String) -> Response {
+    if let Some(scope) = scope {
+        response
+            .extensions_mut()
+            .insert(NamedPlacement { scope, peer });
+    }
+    response
+}
 async fn balance(
     app: &Arc<App>,
-    name: &str,
-    path: &str,
-    query: &str,
-    secure: bool,
+    request: BalanceRequest<'_>,
     grant: &Grant,
     revision: u64,
 ) -> Response {
-    let work = balance_inner(app, name, path, query, secure, grant, revision);
-    tokio::select! { biased;
+    let work = balance_inner(app, request, grant, revision);
+    let mut response = tokio::select! { biased;
         _=grant.cancelled()=>error(StatusCode::FORBIDDEN,"playback policy changed"),
         result=tokio::time::timeout(Duration::from_secs(8),work)=>result.unwrap_or_else(|_|error(StatusCode::SERVICE_UNAVAILABLE,"placement deadline exceeded")),
+    };
+    if response.status().is_redirection() {
+        if !app.playback_auth.release_redirect_lease(grant).await {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "IPTV redirect lease release failed",
+            );
+        }
+        if app.config.revision() != revision {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "routing configuration changed",
+            );
+        }
+        if let Some(placement) = response.extensions_mut().remove::<NamedPlacement>() {
+            app.named_affinity.lock().unwrap().remember(
+                placement.scope,
+                placement.peer,
+                Instant::now(),
+            );
+        }
     }
+    response
 }
 async fn balance_inner(
     app: &Arc<App>,
-    name: &str,
-    path: &str,
-    query: &str,
-    secure: bool,
+    request: BalanceRequest<'_>,
     grant: &Grant,
     revision: u64,
 ) -> Response {
     use futures_util::StreamExt;
+    let BalanceRequest {
+        name,
+        path,
+        query,
+        secure,
+        named,
+        client_ip,
+        viewer_token,
+    } = request;
     let root = app.config.snapshot();
-    let peers = root["peers"].as_array().cloned().unwrap_or_default();
+    let named_policy = if let Some(named) = named {
+        let Some(row) = root["balancers"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == named))
+        else {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "named balancer configuration changed",
+            );
+        };
+        Some(row)
+    } else {
+        None
+    };
+    let allowed = named_policy.map(|row| {
+        row["servers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|server| server["name"].as_str())
+            .collect::<std::collections::HashSet<_>>()
+    });
+    let peers = root["peers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|peer| {
+            allowed.as_ref().is_none_or(|names| {
+                peer["hostname"]
+                    .as_str()
+                    .is_some_and(|name| names.contains(name))
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     if peers.len() > 64 || app.config.revision() != revision {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1335,6 +2398,7 @@ async fn balance_inner(
     drop(calls);
     let mut attempted = std::collections::HashSet::new();
     let mut turn = None;
+    let mut named_affinity_scope = None;
     loop {
         // A failed admission can consume the remaining sample lifetime. Reproject
         // every observed candidate, including those the previous cost excluded.
@@ -1407,7 +2471,51 @@ async fn balance_inner(
             };
             nodes.push(load)
         }
-        let Some(id) = app.routing_rotation.select(&nodes, 0.0, &mut turn) else {
+        let selected = if let Some(policy) = named_policy {
+            nodes.retain(|node| crate::cluster::select(std::slice::from_ref(node), 0.0).is_some());
+            let candidates = nodes
+                .iter()
+                .filter_map(|node| {
+                    let (snapshot, _, _) = observations.iter().find(|(_, peer, _)| {
+                        peer["hostname"].as_str() == Some(node.name.as_str())
+                    })?;
+                    Some(named_balancer::ObservedPeer {
+                        name: &node.name,
+                        output_kbit: snapshot.value["output_kbit"].as_u64(),
+                        bandwidth_usage: snapshot.value["bandwidth_usage"].as_f64(),
+                        clients: snapshot.value["total_clients"].as_u64(),
+                        total_streams_count: snapshot.value["total_streams_count"].as_u64(),
+                        age_ms: node.age_ms,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let ip = client_ip.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+            let country = if named_balancer::row_requires_geoip(policy) {
+                app.geoip.as_ref().and_then(|geoip| geoip.country(ip))
+            } else {
+                None
+            };
+            let ranked = named_balancer::rank(
+                policy,
+                &candidates,
+                ip,
+                country.as_deref(),
+                revision,
+                name,
+                viewer_token,
+            );
+            let scope = *named_affinity_scope.get_or_insert(ranked.scope);
+            let mut affinity = app.named_affinity.lock().unwrap();
+            let order = if scope == ranked.scope {
+                affinity.prefer(&ranked, Instant::now())
+            } else {
+                ranked.order
+            };
+            order.into_iter().next()
+        } else {
+            app.routing_rotation.select(&nodes, 0.0, &mut turn)
+        };
+        let Some(id) = selected else {
             break;
         };
         attempted.insert(id.clone());
@@ -1419,7 +2527,11 @@ async fn balance_inner(
             if let Some(location) = http_balancer::vendor_location(p, name, path, query)
                 && app.hold_vendor_http(p, selected, bitrate_mbps, revision)
             {
-                return (StatusCode::FOUND, [("location", location)]).into_response();
+                return with_named_placement(
+                    (StatusCode::FOUND, [("location", location)]).into_response(),
+                    named_affinity_scope,
+                    id,
+                );
             }
             continue;
         }
@@ -1463,7 +2575,11 @@ async fn balance_inner(
                             path.trim_start_matches('/'),
                             query
                         );
-                        return (StatusCode::FOUND, [("location", url)]).into_response();
+                        return with_named_placement(
+                            (StatusCode::FOUND, [("location", url)]).into_response(),
+                            named_affinity_scope,
+                            id,
+                        );
                     }
                 }
             }
@@ -1473,10 +2589,28 @@ async fn balance_inner(
 }
 async fn media_request(State(app): State<Arc<App>>, request: Request) -> Response {
     let activity = app.media.idle_memory.activity().await;
+    let post_named = (request.method() == "POST")
+        .then(|| named_balancer::http_path(&app.config.snapshot(), request.uri().path()));
     let mut response = if request.method() == "OPTIONS" {
         StatusCode::NO_CONTENT.into_response()
     } else if request.method() == "POST" {
-        publication::receive(app, request).await
+        match post_named.expect("POST path was checked") {
+            Err(message) => error(StatusCode::BAD_REQUEST, message),
+            Ok(Some(_)) => error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "named balancer publishing is not supported",
+            ),
+            Ok(None) => {
+                if browser_management_write_allowed(
+                    &request,
+                    app.options.admin_public_origin.as_ref(),
+                ) {
+                    publication::receive(app, request).await
+                } else {
+                    error(StatusCode::FORBIDDEN, "cross-origin publication request")
+                }
+            }
+        }
     } else {
         serve_media_request(app, request).await
     };
@@ -1503,10 +2637,24 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     if request.method() != "GET" {
         return error(StatusCode::METHOD_NOT_ALLOWED, "playback requires GET");
     }
-    let raw_path = request.uri().path();
+    let named_revision = app.config.revision();
+    let named = match named_balancer::http_path(&app.config.snapshot(), request.uri().path()) {
+        Ok(named) => named,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
+    if named.is_some() && app.options.role != "lb" {
+        return error(StatusCode::NOT_FOUND, "named balancer path is unavailable");
+    }
+    if named.is_some() && !named_balancer::valid_admission_query(request.uri().query()) {
+        return error(StatusCode::BAD_REQUEST, "conflicting admission markers");
+    }
+    let raw_path = named
+        .as_ref()
+        .map_or(request.uri().path(), |route| route.media_path.as_str());
     let path = percent_encoding::percent_decode_str(raw_path.trim_start_matches('/'))
         .decode_utf8_lossy()
         .to_string();
+    let track_route = crate::hls_ts_select::route(&path);
     let special = if path.ends_with(".m4f") {
         let p = path.rsplitn(7, '/').collect::<Vec<_>>();
         if p.len() == 7 {
@@ -1528,6 +2676,14 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         (n, "m4s")
     } else if let Some(n) = path.strip_suffix("/mpegts") {
         (n, "mpegts")
+    } else if let Some(route) = track_route {
+        match route {
+            crate::hls_ts_select::Route::Master { stream } => (stream, "video.m3u8"),
+            crate::hls_ts_select::Route::Playlist { stream, .. }
+            | crate::hls_ts_select::Route::Segment { stream, .. } => {
+                (stream, &path[stream.len() + 1..])
+            }
+        }
     } else if let Some((n, _f)) = path.split_once("/fmp4/") {
         (n, &path[n.len() + 1..])
     } else if let Some((n, f)) = path.rsplit_once('/') {
@@ -1559,7 +2715,15 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
                         .serve(
                             &app,
                             crate::vendor_playback::HttpRequest::new(
-                                &request, name, file, key, revision,
+                                &request,
+                                name,
+                                file,
+                                key,
+                                revision,
+                                raw_path,
+                                named
+                                    .as_ref()
+                                    .map(|route| (route.balancer.as_str(), named_revision)),
                             ),
                         )
                         .await
@@ -1584,7 +2748,39 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         .get::<ConnectInfo<SocketAddr>>()
         .map(|v| v.0.ip().to_string())
         .unwrap_or_else(|| "127.0.0.1".into());
+    let client_ip = ip.parse::<IpAddr>().ok();
     app.http_handoffs.prune();
+    if query.contains_key("flussonix_ticket") && query.contains_key("flussonix_handoff") {
+        return error(StatusCode::BAD_REQUEST, "conflicting admission markers");
+    }
+    if query.contains_key("flussonix_handoff")
+        && app
+            .credentials
+            .peer(header(request.headers(), "x-flussonix-peer"))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "peer playback cannot claim a viewer handoff",
+        );
+    }
+    let mut handoff = if let Some(ticket) = query.get("flussonix_handoff") {
+        let claim = if file.ends_with(".m3u8") {
+            app.http_handoffs.claim_hls(ticket).await
+        } else {
+            app.http_handoffs.claim_once(ticket).await
+        };
+        match claim {
+            Some(claim) => Some(claim),
+            None => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "admission handoff invalid or expired",
+                );
+            }
+        }
+    } else {
+        None
+    };
     let mut grant = if app
         .credentials
         .peer(header(request.headers(), "x-flussonix-peer"))
@@ -1610,10 +2806,32 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             user_agent: header(request.headers(), "user-agent").unwrap_or("").into(),
             referer: header(request.headers(), "referer").unwrap_or("").into(),
             host: header(request.headers(), "host").unwrap_or("").into(),
+            finite_media: file.ends_with(".m4f"),
         };
         // Validate protocol before authorization. A valid native HTTP ticket
         // owns a global slot; possession never bypasses viewer policy checks.
-        let outcome = if let Some(ticket) = query.get("flussonix_ticket") {
+        let outcome = if let Some(handoff) = handoff.as_ref().and_then(http_handoff::Claim::grant) {
+            app.playback_auth
+                .authorize_handoff(resolved.policy, viewer, handoff)
+                .await
+        } else if let Some(identity) = handoff
+            .as_ref()
+            .and_then(http_handoff::Claim::reuse_identity)
+        {
+            match app
+                .playback_auth
+                .authorize_handoff_reuse(resolved.policy, viewer, identity)
+                .await
+            {
+                Some(outcome) => outcome,
+                None => {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "admission handoff belongs to another viewer",
+                    );
+                }
+            }
+        } else if let Some(ticket) = query.get("flussonix_ticket") {
             let slot = {
                 let reservations = app.reservations.lock().await;
                 let Some(r) = reservations.get(ticket).filter(|r| {
@@ -1644,6 +2862,12 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             AuthOutcome::Allowed(g) => g,
             AuthOutcome::Denied => return error(StatusCode::FORBIDDEN, "playback denied"),
             AuthOutcome::Redirect(url) => {
+                if named.is_some() && app.config.revision() != named_revision {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "named balancer configuration changed",
+                    );
+                }
                 if secure && !url::Url::parse(&url).is_ok_and(|u| u.scheme() == "https") {
                     return error(
                         StatusCode::FORBIDDEN,
@@ -1654,6 +2878,16 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             }
         }
     };
+    if let Some(expected) = handoff
+        .as_ref()
+        .and_then(http_handoff::Claim::reuse_identity)
+        && grant.session_identity() != Some(expected)
+    {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admission handoff belongs to another viewer",
+        );
+    }
     if app.config.revision() != resolved.revision {
         // Re-resolve after a concurrent save. Unrelated metadata changes retain the grant,
         // while policy/source changes publish a new authority revision and cancel it.
@@ -1670,12 +2904,24 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         return error(StatusCode::FORBIDDEN, "playback policy changed");
     }
     if app.options.role == "lb" {
+        if named.is_some() && (named_revision != revision || app.config.revision() != revision) {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "named balancer configuration changed",
+            );
+        }
+        let viewer_query = App::http_viewer_query(request.uri().query().unwrap_or(""));
         return balance(
             &app,
-            name,
-            raw_path,
-            &App::http_viewer_query(request.uri().query().unwrap_or("")),
-            secure,
+            BalanceRequest {
+                name,
+                path: raw_path,
+                query: &viewer_query,
+                secure,
+                named: named.as_ref().map(|route| route.balancer.as_str()),
+                client_ip,
+                viewer_token: query.get("token").map(String::as_str).unwrap_or(""),
+            },
             &grant,
             revision,
         )
@@ -1691,8 +2937,11 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
         match valid {
             true => {
                 let reservation = reservations.remove(ticket).unwrap();
-                app.http_handoffs
-                    .insert(ticket.clone(), grant, reservation.bitrate_mbps);
+                if reservation.http_slot.is_some() && grant.session_identity().is_some() {
+                    app.http_handoffs
+                        .insert(ticket.clone(), grant, reservation.bitrate_mbps);
+                    return App::native_http_handoff_redirect(raw_path, &query, ticket);
+                }
                 return App::http_ticket_redirect(raw_path, &query);
             }
             _ => {
@@ -1705,13 +2954,28 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     }
     // M4F signals and timestamp media are one segmented output session.
     let segmented = !matches!(file, "mpegts" | "m4s");
-    grant.set_output_credit(app.http_handoffs.take(&grant, segmented));
+    let credit = if let Some(ref mut claimed) = handoff {
+        app.http_handoffs.activate_claim(claimed, &grant, segmented)
+    } else {
+        app.http_handoffs.take(&grant, segmented && file != "m4f")
+    };
+    if handoff.is_some() && credit.is_none() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admission handoff invalid or expired",
+        );
+    }
+    grant.set_output_credit(credit);
+    drop(handoff);
     let signature = crate::media::media_signature(&cfg);
     let check = async {
-        !grant.is_cancelled()
-            && app.media_config(name).await.is_some_and(|(c, _)| {
-                c["disabled"] != true && crate::media::media_signature(&c) == signature
-            })
+        if grant.is_cancelled() {
+            return false;
+        }
+        let current = app.media_config(name).await.is_some_and(|(c, _)| {
+            c["disabled"] != true && crate::media::media_signature(&c) == signature
+        });
+        current && !grant.is_cancelled()
     };
     let worker = match app.media.ensure_guarded(name, &cfg, true, check).await {
         Ok(w) => w,
@@ -1722,12 +2986,17 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             );
         }
     };
-    if grant.is_cancelled()
-        || !app.media_config(name).await.is_some_and(|(c, _)| {
-            c["disabled"] != true && crate::media::media_signature(&c) == worker.signature()
-        })
-    {
+    let current = app.media_config(name).await.is_some_and(|(c, _)| {
+        c["disabled"] != true && crate::media::media_signature(&c) == worker.signature()
+    });
+    if !current {
         app.media.stop_if_current(name, &worker).await;
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stream changed during startup",
+        );
+    }
+    if grant.is_cancelled() {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "stream changed during startup",
@@ -1735,14 +3004,27 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     }
     if file == "m4s" || file == "m4f" {
         let deadline = Instant::now() + Duration::from_secs(8);
+        let has_payload = || {
+            if file == "m4f" {
+                worker.wire.has_m4f_segment()
+            } else {
+                worker.wire.has_info()
+            }
+        };
         while !grant.is_cancelled()
-            && !worker.wire.has_info()
+            && !has_payload()
             && worker.alive.load(Ordering::Relaxed)
             && Instant::now() < deadline
         {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        if !worker.wire.has_info() {
+        if !has_payload() {
+            if file == "m4f" && worker.wire.has_info() {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "M4F segment not available yet",
+                );
+            }
             return error(
                 StatusCode::NOT_IMPLEMENTED,
                 "wire outputs require H.264/AAC media",
@@ -1772,8 +3054,7 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
                 } else {
                     tokio::select! {biased; _=guard.1.cancelled()=>return None,_=guard.0.closed()=>return None,result=rx.recv()=> match result { Ok(bytes)=>bytes, Err(_)=>return None } }
                 };
-                guard.1.add_bytes(bytes.len());
-                egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                let bytes = wire_output_chunk(bytes, &guard, &egress)?;
                 Some((
                     Ok::<Bytes, std::io::Error>(bytes),
                     (boot, rx, guard, egress),
@@ -1797,39 +3078,38 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
             .into_response();
     }
     if file == "mpegts" {
-        let rx = worker.subscribe();
-        worker.viewers.fetch_add(1, Ordering::Relaxed);
-        let guard = ViewerGuard(worker.clone(), grant);
-        let egress = app.egress.clone();
-        let stream = futures_util::stream::unfold(
-            (rx, guard, egress),
-            |(mut rx, guard, egress)| async move {
-                match tokio::select! {biased; _=guard.1.cancelled()=>Err(tokio::sync::broadcast::error::RecvError::Closed),_=guard.0.closed()=>Err(tokio::sync::broadcast::error::RecvError::Closed),result=rx.recv()=>result}
-                {
-                    Ok(bytes) => {
-                        guard.1.add_bytes(bytes.len());
-                        egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                        Some((Ok::<Bytes, std::io::Error>(bytes), (rx, guard, egress)))
-                    }
-                    Err(_) => None,
-                }
-            },
-        );
+        let connection = matches!(
+            request.version(),
+            axum::http::Version::HTTP_10 | axum::http::Version::HTTP_11
+        )
+        .then(|| {
+            request
+                .extensions()
+                .get::<crate::http_transport::Control>()
+                .cloned()
+        })
+        .flatten();
+        let body = native_ts_body::body(worker, grant, app.egress.clone(), connection);
         return (
             [
                 ("Content-Type".to_owned(), "video/mp2t".to_owned()),
                 ("Cache-Control".into(), "no-store".into()),
             ],
-            Body::from_stream(stream),
+            body,
         )
             .into_response();
     }
+    if let Some(route) = track_route {
+        return serve_selected_hls(&app, name, route, &worker, &grant, &query).await;
+    }
+    let alias = crate::hls_master_alias::Alias::from_file(file);
+    let read_file = alias.map_or(file, |alias| alias.underlying_file());
     let deadline = Instant::now() + Duration::from_secs(8);
     let bytes = loop {
         if grant.is_cancelled() {
             return error(StatusCode::FORBIDDEN, "playback revoked");
         }
-        match app.media.read(name, file).await {
+        match app.media.read(name, read_file).await {
             Ok(b) => break b,
             Err(_)
                 if file.ends_with(".m3u8")
@@ -1844,14 +3124,24 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     let bytes = if file.ends_with(".m3u8") {
         let mut q = query.clone();
         q.remove("flussonix_ticket");
+        q.remove("flussonix_handoff");
         let suffix = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(q.iter())
             .finish();
-        Bytes::from(rewrite_playlist(&String::from_utf8_lossy(&bytes), &suffix))
+        if let Some(alias) = alias {
+            match crate::hls_master_alias::render(alias, &bytes, worker.output_bitrate(), &suffix) {
+                Ok(master) => master,
+                Err(_) => {
+                    return error(StatusCode::SERVICE_UNAVAILABLE, "HLS master unavailable");
+                }
+            }
+        } else {
+            Bytes::from(rewrite_playlist(&String::from_utf8_lossy(&bytes), &suffix))
+        }
     } else {
         bytes
     };
-    if grant.is_cancelled() {
+    if grant.is_cancelled() || (alias.is_some() && worker.is_closed()) {
         return error(StatusCode::FORBIDDEN, "playback revoked");
     }
     grant.add_bytes(bytes.len());
@@ -1876,11 +3166,541 @@ async fn serve_media_request(app: Arc<App>, request: Request) -> Response {
     )
         .into_response()
 }
+async fn serve_selected_hls(
+    app: &Arc<App>,
+    name: &str,
+    route: crate::hls_ts_select::Route<'_>,
+    worker: &Arc<Worker>,
+    grant: &Grant,
+    query: &HashMap<String, String>,
+) -> Response {
+    use crate::hls_ts_select::{Route, Selector};
+    let mut child_query = query.clone();
+    child_query.remove("flussonix_ticket");
+    child_query.remove("flussonix_handoff");
+    let suffix = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(child_query.iter())
+        .finish();
+    let read_file = match route {
+        Route::Master { .. } | Route::Playlist { .. } => "index.m3u8",
+        Route::Segment { file, .. } => file,
+    };
+    let mut cached = match route {
+        Route::Segment { selector, file, .. } => {
+            app.media.cached_selected_hls(worker, file, selector)
+        }
+        _ => None,
+    };
+    let mut miss_permit = None;
+    if matches!(route, Route::Segment { .. }) && cached.is_none() {
+        let permit = tokio::select! { biased;
+            _ = grant.cancelled() => return error(StatusCode::FORBIDDEN, "playback revoked"),
+            _ = worker.closed() => return error(StatusCode::FORBIDDEN, "playback revoked"),
+            result = app.media.selected_hls_miss_permit() => match result {
+                Ok(permit) => permit,
+                Err(()) => return error(StatusCode::SERVICE_UNAVAILABLE, "selected HLS admission unavailable"),
+            },
+        };
+        if grant.is_cancelled()
+            || worker.is_closed()
+            || !app.media.is_current_worker(name, worker).await
+        {
+            return error(StatusCode::FORBIDDEN, "playback revoked");
+        }
+        if let Route::Segment { selector, file, .. } = route {
+            cached = app.media.cached_selected_hls(worker, file, selector);
+        }
+        if cached.is_none() {
+            miss_permit = Some(permit);
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let initial = if cached.is_some() {
+        None
+    } else {
+        Some(loop {
+            if grant.is_cancelled() || worker.is_closed() {
+                return error(StatusCode::FORBIDDEN, "playback revoked");
+            }
+            let read = if let Some(permit) = miss_permit.take() {
+                match app
+                    .media
+                    .read_current_worker_selected_ts(name, read_file, worker, permit)
+                    .await
+                {
+                    Ok((permit, bytes)) => {
+                        miss_permit = Some(permit);
+                        Ok(bytes)
+                    }
+                    Err(err) => Err(err),
+                }
+            } else {
+                app.media.read_current_worker(name, read_file, worker).await
+            };
+            match read {
+                Ok(bytes) => break bytes,
+                Err(_) if read_file.ends_with(".m3u8") && Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "HLS media unavailable"),
+            }
+        })
+    };
+    let mut pending_cache = None;
+    let mut retained_permit = None;
+    let (bytes, content_type) = match route {
+        Route::Segment { selector, file, .. } => {
+            let bytes = if let Some(cached) = cached {
+                cached
+            } else {
+                let source = initial.expect("uncached segment was read");
+                if grant.is_cancelled()
+                    || worker.is_closed()
+                    || !app.media.is_current_worker(name, worker).await
+                {
+                    return error(StatusCode::FORBIDDEN, "playback revoked");
+                }
+                let permit = miss_permit.expect("uncached segment owns an admission slot");
+                let passthrough_subtitles = worker.hls_subtitles == "passthrough";
+                let filtered = tokio::task::spawn_blocking(move || {
+                    (
+                        permit,
+                        crate::hls_ts_select::filter(&source, selector, passthrough_subtitles),
+                    )
+                })
+                .await;
+                let Ok((permit, Ok(filtered))) = filtered else {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "selected HLS segment unavailable",
+                    );
+                };
+                retained_permit = Some(permit);
+                let bytes = Bytes::from(filtered);
+                pending_cache = Some((file, selector));
+                bytes
+            };
+            (bytes, "video/mp2t")
+        }
+        Route::Master { .. } | Route::Playlist { .. } => {
+            let initial = initial.expect("HLS index was read");
+            let media_file = match crate::hls_ts_select::source_media_file(&initial) {
+                Ok(file) => file,
+                Err(_) => {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "HLS media playlist unavailable",
+                    );
+                }
+            };
+            let media = if media_file == "index.m3u8" {
+                initial.clone()
+            } else {
+                match app
+                    .media
+                    .read_current_worker(name, media_file, worker)
+                    .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "HLS media playlist unavailable",
+                        );
+                    }
+                }
+            };
+            let playlist = match crate::hls_ts_select::media_playlist(&media) {
+                Ok(playlist) => playlist,
+                Err(_) => {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "HLS media playlist unavailable",
+                    );
+                }
+            };
+            let Some(sample_name) = crate::hls_ts_select::latest_segment(&playlist) else {
+                return error(StatusCode::SERVICE_UNAVAILABLE, "HLS segment unavailable");
+            };
+            let (video, audio) = if let Some(profile) = worker.hls_track_profile() {
+                profile
+            } else {
+                let permit = tokio::select! { biased;
+                    _ = grant.cancelled() => return error(StatusCode::FORBIDDEN, "playback revoked"),
+                    _ = worker.closed() => return error(StatusCode::FORBIDDEN, "playback revoked"),
+                    result = app.media.selected_hls_miss_permit() => match result {
+                        Ok(permit) => permit,
+                        Err(()) => return error(StatusCode::SERVICE_UNAVAILABLE, "HLS track admission unavailable"),
+                    },
+                };
+                if grant.is_cancelled()
+                    || worker.is_closed()
+                    || !app.media.is_current_worker(name, worker).await
+                {
+                    return error(StatusCode::FORBIDDEN, "playback revoked");
+                }
+                if let Some(profile) = worker.hls_track_profile() {
+                    drop(permit);
+                    profile
+                } else {
+                    let (permit, sample) = match app
+                        .media
+                        .read_current_worker_selected_ts(name, sample_name, worker, permit)
+                        .await
+                    {
+                        Ok(read) => read,
+                        Err(_) => {
+                            return error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "HLS segment unavailable",
+                            );
+                        }
+                    };
+                    if grant.is_cancelled()
+                        || worker.is_closed()
+                        || !app.media.is_current_worker(name, worker).await
+                    {
+                        return error(StatusCode::FORBIDDEN, "playback revoked");
+                    }
+                    let scanned = tokio::task::spawn_blocking(move || {
+                        (permit, crate::hls_ts_select::available(&sample))
+                    })
+                    .await;
+                    let Ok((permit, Ok(profile))) = scanned else {
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "HLS track metadata unavailable",
+                        );
+                    };
+                    if grant.is_cancelled()
+                        || worker.is_closed()
+                        || !app.media.is_current_worker(name, worker).await
+                    {
+                        return error(StatusCode::FORBIDDEN, "playback revoked");
+                    }
+                    let profile = worker.hls_track_profile().unwrap_or(profile);
+                    worker.remember_hls_track_profile(profile);
+                    drop(permit);
+                    profile
+                }
+            };
+            let body = match route {
+                Route::Master { .. } => {
+                    let selector = Selector {
+                        video: (video > 0).then_some(1),
+                        audio: (audio > 0).then_some(1),
+                    };
+                    if selector.video.is_none() && selector.audio.is_none() {
+                        return error(StatusCode::SERVICE_UNAVAILABLE, "HLS tracks unavailable");
+                    }
+                    let alias = crate::hls_master_alias::render(
+                        crate::hls_master_alias::Alias::Ts,
+                        &initial,
+                        worker.output_bitrate(),
+                        &suffix,
+                    );
+                    let Ok(alias) = alias else {
+                        return error(StatusCode::SERVICE_UNAVAILABLE, "HLS master unavailable");
+                    };
+                    match crate::hls_ts_select::master_child(&alias, selector, &suffix) {
+                        Ok(body) => body,
+                        Err(_) => {
+                            return error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "HLS master unavailable",
+                            );
+                        }
+                    }
+                }
+                Route::Playlist { selector, .. } => {
+                    if selector.video.is_some_and(|n| n > video)
+                        || selector.audio.is_some_and(|n| n > audio)
+                    {
+                        return error(StatusCode::NOT_FOUND, "HLS track absent");
+                    }
+                    rewrite_playlist(&playlist, &suffix)
+                }
+                Route::Segment { .. } => unreachable!(),
+            };
+            (Bytes::from(body), "application/vnd.apple.mpegurl")
+        }
+    };
+    if grant.is_cancelled()
+        || worker.is_closed()
+        || !app.media.is_current_worker(name, worker).await
+        || !app.media_config(name).await.is_some_and(|(cfg, _)| {
+            cfg["disabled"] != true && crate::media::media_signature(&cfg) == worker.signature()
+        })
+    {
+        return error(StatusCode::FORBIDDEN, "playback revoked");
+    }
+    if let Some((file, selector)) = pending_cache {
+        app.media
+            .remember_selected_hls(worker, file, selector, bytes.clone());
+    }
+    drop(retained_permit);
+    grant.add_bytes(bytes.len());
+    app.egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    (
+        [
+            ("content-type", content_type),
+            ("cache-control", "no-store"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 struct ViewerGuard(Arc<Worker>, #[allow(dead_code)] Grant);
 impl Drop for ViewerGuard {
     fn drop(&mut self) {
         self.0.viewers.fetch_sub(1, Ordering::Relaxed);
         self.0.touch();
+    }
+}
+
+fn wire_output_chunk(bytes: Bytes, viewer: &ViewerGuard, egress: &AtomicU64) -> Option<Bytes> {
+    // A queued frame can become ready while revocation or worker shutdown is
+    // being published. Check again at the actual HTTP output boundary.
+    if viewer.1.is_cancelled() || viewer.0.is_closed() {
+        return None;
+    }
+    viewer.1.add_bytes(bytes.len());
+    egress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    Some(bytes)
+}
+
+#[cfg(test)]
+mod wire_delivery_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn queued_wire_chunk_is_discarded_when_viewer_or_worker_stops_before_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "/usr/bin/ffmpeg");
+        let worker = engine
+            .ensure("owned", &json!({"inputs":[{"url":"testsrc://"}]}))
+            .await
+            .unwrap();
+        let egress = AtomicU64::new(0);
+        let grant = Grant::peer();
+        let cancel = grant.cancellation_token();
+        worker.viewers.fetch_add(1, Ordering::Relaxed);
+        let viewer = ViewerGuard(worker.clone(), grant);
+
+        assert_eq!(
+            wire_output_chunk(Bytes::from_static(b"first"), &viewer, &egress),
+            Some(Bytes::from_static(b"first"))
+        );
+        cancel.cancel();
+        assert_eq!(
+            wire_output_chunk(Bytes::from_static(b"queued"), &viewer, &egress),
+            None,
+            "a ready chunk must not outlive its viewer grant"
+        );
+        assert_eq!(egress.load(Ordering::Relaxed), 5);
+
+        let other = Grant::peer();
+        worker.viewers.fetch_add(1, Ordering::Relaxed);
+        let other = ViewerGuard(worker.clone(), other);
+        assert_eq!(
+            wire_output_chunk(Bytes::from_static(b"other"), &other, &egress),
+            Some(Bytes::from_static(b"other")),
+            "revoking one viewer must not stop another viewer's media"
+        );
+        assert_eq!(egress.load(Ordering::Relaxed), 10);
+        drop(other);
+        drop(viewer);
+        let grant = Grant::peer();
+        worker.viewers.fetch_add(1, Ordering::Relaxed);
+        let viewer = ViewerGuard(worker.clone(), grant);
+        worker.cancellation_token().cancel();
+        assert_eq!(
+            wire_output_chunk(Bytes::from_static(b"queued"), &viewer, &egress),
+            None,
+            "a ready chunk must not outlive its worker"
+        );
+        assert_eq!(egress.load(Ordering::Relaxed), 10);
+        drop(viewer);
+        engine.stop_all().await;
+    }
+}
+
+#[cfg(test)]
+mod selected_hls_admission_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    async fn get(app: &Arc<App>, path: &str) -> Response {
+        router(app.clone())
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn playlist(app: &Arc<App>, path: &str) -> String {
+        let response = get(app, path).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 2 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    fn first_uri(playlist: &str) -> &str {
+        playlist
+            .lines()
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cached_selected_segment_bypasses_saturated_miss_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.config
+            .put(
+                "streams",
+                "owned",
+                json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+            )
+            .unwrap();
+        let master = playlist(&app, "/owned/video.m3u8").await;
+        let child = first_uri(&master);
+        let media = playlist(&app, &format!("/owned/{child}")).await;
+        let segment = first_uri(&media);
+        let cached_path = format!("/owned/tracks-v1a1/{segment}");
+        assert_eq!(get(&app, &cached_path).await.status(), StatusCode::OK);
+
+        let first = app.media.selected_hls_miss_permit().await.unwrap();
+        let second = app.media.selected_hls_miss_permit().await.unwrap();
+        let cached = tokio::time::timeout(Duration::from_secs(2), get(&app, &cached_path))
+            .await
+            .expect("cached selected media waited for a miss slot");
+        assert_eq!(cached.status(), StatusCode::OK);
+        assert_eq!(app.media.selected_hls_waiters_for_test(), 0);
+
+        let uncached_path = format!("/owned/tracks-v1/{segment}");
+        let uncached = get(&app, &uncached_path);
+        tokio::pin!(uncached);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut uncached)
+                .await
+                .is_err(),
+            "an uncached selected segment bypassed the shared miss limit"
+        );
+        assert_eq!(app.media.selected_hls_waiters_for_test(), 1);
+        drop(first);
+        let response = tokio::time::timeout(Duration::from_secs(8), &mut uncached)
+            .await
+            .expect("uncached selected segment did not resume after admission");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(app.media.selected_hls_waiters_for_test(), 0);
+        drop(second);
+        app.media.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn cold_track_profile_waits_for_shared_miss_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.config
+            .put(
+                "streams",
+                "cold",
+                json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+            )
+            .unwrap();
+        let _index = playlist(&app, "/cold/index.m3u8").await;
+        let first = app.media.selected_hls_miss_permit().await.unwrap();
+        let second = app.media.selected_hls_miss_permit().await.unwrap();
+        let master = get(&app, "/cold/video.m3u8");
+        tokio::pin!(master);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut master)
+                .await
+                .is_err(),
+            "a cold profile read bypassed the shared miss limit"
+        );
+        assert_eq!(app.media.selected_hls_waiters_for_test(), 1);
+        drop(first);
+        let response = tokio::time::timeout(Duration::from_secs(8), &mut master)
+            .await
+            .expect("cold profile did not resume after admission");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(app.media.selected_hls_waiters_for_test(), 0);
+        drop(second);
+        app.media.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_selected_file_read_keeps_its_miss_slot_until_io_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.config
+            .put(
+                "streams",
+                "read-cancel-owned",
+                json!({"static":false,"inputs":[{"url":"testsrc://"}]}),
+            )
+            .unwrap();
+        let master = playlist(&app, "/read-cancel-owned/video.m3u8").await;
+        let media = playlist(&app, &format!("/read-cancel-owned/{}", first_uri(&master))).await;
+        let segment = first_uri(&media).to_owned();
+        let (entered, release) =
+            crate::media::file_reader::pause_once_for_test("read-cancel-owned", &segment);
+        let other = app.media.selected_hls_miss_permit().await.unwrap();
+        let path = format!("/read-cancel-owned/tracks-v1a1/{segment}");
+        let reading_app = app.clone();
+        let request = tokio::spawn(async move { get(&reading_app, &path).await });
+        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(5)).unwrap())
+            .await
+            .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+
+        let acquired = tokio::time::timeout(
+            Duration::from_millis(50),
+            app.media.selected_hls_miss_permit(),
+        )
+        .await;
+        release.send(()).unwrap();
+        drop(other);
+        app.media.stop_all().await;
+        assert!(
+            acquired.is_err(),
+            "a cancelled request freed its slot while the blocking file read continued"
+        );
     }
 }
 pub fn rewrite_playlist(text: &str, query: &str) -> String {
@@ -2037,9 +3857,17 @@ mod continuous_session_tests {
     }
 }
 
+mod config_metrics;
+mod iptv_management;
+mod iptv_peer;
+mod iptv_playlist;
+mod named_balancer;
+mod native_ts_body;
 #[path = "origin_resolution.rs"]
 mod origin_resolution;
+mod ts_startup;
 
+mod fxlink_access;
 mod idle_body;
 pub(crate) mod rtsp_access;
 pub(crate) mod ts_access;
@@ -2052,6 +3880,7 @@ mod http_handoff;
 mod http_tickets;
 pub(crate) mod rtsp_balancer;
 mod srt_lookup;
+mod srt_ticket_issue;
 pub(crate) mod srt_tickets;
 mod vendor_balancer;
 mod vendor_http_state;
@@ -2129,4 +3958,65 @@ mod vendor_namespace_tests {
 }
 
 #[cfg(test)]
+mod view_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn viewer_role_hides_source_activation_addresses_in_node_status() {
+        let mut node = json!({
+            "source_activation": {"owned": {"source": "https://origin.internal:8443"}},
+            "vendor_source_activation": {"owned": {"source": "https://vendor.internal:8443"}},
+            "active": 3
+        });
+        redact_view_value(&mut node);
+        assert_eq!(
+            node["source_activation"]["owned"]["source"],
+            "https://[redacted]"
+        );
+        assert_eq!(
+            node["vendor_source_activation"]["owned"]["source"],
+            "https://[redacted]"
+        );
+        assert_eq!(node["active"], 3);
+    }
+}
+
+#[cfg(test)]
 mod test_vendor_admission;
+
+#[cfg(test)]
+#[path = "server/viewer_worker_tests.rs"]
+mod viewer_worker_tests;
+
+#[cfg(test)]
+mod peer_transport_tests {
+    use super::*;
+
+    // Break caught: every native LB probe and admission can use the raw key on HTTP.
+    #[test]
+    fn cluster_client_rejects_remote_plaintext_peer_endpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = App::new(
+            directory.path().join("config.json"),
+            directory.path().join("media"),
+            Options {
+                admin_password: "owned-admin-password".into(),
+                peer_key: "owned-native-peer-key".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            app.cluster_client(&json!({"api_url":"http://remote.example"}))
+                .is_err()
+        );
+        assert!(
+            app.cluster_client(&json!({"api_url":"http://remote.example","flussonix_allow_insecure_peer_http":true}))
+                .is_ok()
+        );
+        assert!(
+            app.cluster_client(&json!({"api_url":"http://127.0.0.1:9000"}))
+                .is_ok()
+        );
+    }
+}

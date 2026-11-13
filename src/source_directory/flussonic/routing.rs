@@ -103,14 +103,37 @@ fn project(v: &Value) -> Result<Value, LookupFailure> {
         .filter(|n| *n > 0)
         .ok_or(LookupFailure::Invalid)? as f64
         / 1_000_000.0;
-    let output = stats["output_kbit"]
+    let output_kbit = stats["output_kbit"]
         .as_u64()
-        .ok_or(LookupFailure::Invalid)? as f64
-        / 1000.0;
+        .ok_or(LookupFailure::Invalid)?;
+    let output = output_kbit as f64 / 1000.0;
     let active = stats["total_clients"]
         .as_u64()
         .ok_or(LookupFailure::Invalid)?;
     Ok(
-        json!({"role":"cdn","uplink":output/capacity,"uplink_mbps":capacity,"cpu":percent("cpu_usage")?,"ram":percent("memory_usage")?,"drain":false,"age_ms":0,"active":active,"reserved":0,"reserved_mbps":0.0,"limit":u64::MAX,"stream_bitrates":{}}),
+        json!({"role":"cdn","uplink":output/capacity,"uplink_mbps":capacity,"cpu":percent("cpu_usage")?,"ram":percent("memory_usage")?,"drain":false,"age_ms":0,"active":active,"reserved":0,"reserved_mbps":0.0,"limit":u64::MAX,"stream_bitrates":{},"output_kbit":output_kbit,"bandwidth_usage":stats["bandwidth_usage"].as_f64().filter(|n|n.is_finite() && *n>=0.0 && *n<=10_000.0),"total_clients":active,"total_streams_count":stats["total_streams_count"].as_u64()}),
     )
+}
+
+#[cfg(test)]
+mod named_balancer_metric_tests {
+    use super::*;
+
+    #[test]
+    fn vendor_projection_preserves_reported_usage_and_total_streams() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let value = json!({"stats":{
+            "now":now,"streamer_status":"running","cpu_usage":10,"memory_usage":20,
+            "total_bandwidth":100_000_000,"output_kbit":10_000,"total_clients":5,
+            "bandwidth_usage":82.0,"total_streams_count":12,"online_streams_count":3
+        }});
+        let projected = project(&value).unwrap();
+        assert_eq!(projected["output_kbit"], 10_000);
+        assert_eq!(projected["bandwidth_usage"], 82.0);
+        assert_eq!(projected["total_clients"], 5);
+        assert_eq!(projected["total_streams_count"], 12);
+    }
 }

@@ -135,7 +135,14 @@ async fn https_uses_real_peer_and_same_authorization_and_rejects_downgrade() {
             .unwrap()
             .contains(':')
     );
-    for path in ["index.m3u8", "mpegts", "m4s", "m4f"] {
+    for path in [
+        "index.m3u8",
+        "index.ts.m3u8",
+        "index.fmp4.m3u8",
+        "mpegts",
+        "m4s",
+        "m4f",
+    ] {
         assert_eq!(
             c.get(format!("{}/owned/{path}", f.url))
                 .send()
@@ -145,18 +152,20 @@ async fn https_uses_real_peer_and_same_authorization_and_rejects_downgrade() {
             403
         );
     }
-    let result = c
-        .get(format!("{}/owned/index.m3u8?token=owned-token", f.url))
-        .header("x-forwarded-for", "203.0.113.9")
-        .header("x-forwarded-proto", "http")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        result.status(),
-        403,
-        "HTTPS must reject backend plaintext redirects"
-    );
+    for path in ["index.m3u8", "index.ts.m3u8", "index.fmp4.m3u8"] {
+        let result = c
+            .get(format!("{}/owned/{path}?token=owned-token", f.url))
+            .header("x-forwarded-for", "203.0.113.9")
+            .header("x-forwarded-proto", "http")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            result.status(),
+            403,
+            "HTTPS must reject backend plaintext redirects for {path}"
+        );
+    }
     assert_eq!(seen.lock().await[0]["ip"], "127.0.0.1");
     assert_eq!(f.app.media.count().await, 0);
     // The same callback redirect remains valid on the plaintext router.
@@ -173,6 +182,59 @@ async fn https_uses_real_peer_and_same_authorization_and_rejects_downgrade() {
     assert_eq!(result.status(), 302);
     callback_task.abort();
     stop(f).await;
+}
+
+#[tokio::test]
+async fn https_hls_master_aliases_keep_children_secure_and_stop_after_revocation() {
+    let f = fixture("standalone").await;
+    let c = client(&f.cert);
+    let mut results = Vec::new();
+    for alias in ["index.ts.m3u8", "index.fmp4.m3u8"] {
+        let response = c
+            .get(format!("{}/owned/{alias}?token=owned-token", f.url))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let master = response.text().await.unwrap();
+        let child = master
+            .lines()
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .unwrap_or("");
+        let child_url = url::Url::parse(&format!("{}/owned/{alias}", f.url))
+            .unwrap()
+            .join(child)
+            .unwrap();
+        let child_response = c.get(child_url.clone()).send().await.unwrap();
+        let child_status = child_response.status();
+        let child_body = child_response.text().await.unwrap();
+        results.push((alias, status, master, child_url, child_status, child_body));
+    }
+    f.app
+        .config
+        .put("streams", "owned", json!({"disabled":true}))
+        .unwrap();
+    let revoked = c
+        .get(format!("{}/owned/index.ts.m3u8?token=owned-token", f.url))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    stop(f).await;
+    for (alias, status, master, child_url, child_status, child_body) in results {
+        assert_eq!(status, 200, "{alias}: {master}");
+        assert!(master.contains("#EXT-X-STREAM-INF:BANDWIDTH="));
+        assert_eq!(child_url.scheme(), "https");
+        assert!(
+            child_url
+                .query()
+                .unwrap_or("")
+                .contains("token=owned-token")
+        );
+        assert_eq!(child_status, 200, "{alias}: {child_body}");
+        assert!(child_body.contains("#EXTINF:"), "{alias}: {child_body}");
+    }
+    assert_eq!(revoked, 404);
 }
 
 #[tokio::test]
@@ -194,9 +256,20 @@ async fn slow_or_plaintext_handshakes_do_not_block_verified_clients_and_cancel_c
         .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .await
         .unwrap();
+    let other_peer = "127.0.0.2".parse::<std::net::IpAddr>().unwrap();
+    let verified_client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .local_address(other_peer)
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(&std::fs::read(&f.cert.ca).unwrap()).unwrap(),
+        )
+        .build()
+        .unwrap();
     let healthy = tokio::time::timeout(
         Duration::from_secs(2),
-        client(&f.cert).get(format!("{}/health", f.url)).send(),
+        verified_client.get(format!("{}/health", f.url)).send(),
     )
     .await
     .expect("idle handshakes cannot serialize healthy clients")
@@ -205,6 +278,7 @@ async fn slow_or_plaintext_handshakes_do_not_block_verified_clients_and_cancel_c
     assert!(
         reqwest::Client::builder()
             .no_proxy()
+            .local_address(other_peer)
             .build()
             .unwrap()
             .get(format!("{}/health", f.url))
@@ -215,6 +289,7 @@ async fn slow_or_plaintext_handshakes_do_not_block_verified_clients_and_cancel_c
     );
     let wrong_name = reqwest::Client::builder()
         .no_proxy()
+        .local_address(other_peer)
         .add_root_certificate(
             reqwest::Certificate::from_pem(&std::fs::read(&f.cert.ca).unwrap()).unwrap(),
         )

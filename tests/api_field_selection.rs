@@ -71,6 +71,59 @@ async fn selected(app: &Arc<App>, path: &str) -> Value {
 }
 
 #[tokio::test]
+async fn collection_navigation_fields_exist_only_when_a_page_can_be_followed() {
+    let (_dir, app) = fixture();
+    let complete = selected(&app, "/streamer/api/v3/templates").await;
+    assert!(complete.get("next").is_none());
+    assert!(complete.get("prev").is_none());
+
+    let first = selected(&app, "/streamer/api/v3/streams?limit=2").await;
+    assert!(first["next"].is_string());
+    assert!(first.get("prev").is_none());
+    let cursor = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("cursor", first["next"].as_str().unwrap())
+        .finish();
+    let last = selected(&app, &format!("/streamer/api/v3/streams?limit=2&{cursor}")).await;
+    assert!(last.get("next").is_none());
+    assert!(last["prev"].is_string());
+
+    let empty = selected(&app, "/streamer/api/v3/streams?q=no-such-stream").await;
+    assert!(empty.get("next").is_none());
+    assert!(empty.get("prev").is_none());
+}
+
+#[tokio::test]
+async fn explicit_name_sort_estimates_at_most_one_row_beyond_page_limit() {
+    let (_dir, app) = fixture();
+    let first = selected(&app, "/streamer/api/v3/streams?sort=name&limit=1").await;
+    assert_eq!(first["estimated_count"], 2);
+    assert!(first["next"].is_string());
+    let cursor = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("cursor", first["next"].as_str().unwrap())
+        .finish();
+    let second = selected(
+        &app,
+        &format!("/streamer/api/v3/streams?sort=name&limit=1&{cursor}"),
+    )
+    .await;
+    assert_eq!(second["estimated_count"], 2);
+
+    let complete = selected(&app, "/streamer/api/v3/streams?sort=name&limit=3").await;
+    assert_eq!(complete["estimated_count"], 3);
+    let default_order = selected(&app, "/streamer/api/v3/streams?limit=1").await;
+    assert_eq!(default_order["estimated_count"], 3);
+
+    for n in 0..8 {
+        app.config
+            .put("streams", &format!("owned-{n}"), json!({"static":false}))
+            .unwrap();
+    }
+    let eight = selected(&app, "/streamer/api/v3/streams?sort=name&limit=8").await;
+    assert_eq!(eight["streams"].as_array().unwrap().len(), 8);
+    assert_eq!(eight["estimated_count"], 9);
+}
+
+#[tokio::test]
 async fn streams_select_nested_effective_fields_and_retain_required_name_without_side_effects() {
     let (dir, app) = fixture();
     let before = app.config.snapshot();
@@ -82,7 +135,7 @@ async fn streams_select_nested_effective_fields_and_retain_required_name_without
     .await;
     assert_eq!(
         body,
-        json!({"estimated_count":3,"next":null,"prev":null,"timing":{},"streams":[
+        json!({"estimated_count":3,"server_id":body["server_id"],"timing":{},"streams":[
             {"name":"alpha","title":"Needle first","static":false,"transcoder":{"vb":600},"stats":{"status":"waiting"},"config_on_disk":{"name":"alpha","template":"base"}},
             {"name":"beta","title":"Other","static":false,"transcoder":{"vb":600},"stats":{"status":"waiting"},"config_on_disk":{"name":"beta","template":"base"}},
             {"name":"gamma","title":"Needle last","static":false,"transcoder":{"vb":600},"stats":{"status":"waiting"},"config_on_disk":{"name":"gamma","template":"base"}}
@@ -106,7 +159,7 @@ async fn templates_select_whole_arrays_and_merge_sibling_fields() {
     .await;
     assert_eq!(
         body,
-        json!({"estimated_count":1,"next":null,"prev":null,"timing":{},"templates":[
+        json!({"estimated_count":1,"timing":{},"templates":[
             {"inputs":[{"url":"testsrc://"}],"transcoder":{"vb":600,"ab":64},"static":false}
         ]})
     );
@@ -127,7 +180,7 @@ async fn select_keeps_search_sort_counts_and_cursor_pages_based_on_unprojected_r
     .await;
     assert_eq!(
         first,
-        json!({"estimated_count":2,"next":first["next"],"prev":null,"timing":{},"streams":[{"name":"gamma","static":false}]})
+        json!({"estimated_count":2,"server_id":first["server_id"],"next":first["next"],"timing":{},"streams":[{"name":"gamma","static":false}]})
     );
     assert!(first["next"].is_string());
     let cursor = url::form_urlencoded::Serializer::new(String::new())
@@ -140,13 +193,13 @@ async fn select_keeps_search_sort_counts_and_cursor_pages_based_on_unprojected_r
     .await;
     assert_eq!(
         second,
-        json!({"estimated_count":2,"next":null,"prev":second["prev"],"timing":{},"streams":[{"name":"alpha","static":false}]})
+        json!({"estimated_count":2,"server_id":second["server_id"],"prev":second["prev"],"timing":{},"streams":[{"name":"alpha","static":false}]})
     );
     assert!(second["prev"].is_string());
     let absent = selected(&app, "/streamer/api/v3/streams?select=name&q=not-present").await;
     assert_eq!(
         absent,
-        json!({"estimated_count":0,"next":null,"prev":null,"timing":{},"streams":[]})
+        json!({"estimated_count":0,"server_id":absent["server_id"],"timing":{},"streams":[]})
     );
 }
 
@@ -262,4 +315,48 @@ async fn selecting_disk_configuration_retains_its_required_stream_identity() {
         };
         assert_eq!(body["streams"], expected, "select={select}");
     }
+}
+
+#[tokio::test]
+async fn collection_select_rejects_excessive_fields_or_bytes_after_authentication() {
+    let (_dir, app) = fixture();
+    let fields = (0..256)
+        .map(|index| format!("unknown{index}"))
+        .collect::<Vec<_>>();
+    let within_limit = format!("/streamer/api/v3/streams?select={}", fields.join(","));
+    assert_eq!(
+        selected(&app, &within_limit).await["streams"],
+        json!([{"name":"alpha"},{"name":"beta"},{"name":"gamma"}])
+    );
+
+    let too_many = format!("{within_limit},unknown256");
+    assert_eq!(
+        get(&app, &too_many, Some("viewer:view-secret")).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(get(&app, &too_many, None).await.0, StatusCode::UNAUTHORIZED);
+    let encoded_comma = too_many.replacen(",unknown256", "%2Cunknown256", 1);
+    assert_eq!(
+        get(&app, &encoded_comma, Some("viewer:view-secret"))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+
+    let max_length = format!(
+        "/streamer/api/v3/templates?select={}",
+        "x".repeat(16 * 1024)
+    );
+    assert_eq!(
+        get(&app, &max_length, Some("viewer:view-secret")).await.0,
+        StatusCode::OK
+    );
+    let too_long = format!(
+        "/streamer/api/v3/templates?select={}",
+        "x".repeat(16 * 1024 + 1)
+    );
+    assert_eq!(
+        get(&app, &too_long, Some("viewer:view-secret")).await.0,
+        StatusCode::BAD_REQUEST
+    );
 }

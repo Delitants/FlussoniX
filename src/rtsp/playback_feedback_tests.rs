@@ -41,6 +41,7 @@ async fn feedback_fixture() -> (HashMap<u32, Sender>, Vec<tokio::net::UdpSocket>
                 ssrc: id + 11,
                 packets: 0,
                 octets: 0,
+                report_clock: None,
             },
         );
     }

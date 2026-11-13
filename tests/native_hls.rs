@@ -397,7 +397,7 @@ async fn native_hls_assets_require_authorization_and_revoke_cached_delivery() {
         },
     )
     .unwrap();
-    let mut cfg = json!({"static":false,"inputs":[{"url":input}],"flussonix_hls_captions":[{"native_track":7,"language":"en","name":"English"}],"flussonix_token_sha256":format!("{:x}",sha2::Sha256::digest(b"owned-native-viewer"))});
+    let mut cfg = json!({"static":false,"inputs":[{"url":input}],"flussonix_hls_captions":[{"native_track":7,"language":"en","name":"English"},{"native_track":u32::MAX,"language":"de","name":"Deutsch"}],"flussonix_token_sha256":format!("{:x}",sha2::Sha256::digest(b"owned-native-viewer"))});
     app.config
         .put("streams", "group/owned", cfg.clone())
         .unwrap();
@@ -421,6 +421,50 @@ async fn native_hls_assets_require_authorization_and_revoke_cached_delivery() {
     }
     assert_eq!(app.media.count().await, 0);
     assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    for (alias, prefix) in [("index.ts.m3u8", ""), ("index.fmp4.m3u8", "fmp4/")] {
+        let response = client
+            .get(format!(
+                "{base}/group/owned/{alias}?token=owned-native-viewer"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let master = response.text().await.unwrap();
+        assert!(
+            master.contains("English") && master.contains("Deutsch"),
+            "{master}"
+        );
+        assert!(master.contains(&format!(
+            "URI=\"{prefix}nt7.m3u8?token=owned-native-viewer\""
+        )));
+        assert!(master.contains(&format!(
+            "URI=\"{prefix}nt4294967295.m3u8?token=owned-native-viewer\""
+        )));
+        assert!(master.contains(&format!("{prefix}av.m3u8?token=owned-native-viewer\n")));
+        for child in ["av.m3u8", "nt7.m3u8", "nt4294967295.m3u8"] {
+            assert_eq!(
+                client
+                    .get(format!(
+                        "{base}/group/owned/{prefix}{child}?token=owned-native-viewer"
+                    ))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
+            assert_eq!(
+                client
+                    .get(format!("{base}/group/owned/{prefix}{child}?token=wrong"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                403
+            );
+        }
+    }
     for prefix in ["", "fmp4/"] {
         let master = client
             .get(format!(

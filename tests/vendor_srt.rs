@@ -10,6 +10,47 @@ use sha2::{Digest, Sha256};
 use std::{sync::atomic::Ordering, time::Duration};
 use transport::{Receiver, Serving};
 const SECRET: &str = "owned-vendor-srt-transport-key";
+#[test]
+fn peer_direct_token_option_requires_a_vendor_srt_listener_and_boolean_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = flussonix::config::ConfigStore::open(dir.path().join("config.json")).unwrap();
+    let row = json!({
+        "flussonix_peer_kind":"flussonic",
+        "api_url":"https://vendor.invalid",
+        "public_payload_url":"https://vendor.invalid",
+        "cluster_key":"owned-vendor-cluster-key",
+        "flussonix_stream_map":[{"name":"owned","remote_name":"remote"}],
+        "flussonix_srt_url":"srt://vendor.invalid:9998",
+        "flussonix_srt_encrypted":true,
+        "flussonix_srt_allow_direct_token":true
+    });
+    assert!(store.put("peers", "vendor", row.clone()).is_ok());
+    let mut wrong_type = row.clone();
+    wrong_type["flussonix_srt_allow_direct_token"] = json!("true");
+    assert!(store.put("peers", "vendor", wrong_type).is_err());
+    let mut no_listener = row.clone();
+    no_listener
+        .as_object_mut()
+        .unwrap()
+        .remove("flussonix_srt_url");
+    no_listener
+        .as_object_mut()
+        .unwrap()
+        .remove("flussonix_srt_encrypted");
+    assert!(
+        store
+            .put("peers", "vendor-without-listener", no_listener)
+            .is_err()
+    );
+    let mut native = row;
+    native["flussonix_peer_kind"] = json!("native");
+    native
+        .as_object_mut()
+        .unwrap()
+        .remove("flussonix_stream_map");
+    native.as_object_mut().unwrap().remove("cluster_key");
+    assert!(store.put("peers", "native", native).is_err());
+}
 fn policy() -> serde_json::Value {
     json!({"only":[],"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"owned-viewer"))})
 }
@@ -77,7 +118,10 @@ async fn client_count(f: &Fixture) -> usize {
     value["srt_playback"]["clients"].as_u64().unwrap() as usize
 }
 async fn connections(f: &Fixture, expected: usize) -> bool {
-    tokio::time::timeout(Duration::from_secs(4), async {
+    connections_within(f, expected, Duration::from_secs(4)).await
+}
+async fn connections_within(f: &Fixture, expected: usize, within: Duration) -> bool {
+    tokio::time::timeout(within, async {
         while client_count(f).await != expected {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -111,11 +155,18 @@ async fn clear_vendor_srt_revokes_one_viewer_without_stopping_static_or_http() {
     first.stop().await;
     second.stop().await;
     drop(response);
-    let empty = connections(&f, 0).await;
+    let closed_at = std::time::Instant::now();
+    // stop() kills the caller without an SRT shutdown. Allow the listener's
+    // five-second peer-idle timeout plus its polling/scheduling margin.
+    let empty = connections_within(&f, 0, Duration::from_secs(7)).await;
+    let closed_seconds = closed_at.elapsed().as_secs_f64();
     let static_alive = f.app.media.count().await == 1;
     serving.stop().await;
     f.stop().await;
-    assert!(two && http_ok && revoked && one && other_alive && same_pull && empty && static_alive);
+    assert!(
+        two && http_ok && revoked && one && other_alive && same_pull && empty && static_alive,
+        "two={two} http_ok={http_ok} revoked={revoked} one={one} other_alive={other_alive} same_pull={same_pull} empty={empty} closed_seconds={closed_seconds} static_alive={static_alive}"
+    );
 }
 #[tokio::test]
 async fn wrong_or_missing_transport_secret_never_discovers_or_pulls_vendor_media() {

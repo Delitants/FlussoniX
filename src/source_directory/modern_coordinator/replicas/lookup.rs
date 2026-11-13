@@ -20,6 +20,8 @@ pub(super) fn authoritative(error: CoordinationFailure) -> bool {
                         | ProjectionFailure::Unsupported
                         | ProjectionFailure::Limit
                         | ProjectionFailure::Excluded
+                        | ProjectionFailure::MissingGroupPin
+                        | ProjectionFailure::GroupPinMismatch
                         | ProjectionFailure::Ineligible(_)
                         | ProjectionFailure::Policy(_)
                 )
@@ -39,9 +41,15 @@ impl ReplicaLookup {
     fn reject_current(
         &self,
         selected: usize,
+        source_generation: &Arc<()>,
         authoritative: bool,
     ) -> Result<Option<ReplicaChoice>, ReplicaFailure> {
         let mut state = self.selector.state()?;
+        let summarized_denial = state
+            .summaries
+            .get(selected)
+            .and_then(Option::as_ref)
+            .is_some_and(|summary| summary.denies(&self.name, source_generation));
         let entry = state
             .entries
             .get_mut(&self.name)
@@ -52,7 +60,7 @@ impl ReplicaLookup {
         if selected == self.first {
             entry.available = false;
             entry.route.cancel.cancel();
-            if authoritative {
+            if authoritative || summarized_denial {
                 entry.blocked = true;
             }
             if entry.blocked {
@@ -80,7 +88,19 @@ impl ReplicaLookup {
         let outcome = self
             .selector
             .owner
-            .at_handle(handle, || Ok(self.reject_current(selected, authoritative)))
+            .at_handle(handle, || {
+                let fact = handle
+                    .authority
+                    .with_modern_fact_current(|fact| {
+                        self.selector
+                            .publish_summary(selected, NegativeSummary::from_fact(handle, fact))
+                    })
+                    .map_err(|_| CoordinationFailure::Unavailable)?;
+                if let Some(Err(error)) = fact {
+                    return Ok(Err(error));
+                }
+                Ok(self.reject_current(selected, &handle.generation_token(), authoritative))
+            })
             .map_err(ReplicaFailure::Coordination)?;
         self.finish_rejection(outcome)
     }
@@ -131,8 +151,9 @@ impl ReplicaLookup {
             .selector
             .owner
             .at_handle(handle, || {
-                Ok(handle.authority.uniform_policy().ok().flatten()
-                    == Some(self.selector.policy.clone()))
+                Ok(self.selector.policy.as_ref().is_none_or(|expected| {
+                    handle.authority.uniform_policy().ok().flatten().as_ref() == Some(expected)
+                }))
             })
             .map_err(ReplicaFailure::Coordination)?;
         if !uniform {
@@ -143,19 +164,25 @@ impl ReplicaLookup {
                 if !Arc::ptr_eq(&handle.authority, &inventory.handle.authority) {
                     return Err(ReplicaFailure::Stale);
                 }
+                let summary = NegativeSummary::complete(inventory);
                 let observation = self
                     .selector
                     .owner
-                    .at_inventory_current(inventory, || match inventory.candidate(&self.name) {
-                        Ok(candidate) => Observation::Candidate(candidate),
-                        Err(error) if transient(error) || authoritative(error) => {
-                            Observation::Rejected(
-                                self.reject_current(selected, authoritative(error)),
-                            )
-                        }
-                        Err(error) => Observation::Failed(error),
+                    .at_inventory_current(inventory, || {
+                        self.selector.publish_summary(selected, summary)?;
+                        Ok(match inventory.candidate(&self.name) {
+                            Ok(candidate) => Observation::Candidate(candidate),
+                            Err(error) if transient(error) || authoritative(error) => {
+                                Observation::Rejected(self.reject_current(
+                                    selected,
+                                    &handle.generation_token(),
+                                    authoritative(error),
+                                ))
+                            }
+                            Err(error) => Observation::Failed(error),
+                        })
                     })
-                    .map_err(ReplicaFailure::Coordination)?;
+                    .map_err(ReplicaFailure::Coordination)??;
                 match observation {
                     Observation::Candidate(candidate) => Ok(candidate),
                     Observation::Rejected(outcome) => return self.finish_rejection(outcome),
@@ -170,7 +197,7 @@ impl ReplicaLookup {
                     .selector
                     .owner
                     .publish(&candidate, |view, _| {
-                        if view.policy != &self.selector.policy {
+                        if !self.selector.accepts_policy(view.policy) {
                             return Err(ReplicaFailure::PolicyMismatch);
                         }
                         let mut state = self.selector.state()?;
@@ -195,6 +222,7 @@ impl ReplicaLookup {
                         Ok(RouteStamp {
                             selector: self.selector.clone(),
                             name: self.name.clone(),
+                            identity: entry.identity.clone(),
                             selected,
                             route: entry.route.clone(),
                         })

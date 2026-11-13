@@ -77,15 +77,32 @@ impl Configuration {
     pub(crate) fn initialization_nals(&self) -> impl Iterator<Item = &[u8]> {
         self.initialization.iter().map(Vec::as_slice)
     }
-    pub fn access_unit(&self, data: &[u8]) -> Result<AccessUnit, String> {
+    fn check_access_unit(&self, data: &[u8]) -> Result<(), String> {
         if !matches!(self.nal_length_size, 1 | 2 | 4) {
             return Err("unsupported HEVC NAL length width".into());
         }
         if data.is_empty() || data.len() > 16 * 1024 * 1024 {
             return Err("invalid HEVC access-unit size".into());
         }
-        let mut at = 0;
+        Ok(())
+    }
+    pub fn access_unit(&self, data: &[u8]) -> Result<AccessUnit, String> {
+        self.check_access_unit(data)?;
         let mut annex_b = Vec::with_capacity(data.len());
+        let has_irap = self.visit_access_unit(data, |nal| {
+            annex_b.extend_from_slice(&[0, 0, 0, 1]);
+            annex_b.extend_from_slice(nal);
+        })?;
+        Ok(AccessUnit { annex_b, has_irap })
+    }
+    // A later validation error can follow earlier visits; use private builders.
+    pub(crate) fn visit_access_unit(
+        &self,
+        data: &[u8],
+        mut visit: impl FnMut(&[u8]),
+    ) -> Result<bool, String> {
+        self.check_access_unit(data)?;
+        let mut at = 0;
         let mut has_irap = false;
         let mut count = 0;
         while at < data.len() {
@@ -101,10 +118,9 @@ impl Configuration {
             let end = at.checked_add(n).ok_or("HEVC NAL size overflow")?;
             let nal = data.get(at..end).ok_or("HEVC NAL outside access unit")?;
             has_irap |= (16..=21).contains(&nal_type(nal)?);
-            annex_b.extend_from_slice(&[0, 0, 0, 1]);
-            annex_b.extend_from_slice(nal);
+            visit(nal);
             at = end;
         }
-        Ok(AccessUnit { annex_b, has_irap })
+        Ok(has_irap)
     }
 }

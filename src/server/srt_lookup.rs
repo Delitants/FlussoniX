@@ -7,6 +7,17 @@ struct Query {
     selection: crate::srt_playback::Selection,
     encrypted: bool,
 }
+fn qualification_diag(stage: &str, detail: impl FnOnce() -> Value) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED
+        .get_or_init(|| std::env::var_os("FLUSSONIX_QUALIFICATION_SRT_DIAGNOSTICS").is_some())
+    {
+        eprintln!(
+            "srt_lookup_diag {}",
+            json!({"stage":stage,"detail":detail()})
+        );
+    }
+}
 fn decode(raw: &str) -> Option<String> {
     let bytes = raw.as_bytes();
     for (i, b) in bytes.iter().enumerate() {
@@ -102,8 +113,18 @@ pub(super) async fn lookup(State(app): State<Arc<App>>, request: Request) -> Res
             user_agent: header(request.headers(), "user-agent").unwrap_or("").into(),
             referer: header(request.headers(), "referer").unwrap_or("").into(),
             host: header(request.headers(), "host").unwrap_or("").into(),
+            finite_media: false,
         };
-        app.srt_lookup(viewer, &q.streamid, q.encrypted).await
+        app.srt_lookup(
+            viewer,
+            &q.streamid,
+            if q.encrypted {
+                SrtLookupMode::Required
+            } else {
+                SrtLookupMode::Any
+            },
+        )
+        .await
     }
     .await;
     let mut response = match result {
@@ -119,23 +140,26 @@ pub(super) async fn lookup(State(app): State<Arc<App>>, request: Request) -> Res
     response
 }
 impl App {
-    async fn srt_lookup(
+    pub(super) async fn srt_lookup(
         &self,
         viewer: ViewerRequest,
         streamid: &str,
-        encrypted: bool,
+        mode: SrtLookupMode,
     ) -> Result<Value, u16> {
         let selection = self.config.read(|root| {
             crate::vendor_playback::select(root, &viewer.name, self.config.revision())
         });
         match selection {
             crate::vendor_playback::Selection::Excluded => return Err(404),
-            crate::vendor_playback::Selection::Ambiguous => return Err(503),
+            crate::vendor_playback::Selection::Ambiguous => {
+                qualification_diag("ambiguous_route", || json!({}));
+                return Err(503);
+            }
             crate::vendor_playback::Selection::Vendor { key, revision } => {
                 return match &self.vendor_playback {
                     Some(runtime) => {
                         runtime
-                            .srt_lookup(self, viewer, &key, revision, streamid, encrypted)
+                            .srt_lookup(self, viewer, &key, revision, streamid, mode)
                             .await
                     }
                     None => Err(503),
@@ -156,39 +180,52 @@ impl App {
             AuthOutcome::Denied | AuthOutcome::Redirect(_) => return Err(403),
         };
         let result = self
-            .srt_place(&viewer, streamid, encrypted, &grant, resolved.revision)
+            .srt_place(&viewer, streamid, mode, &grant, resolved.revision)
             .await;
-        self.config
-            .at_revision(resolved.revision, |_| {
-                if grant.is_cancelled() {
-                    return Err(403);
-                }
-                if result.is_ok() {
-                    grant.playback();
-                }
-                result
-            })
-            .ok_or(503u16)?
+        if let Err(status) = &result {
+            qualification_diag("placement_rejected", || {
+                json!({"status":status,"revision_current":self.config.revision()==resolved.revision,
+                    "grant_cancelled":grant.is_cancelled()})
+            });
+        }
+        let result = self.config.at_revision(resolved.revision, |_| {
+            if grant.is_cancelled() {
+                return Err(403);
+            }
+            result
+        });
+        let Some(result) = result else {
+            qualification_diag("post_placement_revision_changed", || json!({}));
+            return Err(503);
+        };
+        if result.is_ok() && !self.playback_auth.release_redirect_lease(&grant).await {
+            qualification_diag("redirect_lease_release_failed", || json!({}));
+            return Err(503);
+        }
+        result
     }
     pub(crate) async fn srt_place(
         &self,
         viewer: &ViewerRequest,
         streamid: &str,
-        encrypted: bool,
+        mode: SrtLookupMode,
         grant: &Grant,
         revision: u64,
     ) -> Result<Value, u16> {
-        let work = self.srt_place_inner(viewer, streamid, encrypted, grant, revision);
+        let work = self.srt_place_inner(viewer, streamid, mode, grant, revision);
         tokio::select! {biased; _=grant.cancelled()=>Err(403), result=tokio::time::timeout(Duration::from_secs(8),work)=>result.map_err(|_|503u16)?}
     }
     async fn srt_place_inner(
         &self,
         viewer: &ViewerRequest,
         streamid: &str,
-        encrypted: bool,
+        mode: SrtLookupMode,
         grant: &Grant,
         revision: u64,
     ) -> Result<Value, u16> {
+        let encrypted = !matches!(mode, SrtLookupMode::Any);
+        let ticket_only = matches!(mode, SrtLookupMode::Ticket);
+        let private = ticket_only || (encrypted && !viewer.token.is_empty());
         let peers = self.config.snapshot()["peers"]
             .as_array()
             .cloned()
@@ -203,15 +240,37 @@ impl App {
             if encrypted && !required {
                 return None;
             }
-            let id = mapped(
-                streamid,
-                if vendor {
-                    crate::config::vendor_peers::remote_name(&peer, &viewer.name)?
+            if vendor
+                && (ticket_only
+                    || (!viewer.token.is_empty()
+                        && peer["flussonix_srt_allow_direct_token"] != true))
+            {
+                return None;
+            }
+            if !vendor && !required {
+                return None;
+            }
+            let id = if vendor {
+                mapped(
+                    streamid,
+                    crate::config::vendor_peers::remote_name(&peer, &viewer.name)?,
+                )?
+            } else if !private && !viewer.token.is_empty() {
+                mapped(streamid, &viewer.name)?
+            } else {
+                String::new()
+            };
+            if !vendor
+                && (if viewer.token.is_empty() || private {
+                    crate::srt_playback::ticket_only(
+                        &viewer.name,
+                        "00000000-0000-0000-0000-000000000000",
+                    )
                 } else {
-                    &viewer.name
-                },
-            )?;
-            if !vendor && append_ticket(&id, "00000000-0000-0000-0000-000000000000").is_none() {
+                    append_ticket(&id, "00000000-0000-0000-0000-000000000000")
+                })
+                .is_none()
+            {
                 return None;
             }
             let snapshot = self.http_snapshot(&peer, &viewer.name, revision).await?;
@@ -221,6 +280,9 @@ impl App {
                 if !matches!(node["role"].as_str(), Some("cdn" | "standalone"))
                     || profile["enabled"] != true
                     || profile["encrypted"] != required
+                    || (!private
+                        && !viewer.token.is_empty()
+                        && profile["direct_tokens_allowed"] != true)
                     || profile["listener_id"]
                         .as_str()
                         .and_then(|id| uuid::Uuid::parse_str(id).ok())
@@ -250,6 +312,20 @@ impl App {
             }
         }
         drop(calls);
+        qualification_diag("observations", || {
+            json!({"count":observations.len(),"peers":observations.iter().map(|(snapshot,peer,_,_,_)| json!({
+                "hostname":peer["hostname"],"age_ms":snapshot.value["age_ms"],
+                "cpu":snapshot.value["cpu"],"ram":snapshot.value["ram"],
+                "uplink":snapshot.value["uplink"],"active":snapshot.value["active"],
+                "reserved":snapshot.value["reserved"],
+                "srt_enabled":snapshot.value["srt_playback"]["enabled"],
+                "srt_encrypted":snapshot.value["srt_playback"]["encrypted"],
+                "srt_clients":snapshot.value["srt_playback"]["clients"],
+                "srt_reserved":snapshot.value["srt_playback"]["reserved"],
+                "srt_client_limit":snapshot.value["srt_playback"]["client_limit"],
+                "srt_listener_ready":snapshot.value["srt_playback"]["listener_id"].is_string()
+            })).collect::<Vec<_>>() })
+        });
         let mut attempted = std::collections::HashSet::new();
         let mut turn = None;
         loop {
@@ -283,6 +359,7 @@ impl App {
                 })
                 .fold(crate::cluster::FALLBACK_MBPS, f64::max);
             if !bitrate.is_finite() || bitrate > crate::cluster::MAX_HINT_MBPS {
+                qualification_diag("bitrate_invalid", || json!({"bitrate":bitrate}));
                 return Err(503);
             }
             let nodes = valid
@@ -307,6 +384,10 @@ impl App {
                 })
                 .collect::<Vec<_>>();
             let Some(id) = self.routing_rotation.select(&nodes, 0.0, &mut turn) else {
+                qualification_diag(
+                    "no_eligible_node",
+                    || json!({"valid":valid.len(),"nodes":nodes}),
+                );
                 return Err(503);
             };
             attempted.insert(id.clone());
@@ -314,6 +395,10 @@ impl App {
                 return Err(403);
             }
             if self.options.drain || self.config.revision() != revision {
+                qualification_diag(
+                    "pre_admission_revision_or_drain",
+                    || json!({"drain":self.options.drain}),
+                );
                 return Err(503);
             }
             let (snapshot, peer, address, streamid, required) = observations
@@ -333,23 +418,55 @@ impl App {
                 let Some(api) = peer["api_url"].as_str() else {
                     continue;
                 };
-                let response=client.post(format!("{}/flussonix/api/v1/admit",api.trim_end_matches('/')))
-                    .header("X-Flussonix-Peer",peer["cluster_key"].as_str().unwrap_or(&self.options.peer_key))
-                    .json(&json!({"name":viewer.name,"protocol":"srt","encrypted":required,"token_hash":super::rtsp_balancer::token_hash(viewer),"bitrate_mbps":bitrate}))
-                    .timeout(Duration::from_secs(4)).send().await;
+                if private
+                    && !url::Url::parse(api)
+                        .ok()
+                        .is_some_and(|url| crate::peer_transport::require(&url, false).is_ok())
+                {
+                    continue;
+                }
+                let request = client
+                    .post(format!(
+                        "{}/flussonix/api/v1/admit",
+                        api.trim_end_matches('/')
+                    ))
+                    .header(
+                        "X-Flussonix-Peer",
+                        peer["cluster_key"]
+                            .as_str()
+                            .unwrap_or(&self.options.peer_key),
+                    );
+                let request = if !private {
+                    request.json(&json!({"name":viewer.name,"protocol":"srt","encrypted":required,"token_hash":super::rtsp_balancer::token_hash(viewer),"bitrate_mbps":bitrate}))
+                } else {
+                    request.header("X-Flussonix-Srt-Credential","1")
+                        .json(&json!({"name":viewer.name,"protocol":"srt","encrypted":true,"token_hash":super::rtsp_balancer::token_hash(viewer),"bitrate_mbps":bitrate,
+                            "srt_viewer":{"token":viewer.token,"qs":viewer.qs,"ip":viewer.ip,"user_agent":viewer.user_agent,"referer":viewer.referer,"host":viewer.host}}))
+                };
+                let response = request.timeout(Duration::from_secs(4)).send().await;
                 let Ok(response) = response else {
+                    qualification_diag("admission_transport_failed", || json!({"node":id}));
                     continue;
                 };
                 if !response.status().is_success() {
+                    qualification_diag(
+                        "admission_rejected",
+                        || json!({"node":id,"status":response.status().as_u16()}),
+                    );
                     continue;
                 }
                 let Some(body) = super::admission::read_json(response).await else {
+                    qualification_diag("admission_response_invalid", || json!({"node":id}));
                     continue;
                 };
-                let Some(id) = body["ticket"]
-                    .as_str()
-                    .and_then(|id| append_ticket(streamid, id))
-                else {
+                let Some(id) = body["ticket"].as_str().and_then(|id| {
+                    if !private && !viewer.token.is_empty() {
+                        append_ticket(streamid, id)
+                    } else {
+                        crate::srt_playback::ticket_only(&viewer.name, id)
+                    }
+                }) else {
+                    qualification_diag("admission_ticket_invalid", || json!({"node":id}));
                     continue;
                 };
                 id
@@ -358,6 +475,10 @@ impl App {
                 return Err(403);
             }
             if self.options.drain || self.config.revision() != revision {
+                qualification_diag(
+                    "post_admission_revision_or_drain",
+                    || json!({"drain":self.options.drain}),
+                );
                 return Err(503);
             }
             return Ok(

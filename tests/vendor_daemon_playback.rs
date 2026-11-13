@@ -41,7 +41,14 @@ struct Fixture {
     remote: Arc<Mutex<Value>>,
     segment: Arc<Mutex<Vec<u8>>>,
     duration: Arc<std::sync::atomic::AtomicU64>,
+    control_second: Arc<std::sync::atomic::AtomicU64>,
+    first_signal_delay: Arc<std::sync::atomic::AtomicU64>,
     control_epoch: Arc<Mutex<CancellationToken>>,
+    control_close_invalid: Arc<std::sync::atomic::AtomicBool>,
+    first_media_delay: Arc<std::sync::atomic::AtomicU64>,
+    page_delay: Arc<std::sync::atomic::AtomicU64>,
+    page_limits: Arc<Mutex<Vec<usize>>>,
+    page_snapshots: Arc<Mutex<Vec<(tokio::time::Instant, bool)>>>,
     server: tokio::task::JoinHandle<()>,
     owner: tokio::task::JoinHandle<Result<(), String>>,
     cancel: CancellationToken,
@@ -66,32 +73,50 @@ impl Fixture {
         let payload = segment.clone();
         let duration = Arc::new(std::sync::atomic::AtomicU64::new(4000));
         let control_duration = duration.clone();
+        let control_second = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let signal_second = control_second.clone();
+        let first_signal_delay = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let signal_delay = first_signal_delay.clone();
         let control_epoch = Arc::new(Mutex::new(CancellationToken::new()));
         let epoch = control_epoch.clone();
+        let control_close_invalid = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let invalid_control = control_close_invalid.clone();
+        let page_delay = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let delayed = page_delay.clone();
+        let page_limits = Arc::new(Mutex::new(Vec::new()));
+        let limits = page_limits.clone();
+        let page_snapshots = Arc::new(Mutex::new(Vec::new()));
+        let snapshots = page_snapshots.clone();
+        let first_media_delay = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let media_delay = first_media_delay.clone();
         let service=Router::new().fallback(get(move |OriginalUri(uri):OriginalUri,h:HeaderMap|{
-            record.lock().unwrap().push((uri.path().to_owned(),h.clone()));let rows=rows.clone();let held=held.clone();let payload=payload.clone();let control_duration=control_duration.clone();let epoch=epoch.clone();
+            record.lock().unwrap().push((uri.path().to_owned(),h.clone()));let rows=rows.clone();let held=held.clone();let payload=payload.clone();let control_duration=control_duration.clone();let signal_second=signal_second.clone();let signal_delay=signal_delay.clone();let epoch=epoch.clone();let invalid_control=invalid_control.clone();let delayed=delayed.clone();let limits=limits.clone();let snapshots=snapshots.clone();let media_delay=media_delay.clone();
             async move {
                 assert!(!h.contains_key("x-flussonix-peer"),"native credentials reached vendor");
                 if uri.path()=="/owned/m4f" {
                     assert!(h.contains_key("cluster-auth-key"));assert!(!h.contains_key("authorization"));
                     let millis=control_duration.load(std::sync::atomic::Ordering::SeqCst);
+                    let second=signal_second.load(std::sync::atomic::Ordering::SeqCst);
+                    let delay=signal_delay.load(std::sync::atomic::Ordering::SeqCst);
                     let closed=epoch.lock().unwrap().clone();
-                    let body=futures_util::stream::unfold(false,move |sent|{let closed=closed.clone();async move{
-                        if sent {closed.cancelled().await;return None;}
-                        Some((Ok::<_,std::io::Error>(bytes::Bytes::from(format!("1 2026/10/13/00/00/00-{millis}\n"))),true))
+                    let body=futures_util::stream::unfold(false,move |sent|{let closed=closed.clone();let invalid_control=invalid_control.clone();async move{
+                        if sent {closed.cancelled().await;if invalid_control.swap(false,std::sync::atomic::Ordering::SeqCst){return Some((Ok::<_,std::io::Error>(bytes::Bytes::from_static(b"bad\n")),true));}return None;}
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        Some((Ok::<_,std::io::Error>(bytes::Bytes::from(format!("1 2026/10/13/00/00/{second:02}-{millis}\n"))),true))
                     }
                     });
                     return Response::new(Body::from_stream(body));
                 }
-                if uri.path()=="/owned/2026/10/13/00/00/00.m4f" {
+                if uri.path().starts_with("/owned/2026/10/13/00/00/") && uri.path().ends_with(".m4f") {
                     assert!(h.contains_key("cluster-auth-key"));assert!(!h.contains_key("authorization"));
                     return Response::new(Body::from(payload.lock().unwrap().clone()));
                 }
                 if uri.path().ends_with("/owned/m4s") {
                     assert!(h.contains_key("cluster-auth-key"));assert!(!h.contains_key("authorization"));
                     let track=Track{id:1,codec:"mp3".into(),config:vec![]};
-                    let body=futures_util::stream::unfold((0u64,track),|(i,track)|async move {
-                        let bytes=if i==0 {wire::encode_info(std::slice::from_ref(&track)).unwrap()} else {
+                    let delay=media_delay.load(std::sync::atomic::Ordering::SeqCst);
+                    let body=futures_util::stream::unfold((0u64,track),move |(i,track)|async move {
+                        let bytes=if i==0 {tokio::time::sleep(Duration::from_millis(delay)).await;wire::encode_info(std::slice::from_ref(&track)).unwrap()} else {
                             tokio::time::sleep(Duration::from_millis(3)).await;
                             wire::encode_frame(&track,&Frame{track_id:1,dts:90000+(i-1)*2351,pts_offset:0,key:true,body:include_bytes!("fixtures/codecs/mp3.bin").to_vec()}).unwrap()
                         };
@@ -104,7 +129,26 @@ impl Fixture {
                     let pause=held.lock().unwrap().take();
                     if let Some((started,release))=pause {let _=started.send(());let _=release.await;}
                 }
-                let value=if uri.path().ends_with("/config") {json!({"stats":{"id":"owned-vendor-origin"}})} else {assert_eq!(uri.path(),"/streamer/api/v3/streams");json!({"server_id":"owned-vendor-origin","streams":rows.lock().unwrap().clone()})};
+                let value=if uri.path().ends_with("/config") {json!({"stats":{"id":"owned-vendor-origin"}})} else {
+                    assert_eq!(uri.path(),"/streamer/api/v3/streams");
+                    let delay=delayed.load(std::sync::atomic::Ordering::SeqCst);
+                    if delay==0 {json!({"server_id":"owned-vendor-origin","streams":rows.lock().unwrap().clone()})}
+                    else {
+                        let query:std::collections::HashMap<_,_>=url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()).into_owned().collect();
+                        assert_eq!(query.get("select").unwrap(),"name,named_by,groups,static,disabled");
+                        let limit:usize=query.get("limit").unwrap().parse().unwrap();
+                        assert!((1..=1000).contains(&limit));
+                        limits.lock().unwrap().push(limit);
+                        let offset=query.get("cursor").map(|c|c.strip_prefix("owned page:").unwrap().parse::<usize>().unwrap()).unwrap_or(0);
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        let catalog=rows.lock().unwrap();let catalog=catalog.as_array().unwrap();
+                        snapshots.lock().unwrap().push((tokio::time::Instant::now(),catalog.iter().any(|row|row["name"]=="owned")));
+                        let end=(offset+limit).min(catalog.len());
+                        let mut value=json!({"server_id":"owned-vendor-origin","streams":catalog[offset..end]});
+                        if end<catalog.len() {value["next"]=json!(format!("owned page:{end}"));}
+                        value
+                    }
+                };
                 Response::new(Body::from(value.to_string()))
             }
         }));
@@ -147,7 +191,14 @@ impl Fixture {
             remote,
             segment,
             duration,
+            control_second,
+            first_signal_delay,
             control_epoch,
+            control_close_invalid,
+            first_media_delay,
+            page_delay,
+            page_limits,
+            page_snapshots,
             server,
             owner,
             cancel,
@@ -519,6 +570,91 @@ async fn processing_template_edit_revokes_old_body_and_replaces_profile_and_cach
     for pid in [before, after] {
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
     }
+}
+
+#[tokio::test]
+async fn vendor_group_pin_edit_retires_existing_cdn_viewer() {
+    use http_body_util::BodyExt;
+    use sha2::{Digest, Sha256};
+    let f = Fixture::new(json!({
+        "on_play":"true",
+        "group_config":{
+            "paid":{"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"paid-viewer"))},
+            "public":{"on_play":"true"}
+        },
+        "flussonix_group_pins":{"owned":["paid"]}
+    }))
+    .await;
+    (*f.remote.lock().unwrap())[0]["groups"] = json!(["paid"]);
+    assert_eq!(
+        f.get("/owned/m4s?token=wrong").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    let live = f.get("/owned/m4s?token=paid-viewer").await;
+    assert_eq!(live.status(), StatusCode::OK);
+    let mut old = live.into_body();
+    assert!(old.frame().await.is_some());
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_group_pins":{"owned":["public"]}}),
+        )
+        .unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(2), async {
+        while old.frame().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    let after = f.get("/owned/m4s?token=paid-viewer").await;
+    assert_ne!(after.status(), StatusCode::OK);
+    drop(old);
+    f.stop().await;
+    assert!(closed, "an old paid viewer survived a local pin edit");
+}
+#[tokio::test]
+async fn vendor_group_policy_edit_retires_existing_cdn_viewer() {
+    use http_body_util::BodyExt;
+    use sha2::{Digest, Sha256};
+    let f = Fixture::new(json!({
+        "on_play":"true",
+        "group_config":{"paid":{"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"old-paid-viewer"))}},
+        "flussonix_group_pins":{"owned":["paid"]}
+    }))
+    .await;
+    (*f.remote.lock().unwrap())[0]["groups"] = json!(["paid"]);
+    let live = f.get("/owned/m4s?token=old-paid-viewer").await;
+    assert_eq!(live.status(), StatusCode::OK);
+    let mut old = live.into_body();
+    assert!(old.frame().await.is_some());
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"group_config":{"paid":{"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"new-paid-viewer"))}}}),
+        )
+        .unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(2), async {
+        while old.frame().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    assert_eq!(
+        f.get("/owned/m4s?token=old-paid-viewer").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        f.get("/owned/m4s?token=new-paid-viewer").await.status(),
+        StatusCode::OK
+    );
+    drop(old);
+    f.stop().await;
+    assert!(
+        closed,
+        "an old paid viewer survived a local group policy edit"
+    );
 }
 #[tokio::test]
 async fn processing_templates_are_isolated_between_distinct_vendor_sources() {
@@ -931,6 +1067,29 @@ async fn https_vendor_playback_works_and_callback_redirect_cannot_downgrade() {
     assert_eq!(response.status(), StatusCode::OK);
     assert!(!response.chunk().await.unwrap().unwrap().is_empty());
     drop(response);
+    for (alias, child) in [
+        ("index.ts.m3u8", "index.m3u8"),
+        ("index.fmp4.m3u8", "fmp4/index.m3u8"),
+    ] {
+        let entry = url::Url::parse(&format!("{url}/owned/{alias}")).unwrap();
+        let response = client
+            .get(format!("{entry}?token=secure-viewer"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let master = response.text().await.unwrap();
+        assert!(
+            master.contains(&format!("{child}?token=secure-viewer")),
+            "{master}"
+        );
+        let child_url = entry.join(&format!("{child}?token=secure-viewer")).unwrap();
+        assert_eq!(child_url.scheme(), "https");
+        assert_eq!(
+            client.get(child_url).send().await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
     let callback_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let callback_url = format!("http://{}", callback_listener.local_addr().unwrap());
     let callback = tokio::spawn(async move {
@@ -957,6 +1116,17 @@ async fn https_vendor_playback_works_and_callback_redirect_cannot_downgrade() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
     drop(r);
+    for alias in ["index.ts.m3u8", "index.fmp4.m3u8"] {
+        assert_eq!(
+            client
+                .get(format!("{url}/owned/{alias}?token=redirect"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
     let r = f.get("/owned/m4s?token=redirect").await;
     assert_eq!(r.status(), StatusCode::FOUND);
     assert_eq!(
@@ -1004,6 +1174,31 @@ fn multitrack_segment() -> Vec<u8> {
             key: true,
             body: include_bytes!("fixtures/codecs/mp2.bin").to_vec(),
         });
+    }
+    frames.sort_by_key(|f| f.dts);
+    flussonix::m4f::pack(&tracks, &frames, 360000).unwrap()
+}
+fn hevc_multitrack_segment() -> Vec<u8> {
+    let (mut tracks, mut frames) = flussonix::m4f::unpack(&multitrack_segment()).unwrap();
+    tracks.push(Track {
+        id: 205,
+        codec: "hevc".into(),
+        config: include_bytes!("fixtures/codecs/hevc.hvcc").to_vec(),
+    });
+    let timing: Vec<Value> =
+        serde_json::from_str(include_str!("fixtures/codecs/hevc-timing.json")).unwrap();
+    for cycle in 0..8u64 {
+        for (i, t) in timing.iter().enumerate() {
+            let d = t["dts"].as_i64().unwrap();
+            let p = t["pts"].as_i64().unwrap();
+            frames.push(Frame {
+                track_id: 205,
+                dts: 90000 + cycle * 43200 + ((d + 1024) * 90000 / 12800) as u64,
+                pts_offset: (p - d) * 90000 / 12800,
+                key: t["flags"].as_str().unwrap().contains('K'),
+                body: std::fs::read(format!("tests/fixtures/codecs/hevc-{i:02}.bin")).unwrap(),
+            });
+        }
     }
     frames.sort_by_key(|f| f.dts);
     flussonix::m4f::pack(&tracks, &frames, 360000).unwrap()
@@ -1113,6 +1308,27 @@ async fn processing_template_converts_english_and_german_native_text_with_shared
     .await
     .unwrap();
     assert!(master.contains("English") && master.contains("Deutsch"));
+    for (alias, prefix) in [("index.ts.m3u8", ""), ("index.fmp4.m3u8", "fmp4/")] {
+        let response = f.get(&format!("/owned/{alias}?token=caption")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let alias_master = String::from_utf8(bytes(response).await.to_vec()).unwrap();
+        assert_eq!(alias_master.matches("#EXT-X-STREAM-INF:").count(), 1);
+        assert!(alias_master.contains("English") && alias_master.contains("Deutsch"));
+        assert!(alias_master.contains(&format!("URI=\"{prefix}nt7.m3u8?token=caption\"")));
+        assert!(alias_master.contains(&format!("URI=\"{prefix}nt8.m3u8?token=caption\"")));
+        assert!(alias_master.contains(&format!("{prefix}av.m3u8?token=caption\n")));
+        for child in ["av.m3u8", "nt7.m3u8", "nt8.m3u8"] {
+            let path = format!("/owned/{prefix}{child}?token=caption");
+            assert_eq!(f.get(&path).await.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                f.get(&format!("/owned/{prefix}{child}?token=wrong"))
+                    .await
+                    .status(),
+                StatusCode::FORBIDDEN,
+                "{path}"
+            );
+        }
+    }
     let first_pid = f.app.media.stats("owned").await["pid"].clone();
     let live = f.get("/owned/m4s?token=caption").await;
     assert_eq!(live.status(), StatusCode::OK);
@@ -1239,7 +1455,7 @@ async fn processing_template_preserve_with_transcoding_fails_explicitly_for_nati
     assert_eq!(stats["last_error"], "native_subtitle_transcode_unsupported");
 }
 #[tokio::test]
-async fn processing_template_conversion_restarts_with_fresh_state_in_the_same_config_revision() {
+async fn processing_template_conversion_restarts_after_invalid_control_with_fresh_state() {
     use http_body_util::BodyExt;
     let f = Fixture::variant(json!({"on_play":"true"}), "m4f", "standalone").await;
     *f.segment.lock().unwrap() = text_segment();
@@ -1282,6 +1498,10 @@ async fn processing_template_conversion_restarts_with_fresh_state_in_the_same_co
         }
     }
     *f.segment.lock().unwrap() = flussonix::m4f::pack(&tracks, &frames, 900000).unwrap();
+    // A malformed control frame requires supervised replacement. Clean EOF
+    // intentionally keeps the worker and skips this already-published GOP.
+    f.control_close_invalid
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let closed = std::mem::replace(
         &mut *f.control_epoch.lock().unwrap(),
         CancellationToken::new(),
@@ -1314,13 +1534,250 @@ async fn processing_template_conversion_restarts_with_fresh_state_in_the_same_co
     f.stop().await;
     assert!(ended);
     assert!(same_revision);
-    assert_eq!(management, new_management);
+    // Recovery refreshes the origin profile and catalog before reopening it.
+    assert_eq!(new_management, management + 3);
     assert_ne!(old_pid, new_pid);
     assert_ne!(old_file, new_file);
     assert!(String::from_utf8_lossy(&old_text).contains("AMERICA HELLO"));
     assert!(String::from_utf8_lossy(&text).contains("NEW INPUT GENERATION"));
     assert!(!String::from_utf8_lossy(&text).contains("AMERICA HELLO"));
 }
+
+#[tokio::test]
+async fn clean_m4f_eof_keeps_daemon_packager_and_delivers_new_timestamp_once() {
+    use http_body_util::BodyExt;
+    let f = Fixture::variant(json!({"on_play":"true"}), "m4f", "cdn").await;
+    let manifest = f.get("/owned/index.m3u8").await;
+    assert_eq!(manifest.status(), StatusCode::OK);
+    let live = f.get("/owned/m4s").await;
+    assert_eq!(live.status(), StatusCode::OK);
+    let mut body = live.into_body();
+    let _ = native_info(&mut body).await;
+    let pid = f.app.media.stats("owned").await["pid"].as_u64().unwrap();
+    let (controls, segments, catalog) = {
+        let before = f.calls.lock().unwrap();
+        (
+            before.iter().filter(|(p, _)| p == "/owned/m4f").count(),
+            before.iter().filter(|(p, _)| p.ends_with(".m4f")).count(),
+            before
+                .iter()
+                .filter(|(p, _)| p.contains("/streamer/api/"))
+                .count(),
+        )
+    };
+    let closed = std::mem::replace(
+        &mut *f.control_epoch.lock().unwrap(),
+        CancellationToken::new(),
+    );
+    closed.cancel();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (new_controls, new_catalog) = {
+                let calls = f.calls.lock().unwrap();
+                (
+                    calls.iter().filter(|(p, _)| p == "/owned/m4f").count(),
+                    calls
+                        .iter()
+                        .filter(|(p, _)| p.contains("/streamer/api/"))
+                        .count(),
+                )
+            };
+            if new_controls > controls && new_catalog > catalog {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("clean EOF did not renew catalog and reopen M4F control");
+    assert_eq!(f.app.media.stats("owned").await["pid"].as_u64(), Some(pid));
+    assert_eq!(
+        f.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p.ends_with(".m4f"))
+            .count(),
+        segments,
+        "replayed segment was fetched again"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while body.frame().await.is_some() {}
+        })
+        .await
+        .is_err(),
+        "existing native viewer unexpectedly ended"
+    );
+    let (tracks, mut frames) = flussonix::m4f::unpack(&multitrack_segment()).unwrap();
+    for frame in &mut frames {
+        frame.dts += 360_000;
+    }
+    *f.segment.lock().unwrap() = flussonix::m4f::pack(&tracks, &frames, 360_000).unwrap();
+    f.control_second
+        .store(4, std::sync::atomic::Ordering::SeqCst);
+    let closed = std::mem::replace(
+        &mut *f.control_epoch.lock().unwrap(),
+        CancellationToken::new(),
+    );
+    closed.cancel();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let fetched = {
+                let calls = f.calls.lock().unwrap();
+                calls
+                    .iter()
+                    .any(|(path, _)| path == "/owned/2026/10/13/00/00/04.m4f")
+            };
+            if fetched {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("new M4F timestamp was not fetched after the second clean EOF");
+    let fresh = f.get("/owned/m4s").await;
+    assert_eq!(fresh.status(), StatusCode::OK);
+    let mut fresh_body = fresh.into_body();
+    let mut decoder = flussonix::m4s::Decoder::default();
+    let mut seen = std::collections::HashSet::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let data = fresh_body
+                .frame()
+                .await
+                .expect("native viewer ended before the new timestamp")
+                .unwrap()
+                .into_data()
+                .unwrap();
+            for event in decoder.push(&data).unwrap() {
+                let media = match event {
+                    flussonix::m4s::Event::Frame { track_id, dts, .. } => vec![(track_id, dts)],
+                    flussonix::m4s::Event::Gop { frames, .. } => frames
+                        .into_iter()
+                        .map(|frame| (frame.track_id, frame.dts))
+                        .collect(),
+                    _ => vec![],
+                };
+                for (track_id, dts) in media {
+                    assert!(
+                        seen.insert((track_id, dts)),
+                        "duplicate native media timestamp"
+                    );
+                    if dts >= 450_000 {
+                        return;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("new timestamp did not reach native playback");
+    assert_eq!(f.app.media.stats("owned").await["pid"].as_u64(), Some(pid));
+    {
+        let calls = f.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(path, _)| path == "/owned/2026/10/13/00/00/00.m4f")
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(path, _)| path == "/owned/2026/10/13/00/00/04.m4f")
+                .count(),
+            1
+        );
+    }
+    drop(fresh_body);
+    drop(body);
+    f.stop().await;
+}
+#[tokio::test]
+async fn m4f_control_stays_unavailable_until_the_first_segment_is_cached() {
+    let f = Fixture::variant(json!({"on_play":"true"}), "m4f", "standalone").await;
+    f.first_signal_delay
+        .store(30_000, std::sync::atomic::Ordering::SeqCst);
+    f.app
+        .config
+        .put(
+            "templates",
+            "short-m4f",
+            json!({"flussonix_input_timeout":10}),
+        )
+        .unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"short-m4f"}),
+        )
+        .unwrap();
+    let started = std::time::Instant::now();
+    let status = f.get("/owned/m4f").await.status();
+    let elapsed = started.elapsed();
+    let stats = f.app.media.stats("owned").await;
+    f.stop().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(elapsed >= Duration::from_secs(8));
+    assert_eq!(stats["bytes_in"], 0);
+}
+
+#[tokio::test]
+async fn m4f_control_waits_for_a_segment_within_the_worker_startup_allowance() {
+    use http_body_util::BodyExt;
+    let f = Fixture::variant(json!({"on_play":"true"}), "m4f", "standalone").await;
+    f.first_signal_delay
+        .store(9_000, std::sync::atomic::Ordering::SeqCst);
+    f.app
+        .config
+        .put(
+            "templates",
+            "slow-m4f",
+            json!({"flussonix_input_timeout":20}),
+        )
+        .unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"slow-m4f"}),
+        )
+        .unwrap();
+    let started = std::time::Instant::now();
+    let response = f.get("/owned/m4f").await;
+    let elapsed = started.elapsed();
+    let status = response.status();
+    let mut body = response.into_body();
+    let signal = if status == StatusCode::OK {
+        tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap()
+    } else {
+        Default::default()
+    };
+    let segment = if status == StatusCode::OK {
+        f.get("/owned/2026/10/13/00/00/00.m4f").await.status()
+    } else {
+        status
+    };
+    drop(body);
+    f.stop().await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(elapsed >= Duration::from_secs(9));
+    assert!(String::from_utf8_lossy(&signal).contains("2026/10/13/00/00/00"));
+    assert_eq!(segment, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn m4f_source_serves_original_multitrack_segment_and_hls_through_daemon() {
     use http_body_util::BodyExt;
@@ -1407,6 +1864,10 @@ async fn active_vendor_worker_is_visible_in_node_stream_inventory() {
         .unwrap()
         .iter()
         .any(|stream| stream["name"] == "owned");
+    assert_eq!(
+        node["total_streams_count"], 1,
+        "mirrored stream was omitted from native balancer load"
+    );
     drop(r);
     f.stop().await;
     assert!(visible, "active shared worker missing from node inventory");
@@ -1502,6 +1963,409 @@ async fn fmp4_hls_child_segments_are_guarded_and_decode_with_init() {
     assert!(result.unwrap().status.success());
 }
 
+#[tokio::test]
+async fn vendor_audio_only_track_urls_remain_authorized_and_decode_mp3() {
+    use sha2::{Digest, Sha256};
+    let hash = format!("{:x}", Sha256::digest(b"track-viewer"));
+    let f = Fixture::new(json!({"flussonix_token_sha256": hash})).await;
+    let denied = [
+        f.get("/owned/video.m3u8?token=wrong").await.status(),
+        f.get("/owned/tracks-a1/mono.m3u8?token=wrong")
+            .await
+            .status(),
+        f.get("/owned/tracks-a1/g1_1.ts?token=wrong").await.status(),
+    ];
+    let master_response = f.get("/owned/video.m3u8?token=track-viewer").await;
+    let master_status = master_response.status();
+    let master = String::from_utf8(bytes(master_response).await.to_vec()).unwrap();
+    let child = master
+        .lines()
+        .find(|line| line.starts_with("tracks-a1/mono.m3u8"))
+        .unwrap_or("")
+        .to_owned();
+    let child_response = f.get(&format!("/owned/{child}")).await;
+    let child_status = child_response.status();
+    let playlist = String::from_utf8(bytes(child_response).await.to_vec()).unwrap();
+    let segment = playlist
+        .lines()
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .unwrap_or("")
+        .to_owned();
+    let segment_response = f.get(&format!("/owned/tracks-a1/{segment}")).await;
+    let segment_status = segment_response.status();
+    let segment_bytes = bytes(segment_response).await;
+    let probe_dir = tempfile::tempdir().unwrap();
+    let file = probe_dir.path().join("selected-vendor-a1.ts");
+    std::fs::write(&file, segment_bytes.as_ref()).unwrap();
+    let invalid = f
+        .get("/owned/tracks-a2/mono.m3u8?token=track-viewer")
+        .await
+        .status();
+    f.stop().await;
+    assert_eq!(denied, [StatusCode::FORBIDDEN; 3]);
+    assert_eq!(master_status, StatusCode::OK, "{master}");
+    assert!(
+        child.starts_with("tracks-a1/mono.m3u8?token=track-viewer"),
+        "{master}"
+    );
+    assert_eq!(child_status, StatusCode::OK, "{playlist}");
+    assert!(segment.ends_with(".ts?token=track-viewer"), "{playlist}");
+    assert_eq!(segment_status, StatusCode::OK);
+    assert!(!segment_bytes.is_empty());
+    assert_ne!(
+        invalid,
+        StatusCode::OK,
+        "unknown audio track must not be advertised"
+    );
+    let probe = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new("ffprobe")
+            .kill_on_drop(true)
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_name,codec_type",
+                "-of",
+                "json",
+            ])
+            .arg(&file)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        probe.status.success(),
+        "{}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    let streams: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+    assert_eq!(streams["streams"].as_array().unwrap().len(), 1);
+    assert_eq!(streams["streams"][0]["codec_name"], "mp3");
+    assert_eq!(streams["streams"][0]["codec_type"], "audio");
+}
+
+#[tokio::test]
+async fn vendor_m4f_hls_selects_each_of_two_audio_codecs() {
+    let f = Fixture::variant(json!({"on_play":"true"}), "m4f", "standalone").await;
+    let master = f.get("/owned/video.m3u8").await;
+    assert_eq!(master.status(), StatusCode::OK);
+    let master = String::from_utf8(bytes(master).await.to_vec()).unwrap();
+    assert!(master.contains("tracks-a1/mono.m3u8"), "{master}");
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut results = Vec::new();
+    for (ordinal, expected_codec) in [(1, "mp3"), (2, "mp2")] {
+        let playlist = playlist(&f, &format!("/owned/tracks-a{ordinal}/mono.m3u8")).await;
+        let segment = playlist
+            .lines()
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .expect("selected audio segment");
+        let response = f.get(&format!("/owned/tracks-a{ordinal}/{segment}")).await;
+        let status = response.status();
+        let file = probe_dir.path().join(format!("selected-a{ordinal}.ts"));
+        std::fs::write(&file, bytes(response).await).unwrap();
+        results.push((ordinal, expected_codec, status, file));
+    }
+    let unavailable = f.get("/owned/tracks-a3/mono.m3u8").await.status();
+    f.stop().await;
+    assert_ne!(
+        unavailable,
+        StatusCode::OK,
+        "unknown audio track was admitted"
+    );
+    for (ordinal, expected_codec, status, file) in results {
+        assert_eq!(status, StatusCode::OK, "audio track {ordinal}");
+        let probe = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new("ffprobe")
+                .kill_on_drop(true)
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_name,codec_type",
+                    "-of",
+                    "json",
+                ])
+                .arg(&file)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            probe.status.success(),
+            "audio track {ordinal}: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        let streams: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+        let streams = streams["streams"].as_array().unwrap();
+        assert_eq!(streams.len(), 1, "audio track {ordinal}: {streams:?}");
+        assert_eq!(streams[0]["codec_type"], "audio");
+        assert_eq!(streams[0]["codec_name"], expected_codec);
+    }
+}
+
+#[tokio::test]
+async fn vendor_m4f_hls_selects_hevc_with_and_without_audio() {
+    let f = Fixture::variant(json!({"on_play":"true"}), "m4f", "standalone").await;
+    *f.segment.lock().unwrap() = hevc_multitrack_segment();
+    let master = f.get("/owned/video.m3u8").await;
+    assert_eq!(master.status(), StatusCode::OK);
+    let master = String::from_utf8(bytes(master).await.to_vec()).unwrap();
+    assert!(master.contains("tracks-v1a1/mono.m3u8"), "{master}");
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut selected = Vec::new();
+    for selector in ["v1a1", "v1"] {
+        let playlist = playlist(&f, &format!("/owned/tracks-{selector}/mono.m3u8")).await;
+        let segment = playlist
+            .lines()
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .expect("selected HEVC segment");
+        let response = f.get(&format!("/owned/tracks-{selector}/{segment}")).await;
+        assert_eq!(response.status(), StatusCode::OK, "{selector}");
+        let file = probe_dir.path().join(format!("selected-{selector}.ts"));
+        std::fs::write(&file, bytes(response).await).unwrap();
+        selected.push((selector, file));
+    }
+    f.stop().await;
+    for (selector, file) in selected {
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new("ffprobe")
+                .kill_on_drop(true)
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_name,codec_type",
+                    "-of",
+                    "json",
+                ])
+                .arg(&file)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{selector}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let streams = value["streams"].as_array().unwrap();
+        let codecs: Vec<_> = streams
+            .iter()
+            .map(|stream| stream["codec_name"].as_str().unwrap())
+            .collect();
+        assert!(codecs.contains(&"hevc"), "{selector}: {value}");
+        assert_eq!(
+            codecs.contains(&"mp3"),
+            selector == "v1a1",
+            "{selector}: {value}"
+        );
+        assert!(!codecs.contains(&"mp2"), "{selector}: {value}");
+        let decoded = tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio::process::Command::new("ffmpeg")
+                .kill_on_drop(true)
+                .args(["-nostdin", "-v", "error", "-threads", "1", "-i"])
+                .arg(&file)
+                .args(["-map", "0:v:0", "-t", "0.2", "-f", "null", "-"])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            decoded.status.success(),
+            "{selector}: {}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+    }
+}
+
+#[tokio::test]
+async fn vendor_selected_hls_master_keeps_converted_english_and_german_captions() {
+    use sha2::{Digest, Sha256};
+    let token_hash = format!("{:x}", Sha256::digest(b"caption-viewer"));
+    let f = Fixture::variant(
+        json!({"on_play":"true","flussonix_token_sha256":token_hash}),
+        "m4f",
+        "standalone",
+    )
+    .await;
+    *f.segment.lock().unwrap() = text_segment();
+    f.duration.store(10000, std::sync::atomic::Ordering::SeqCst);
+    f.app
+        .config
+        .put(
+            "templates",
+            "processing",
+            json!({
+                "flussonix_hls_subtitles":"convert",
+                "flussonix_hls_captions":[
+                    {"native_track":7,"language":"en","name":"English"},
+                    {"native_track":8,"language":"de","name":"Deutsch"}
+                ]
+            }),
+        )
+        .unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"processing"}),
+        )
+        .unwrap();
+    let master = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let response = f.get("/owned/video.m3u8?token=caption-viewer").await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let text = String::from_utf8(bytes(response).await.to_vec()).unwrap();
+            if text.contains("TYPE=SUBTITLES") {
+                break text;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        master.contains("English") && master.contains("Deutsch"),
+        "{master}"
+    );
+    for id in [7, 8] {
+        assert!(
+            master.contains(&format!("URI=\"nt{id}.m3u8?token=caption-viewer\"")),
+            "{master}"
+        );
+    }
+    let child = master
+        .lines()
+        .find(|line| line.starts_with("tracks-a1/mono.m3u8"))
+        .expect("selected audio child")
+        .to_owned();
+    let playlist = playlist(&f, &format!("/owned/{child}")).await;
+    let segment = playlist
+        .lines()
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .expect("selected audio segment");
+    let selected = f.get(&format!("/owned/tracks-a1/{segment}")).await;
+    assert_eq!(selected.status(), StatusCode::OK);
+    assert_eq!(
+        f.get("/owned/video.m3u8?token=wrong").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        f.get("/owned/tracks-a1/mono.m3u8?token=wrong")
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    for id in [7, 8] {
+        assert_eq!(
+            f.get(&format!("/owned/nt{id}.m3u8?token=caption-viewer"))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn vendor_hls_master_aliases_preserve_authorized_child_playback() {
+    use sha2::{Digest, Sha256};
+    let hash = format!("{:x}", Sha256::digest(b"alias-viewer"));
+    let f = Fixture::new(json!({"flussonix_token_sha256": hash})).await;
+    let denied = f.get("/owned/index.ts.m3u8?token=wrong").await.status();
+    let mut results = Vec::new();
+    for (alias, child, extension) in [
+        ("index.ts.m3u8", "index.m3u8", ".ts"),
+        ("index.fmp4.m3u8", "fmp4/index.m3u8", ".m4s"),
+    ] {
+        let response = f.get(&format!("/owned/{alias}?token=alias-viewer")).await;
+        let status = response.status();
+        let body = String::from_utf8(bytes(response).await.to_vec()).unwrap();
+        let child_line = body.lines().find(|line| line.starts_with(child));
+        let (child_status, child_body, segment_status, unguarded_status) =
+            if let Some(line) = child_line {
+                let child_response = f.get(&format!("/owned/{line}")).await;
+                let child_status = child_response.status();
+                let child_body = String::from_utf8(bytes(child_response).await.to_vec()).unwrap();
+                let segment = child_body
+                    .lines()
+                    .find(|line| !line.is_empty() && !line.starts_with('#'));
+                let (segment_status, unguarded_status) = if let Some(segment) = segment {
+                    let parent = child.rsplit_once('/').map_or("", |(parent, _)| parent);
+                    let relative = if parent.is_empty() {
+                        segment.to_owned()
+                    } else {
+                        format!("{parent}/{segment}")
+                    };
+                    let segment_status = f.get(&format!("/owned/{relative}")).await.status();
+                    let unguarded_status = f
+                        .get(&format!("/owned/{}", relative.split('?').next().unwrap()))
+                        .await
+                        .status();
+                    (segment_status, unguarded_status)
+                } else {
+                    (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND)
+                };
+                (child_status, child_body, segment_status, unguarded_status)
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    String::new(),
+                    StatusCode::NOT_FOUND,
+                    StatusCode::NOT_FOUND,
+                )
+            };
+        results.push((
+            status,
+            body,
+            child_status,
+            child_body,
+            segment_status,
+            unguarded_status,
+            child,
+            extension,
+        ));
+    }
+    f.stop().await;
+    assert_eq!(denied, StatusCode::FORBIDDEN);
+    for (
+        status,
+        body,
+        child_status,
+        child_body,
+        segment_status,
+        unguarded_status,
+        child,
+        extension,
+    ) in results
+    {
+        assert_eq!(status, StatusCode::OK, "{child}: {body}");
+        assert!(body.contains("#EXT-X-STREAM-INF:BANDWIDTH="));
+        assert!(body.contains(&format!("{child}?token=alias-viewer")));
+        assert!(!body.contains("flussonix_ticket"));
+        assert!(!body.contains("flussonix_handoff"));
+        assert_eq!(child_status, StatusCode::OK, "{child}: {body}");
+        assert!(
+            child_body
+                .lines()
+                .any(|line| line.split('?').next().unwrap().ends_with(extension)),
+            "{child}: {child_body}"
+        );
+        assert_eq!(segment_status, StatusCode::OK, "{child}: {child_body}");
+        assert_eq!(unguarded_status, StatusCode::FORBIDDEN);
+    }
+}
+
 #[path = "vendor_daemon_playback/placement.rs"]
 mod placement;
 
@@ -1571,29 +2435,7 @@ async fn automatic_m4f_static_startup_requires_no_viewer_and_decodes_hls() {
 #[tokio::test]
 async fn m4f_vendor_rtsp_decodes_hevc_mp3_and_mp2_with_independent_ffmpeg() {
     let f = Fixture::variant(json!({"on_play":"true","only":[]}), "m4f", "standalone").await;
-    let (mut tracks, mut frames) = flussonix::m4f::unpack(&multitrack_segment()).unwrap();
-    tracks.push(Track {
-        id: 205,
-        codec: "hevc".into(),
-        config: include_bytes!("fixtures/codecs/hevc.hvcc").to_vec(),
-    });
-    let timing: Vec<Value> =
-        serde_json::from_str(include_str!("fixtures/codecs/hevc-timing.json")).unwrap();
-    for cycle in 0..8u64 {
-        for (i, t) in timing.iter().enumerate() {
-            let d = t["dts"].as_i64().unwrap();
-            let p = t["pts"].as_i64().unwrap();
-            frames.push(Frame {
-                track_id: 205,
-                dts: 90000 + cycle * 43200 + ((d + 1024) * 90000 / 12800) as u64,
-                pts_offset: (p - d) * 90000 / 12800,
-                key: t["flags"].as_str().unwrap().contains('K'),
-                body: std::fs::read(format!("tests/fixtures/codecs/hevc-{i:02}.bin")).unwrap(),
-            });
-        }
-    }
-    frames.sort_by_key(|f| f.dts);
-    *f.segment.lock().unwrap() = flussonix::m4f::pack(&tracks, &frames, 360000).unwrap();
+    *f.segment.lock().unwrap() = hevc_multitrack_segment();
     let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
         "rtsp://{}/owned?token=owned-rtsp",
@@ -1623,7 +2465,22 @@ async fn m4f_vendor_rtsp_decodes_hevc_mp3_and_mp2_with_independent_ffmpeg() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let status = match tokio::time::timeout(Duration::from_secs(20), child.wait()).await {
+    let mut live_pids = std::collections::BTreeSet::new();
+    let playback = async {
+        loop {
+            let pid = f.app.media.stats("owned").await["pid"]
+                .as_u64()
+                .unwrap_or(0);
+            if pid > 0 && std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                live_pids.insert(pid);
+            }
+            tokio::select! {
+                status = child.wait() => break status,
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+    };
+    let status = match tokio::time::timeout(Duration::from_secs(20), playback).await {
         Ok(status) => Some(status.unwrap()),
         Err(_) => {
             child.kill().await.unwrap();
@@ -1638,9 +2495,6 @@ async fn m4f_vendor_rtsp_decodes_hevc_mp3_and_mp2_with_independent_ffmpeg() {
         .iter()
         .filter(|(p, _)| p == "/owned/m4f")
         .count();
-    let pid = f.app.media.stats("owned").await["pid"]
-        .as_u64()
-        .unwrap_or(0);
     cancel.cancel();
     listener.await.unwrap().unwrap();
     f.stop().await;
@@ -1650,9 +2504,493 @@ async fn m4f_vendor_rtsp_decodes_hevc_mp3_and_mp2_with_independent_ffmpeg() {
         std::fs::read_to_string(path).unwrap()
     );
     assert_eq!(pulls, 1);
-    assert!(pid > 0);
-    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    assert!(
+        !live_pids.is_empty(),
+        "real playback must witness a live packager"
+    );
+    for pid in live_pids {
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
 }
 
 #[path = "vendor_daemon_playback/srt.rs"]
 mod srt;
+
+#[tokio::test]
+async fn large_catalog_concurrent_playback_renews_one_pull_and_closes_on_removal() {
+    use futures_util::FutureExt;
+    use http_body_util::BodyExt;
+    use sha2::{Digest, Sha256};
+    use std::sync::atomic::Ordering;
+
+    let hash = format!("{:x}", Sha256::digest(b"catalog-viewer"));
+    let f = Fixture::new(json!({"on_play":"true","flussonix_token_sha256":hash})).await;
+    let mut rows: Vec<Value> = (0..950)
+        .map(|i| json!({"name":format!("filler-{i:04}"),"groups":[],"named_by":"config","static":false}))
+        .collect();
+    rows.push(json!({"name":"owned","groups":[],"named_by":"config","static":false}));
+    *f.remote.lock().unwrap() = json!(rows);
+    // Twelve old80-row pages exceed the actual daemon's five-second budget.
+    // The selected target is deliberately the last row, never a partial result.
+    f.page_delay.store(600, Ordering::SeqCst);
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let responses = futures_util::future::join_all(
+            (0..8).map(|_| f.get("/owned/m4s?token=catalog-viewer")),
+        ).await;
+        let mut bodies = Vec::new();
+        for response in responses {
+            assert_eq!(response.status(), StatusCode::OK, "complete catalog must admit the final row before the daemon deadline");
+            let mut body = response.into_body();
+            let tracks = native_info(&mut body).await;
+            assert!(tracks.iter().any(|track| track.codec == "mp3"));
+            bodies.push(body);
+        }
+        let worker_pid = f.app.media.stats("owned").await["pid"].as_u64().unwrap();
+        assert_eq!(f.media_calls(), 1);
+        assert_eq!(*f.page_limits.lock().unwrap(), [1000]);
+        assert_eq!(f.get("/owned/m4s?token=wrong").await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(*f.page_limits.lock().unwrap(), [1000]);
+
+        let until = tokio::time::Instant::now() + Duration::from_secs(32);
+        let drained = futures_util::future::join_all(bodies.into_iter().map(|mut body| async move {
+            let mut chunks = 0;
+            let mut last_data = tokio::time::Instant::now();
+            loop {
+                if tokio::time::Instant::now() >= until {
+                    break;
+                }
+                let read_deadline = until.min(last_data + Duration::from_secs(2));
+                match tokio::time::timeout_at(read_deadline, body.frame()).await {
+                    Err(_) if tokio::time::Instant::now() >= until => break,
+                    Err(_) => panic!("viewer stopped receiving data for two seconds"),
+                    Ok(Some(Ok(frame))) => {
+                        if let Ok(data) = frame.into_data() {
+                            assert!(!data.is_empty());
+                            let received_at = tokio::time::Instant::now();
+                            assert!(received_at.duration_since(last_data) < Duration::from_secs(2));
+                            chunks += 1;
+                            last_data = received_at;
+                        }
+                    }
+                    other => panic!("viewer closed before the renewed source deadline: {other:?}"),
+                }
+            }
+            assert!(chunks > 100, "viewer did not receive sustained media");
+            assert!(last_data.elapsed() < Duration::from_secs(2));
+            (body, chunks)
+        })).await;
+        assert_eq!(f.app.media.stats("owned").await["pid"], worker_pid);
+        assert_eq!(f.media_calls(), 1);
+        assert_eq!(*f.page_limits.lock().unwrap(), [1000, 1000]);
+        let config_requests = f.calls.lock().unwrap().iter().filter(|(path, _)| path.ends_with("/config")).count();
+        assert_eq!(config_requests, 4, "one bracketed discovery plus one shared renewal");
+
+        let manifest = playlist(&f, "/owned/index.m3u8?token=catalog-viewer").await;
+        let segment = manifest.lines().find(|line| !line.is_empty() && !line.starts_with('#')).unwrap();
+        let response = f.get(&format!("/owned/{segment}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let media = bytes(response).await;
+        assert!(!media.is_empty());
+        assert_eq!(f.get(&format!("/owned/{}", segment.replace("token=catalog-viewer", "token=wrong"))).await.status(), StatusCode::FORBIDDEN);
+        let path = f._dir.path().join("large-catalog.ts");
+        std::fs::write(&path, media).unwrap();
+        let config_before_removal = f.calls.lock().unwrap().iter().filter(|(path, _)| path.ends_with("/config")).count();
+        let pages_before_removal = f.page_limits.lock().unwrap().len();
+        // Both one-page refreshes completed their config brackets; playback
+        // beyond the original lease establishes that the second was committed.
+        assert_eq!(config_before_removal, 4);
+        assert_eq!(pages_before_removal, 2);
+        let last_good_snapshot = f.page_snapshots.lock().unwrap().last().copied().unwrap();
+        assert!(last_good_snapshot.1);
+        let removed_at = tokio::time::Instant::now();
+        f.remote.lock().unwrap().as_array_mut().unwrap().retain(|row| row["name"] != "owned");
+        let counts: Vec<_> = drained.iter().map(|(_, count)| *count).collect();
+        let decode = async {
+        let decoded_path = f._dir.path().join("large-catalog.pcm");
+        let mut decoder = tokio::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-i"])
+            .arg(&path)
+            .args(["-map", "0:a:0", "-frames:a", "10", "-f", "s16le"])
+            .arg(&decoded_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true).spawn().unwrap();
+        let status = match tokio::time::timeout(Duration::from_secs(10), decoder.wait()).await {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                decoder.kill().await.unwrap();
+                let _ = decoder.wait().await;
+                panic!("owned strict decoder timed out");
+            }
+        };
+        assert!(status.success(), "independent strict HLS audio decode failed");
+        let decoded_audio_bytes = std::fs::metadata(&decoded_path).unwrap().len();
+        assert!(decoded_audio_bytes > 0 && decoded_audio_bytes <= 1024 * 1024);
+        let decoder_pid_absent = decoder.id().is_none();
+        assert!(decoder_pid_absent, "strict decoder was not reaped");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&decoded_path).unwrap();
+        (decoded_audio_bytes, decoder_pid_absent)
+        };
+        let close = async {
+        tokio::time::timeout(Duration::from_secs(22), futures_util::future::join_all(drained.into_iter().map(|(mut body, _)| async move {
+                loop {
+                    match body.frame().await {
+                        Some(Ok(_)) => {}
+                        None => break (tokio::time::Instant::now(), false),
+                        Some(Err(_)) => break (tokio::time::Instant::now(), true),
+                    }
+                }
+            }))).await.expect("catalog removal must close every admitted viewer at shared renewal")
+        };
+        let ((decoded_audio_bytes, decoder_pid_absent), terminals) = tokio::join!(decode, close);
+        let closed_at = terminals.iter().map(|(time, _)| *time).max().unwrap();
+        // Inspect the completed removal refresh before a playback GET could discover it.
+        let config_after_removal = f.calls.lock().unwrap().iter().filter(|(path, _)| path.ends_with("/config")).count();
+        assert_eq!(config_after_removal, config_before_removal + 2);
+        assert_eq!(f.page_limits.lock().unwrap().len(), pages_before_removal + 1);
+        let absent_snapshot = f.page_snapshots.lock().unwrap().last().copied().unwrap();
+        assert!(!absent_snapshot.1 && absent_snapshot.0 >= removed_at);
+        assert!(terminals.iter().all(|(time, _)| *time >= absent_snapshot.0), "a response ended before catalog removal was observed");
+        let removal_close_delay = closed_at.checked_duration_since(absent_snapshot.0).unwrap();
+        assert!(removal_close_delay < Duration::from_secs(2));
+        // A 30-second lease starts before the at-most-five-second lookup.
+        // It cannot expire earlier than 25 seconds after that good snapshot.
+        let earliest_expiry = last_good_snapshot.0 + Duration::from_secs(25);
+        assert!(closed_at < earliest_expiry, "lease expiry must not satisfy the removal check");
+        assert_eq!(f.get("/owned/index.m3u8?token=catalog-viewer").await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(f.media_calls(), 1, "removal must not retry private media");
+        json!({"responses":8,"initial_rows":951,"private_pulls":1,"worker_pid":worker_pid,"sustained_chunks_per_response":counts,"config_requests_before_removal":config_requests,"catalog_removal_closed_all_responses":true,"strict_hls_audio_decode":true,"decoded_audio_bytes":decoded_audio_bytes,"decoder_reaped":decoder_pid_absent,"removal_refresh_config_delta":config_after_removal-config_before_removal,"removal_refresh_page_delta":1,"removal_close_delay_ms":removal_close_delay.as_millis(),"closure_before_expiry_bound_ms":earliest_expiry.duration_since(closed_at).as_millis(),"maximum_response_idle_ms":2000,"terminal_body_errors":terminals.iter().filter(|(_,error)|*error).count()})
+    }).catch_unwind().await;
+    // Assertions inside the exercise must not abandon the owner or media child.
+    f.stop().await;
+    match outcome {
+        Ok(report) => {
+            let pid = report["worker_pid"].as_u64().unwrap();
+            assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+            println!("large_catalog_qualification={report}");
+        }
+        Err(error) => std::panic::resume_unwind(error),
+    }
+}
+
+#[tokio::test]
+async fn omitted_groups_daemon_playback_keeps_viewer_token_guard_and_one_shared_pull() {
+    let hash = ring::digest::digest(&ring::digest::SHA256, b"owned-group-viewer")
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let f = Fixture::new(json!({"flussonix_token_sha256":hash})).await;
+    *f.remote.lock().unwrap() = json!([{"name":"owned","named_by":"config","static":false}]);
+    assert_eq!(
+        f.get("/owned/m4s?token=wrong").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(f.media_calls(), 0);
+    let first = f.get("/owned/m4s?token=owned-group-viewer").await;
+    let second = f.get("/owned/m4s?token=owned-group-viewer").await;
+    let statuses = (first.status(), second.status());
+    if statuses != (StatusCode::OK, StatusCode::OK) {
+        drop(first);
+        drop(second);
+        f.stop().await;
+        assert_eq!(statuses, (StatusCode::OK, StatusCode::OK));
+        return;
+    }
+    let mut first = first.into_body();
+    let mut second = second.into_body();
+    assert_eq!(
+        native_info(&mut first).await,
+        native_info(&mut second).await
+    );
+    assert_eq!(f.media_calls(), 1);
+    drop(first);
+    drop(second);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn omitted_groups_new_group_override_retires_existing_session_without_repull() {
+    use http_body_util::BodyExt;
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    *f.remote.lock().unwrap() = json!([{"name":"owned","named_by":"config","static":false}]);
+    let live = f.get("/owned/m4s?token=owned").await;
+    let status = live.status();
+    if status != StatusCode::OK {
+        drop(live);
+        f.stop().await;
+        assert_eq!(status, StatusCode::OK);
+        return;
+    }
+    let mut body = live.into_body();
+    assert!(!native_info(&mut body).await.is_empty());
+    assert_eq!(f.media_calls(), 1);
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"group_config":{"protected":{"on_play":"https://other.invalid/check"}}}),
+        )
+        .unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+        while body.frame().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    let denied = f.get("/owned/m4s?token=owned").await.status();
+    let pulls = f.media_calls();
+    drop(body);
+    f.stop().await;
+    assert!(
+        closed,
+        "nonuniform group edit must fence the existing session"
+    );
+    assert_eq!(denied, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(pulls, 1);
+}
+
+// A valid input can become ready after the old HTTP wait but before its worker
+// startup budget. The first request must receive the resulting HLS, without a
+// replacement pull or worker. This would fail with the fixed eight-second wait.
+#[tokio::test]
+async fn delayed_vendor_hls_startup_uses_remaining_configured_budget() {
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    f.app
+        .config
+        .put(
+            "templates",
+            "slow-start",
+            json!({"flussonix_input_timeout":20}),
+        )
+        .unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"slow-start"}),
+        )
+        .unwrap();
+    f.first_media_delay
+        .store(9000, std::sync::atomic::Ordering::SeqCst);
+    let began = std::time::Instant::now();
+    let response = f.get("/owned/fmp4/index.m3u8?token=slow").await;
+    let status = response.status();
+    let text = String::from_utf8(bytes(response).await.to_vec()).unwrap();
+    let elapsed = began.elapsed();
+    let stats = f.app.media.stats("owned").await;
+    let pid = stats["pid"].as_u64().unwrap();
+    let pulls = f.media_calls();
+    let ts_status = if status == StatusCode::OK {
+        f.get("/owned/index.m3u8?token=slow").await.status()
+    } else {
+        status
+    };
+    f.stop().await;
+    assert_eq!(status, StatusCode::OK, "first delayed manifest: {text}");
+    assert_eq!(ts_status, StatusCode::OK);
+    assert!(text.contains("#EXTINF:") && text.contains("#EXT-X-MAP:"));
+    assert!(elapsed >= Duration::from_secs(9) && elapsed < Duration::from_secs(12));
+    assert_eq!(pulls, 1);
+    assert_eq!(stats["restart_count"], 0);
+    assert!(stats["last_error"].is_null());
+    assert!(pid > 0 && !std::path::Path::new(&format!("/proc/{pid}")).exists());
+}
+
+#[tokio::test]
+async fn delayed_vendor_hls_startup_still_stops_on_short_worker_timeout() {
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    f.app
+        .config
+        .put(
+            "templates",
+            "short-start",
+            json!({"flussonix_input_timeout":1}),
+        )
+        .unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"short-start"}),
+        )
+        .unwrap();
+    f.first_media_delay
+        .store(9000, std::sync::atomic::Ordering::SeqCst);
+    let began = std::time::Instant::now();
+    let status = f.get("/owned/index.m3u8?token=short").await.status();
+    let elapsed = began.elapsed();
+    let stats = f.app.media.stats("owned").await;
+    let pulls = f.media_calls();
+    f.stop().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(elapsed < Duration::from_secs(3));
+    assert_eq!(stats["pid"], 0);
+    assert_eq!(stats["last_error"], "startup_timeout");
+    assert_eq!(pulls, 1);
+}
+
+#[tokio::test]
+async fn delayed_vendor_hls_startup_is_fenced_by_source_edit() {
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    f.app
+        .config
+        .put(
+            "templates",
+            "slow-start",
+            json!({"flussonix_input_timeout":20}),
+        )
+        .unwrap();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_output_template":"slow-start"}),
+        )
+        .unwrap();
+    f.first_media_delay
+        .store(9000, std::sync::atomic::Ordering::SeqCst);
+    let request = f.get("/owned/index.m3u8?token=edit");
+    let edit = async {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while f.media_calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        f.app
+            .config
+            .put("sources", &f.source, json!({"except":["owned"]}))
+            .unwrap();
+        std::time::Instant::now()
+    };
+    let (response, edited) = tokio::join!(request, edit);
+    let status = response.status();
+    let delay = edited.elapsed();
+    let pulls = f.media_calls();
+    let pid = f.app.media.stats("owned").await["pid"].clone();
+    f.stop().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(delay < Duration::from_secs(2));
+    assert_eq!(pid, 0);
+    assert_eq!(pulls, 1);
+}
+
+// A complete, valid catalog that takes longer than the old3s allowance must
+// still reach viewer authorization without admitting partial inventory/media.
+#[tokio::test]
+async fn slow_vendor_catalog_completes_before_viewer_admission() {
+    use sha2::{Digest, Sha256};
+    let f=Fixture::new(json!({"on_play":"true","flussonix_token_sha256":format!("{:x}",Sha256::digest(b"catalog-slow"))})).await;
+    f.page_delay
+        .store(3500, std::sync::atomic::Ordering::SeqCst);
+    let began = std::time::Instant::now();
+    let wrong = f.get("/owned/index.m3u8?token=wrong").await.status();
+    let elapsed = began.elapsed();
+    let before = f.media_calls();
+    let after_configs = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(p, _)| p.ends_with("/config"))
+        .count();
+    let allowed = if wrong == StatusCode::FORBIDDEN {
+        f.get("/owned/m4s?token=catalog-slow").await.status()
+    } else {
+        wrong
+    };
+    let configs_after_allowed = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(p, _)| p.ends_with("/config"))
+        .count();
+    let pages_after_allowed = f.page_limits.lock().unwrap().len();
+    let pulls = f.media_calls();
+    let pid = f.app.media.stats("owned").await["pid"]
+        .as_u64()
+        .unwrap_or(0);
+    f.stop().await;
+    assert_eq!(
+        wrong,
+        StatusCode::FORBIDDEN,
+        "valid complete catalog must reach independent viewer denial"
+    );
+    assert!(elapsed >= Duration::from_millis(3500) && elapsed < Duration::from_secs(6));
+    assert_eq!(before, 0, "denied viewer must not start private media");
+    assert_eq!(after_configs, 2, "both identity probes must complete");
+    assert_eq!(allowed, StatusCode::OK);
+    assert_eq!(
+        configs_after_allowed, after_configs,
+        "cached admission must not rediscover configuration"
+    );
+    assert_eq!(
+        pages_after_allowed, 1,
+        "cached admission must not refetch the catalog"
+    );
+    assert_eq!(pulls, 1);
+    assert!(pid == 0 || !std::path::Path::new(&format!("/proc/{pid}")).exists());
+}
+
+#[tokio::test]
+async fn slow_vendor_catalog_still_has_a_five_second_hard_deadline() {
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    f.page_delay
+        .store(7000, std::sync::atomic::Ordering::SeqCst);
+    let began = std::time::Instant::now();
+    let status = f.get("/owned/index.m3u8?token=late").await.status();
+    let elapsed = began.elapsed();
+    let pulls = f.media_calls();
+    let sessions = f.app.playback_auth.snapshots().len();
+    f.stop().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(elapsed >= Duration::from_millis(4500) && elapsed < Duration::from_millis(6500));
+    assert_eq!(pulls, 0);
+    assert_eq!(sessions, 0);
+}
+
+#[tokio::test]
+async fn slow_vendor_catalog_is_cancelled_by_runtime_shutdown() {
+    let f = Fixture::new(json!({"on_play":"true"})).await;
+    f.page_delay
+        .store(3500, std::sync::atomic::Ordering::SeqCst);
+    let app = f.app.clone();
+    let request = tokio::spawn(async move {
+        router(app)
+            .oneshot(
+                Request::builder()
+                    .uri("/owned/index.m3u8?token=shutdown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.page_limits.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let began = std::time::Instant::now();
+    f.cancel.cancel();
+    let status = tokio::time::timeout(Duration::from_secs(1), request)
+        .await
+        .unwrap()
+        .unwrap();
+    let elapsed = began.elapsed();
+    let pulls = f.media_calls();
+    f.stop().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(elapsed < Duration::from_secs(1));
+    assert_eq!(pulls, 0);
+}

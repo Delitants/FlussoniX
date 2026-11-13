@@ -1,5 +1,7 @@
 //! One private input per generation; viewer grants remain independently owned.
+mod bridge;
 mod feed;
+mod m4f_run;
 mod permission;
 mod renewal;
 use super::{AdmissionFailure, AdmittedCandidate, ModernSourceCoordinator};
@@ -14,7 +16,10 @@ use std::{
     collections::{HashMap, VecDeque},
     io,
     pin::Pin,
-    sync::{Arc, Mutex, Weak, atomic::AtomicU64},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -55,7 +60,8 @@ pub struct SharedInputs {
     owner: Arc<ModernSourceCoordinator>,
     id: Arc<()>,
     failures: Mutex<HashMap<String, FailureSlot>>,
-    workers: Mutex<Registry>,
+    workers: Arc<Mutex<Registry>>,
+    renewal: Arc<renewal::RenewalContext>,
 }
 struct Registry {
     workers: HashMap<String, Weak<Worker>>,
@@ -65,6 +71,7 @@ struct Worker {
     id: Uuid,
     registry: Arc<()>,
     owner: Arc<ModernSourceCoordinator>,
+    renewal: Weak<renewal::RenewalContext>,
     handle: super::super::SourceHandle,
     route: Mutex<super::super::CoordinatedCandidate>,
     scope: Option<super::super::ReplicaRoute>,
@@ -79,9 +86,40 @@ struct Worker {
     transport: crate::m4_ingest::flussonic::Transport,
     ts: media_queue::Channel,
     required: Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>,
+    required_issued: AtomicU64,
+    drain: Arc<SharedDrain>,
     tracks: Mutex<Option<Vec<Track>>>,
     metadata_ready: Notify,
     detected: AtomicU64,
+}
+/// Owner-only completion fence for M4F's required TS feed and child stdin.
+#[derive(Default)]
+pub(crate) struct SharedDrain {
+    written: AtomicU64,
+    complete: AtomicBool,
+    deadline: Mutex<Option<tokio::time::Instant>>,
+}
+impl SharedDrain {
+    fn start(&self) -> tokio::time::Instant {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        *self.deadline.lock().unwrap() = Some(deadline);
+        deadline
+    }
+    fn complete(&self) {
+        self.complete.store(true, Ordering::Release);
+    }
+    pub(crate) fn is_complete(&self) -> bool {
+        self.complete.load(Ordering::Acquire)
+    }
+    pub(crate) fn deadline(&self) -> Option<tokio::time::Instant> {
+        *self.deadline.lock().unwrap()
+    }
+    pub(crate) fn wrote_packager(&self, n: usize) {
+        self.written.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    fn written(&self) -> u64 {
+        self.written.load(Ordering::Relaxed)
+    }
 }
 struct Viewer {
     id: Uuid,
@@ -349,6 +387,7 @@ impl SharedInputs {
     pub(crate) fn install_idle(
         &self,
         prepared: super::super::PreparedSource,
+        predecessor: Option<&super::super::SourceHandle>,
     ) -> Result<super::super::SourceHandle, SharedFailure> {
         let registry = self.workers.lock().unwrap();
         if registry
@@ -360,18 +399,21 @@ impl SharedInputs {
             return Err(SharedFailure::Unavailable);
         }
         self.owner
-            .install(prepared)
+            .rebind_unchanged(prepared, predecessor)
             .map_err(|e| SharedFailure::Authority(AdmissionFailure::Coordination(e)))
     }
     pub fn new(owner: Arc<ModernSourceCoordinator>) -> Self {
+        let workers = Arc::new(Mutex::new(Registry {
+            workers: HashMap::new(),
+            epoch: Arc::new(()),
+        }));
+        let renewal = Arc::new(renewal::RenewalContext::new(owner.clone(), workers.clone()));
         Self {
             owner,
             id: Arc::new(()),
             failures: Mutex::new(HashMap::new()),
-            workers: Mutex::new(Registry {
-                workers: HashMap::new(),
-                epoch: Arc::new(()),
-            }),
+            workers,
+            renewal,
         }
     }
     /// Consume opaque replica admission with its selected-route fence intact.
@@ -519,6 +561,7 @@ impl SharedInputs {
                             id: Uuid::new_v4(),
                             registry: self.id.clone(),
                             owner: self.owner.clone(),
+                            renewal: Arc::downgrade(&self.renewal),
                             handle: admission.candidate().handle.clone(),
                             route: Mutex::new(copy_route(admission.candidate())),
                             scope: admission.selection().cloned(),
@@ -533,6 +576,8 @@ impl SharedInputs {
                             transport: input.transport(),
                             ts: media_queue::Channel::new(128, 8 * 1024 * 1024),
                             required: Mutex::new(None),
+                            required_issued: AtomicU64::new(0),
+                            drain: Arc::new(SharedDrain::default()),
                             tracks: Mutex::new(None),
                             metadata_ready: Notify::new(),
                             detected: AtomicU64::new(0),
@@ -587,6 +632,12 @@ impl Drop for SharedInputs {
     }
 }
 impl SharedViewer {
+    /// A terminal M4F source may still be draining accepted TS into its child.
+    /// Refuse fresh control readers while the old packaging worker is alive.
+    pub(crate) fn m4f_terminal(&self) -> bool {
+        self.inner.worker.transport == crate::m4_ingest::flussonic::Transport::M4f
+            && self.inner.worker.drain.deadline().is_some()
+    }
     pub(crate) fn counts_as_viewer(&self) -> bool {
         self.inner.admission.counts_as_viewer()
     }
@@ -644,9 +695,16 @@ impl SharedViewer {
         self.subscription(bootstrap, receiver)
     }
     pub fn subscribe_m4f(&self) -> Result<SharedSubscription, SharedFailure> {
+        if self.m4f_terminal() {
+            return Err(SharedFailure::Closed);
+        }
         self.current()?;
         let (bootstrap, receiver) = self.inner.worker.hub.signal_subscribe();
-        self.subscription(bootstrap, receiver)
+        let subscription = self.subscription(bootstrap, receiver)?;
+        if self.m4f_terminal() {
+            return Err(SharedFailure::Closed);
+        }
+        Ok(subscription)
     }
     pub fn segment(&self, name: &str) -> Result<Option<Bytes>, SharedFailure> {
         self.current()?;
@@ -667,6 +725,7 @@ impl SharedViewer {
 struct QueueWriter<'a> {
     channel: &'a media_queue::Channel,
     required: Option<tokio_util::sync::PollSender<Bytes>>,
+    required_issued: &'a AtomicU64,
 }
 impl AsyncWrite for QueueWriter<'_> {
     fn poll_write(
@@ -691,6 +750,8 @@ impl AsyncWrite for QueueWriter<'_> {
             if required.send_item(bytes.clone()).is_err() {
                 return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
             }
+            this.required_issued
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         }
         Poll::Ready(
             this.channel
@@ -706,9 +767,32 @@ impl AsyncWrite for QueueWriter<'_> {
         Poll::Ready(Ok(()))
     }
 }
+fn allow_clean_eof_reopen(
+    eofs: &mut VecDeque<std::time::Instant>,
+    now: std::time::Instant,
+    media_progressed: bool,
+) -> bool {
+    if media_progressed {
+        while eofs
+            .front()
+            .is_some_and(|old| now.saturating_duration_since(*old) >= Duration::from_secs(30))
+        {
+            eofs.pop_front();
+        }
+    }
+    if eofs.len() >= 4 {
+        return false;
+    }
+    eofs.push_back(now);
+    true
+}
+
 impl SharedInput {
     /// Run this unique input in the caller's task. Drop/abort closes the generation.
     pub async fn run(self) -> Result<(), SharedFailure> {
+        if self.worker.transport == crate::m4_ingest::flussonic::Transport::M4f {
+            return self.run_m4f_buffered().await;
+        }
         let worker = &self.worker;
         worker.current()?;
         let authority = || worker.current().is_ok();
@@ -721,18 +805,20 @@ impl SharedInput {
         let mut output = QueueWriter {
             channel: &worker.ts,
             required,
+            required_issued: &worker.required_issued,
         };
         let (tx, mut metadata) = oneshot::channel();
+        let options = crate::m4_ingest::PullOptions {
+            preserve: worker.options.preserve_subtitles,
+            detected: Some(&worker.detected),
+            conversion: worker.options.conversion.as_deref(),
+            ..Default::default()
+        };
         let pull = self.input.pull_guarded_classified(
             &mut output,
             Some(&worker.hub),
             tx,
-            crate::m4_ingest::PullOptions {
-                preserve: worker.options.preserve_subtitles,
-                detected: Some(&worker.detected),
-                conversion: worker.options.conversion.as_deref(),
-                ..Default::default()
-            },
+            options,
             &authority,
         );
         tokio::pin!(pull);
@@ -744,9 +830,9 @@ impl SharedInput {
                 _=worker.cancel.cancelled()=>return Err(SharedFailure::Closed),
                 _=worker.changed.notified()=>worker.current()?,
                 _=tick.tick()=>worker.current()?,
-                tracks = &mut metadata, if metadata_pending => {
-                    metadata_pending = false;
-                    if let Ok(tracks) = tracks {
+                tracks=&mut metadata, if metadata_pending=>{
+                    metadata_pending=false;
+                    if let Ok(tracks)=tracks {
                         worker.current()?;
                         worker.at_source_route(|_| {
                             let commit=|| {
@@ -758,14 +844,13 @@ impl SharedInput {
                         })?;
                     }
                 },
-                result = &mut pull => {
+                result=&mut pull=>{
                     worker.current()?;
-                    if let Err(kind)=result {
-                        worker.input_failed(kind,false)?;
-                        return Err(SharedFailure::Input);
-                    }
-                    return Ok(());
-                }
+                    return match result {
+                        Err(kind)=>{worker.input_failed(kind,false)?;Err(SharedFailure::Input)},
+                        Ok(())=>Ok(()),
+                    };
+                },
             }
         }
     }
@@ -839,5 +924,43 @@ impl SharedInputs {
     pub(crate) fn take_failure(&self, name: &str) -> Option<FailureObservation> {
         let slot = self.failures.lock().ok()?.get(name)?.clone();
         slot.lock().ok()?.take()
+    }
+}
+
+#[cfg(test)]
+mod rapid_eof_tests {
+    use super::*;
+
+    #[test]
+    fn media_progress_expires_only_eofs_outside_the_rolling_window() {
+        let base = std::time::Instant::now();
+        let mut eofs = VecDeque::new();
+        assert!(allow_clean_eof_reopen(&mut eofs, base, false));
+        for seconds in [20, 40, 60, 80] {
+            assert!(allow_clean_eof_reopen(
+                &mut eofs,
+                base + Duration::from_secs(seconds),
+                true
+            ));
+        }
+        assert_eq!(eofs.len(), 2);
+    }
+
+    #[test]
+    fn no_new_media_keeps_the_eof_cap_even_when_closes_are_spaced_out() {
+        let base = std::time::Instant::now();
+        let mut eofs = VecDeque::new();
+        for seconds in [0, 20, 40, 60] {
+            assert!(allow_clean_eof_reopen(
+                &mut eofs,
+                base + Duration::from_secs(seconds),
+                false
+            ));
+        }
+        assert!(!allow_clean_eof_reopen(
+            &mut eofs,
+            base + Duration::from_secs(80),
+            false
+        ));
     }
 }

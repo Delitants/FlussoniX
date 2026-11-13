@@ -23,6 +23,104 @@ fn settings() -> Settings {
 fn source() -> String {
     "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Owned fixture\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video 20000 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1\r\nm=audio 20002 RTP/AVP 97\r\na=rtpmap:97 MPEG4-GENERIC/48000/2\r\na=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;config=1190;sizeLength=13;indexLength=3;indexDeltaLength=3\r\n".into()
 }
+fn secure_settings(ssrcs: &[u32]) -> Settings {
+    Settings::input(&json!({"url":"srtp://127.0.0.1:20000","flussonix_rtp":{
+        "profile":"elementary","sdp_file":"/tmp/owned.sdp",
+        "key_file":"/tmp/owned.key","expected_ssrcs":ssrcs
+    }}))
+    .unwrap()
+    .unwrap()
+}
+fn secure_source() -> String {
+    source()
+        .replace("RTP/AVP", "RTP/SAVP")
+        .replace(
+            "a=fmtp:96 packetization-mode=1\r\n",
+            "a=fmtp:96 packetization-mode=1\r\na=ssrc:101 cname:fx-video\r\n",
+        )
+        .replace(
+            "a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;config=1190;sizeLength=13;indexLength=3;indexDeltaLength=3\r\n",
+            "a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;config=1190;sizeLength=13;indexLength=3;indexDeltaLength=3\r\na=ssrc:202 cname:fx-audio\r\n",
+        )
+}
+
+#[test]
+fn secure_sdp_identity_matches_expected_ssrcs_and_stays_out_of_private_decoder() {
+    use flussonix::direct_rtp::elementary::sdp::Session;
+    let source = secure_source();
+    let parsed = Session::parse(source.as_bytes(), &secure_settings(&[101, 202])).unwrap();
+    assert_eq!(parsed.tracks.len(), 2);
+    let private = parsed.decoder_sdp(&[30000, 30002]);
+    assert!(!private.contains("a=ssrc:"));
+    assert!(!private.contains("fx-video"));
+    assert!(!private.contains("fx-audio"));
+    assert!(
+        Session::parse(
+            source.replace("ssrc:202", "ssrc:203").as_bytes(),
+            &secure_settings(&[101, 202]),
+        )
+        .is_err()
+    );
+    let partial = source.replace("a=ssrc:202 cname:fx-audio\r\n", "");
+    let parsed = Session::parse(partial.as_bytes(), &secure_settings(&[101, 202])).unwrap();
+    assert_eq!(parsed.tracks[0].ssrc, Some(101));
+    assert_eq!(parsed.tracks[1].ssrc, Some(202));
+    let absent = partial.replace("a=ssrc:101 cname:fx-video\r\n", "");
+    let parsed = Session::parse(absent.as_bytes(), &secure_settings(&[101, 202])).unwrap();
+    assert_eq!(parsed.tracks[0].ssrc, Some(101));
+    assert_eq!(parsed.tracks[1].ssrc, Some(202));
+}
+
+#[test]
+fn secure_sdp_rejects_duplicate_or_unbounded_media_identity() {
+    use flussonix::direct_rtp::elementary::sdp::Session;
+    let valid = secure_source();
+    let settings = secure_settings(&[101, 202]);
+    for bad in [
+        valid.replace("a=ssrc:101 cname:fx-video", "a=ssrc:0 cname:fx-video"),
+        valid.replace(
+            "a=ssrc:101 cname:fx-video",
+            "a=ssrc:4294967296 cname:fx-video",
+        ),
+        valid.replace("a=ssrc:101 cname:fx-video", "a=ssrc:+101 cname:fx-video"),
+        valid.replace("a=ssrc:101 cname:fx-video", "a=ssrc:101 cname:bad/name"),
+        valid.replace(
+            "a=ssrc:101 cname:fx-video",
+            &format!("a=ssrc:101 cname:{}", "x".repeat(65)),
+        ),
+        valid.replace(
+            "a=ssrc:101 cname:fx-video\r\n",
+            "a=ssrc:101 cname:fx-video\r\na=ssrc:101 cname:fx-video\r\n",
+        ),
+        valid.replace(
+            "m=video 20000",
+            "a=ssrc:101 cname:fx-video\r\nm=video 20000",
+        ),
+        valid.clone() + "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:private\r\n",
+        valid.clone() + "a=control:rtsp://example.invalid/media\r\n",
+    ] {
+        assert!(
+            Session::parse(bad.as_bytes(), &settings).is_err(),
+            "accepted {bad}"
+        );
+    }
+    let shared_key_only = Settings::input(&json!({
+        "url":"srtp://127.0.0.1:20000",
+        "flussonix_rtp":{"profile":"elementary","sdp_file":"/tmp/owned.sdp","key_file":"/tmp/owned.key"}
+    }))
+    .unwrap()
+    .unwrap();
+    assert!(Session::parse(valid.as_bytes(), &shared_key_only).is_ok());
+    assert!(
+        Session::parse(
+            valid
+                .replace("a=ssrc:202 cname:fx-audio", "a=ssrc:101 cname:fx-audio")
+                .as_bytes(),
+            &shared_key_only,
+        )
+        .is_err()
+    );
+}
 #[test]
 fn static_sdp_accepts_supported_media_and_rejects_indirection_and_conflicting_ports() {
     use flussonix::direct_rtp::elementary::sdp::Session;

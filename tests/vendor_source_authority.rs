@@ -29,12 +29,95 @@ fn policy(config: Value) -> Policy {
     Policy::from_config(&config, &json!({})).unwrap()
 }
 
+#[test]
+fn local_paid_group_pin_rejects_forged_public_membership() {
+    let mut config = source();
+    config["group_config"] = json!({
+        "paid": {"flussonix_token_sha256": "a".repeat(64)}
+    });
+    config["flussonix_group_pins"] = json!({"music": ["paid"]});
+    let authority = authority(&config);
+    let snapshot = authority.snapshot().unwrap();
+    assert!(snapshot.candidate(&row("music", &[])).is_err());
+    assert!(snapshot.candidate(&row("music", &["public"])).is_err());
+    let candidate = snapshot.candidate(&row("music", &["paid"])).unwrap();
+    authority
+        .at_current(&candidate, |view| {
+            assert_eq!(
+                view.policy,
+                &policy(json!({
+                    "flussonix_token_sha256": "a".repeat(64)
+                }))
+            );
+        })
+        .unwrap();
+}
+
+#[test]
+fn omitted_membership_uses_only_an_exact_local_pin() {
+    let mut config = source();
+    config["prefix"] = json!("region");
+    config["group_config"] = json!({"paid":{"flussonix_token_sha256":"b".repeat(64)}});
+    config["flussonix_group_pins"] = json!({"region/news":["paid"]});
+    let a = SourceAuthority::new_modern(&config, &json!([]), std::time::Duration::from_secs(3))
+        .unwrap();
+    let snapshot = a.snapshot().unwrap();
+    let mut pinned = row("region/news", &[]);
+    pinned.groups = None;
+    let selected = snapshot.candidate(&pinned).unwrap();
+    a.at_current(&selected, |view| {
+        assert_eq!(
+            view.policy,
+            &policy(json!({"flussonix_token_sha256":"b".repeat(64)}))
+        );
+    })
+    .unwrap();
+    assert!(snapshot.candidate(&row("region/news2", &["paid"])).is_err());
+    let mut sibling = row("region/news2", &[]);
+    sibling.groups = None;
+    assert!(snapshot.candidate(&sibling).is_err());
+}
+
+#[test]
+fn group_pins_require_bounded_exact_streams_and_known_unique_groups() {
+    let mut source = source();
+    source["group_config"] = json!({"paid":{"flussonix_token_sha256":"c".repeat(64)}});
+    for pins in [
+        json!([]),
+        json!({"news/*":["paid"]}),
+        json!({"news":[]}),
+        json!({"news":["other"]}),
+        json!({"news":["paid","paid"]}),
+        json!({"news":"paid"}),
+        json!({"news":vec!["paid";65]}),
+        json!(
+            (0..129)
+                .map(|i| (format!("news/{i}"), json!(["paid"])))
+                .collect::<serde_json::Map<String, Value>>()
+        ),
+    ] {
+        source["flussonix_group_pins"] = pins;
+        assert!(SourceAuthority::new(&source, &json!([])).is_err());
+    }
+}
+
+#[test]
+fn uniform_group_policy_needs_no_pin() {
+    let mut config = source();
+    config["group_config"] = json!({"public":{"on_play":"true"}});
+    let a = authority(&config);
+    let snapshot = a.snapshot().unwrap();
+    assert!(snapshot.candidate(&row("news", &[])).is_ok());
+    assert!(snapshot.candidate(&row("news", &["public"])).is_ok());
+}
+
 // Break caught: projecting group objects drops protection or changes name binding.
 #[test]
 fn complete_source_group_projection_preserves_local_policy_and_literal_names() {
     let mut config = source();
     config["flussonix_token_sha256"] = json!("a".repeat(64));
     config["group_config"] = json!({"日本語/HD":{"name":"日本語/HD","on_play":"auth://billing"}});
+    config["flussonix_group_pins"] = json!({"region/space %2F name":["日本語/HD"]});
     let a = SourceAuthority::new(
         &config,
         &json!([{"name":"billing","url":"https://billing.invalid/check"}]),
@@ -313,12 +396,22 @@ fn unresolved_policy_and_conflicting_groups_cannot_bind_candidates() {
         Some(Failure::Policy(PolicyFailure::Unresolved))
     );
     config["group_config"] = json!({"public":{"on_play":"true"},"protected":{"on_play":"https://billing.invalid/check"}});
+    let unpinned = authority(&config);
+    assert_eq!(
+        unpinned
+            .snapshot()
+            .unwrap()
+            .candidate(&row("news", &["public"]))
+            .err(),
+        Some(Failure::MissingGroupPin)
+    );
+    config["flussonix_group_pins"] = json!({"news":["protected"]});
     let a = authority(&config);
     let s = a.snapshot().unwrap();
     for groups in [["public", "protected"], ["protected", "public"]] {
         assert_eq!(
             s.candidate(&row("news", &groups)).err(),
-            Some(Failure::Policy(PolicyFailure::Ambiguous))
+            Some(Failure::GroupPinMismatch)
         );
     }
     let c = s.candidate(&row("news", &["protected"])).unwrap();

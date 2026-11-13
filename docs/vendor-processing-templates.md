@@ -44,5 +44,7 @@ interoperability qualification. Native LB placement into vendor-backed FlussoniX
 [here](vendor-cdn-placement.md), including vendor discovery on the LB. Processing
 runs on the CDN; it is never applied on the LB. [Vendor failover](vendor-daemon-failover.md) preserves equal processing settings
 across members. [Static activation](vendor-static-activation.md) and CDN/standalone
-[RTSP/RTSPS playback](vendor-daemon-playback.md) are supported; vendor RTSP LB
-placement and SRT delivery remain pending.
+[RTSP/RTSPS playback](vendor-daemon-playback.md) are supported. Native LB
+[RTSP/RTSPS placement and HTTPS SRT destination lookup](vendor-cdn-placement.md)
+are available for compatible clients; production mixed-cluster qualification
+remains pending.

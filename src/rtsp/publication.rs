@@ -106,7 +106,7 @@ async fn admit(
         .map_err(|_| 503u16)?;
     let id = uuid::Uuid::new_v4().to_string();
     let mut grant = Grant {
-        metadata: json!({"name":name,"proto":"rtsp","ip":peer.ip().to_string(),"token":token,"qs":qs,"user_agent":r.headers.get("user-agent").map(String::as_str).unwrap_or(""),"referer":r.headers.get("referer").map(String::as_str).unwrap_or(""),"host":r.headers.get("host").map(String::as_str).unwrap_or(""),"session_id":id}),
+        metadata: json!({"name":name,"proto":"rtsp","ip":peer.ip().to_string(),"token":token,"qs":crate::publish::callback_query(qs),"user_agent":r.headers.get("user-agent").map(String::as_str).unwrap_or(""),"referer":r.headers.get("referer").map(String::as_str).unwrap_or(""),"host":r.headers.get("host").map(String::as_str).unwrap_or(""),"session_id":id}),
         started: Instant::now(),
         number: 0,
         bytes: 0,
@@ -480,23 +480,25 @@ pub(super) async fn receive<W: AsyncWrite + Unpin>(
     cancel: &CancellationToken,
     secure: bool,
     pool: Option<Arc<udp::Pool>>,
+    preauth_lease: &mut Option<super::PreAuthLease>,
 ) -> std::io::Result<()> {
     let auth = auth::Auth::new(&r.uri);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = preauth_lease.as_ref().map_or_else(
+        || Instant::now() + Duration::from_secs(30),
+        |lease| lease.started + Duration::from_secs(30),
+    );
     let mut challenges = 0;
     let mut s = loop {
         let admission = tokio::select! {biased;_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep_until(deadline)=>return Ok(()),s=admit(&r,app,peer,secure,pool.clone(),&auth)=>s};
         match admission {
             Ok(s) => break s,
             Err(401) => {
-                reply(
-                    write,
-                    cancel,
-                    401,
-                    r.cseq,
-                    &[("WWW-Authenticate", auth.challenge())],
-                )
-                .await?;
+                let headers = [("WWW-Authenticate", auth.challenge())];
+                tokio::select! {
+                    biased;
+                    _=tokio::time::sleep_until(deadline)=>return Ok(()),
+                    result=reply(write,cancel,401,r.cseq,&headers)=>result?,
+                }
                 if challenges == 2 {
                     return Ok(());
                 }
@@ -505,14 +507,25 @@ pub(super) async fn receive<W: AsyncWrite + Unpin>(
                 match event {
                     Some(Ok(Event::Request(next))) if next.method == "ANNOUNCE" => r = next,
                     Some(Ok(Event::Request(next))) => {
-                        return reply(write, cancel, 400, next.cseq, &[]).await;
+                        return tokio::select! {
+                            biased;
+                            _=tokio::time::sleep_until(deadline)=>Ok(()),
+                            result=reply(write,cancel,400,next.cseq,&[])=>result,
+                        };
                     }
                     _ => return Ok(()),
                 }
             }
-            Err(code) => return reply(write, cancel, code, r.cseq, &[]).await,
+            Err(code) => {
+                return tokio::select! {
+                    biased;
+                    _=tokio::time::sleep_until(deadline)=>Ok(()),
+                    result=reply(write,cancel,code,r.cseq,&[])=>result,
+                };
+            }
         }
     };
+    drop(preauth_lease.take());
     let result = run(&mut s, r.cseq, controls, write, app, cancel).await;
     if let Some(p) = s.publication.take() {
         let worker = p.worker.clone();

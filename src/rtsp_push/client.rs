@@ -7,8 +7,7 @@ use crate::rtp::Description;
 use bytes::Bytes;
 use std::{collections::HashMap, time::Duration};
 use tokio::{
-    io::{AsyncWriteExt, BufReader},
-    net::{TcpStream, tcp::OwnedWriteHalf},
+    io::{AsyncWriteExt, BufReader, DuplexStream, WriteHalf},
     sync::mpsc,
 };
 struct Lane {
@@ -22,7 +21,7 @@ struct Lane {
     udp: Option<super::udp::Pair>,
 }
 pub(super) struct Client {
-    write: OwnedWriteHalf,
+    write: WriteHalf<DuplexStream>,
     read: mpsc::Receiver<Result<Frame, std::io::Error>>,
     url: String,
     route: bridge::Route,
@@ -36,19 +35,15 @@ pub(super) struct Client {
 }
 impl Client {
     pub async fn publish(
-        bridge: &bridge::Bridge,
+        bridge: &mut bridge::Bridge,
         credentials: Option<Credentials>,
         description: &Description,
         stamp_origin: u64,
         readers: &mut tokio::task::JoinSet<()>,
     ) -> Result<Self, &'static str> {
-        let url = bridge.local_url();
-        let parsed = url::Url::parse(url).map_err(|_| "push_setup_failed")?;
-        let socket = TcpStream::connect(("127.0.0.1", parsed.port().ok_or("push_setup_failed")?))
-            .await
-            .map_err(|_| "push_setup_failed")?;
-        socket.set_nodelay(true).map_err(|_| "push_setup_failed")?;
-        let (read, write) = socket.into_split();
+        let url = bridge.local_url().to_owned();
+        let socket = bridge.take_client().ok_or("push_setup_failed")?;
+        let (read, write) = tokio::io::split(socket);
         let (tx, rx) = mpsc::channel(16);
         let udp_tx = tx.clone();
         readers.spawn(async move {
@@ -64,7 +59,7 @@ impl Client {
         let mut client = Self {
             write,
             read: rx,
-            url: url.into(),
+            url: url.clone(),
             route: bridge.route(),
             auth: Auth::new(credentials),
             seq: 0,
@@ -78,7 +73,7 @@ impl Client {
         client
             .exchange(
                 "ANNOUNCE",
-                url,
+                &url,
                 "Content-Type: application/sdp\r\n",
                 sdp.as_bytes(),
             )
@@ -149,7 +144,7 @@ impl Client {
             return Err("push_session_rejected");
         }
         client
-            .exchange("RECORD", url, "Range: npt=0-\r\n", &[])
+            .exchange("RECORD", &url, "Range: npt=0-\r\n", &[])
             .await?;
         // RECORD receivers need an initial common clock before media arrives.
         client.report_origin = (tokio::time::Instant::now(), std::time::SystemTime::now());

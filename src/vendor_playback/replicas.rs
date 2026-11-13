@@ -18,12 +18,19 @@ pub(super) struct Group {
     pub revision: u64,
     pub gate: Mutex<()>,
     spec: Value,
+    single: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Mode {
     Normal,
     Rotate,
     Selected,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Probe {
+    Cached,
+    Fresh,
+    FreshAfterCooldown,
 }
 pub(super) enum Candidate {
     Direct(CoordinatedCandidate),
@@ -49,21 +56,47 @@ struct GroupPlan {
     spec: Value,
     names: std::collections::HashSet<String>,
     revision: u64,
+    single: bool,
 }
 impl Runtime {
     fn capture_group(app: &App, key: &str, revision: u64) -> Result<Option<GroupPlan>, Failure> {
+        fn route_name(source: &Value) -> String {
+            source["flussonix_source_group"]
+                .as_str()
+                .map(str::to_owned)
+                // NUL cannot appear in a configured group name.
+                .unwrap_or_else(|| {
+                    format!(
+                        "\0{}",
+                        crate::config::item_key("sources", source).expect("validated source")
+                    )
+                })
+        }
         app.config.at_revision(revision, |root| {
             let Some(sources) = root["sources"].as_array() else { return Ok(None) };
-            let Some(source) = sources.iter().find(|s| crate::config::item_key("sources",s) == Some(key)) else { return Ok(None) };
-            let Some(name) = source["flussonix_source_group"].as_str() else { return Ok(None) };
-            let rows = sources.iter().filter(|s| s["flussonix_source_kind"] == "flussonic" && s["flussonix_source_group"] == name).collect::<Vec<_>>();
+            let Some(source) = sources.iter().find(|s| {
+                crate::config::item_key("sources", s) == Some(key)
+                    && s["flussonix_source_kind"] == "flussonic"
+            }) else { return Ok(None) };
+            let single = source["flussonix_source_group"].as_str().is_none();
+            let name = route_name(source);
+            let rows = sources.iter().filter(|s| {
+                s["flussonix_source_kind"] == "flussonic" && route_name(s) == name
+            }).collect::<Vec<_>>();
             let members = rows.iter().map(|s| ReplicaMember {
-                source_key: crate::config::item_key("sources",s).expect("validated source").into(),
-                content_id: s["flussonix_content_id"].as_str().expect("validated identity").into(),
+                source_key: crate::config::item_key("sources", s).expect("validated source").into(),
+                content_id: if single { "single-origin" } else {
+                    s["flussonix_content_id"].as_str().expect("validated identity")
+                }.into(),
             }).collect();
-            let spec = serde_json::json!({"sources":rows,"processing":crate::vendor_output::resolve(root,source).map_err(|_| Failure::Unavailable)?});
-            let names = sources.iter().filter_map(|s| s["flussonix_source_group"].as_str().map(str::to_owned)).collect();
-            Ok(Some(GroupPlan { name:name.into(), members, spec, names, revision }))
+            let spec = serde_json::json!({
+                "sources":rows,
+                "processing":crate::vendor_output::resolve(root, source).map_err(|_| Failure::Unavailable)?
+            });
+            let names = sources.iter()
+                .filter(|s| s["flussonix_source_kind"] == "flussonic")
+                .map(route_name).collect();
+            Ok(Some(GroupPlan { name, members, spec, names, revision, single }))
         }).ok_or(Failure::Unavailable)?
     }
     pub(super) fn group_for(
@@ -84,6 +117,7 @@ impl Runtime {
             spec,
             names,
             revision,
+            single,
         } = plan;
         let (ready, previous) = app
             .config
@@ -91,7 +125,7 @@ impl Runtime {
                 let mut groups = self.groups.lock().map_err(|_| Failure::Unavailable)?;
                 if groups.revision != revision {
                     for group in groups.groups.values() {
-                        group.selector.shutdown();
+                        group.selector.retire_for_revision();
                     }
                     groups.groups.retain(|name, _| names.contains(name));
                     groups.revision = revision;
@@ -108,8 +142,12 @@ impl Runtime {
         }
         let keys = members.iter().map(|m| m.source_key.clone()).collect();
         let selector = Arc::new(
-            ReplicaSelector::new(self.owner.clone(), &name, members)
-                .map_err(|_| Failure::Unavailable)?,
+            if single {
+                ReplicaSelector::single_origin(self.owner.clone(), &members[0].source_key)
+            } else {
+                ReplicaSelector::new(self.owner.clone(), &name, members)
+            }
+            .map_err(|_| Failure::Unavailable)?,
         );
         if let Some(old) = previous
             && old.spec == spec
@@ -122,6 +160,7 @@ impl Runtime {
             revision,
             gate: Mutex::new(()),
             spec,
+            single,
         });
         app.config
             .at_revision(revision, |_| {
@@ -156,11 +195,15 @@ impl Runtime {
             let _gate = group.gate.lock().await;
             self.process_failure(name, &group);
             let mode = self.recovery_mode(name, &group);
+            if group.single && mode == Mode::Normal {
+                // Preserve direct lookup's 404 vs policy/unavailability distinction.
+                self.direct_candidate(app, key, revision, name).await?;
+            }
             let choice = self.choose_group_locked(app, &group, name, mode).await?;
             self.selected_recovery(name, &group);
             Ok(Candidate::Replica(group.clone(), choice))
         };
-        tokio::select! {biased;_=self.closed.cancelled()=>Err(Failure::Closed),result=tokio::time::timeout(Duration::from_secs(4),work)=>result.unwrap_or(Err(Failure::Unavailable))}
+        tokio::select! {biased;_=self.closed.cancelled()=>Err(Failure::Closed),result=tokio::time::timeout(GROUP_SELECTION_BUDGET,work)=>result.unwrap_or(Err(Failure::Unavailable))}
     }
     pub(super) async fn admit_selection(
         &self,
@@ -191,7 +234,7 @@ impl Runtime {
         app: &App,
         key: &str,
         revision: u64,
-        force: bool,
+        probe: Probe,
     ) -> Result<
         (
             SourceHandle,
@@ -199,31 +242,27 @@ impl Runtime {
         ),
         Failure,
     > {
-        let slot = {
-            let mut caches = self.caches.lock().await;
-            if app.config.revision() != revision {
-                return Err(Failure::Unavailable);
-            }
-            if caches.revision != revision {
-                caches.sources.clear();
-                caches.revision = revision;
-            }
-            if caches.sources.len() >= 64 && !caches.sources.contains_key(key) {
-                return Err(Failure::Unavailable);
-            }
-            caches.sources.entry(key.into()).or_default().clone()
-        };
+        let slot = self.source_cache_slot(app, key, revision).await?;
         let mut cache = slot.lock().await;
-        if !force
-            && let (Some(handle), Some(rows)) = (&cache.handle, &cache.inventory)
+        cache.at_revision(revision);
+        if probe == Probe::Cached
+            && let (Some(handle), Some(Ok(rows))) = (&cache.handle, &cache.inventory)
             && self.owner.at_inventory_current(rows, || ()).is_ok()
         {
             return Ok((handle.clone(), Ok(rows.clone())));
         }
-        if cache.next_probe.is_some_and(|t| t > Instant::now()) {
-            return Err(Failure::Unavailable);
+        if let Some(next) = cache.next_probe.filter(|t| *t > Instant::now()) {
+            if probe != Probe::FreshAfterCooldown {
+                return Err(Failure::Unavailable);
+            }
+            // Keep the source slot while waiting so another poll cannot advance
+            // the cooldown between this read and the forced probe. Callers retain
+            // their existing selection deadlines and cancellation guards.
+            tokio::time::sleep_until(next.into()).await;
         }
         cache.next_probe = Some(Instant::now() + Duration::from_millis(500));
+        // Cancellation must not leave an earlier result available to observers.
+        cache.inventory = None;
         let _permit = self.queries.acquire().await.map_err(|_| Failure::Closed)?;
         let handle = if let Some(h) = &cache.handle
             && self.owner.handle_current(h)
@@ -235,11 +274,11 @@ impl Runtime {
                 return Err(Failure::Unavailable);
             }
             let prepared = captured
-                .prepare(Duration::from_millis(750))
+                .prepare(DISCOVERY_BUDGET)
                 .map_err(|_| Failure::Unavailable)?;
             let handle = self
                 .inputs
-                .install_idle(prepared)
+                .install_idle(prepared, cache.handle.as_ref())
                 .map_err(|_| Failure::Unavailable)?;
             cache.handle = Some(handle.clone());
             handle
@@ -259,8 +298,39 @@ impl Runtime {
             self.owner.inventory(&handle, Duration::from_secs(30)).await
         };
         let rows = rows.map(Arc::new);
-        cache.inventory = rows.as_ref().ok().cloned();
+        cache.inventory = Some(rows.clone());
         Ok((handle, rows))
+    }
+    /// Consume the latest completed result, including failure, under the same
+    /// source lock as discovery. Waiting for an in-flight refresh retains the
+    /// caller's selection deadline; the closure performs no I/O or awaits.
+    async fn with_replica_inventory<T>(
+        &self,
+        app: &App,
+        key: &str,
+        revision: u64,
+        observe: impl FnOnce(
+            &SourceHandle,
+            Result<&CoordinatedInventory, CoordinationFailure>,
+        ) -> Result<T, Failure>,
+    ) -> Result<T, Failure> {
+        let slot = {
+            let caches = self.caches.lock().await;
+            if app.config.revision() != revision || caches.revision != revision {
+                return Err(Failure::Unavailable);
+            }
+            caches
+                .sources
+                .get(key)
+                .cloned()
+                .ok_or(Failure::Unavailable)?
+        };
+        let cache = slot.lock().await;
+        let handle = cache.handle.as_ref().ok_or(Failure::Unavailable)?;
+        let rows = cache.inventory.as_ref().ok_or(Failure::Unavailable)?;
+        // The observer retains every coordinator/lease/selection publication
+        // fence. The cache lock only prevents a sibling poll replacing its turn.
+        observe(handle, rows.as_deref().map_err(|e| *e))
     }
     pub(super) async fn choose_group_locked(
         &self,
@@ -282,7 +352,7 @@ impl Runtime {
             .selector
             .begin(name)
             .map_err(|_| Failure::Unavailable)?;
-        let mut original = None;
+        let mut original = false;
         // Consult selected authority before probing alternatives. This detects
         // removal/disable/rejection even when only the private transport failed.
         let selected_key = lookup
@@ -294,12 +364,21 @@ impl Runtime {
             .iter()
             .position(|key| key == &selected_key)
             .ok_or(Failure::Unavailable)?;
-        let (handle, rows) = self
-            .replica_inventory(app, &selected_key, group.revision, mode != Mode::Normal)
+        let probe = match (mode, group.single) {
+            (Mode::Normal, _) => Probe::Cached,
+            (_, true) => Probe::FreshAfterCooldown,
+            _ => Probe::Fresh,
+        };
+        let _ = self
+            .replica_inventory(app, &selected_key, group.revision, probe)
             .await?;
-        if let Some(choice) = lookup
-            .observe_cached(&handle, rows.as_deref().map_err(|e| *e))
-            .map_err(|_| Failure::Unavailable)?
+        if let Some(choice) = self
+            .with_replica_inventory(app, &selected_key, group.revision, |handle, rows| {
+                lookup
+                    .observe_cached(handle, rows)
+                    .map_err(|_| Failure::Unavailable)
+            })
+            .await?
         {
             if mode != Mode::Rotate {
                 return Ok(choice);
@@ -307,7 +386,7 @@ impl Runtime {
             choice
                 .fail_current(false)
                 .map_err(|_| Failure::Unavailable)?;
-            original = rows.ok().map(|rows| (handle, rows));
+            original = true;
             lookup = group
                 .selector
                 .begin_after_media(name)
@@ -331,8 +410,9 @@ impl Runtime {
             queries.push(async move {
                 (
                     key.clone(),
-                    self.replica_inventory(app, key, group.revision, false)
-                        .await,
+                    self.replica_inventory(app, key, group.revision, Probe::Cached)
+                        .await
+                        .map(|_| ()),
                 )
             });
         }
@@ -341,23 +421,32 @@ impl Runtime {
             observed.insert(key, result);
         }
         while let Some(key) = lookup.next_source().map_err(|_| Failure::Unavailable)? {
-            let (handle, rows) = observed.remove(&key).ok_or(Failure::Unavailable)??;
-            if let Some(choice) = lookup
-                .observe_cached(&handle, rows.as_deref().map_err(|e| *e))
-                .map_err(|_| Failure::Unavailable)?
+            observed.remove(&key).ok_or(Failure::Unavailable)??;
+            if let Some(choice) = self
+                .with_replica_inventory(app, &key, group.revision, |handle, rows| {
+                    lookup
+                        .observe_cached(handle, rows)
+                        .map_err(|_| Failure::Unavailable)
+                })
+                .await?
             {
                 return Ok(choice);
             }
         }
         // After bounded alternatives, a freshly validated original remains a
         // legitimate last retry. No extra fetch, stale import or denial bypass.
-        if let Some((handle, rows)) = original {
-            return group
+        if original {
+            let mut retry = group
                 .selector
                 .begin(name)
-                .map_err(|_| Failure::Unavailable)?
-                .observe_cached(&handle, Ok(&rows))
-                .map_err(|_| Failure::Unavailable)?
+                .map_err(|_| Failure::Unavailable)?;
+            return self
+                .with_replica_inventory(app, &selected_key, group.revision, |handle, rows| {
+                    retry
+                        .observe_cached(handle, rows)
+                        .map_err(|_| Failure::Unavailable)
+                })
+                .await?
                 .ok_or(Failure::Unavailable);
         }
         Err(Failure::Unavailable)

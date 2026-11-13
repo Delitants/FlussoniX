@@ -149,3 +149,30 @@ fn direct_rtp_and_srtp_egress_counts_towards_load_balancer_capacity() {
     assert_eq!(v["egress_mbps"], 8.0);
     assert_eq!(v["uplink"], 0.08);
 }
+
+#[test]
+fn fxlink_application_datagrams_count_separately_and_preserve_interface_authority() {
+    let d = fixture();
+    for mode in ["process", "wan0"] {
+        let sampler =
+            Sampler::with_roots(mode, d.path().join("proc"), d.path().join("sys")).unwrap();
+        let t = Instant::now();
+        write(d.path(), 1000, 100, 80);
+        sampler.sample_with_fxlink_at(t, 0, 0, 0, 0, 0);
+        write(d.path(), 2_001_000, 200, 150);
+        sampler.sample_with_fxlink_at(t + Duration::from_secs(1), 100_000, 0, 0, 0, 400_000);
+        let v = sampler.snapshot_at(t + Duration::from_secs(1), 100.0);
+        assert_eq!(v["http_egress_mbps"], 0.8);
+        assert_eq!(v["fxlink_egress_mbps"], 3.2);
+        assert_eq!(v["fxlink_bytes_out"], 400_000);
+        assert_eq!(v["media_egress_mbps"], 4.0);
+        assert_eq!(v["egress_mbps"], if mode == "process" { 4.0 } else { 16.0 });
+        sampler.sample_with_fxlink_at(t + Duration::from_secs(2), 100_000, 0, 0, 0, 1);
+        let v = sampler.snapshot_at(t + Duration::from_secs(2), 100.0);
+        assert!(v["fxlink_egress_mbps"].is_null());
+        assert!(v["media_egress_mbps"].is_null());
+        if mode == "process" {
+            assert!(v["egress_mbps"].is_null());
+        }
+    }
+}

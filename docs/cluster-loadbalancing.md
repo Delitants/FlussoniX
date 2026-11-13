@@ -172,6 +172,49 @@ sequenceDiagram
 
 The reservation is a FlussoniX internal design choice. A compatibility route to a legacy CDN does not assume it supports this RPC.
 
+## Named HTTP balancers
+
+On an LB node, **Cluster → Balancers** configures paths such as
+`/lb0/channel/index.m3u8`, `/lb0/channel/mpegts`, `/lb0/channel/m4s` and
+`/lb0/channel/m4f`. Add registered CDN peers with public HTTP(S) delivery URLs,
+then select `bitrate`, `usage`, `clients` or `streams`. The existing native
+CPU/RAM/uplink placement still handles ordinary paths. Named requests reuse
+viewer authorization, current source ownership, peer health, CDN admission and
+short-lived tickets. A secure request only redirects to an HTTPS CDN; the LB
+does not start a media worker. CDNs authorize the viewer again and share one
+source pull when media is not local.
+
+Each server row can set a maximum output bitrate in **bit/s**. The compatibility
+comparison uses the peer's reported `output_kbit × 1024`; `40M` in the inspected
+reference parser is 41,943,040 bit/s. An omitted maximum adds no ceiling, while
+zero excludes a peer with positive output. `usage` orders by the peer's reported
+uplink percentage, independently of that ceiling. Missing or stale measurements
+make a peer ineligible. A failed native CDN reservation tries the next eligible
+peer within the existing placement deadline. Vendor CDNs use guarded telemetry
+and local capacity holds instead of the native reservation RPC.
+
+Country rules require a locally provisioned MaxMindDB Country or City file.
+Start the LB with `--geoip-db /absolute/path/country.mmdb` so the file stays the
+same across service restarts. Relative paths are accepted and resolve from the
+daemon's working directory. No database is bundled or fetched at runtime.
+A match uses the direct viewer socket address;
+untrusted `X-Forwarded-For` is ignored. When no country matches or lookup is
+unavailable, only rows explicitly marked **Default country fallback** qualify.
+Changing the balancer's GeoIP file requires an LB restart. The Cluster screen
+shows whether GeoIP is loaded and its short revision.
+
+Named routing currently supports HTTP **GET playback**. A named-path POST
+returns 405 before reading a publisher body; publish directly to a source or
+ingest node. RTSP, SRT and RTP retain their existing native placement paths.
+M4S/M4SS wire protocols are unchanged. The bundled private-schema Config API
+has `/cluster/balancers` collection and item routes, and **Config → Balancers**
+supports staged edits. The isolated TLS source→CDN→LB test checks protected
+HLS and MPEG-TS playback with independent `ffprobe` decoding, token denial,
+ticket replay rejection, HTTPS redirects and no LB worker. A vendor-owned named
+route is covered by an owned network fixture. Exact live Flussonic balancer
+response parity remains unqualified: the inspected demo endpoints returned
+501 for this collection.
+
 ## Flussonic reference behavior
 
 Flussonic `source` discovers streams from an upstream server and supports static/on-demand restreaming. Its source filters have specific behavior: `except` takes priority; `only` promotes selected streams to static while others can remain on demand. Locally configured or published streams take precedence over remote names. Multiple sources can provide alternatives. M4F is the documented default inter-server transport. Preserve these semantics in the compatibility profile. [Cluster restreaming](https://flussonic.com/doc/fms/cluster/restreaming/)
@@ -362,6 +405,8 @@ Recovery enumerates the bounded viewer cache once per reconciliation pass. The p
 Sources and peers accept an optional `flussonix_tls_ca` absolute PEM path for their HTTPS management endpoint. It covers source metadata, CDN telemetry and admission; each request still uses its configured peer key, verifies the original hostname/IP, and rejects all redirects. Custom bundles replace public roots. The daemon reuses connection pools for up to 64 trust profiles, with saved configuration revisions invalidating the cache. No peer credentials are stored as client defaults.
 
 Sources also accept `flussonix_media_tls_ca` for their effective private HTTPS endpoint, defaulting to `private_payload_url` or `api_url`. When absent, private HTTPS media uses the management CA, then public roots if neither file is configured. An explicit media bundle supports different management and LAN certificates. HLS, MPEG-TS, M4F and M4S pulls use that receiving node's local trust file; plaintext LAN pulls do not inherit a CA. Plaintext endpoints with explicit CA settings are rejected. Cluster forms expose labeled file fields, retain paths on reload and remove incompatible settings when changing to HTTP.
+
+Native peer keys are sent only to HTTPS endpoints or literal loopback IP addresses by default. This applies to discovery, inventory, load-balancer telemetry/admission and keyed HLS/M4F/M4S media pulls. An HTTP hostname or LAN IP requires `flussonix_allow_insecure_peer_http: true` on that particular native source, peer, stream or template. The admin form calls this **Plain HTTP peer-key compatibility**. Use it only on a trusted private link; a key sent over HTTP can be observed by anyone with access to that link. The setting does not affect Flussonic Cluster credentials or change M4S/M4SS wire formats. Prefer HTTPS management and private media URLs, with an appropriate trusted CA file where necessary.
 
 CA bundles must exist on every receiving node; files are not distributed from the source. Use a new CA path and save the relationship to replace active media generations when rotating trust. Existing TLS sessions do not continuously revalidate file contents or certificate expiry. Automatic certificate rotation, mutual TLS, mixed vendor clusters and production capacity remain unqualified.
 

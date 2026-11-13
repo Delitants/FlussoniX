@@ -5,12 +5,13 @@ use flussonix::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
+    net::SocketAddr,
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
 };
 use tokio_util::sync::CancellationToken;
 async fn fixture(
@@ -51,6 +52,59 @@ async fn connect(url: &str) -> BufReader<TcpStream> {
             .await
             .unwrap(),
     )
+}
+#[tokio::test]
+async fn unauthenticated_options_from_one_address_cannot_exhaust_rtsp_listener() {
+    let (_d, app, url, cancel, task) = fixture("standalone").await;
+    let endpoint = url::Url::parse(&url).unwrap();
+    let address: SocketAddr = format!(
+        "{}:{}",
+        endpoint.host_str().unwrap(),
+        endpoint.port().unwrap()
+    )
+    .parse()
+    .unwrap();
+    let mut held = Vec::new();
+    for _ in 0..256 {
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        let _ = socket
+            .write_all(format!("OPTIONS {url} RTSP/1.0\r\nCSeq: 1\r\n\r\n").as_bytes())
+            .await;
+        held.push(socket);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+    let mut independent = BufReader::new(socket.connect(address).await.unwrap());
+    assert_eq!(request(&mut independent, "OPTIONS", &url, "").await.0, 200);
+    drop(held);
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+    app.media.stop_all().await;
+}
+#[tokio::test]
+async fn authenticated_viewers_release_preauth_capacity_for_same_address() {
+    let (_d, app, url, cancel, task) = fixture("standalone").await;
+    let mut admitted = Vec::new();
+    for _ in 0..20 {
+        let mut socket = connect(&url).await;
+        assert_eq!(
+            request(
+                &mut socket,
+                "DESCRIBE",
+                &format!("{url}?token=owned-token"),
+                "Accept: application/sdp\r\n"
+            )
+            .await
+            .0,
+            200
+        );
+        admitted.push(socket);
+    }
+    drop(admitted);
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+    app.media.stop_all().await;
 }
 async fn request(
     s: &mut BufReader<TcpStream>,
@@ -791,7 +845,7 @@ async fn rtsp2_camera_default_keeps_video_decodable_with_reencoded_audio() {
 }
 async fn udp_input_roundtrip(scheme: &str, explicit_udp: bool) {
     let (_d, app, url, c, t, _pool) = fixture_udp("standalone", 2, 100.0).await;
-    let mut input = json!({"url":format!("{}?token=owned%2Dtoken", url.replacen("rtsp://", &format!("{scheme}://"), 1))});
+    let mut input = json!({"url":format!("{}?token=owned%2Dtoken", url.replacen("rtsp://", &format!("{scheme}://owned-user:owned-input-secret@"), 1))});
     if explicit_udp {
         input["rtp"] = json!("udp");
     }
@@ -803,6 +857,19 @@ async fn udp_input_roundtrip(scheme: &str, explicit_udp: bool) {
             .await
             .unwrap();
         assert_eq!(worker.stats()["input_protocol"], scheme);
+        let args = std::fs::read(format!("/proc/{}/cmdline", worker.pid())).unwrap();
+        assert!(
+            !args
+                .windows(b"owned%2Dtoken".len())
+                .any(|part| part == b"owned%2Dtoken"),
+            "RTSP source token appeared in decoder arguments"
+        );
+        assert!(
+            !args
+                .windows(b"owned-input-secret".len())
+                .any(|part| part == b"owned-input-secret"),
+            "RTSP source password appeared in decoder arguments"
+        );
         let mut path = None;
         for _ in 0..180 {
             if let Ok(data) = relay.read("roundtrip", "index.m3u8").await {

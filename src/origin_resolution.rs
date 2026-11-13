@@ -1,12 +1,39 @@
 //! Sticky source selection and publication fencing. Lives beneath server to keep authority private.
 use super::*;
-use crate::source_directory::{LookupFailure, allows, query};
+use crate::source_directory::{LookupFailure, allows, control_timeout, query};
 use futures_util::{StreamExt, stream};
 enum OriginState {
     Ready,
     Unavailable,
     Denied,
     Unresolved,
+}
+fn project_native_origin(c: &Value) -> Result<Value, ()> {
+    let source = c.as_object().ok_or(())?;
+    Ok(Value::Object(
+        crate::source_directory::NATIVE_DISCOVERY_FIELDS
+            .iter()
+            .filter_map(|field| {
+                source
+                    .get(*field)
+                    .cloned()
+                    .map(|value| ((*field).into(), value))
+            })
+            .collect(),
+    ))
+}
+fn native_callback_approved(policy: &Policy, root: &Value) -> bool {
+    policy.url.as_deref().is_none_or(|url| {
+        root["auth_backends"].as_array().is_some_and(|backends| {
+            backends
+                .iter()
+                .any(|backend| backend["url"].as_str() == Some(url))
+        })
+    })
+}
+pub(super) fn approved_mirror_policy(config: &Value, root: &Value) -> Option<Policy> {
+    let policy = Policy::from_config(config, root).ok()?;
+    native_callback_approved(&policy, root).then_some(policy)
 }
 #[derive(Clone)]
 pub(super) struct Ticket {
@@ -40,14 +67,32 @@ impl App {
         let mut mirrors = self.mirrors.lock().await;
         mirrors.retain(|_, m| m.known || m.when.elapsed() < Duration::from_secs(1));
         self.config.at_revision(revision, |_| {
+            let sources = root["sources"].as_array();
             let old = mirrors
                 .get(name)
-                .filter(|m| {
-                    root["sources"]
-                        .as_array()
-                        .is_some_and(|s| s.contains(&m.source))
-                })
+                .filter(|m| sources.is_some_and(|s| s.contains(&m.source)))
                 .cloned();
+            let eligible_fxlink = |source: &Value| {
+                crate::source_directory::native_source(source)
+                    && source["flussonix_transport"] == "fxlink"
+                    && source["drain"] != true
+                    && allows(source, name)
+            };
+            let long_haul = if let Some(m) = old.as_ref().filter(|m| m.known) {
+                eligible_fxlink(&m.source)
+                    || m.source["flussonix_source_group"].as_str().is_some()
+                        && m.config["flussonix_content_id"].as_str().is_some()
+                        && sources.is_some_and(|sources| {
+                            sources.iter().any(|source| {
+                                source != &m.source
+                                    && source["flussonix_source_group"]
+                                        == m.source["flussonix_source_group"]
+                                    && eligible_fxlink(source)
+                            })
+                        })
+            } else {
+                sources.is_some_and(|sources| sources.iter().any(eligible_fxlink))
+            };
             let ticket = Ticket {
                 id: uuid::Uuid::new_v4(),
                 done: tokio::sync::watch::channel(false).0,
@@ -56,7 +101,8 @@ impl App {
             Lookup {
                 old,
                 ticket,
-                deadline: tokio::time::Instant::now() + Duration::from_secs(3),
+                deadline: tokio::time::Instant::now()
+                    + Duration::from_secs(if long_haul { 6 } else { 3 }),
                 activation_only,
             }
         })
@@ -109,7 +155,7 @@ impl App {
     }
 
     async fn query_source(&self, source: &Value, name: &str) -> Result<Value, LookupFailure> {
-        tokio::time::timeout(Duration::from_millis(750), async {
+        tokio::time::timeout(control_timeout(source), async {
             let _permit = self
                 .source_queries
                 .acquire()
@@ -125,6 +171,11 @@ impl App {
     }
     pub(super) async fn stream_stats(&self, name: &str) -> Value {
         let mut stats = self.media.stats(name).await;
+        if let Some(config) = self.config.effective(name)
+            && let Some(index) = self.media.preferred_input(name, &config).await
+        {
+            stats["preferred_input_index"] = json!(index);
+        }
         if let Some(m) = self
             .mirrors
             .lock()
@@ -180,22 +231,53 @@ impl App {
         &self,
         source: &Value,
         name: &str,
-        mut c: Value,
+        c: Value,
         root: &Value,
     ) -> Result<Value, ()> {
+        let mut c = project_native_origin(&c)?;
         if c["name"].as_str() != Some(name) || c.get("disabled").is_some_and(|v| !v.is_boolean()) {
             return Err(());
         }
         if let Some(id) = c.get("flussonix_content_id") {
             crate::config::valid_identity(id).map_err(|_| ())?;
         }
-        Policy::from_config(&c, root).map_err(|_| ())?;
+        approved_mirror_policy(&c, root).ok_or(())?;
         let api = source["api_url"].as_str().ok_or(())?;
         let private = source["private_payload_url"].as_str().unwrap_or(api);
         let transport = source["flussonix_transport"].as_str().unwrap_or("hls");
-        let input = crate::cluster::source_input_url(private, name, transport).map_err(|_| ())?;
+        let input = if transport == "fxlink" {
+            let endpoint = source["flussonix_fxlink_url"].as_str().ok_or(())?;
+            let address = crate::fxlink::Address::parse(endpoint, false).map_err(|_| ())?;
+            if address.stream.is_some() || !crate::source_directory::native_source(source) {
+                return Err(());
+            }
+            let encoded = name
+                .split('/')
+                .map(|p| {
+                    percent_encoding::utf8_percent_encode(p, percent_encoding::NON_ALPHANUMERIC)
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            format!("{}/{encoded}", endpoint.trim_end_matches('/'))
+        } else {
+            let media_url = url::Url::parse(private).map_err(|_| ())?;
+            crate::peer_transport::require(
+                &media_url,
+                source["flussonix_allow_insecure_peer_http"] == true,
+            )
+            .map_err(|_| ())?;
+            crate::cluster::source_input_url(private, name, transport).map_err(|_| ())?
+        };
         c["inputs"] = json!([{"url":input}]);
-        if url::Url::parse(private).is_ok_and(|u| u.scheme() == "https") {
+        if transport == "fxlink" {
+            for field in ["flussonix_fxlink", "flussonix_fxlink_token"] {
+                if let Some(value) = source.get(field) {
+                    c["inputs"][0][field] = value.clone();
+                }
+            }
+        }
+        if transport == "fxlink" || url::Url::parse(private).is_ok_and(|u| u.scheme() == "https") {
             if let Some(ca) = source
                 .get("flussonix_media_tls_ca")
                 .or_else(|| source.get("flussonix_tls_ca"))
@@ -203,15 +285,14 @@ impl App {
                 c["inputs"][0]["flussonix_tls_ca"] = ca.clone();
             }
         }
-        c.as_object_mut().ok_or(())?.remove("transcoder");
-        // Output destinations belong to local configuration, never source discovery.
-        c.as_object_mut().ok_or(())?.remove("pushes");
         c["static"] = json!(false);
         c["flussonix_peer_key"] = json!(
             source["cluster_key"]
                 .as_str()
                 .unwrap_or(&self.options.peer_key)
         );
+        c["flussonix_allow_insecure_peer_http"] =
+            json!(source["flussonix_allow_insecure_peer_http"] == true);
         Ok(c)
     }
     fn publish_claimed(
@@ -233,7 +314,7 @@ impl App {
         revision: u64,
     ) -> Option<Resolved> {
         let policy = if m.known && !m.denied && m.config["disabled"] != true {
-            Policy::from_config(&m.config, root).ok()
+            approved_mirror_policy(&m.config, root)
         } else {
             None
         };
@@ -572,6 +653,235 @@ impl App {
 
 #[cfg(test)]
 mod cache_tests {
+    #[tokio::test]
+    async fn revoked_callback_backend_cancels_cached_mirror_and_cannot_republish() {
+        use super::*;
+        let d = tempfile::tempdir().unwrap();
+        let app = App::new(
+            d.path().join("config.json"),
+            d.path().join("media"),
+            Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let callback = format!("http://{}/approved", listener.local_addr().unwrap());
+        let auth_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/approved",
+                    axum::routing::get(|| async { axum::http::StatusCode::OK }),
+                ),
+            )
+            .await
+            .unwrap()
+        });
+        app.config
+            .put("sources", "origin", json!({"api_url":"http://127.0.0.1:9"}))
+            .unwrap();
+        app.config
+            .put("auth_backends", "billing", json!({"url":callback}))
+            .unwrap();
+        let root = app.config.snapshot();
+        let mirror = Mirror {
+            when: Instant::now(),
+            source: root["sources"][0].clone(),
+            config: json!({"name":"owned","static":false,"inputs":[{"url":"testsrc://"}],"on_play":callback}),
+            available: true,
+            denied: false,
+            known: true,
+            activation_only: false,
+            serial: 1,
+            switches: 0,
+        };
+        let snapshot = app
+            .publish_resolved("owned", &mirror, &root, app.config.revision())
+            .unwrap()
+            .policy;
+        app.mirrors
+            .lock()
+            .await
+            .insert("owned".into(), mirror.clone());
+        // A grant from the approved backend must be cancelled as soon as the
+        // local administrator replaces its URL, before another discovery call.
+        let AuthOutcome::Allowed(grant) = app
+            .playback_auth
+            .authorize(
+                snapshot,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "hls".into(),
+                    token: "viewer-secret".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("approved callback should authorize")
+        };
+        app.config
+            .put(
+                "auth_backends",
+                "billing",
+                json!({"url":"http://127.0.0.1:9/replaced"}),
+            )
+            .unwrap();
+        app.invalidate_sessions().await;
+        assert!(
+            grant.is_cancelled(),
+            "the active viewer retained the removed callback"
+        );
+        let changed = app.config.snapshot();
+        assert!(
+            app.publish_resolved("owned", &mirror, &changed, app.config.revision())
+                .is_none(),
+            "a cached mirror restored a callback after its local approval changed"
+        );
+        let unavailable = Mirror {
+            available: false,
+            ..mirror.clone()
+        };
+        assert!(
+            app.publish_resolved("owned", &unavailable, &changed, app.config.revision())
+                .is_none(),
+            "an unavailable upstream restored the revoked callback policy"
+        );
+        app.config.delete("auth_backends", "billing").unwrap();
+        app.invalidate_sessions().await;
+        assert!(
+            app.publish_resolved(
+                "owned",
+                &mirror,
+                &app.config.snapshot(),
+                app.config.revision()
+            )
+            .is_none(),
+            "deleting the backend must also reject the cached mirror"
+        );
+        auth_task.abort();
+    }
+
+    #[test]
+    fn discovered_callback_requires_exact_local_backend() {
+        let d = tempfile::tempdir().unwrap();
+        let app = super::App::new(
+            d.path().join("config.json"),
+            d.path().join("media"),
+            super::Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let source = serde_json::json!({"api_url":"http://127.0.0.1:19990"});
+        let callback = "https://billing.example/on_play?tenant=one";
+        let raw = serde_json::json!({"name":"owned","on_play":callback});
+        assert!(
+            app.normalize_origin(&source, "owned", raw.clone(), &app.config.snapshot())
+                .is_err()
+        );
+        let wrong = serde_json::json!({"auth_backends":[{"name":"billing","url":"https://billing.example/on_play?tenant=two"}]});
+        assert!(
+            app.normalize_origin(&source, "owned", raw.clone(), &wrong)
+                .is_err()
+        );
+        let approved = serde_json::json!({"auth_backends":[{"name":"billing","url":callback}]});
+        assert!(
+            app.normalize_origin(&source, "owned", raw, &approved)
+                .is_ok()
+        );
+        let object = serde_json::json!({"name":"owned","on_play":{"url":callback,"session_keys":["name","proto","token"],"max_sessions":2}});
+        let normalized = app
+            .normalize_origin(&source, "owned", object, &approved)
+            .unwrap();
+        assert_eq!(normalized["on_play"]["max_sessions"], 2);
+        for raw in [
+            serde_json::json!({"name":"owned","on_play":"iptv://"}),
+            serde_json::json!({"name":"owned"}),
+        ] {
+            assert!(
+                app.normalize_origin(&source, "owned", raw, &app.config.snapshot())
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn discovered_origin_cannot_install_local_outputs_or_http_opt_in() {
+        let d = tempfile::tempdir().unwrap();
+        let app = super::App::new(
+            d.path().join("config.json"),
+            d.path().join("media"),
+            super::Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let raw = serde_json::json!({
+            "name":"owned",
+            "flussonix_rtp_outputs":[{"url":"rtp://198.51.100.10:5000"}],
+            "pushes":[{"url":"srt://receiver:9000"}],
+            "transcoder":{"video":"h264"},
+            "flussonix_allow_insecure_peer_http":true
+        });
+        let normalized = app
+            .normalize_origin(
+                &serde_json::json!({"api_url":"http://127.0.0.1:19990"}),
+                "owned",
+                raw,
+                &app.config.snapshot(),
+            )
+            .unwrap();
+        for field in ["flussonix_rtp_outputs", "pushes", "transcoder"] {
+            assert!(normalized.get(field).is_none(), "remote {field} survived");
+        }
+        assert_eq!(normalized["flussonix_allow_insecure_peer_http"], false);
+    }
+
+    #[test]
+    fn local_peer_http_opt_in_controls_private_media_url() {
+        let d = tempfile::tempdir().unwrap();
+        let app = super::App::new(
+            d.path().join("config.json"),
+            d.path().join("media"),
+            super::Options {
+                admin_password: "owned-admin".into(),
+                peer_key: "owned-peer-secret".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let source = serde_json::json!({
+            "api_url":"https://source.example",
+            "private_payload_url":"http://media.example"
+        });
+        let remote = serde_json::json!({"name":"owned","flussonix_allow_insecure_peer_http":true});
+        assert!(
+            app.normalize_origin(&source, "owned", remote.clone(), &app.config.snapshot())
+                .is_err()
+        );
+        let allowed = app
+            .normalize_origin(
+                &serde_json::json!({
+                    "api_url":"https://source.example",
+                    "private_payload_url":"http://media.example",
+                    "flussonix_allow_insecure_peer_http":true
+                }),
+                "owned",
+                remote,
+                &app.config.snapshot(),
+            )
+            .unwrap();
+        assert_eq!(allowed["flussonix_allow_insecure_peer_http"], true);
+    }
+
     #[test]
     fn discovered_origin_pushes_are_never_activated_on_a_cdn() {
         let d = tempfile::tempdir().unwrap();
@@ -980,6 +1290,294 @@ mod cache_tests {
         );
         assert!(app.source_lookups.lock().await.len() < 10000);
         assert!(app.mirrors.lock().await.len() < 10000);
+    }
+}
+
+#[cfg(test)]
+mod longhaul_control_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unrelated_fxlink_group_does_not_extend_an_ordinary_mirror_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-longhaul-admin".into(),
+                peer_key: "owned-longhaul-key".into(),
+                role: "cdn".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.config
+            .put(
+                "sources",
+                "ordinary",
+                json!({"api_url":"http://127.0.0.1:19996","flussonix_transport":"m4s","flussonix_source_group":"primary"}),
+            )
+            .unwrap();
+        app.config
+            .put(
+                "sources",
+                "fx",
+                json!({"api_url":"http://127.0.0.1:19997","flussonix_transport":"fxlink","flussonix_fxlink_url":"fxlink://127.0.0.1:55000","flussonix_source_group":"unrelated"}),
+            )
+            .unwrap();
+        let root = app.config.snapshot();
+        let ordinary = root["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["hostname"] == "ordinary")
+            .unwrap()
+            .clone();
+        app.mirrors.lock().await.insert(
+            "owned".into(),
+            Mirror {
+                when: Instant::now() - Duration::from_secs(11),
+                source: ordinary,
+                config: json!({"name":"owned","flussonix_content_id":"owned-content"}),
+                available: false,
+                denied: false,
+                known: true,
+                activation_only: false,
+                serial: 1,
+                switches: 0,
+            },
+        );
+        let lookup = app
+            .begin_lookup("owned", &root, app.config.revision(), false)
+            .await
+            .unwrap();
+        assert!(
+            lookup.deadline.duration_since(tokio::time::Instant::now()) < Duration::from_secs(4)
+        );
+        drop(lookup);
+
+        app.config
+            .put("sources", "fx", json!({"flussonix_source_group":"primary"}))
+            .unwrap();
+        let root = app.config.snapshot();
+        let eligible = app
+            .begin_lookup("owned", &root, app.config.revision(), false)
+            .await
+            .unwrap();
+        assert!(
+            eligible
+                .deadline
+                .duration_since(tokio::time::Instant::now())
+                > Duration::from_secs(5)
+        );
+        drop(eligible);
+        app.media.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn fxlink_failover_can_select_a_backup_after_a_slow_control_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-longhaul-admin".into(),
+                peer_key: "owned-longhaul-key".into(),
+                role: "cdn".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let slow_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_url = format!("http://{}", slow_listener.local_addr().unwrap());
+        let slow_router = axum::Router::new().route(
+            "/flussonix/api/v1/stream/owned",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                assert_eq!(headers["x-flussonix-peer"], "owned-longhaul-key");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                axum::Json(json!({"name":"owned"}))
+            }),
+        );
+        let slow_server =
+            tokio::spawn(async move { axum::serve(slow_listener, slow_router).await.unwrap() });
+        let backup_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backup_url = format!("http://{}", backup_listener.local_addr().unwrap());
+        let backup_router = axum::Router::new().route(
+            "/flussonix/api/v1/stream/owned",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                assert_eq!(headers["x-flussonix-peer"], "owned-longhaul-key");
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+                axum::Json(
+                    json!({"name":"owned","disabled":false,"flussonix_content_id":"owned-content"}),
+                )
+            }),
+        );
+        let backup_server =
+            tokio::spawn(async move { axum::serve(backup_listener, backup_router).await.unwrap() });
+        for (name, url, port) in [("slow", slow_url, 55001), ("backup", backup_url, 55002)] {
+            app.config
+                .put(
+                    "sources",
+                    name,
+                    json!({"api_url":url,"flussonix_transport":"fxlink","flussonix_fxlink_url":format!("fxlink://127.0.0.1:{port}"),"flussonix_source_group":"owned-group"}),
+                )
+                .unwrap();
+        }
+        let root = app.config.snapshot();
+        let slow_source = root["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["hostname"] == "slow")
+            .unwrap()
+            .clone();
+        app.mirrors.lock().await.insert(
+            "owned".into(),
+            Mirror {
+                when: Instant::now() - Duration::from_secs(11),
+                source: slow_source,
+                config: json!({"name":"owned","flussonix_content_id":"owned-content","static":false,"inputs":[{"url":"fxlink://127.0.0.1:55001/owned"}]}),
+                available: false,
+                denied: false,
+                known: true,
+                activation_only: false,
+                serial: 1,
+                switches: 0,
+            },
+        );
+        let started = tokio::time::Instant::now();
+        let resolved = tokio::time::timeout(Duration::from_secs(8), app.resolve("owned"))
+            .await
+            .expect("lookup must stay bounded")
+            .expect("backup must be selected");
+        let elapsed = started.elapsed();
+        assert!(elapsed > Duration::from_secs(3));
+        assert_eq!(resolved.config["flussonix_content_id"], "owned-content");
+        assert_eq!(
+            app.mirrors.lock().await["owned"].source["hostname"],
+            "backup"
+        );
+        slow_server.abort();
+        backup_server.abort();
+        let _ = slow_server.await;
+        let _ = backup_server.await;
+        app.media.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn fxlink_source_admission_and_selection_allow_bounded_long_haul_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-longhaul-admin".into(),
+                peer_key: "owned-longhaul-key".into(),
+                role: "cdn".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = axum::Router::new().route(
+            "/flussonix/api/v1/stream/owned",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                assert_eq!(headers["x-flussonix-peer"], "owned-longhaul-key");
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                axum::Json(json!({"name":"owned","disabled":false}))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        app.config
+            .put(
+                "sources",
+                "owned",
+                json!({"api_url":url.clone(),"flussonix_transport":"fxlink","flussonix_fxlink_url":"fxlink://127.0.0.1:55000"}),
+            )
+            .unwrap();
+        let root = app.config.snapshot();
+        let source = &root["sources"][0];
+        assert_eq!(
+            app.query_source(source, "owned").await,
+            Ok(json!({"name":"owned","disabled":false}))
+        );
+        let lookup = app
+            .begin_lookup("owned", &root, app.config.revision(), false)
+            .await
+            .unwrap();
+        assert!(
+            lookup.deadline.duration_since(tokio::time::Instant::now()) > Duration::from_secs(5)
+        );
+        drop(lookup);
+        let mut ordinary = source.clone();
+        ordinary["flussonix_transport"] = json!("m4s");
+        ordinary
+            .as_object_mut()
+            .unwrap()
+            .remove("flussonix_fxlink_url");
+        assert_eq!(
+            app.query_source(&ordinary, "owned").await,
+            Err(LookupFailure::Unavailable)
+        );
+        app.config
+            .put(
+                "sources",
+                "owned",
+                json!({"api_url":url,"flussonix_transport":"m4s","flussonix_fxlink_url":null}),
+            )
+            .unwrap();
+        let root = app.config.snapshot();
+        let ordinary_lookup = app
+            .begin_lookup("owned", &root, app.config.revision(), false)
+            .await
+            .unwrap();
+        let remaining = ordinary_lookup
+            .deadline
+            .duration_since(tokio::time::Instant::now());
+        assert!(remaining > Duration::from_secs(2) && remaining < Duration::from_secs(4));
+        drop(ordinary_lookup);
+        app.config
+            .put(
+                "sources",
+                "owned",
+                json!({"flussonix_transport":"fxlink","flussonix_fxlink_url":"fxlink://127.0.0.1:55000","drain":true}),
+            )
+            .unwrap();
+        let root = app.config.snapshot();
+        let draining = app
+            .begin_lookup("owned", &root, app.config.revision(), false)
+            .await
+            .unwrap();
+        assert!(
+            draining
+                .deadline
+                .duration_since(tokio::time::Instant::now())
+                < Duration::from_secs(4)
+        );
+        drop(draining);
+        app.config
+            .put(
+                "sources",
+                "owned",
+                json!({"drain":false,"except":["owned"]}),
+            )
+            .unwrap();
+        let root = app.config.snapshot();
+        let excluded = app
+            .begin_lookup("owned", &root, app.config.revision(), false)
+            .await
+            .unwrap();
+        assert!(
+            excluded
+                .deadline
+                .duration_since(tokio::time::Instant::now())
+                < Duration::from_secs(4)
+        );
+        drop(excluded);
+        server.abort();
+        let _ = server.await;
+        app.media.stop_all().await;
     }
 }
 

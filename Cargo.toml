@@ -4,11 +4,27 @@ version = "0.10.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Independent live media server and cluster control plane"
+license = "Apache-2.0"
+
+[workspace]
+members = [".", "vendor/quinn-proto"]
+default-members = ["."]
+resolver = "3"
+
+[patch.crates-io]
+quinn-proto = { path = "vendor/quinn-proto" }
 
 [dependencies]
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+reed-solomon-erasure = { version = "6.0.0", default-features = false, features = ["std"] }
 webpki-roots = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime", "with-uuid-1", "with-serde_json-1", "with-chrono-0_4"] }
+tokio-postgres-rustls = { version = "0.14.0", default-features = false, features = ["ring"] }
 axum = { version = "0.8", features = ["macros"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -16,6 +32,7 @@ bytes = "1"
 http-body = "1"
 base64 = "0.22"
 sha2 = "0.10"
+maxminddb = { version = "0.27.2", default-features = false }
 ring = { version = "0.17", default-features = false }
 md-5 = "0.10.6"
 subtle = "2"
@@ -34,10 +51,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libloading = "0.8.9"
 libc = "0.2"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
-tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
 [profile.release]

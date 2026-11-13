@@ -35,7 +35,7 @@ impl ObservedInventory {
 
 /// Opt-in modern endpoint and refresh budget. No legacy endpoint fallback,
 /// proxies, redirects, background refresh or daemon configuration integration.
-/// The privileged key and prepared TLS client remain private and nonserializable.
+/// The privileged key and prepared TLS trust remain private and nonserializable.
 pub struct ModernInventoryClient {
     transport: InventoryClient,
     config: Url,
@@ -150,7 +150,7 @@ impl ModernInventoryClient {
                 let mut query = url.query_pairs_mut();
                 query
                     .append_pair("select", SELECT)
-                    .append_pair("limit", "100");
+                    .append_pair("limit", "1000");
                 if let Some(cursor) = &cursor {
                     query.append_pair("cursor", cursor);
                 }

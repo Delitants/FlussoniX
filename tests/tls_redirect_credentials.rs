@@ -348,6 +348,13 @@ async fn basic_and_digest_redirected_inputs_produce_independently_decoded_hls() 
         let result = std::panic::AssertUnwindSafe(async {
             let cfg = json!({"inputs":[{"url":camera.url,"flussonix_tls_ca":camera.cert.ca}]});
             let worker = relay.ensure("relay", &cfg).await.unwrap();
+            let args = std::fs::read(format!("/proc/{}/cmdline", worker.pid())).unwrap();
+            assert!(
+                !args
+                    .windows(b"owned-password".len())
+                    .any(|part| part == b"owned-password"),
+                "authenticated RTSPS input password appeared in decoder arguments"
+            );
             let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
             let file = loop {
                 if let Ok(bytes) = relay.read("relay", "index.m3u8").await {
