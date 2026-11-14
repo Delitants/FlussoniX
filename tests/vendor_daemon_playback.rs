@@ -918,6 +918,25 @@ async fn long_lived_daemon_response_is_renewed_past_original_source_deadline() {
     f.stop().await;
 }
 #[tokio::test]
+async fn already_cancelled_vendor_owner_is_clean_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = App::new(
+        dir.path().join("config.json"),
+        dir.path().join("media"),
+        Options {
+            admin_password: "owned-admin-key".into(),
+            peer_key: "owned-native-peer-key".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    assert_eq!(app.run_vendor_playback(cancel).await, Ok(()));
+}
+
+#[tokio::test]
 async fn owner_is_single_use_and_abort_cancels_playback() {
     use http_body_util::BodyExt;
     let f = Fixture::new(json!({"on_play":"true"})).await;

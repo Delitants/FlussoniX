@@ -9,7 +9,7 @@ mod rtsp;
 mod srt;
 mod srt_lookup;
 use crate::{
-    media::{SharedHlsOptions, SharedHlsSessions},
+    media::{HlsSessionFailure, SharedHlsOptions, SharedHlsSessions},
     server::App,
     source_directory::{
         allows,
@@ -164,6 +164,14 @@ impl Drop for RunGuard<'_> {
     }
 }
 impl Runtime {
+    fn owner_result(result: Result<(), HlsSessionFailure>) -> Result<(), String> {
+        match result {
+            // Closed is returned only when cancellation wins before the
+            // shared-session owner is installed. That is a clean daemon stop.
+            Ok(()) | Err(HlsSessionFailure::Closed) => Ok(()),
+            Err(_) => Err("vendor playback owner unavailable".into()),
+        }
+    }
     async fn source_cache_slot(
         &self,
         app: &App,
@@ -234,9 +242,9 @@ impl Runtime {
         let activation = self.poll_static_catalogs(app, cancel.clone());
         tokio::pin!(sessions, recovery, activation);
         tokio::select! {
-            result=&mut sessions=>{cancel.cancel();tokio::join!(recovery,activation);result.map_err(|_|"vendor playback owner unavailable".into())},
-            _=&mut recovery=>{cancel.cancel();let(result,_)=tokio::join!(sessions,activation);result.map_err(|_|"vendor playback owner unavailable".into())},
-            _=&mut activation=>{cancel.cancel();let(result,_)=tokio::join!(sessions,recovery);result.map_err(|_|"vendor playback owner unavailable".into())},
+            result=&mut sessions=>{cancel.cancel();tokio::join!(recovery,activation);Self::owner_result(result)},
+            _=&mut recovery=>{cancel.cancel();let(result,_)=tokio::join!(sessions,activation);Self::owner_result(result)},
+            _=&mut activation=>{cancel.cancel();let(result,_)=tokio::join!(sessions,recovery);Self::owner_result(result)},
         }
     }
     fn running(&self) -> bool {
