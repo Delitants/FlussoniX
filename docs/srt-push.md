@@ -25,18 +25,27 @@ customization remain pending. Documented vendor zero/unlimited timeouts are
 rejected in this bounded profile. Unknown and duplicate query keys are rejected.
 Validation errors contain no destination secrets.
 
-Each enabled destination owns one copy-only FFmpeg remux process, using the
-configured independent FFmpeg with libsrt support. It receives the worker's
-bounded live TS broadcast, maps every retained track and never encodes again.
+Each enabled destination owns one copy-only FFmpeg remux process and a native
+libsrt caller. FFmpeg reads and writes only local MPEG-TS pipes; FlussoniX sets
+the SRT stream ID and passphrase on the native socket, so neither appears in
+FFmpeg's command line. A system libsrt 1.5 library is required. The remuxer
+receives the worker's bounded live TS broadcast, maps every retained track and
+never encodes again.
 HEVC, AAC, MPEG Layer II and MP3 use the worker's existing output profiles.
 Separate subtitle tracks follow **Original subtitle tracks**; SRT does not
 convert them to WebVTT. Embedded captions follow the worker's copy/encode
 behavior. Exact TS byte/PID preservation is not promised after remuxing.
 
 A slow consumer cannot block the shared worker. Broadcast overflow, a failed
-process or absent output progress kills and reaps that destination before
-retrying. Initial progress has the connection timeout plus five seconds for
-probing; after first output, progress must continue within ten seconds. Stop, source closure, stream disable/delete or configuration
+process, a broken native caller or absent output progress kills and reaps that
+destination before retrying. DNS lookup and the subsequent SRT handshake each
+have the configured connection timeout. Resolved addresses are attempted
+together so an unreachable first address does not delay a healthy one. The
+race can briefly open more than one publisher session when a hostname resolves
+to several accepting addresses; use a single-address ingest name when the
+receiver allows only one publisher. The
+remuxer starts after the handshake and has five seconds for initial output;
+after first output, progress must continue within ten seconds. Stop, source closure, stream disable/delete or configuration
 replacement cancels and joins all destination processes. Destination edits
 replace the shared worker in this first profile and require continuous viewers
 to reconnect. Enabled pushes keep an on-demand configured stream active without
@@ -44,9 +53,10 @@ viewers; disabled pushes do not. Publication inputs still wait for a publisher.
 Push configuration is local and is not inherited by discovered CDN mirrors.
 
 `stats.flussonix_pushes` reports the destination index, sanitized host/port,
-state, current process ID, attempts, input bytes fed, output bytes muxed and a
-fixed failure code. `sending` requires FFmpeg output progress, not merely input
-queued. Neither byte count proves remote reception or SRT acknowledgement.
+state, current remux process ID, attempts, input bytes fed, output bytes accepted
+by the native SRT send queue and a fixed failure code. `sending` requires
+native SRT output progress, not merely input queued. Neither byte count proves
+remote reception or SRT acknowledgement.
 These are native diagnostics, not a claim of vendor push counter parity.
 Passphrases, query strings, stream IDs and raw FFmpeg errors are never included.
 
@@ -60,12 +70,11 @@ H.264/HEVC with AAC copy-mode CEA-608/708 and exact DVB/teletext carriage, separ
 and CEA HLS conversion alongside SRT. Broader encoder, input and cluster
 subtitle combinations remain pending. Receiver handshake logs also verify exact Stream IDs, including a 512-byte
 UTF-8 ID and punctuation-bearing passphrases from query and normal fields.
-Decoded values are passed as separate FFmpeg output options to avoid older
-versions' missing URL decode and encoded query-buffer truncation. Owned fault
+Decoded values are passed as native libsrt socket options, preserving exact
+stream IDs without placing credentials in a subprocess argument. Owned fault
 processes qualify stalls and cancellation, not media interoperability. No production
 listener is changed. Internet loss/retransmission, sustained throughput and
 all vendor SRT dialects remain unqualified.
 
-FFmpeg's [protocol reference](https://ffmpeg.org/ffmpeg-protocols.html#srt)
-uses microseconds for latency and milliseconds for connection timeout; the
-adapter translates the public milliseconds/seconds units explicitly.
+The native caller converts the public connection timeout in seconds to
+libsrt's millisecond option.

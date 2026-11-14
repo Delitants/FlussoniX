@@ -7,6 +7,7 @@ pub(super) const FIELDS: &[&str] = &[
     "on_play",
     "flussonix_token_sha256",
     "group_config",
+    "flussonix_group_pins",
     "flussonix_output_template",
     "flussonix_content_id",
 ];
@@ -35,6 +36,7 @@ pub(super) fn validate(source: &Value, root: &Value) -> Result<(), String> {
             "on_play",
             "flussonix_token_sha256",
             "group_config",
+            "flussonix_group_pins",
             "flussonix_output_template",
             "flussonix_content_id",
         ]
@@ -80,12 +82,36 @@ pub(super) fn validate_groups(root: &Value) -> Result<(), String> {
     let invalid = || {
         "vendor replica group requires equal content identity, namespace, exclusions, processing and uniform viewer policy".to_owned()
     };
+    let pin_sets = |source: &Value| -> Result<
+        std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+        String,
+    > {
+        let Some(pins) = source.get("flussonix_group_pins") else {
+            return Ok(Default::default());
+        };
+        pins.as_object()
+            .ok_or_else(invalid)?
+            .iter()
+            .map(|(stream, names)| {
+                Ok((
+                    stream.clone(),
+                    names
+                        .as_array()
+                        .ok_or_else(invalid)?
+                        .iter()
+                        .map(|name| name.as_str().map(str::to_owned).ok_or_else(invalid))
+                        .collect::<Result<_, _>>()?,
+                ))
+            })
+            .collect()
+    };
     for members in groups.values().filter(|members| {
         members
             .iter()
             .any(|s| s["flussonix_source_kind"] == "flussonic")
     }) {
         let first = members[0];
+        let expected_pins = pin_sets(first)?;
         let filters = |source: &Value| {
             let mut excluded: Vec<_> = source["except"]
                 .as_array()
@@ -105,6 +131,7 @@ pub(super) fn validate_groups(root: &Value) -> Result<(), String> {
                 || source["flussonix_content_id"] != first["flussonix_content_id"]
                 || filters(source) != filters(first)
                 || crate::vendor_output::resolve(root, source)? != processing
+                || pin_sets(source)? != expected_pins
             {
                 return Err(invalid());
             }

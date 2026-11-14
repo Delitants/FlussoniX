@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use tokio::sync::oneshot;
 
 type Hold = Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>;
-struct Auth {
+pub(super) struct Auth {
     url: String,
     hold: Arc<Mutex<Hold>>,
-    calls: Arc<AtomicUsize>,
+    pub(super) calls: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Auth {
@@ -16,7 +16,13 @@ impl Drop for Auth {
     }
 }
 impl Auth {
-    async fn start() -> Self {
+    pub(super) async fn start() -> Self {
+        Self::start_for(Some(NAME)).await
+    }
+    pub(super) async fn start_any() -> Self {
+        Self::start_for(None).await
+    }
+    async fn start_for(expected_name: Option<&'static str>) -> Self {
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/auth", tcp.local_addr().unwrap());
         let hold: Arc<Mutex<Hold>> = Arc::new(Mutex::new(None));
@@ -30,7 +36,9 @@ impl Auth {
                     assert!(!headers.contains_key("cluster-auth-key"));
                     assert!(!headers.contains_key("authorization"));
                     assert!(!headers.contains_key("x-flussonix-peer"));
-                    assert_eq!(query.get("name").unwrap(), NAME);
+                    if let Some(expected) = expected_name {
+                        assert_eq!(query.get("name").unwrap(), expected);
+                    }
                     let held = h.lock().unwrap().take();
                     if let Some((entered, released)) = held {
                         entered.send(()).unwrap();
@@ -58,13 +66,13 @@ impl Auth {
             task,
         }
     }
-    fn pause(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pub(super) fn pause(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (tx, rx) = oneshot::channel();
         let (release, released) = oneshot::channel();
         assert!(self.hold.lock().unwrap().replace((tx, released)).is_none());
         (rx, release)
     }
-    fn configure(&self, f: &Fixture) {
+    pub(super) fn configure(&self, f: &Fixture) {
         for origin in &f.origins {
             f.config
                 .put(

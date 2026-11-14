@@ -389,6 +389,13 @@ async fn unsupported_paths_and_empty_duplicate_fields_have_deterministic_fallbac
     names(
         &app,
         "streams",
+        &"x".repeat(257),
+        &["alpha", "beta", "delta", "gamma"],
+    )
+    .await;
+    names(
+        &app,
+        "streams",
         "unknown,-position,position",
         &["delta", "gamma", "alpha", "beta"],
     )
@@ -477,7 +484,7 @@ async fn sorting_preserves_auth_config_and_other_collections() {
             .iter()
             .map(|row| row["name"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["alpha", "beta", "delta", "gamma"]
+        ["beta", "alpha", "delta", "gamma"]
     );
     for host in ["a", "z"] {
         app.config

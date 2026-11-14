@@ -2,7 +2,329 @@ import {test,expect} from '@playwright/test';
 import dgram from 'node:dgram';
 import fs from 'node:fs';
 import path from 'node:path';
+
 test.beforeEach(async({page})=>{await page.goto('/admin/');await page.getByLabel('Username').fill(process.env.FLUSSONIX_ADMIN_USER||'admin');await page.getByLabel('Password',{exact:true}).fill(process.env.FLUSSONIX_ADMIN_PASSWORD!);await page.getByRole('button',{name:'Sign in',exact:true}).click();await expect(page.getByRole('heading',{name:'Streams',exact:true})).toBeVisible();});
+test('named balancers have friendly direct and staged Cluster controls',async({page})=>{
+ let balancers:any[]=[];
+ const peer={hostname:'ui-test-cdn',api_url:'https://api.example.invalid',public_payload_url:'https://cdn.example.invalid'};
+ await page.route('**/streamer/api/v3/config?full=true',async route=>{
+  await route.fulfill({status:200,json:{streams:[],templates:[],sources:[],peers:[peer],auth_backends:[],balancers}});
+ });
+ await page.route('**/streamer/api/v3/cluster/balancers**',async route=>{
+  const url=new URL(route.request().url()),method=route.request().method();
+  if(method==='GET')return route.fulfill({status:200,json:{balancers}});
+  const name=decodeURIComponent(url.pathname.split('/').at(-1)||'');
+  if(method==='PUT'){const row=route.request().postDataJSON();delete row.$reset;
+   balancers=[...balancers.filter(item=>item.name!==name),{...row,name}];
+   return route.fulfill({status:200,json:{...row,name}})}
+  if(method==='DELETE'){balancers=balancers.filter(item=>item.name!==name);return route.fulfill({status:204});}
+  return route.fulfill({status:405});
+ });
+ await page.route('**/streamer/api/v3/config',async route=>{
+  if(route.request().method()==='PUT')balancers=route.request().postDataJSON().balancers||[];
+  await route.fulfill({status:200,json:{}});
+ });
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();
+ await page.getByRole('button',{name:'Balancers',exact:true}).click();
+ await page.getByRole('button',{name:'Add balancer',exact:true}).click();
+ await page.getByLabel('Balancer name',{exact:true}).fill('lb-ui');
+ await page.getByLabel('Selection mode',{exact:true}).selectOption('usage');
+ await page.getByLabel('CDN server 1',{exact:true}).selectOption('ui-test-cdn');
+ await page.getByLabel('Maximum bitrate 1',{exact:true}).fill('41943040');
+ await expect(page.getByRole('dialog').locator('textarea')).toHaveCount(0);
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ await expect(page.getByRole('cell',{name:'lb-ui',exact:true})).toBeVisible();
+ await expect(page.getByRole('row').filter({has:page.getByRole('cell',{name:'lb-ui',exact:true})})).toContainText('Lowest uplink usage');
+ await expect(page.getByRole('region',{name:'Named HTTP routing'})).toContainText('Unavailable or stale peer measurements exclude that CDN');
+ expect(balancers[0]).toMatchObject({name:'lb-ui',mode:'usage',servers:[{name:'ui-test-cdn',max_bitrate:41943040}]});
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await page.getByRole('button',{name:'Balancers',exact:true}).click();
+ const row=page.getByRole('row').filter({has:page.getByRole('cell',{name:'lb-ui',exact:true})});
+ await row.getByRole('button',{name:'Edit',exact:true}).click();
+ await page.getByLabel('Selection mode',{exact:true}).selectOption('clients');
+ await page.getByLabel('Countries 1',{exact:true}).fill('SE');
+ await page.getByLabel('Default country fallback 1',{exact:true}).check();
+ await expect(page.getByText('Country rules require a local GeoIP Country or City database configured at startup.')).toBeVisible();
+ await page.getByRole('button',{name:'Stage changes',exact:true}).click();
+ expect(balancers[0].mode).toBe('usage');
+ await page.getByRole('button',{name:'Validate',exact:true}).click();
+ await page.getByRole('button',{name:'Save & apply',exact:true}).click();
+ await expect(page.locator('.notice[role=status]')).toContainText('saved and applied');
+ expect(balancers[0]).toMatchObject({mode:'clients',servers:[{countries:['SE'],countries_default:true}]});
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();
+ await page.getByRole('button',{name:'Balancers',exact:true}).click();
+ page.once('dialog',dialog=>dialog.accept());
+ await page.getByRole('row').filter({has:page.getByRole('cell',{name:'lb-ui',exact:true})}).getByRole('button',{name:'Delete',exact:true}).click();
+ await expect(page.getByRole('cell',{name:'lb-ui',exact:true})).toHaveCount(0);
+ expect(balancers).toEqual([]);
+});
+test('view role sees balancer policy without edit actions or peer keys',async({page})=>{
+ await page.route('**/flussonix/api/v1/node',async route=>{
+  await route.fulfill({status:200,json:{name:'owned-node',role:'lb',management_role:'view'}});
+ });
+ await page.route('**/streamer/api/v3/config?full=true',async route=>{
+  await route.fulfill({status:200,json:{streams:[],templates:[],sources:[],auth_backends:[],
+   peers:[{hostname:'ui-view-cdn',api_url:'https://api.example.invalid',public_payload_url:'https://cdn.example.invalid',cluster_key:'owned-private-peer-key'}],
+   balancers:[{name:'lb-view',mode:'clients',servers:[{name:'ui-view-cdn'}]}]}});
+ });
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();
+ await page.getByRole('button',{name:'Balancers',exact:true}).click();
+ await expect(page.getByRole('cell',{name:'lb-view',exact:true})).toBeVisible();
+ await expect(page.getByRole('button',{name:'Add balancer',exact:true})).toHaveCount(0);
+ await expect(page.getByRole('button',{name:'Edit',exact:true})).toHaveCount(0);
+ await expect(page.getByRole('button',{name:'Delete',exact:true})).toHaveCount(0);
+ await expect(page.locator('main')).not.toContainText('owned-private-peer-key');
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await page.getByRole('button',{name:'Balancers',exact:true}).click();
+ await expect(page.getByRole('cell',{name:'lb-view',exact:true})).toBeVisible();
+ await expect(page.getByRole('button',{name:'Add balancer',exact:true})).toHaveCount(0);
+ await expect(page.getByRole('button',{name:'Stage changes',exact:true})).toHaveCount(0);
+ await expect(page.getByRole('button',{name:'Save & apply',exact:true})).toHaveCount(0);
+ await expect(page.getByRole('button',{name:'Edit',exact:true})).toHaveCount(0);
+ await expect(page.getByRole('button',{name:'Remove',exact:true})).toHaveCount(0);
+});
+test('named balancer form persists through the real management API',async({page,request})=>{
+ const suffix=Date.now().toString(36),peer='ui-named-cdn-'+suffix,name='ui-named-lb-'+suffix;
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const peerUrl='/streamer/api/v3/cluster/peers/'+peer,balancerUrl='/streamer/api/v3/cluster/balancers/'+name;
+ try{
+  const created=await request.put(peerUrl,{headers,data:{$reset:true,api_url:'http://127.0.0.1:1',public_payload_url:'https://cdn.example.invalid'}});
+  expect(created.ok(),await created.text()).toBeTruthy();
+  await page.getByRole('button',{name:'Cluster',exact:true}).click();
+  await expect(page.getByRole('cell',{name:peer,exact:true})).toBeVisible();
+  await page.getByRole('button',{name:'Balancers',exact:true}).click();
+  await page.getByRole('button',{name:'Add balancer',exact:true}).click();
+  await page.getByLabel('Balancer name',{exact:true}).fill(name);
+  await page.getByLabel('Selection mode',{exact:true}).selectOption('usage');
+  await page.getByLabel('CDN server 1',{exact:true}).selectOption(peer);
+  await page.getByLabel('Maximum bitrate 1',{exact:true}).fill('0');
+  await expect(page.getByRole('dialog').locator('textarea')).toHaveCount(0);
+  await page.getByRole('button',{name:'Save',exact:true}).click();
+  await expect(page.getByRole('cell',{name,exact:true})).toBeVisible();
+  let saved=await(await request.get(balancerUrl,{headers})).json();
+  expect(saved).toMatchObject({name,mode:'usage',servers:[{name:peer,max_bitrate:0}]});
+  await page.getByRole('row').filter({has:page.getByRole('cell',{name,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+  await page.getByLabel('Selection mode',{exact:true}).selectOption('clients');
+  await page.getByRole('button',{name:'Save',exact:true}).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  saved=await(await request.get(balancerUrl,{headers})).json();
+  expect(saved.mode).toBe('clients');
+ }finally{
+  await request.delete(balancerUrl,{headers});
+  await request.delete(peerUrl,{headers});
+ }
+});
+test('IPTV forms create packages and subscribers without JSON fields',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const suffix=Date.now().toString(36),channel='ui-iptv-channel-'+suffix,pack='ui-iptv-package-'+suffix,subscriber='ui-iptv-subscriber-'+suffix;
+ await request.put('/streamer/api/v3/iptv',{headers,data:{}});await request.delete('/streamer/api/v3/iptv',{headers});
+ expect((await request.put('/streamer/api/v3/streams/'+channel,{headers,data:{$reset:true,static:false,inputs:[{url:'testsrc://'}],on_play:'iptv://'}})).ok()).toBeTruthy();
+ await page.getByRole('button',{name:'Config',exact:true}).click();await page.getByRole('button',{name:'IPTV',exact:true}).click();
+ await page.getByRole('button',{name:'Enable IPTV',exact:true}).click();
+ await page.getByRole('button',{name:'Add package',exact:true}).click();await page.getByLabel('Package name',{exact:true}).fill(pack);
+ await page.getByLabel(channel,{exact:true}).check();await expect(page.getByRole('dialog').locator('textarea')).toHaveCount(0);
+ await page.getByRole('button',{name:'Save package',exact:true}).click();await expect(page.getByRole('cell',{name:pack,exact:true})).toBeVisible();
+ await page.getByRole('button',{name:'Subscribers',exact:true}).click();await page.getByRole('button',{name:'Add subscriber',exact:true}).click();
+ await page.getByLabel('Subscriber name',{exact:true}).fill(subscriber);await page.getByLabel(pack,{exact:true}).check();
+ await page.getByLabel('Maximum sessions on this node',{exact:true}).fill('2');await page.getByLabel('Expires at (UTC)',{exact:true}).fill('2099-01-01T00:00');
+ await expect(page.getByRole('dialog').locator('textarea')).toHaveCount(0);await page.getByRole('button',{name:'Save subscriber',exact:true}).click();
+ await expect(page.getByRole('dialog')).toHaveCount(0);
+ const saved=await(await request.get('/streamer/api/v3/iptv/subscribers/'+subscriber,{headers})).json();
+ expect(saved.packages).toEqual([pack]);expect(saved.max_sessions).toBe(2);expect(saved.flussonix_expires_at).toBe('2099-01-01T00:00:00Z');expect(saved.token.length).toBeGreaterThanOrEqual(32);
+ const row=page.getByRole('row').filter({has:page.getByRole('cell',{name:subscriber,exact:true})});await expect(row).toContainText('••••');await expect(row).not.toContainText(saved.token);
+ expect(await row.evaluate(element=>element.outerHTML)).not.toContain(saved.token);
+ await row.getByRole('button',{name:'Reveal token',exact:true}).click();await expect(row).toContainText(saved.token);
+ await page.getByRole('button',{name:'Packages',exact:true}).click();await page.getByRole('button',{name:'Subscribers',exact:true}).click();await expect(row).not.toContainText(saved.token);
+ await row.getByRole('button',{name:'Reveal token',exact:true}).click();await expect(row).toContainText(saved.token);
+ await row.getByRole('button',{name:'Hide token',exact:true}).click();await expect(row).not.toContainText(saved.token);
+ await page.context().grantPermissions(['clipboard-read','clipboard-write']);await row.getByRole('button',{name:'Copy token',exact:true}).click();
+ expect(await page.evaluate(()=>navigator.clipboard.readText())).toBe(saved.token);
+ await row.getByRole('button',{name:'Copy playlist link',exact:true}).click();expect(await page.evaluate(()=>navigator.clipboard.readText())).toContain('/tv/playlists/'+subscriber+'?token='+encodeURIComponent(saved.token));
+ await expect(page.getByText('Limits apply separately on each node.')).toBeVisible();
+ await row.getByRole('button',{name:'Edit',exact:true}).click();await expect(page.getByLabel('Subscriber token',{exact:true})).toHaveValue('');
+ await page.getByRole('button',{name:'Generate new token on save',exact:true}).click();await page.getByRole('button',{name:'Save subscriber',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+ const rotated=await(await request.get('/streamer/api/v3/iptv/subscribers/'+subscriber,{headers})).json();expect(rotated.token).not.toBe(saved.token);
+ page.once('dialog',dialog=>dialog.accept());await row.getByRole('button',{name:'Delete',exact:true}).click();await expect(row).toHaveCount(0);await expect(page.getByRole('status')).toContainText('viewers');
+});
+test('IPTV HA keeps unsaved package fields after a revision conflict',async({page})=>{
+ await page.route('**/flussonix/api/v1/node',async route=>{
+  const response=await route.fetch();const node=await response.json();
+  node.iptv_cluster={mode:'authority',backend:'postgresql',ready:true,database_ready:true,catalog_revision:1,
+   capacity:{active_sessions:0,max_sessions:100000,operation_count:0,max_operations:200000},export_healthy:false};
+  await route.fulfill({response,json:node});
+ });
+ let revision=1,attempts=0;const headersSeen:string[]=[];let packages:{name:string;channels:string[]}[]=[];
+ await page.route('**/streamer/api/v3/iptv**',async route=>{
+  const request=route.request(),url=new URL(request.url()),method=request.method();
+  const etag=`"${revision}"`;const base='/streamer/api/v3/iptv';
+  if(url.pathname===base&&method==='GET')return route.fulfill({status:200,headers:{etag},json:{}});
+  if(url.pathname===base+'/packages'&&method==='GET')return route.fulfill({status:200,headers:{etag},json:{packages}});
+  if(url.pathname===base+'/subscribers'&&method==='GET')return route.fulfill({status:200,headers:{etag},json:{subscribers:[]}});
+  if(url.pathname.startsWith(base+'/packages/')&&method==='PUT'){
+   headersSeen.push(request.headers()['if-match']||'');attempts++;
+   if(attempts===1){revision=2;return route.fulfill({status:412,headers:{etag:'"2"'},json:{errors:[{message:'IPTV catalog revision changed'}]}})}
+   if(request.headers()['if-match']!==`"${revision}"`)return route.fulfill({status:428,json:{errors:[{message:'IPTV catalog revision required'}]}});
+   const name=decodeURIComponent(url.pathname.slice((base+'/packages/').length));const body=request.postDataJSON();
+   packages=[{name,channels:body.channels}];revision++;
+   return route.fulfill({status:200,headers:{etag:`"${revision}"`},json:packages[0]});
+  }
+  return route.fulfill({status:404,json:{errors:[{message:'unknown IPTV request'}]}});
+ });
+ await page.getByRole('button',{name:'Config',exact:true}).click();await page.getByRole('button',{name:'IPTV',exact:true}).click();
+ await expect(page.getByText('Local export needs attention')).toBeVisible();
+ await page.getByRole('button',{name:'Add package',exact:true}).click();await page.getByLabel('Package name',{exact:true}).fill('kept-package');
+ await page.getByRole('button',{name:'Save package',exact:true}).click();
+ await expect(page.getByRole('dialog')).toBeVisible();await expect(page.getByLabel('Package name',{exact:true})).toHaveValue('kept-package');
+ await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Catalog changed');
+ await page.getByRole('button',{name:'Refresh catalog to retry',exact:true}).click();
+ await page.getByRole('button',{name:'Save package',exact:true}).click();
+ await expect(page.getByRole('dialog')).toHaveCount(0);await expect(page.getByRole('cell',{name:'kept-package',exact:true})).toBeVisible();
+ expect(headersSeen).toEqual(['"1"','"2"']);
+});
+test('IPTV HA live authority protects a concurrent editor and masks view-role tokens',async({page,request,browser})=>{
+ test.skip(!process.env.FLUSSONIX_HA_UI_READY_FILE,'Separate owned PostgreSQL authority fixture is not running');
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const root=await request.get('/streamer/api/v3/iptv',{headers});expect(root.status()).toBe(404);
+ expect(root.headers()['etag']).toBe('"0"');
+ const enable=await request.put('/streamer/api/v3/iptv',{headers:{...headers,'If-Match':'"0"'},data:{}});expect(enable.ok()).toBeTruthy();
+ const channel='ha-ui-channel-'+Date.now(),pack='ha-ui-package-'+Date.now(),subscriber='ha-ui-subscriber-'+Date.now();
+ expect((await request.put('/streamer/api/v3/streams/'+channel,{headers,data:{$reset:true,static:false,inputs:[{url:'testsrc://'}]}})).ok()).toBeTruthy();
+ const created=await request.put('/streamer/api/v3/iptv/packages/'+pack,{headers:{...headers,'If-Match':'"1"'},data:{channels:[]}});
+ expect(created.ok()).toBeTruthy();expect(created.headers()['etag']).toBe('"2"');
+ await page.getByRole('button',{name:'Config',exact:true}).click();await page.getByRole('button',{name:'IPTV',exact:true}).click();
+ await expect(page.getByRole('region',{name:'IPTV HA health'})).toContainText('Catalog revision');
+ const row=page.getByRole('row').filter({has:page.getByRole('cell',{name:pack,exact:true})});
+ await row.getByRole('button',{name:'Edit',exact:true}).click();await page.getByLabel(channel,{exact:true}).check();
+ const other=await request.put('/streamer/api/v3/iptv/packages/'+pack,{headers:{...headers,'If-Match':'"2"'},data:{channels:[]}});
+ expect(other.ok()).toBeTruthy();expect(other.headers()['etag']).toBe('"3"');
+ await page.getByRole('button',{name:'Save package',exact:true}).click();
+ await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Catalog changed');
+ await expect(page.getByLabel(channel,{exact:true})).toBeChecked();
+ await page.getByRole('button',{name:'Refresh catalog to retry',exact:true}).click();
+ await page.getByRole('button',{name:'Save package',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+ const saved=await request.get('/streamer/api/v3/iptv/packages/'+pack,{headers});expect((await saved.json()).channels).toEqual([channel]);
+ const member=await request.put('/streamer/api/v3/iptv/subscribers/'+subscriber,{headers:{...headers,'If-Match':'"4"'},data:{packages:[pack],token:'ha-ui-owned-secret-token'}});
+ expect(member.ok()).toBeTruthy();
+ const view=await browser.newPage();try{
+  await view.goto('/admin/');await view.getByLabel('Username').fill(process.env.FLUSSONIX_VIEW_USER||'viewer');
+  await view.getByLabel('Password',{exact:true}).fill(process.env.FLUSSONIX_VIEW_PASSWORD!);
+  await view.getByRole('button',{name:'Sign in',exact:true}).click();
+  await view.getByRole('button',{name:'Config',exact:true}).click();await view.getByRole('button',{name:'IPTV',exact:true}).click();
+  await view.getByRole('button',{name:'Subscribers',exact:true}).click();
+  const viewerRow=view.getByRole('row').filter({has:view.getByRole('cell',{name:subscriber,exact:true})});
+  await expect(viewerRow).toContainText('[redacted]');await expect(viewerRow).not.toContainText('ha-ui-owned-secret-token');
+  await expect(viewerRow.getByRole('button',{name:'Reveal token',exact:true})).toHaveCount(0);
+ }finally{await view.close();}
+});
+test('stream editor offers the built-in IPTV viewer policy',async({page,request})=>{
+ const name='ui-iptv-policy-'+Date.now();
+ await page.getByRole('button',{name:'Add stream',exact:true}).click();await page.getByLabel('Stream name',{exact:true}).fill(name);
+ await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');await page.getByLabel('Authorization policy',{exact:true}).selectOption('iptv');
+ await expect(page.getByLabel('Callback URL',{exact:true})).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(saved.on_play.url||saved.on_play).toBe('iptv://');
+});
+test('IPTV subscriber fields validate inline and disabling explains viewer revocation',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ await request.put('/streamer/api/v3/iptv',{headers,data:{}});
+ await page.getByRole('button',{name:'Config',exact:true}).click();await page.getByRole('button',{name:'IPTV',exact:true}).click();
+ await page.getByRole('button',{name:'Subscribers',exact:true}).click();await page.getByRole('button',{name:'Add subscriber',exact:true}).click();
+ await page.getByLabel('Subscriber name',{exact:true}).fill('ui-invalid-'+Date.now());await page.getByLabel('Maximum sessions on this node',{exact:true}).fill('0');
+ await page.getByRole('button',{name:'Save subscriber',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('positive');
+ await page.getByRole('button',{name:'Cancel',exact:true}).click();
+ await page.getByRole('button',{name:'Disable IPTV',exact:true}).click();await expect(page.getByRole('status')).toContainText('viewers');
+ expect((await request.get('/streamer/api/v3/iptv',{headers})).status()).toBe(404);
+ await page.getByRole('button',{name:'Enable IPTV',exact:true}).click();
+});
+test('IPTV view role cannot reveal redacted subscriber tokens',async({page,request,browser})=>{
+ test.skip(!process.env.FLUSSONIX_VIEW_PASSWORD,'Owned fixture has no view-role account');
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const pack='ui-view-package-'+Date.now(),subscriber='ui-view-subscriber-'+Date.now();
+ await request.put('/streamer/api/v3/iptv',{headers,data:{}});await request.put('/streamer/api/v3/iptv/packages/'+pack,{headers,data:{channels:[]}});
+ await request.put('/streamer/api/v3/iptv/subscribers/'+subscriber,{headers,data:{packages:[pack],token:'ui-view-secret-'+Date.now()}});
+ const view=await browser.newPage();try{
+  await view.goto('/admin/');await view.getByLabel('Username').fill(process.env.FLUSSONIX_VIEW_USER||'viewer');await view.getByLabel('Password',{exact:true}).fill(process.env.FLUSSONIX_VIEW_PASSWORD!);
+  await view.getByRole('button',{name:'Sign in',exact:true}).click();await view.getByRole('button',{name:'Config',exact:true}).click();await view.getByRole('button',{name:'IPTV',exact:true}).click();
+  await view.getByRole('button',{name:'Subscribers',exact:true}).click();const row=view.getByRole('row').filter({has:view.getByRole('cell',{name:subscriber,exact:true})});
+  await expect(row).toContainText('[redacted]');await expect(row.getByRole('button',{name:'Reveal token',exact:true})).toHaveCount(0);await expect(row.getByRole('button',{name:'Copy token',exact:true})).toHaveCount(0);await expect(row.getByRole('button',{name:'Edit',exact:true})).toHaveCount(0);
+ }finally{await view.close();}
+});
+test('IPTV playlist action is absent without a configured public origin',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const pack='ui-no-origin-package-'+Date.now(),subscriber='ui-no-origin-subscriber-'+Date.now();
+ await request.put('/streamer/api/v3/iptv',{headers,data:{}});await request.put('/streamer/api/v3/iptv/packages/'+pack,{headers,data:{channels:[]}});
+ await request.put('/streamer/api/v3/iptv/subscribers/'+subscriber,{headers,data:{packages:[pack],token:'ui-no-origin-secret-'+Date.now()}});
+ await page.route('**/flussonix/api/v1/node',async route=>{const response=await route.fetch();const node=await response.json();node.iptv_public_origin=null;await route.fulfill({response,json:node})});
+ await page.getByRole('button',{name:'Config',exact:true}).click();await page.getByRole('button',{name:'IPTV',exact:true}).click();
+ await page.getByRole('button',{name:'Subscribers',exact:true}).click();const row=page.getByRole('row').filter({has:page.getByRole('cell',{name:subscriber,exact:true})});
+ await expect(row).toBeVisible();await expect(row.getByRole('button',{name:'Copy playlist link',exact:true})).toHaveCount(0);
+ await expect(page.getByText('Set the IPTV public origin at startup')).toBeVisible();
+});
+test('IPTV remains reachable from mobile Configuration',async({page})=>{
+ test.setTimeout(12000);
+ await page.setViewportSize({width:375,height:800});await page.getByRole('button',{name:'Config',exact:true}).click();
+ await page.getByRole('button',{name:'IPTV',exact:true}).click();await expect(page.getByRole('heading',{name:'IPTV',exact:true})).toBeVisible();
+});
+test('IPTV screen warns when a CDN lacks cluster authority',async({page})=>{
+ await page.route('**/flussonix/api/v1/node',async route=>{
+  const response=await route.fetch();const node=await response.json();
+  node.iptv_cluster={mode:'missing_authority',configured:false,ready:false,reason:'IPTV authority is required for cluster session limits'};
+  await route.fulfill({response,json:node});
+ });
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await page.getByRole('button',{name:'IPTV',exact:true}).click();
+ await expect(page.getByRole('alert')).toContainText('authority is required');
+ await expect(page.getByRole('button',{name:'Enable IPTV',exact:true})).toHaveCount(0);
+});
+test('IPTV HA client shows each authority state without local catalog edits',async({page})=>{
+ await page.route('**/flussonix/api/v1/node',async route=>{
+  const response=await route.fetch();const node=await response.json();
+  node.iptv_cluster={mode:'client',configured:true,ready:true,connected:true,origins:[
+   {origin:'https://authority-one.example/',reachable:false,ready:false,refused:false},
+   {origin:'https://authority-two.example/',reachable:true,ready:true,refused:false}
+  ]};await route.fulfill({response,json:node});
+ });
+ await page.getByRole('button',{name:'Config',exact:true}).click();await page.getByRole('button',{name:'IPTV',exact:true}).click();
+ await expect(page.getByRole('region',{name:'IPTV authority origins'})).toContainText('authority-one.example');
+ await expect(page.getByRole('region',{name:'IPTV authority origins'})).toContainText('authority-two.example');
+ await expect(page.getByRole('button',{name:'Add package',exact:true})).toHaveCount(0);
+});
+test('View IPTV health distinguishes hidden authority slots without exposing URLs',async({page})=>{
+ const duplicateKeys:string[]=[];
+ page.on('console',message=>{if(message.type()==='error'&&message.text().includes('same key'))duplicateKeys.push(message.text())});
+ await page.route('**/flussonix/api/v1/node',async route=>{
+  const response=await route.fetch();const node=await response.json();
+  node.management_role='view';
+  node.iptv_cluster={mode:'client',configured:true,ready:true,connected:true,origins:[
+   {origin:'https://[redacted]',reachable:false,ready:false,refused:false},
+   {origin:'https://[redacted]',reachable:true,ready:true,refused:false}
+  ]};await route.fulfill({response,json:node});
+ });
+ await page.getByRole('button',{name:'Config',exact:true}).click();await page.getByRole('button',{name:'IPTV',exact:true}).click();
+ const health=page.getByRole('region',{name:'IPTV authority origins'});
+ await expect(health.locator('p')).toHaveCount(2);
+ await expect(health.locator('p').nth(0)).toContainText('Authority 1 · Unreachable');
+ await expect(health.locator('p').nth(1)).toContainText('Authority 2 · Ready');
+ await expect(health).not.toContainText('https://[redacted]');
+ expect(duplicateKeys).toEqual([]);
+});
+test('status strip reports the running server version and follows node status updates',async({page,request})=>{
+ const health=await(await request.get('/health')).json();
+ expect(typeof health.version).toBe('string');expect(health.version.length).toBeGreaterThan(0);
+ await expect(page.locator('.status-strip .right')).toContainText(`v${health.version}`);
+ let version:string|undefined='9.8.7-rc.2';
+ await page.route('**/flussonix/api/v1/node',async route=>{
+  const response=await route.fetch();const data=await response.json();
+  if(version===undefined)delete data.version;else data.version=version;
+  await route.fulfill({response,json:data});
+ });
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await expect(page.locator('.status-strip .right')).toContainText('v9.8.7-rc.2');
+ version=undefined;
+ await page.getByRole('button',{name:'Cluster',exact:true}).click();
+ await expect(page.locator('.status-strip .right')).toContainText('Version unavailable');
+ await expect(page.locator('.status-strip .right')).not.toContainText('v9.8.7-rc.2');
+});
 test('Config shows actual HTTP and HTTPS listeners with startup guidance',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
  const node=await(await request.get('/flussonix/api/v1/node',{headers})).json();
@@ -19,10 +341,20 @@ test('Config shows readable SRT playback state without exposing startup secrets'
  const node=await(await request.get('/flussonix/api/v1/node',{headers})).json();
  await page.getByRole('button',{name:'Config',exact:true}).click();
  const playback=page.getByRole('region',{name:'SRT playback',exact:true});await expect(playback).toBeVisible();
- await expect(playback).toContainText(node.srt_playback?.listen||'Not enabled');await expect(playback).toContainText('startup options');await expect(playback.locator('input,textarea')).toHaveCount(0);
+ await expect(playback).toContainText(node.srt_playback?.listen||'Not enabled');await expect(playback).toContainText('startup options');await expect(playback).toContainText('Ticket playback');await expect(playback).toContainText('Direct tokens');await expect(playback.locator('input,textarea')).toHaveCount(0);
  if(node.srt_playback?.enabled){await expect(playback).toContainText(node.srt_playback.encrypted?'Encrypted':'Plaintext');await expect(playback).toContainText(`${node.srt_playback.latency_ms} ms`);}
  await page.route('**/flussonix/api/v1/node',async route=>{const response=await route.fetch();const data=await response.json();data.srt_playback={enabled:false,listen:null,encrypted:false,passphrase:'owned-never-rendered-secret'};await route.fulfill({response,json:data});});
- await expect(playback).toContainText('Not enabled');await expect(page.getByText('owned-never-rendered-secret',{exact:false})).toHaveCount(0);
+ await expect(playback).toContainText('Not enabled');await expect(playback).toContainText('Needs encrypted SRT listener');await expect(page.getByText('owned-never-rendered-secret',{exact:false})).toHaveCount(0);
+});
+test('Config explains SRT ticket readiness and explicit direct-token exposure',async({page})=>{
+ await page.route('**/flussonix/api/v1/node',async route=>{const response=await route.fetch();const data=await response.json();data.http_delivery={http:'127.0.0.1:18210',https:'127.0.0.1:18443'};data.srt_playback={enabled:true,listen:'0.0.0.0:9998',public_url:'srt://cdn.example:9998',encrypted:true,direct_tokens_allowed:true,latency_ms:120,client_limit:128,clients:0,passphrase:'owned-never-rendered-secret'};await route.fulfill({response,json:data});});
+ await page.getByRole('button',{name:'Config',exact:true}).click();const playback=page.getByRole('region',{name:'SRT playback',exact:true});
+ await expect(playback).toContainText('srt://cdn.example:9998');await expect(playback).toContainText('Ticket playback');await expect(playback).toContainText('Ready');await expect(playback).toContainText('Direct tokens');await expect(playback).toContainText('Allowed');await expect(playback).toContainText('--srt-play-allow-direct-token');await expect(playback).not.toContainText('owned-never-rendered-secret');
+});
+test('Config marks wildcard SRT listener without public URL as ticket unavailable',async({page})=>{
+ await page.route('**/flussonix/api/v1/node',async route=>{const response=await route.fetch();const data=await response.json();data.http_delivery={http:'127.0.0.1:18210',https:'127.0.0.1:18443'};data.srt_playback={enabled:true,listen:'[::]:9998',public_url:null,encrypted:true,direct_tokens_allowed:false,latency_ms:120,client_limit:128,clients:0};await route.fulfill({response,json:data});});
+ await page.setViewportSize({width:393,height:852});await page.getByRole('button',{name:'Config',exact:true}).click();const playback=page.getByRole('region',{name:'SRT playback',exact:true});
+ await expect(playback).toContainText('Needs public SRT URL');await expect(playback).toContainText('--srt-play-public-url');await expect(playback).toContainText('Off');expect(await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth)).toBe(false);
 });
 test('SRT playback status remains visible in mobile Config',async({page})=>{
  await page.addStyleTag({content:':root{font-family:"DejaVu Sans",sans-serif}'});
@@ -30,14 +362,67 @@ test('SRT playback status remains visible in mobile Config',async({page})=>{
  const playback=page.getByRole('region',{name:'SRT playback',exact:true});await expect(playback).toBeVisible();await expect(playback).toContainText('startup options');
  expect(await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth)).toBe(false);
 });
-test('SRT playback URL uses an IPv6 endpoint and token placeholder without saved secrets',async({page,request})=>{
+for (const width of [1440,901,900,393,320]) for (const ipv6 of [false,true]) {
+ test(`Config sidebar values remain readable at ${width}px with ${ipv6?'IPv6':'disabled listeners'}`,async({page},testInfo)=>{
+  const address='[2001:db8:1234:5678:9abc:def0:1234:5678]';
+  await page.route('**/flussonix/api/v1/node',async route=>{
+   const response=await route.fetch();const data=await response.json();
+   data.http_delivery={http:ipv6?`${address}:18210`:'127.0.0.1:18210',https:ipv6?`${address}:443`:null,https_only:false};
+   data.srt_playback={enabled:ipv6,listen:ipv6?`${address}:9998`:null,public_url:ipv6?`srt://${address}:9998`:null,encrypted:ipv6,direct_tokens_allowed:false,latency_ms:120,client_limit:128,clients:0};
+   data.fxlink={...data.fxlink,enabled:ipv6,listen:ipv6?`${address}:55000`:null};
+   await route.fulfill({response,json:data});
+  });
+  await page.setViewportSize({width,height:1100});
+  await page.getByRole('button',{name:'Config',exact:true}).click();
+  const sidebar=page.locator('.config-layout aside');
+  await expect(sidebar.getByRole('region',{name:'HTTP delivery',exact:true}).locator('dd')).toHaveText([
+   ipv6?`${address}:18210`:'127.0.0.1:18210',ipv6?`${address}:443`:'Not enabled',ipv6?'HTTP and HTTPS':'HTTP',
+  ]);
+  await expect(sidebar.getByRole('region',{name:'SRT playback',exact:true}).locator('dd')).toHaveText([
+   ipv6?`${address}:9998`:'Not enabled',ipv6?'Encrypted':'—',ipv6?'120 ms':'—',ipv6?'128':'—',ipv6?'0':'—',ipv6?`srt://${address}:9998`:'Not configured',ipv6?'Ready':'Needs encrypted SRT listener','Off',
+  ]);
+  await expect(sidebar.getByRole('region',{name:'FXLink transport',exact:true}).locator('dd')).toHaveText([
+   ipv6?`${address}:55000`:'Not enabled','TLS + Reed–Solomon FEC','1,000 ms',
+  ]);
+  await page.evaluate(()=>document.fonts.ready);
+  const values=await sidebar.locator('dd').evaluateAll(elements=>elements.map(element=>{
+   const range=document.createRange();range.selectNodeContents(element);
+   const box=element.getBoundingClientRect();const panel=element.closest('aside')!.getBoundingClientRect();
+   return {label:element.previousElementSibling?.textContent,text:element.textContent||'',lines:range.getClientRects().length,left:box.left,right:box.right,panelLeft:panel.left,panelRight:panel.right,scrollWidth:element.scrollWidth,width:element.clientWidth};
+  }));
+  await testInfo.attach('sidebar-values',{body:JSON.stringify(values,null,2),contentType:'application/json'});
+  await page.screenshot({path:testInfo.outputPath('config.png'),fullPage:true});
+  for(const value of values){
+   expect(value.lines,`${value.text} should remain readable`).toBeLessThanOrEqual(value.label==='Public SRT URL'||value.text.startsWith('[')?3:value.label==='Ticket playback'||value.label==='Protection'?2:1);
+   expect(value.left).toBeGreaterThanOrEqual(value.panelLeft);
+   expect(value.right).toBeLessThanOrEqual(value.panelRight);
+   expect(value.scrollWidth).toBeLessThanOrEqual(value.width+1);
+  }
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+ });
+}
+test('SRT ticket Output uses an IPv6 endpoint and tokenless handshake without saved secrets',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
  expect((await request.put('/streamer/api/v3/streams/srt-ui-playback',{headers,data:{inputs:[{url:'testsrc://'}],static:false}})).ok()).toBeTruthy();
- await page.route('**/flussonix/api/v1/node',async route=>{const response=await route.fetch();const data=await response.json();data.srt_playback={enabled:true,listen:'[::1]:28567',encrypted:true,latency_ms:120,client_limit:128,clients:0,passphrase:'owned-never-rendered-secret'};await route.fulfill({response,json:data});});
+ await page.route('**/flussonix/api/v1/node',async route=>{const response=await route.fetch();const data=await response.json();data.http_delivery={http:'127.0.0.1:18210',https:'[::1]:18443'};data.srt_playback={enabled:true,listen:'[::1]:28567',public_url:'srt://[::1]:28567',encrypted:true,direct_tokens_allowed:false,latency_ms:120,client_limit:128,clients:0,passphrase:'owned-never-rendered-secret'};await route.fulfill({response,json:data});});
  await page.getByRole('button',{name:'Streams',exact:true}).click();await page.getByRole('button',{name:'srt-ui-playback',exact:true}).click();await page.getByRole('button',{name:'Output',exact:true}).click();
- const playback=page.getByRole('region',{name:'SRT playback URL',exact:true});await expect(playback).toBeVisible();await expect(playback).toContainText('srt://[::1]:28567');await expect(playback).toContainText('#!::r=srt-ui-playback,m=request,u=YOUR_TOKEN');await expect(playback).toContainText('client passphrase');await expect(playback).not.toContainText('owned-never-rendered-secret');await expect(page.locator('textarea')).toHaveCount(0);
+ const playback=page.getByRole('region',{name:'SRT playback URL',exact:true});await expect(playback).toBeVisible();await expect(playback).toContainText('srt://[::1]:28567');await expect(playback).toContainText('POST /flussonix/api/v1/srt-ticket');await expect(playback).toContainText('#!::r=srt-ui-playback,m=request,u=YOUR_TOKEN');await expect(playback).toContainText('flussonix_ticket=');await expect(playback).toContainText('five seconds');await expect(playback).toContainText('client passphrase');await expect(playback).not.toContainText('owned-never-rendered-secret');await expect(playback.getByText(/flussonix_ticket=/)).not.toContainText('u=YOUR_TOKEN');await expect(page.locator('textarea')).toHaveCount(0);
  await page.addStyleTag({content:':root{font-family:"DejaVu Sans",sans-serif}'});
  await page.setViewportSize({width:393,height:852});await expect(playback).toBeVisible();expect(await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth)).toBe(false);
+});
+
+test('saved SRT input summary hides query and fragment credentials',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-srt-secret-summary-'+Date.now().toString(36);
+ const url='srt://127.0.0.1:19990?streamid=owned-query-secret#passphrase=owned-fragment-secret-123';
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,disabled:true,static:false,inputs:[{url}]}})).ok()).toBeTruthy();
+ try{
+  await page.reload();await page.getByLabel('Username').fill(process.env.FLUSSONIX_ADMIN_USER||'admin');await page.getByLabel('Password',{exact:true}).fill(process.env.FLUSSONIX_ADMIN_PASSWORD!);await page.getByRole('button',{name:'Sign in',exact:true}).click();
+  await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Input',exact:true}).click();
+  await expect(page.locator('body')).toContainText('srt://127.0.0.1:19990');
+  await expect(page.locator('body')).not.toContainText('owned-query-secret');
+  await expect(page.locator('body')).not.toContainText('owned-fragment-secret-123');
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});}
 });
 test('create owned stream and show persisted operational state',async({page})=>{await page.getByRole('button',{name:'Add stream'}).click();await page.getByLabel('Stream name',{exact:true}).fill('ui-test');await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('heading',{name:'ui-test',exact:true})).toBeVisible();await page.getByRole('button',{name:'← Streams'}).click();await expect(page.getByRole('button',{name:'ui-test',exact:true})).toBeVisible();await page.screenshot({path:'../.runtime/screenshots/streams.png',fullPage:true});});
 test('configuration edits can be validated without applying',async({page,request})=>{
@@ -50,6 +435,96 @@ test('configuration edits can be validated without applying',async({page,request
  await page.getByRole('button',{name:'Save & apply',exact:true}).click();await expect(page.locator('.notice[role=status]')).toContainText('saved and applied');
  expect((await request.get('/streamer/api/v3/streams/staged-stream',{headers})).ok()).toBeTruthy();
  await expect(page.locator('textarea')).toHaveCount(0);
+});
+test('Config edits use full saved state while runtime stats change',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-config-full-'+Date.now().toString(36),reads:string[]=[];
+ page.on('request',r=>{const url=new URL(r.url());if(r.method()==='GET'&&url.pathname==='/streamer/api/v3/config')reads.push(url.search);});
+ try{
+  await page.getByRole('button',{name:'Config',exact:true}).click();
+  await page.getByRole('button',{name:'Add stream',exact:true}).click();
+  await page.getByLabel('Stream name',{exact:true}).fill(name);
+  await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');
+  await page.getByRole('button',{name:'Stage changes',exact:true}).click();
+  await page.waitForTimeout(1200);
+  await page.getByRole('button',{name:'Save & apply',exact:true}).click();
+  await expect(page.locator('.notice[role=status]')).toContainText('saved and applied');
+  expect(reads.length).toBeGreaterThan(1);
+  expect(reads.every(query=>new URLSearchParams(query).get('full')==='true')).toBeTruthy();
+  expect((await request.get('/streamer/api/v3/streams/'+name,{headers})).ok()).toBeTruthy();
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});}
+});
+test('Config displays validation details returned by the server',async({page})=>{
+ await page.route('**/streamer/api/v3/config*',async route=>{
+  if(route.request().method()==='POST')await route.fulfill({status:400,contentType:'application/json',body:JSON.stringify({error:'unknown_key',detail:'server option unsupported_feature is not implemented',path:['server_config','unsupported_feature'],config:{unsupported_feature:true}})});
+  else await route.continue();
+ });
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await page.getByRole('button',{name:'Validate',exact:true}).click();
+ await expect(page.getByRole('alert')).toContainText('unsupported_feature');
+});
+test('Config validation error survives a background refresh that finishes afterward',async({page})=>{
+ const initial=page.waitForResponse(response=>response.url().includes('/streamer/api/v3/config?full=true')&&response.request().method()==='GET');
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await initial;
+ let beginRefresh!:()=>void;
+ let releaseRefresh!:()=>void;
+ const refreshing=new Promise<void>(resolve=>{beginRefresh=resolve});
+ const held=new Promise<void>(resolve=>{releaseRefresh=resolve});
+ await page.route('**/streamer/api/v3/config*',async route=>{
+  if(route.request().method()==='POST'){
+   await route.fulfill({status:400,contentType:'application/json',body:JSON.stringify({error:'unknown_key',detail:'server option unsupported_feature is not implemented'})});
+  }else{
+   const response=await route.fetch();
+   beginRefresh();
+   await held;
+   await route.fulfill({response});
+  }
+ });
+ await refreshing;
+ await page.getByRole('button',{name:'Validate',exact:true}).click();
+ await expect(page.getByRole('alert')).toContainText('unsupported_feature');
+ const finished=page.waitForResponse(response=>response.url().includes('/streamer/api/v3/config?full=true')&&response.request().method()==='GET');
+ releaseRefresh();
+ await finished;
+ await page.waitForTimeout(250);
+ await expect(page.getByRole('alert')).toContainText('unsupported_feature');
+});
+test('Config shows refresh errors beneath action errors and dismisses each source',async({page})=>{
+ const initial=page.waitForResponse(response=>response.url().includes('/streamer/api/v3/config?full=true')&&response.request().method()==='GET');
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await initial;
+ await page.route('**/streamer/api/v3/config*',async route=>{
+  if(route.request().method()==='POST'){
+   await route.fulfill({status:400,contentType:'application/json',body:JSON.stringify({detail:'server option unsupported_feature is not implemented'})});
+  }else{
+   await route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({detail:'refresh unavailable'})});
+  }
+ });
+ await page.waitForResponse(response=>response.url().includes('/streamer/api/v3/config?full=true')&&response.request().method()==='GET'&&response.status()===503);
+ await expect(page.getByRole('alert')).toContainText('refresh unavailable');
+ await page.getByRole('button',{name:'Validate',exact:true}).click();
+ await expect(page.getByRole('alert')).toContainText('unsupported_feature');
+ await expect(page.getByRole('alert')).toHaveCount(1);
+ await page.getByRole('button',{name:'Dismiss error'}).click();
+ await expect(page.getByRole('alert')).toContainText('refresh unavailable');
+ await page.getByRole('navigation').getByRole('button',{name:/^Media/}).click();
+ await expect(page.getByRole('alert')).toHaveCount(0);
+});
+test('Config clears an old validation error when a later validation succeeds',async({page})=>{
+ let attempts=0;
+ await page.route('**/streamer/api/v3/config*',async route=>{
+  if(route.request().method()==='POST'&&++attempts===1){
+   await route.fulfill({status:400,contentType:'application/json',body:JSON.stringify({detail:'server option unsupported_feature is not implemented'})});
+  }else await route.continue();
+ });
+ await page.getByRole('button',{name:'Config',exact:true}).click();
+ await page.getByRole('button',{name:'Validate',exact:true}).click();
+ await expect(page.getByRole('alert')).toContainText('unsupported_feature');
+ await page.getByRole('button',{name:'Validate',exact:true}).click();
+ await expect(page.getByRole('status')).toContainText('Configuration is valid');
+ await expect(page.getByRole('alert')).toHaveCount(0);
+ expect(attempts).toBe(2);
 });
 test('cluster and template screens use configured data',async({page})=>{await page.getByRole('button',{name:'Templates',exact:true}).click();await expect(page.getByRole('heading',{name:'Templates',exact:true})).toBeVisible();await page.getByRole('button',{name:'Cluster',exact:true}).click();await expect(page.getByText('Viewer entry point',{exact:true})).toBeVisible();await page.getByRole('button',{name:'Source servers',exact:true}).click();await expect(page.getByText('No sources configured')).toBeVisible();await page.screenshot({path:'../.runtime/screenshots/cluster.png',fullPage:true});});
 test('editing a title preserves template inheritance',async({page,request})=>{
@@ -133,6 +608,19 @@ test('changing authorization mode preserves the existing session limits and iden
  const result=await (await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(result.on_play.max_sessions).toBe(3);expect(result.on_play.session_keys).toEqual(['name','proto','token','token']);
 });
 
+test('token-bound callback session is required before saving a stream',async({page})=>{
+ await page.getByRole('button',{name:'Add stream',exact:true}).click();
+ await page.getByLabel('Stream name',{exact:true}).fill('ui-token-bound-callback');
+ await page.getByLabel('Input URL',{exact:true}).fill('testsrc://');
+ await page.getByLabel('Authorization policy',{exact:true}).selectOption('url');
+ await page.getByLabel('Callback URL',{exact:true}).fill('https://auth.example/check');
+ const identity=page.locator('details.form-details').filter({hasText:'Session identity'});
+ await identity.locator('summary').click();
+ await identity.getByRole('button',{name:'Remove',exact:true}).last().click();
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ await expect(page.getByRole('dialog').getByRole('alert')).toContainText('callback session_keys must include token');
+});
+
 test('media timeout forms preserve template inheritance and explicit overrides',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
  const template='ui-recovery-template',name='ui-recovery-timeout';
@@ -207,6 +695,38 @@ test('RTSP input transport uses a friendly selector and clears UDP when changing
  await request.delete('/streamer/api/v3/streams/'+name,{headers});
 });
 
+test('RTSP startup mode saves a single-admission hint and clears it for other protocols',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-rtsp-startup-'+Date.now();
+ try{
+  expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,static:false,inputs:[{url:'rtsp://127.0.0.1:19990/camera'}]}})).ok()).toBeTruthy();
+  await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+  const mode=page.getByLabel('RTSP startup',{exact:true});await expect(mode).toHaveValue('auto');await mode.selectOption('h264');await page.getByRole('button',{name:'Save',exact:true}).click();
+  let state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_rtsp_startup).toBe('h264');
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(mode).toHaveValue('h264');await mode.selectOption('conservative');await page.getByRole('button',{name:'Save',exact:true}).click();
+  state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_rtsp_startup).toBe('conservative');
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await mode.selectOption('auto');await page.getByRole('button',{name:'Save',exact:true}).click();
+  state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_rtsp_startup).toBeUndefined();
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await mode.selectOption('h264');await page.getByLabel('Input URL',{exact:true}).fill('hls://example.net/camera/index.m3u8');await expect(mode).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();
+  state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_rtsp_startup).toBeUndefined();await expect(page.locator('textarea')).toHaveCount(0);
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});}
+});
+
+test('RTSP startup mode is editable in Templates and visible to inherited streams',async({page,request})=>{
+ test.setTimeout(45000);
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const template='ui-rtsp-startup-template-'+Date.now(),name='ui-rtsp-startup-child-'+Date.now();
+ try{
+  expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{$reset:true,inputs:[{url:'rtsps://localhost:19990/camera'}]}})).ok()).toBeTruthy();
+  await page.getByRole('button',{name:'Templates',exact:true}).click();await page.getByRole('row').filter({has:page.getByRole('cell',{name:template,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+  const mode=page.getByLabel('RTSP startup',{exact:true});await expect(mode).toHaveValue('auto');await mode.selectOption('h264');await page.getByRole('button',{name:'Save',exact:true}).click();
+  const saved=await(await request.get('/streamer/api/v3/templates/'+template,{headers})).json();expect(saved.inputs[0].flussonix_rtsp_startup).toBe('h264');
+  expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,template,static:false}})).ok()).toBeTruthy();
+  await page.getByRole('button',{name:'Streams',exact:true}).click();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Input',exact:true}).click();
+  await expect(page.getByText(/H\.264 startup · no probe/)).toBeVisible();
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});await request.delete('/streamer/api/v3/templates/'+template,{headers});}
+});
+
 
 test('RTSPS trust uses a friendly CA path field and clears it when changing protocol',async({page,request})=>{
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};const name='ui-rtsps-trust';
@@ -216,6 +736,50 @@ test('RTSPS trust uses a friendly CA path field and clears it when changing prot
  await ca.fill(process.env.FLUSSONIX_TEST_CA_FILE!);await page.getByRole('button',{name:'Save',exact:true}).click();let state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_tls_ca).toBe(process.env.FLUSSONIX_TEST_CA_FILE);
  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(ca).toHaveValue(process.env.FLUSSONIX_TEST_CA_FILE!);await ca.fill('');await page.getByRole('button',{name:'Save',exact:true}).click();state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_tls_ca).toBeUndefined();
  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await ca.fill(process.env.FLUSSONIX_TEST_CA_FILE!);await page.getByLabel('Input URL',{exact:true}).fill('hls://example.net/camera/index.m3u8');await expect(ca).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();state=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(state.config_on_disk.inputs[0].flussonix_tls_ca).toBeUndefined();await expect(page.locator('textarea')).toHaveCount(0);await request.delete('/streamer/api/v3/streams/'+name,{headers});
+});
+
+test('Streams edit approved RTSPS redirects as origin rows and clear them on protocol change',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const name='ui-rtsps-redirect-'+Date.now();
+ try{
+  expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,static:false,inputs:[{url:'rtsps://localhost:19990/camera'}]}})).ok()).toBeTruthy();
+  await expect(page.getByRole('button',{name,exact:true})).toBeVisible();await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+  await expect(page.getByText('Allowed RTSPS redirects',{exact:true})).toBeVisible();
+  await page.getByRole('button',{name:'Add allowed RTSPS redirect',exact:true}).click();
+  const root=page.getByLabel('Allowed RTSPS redirect 1',{exact:true});
+  for(const invalid of ['rtsps://cdn.example/live','rtsps://cdn.example/live/..','rtsps://cdn.example/%2e','rtsps://cdn.example?','rtsps://cdn.example#']){
+   await root.fill(invalid);await page.getByRole('button',{name:'Save',exact:true}).click();
+   await expect(page.getByText('Allowed RTSPS redirects must be RTSPS origin roots without paths or credentials.',{exact:true})).toBeVisible();
+  }
+  await root.fill('rtsps://cdn.example:8322');await page.getByRole('button',{name:'Save',exact:true}).click();
+  let saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(saved.config_on_disk.inputs[0].flussonix_rtsps_redirect_origins).toEqual(['rtsps://cdn.example:8322']);
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(root).toHaveValue('rtsps://cdn.example:8322');
+  await page.getByRole('button',{name:'Remove allowed RTSPS redirect 1',exact:true}).click();await page.getByRole('button',{name:'Save',exact:true}).click();
+  saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(saved.config_on_disk.inputs[0].flussonix_rtsps_redirect_origins).toBeUndefined();
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByRole('button',{name:'Add allowed RTSPS redirect',exact:true}).click();await root.fill('rtsps://cdn.example:8322');
+  await page.getByLabel('Input URL',{exact:true}).fill('hls://example.net/camera/index.m3u8');await expect(page.getByText('Allowed RTSPS redirects',{exact:true})).toHaveCount(0);
+  await page.getByRole('button',{name:'Save',exact:true}).click();saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(saved.config_on_disk.inputs[0].flussonix_rtsps_redirect_origins).toBeUndefined();
+  await expect(page.locator('textarea')).toHaveCount(0);
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});}
+});
+
+test('Templates persist approved RTSPS redirects for inheriting streams',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const template='ui-rtsps-redirect-template-'+Date.now(),name='ui-rtsps-redirect-child-'+Date.now();
+ try{
+  expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{$reset:true,inputs:[{url:'rtsps://localhost:19990/camera'}]}})).ok()).toBeTruthy();
+  await page.getByRole('button',{name:'Templates',exact:true}).click();await page.getByRole('row').filter({has:page.getByRole('cell',{name:template,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+  await page.getByRole('button',{name:'Add allowed RTSPS redirect',exact:true}).click();await page.getByLabel('Allowed RTSPS redirect 1',{exact:true}).fill('rtsps://cdn.example:8322');
+  await page.getByRole('button',{name:'Save',exact:true}).click();
+  const saved=await(await request.get('/streamer/api/v3/templates/'+template,{headers})).json();expect(saved.inputs[0].flussonix_rtsps_redirect_origins).toEqual(['rtsps://cdn.example:8322']);
+  expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{$reset:true,template,static:false}})).ok()).toBeTruthy();
+  const child=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(child.inputs[0].flussonix_rtsps_redirect_origins).toEqual(['rtsps://cdn.example:8322']);
+  await page.getByRole('row').filter({has:page.getByRole('cell',{name:template,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+  await expect(page.getByLabel('Allowed RTSPS redirect 1',{exact:true})).toHaveValue('rtsps://cdn.example:8322');
+  await page.getByRole('button',{name:'Remove allowed RTSPS redirect 1',exact:true}).click();await page.getByRole('button',{name:'Save',exact:true}).click();
+  const cleared=await(await request.get('/streamer/api/v3/templates/'+template,{headers})).json();expect(cleared.inputs[0].flussonix_rtsps_redirect_origins).toBeUndefined();
+  await expect(page.locator('textarea')).toHaveCount(0);
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});await request.delete('/streamer/api/v3/templates/'+template,{headers});}
 });
 
 test('publication forms expose masked publisher credentials and preserve template inheritance',async({page,request})=>{
@@ -346,7 +910,7 @@ test('reopening a saved source uses acknowledged settings while refresh is delay
   await page.getByRole('button',{name:'Cluster',exact:true}).click();await page.getByRole('button',{name:'Source servers',exact:true}).click();
   const edit=()=>page.getByRole('row').filter({has:page.getByRole('cell',{name,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
   await edit();await page.getByLabel('Source transport',{exact:true}).selectOption('mpegts');
-  await page.route('**/streamer/api/v3/config',async route=>{const response=await route.fetch();if(delay)await new Promise<void>(resolve=>releases.push(resolve));await route.fulfill({response});});
+  await page.route('**/streamer/api/v3/config*',async route=>{const response=await route.fetch();if(delay)await new Promise<void>(resolve=>releases.push(resolve));await route.fulfill({response});});
   delay=true;await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
   const saved=await(await request.get(`/streamer/api/v3/cluster/sources/${name}`,{headers})).json();expect(saved.flussonix_transport).toBe('mpegts');
   await edit();await expect(page.getByLabel('Source transport',{exact:true})).toHaveValue('mpegts');
@@ -634,15 +1198,18 @@ test('SRT destinations reject malformed query encoding before expanding fields',
 });
 
 test('direct RTP forms persist friendly input and destination controls without JSON',async({page,request})=>{
+ test.setTimeout(60000);
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};const name='ui-direct-rtp';
  expect((await request.put(`/streamer/api/v3/streams/${name}`,{headers,data:{$reset:true,disabled:true,static:false,inputs:[{url:'hls://example.net/owned/index.m3u8'}]}})).ok()).toBeTruthy();
  try{
   await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Input URL',{exact:true}).fill('rtp://127.0.0.1:39002');
   await expect(page.getByLabel('RTP source IP',{exact:true})).toBeVisible();await page.getByLabel('RTP source IP',{exact:true}).fill('127.0.0.1');await page.getByLabel('RTP jitter (milliseconds)',{exact:true}).fill('25');
+  await page.getByLabel('RTP receive buffer (MiB)',{exact:true}).fill('33');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('receive buffer');
+  const buffer=page.getByLabel('RTP receive buffer (MiB)',{exact:true});await buffer.fill('abc');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog').getByRole('alert')).toContainText('receive buffer');await buffer.fill('');await buffer.pressSequentially('1.');await expect(buffer).toHaveValue('1.');await buffer.pressSequentially('5');await expect(buffer).toHaveValue('1.5');
   await page.getByLabel('Direct transport destinations',{exact:true}).selectOption('override');await page.getByLabel('RTP destination URL 1',{exact:true}).fill('rtp://127.0.0.1:39004');await page.getByLabel('RTP maximum bitrate (Mbps) 1',{exact:true}).fill('10');
   await expect(page.locator('textarea')).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
-  let data=await(await request.get(`/streamer/api/v3/streams/${name}`,{headers})).json();expect(data.config_on_disk.inputs[0].flussonix_rtp).toMatchObject({source_ip:'127.0.0.1',jitter_ms:25});expect(data.config_on_disk.flussonix_rtp_outputs[0]).toMatchObject({url:'rtp://127.0.0.1:39004',max_mbps:10});
-  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(page.getByLabel('RTP source IP',{exact:true})).toHaveValue('127.0.0.1');await page.getByLabel('Input URL',{exact:true}).fill('hls://example.net/owned/index.m3u8');await expect(page.getByLabel('RTP source IP',{exact:true})).toHaveCount(0);await page.getByLabel('Direct transport destinations',{exact:true}).selectOption('none');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+  let data=await(await request.get(`/streamer/api/v3/streams/${name}`,{headers})).json();expect(data.config_on_disk.inputs[0].flussonix_rtp).toMatchObject({source_ip:'127.0.0.1',jitter_ms:25,receive_buffer_bytes:1572864});expect(data.config_on_disk.flussonix_rtp_outputs[0]).toMatchObject({url:'rtp://127.0.0.1:39004',max_mbps:10});
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(page.getByLabel('RTP source IP',{exact:true})).toHaveValue('127.0.0.1');await expect(page.getByLabel('RTP receive buffer (MiB)',{exact:true})).toHaveValue('1.5');await page.getByLabel('Input URL',{exact:true}).fill('hls://example.net/owned/index.m3u8');await expect(page.getByLabel('RTP source IP',{exact:true})).toHaveCount(0);await page.getByLabel('Direct transport destinations',{exact:true}).selectOption('none');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
   data=await(await request.get(`/streamer/api/v3/streams/${name}`,{headers})).json();expect(data.config_on_disk.inputs[0].flussonix_rtp).toBeUndefined();expect(data.config_on_disk.flussonix_rtp_outputs).toEqual([]);
  }finally{await request.delete(`/streamer/api/v3/streams/${name}`,{headers})}
 });
@@ -652,7 +1219,12 @@ test('direct transport template destinations inherit, override and clear without
  const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};const template='ui-direct-template-'+Date.now(),name=template+'-stream';
  const outputs=[{url:'rtp://127.0.0.1:39004',disabled:true,max_mbps:20}];
  expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{disabled:true,static:false,inputs:[{url:'testsrc://'}],flussonix_rtp_outputs:outputs}})).ok()).toBeTruthy();expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{template}})).ok()).toBeTruthy();
- try{await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();await expect(page.getByLabel('Direct transport destinations',{exact:true})).toHaveValue('inherit');await page.getByLabel('Direct transport destinations',{exact:true}).selectOption('override');await expect(page.getByLabel('RTP maximum bitrate (Mbps) 1',{exact:true})).toHaveValue('20');await page.getByLabel('RTP maximum bitrate (Mbps) 1',{exact:true}).fill('30');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+ try{await page.getByRole('button',{name,exact:true}).click();await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+ // The fixtures are created outside the UI. A poll can read templates before
+ // creation and streams after it, so wait for the inherited destination to load.
+ const destinations=page.getByRole('group',{name:'RTP and SRTP destinations',exact:true});
+ await expect(destinations).toContainText('1. rtp://127.0.0.1:39004 · Disabled · Plaintext · MPEG-TS / PT33');
+ await expect(page.getByLabel('Direct transport destinations',{exact:true})).toHaveValue('inherit');await page.getByLabel('Direct transport destinations',{exact:true}).selectOption('override');await expect(page.getByLabel('RTP maximum bitrate (Mbps) 1',{exact:true})).toHaveValue('20');await page.getByLabel('RTP maximum bitrate (Mbps) 1',{exact:true}).fill('30');await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
  let data=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(data.config_on_disk.flussonix_rtp_outputs[0].max_mbps).toBe(30);
  for(const mode of ['none','inherit']){await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Direct transport destinations',{exact:true}).selectOption(mode);await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);data=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();if(mode==='none')expect(data.flussonix_rtp_outputs).toEqual([]);else{expect(data.config_on_disk.flussonix_rtp_outputs).toBeUndefined();expect(data.flussonix_rtp_outputs).toEqual(outputs);}}
  }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});await request.delete('/streamer/api/v3/templates/'+template,{headers});}
@@ -723,6 +1295,126 @@ test('secure elementary fields preserve profiles on URL changes and remove stale
  await page.getByRole('button',{name:'Edit stream',exact:true}).click();await page.getByLabel('Input URL',{exact:true}).fill('rtp://127.0.0.1:50440');await page.getByLabel('RTP destination URL 1',{exact:true}).fill('rtp://127.0.0.1:50460');await expect(page.getByLabel('RTP input profile',{exact:true})).toHaveValue('elementary');await expect(page.getByLabel('RTP input SDP file',{exact:true})).toHaveValue('/tmp/owned-secure-input.sdp');await expect(page.getByLabel('RTP destination profile 1',{exact:true})).toHaveValue('elementary');await expect(page.getByLabel('SRTP key file',{exact:true})).toHaveCount(0);await expect(page.getByLabel('SRTP key file 1',{exact:true})).toHaveCount(0);await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
  saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();expect(saved.inputs[0].flussonix_rtp.key_file).toBeUndefined();expect(saved.flussonix_rtp_outputs[0].flussonix_rtp.key_file).toBeUndefined();expect(saved.inputs[0].flussonix_rtp.sdp_file).toBe('/tmp/owned-secure-input.sdp');
  }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers})}
+});
+test('SRTP track protection uses labeled stream controls and clears on plaintext',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')},name='ui-srtp-tracks-'+Date.now();
+ await page.getByRole('button',{name:'Add stream'}).click();await page.getByLabel('Stream name',{exact:true}).fill(name);
+ await page.getByLabel('Input URL',{exact:true}).fill('srtp://127.0.0.1:50540');
+ await page.getByLabel('RTP input profile',{exact:true}).selectOption('elementary');
+ await page.getByLabel('RTP input SDP file',{exact:true}).fill('/tmp/owned-tracks.sdp');
+ await page.getByLabel('SRTP input protection',{exact:true}).selectOption('separate');
+ await page.getByLabel('Track key file 1',{exact:true}).fill('/tmp/track-a.key');
+ await page.getByRole('button',{name:'Add track key',exact:true}).click();
+ await page.getByLabel('Track key file 2',{exact:true}).fill('/tmp/track-b.key');
+ await page.getByLabel('Allow reused SRTP receiver key',{exact:true}).check();
+ await page.getByLabel('Direct transport destinations',{exact:true}).selectOption('override');
+ await page.getByLabel('RTP destination URL 1',{exact:true}).fill('srtp://127.0.0.1:50560');
+ await page.getByLabel('RTP destination profile 1',{exact:true}).selectOption('elementary');
+ await page.getByLabel('SRTP destination protection 1',{exact:true}).selectOption('per-track');
+ await page.getByLabel('SRTP track ID 1.1',{exact:true}).fill('7');
+ await page.getByLabel('SRTP track media 1.1',{exact:true}).selectOption('audio');
+ await page.getByLabel('SRTP track encoding 1.1',{exact:true}).fill('MPEG4-GENERIC/48000/2');
+ await page.getByLabel('SRTP track key file 1.1',{exact:true}).fill('/tmp/out-a.key');
+ await page.getByRole('button',{name:'Add SRTP track 1',exact:true}).click();
+ await page.getByLabel('SRTP track ID 1.2',{exact:true}).fill('9');
+ await page.getByLabel('SRTP track media 1.2',{exact:true}).selectOption('audio');
+ await page.getByLabel('SRTP track encoding 1.2',{exact:true}).fill('MPA/90000');
+ await page.getByLabel('SRTP track key file 1.2',{exact:true}).fill('/tmp/out-b.key');
+ await page.getByLabel('RTP destination enabled 1',{exact:true}).uncheck();
+ await page.getByLabel('Activation',{exact:true}).selectOption('ondemand');
+ await page.getByLabel('SRTP track ID 1.2',{exact:true}).fill('0');
+ await page.getByRole('button',{name:'Save',exact:true}).click();
+ await expect(page.getByRole('dialog').getByRole('alert')).toContainText('output tracks');
+ await page.getByLabel('SRTP track ID 1.2',{exact:true}).fill('9');
+ await expect(page.getByRole('dialog').locator('textarea')).toHaveCount(0);
+ await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+ try{
+  let saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();
+  expect(saved.inputs[0].flussonix_rtp.track_key_files).toEqual(['/tmp/track-a.key','/tmp/track-b.key']);
+  expect(saved.inputs[0].flussonix_rtp.allow_legacy_reused_key).toBe(true);
+  expect(saved.flussonix_rtp_outputs[0].flussonix_rtp.track_keys).toEqual([
+   {track_id:7,media:'audio',encoding:'MPEG4-GENERIC/48000/2',key_file:'/tmp/out-a.key'},
+   {track_id:9,media:'audio',encoding:'MPA/90000',key_file:'/tmp/out-b.key'}]);
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+  await expect(page.getByLabel('Track key file 2',{exact:true})).toHaveValue('/tmp/track-b.key');
+  await expect(page.getByLabel('SRTP track ID 1.2',{exact:true})).toHaveValue('9');
+  await page.getByLabel('SRTP input protection',{exact:true}).selectOption('shared');
+  await page.getByLabel('SRTP key file',{exact:true}).fill('/tmp/shared.key');
+  await page.getByLabel('Expected SSRC 1',{exact:true}).fill('101');
+  await page.getByRole('button',{name:'Add expected SSRC',exact:true}).click();
+  await page.getByLabel('Expected SSRC 2',{exact:true}).fill('202');
+  await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+  saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();
+  expect(saved.inputs[0].flussonix_rtp.track_key_files).toBeUndefined();
+  expect(saved.inputs[0].flussonix_rtp.expected_ssrcs).toEqual([101,202]);
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+  await page.getByLabel('RTP input profile',{exact:true}).selectOption('mp2t');
+  await page.getByLabel('RTP destination profile 1',{exact:true}).selectOption('mp2t');
+  await expect(page.getByLabel('Expected SSRC 1',{exact:true})).toHaveCount(0);
+  await expect(page.getByLabel('SRTP track ID 1.1',{exact:true})).toHaveCount(0);
+  await page.getByLabel('SRTP key file 1',{exact:true}).fill('/tmp/mp2t-output.key');
+  await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+  saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();
+  expect(saved.inputs[0].flussonix_rtp.expected_ssrcs).toBeUndefined();
+  expect(saved.flussonix_rtp_outputs[0].flussonix_rtp.track_keys).toBeUndefined();
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+  await page.getByLabel('Input URL',{exact:true}).fill('rtp://127.0.0.1:50540');
+  await page.getByLabel('RTP destination URL 1',{exact:true}).fill('rtp://127.0.0.1:50560');
+  await expect(page.getByLabel('SRTP input protection',{exact:true})).toHaveCount(0);
+  await expect(page.getByLabel('SRTP destination protection 1',{exact:true})).toHaveCount(0);
+  await page.getByRole('button',{name:'Save',exact:true}).click();await expect(page.getByRole('dialog')).toHaveCount(0);
+  saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();
+  for(const row of [saved.inputs[0],saved.flussonix_rtp_outputs[0]])for(const field of ['key_file','track_key_files','expected_ssrcs','track_keys','allow_legacy_reused_key'])expect(row.flussonix_rtp?.[field]).toBeUndefined();
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers})}
+});
+test('SRTP input with explicit false legacy override remains editable',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')},name='ui-srtp-false-'+Date.now();
+ const input={url:'srtp://127.0.0.1:50740',flussonix_rtp:{profile:'elementary',sdp_file:'/tmp/owned-false.sdp',key_file:'/tmp/owned-false.key',expected_ssrcs:[101],allow_legacy_reused_key:false}};
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{disabled:true,static:false,inputs:[input]}})).ok()).toBeTruthy();
+ try{
+  await page.getByRole('button',{name,exact:true}).click();
+  await page.getByRole('button',{name:'Edit stream',exact:true}).click();
+  await expect(page.getByLabel('Allow reused SRTP receiver key',{exact:true})).not.toBeChecked();
+  await page.getByLabel('Title',{exact:true}).fill('Still editable');
+  await page.getByRole('button',{name:'Save',exact:true}).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  const saved=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();
+  expect(saved.config_on_disk.title).toBe('Still editable');
+  expect(saved.config_on_disk.inputs[0].flussonix_rtp.allow_legacy_reused_key).toBe(false);
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers})}
+});
+test('SRTP template bindings inherit and reject invalid SSRCs before save',async({page,request})=>{
+ const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')};
+ const template='ui-srtp-template-'+Date.now(),name=template+'-stream';
+ const input={url:'srtp://127.0.0.1:50640',flussonix_rtp:{profile:'elementary',sdp_file:'/tmp/owned-template.sdp',key_file:'/tmp/owned-shared.key',expected_ssrcs:[101,202],allow_legacy_reused_key:false}};
+ const output={url:'srtp://127.0.0.1:50660',disabled:true,flussonix_rtp:{profile:'elementary',track_keys:[{track_id:7,media:'audio',encoding:'MPEG4-GENERIC/48000/2',key_file:'/tmp/owned-output-a.key'}]}};
+ expect((await request.put('/streamer/api/v3/templates/'+template,{headers,data:{disabled:true,static:false,inputs:[input],flussonix_rtp_outputs:[output]}})).ok()).toBeTruthy();
+ expect((await request.put('/streamer/api/v3/streams/'+name,{headers,data:{template}})).ok()).toBeTruthy();
+ try{
+  await page.getByRole('button',{name:'Templates',exact:true}).click();
+  await page.getByRole('row').filter({has:page.getByRole('cell',{name:template,exact:true})}).getByRole('button',{name:'Edit',exact:true}).click();
+  await expect(page.getByLabel('Expected SSRC 2',{exact:true})).toHaveValue('202');
+  await expect(page.getByLabel('SRTP track ID 1.1',{exact:true})).toHaveValue('7');
+  await page.getByLabel('Expected SSRC 2',{exact:true}).fill('0');
+  await page.getByRole('button',{name:'Save',exact:true}).click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await expect(page.getByRole('dialog').getByRole('alert')).toContainText('expected SSRCs');
+  await page.getByLabel('Expected SSRC 2',{exact:true}).fill('303');
+  await page.getByRole('button',{name:'Save',exact:true}).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  const stored=await(await request.get('/streamer/api/v3/templates/'+template,{headers})).json();
+  expect(stored.inputs[0].flussonix_rtp.expected_ssrcs).toEqual([101,303]);
+  expect(stored.inputs[0].flussonix_rtp.allow_legacy_reused_key).toBe(false);
+  const inherited=await(await request.get('/streamer/api/v3/streams/'+name,{headers})).json();
+  expect(inherited.inputs[0].flussonix_rtp.expected_ssrcs).toEqual([101,303]);
+  expect(inherited.config_on_disk.inputs).toBeUndefined();
+  expect(inherited.config_on_disk.flussonix_rtp_outputs).toBeUndefined();
+  await page.getByRole('button',{name:'Streams',exact:true}).click();
+  await page.getByRole('button',{name,exact:true}).click();
+  await expect(page.getByRole('heading',{name:'Saved overrides'})).toBeVisible();
+  await expect(page.getByRole('main')).not.toContainText('/tmp/owned-shared.key');
+  await expect(page.getByRole('main')).not.toContainText('/tmp/owned-output-a.key');
+ }finally{await request.delete('/streamer/api/v3/streams/'+name,{headers});await request.delete('/streamer/api/v3/templates/'+template,{headers})}
 });
 test('secure elementary SDP is key-free and explains receiver-local key setup',async({page,request})=>{
  test.setTimeout(60000);const headers={Authorization:'Basic '+Buffer.from((process.env.FLUSSONIX_ADMIN_USER||'admin')+':'+process.env.FLUSSONIX_ADMIN_PASSWORD).toString('base64')},name='ui-secure-sdp-'+Date.now();

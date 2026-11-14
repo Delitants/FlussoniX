@@ -16,6 +16,8 @@ pub(super) struct State {
 }
 struct Catalog {
     names: BTreeSet<String>,
+    missing_group_pins: usize,
+    mismatched_group_pins: usize,
     expires: Option<Instant>,
     next_poll: Instant,
     error: Option<&'static str>,
@@ -38,6 +40,12 @@ impl Drop for Demand {
             control.cancel();
         }
     }
+}
+fn demand_retry_delay(demand: &Demand, name: &str) -> Duration {
+    demand.group.as_ref().map_or_else(
+        || private_retry_delay(&demand.key, name, demand.streak),
+        |group| recovery::group_retry_delay(group, name, demand.streak),
+    )
 }
 impl Runtime {
     /// Only config/fact checks here. Final source and selected-route fences are
@@ -142,7 +150,7 @@ impl Runtime {
             && d.group.as_ref().is_some_and(|g| Arc::ptr_eq(g, group))
         {
             d.mode = mode;
-            d.next_attempt = Instant::now() + crate::recovery::retry_delay(d.streak);
+            d.next_attempt = Instant::now() + demand_retry_delay(d, name);
         }
     }
     pub(super) fn reset_static_mode(&self, name: &str, group: &Arc<Group>) {
@@ -238,7 +246,7 @@ impl Runtime {
             else {
                 return false;
             };
-            d.next_attempt = Instant::now() + crate::recovery::retry_delay(d.streak);
+            d.next_attempt = Instant::now() + demand_retry_delay(d, name);
             d.streak = d.streak.saturating_add(1);
         }
         // Serialize static and foreground/recovery selection through the same gate.
@@ -267,29 +275,36 @@ impl Runtime {
         }
         let activation = match candidate {
             Candidate::Direct(c) => self.owner.activate(c).ok(),
-            Candidate::Replica(g, c) => g.selector.activate(c).ok(),
+            Candidate::Replica(g, c) => g.selector.activate_provisional(c).ok(),
         };
         let Some(activation) = activation else {
             return false;
         };
         let control = activation.control();
-        let accepted = app
-            .config
-            .at_revision(revision, |_| {
-                let mut state = self.activation.lock().unwrap();
-                let Some(d) = state
-                    .demands
-                    .get_mut(name)
-                    .filter(|d| Arc::ptr_eq(&d.epoch, &epoch))
-                else {
-                    return false;
-                };
-                if let Some(old) = d.control.replace(control.clone()) {
-                    old.cancel();
-                }
-                true
-            })
-            .unwrap_or(false);
+        let accept = || {
+            let mut state = self.activation.lock().unwrap();
+            let Some(d) = state
+                .demands
+                .get_mut(name)
+                .filter(|d| Arc::ptr_eq(&d.epoch, &epoch))
+            else {
+                return false;
+            };
+            if let Some(old) = d.control.replace(control.clone()) {
+                old.cancel();
+            }
+            true
+        };
+        let accepted = match &group {
+            Some(g) => g
+                .selector
+                .commit_static_demand(&activation, accept)
+                .unwrap_or(false),
+            None => app
+                .config
+                .at_revision(revision, |_| accept())
+                .unwrap_or(false),
+        };
         if !accepted {
             control.cancel();
             return false;
@@ -337,7 +352,7 @@ impl Runtime {
                 return serde_json::json!({"wanted_streams":0,"active_streams":0,"capacity_limited":false,"sources":[]});
             }
             (
-                serde_json::json!({"wanted_streams":state.demands.len(),"active_streams":0,"capacity_limited":state.capacity,"sources":state.catalogs.iter().map(|(key,c)|serde_json::json!({"source":key,"inventory_streams":c.names.len(),"lease_valid":c.expires.is_some_and(|t|t>Instant::now()),"last_error":c.error})).collect::<Vec<_>>()}),
+                serde_json::json!({"wanted_streams":state.demands.len(),"active_streams":0,"capacity_limited":state.capacity,"sources":state.catalogs.iter().map(|(key,c)|{let valid=c.expires.is_some_and(|t|t>Instant::now());serde_json::json!({"source":key,"inventory_streams":c.names.len(),"missing_group_pins":if valid{c.missing_group_pins}else{0},"mismatched_group_pins":if valid{c.mismatched_group_pins}else{0},"lease_valid":valid,"last_error":c.error})}).collect::<Vec<_>>()}),
                 state
                     .demands
                     .values()

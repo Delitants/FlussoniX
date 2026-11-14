@@ -29,5 +29,7 @@ outputs use the normal processing and authorization paths.
 
 Owned tests cover automatic startup, CPU audio conversion, renewal, failover,
 viewer sharing and shutdown. Production vendor interoperability and capacity
-qualification remain pending. RTSP/RTSPS playback is supported on CDN and standalone nodes; vendor RTSP LB
-placement and SRT delivery remain separate work.
+qualification remain pending. RTSP/RTSPS and encrypted SRT playback are
+supported on CDN and standalone nodes; native LB
+[RTSP/RTSPS placement and HTTPS SRT destination lookup](vendor-cdn-placement.md)
+are available for compatible clients.

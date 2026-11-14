@@ -26,6 +26,27 @@ not establish version negotiation as the cause or qualify payload delivery.
 Connections were closed, no remote settings changed, and no reference code was
 executed or shipped by FlussoniX. Media bodies and credentials were not retained.
 
+Later bounded captures using the independent pre-fix Rust client delivered
+1920x1080 H.264/AAC over both M4F and M4S with strict local AV decoding; incorrect
+Cluster keys produced no metadata or media. A second M4F session was rejected,
+so those captures alone do not qualify reconnect reliability. Separate read-only
+checks observed a closed explicit M4F playback ID rejected with
+`connection_closed`, fresh IDs accepted at the control boundary, and one fresh-ID
+segment returning404. A no-ID control also succeeded after elapsed time. These
+observations do not establish a single cause for all intermittent failures.
+A later bounded two-session check fetched six announced segments successfully
+and did not reproduce the404. Early publication or expiration was not proven.
+
+Explicit vendor M4F pulls now send a fresh opaque `x-playback-session-id` for
+each pull, shared by its control and segment requests. Reopening or concurrently
+pulling the same input uses distinct IDs, matching the inspected reader's session
+lifetime. The ID is not a credential or server identity assertion. Status and
+Cluster acknowledgment checks still apply to every response; there is no
+in-pull retry or credential fallback. An acknowledged announced-segment404
+ends the pull as transient unavailability for existing supervised recovery;
+it does not accept the response as media. Public/native inputs and vendor M4S retain
+their existing header behavior.
+
 ## What operators can rely on
 
 The check establishes that the configured endpoint acknowledged the credential
@@ -49,3 +70,8 @@ segment losing acknowledgment, reconnects, valid media publication, and unchange
 public/native-peer inputs. Existing fixtures retain codec, TLS, status, redirect,
 cancellation, source binding and relay-publication coverage. No official vendor
 component is required to build, test or run this behavior.
+
+Owned session regressions reject missing, reused or mismatched playback IDs and
+incorrect credentials while checking exact segment bytes, metadata, sequential
+reopening and concurrent pulls. Native and vendor M4S checks assert that the new
+header is absent.

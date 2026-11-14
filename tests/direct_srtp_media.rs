@@ -1,6 +1,12 @@
 #[path = "support/direct_media.rs"]
 mod matrix;
 #[tokio::test]
+async fn direct_mp2t_srtp_mixed_audio_h264_hevc_fmp4_decodes() {
+    for video in ["libx264", "libx265"] {
+        matrix::run_fmp4_copy(video, true).await;
+    }
+}
+#[tokio::test]
 async fn independent_srtp_peers_decode_h264_hevc_all_audio_codecs_and_audio_only() {
     for video in [Some("libx264"), Some("libx265"), None] {
         matrix::run(video, true, None).await;

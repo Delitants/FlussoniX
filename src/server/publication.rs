@@ -226,7 +226,7 @@ pub async fn receive(app: Arc<App>, request: Request<Body>) -> Response {
         .map(|v| v.0.ip().to_string())
         .unwrap_or_else(|| "127.0.0.1".into());
     let mut session = Session {
-        metadata: json!({"name":name,"proto":"mpegts","ip":ip,"token":token.unwrap_or_default(),"qs":qs,"user_agent":header(request.headers(),"user-agent").unwrap_or(""),"referer":header(request.headers(),"referer").unwrap_or(""),"host":header(request.headers(),"host").unwrap_or(""),"session_id":uuid::Uuid::new_v4().to_string()}),
+        metadata: json!({"name":name,"proto":"mpegts","ip":ip,"token":token.unwrap_or_default(),"qs":crate::publish::callback_query(qs),"user_agent":header(request.headers(),"user-agent").unwrap_or(""),"referer":header(request.headers(),"referer").unwrap_or(""),"host":header(request.headers(),"host").unwrap_or(""),"session_id":uuid::Uuid::new_v4().to_string()}),
         started: Instant::now(),
         number: 0,
         bytes: 0,

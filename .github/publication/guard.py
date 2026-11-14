@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Keep local planning and reports out of source pushes and release uploads."""
-import argparse,fnmatch,json,pathlib,re,shutil,stat,subprocess,sys,tarfile,tempfile,zipfile
+import argparse,fnmatch,gzip,hashlib,json,pathlib,re,shutil,stat,subprocess,sys,tarfile,tempfile,zipfile
+from contextlib import contextmanager
 CONTROL='.github/publication/'
 CONTROL_FILES={CONTROL+'guard.py',CONTROL+'install-hooks.py',CONTROL+'policy.json'}
 PRIVATE_DIRS={'work','outputs','internal','reports','test-reports','evidence','acceptance','plans',
@@ -12,33 +13,129 @@ DOC_TYPES={'.md','.rst','.txt','.json','.csv','.pdf','.html','.xml'}
 REPORT=re.compile(r'(?:^|[-_ .])(?:test[-_ ]?(?:reports?|results)|implementation[-_ ]?(?:plans?|notes)|planning|qualification|verification[-_ ]?report|development[-_ ]?(?:notes|evidence)|host[-_ ]?matrix)(?:[-_ .]|$)',re.I)
 INTERNAL=re.compile(r'(?im)(?:/Users/[^\s/]+/|\b\d+\s+(?:(?:unit|integration|native)\s+)?tests?\s+(?:passed|failed|skipped)\b|^\s*(?:#+\s*)?(?:implementation plan|test results|test report|verification report|acceptance evidence|qualification results|post-signing checks|source commit|reviewed source|build log)\b)')
 USER_DOCS={'readme.md','readme.txt','readme','install.md','install.txt','recovery.md','known-limits.md','changelog.md'}
+PUBLIC_GUIDE_TYPES={'.md','.rst','.txt','.html'}
 PACKAGE_DATA={'package.json','package-lock.json','composer.json','composer.lock','tsconfig.json','Cargo.lock'}
 CODE_TYPES={'.go','.c','.h','.cc','.cpp','.cxx','.hpp','.swift','.py','.sh','.js','.ts','.php','.rs','.java','.m','.mm','.lua','.pl','.rb','.erl','.ex','.sql','.s','.asm'}
 MAX_TEXT=1048576
+MAX_ARCHIVE_MEMBERS=4096
+MAX_ARCHIVE_UNCOMPRESSED=512*1024*1024
+MAX_CHECKSUM=65536
+CHECKSUM_LINE=re.compile(r'[0-9a-fA-F]{64}  [A-Za-z0-9][A-Za-z0-9._+-]*\.tar\.gz(?:\.sha256)?')
+GITHUB_ORIGIN=re.compile(
+ r'(?:https://(?:[^@/?#\s]+@)?github\.com/|git@github\.com:|ssh://git@github\.com/)'
+ r'([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?',re.I|re.ASCII)
 
-def private_error(name):
+def origin_matches_repository(origin,repository):
+ match=GITHUB_ORIGIN.fullmatch(origin)
+ return bool(match and match[1].casefold()==repository.casefold())
+
+def private_error(name,policy=None):
  p=pathlib.PurePosixPath(name)
  if not name or not p.parts or p.is_absolute() or '..' in p.parts or '\\' in name:return 'unsafe path'
  parts=[x.removeprefix('._').casefold() for x in p.parts]
  if any(x in PRIVATE_DIRS and not (x=='internal' and (p.suffix.casefold() in CODE_TYPES or parts[-1]=='openapi.json')) for x in parts):return 'local-only directory'
  if parts[-1] in PRIVATE_FILES or p.suffix.casefold()=='.log':return 'local-only report/log'
- if p.suffix.casefold() in DOC_TYPES|{'.zip','.gz','.xz','.tar','.tgz'} and REPORT.search(parts[-1]):return 'internal planning/report file'
+ if p.suffix.casefold() in DOC_TYPES|{'.zip','.gz','.xz','.tar','.tgz'} and REPORT.search(parts[-1]):
+  if not policy or name not in policy.get('public_docs',[]):return 'internal planning/report file'
  return None
 
 def text_errors(name,text):
  return [name+': keep planning, test details and local paths out of public help/notes'] if INTERNAL.search(text) else []
 
+def public_guide(name):
+ return pathlib.PurePosixPath(name).suffix.casefold() in PUBLIC_GUIDE_TYPES
+
+def artifact_path_value(step):
+ lines=step.splitlines()
+ for i,line in enumerate(lines):
+  if not re.fullmatch(r'with:\s*(?:#.*)?',line.strip()):continue
+  with_indent=len(line)-len(line.lstrip())
+  for j in range(i+1,len(lines)):
+   current=lines[j]
+   if not current.strip() or current.lstrip().startswith('#'):continue
+   indent=len(current)-len(current.lstrip())
+   if indent<=with_indent:break
+   match=re.match(r'\s+path:\s*(.*)$',current)
+   if not match:continue
+   value=match[1].strip()
+   if not re.fullmatch(r'[|>](?:[1-9][+-]?|[+-][1-9]?)?(?:\s+#.*)?',value):return value
+   path_indent=indent
+   values=[]
+   for following in lines[j+1:]:
+    if following.strip() and len(following)-len(following.lstrip())<=path_indent:break
+    if following.strip() and not following.lstrip().startswith('!'):values.append(following.strip())
+   return '\n'.join(values)
+ return None
+
 def workflow_errors(name,text):
  errors=[]
- starts=list(re.finditer(r'(?m)^( +)- (?:name|uses|run|id|if):',text))
+ if re.search(r'\\(?:x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})',text):
+  errors.append(name+': escaped YAML scalars could hide an upload action or path')
+ for action in re.finditer(r'(?m)^\s*(?:-\s*)?uses\s*:\s*([^\n]*)',text):
+  value=action[1].strip()
+  if value.startswith('*') or '\\' in value or '${{' in value:
+   errors.append(name+': workflow action must be a concrete literal')
+ starts=list(re.finditer(r'(?m)^( +)-(?=\s|$)',text))
+ recognized=[]
  for i,match in enumerate(starts):
   end=next((m.start() for m in starts[i+1:] if len(m[1])<=len(match[1])),len(text))
   step=text[match.start():end]
-  if not re.search(r'uses:\s*[^\n]*upload-artifact@',step):continue
-  visible='\n'.join(line for line in step.splitlines() if not line.strip().startswith('!'))
-  private_paths=any(re.search(r"(?:^|[/\s:'\"])"+re.escape(part)+r'(?:/|$)',visible,re.I) for part in PRIVATE_DIRS)
+  if not re.search(r'(?m)^\s*(?:-\s*)?uses:\s*[^\n]*upload-artifact@',step):continue
+  recognized.append((match.start(),end))
+  visible=artifact_path_value(step)
+  if visible is None:
+   errors.append(name+': upload-artifact path must be explicit');continue
+  if '\\' in visible or '${{' in visible or re.match(r'\s*[*&]',visible):
+   errors.append(name+': upload-artifact path must be a concrete path');continue
+  private_paths=any(re.search(r"(?:^|[/\s:'\"])"+re.escape(part)+r"""(?=/|\s|['",\]}]|$)""",visible,re.I) for part in PRIVATE_DIRS)
   if private_paths or re.search(r'(?i)(?:evidence|coverage[-_ ]?report|(?:qa|test)[-_ /](?:results?|reports?|logs?)|work/qa|\.log\b|junit[^\n]*\.xml)',visible):
    errors.append(name+': internal QA/test reports must stay local')
+ for mention in re.finditer(r'upload-artifact@',text):
+  if not any(start<=mention.start()<end for start,end in recognized):
+   errors.append(name+': upload-artifact action must use an explicit step and path')
+ return errors
+
+def _yaml_code(line):
+ out=[];quote=None;escaped=False
+ for character in line:
+  if quote=='"':
+   out.append(character)
+   if escaped:escaped=False
+   elif character=='\\':escaped=True
+   elif character=='"':quote=None
+  elif quote=="'":
+   out.append(character)
+   if character=="'":quote=None
+  elif character in "'\"":quote=character;out.append(character)
+  elif character=='#':break
+  else:out.append(character)
+ return ''.join(out).rstrip()
+
+def workflow_pin_errors(name,text):
+ errors=[]
+ for line in text.splitlines():
+  code=_yaml_code(line)
+  match=re.fullmatch(r'\s*(?:-\s*)?uses\s*:\s*(.*?)\s*',code)
+  ambiguous=(re.match(r'\s*(?:-\s*)?["\']uses["\']\s*:',code)
+             or re.search(r'[{,]\s*(?:uses|["\']uses["\'])\s*:',code)
+             or re.match(r'\s*(?:-\s*)?\?(?:\s|$)',code)
+             or re.match(r'\s*(?:-\s*)?\*[A-Za-z0-9_.-]+\s*:',code)
+             or re.match(r'\s*(?:-\s*)?[!&][^\s]+\s+(?:uses|["\']uses["\'])\s*:',code))
+  if not match:
+   if ambiguous:errors.append(name+': workflow action must use a plain concrete uses key')
+   continue
+  value=match[1]
+  if (len(value)>=2 and value[0]==value[-1] and value[0] in "'\""):
+   value=value[1:-1]
+  if (not value or value.startswith(('*','&','|','>')) or '\\' in value
+      or '${{' in value or any(character.isspace() for character in value)):
+   errors.append(name+': workflow action must be a concrete literal');continue
+  if value.startswith('./'):
+   continue
+  if not re.fullmatch(
+      r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*@[0-9A-Fa-f]{40}',
+      value):
+   errors.append(name+': external workflow action must use a full commit SHA')
  return errors
 
 def git(repo,*args):return subprocess.check_output(['git','-C',str(repo),*args],stderr=subprocess.PIPE)
@@ -55,7 +152,7 @@ def changed_errors(repo,policy,revision,index=False):
  errors=[]
  for name in sorted(names):
   if not index and not exists_at(repo,revision,name):continue
-  error=private_error(name)
+  error=private_error(name,policy)
   if error:errors.append(name+': '+error);continue
   p=pathlib.PurePosixPath(name)
   if p.suffix.casefold() in DOC_TYPES and name not in CONTROL_FILES and p.name not in PACKAGE_DATA:
@@ -66,13 +163,42 @@ def changed_errors(repo,policy,revision,index=False):
     errors.append(name+': new document/data path needs public-policy approval');continue
   if name.startswith('.github/workflows/') and p.suffix.casefold() in {'.yml','.yaml'}:
    errors+=workflow_errors(name,git(repo,'show',(':' if index else revision+':')+name).decode('utf-8'))
-  if p.name.casefold() in USER_DOCS and p.suffix.casefold()!='.json':
+  historical_exception=not index and name in policy.get('historical_public_guide_exceptions',{}).get(revision,[])
+  scan_public_guide=public_guide(name) and not historical_exception
+  if index and scan_public_guide and exists_at(repo,'HEAD',name):
+   scan_public_guide=git(repo,'show',':'+name)!=git(repo,'show','HEAD:'+name)
+  if (p.name.casefold() in USER_DOCS and p.suffix.casefold()!='.json') or scan_public_guide:
    value=git(repo,'show',(':' if index else revision+':')+name)
    if len(value)>MAX_TEXT:errors.append(name+': help file exceeds size limit')
    else:errors+=text_errors(name,value.decode('utf-8'))
  return errors
 
-def index_errors(repo,policy):return changed_errors(repo,policy,None,index=True)
+def final_workflow_pin_errors(repo,revision=None,index=False):
+ if index:
+  names=git(repo,'ls-files','--cached','-z','--','.github/workflows')
+ else:
+  names=git(repo,'ls-tree','-r','--name-only','-z',revision,'--','.github/workflows')
+ errors=[]
+ for raw in names.split(b'\0'):
+  if not raw:continue
+  name=raw.decode('utf-8')
+  if pathlib.PurePosixPath(name).suffix.casefold() not in {'.yml','.yaml'}:continue
+  value=git(repo,'show',(':' if index else revision+':')+name).decode('utf-8')
+  errors+=workflow_pin_errors(name,value)
+ return errors
+
+def final_public_guide_errors(repo,policy,revision):
+ errors=[]
+ for name in sorted(set(policy.get('public_docs',[]))):
+  path=pathlib.PurePosixPath(name)
+  if path.suffix.casefold() not in PUBLIC_GUIDE_TYPES or not exists_at(repo,revision,name):continue
+  value=git(repo,'show',revision+':'+name)
+  if len(value)>MAX_TEXT:errors.append(name+': help file exceeds size limit')
+  else:errors+=text_errors(name,value.decode('utf-8'))
+ return errors
+
+def index_errors(repo,policy):
+ return changed_errors(repo,policy,None,index=True)+final_workflow_pin_errors(repo,index=True)
 
 def history_errors(repo,policy,revision):
  try:
@@ -80,7 +206,10 @@ def history_errors(repo,policy,revision):
   if subprocess.run(['git','-C',str(repo),'merge-base','--is-ancestor',base,revision],capture_output=True).returncode:
    return ['Update/rebase from the protected public baseline before publishing.']
   errors=[]
-  for commit in git(repo,'rev-list',revision,'^'+base).decode().splitlines():errors += [commit[:12]+' '+e for e in changed_errors(repo,policy,commit)]
+  for commit in git(repo,'rev-list',revision,'^'+base).decode().splitlines():
+   errors += [commit[:12]+' '+e for e in changed_errors(repo,policy,commit)]
+  errors += final_public_guide_errors(repo,policy,revision)
+  errors += final_workflow_pin_errors(repo,revision)
   return errors
  except (OSError,ValueError,UnicodeError,subprocess.CalledProcessError) as e:return ['Cannot verify source: '+str(e)]
 
@@ -89,34 +218,50 @@ def archive_errors(path):
  def entry(name,size,reader):
   error=private_error(name+'__directory__.c' if name.endswith('/') else name)
   if error:errors.append(name+': '+error)
-  elif pathlib.PurePosixPath(name).name.casefold() in USER_DOCS and reader:
+  elif reader and (pathlib.PurePosixPath(name).name.casefold() in USER_DOCS or pathlib.PurePosixPath(name).suffix.casefold() in PUBLIC_GUIDE_TYPES):
    if size>MAX_TEXT:errors.append(name+': help exceeds size limit')
    else:errors.extend(text_errors(name,reader().decode('utf-8')))
  try:
-  if zipfile.is_zipfile(path):
-   with zipfile.ZipFile(path) as z:
-    for item in z.infolist():
-     if stat.S_ISLNK(item.external_attr>>16):
-      target=z.read(item).decode('utf-8')
-      if private_error(target):errors.append(item.filename+': unsafe or private archive link')
-     entry(item.filename,item.file_size,None if item.is_dir() else lambda i=item:z.read(i))
-  elif tarfile.is_tarfile(path):
-   with tarfile.open(path,'r:*') as tar:
-    for item in tar:
-     if item.issym() or item.islnk():
-      error=private_error(item.linkname)
-      if error:errors.append(item.name+': unsafe or private archive link')
-     entry(item.name+'/' if item.isdir() else item.name,item.size,(lambda i=item:tar.extractfile(i).read(MAX_TEXT+1)) if item.isfile() else None)
-  elif str(path).lower().endswith(('.zip','.tar','.tar.gz','.tgz','.tar.xz','.tar.bz2')):
-   errors.append(str(path)+': unreadable archive')
- except (OSError,ValueError,UnicodeError,RuntimeError,zipfile.BadZipFile,tarfile.TarError) as e:errors.append(str(path)+': '+str(e))
+  expanded=0
+  with gzip.open(path,'rb') as source:
+   while data:=source.read(65536):
+    expanded+=len(data)
+    if expanded>MAX_ARCHIVE_UNCOMPRESSED:
+     errors.append(str(path)+': archive exceeds uncompressed size limit');return errors
+  with tarfile.open(path,'r:gz') as tar:
+   for index,item in enumerate(tar):
+    if index>=MAX_ARCHIVE_MEMBERS:
+     errors.append(str(path)+': archive has too many members');break
+    if item.issym() or item.islnk():
+     error=private_error(item.linkname)
+     if error:errors.append(item.name+': unsafe or private archive link')
+    entry(item.name+'/' if item.isdir() else item.name,item.size,(lambda i=item:tar.extractfile(i).read(MAX_TEXT+1)) if item.isfile() else None)
+   tar_end=tar.offset
+  with gzip.open(path,'rb') as source:
+   source.seek(tar_end)
+   while data:=source.read(65536):
+    if any(data):
+     errors.append(str(path)+': archive has nonzero data after tar end marker');break
+ except (OSError,ValueError,UnicodeError,RuntimeError,EOFError,tarfile.TarError) as e:errors.append(str(path)+': '+str(e))
  return errors
+
+def checksum_errors(path):
+ try:
+  if path.stat().st_size>MAX_CHECKSUM:return [str(path)+': checksum file exceeds size limit']
+  with path.open('rb') as source:data=source.read(MAX_CHECKSUM+1)
+  if len(data)>MAX_CHECKSUM:return [str(path)+': checksum file exceeds size limit']
+  text=data.decode('ascii')
+  lines=text.removesuffix('\n').split('\n')
+  if not text or not all(CHECKSUM_LINE.fullmatch(line) for line in lines):
+   return [str(path)+': invalid checksum lines']
+  return []
+ except (OSError,UnicodeError) as error:return [str(path)+': '+str(error)]
 
 def release_errors(policy,tag,assets,notes=None):
  if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]*',tag):return ['Unsafe release tag']
  version=tag[1:] if tag.startswith('v') else tag
  patterns=[p.replace('{version}',version) for p in policy.get('release_assets',[])]
- errors=[];seen=set()
+ errors=[];seen=set();archives={};checksums={}
  for value in assets:
   p=pathlib.Path(value);name=p.name
   if name in seen:errors.append('Duplicated release asset: '+name)
@@ -125,29 +270,173 @@ def release_errors(policy,tag,assets,notes=None):
   if error:errors.append(name+': '+error);continue
   if not any(fnmatch.fnmatchcase(name,pattern) for pattern in patterns):errors.append(name+': not an approved release asset');continue
   if p.is_symlink() or not p.is_file():errors.append(name+': missing/unsafe asset');continue
-  errors+=archive_errors(p)
+  if name.endswith('.tar.gz'):
+   archive_problems=archive_errors(p)
+   errors+=archive_problems
+   if not archive_problems:archives[name]=p
+  elif name.endswith('.tar.gz.sha256') or name=='SHA256SUMS':
+   checksum_problems=checksum_errors(p)
+   errors+=checksum_problems
+   if not checksum_problems:checksums[name]=p
+  else:errors.append(name+': release asset type has no validator')
   if name.casefold() in USER_DOCS:
    if p.stat().st_size>MAX_TEXT:errors.append(name+': help exceeds size limit')
    else:errors+=text_errors(name,p.read_text(encoding='utf-8'))
+ for name,archive in archives.items():
+  sidecar=checksums.get(name+'.sha256')
+  manifest=checksums.get('SHA256SUMS')
+  if not sidecar and not manifest:
+   errors.append(name+': missing checksum sidecar or SHA256SUMS');continue
+  with archive.open('rb') as source:digest=hashlib.file_digest(source,'sha256').hexdigest()
+  for checksum_file in (sidecar,manifest):
+   if checksum_file is None:continue
+   lines=[line.split('  ',1) for line in checksum_file.read_text(encoding='ascii').splitlines()]
+   matching=[value for value,filename in lines if filename==name]
+   if len(matching)!=1:
+    errors.append(checksum_file.name+': checksum must name '+name+' exactly once')
+   elif matching[0].lower()!=digest:
+    errors.append(checksum_file.name+': checksum mismatch for '+name)
  if notes:
   p=pathlib.Path(notes)
   if p.is_symlink() or not p.is_file() or p.stat().st_size>MAX_TEXT:errors.append('Missing/unsafe release notes')
   else:errors+=text_errors('Release notes',p.read_text(encoding='utf-8'))
  return errors
 
+def verify_ci_metadata(run,jobs,artifacts,run_id,tag,revision,repository):
+ if not all(isinstance(value,dict) for value in (run,jobs,artifacts)):
+  raise ValueError('Qualified CI metadata is invalid')
+ version=tag[1:] if tag.startswith('v') else tag
+ archive=f'flussonix-{version}-linux-x86_64-{revision[:12]}.tar.gz'
+ artifact_name=f'flussonix-candidate-{revision}'
+ if (run.get('status')!='completed' or run.get('conclusion')!='success'
+     or run.get('event')!='push' or run.get('head_branch')!='main'
+     or run.get('head_sha')!=revision or run.get('name')!='check'
+     or run.get('path') not in ('.github/workflows/ci.yml',
+                                '.github/workflows/ci.yml@main')
+     or not isinstance(run.get('repository'),dict)
+     or run['repository'].get('full_name')!=repository
+     or type(run['repository'].get('id')) is not int):
+  raise ValueError('Qualified CI run does not match the release source')
+ rows=jobs.get('jobs')
+ if (not isinstance(rows,list) or jobs.get('total_count')!=len(rows)
+     or len(rows)!=2 or {row.get('name') for row in rows if isinstance(row,dict)}
+     != {'verify','release_package_smoke'}
+     or any(not isinstance(row,dict) or row.get('status')!='completed'
+            or row.get('conclusion')!='success' for row in rows)):
+  raise ValueError('Qualified CI jobs did not both pass')
+ rows=artifacts.get('artifacts')
+ if not isinstance(rows,list) or artifacts.get('total_count')!=1 or len(rows)!=1:
+  raise ValueError('Qualified CI artifact is missing or ambiguous')
+ row=rows[0]
+ if (not isinstance(row,dict) or type(row.get('id')) is not int or row['id']<=0
+     or not isinstance(row.get('digest'),str)
+     or not re.fullmatch(r'sha256:[0-9a-f]{64}',row['digest'])
+     or row.get('name')!=artifact_name
+     or row.get('expired') is not False
+     or type(row.get('size_in_bytes')) is not int
+     or not 0<row['size_in_bytes']<=MAX_ARCHIVE_UNCOMPRESSED
+     or not isinstance(row.get('workflow_run'),dict)
+     or row['workflow_run'].get('id')!=run_id
+     or row['workflow_run'].get('head_sha')!=revision
+     or row['workflow_run'].get('repository_id')!=run['repository']['id']):
+  raise ValueError('Qualified CI artifact does not match the release run')
+ return artifact_name,archive,archive+'.sha256'
+
+def verify_ci_zip(downloaded,assets,archive,digest,size):
+ names={archive,archive+'.sha256'}
+ if len(assets)!=2 or {path.name for path in assets}!=names:
+  raise ValueError('Upload must contain the exact CI archive and checksum')
+ if (downloaded.is_symlink() or not downloaded.is_file()
+     or downloaded.stat().st_size!=size or size>MAX_ARCHIVE_UNCOMPRESSED):
+  raise ValueError('Qualified CI ZIP size differs from GitHub metadata')
+ with downloaded.open('rb') as source:
+  if 'sha256:'+hashlib.file_digest(source,'sha256').hexdigest()!=digest:
+   raise ValueError('Qualified CI ZIP digest differs from GitHub metadata')
+ try:
+  with zipfile.ZipFile(downloaded) as bundle:
+   entries=bundle.infolist()
+   if len(entries)!=2 or {item.filename for item in entries}!=names:
+    raise ValueError('Downloaded CI artifact has unexpected files')
+   for item in entries:
+    limit=MAX_CHECKSUM if item.filename.endswith('.sha256') else MAX_ARCHIVE_UNCOMPRESSED
+    mode=stat.S_IFMT(item.external_attr>>16)
+    if (item.is_dir() or item.flag_bits&1 or mode not in (0,stat.S_IFREG)
+        or item.file_size>limit):
+     raise ValueError('Qualified CI artifact contains unsafe files')
+    local=next(path for path in assets if path.name==item.filename)
+    if (local.is_symlink() or not local.is_file() or local.stat().st_size!=item.file_size):
+     raise ValueError('Upload differs from qualified CI artifact')
+    with bundle.open(item) as remote,local.open('rb') as source:
+     remote_hash=hashlib.sha256();total=0
+     while block:=remote.read(65536):
+      total+=len(block)
+      if total>limit:raise ValueError('Qualified CI entry exceeds size limit')
+      remote_hash.update(block)
+     if total!=item.file_size or remote_hash.digest()!=hashlib.file_digest(source,'sha256').digest():
+      raise ValueError('Upload differs from qualified CI artifact')
+ except (zipfile.BadZipFile,RuntimeError,EOFError) as error:
+  raise ValueError('Qualified CI ZIP is invalid') from error
+
+def github_json(repository,path):
+ return json.loads(subprocess.check_output(['gh','api',path]))
+
+def remote_tag_revision(repository,tag):
+ ref=github_json(repository,f'repos/{repository}/git/ref/tags/{tag}')
+ value=ref.get('object') if isinstance(ref,dict) else None
+ for _ in range(4):
+  if not isinstance(value,dict) or not re.fullmatch(r'[0-9a-f]{40}',str(value.get('sha',''))):
+   break
+  if value.get('type')=='commit':return value['sha']
+  if value.get('type')!='tag':break
+  tagged=github_json(repository,f'repos/{repository}/git/tags/{value["sha"]}')
+  value=tagged.get('object') if isinstance(tagged,dict) else None
+ raise ValueError('Remote release tag does not resolve to a commit')
+
+def download_ci_zip(repository,artifact_id,destination):
+ with destination.open('xb') as output:
+  subprocess.run(['gh','api',f'repos/{repository}/actions/artifacts/{artifact_id}/zip'],
+                 stdout=output,check=True)
+
+def verify_ci_provenance(repo,policy,tag,assets,run_id):
+ if (type(run_id) is not int or run_id<=0
+     or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]*',tag)):
+  raise ValueError('Qualified CI run ID or release tag is invalid')
+ repository=policy['repository']
+ revision=git(repo,'rev-parse','HEAD').decode().strip()
+ if not re.fullmatch(r'[0-9a-f]{40}',revision):
+  raise ValueError('Release checkout revision is invalid')
+ local_tag=git(repo,'rev-parse','--verify',f'refs/tags/{tag}^{{commit}}').decode().strip()
+ if local_tag!=revision or remote_tag_revision(repository,tag)!=revision:
+  raise ValueError('Release tag differs from qualified source revision')
+ root=f'repos/{repository}/actions/runs/{run_id}'
+ run=github_json(repository,root)
+ jobs=github_json(repository,root+'/jobs?per_page=100')
+ artifacts=github_json(repository,root+'/artifacts?per_page=100')
+ _,archive,_=verify_ci_metadata(run,jobs,artifacts,run_id,tag,revision,repository)
+ artifact=artifacts['artifacts'][0]
+ common=(pathlib.Path(repo)/git(repo,'rev-parse','--git-common-dir').decode().strip()).resolve()
+ with tempfile.TemporaryDirectory(prefix='publication-qualified-',dir=common) as temporary:
+  downloaded=pathlib.Path(temporary)/'artifact.zip'
+  download_ci_zip(repository,artifact['id'],downloaded)
+  verify_ci_zip(downloaded,assets,archive,artifact['digest'],artifact['size_in_bytes'])
+
+@contextmanager
 def upload_snapshot(repo,policy,tag,assets,notes):
  common=(pathlib.Path(repo)/git(repo,'rev-parse','--git-common-dir').decode().strip()).resolve()
  stage=pathlib.Path(tempfile.mkdtemp(prefix='publication-upload-',dir=common));paths=[]
- for asset in assets:
-  destination=stage/pathlib.Path(asset).name
-  if destination.exists():raise ValueError('Duplicate upload filename')
-  shutil.copyfile(asset,destination,follow_symlinks=False);paths.append(destination)
- note=None
- if notes:
-  note=stage/'upload-notes.txt';shutil.copyfile(notes,note,follow_symlinks=False)
- errors=release_errors(policy,tag,paths,note)
- if errors:raise ValueError('; '.join(errors))
- return paths,note
+ try:
+  for asset in assets:
+   destination=stage/pathlib.Path(asset).name
+   if destination.exists():raise ValueError('Duplicate upload filename')
+   shutil.copyfile(asset,destination,follow_symlinks=False);paths.append(destination)
+  note=None
+  if notes:
+   note=stage/'upload-notes.txt';shutil.copyfile(notes,note,follow_symlinks=False)
+  errors=release_errors(policy,tag,paths,note)
+  if errors:raise ValueError('; '.join(errors))
+  yield paths,note
+ finally:
+  shutil.rmtree(stage)
 
 def main():
  p=argparse.ArgumentParser(description=__doc__)
@@ -157,6 +446,7 @@ def main():
  sub.add_parser('pre-push')
  for mode in ['release-files','upload']:
   r=sub.add_parser(mode);r.add_argument('--tag',required=True);r.add_argument('--asset',action='append',type=pathlib.Path,required=True);r.add_argument('--notes-file',type=pathlib.Path)
+  if mode=='upload':r.add_argument('--qualified-run',type=int)
  args=p.parse_args();repo=args.repository.resolve()
  try:
   policy=json.loads((args.policy or repo/(CONTROL+'policy.json')).read_text())
@@ -175,22 +465,23 @@ def main():
    if args.command=='upload':
     errors+=history_errors(repo,policy,'HEAD')
     if git(repo,'status','--porcelain').strip():errors.append('Upload requires a clean source checkout')
+    if args.qualified_run is None:errors.append('Qualified CI run ID required for upload')
   if errors:
    for error in errors:print('Publication blocked: '+error,file=sys.stderr)
    return 1
   if args.command=='upload':
    # Preserve existing project signing/qualification gates; this checks the upload only.
-   origin=git(repo,'remote','get-url','origin').decode().strip()
-   identity=re.search(r'github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$',origin,re.I)
-   if not identity or identity[1].casefold()!=policy['repository'].casefold():raise ValueError('Upload repository identity differs')
-   assets,notes=upload_snapshot(repo,policy,args.tag,args.asset,args.notes_file)
-   release=json.loads(subprocess.check_output(['gh','api',f'repos/{policy["repository"]}/releases/tags/{args.tag}']))
-   if text_errors('Release notes',release.get('body') or ''):raise ValueError('Existing release notes contain internal details')
-   version=args.tag[1:] if args.tag.startswith('v') else args.tag
-   patterns=[p.replace('{version}',version) for p in policy.get('release_assets',[])]
-   for asset in release['assets']:
-    if private_error(asset['name']) or not any(fnmatch.fnmatchcase(asset['name'],p) for p in patterns):raise ValueError('Existing release has an unapproved attachment; review it before upload')
-   subprocess.run(['gh','release','upload',args.tag,*[str(x) for x in assets],'--repo',policy['repository']],check=True)
+   origin=git(repo,'remote','get-url','origin').decode().removesuffix('\n')
+   if not origin_matches_repository(origin,policy['repository']):raise ValueError('Upload repository identity differs')
+   with upload_snapshot(repo,policy,args.tag,args.asset,args.notes_file) as (assets,notes):
+    verify_ci_provenance(repo,policy,args.tag,assets,args.qualified_run)
+    release=json.loads(subprocess.check_output(['gh','api',f'repos/{policy["repository"]}/releases/tags/{args.tag}']))
+    if text_errors('Release notes',release.get('body') or ''):raise ValueError('Existing release notes contain internal details')
+    version=args.tag[1:] if args.tag.startswith('v') else args.tag
+    patterns=[p.replace('{version}',version) for p in policy.get('release_assets',[])]
+    for asset in release['assets']:
+     if private_error(asset['name']) or not any(fnmatch.fnmatchcase(asset['name'],p) for p in patterns):raise ValueError('Existing release has an unapproved attachment; review it before upload')
+    subprocess.run(['gh','release','upload',args.tag,*[str(x) for x in assets],'--repo',policy['repository']],check=True)
   return 0
  except (OSError,ValueError,UnicodeError,KeyError,TypeError,subprocess.CalledProcessError) as error:
   print('Publication blocked: '+str(error),file=sys.stderr);return 1

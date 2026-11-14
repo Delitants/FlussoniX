@@ -2,6 +2,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 use std::cmp::Ordering;
 
+pub(crate) fn bounded_fields(expression: &str) -> Result<Vec<&str>, &'static str> {
+    const MAX_SORT_FIELDS: usize = 16;
+    // Existing API clients may send long unsupported dotted paths. Keep their
+    // deterministic fallback while limiting parsing and per-row key work.
+    const MAX_SORT_BYTES: usize = 8192;
+    if expression.len() > MAX_SORT_BYTES {
+        return Err("sort expression is too long");
+    }
+    let fields = expression
+        .split(',')
+        .take(MAX_SORT_FIELDS + 1)
+        .collect::<Vec<_>>();
+    if fields.len() > MAX_SORT_FIELDS {
+        return Err("sort expression has too many fields");
+    }
+    Ok(fields)
+}
+
 /// Scalar collection ordering. Paths are compiled once per request; identity
 /// breaks ties so repeated pages have a deterministic order for a fixed snapshot.
 pub(crate) struct Sort<'a> {
@@ -156,6 +174,9 @@ impl Scalar<'_> {
 }
 
 fn scalar<'a>(row: &'a Value, path: &[&str]) -> Scalar<'a> {
+    if path.len() > 16 || path.iter().any(|component| component.len() > 256) {
+        return Scalar::Missing;
+    }
     let mut value = row;
     for part in path {
         let Some(next) = value.as_object().and_then(|object| object.get(*part)) else {

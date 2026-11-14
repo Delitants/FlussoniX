@@ -1,28 +1,41 @@
 //! Viewer authorization is independent of worker ownership and cluster peer credentials.
+use crate::iptv::{
+    client::{AuthorityClient, LeaseInput, LeaseReply},
+    lease::SessionKey,
+    store::IptvStore,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
     pub url: Option<String>,
+    kind: PolicyKind,
     keys: Vec<String>,
     max_sessions: Option<u64>,
     token_hash: Option<String>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PolicyKind {
+    Open,
+    Callback,
+    Iptv,
 }
 impl Policy {
     pub fn from_config(cfg: &Value, root: &Value) -> Result<Self, String> {
         let mut policy = Self {
             url: None,
+            kind: PolicyKind::Open,
             keys: ["name", "proto", "ip", "token"].map(str::to_owned).to_vec(),
             max_sessions: None,
             token_hash: cfg
@@ -46,6 +59,11 @@ impl Policy {
                     .any(|k| !["url", "session_keys", "max_sessions"].contains(&k.as_str()))
                 {
                     return Err("unsupported on_play field".into());
+                }
+                if obj.get("url").and_then(Value::as_str) == Some("iptv://")
+                    && (obj.contains_key("session_keys") || obj.contains_key("max_sessions"))
+                {
+                    return Err("IPTV on_play does not accept callback options".into());
                 }
                 if let Some(keys) = obj.get("session_keys") {
                     policy.keys = keys
@@ -79,6 +97,13 @@ impl Policy {
                     .and_then(Value::as_str)
                     .ok_or("on_play.url required")?
             };
+            if raw == "iptv://" {
+                policy.kind = PolicyKind::Iptv;
+                return Ok(policy);
+            }
+            if raw.starts_with("iptv://") {
+                return Err("IPTV on_play must be exactly iptv://".into());
+            }
             let url = if let Some(name) = raw.strip_prefix("auth://") {
                 crate::config::valid_name(name)?;
                 root["auth_backends"]
@@ -90,7 +115,11 @@ impl Policy {
                 raw
             };
             validate_http(url)?;
+            if !policy.keys.iter().any(|key| key == "token") {
+                return Err("callback session_keys must include token".into());
+            }
             policy.url = Some(url.to_owned());
+            policy.kind = PolicyKind::Callback;
         }
         Ok(policy)
     }
@@ -112,6 +141,23 @@ impl Policy {
             };
             h.update((key.len() as u64).to_be_bytes());
             h.update(key.as_bytes());
+            h.update((value.len() as u64).to_be_bytes());
+            h.update(value.as_bytes());
+        }
+        format!("{:x}", h.finalize())
+    }
+    fn callback_identity(&self, r: &ViewerRequest) -> String {
+        let mut h = Sha256::new();
+        for value in [
+            &r.name,
+            &r.proto,
+            &r.ip,
+            &r.token,
+            &r.qs,
+            &r.user_agent,
+            &r.referer,
+            &r.host,
+        ] {
             h.update((value.len() as u64).to_be_bytes());
             h.update(value.as_bytes());
         }
@@ -145,6 +191,8 @@ pub struct ViewerRequest {
     pub user_agent: String,
     pub referer: String,
     pub host: String,
+    /// A finite media response sharing the protocol identity of a live signal.
+    pub finite_media: bool,
 }
 #[derive(Clone)]
 enum Decision {
@@ -152,6 +200,41 @@ enum Decision {
     Allow,
     Deny,
     Redirect(String),
+}
+struct CallbackLane {
+    count: Arc<AtomicU64>,
+    flight: Arc<AsyncMutex<()>>,
+    request: ViewerRequest,
+    decision: Decision,
+    next_check: Instant,
+    allowed_until: Instant,
+    deadline_nanos: Arc<AtomicU64>,
+    expiry_task: Option<tokio::task::AbortHandle>,
+    renewal_task: Option<tokio::task::AbortHandle>,
+    approvals: u64,
+    forced: bool,
+    last_seen: Instant,
+    playback_seen: Option<Instant>,
+    generation: u64,
+    pending: usize,
+    live: usize,
+    user_id: String,
+    effective_max: Option<u64>,
+    unique: bool,
+    account_conflict: bool,
+    cancel: CancellationToken,
+}
+impl Drop for CallbackLane {
+    fn drop(&mut self) {
+        if let Some(task) = self.expiry_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.renewal_task.take() {
+            task.abort();
+        }
+        self.cancel.cancel();
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 struct State {
     policy: Policy,
@@ -163,22 +246,138 @@ struct State {
     created: Instant,
     last_seen: Instant,
     playback_seen: Option<Instant>,
+    segmented_seen: Option<Instant>,
+    continuous_live: usize,
+    control_live: usize,
+    segmented_live: usize,
+    segmented_control_live: usize,
+    handoff_live: usize,
     effective_max: Option<u64>,
     unique: bool,
     number: u64,
     generation: u64,
+    lane_serial: u64,
     user_id: String,
     available: bool,
     revoked_until: Option<Instant>,
     cancel: CancellationToken,
+    callback_lanes: HashMap<String, CallbackLane>,
 }
 impl State {
+    /// Slot count after a prospective grant, using the same grouping as
+    /// `capacity_units` but without publishing or changing live state.
+    fn projected_capacity_units(&self, kind: GrantKind, consumes_handoff: bool) -> usize {
+        let active = self
+            .control_live
+            .saturating_add(self.handoff_live)
+            .saturating_add(self.continuous_live)
+            .saturating_sub(usize::from(consumes_handoff))
+            .saturating_add(usize::from(matches!(
+                kind,
+                GrantKind::Control | GrantKind::Continuous | GrantKind::Handoff
+            )));
+        let segmented = self
+            .segmented_live
+            .saturating_add(self.segmented_control_live)
+            .saturating_add(usize::from(matches!(
+                kind,
+                GrantKind::Segmented | GrantKind::SegmentedControl
+            )));
+        active.saturating_add(usize::from(active == 0 && segmented > 0))
+    }
+    fn capacity_units(&self, live: usize, per_connection: bool) -> usize {
+        if live == 0 {
+            if self.policy.kind == PolicyKind::Callback {
+                return usize::from(self.callback_lanes.values().any(|lane| {
+                    matches!(lane.decision, Decision::Allow)
+                        && lane.allowed_until > Instant::now()
+                        && !lane.cancel.is_cancelled()
+                        && lane
+                            .playback_seen
+                            .is_some_and(|seen| seen.elapsed() < Duration::from_secs(30))
+                }));
+            }
+            let recent = if self.policy.kind == PolicyKind::Iptv {
+                self.segmented_seen
+            } else {
+                self.playback_seen
+            };
+            return usize::from(
+                matches!(self.decision, Decision::Allow)
+                    && recent.is_some_and(|seen| seen.elapsed() < Duration::from_secs(30)),
+            );
+        }
+        if !per_connection {
+            return 1;
+        }
+        // Unclaimed handoffs each hold a slot. Finite media shares a matching
+        // continuous signal's slot; ordinary controls remain independent.
+        let active = self
+            .control_live
+            .saturating_add(self.handoff_live)
+            .saturating_add(self.continuous_live);
+        active.saturating_add(usize::from(
+            active == 0 && (self.segmented_live > 0 || self.segmented_control_live > 0),
+        ))
+    }
+    fn add_grant(&mut self, kind: GrantKind) {
+        match kind {
+            GrantKind::Continuous => self.continuous_live += 1,
+            GrantKind::Segmented => self.segmented_live += 1,
+            GrantKind::Handoff => self.handoff_live += 1,
+            GrantKind::Control => self.control_live += 1,
+            GrantKind::SegmentedControl => self.segmented_control_live += 1,
+            GrantKind::ConsumedHandoff => {}
+        }
+    }
+    fn remove_grant(&mut self, kind: GrantKind) {
+        match kind {
+            GrantKind::Continuous => self.continuous_live -= 1,
+            GrantKind::Segmented => self.segmented_live -= 1,
+            GrantKind::Handoff => self.handoff_live -= 1,
+            GrantKind::Control => self.control_live -= 1,
+            GrantKind::SegmentedControl => self.segmented_control_live -= 1,
+            GrantKind::ConsumedHandoff => {}
+        }
+    }
     fn cancel_playback(&mut self) {
         self.cancel.cancel();
         self.playback_seen = None;
+        self.segmented_seen = None;
         self.allowed_until = Instant::now();
+        for lane in self.callback_lanes.values_mut() {
+            lane.playback_seen = None;
+            lane.allowed_until = Instant::now();
+            lane.deadline_nanos.store(0, Ordering::Release);
+            if let Some(task) = lane.expiry_task.take() {
+                task.abort();
+            }
+            if let Some(task) = lane.renewal_task.take() {
+                task.abort();
+            }
+        }
     }
     fn recovery_activity(&self, current: Option<&Policy>, now: Instant) -> Option<Instant> {
+        if self.policy.kind == PolicyKind::Callback {
+            return self
+                .callback_lanes
+                .values()
+                .filter_map(|lane| {
+                    let seen = lane.playback_seen?;
+                    (now.duration_since(seen) < Duration::from_secs(30)
+                        && matches!(lane.decision, Decision::Allow)
+                        && self.available
+                        && !self.cancel.is_cancelled()
+                        && !lane.cancel.is_cancelled()
+                        && !lane.forced
+                        && lane.allowed_until > now
+                        && !self.revoked_until.is_some_and(|until| until > now)
+                        && current == Some(&self.policy)
+                        && self.policy.accepts_token(&lane.request.token))
+                    .then_some(seen)
+                })
+                .max();
+        }
         let seen = self.playback_seen?;
         (now.duration_since(seen) < Duration::from_secs(30)
             && matches!(self.decision, Decision::Allow)
@@ -195,10 +394,32 @@ impl State {
 struct Entry {
     id: String,
     state: Mutex<State>,
-    flight: AsyncMutex<()>,
+    flight: Arc<AsyncMutex<()>>,
+    remote: AsyncMutex<RemoteState>,
+    remote_notify: Notify,
+    remote_epoch: Instant,
+    remote_deadline_micros: AtomicU64,
     live: AtomicU64,
     admissions: AtomicU64,
     bytes: AtomicU64,
+}
+struct RemoteState {
+    current: Option<RemoteLease>,
+    running: bool,
+    session: uuid::Uuid,
+}
+impl Default for RemoteState {
+    fn default() -> Self {
+        Self {
+            current: None,
+            running: false,
+            session: uuid::Uuid::new_v4(),
+        }
+    }
+}
+struct RemoteLease {
+    input: LeaseInput,
+    reply: LeaseReply,
 }
 /// Per-pass stream/activity only, never cached permission or retained session ownership.
 pub(crate) struct RecoveryDemand {
@@ -246,14 +467,55 @@ impl Entries {
             !sessions.is_empty()
         });
     }
+    /// Called under the cache lock, which also serializes new Arc/Weak owners.
+    fn prune(&mut self, now: Instant, capacity_pressure: bool) {
+        self.retain(|_, entry| {
+            // Renewal callbacks carry Arc ownership without an admission count.
+            if Arc::strong_count(entry) > 1
+                || entry.live.load(Ordering::Relaxed) > 0
+                || entry.admissions.load(Ordering::Relaxed) > 0
+            {
+                return true;
+            }
+            let state = entry.state.lock().unwrap();
+            if state.revoked_until.is_some_and(|until| until > now)
+                || state
+                    .playback_seen
+                    .is_some_and(|seen| now.duration_since(seen) < Duration::from_secs(30))
+            {
+                return true;
+            }
+            if capacity_pressure {
+                // Ordinary failed decisions may be checked early, but allowed
+                // sessions keep their normal reconnect/renewal semantics.
+                matches!(state.decision, Decision::Allow)
+            } else {
+                now.duration_since(state.last_seen) < Duration::from_secs(30)
+                    || (!matches!(state.decision, Decision::Allow) && state.next_check > now)
+            }
+        });
+    }
 }
 impl Entry {
-    fn occupied(&self) -> bool {
+    fn set_remote_deadline(&self, deadline: Instant) {
+        let micros = deadline
+            .saturating_duration_since(self.remote_epoch)
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        self.remote_deadline_micros
+            .store(micros.max(1), Ordering::Release);
+    }
+    fn remote_lease_expired(&self) -> bool {
+        let deadline = self.remote_deadline_micros.load(Ordering::Acquire);
+        deadline != 0 && self.remote_epoch.elapsed().as_micros() >= u128::from(deadline)
+    }
+    fn occupied_units(&self, node_capacity: bool) -> usize {
         let s = self.state.lock().unwrap();
-        self.live.load(Ordering::Relaxed) > 0
-            || (matches!(s.decision, Decision::Allow)
-                && s.playback_seen
-                    .is_some_and(|seen| seen.elapsed() < Duration::from_secs(30)))
+        let live = usize::try_from(self.live.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+        s.capacity_units(live, node_capacity || s.policy.kind == PolicyKind::Iptv)
+    }
+    fn occupied(&self) -> bool {
+        self.occupied_units(false) > 0
     }
 }
 // Keep in-flight policy requests in the cache; only admitted grants own capacity.
@@ -261,6 +523,22 @@ struct PendingAuthorization(Arc<Entry>);
 impl Drop for PendingAuthorization {
     fn drop(&mut self) {
         self.0.admissions.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+struct PendingCallbackLane {
+    entry: Arc<Entry>,
+    key: String,
+    generation: u64,
+    session_generation: u64,
+}
+impl Drop for PendingCallbackLane {
+    fn drop(&mut self) {
+        let mut state = self.entry.state.lock().unwrap();
+        if let Some(lane) = state.callback_lanes.get_mut(&self.key)
+            && lane.generation == self.generation
+        {
+            lane.pending -= 1;
+        }
     }
 }
 /// A short-lived global slot promised to one native HTTP admission ticket.
@@ -277,9 +555,94 @@ pub struct Grant {
     capacity_reservation: Option<Arc<CapacityReservation>>,
     output_credit: Option<Arc<crate::admission_credit::OutputCredit>>,
     entry: Option<Arc<Entry>>,
+    callback_lane: Option<String>,
+    callback_generation: Option<u64>,
+    callback_deadline_nanos: Option<Arc<AtomicU64>>,
     cancel: CancellationToken,
+    expires_at: Option<SystemTime>,
+    expiry_task: Option<tokio::task::JoinHandle<()>>,
+    kind: AtomicU8,
+    segmented_delivery: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum GrantKind {
+    Control,
+    Continuous,
+    Segmented,
+    Handoff,
+    SegmentedControl,
+    ConsumedHandoff,
+}
+impl GrantKind {
+    fn for_request(playback: bool, segmented: bool) -> Self {
+        match (playback, segmented) {
+            (false, false) => Self::Control,
+            (false, true) => Self::SegmentedControl,
+            (true, false) => Self::Continuous,
+            (true, true) => Self::Segmented,
+        }
+    }
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Continuous,
+            2 => Self::Segmented,
+            3 => Self::Handoff,
+            4 => Self::SegmentedControl,
+            5 => Self::ConsumedHandoff,
+            _ => Self::Control,
+        }
+    }
 }
 impl Grant {
+    fn expire_at(&mut self, expires_at: SystemTime) {
+        self.expires_at = Some(expires_at);
+        // A child token keeps this viewer's deadline separate from the
+        // entry's shared cancellation state and wakes token-only transports.
+        self.cancel = self.cancel.child_token();
+        let cancel = self.cancel.clone();
+        self.expiry_task = Some(tokio::spawn(async move {
+            loop {
+                let Ok(remaining) = expires_at.duration_since(SystemTime::now()) else {
+                    cancel.cancel();
+                    break;
+                };
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(remaining.min(Duration::from_secs(60))) => {}
+                }
+            }
+        }));
+    }
+    pub(crate) fn mark_handoff(&mut self) {
+        if let Some(entry) = &self.entry {
+            let mut s = entry.state.lock().unwrap();
+            let kind = GrantKind::from_u8(self.kind.load(Ordering::Relaxed));
+            if matches!(kind, GrantKind::Control | GrantKind::SegmentedControl) {
+                s.remove_grant(kind);
+                s.add_grant(GrantKind::Handoff);
+                self.kind.store(GrantKind::Handoff as u8, Ordering::Relaxed);
+            }
+        }
+    }
+    pub(crate) fn restore_handoff(&mut self) -> bool {
+        if self.is_cancelled() {
+            return false;
+        }
+        let Some(entry) = &self.entry else {
+            return false;
+        };
+        let mut state = entry.state.lock().unwrap();
+        match GrantKind::from_u8(self.kind.load(Ordering::Relaxed)) {
+            GrantKind::Handoff => true,
+            GrantKind::ConsumedHandoff => {
+                state.add_grant(GrantKind::Handoff);
+                self.kind.store(GrantKind::Handoff as u8, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
+    }
     pub(crate) fn release_capacity_reservation(&mut self) {
         self.capacity_reservation = None;
     }
@@ -296,11 +659,26 @@ impl Grant {
     }
     /// Read-only recovery permission from this original native viewer grant.
     pub(crate) fn recovery_activity(&self) -> Option<Instant> {
-        if self.cancel.is_cancelled() {
+        if self.is_cancelled() {
             return None;
         }
         let entry = self.entry.as_ref()?;
         let state = entry.state.lock().ok()?;
+        if let Some(key) = &self.callback_lane {
+            let lane = state.callback_lanes.get(key)?;
+            let seen = lane.playback_seen?;
+            let now = Instant::now();
+            return (now.duration_since(seen) < Duration::from_secs(30)
+                && matches!(lane.decision, Decision::Allow)
+                && state.available
+                && !state.cancel.is_cancelled()
+                && !lane.cancel.is_cancelled()
+                && !lane.forced
+                && lane.allowed_until > now
+                && !state.revoked_until.is_some_and(|until| until > now)
+                && state.policy.accepts_token(&lane.request.token))
+            .then_some(seen);
+        }
         state.recovery_activity(Some(&state.policy), Instant::now())
     }
     pub(crate) fn session_identity(&self) -> Option<&str> {
@@ -310,20 +688,46 @@ impl Grant {
     pub(crate) fn playback(&self) {
         if let Some(e) = &self.entry {
             let mut s = e.state.lock().unwrap();
-            if self.cancel.is_cancelled() {
+            if self.is_cancelled() {
                 return;
+            }
+            let previous = GrantKind::from_u8(self.kind.load(Ordering::Relaxed));
+            if matches!(previous, GrantKind::Control | GrantKind::SegmentedControl) {
+                let kind = if self.segmented_delivery {
+                    GrantKind::Segmented
+                } else {
+                    GrantKind::Continuous
+                };
+                s.remove_grant(previous);
+                s.add_grant(kind);
+                if let Some(key) = &self.callback_lane
+                    && let Some(lane) = s.callback_lanes.get_mut(key)
+                {
+                    lane.playback_seen = Some(Instant::now());
+                }
+                self.kind.store(kind as u8, Ordering::Relaxed);
             }
             let now = Instant::now();
             s.playback_seen = Some(now);
+            if self.segmented_delivery {
+                s.segmented_seen = Some(now);
+            }
             s.last_seen = now;
         }
     }
     pub fn peer() -> Self {
         Self {
             entry: None,
+            callback_lane: None,
+            callback_generation: None,
+            callback_deadline_nanos: None,
             output_credit: None,
             capacity_reservation: None,
             cancel: CancellationToken::new(),
+            expires_at: None,
+            expiry_task: None,
+            kind: AtomicU8::new(GrantKind::Control as u8),
+            segmented_delivery: false,
         }
     }
     pub async fn cancelled(&self) {
@@ -334,17 +738,32 @@ impl Grant {
     }
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+            || self
+                .callback_deadline_nanos
+                .as_ref()
+                .zip(self.entry.as_ref())
+                .is_some_and(|(deadline, entry)| {
+                    let nanos = deadline.load(Ordering::Acquire);
+                    nanos == 0 || entry.remote_epoch.elapsed().as_nanos() >= u128::from(nanos)
+                })
+            || self
+                .expires_at
+                .is_some_and(|expires_at| SystemTime::now() >= expires_at)
+            || self
+                .entry
+                .as_ref()
+                .is_some_and(|entry| entry.remote_lease_expired())
     }
     pub fn add_bytes(&self, bytes: usize) {
         if bytes > 0
-            && !self.cancel.is_cancelled()
+            && !self.is_cancelled()
             && let Some(credit) = &self.output_credit
         {
             credit.record(bytes);
         }
         if let Some(e) = &self.entry {
             let mut s = e.state.lock().unwrap();
-            if self.cancel.is_cancelled() {
+            if self.is_cancelled() {
                 return;
             }
             e.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
@@ -353,11 +772,26 @@ impl Grant {
             if s.playback_seen.is_some() {
                 s.playback_seen = Some(now);
             }
+            if self.segmented_delivery && s.segmented_seen.is_some() {
+                s.segmented_seen = Some(now);
+            }
+            if let Some(key) = &self.callback_lane
+                && let Some(lane) = s.callback_lanes.get_mut(key)
+                && Some(lane.generation) == self.callback_generation
+            {
+                lane.last_seen = now;
+                if lane.playback_seen.is_some() {
+                    lane.playback_seen = Some(now);
+                }
+            }
         }
     }
 }
 impl Drop for Grant {
     fn drop(&mut self) {
+        if let Some(task) = self.expiry_task.take() {
+            task.abort();
+        }
         if let Some(e) = &self.entry {
             // A reservation represented by this live grant must return to the
             // pending count atomically with releasing its live occupancy.
@@ -365,7 +799,21 @@ impl Drop for Grant {
                 .capacity_reservation
                 .as_ref()
                 .map(|r| r.entries.lock().unwrap());
-            e.live.fetch_sub(1, Ordering::Relaxed);
+            let mut s = e.state.lock().unwrap();
+            s.remove_grant(GrantKind::from_u8(self.kind.load(Ordering::Relaxed)));
+            if let Some(key) = &self.callback_lane
+                && let Some(lane) = s.callback_lanes.get_mut(key)
+                && Some(lane.generation) == self.callback_generation
+            {
+                lane.live -= 1;
+            }
+            if e.live.fetch_sub(1, Ordering::Relaxed) == 1 {
+                // A new account needs a callback after the previous account
+                // releases its last grant from this configurable session.
+                s.callback_lanes.retain(|_, lane| !lane.account_conflict);
+            }
+            drop(s);
+            e.remote_notify.notify_one();
         }
     }
 }
@@ -375,16 +823,232 @@ pub enum AuthOutcome {
     Redirect(String),
 }
 pub struct PlaybackAuth {
+    iptv: Option<Arc<IptvStore>>,
+    remote_iptv: Option<Arc<AuthorityClient>>,
+    remote_boot: uuid::Uuid,
+    #[cfg(test)]
+    iptv_lookup_gate: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     idle_memory: crate::idle_memory::Controller,
     authority: Mutex<HashMap<String, Authority>>,
     entries: Arc<Mutex<Entries>>,
     client: reqwest::Client,
     callbacks: Semaphore,
+    background_callbacks: Arc<Semaphore>,
+    callback_lane_count: Arc<AtomicU64>,
+    callback_lane_limit: u64,
+    callback_empty_reclaim_after: Mutex<Option<Instant>>,
     limit: usize,
 }
 impl PlaybackAuth {
+    /// A load balancer redirects without delivering media. Return its short
+    /// authorization lease before the CDN attempts its own admission.
+    pub(crate) async fn release_redirect_lease(&self, grant: &Grant) -> bool {
+        let Some(entry) = grant.entry.as_ref() else {
+            return true;
+        };
+        if entry.state.lock().unwrap().policy.kind != PolicyKind::Iptv {
+            return true;
+        }
+        let Some(client) = &self.remote_iptv else {
+            return false;
+        };
+        let mut remote = entry.remote.lock().await;
+        if grant.is_cancelled() {
+            return false;
+        }
+        let Some(lease) = remote.current.as_ref() else {
+            return false;
+        };
+        if client.release(&lease.input, &lease.reply).await.is_err() {
+            return false;
+        }
+        remote.current = None;
+        remote.session = uuid::Uuid::new_v4();
+        Self::revoke_remote_grant(entry);
+        entry.remote_notify.notify_one();
+        true
+    }
+    fn revoke_remote_grant(entry: &Entry) {
+        let mut state = entry.state.lock().unwrap();
+        state.cancel_playback();
+        state.decision = Decision::Unknown;
+        state.next_check = Instant::now();
+        state.generation += 1;
+    }
+    async fn retire_remote_lease(remote: &mut RemoteState, client: &AuthorityClient) {
+        if let Some(lease) = remote.current.take() {
+            // Keep the per-entry operation gate held through the release RPC.
+            // The next grant gets a new session key so a delayed old release
+            // cannot remove a replacement lease after an ambiguous timeout.
+            let _ = client.release(&lease.input, &lease.reply).await;
+        }
+        remote.session = uuid::Uuid::new_v4();
+        remote.running = false;
+    }
+    async fn watch_remote_lease(entry: Arc<Entry>, client: Arc<AuthorityClient>) {
+        loop {
+            let wake = entry.remote_notify.notified();
+            let mut remote = entry.remote.lock().await;
+            let Some(current) = remote.current.as_ref() else {
+                remote.running = false;
+                return;
+            };
+            let reply = current.reply;
+            let (units, cancelled) = {
+                let state = entry.state.lock().unwrap();
+                let live =
+                    usize::try_from(entry.live.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+                (
+                    state.capacity_units(live, true),
+                    state.cancel.is_cancelled(),
+                )
+            };
+            if cancelled || units == 0 || reply.deadline <= Instant::now() {
+                if reply.deadline <= Instant::now() {
+                    Self::revoke_remote_grant(&entry);
+                }
+                Self::retire_remote_lease(&mut remote, &client).await;
+                return;
+            }
+            let input = current.input.clone();
+            let mut updated = None;
+            if units != reply.units as usize {
+                let Ok(units) = u32::try_from(units) else {
+                    Self::revoke_remote_grant(&entry);
+                    Self::retire_remote_lease(&mut remote, &client).await;
+                    return;
+                };
+                let mut replacement = input.clone();
+                replacement.operation = uuid::Uuid::new_v4();
+                replacement.units = units;
+                replacement.lease_id = None;
+                if let Ok(pending) = client.acquire(&replacement).await {
+                    let mut with_id = replacement.clone();
+                    with_id.lease_id = Some(pending.lease_id);
+                    match client.commit(&with_id).await {
+                        Ok(committed) => updated = Some((replacement, committed)),
+                        Err(_) => {
+                            let _ = client.rollback(&replacement, &pending).await;
+                        }
+                    }
+                }
+                if updated.is_none() {
+                    Self::revoke_remote_grant(&entry);
+                    Self::retire_remote_lease(&mut remote, &client).await;
+                    return;
+                }
+            } else if reply.deadline <= Instant::now() + Duration::from_secs(5) {
+                let mut renewal = input.clone();
+                renewal.lease_id = Some(reply.lease_id);
+                match client.renew(&renewal).await {
+                    Ok(renewed) => updated = Some((input.clone(), renewed)),
+                    Err(_) => {
+                        Self::revoke_remote_grant(&entry);
+                        Self::retire_remote_lease(&mut remote, &client).await;
+                        return;
+                    }
+                }
+            }
+            // A response received after this grant's old local deadline must
+            // never turn an already-expired media output back on. The newly
+            // renewed authority slot is released and the viewer reconnects.
+            if reply.deadline <= Instant::now() {
+                Self::revoke_remote_grant(&entry);
+                if let Some((input, renewed)) = updated {
+                    remote.current = Some(RemoteLease {
+                        input,
+                        reply: renewed,
+                    });
+                }
+                Self::retire_remote_lease(&mut remote, &client).await;
+                return;
+            }
+            if let Some((input, reply)) = updated {
+                remote.current = Some(RemoteLease { input, reply });
+                entry.set_remote_deadline(reply.deadline);
+                let cancelled = {
+                    let mut state = entry.state.lock().unwrap();
+                    if state.cancel.is_cancelled() {
+                        true
+                    } else {
+                        state.allowed_until = reply.deadline;
+                        state.next_check = reply.deadline;
+                        false
+                    }
+                };
+                if cancelled {
+                    Self::retire_remote_lease(&mut remote, &client).await;
+                    return;
+                }
+            }
+            let remaining = remote
+                .current
+                .as_ref()
+                .unwrap()
+                .reply
+                .deadline
+                .saturating_duration_since(Instant::now());
+            let sleep = remaining
+                .saturating_sub(Duration::from_secs(5))
+                .min(Duration::from_secs(4));
+            drop(remote);
+            tokio::select! {
+                _ = wake => {},
+                _ = tokio::time::sleep(sleep) => {},
+            }
+        }
+    }
+    fn projected_remote_units(
+        entry: &Arc<Entry>,
+        playback: bool,
+        segmented: bool,
+        handoff: Option<&Grant>,
+    ) -> Option<usize> {
+        let state = entry.state.lock().unwrap();
+        if !matches!(state.decision, Decision::Allow) || state.cancel.is_cancelled() {
+            return None;
+        }
+        let handoff_valid = handoff.is_some_and(|grant| {
+            grant
+                .entry
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(owner, entry))
+                && GrantKind::from_u8(grant.kind.load(Ordering::Relaxed)) == GrantKind::Handoff
+                && !grant.is_cancelled()
+        });
+        if handoff.is_some() && !handoff_valid {
+            return None;
+        }
+        Some(
+            state.projected_capacity_units(
+                GrantKind::for_request(playback, segmented),
+                handoff_valid,
+            ),
+        )
+    }
     pub fn new(limit: usize) -> Self {
+        Self::build(limit, None)
+    }
+    pub fn with_iptv(limit: usize, store: Arc<IptvStore>) -> Self {
+        Self::build(limit, Some(store))
+    }
+    pub fn with_remote_iptv(limit: usize, client: Arc<AuthorityClient>) -> Self {
+        let mut auth = Self::build(limit, None);
+        auth.remote_iptv = Some(client);
+        auth
+    }
+    fn build(limit: usize, iptv: Option<Arc<IptvStore>>) -> Self {
         Self {
+            iptv,
+            remote_iptv: None,
+            remote_boot: uuid::Uuid::new_v4(),
+            #[cfg(test)]
+            iptv_lookup_gate: Mutex::new(None),
             idle_memory: crate::idle_memory::Controller::default(),
             authority: Mutex::new(HashMap::new()),
             entries: Arc::new(Mutex::new(Entries::default())),
@@ -395,7 +1059,74 @@ impl PlaybackAuth {
                 .build()
                 .expect("HTTP client"),
             callbacks: Semaphore::new(128),
+            background_callbacks: Arc::new(Semaphore::new(16)),
+            callback_lane_count: Arc::new(AtomicU64::new(0)),
+            callback_lane_limit: 50_000,
+            callback_empty_reclaim_after: Mutex::new(None),
             limit,
+        }
+    }
+    fn reclaim_idle_callback_lanes(&self) -> bool {
+        // A full cache of live/pending lanes can otherwise trigger one global
+        // scan for every attacker-controlled query. Contenders fail closed.
+        let Ok(mut empty_scan_after) = self.callback_empty_reclaim_after.try_lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        if empty_scan_after.is_some_and(|after| after > now) {
+            return false;
+        }
+        let all = self.entries.lock().unwrap();
+        let batch = (self.callback_lane_limit / 2).clamp(1, 16) as usize;
+        let mut oldest: Vec<(Instant, Arc<Entry>, String)> = Vec::with_capacity(batch);
+        for entry in all.values() {
+            let state = entry.state.lock().unwrap();
+            for (key, lane) in &state.callback_lanes {
+                if lane.live == 0 && lane.pending == 0 {
+                    let position = oldest.partition_point(|(seen, _, _)| *seen <= lane.last_seen);
+                    if position < batch {
+                        oldest.insert(position, (lane.last_seen, entry.clone(), key.clone()));
+                        if oldest.len() > batch {
+                            oldest.pop();
+                        }
+                    }
+                }
+            }
+        }
+        let mut removed = 0;
+        for (_, entry, key) in oldest {
+            let mut state = entry.state.lock().unwrap();
+            if state
+                .callback_lanes
+                .get(&key)
+                .is_some_and(|lane| lane.live == 0 && lane.pending == 0)
+            {
+                state.callback_lanes.remove(&key);
+                removed += 1;
+            }
+        }
+        if removed == 0 {
+            *empty_scan_after = Some(now + Duration::from_millis(100));
+        } else {
+            *empty_scan_after = None;
+        }
+        removed > 0
+    }
+    fn reserve_callback_lane(&self) -> bool {
+        let mut count = self.callback_lane_count.load(Ordering::Acquire);
+        loop {
+            if count >= self.callback_lane_limit {
+                return false;
+            }
+            match self.callback_lane_count.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => count = actual,
+            }
         }
     }
     /// Only the configuration/discovery owner publishes policies. Requests consume versioned snapshots.
@@ -418,6 +1149,7 @@ impl PlaybackAuth {
                 }
                 s.cancel_playback();
                 s.generation += 1;
+                s.callback_lanes.clear();
                 s.available = policy
                     .as_ref()
                     .is_some_and(|p| p.identity(&s.request) == *identity);
@@ -441,14 +1173,49 @@ impl PlaybackAuth {
         })
     }
     pub async fn authorize(&self, snapshot: PolicySnapshot, request: ViewerRequest) -> AuthOutcome {
-        self.authorize_inner(snapshot, request, true, None).await
+        self.authorize_inner(snapshot, request, true, None, None, None)
+            .await
+    }
+    pub(crate) async fn authorize_handoff(
+        &self,
+        snapshot: PolicySnapshot,
+        request: ViewerRequest,
+        handoff: &Grant,
+    ) -> AuthOutcome {
+        self.authorize_inner(snapshot, request, true, None, Some(handoff), None)
+            .await
+    }
+    pub(crate) async fn authorize_handoff_reuse(
+        &self,
+        snapshot: PolicySnapshot,
+        request: ViewerRequest,
+        identity: &str,
+    ) -> Option<AuthOutcome> {
+        let key = snapshot.policy.identity(&request);
+        if snapshot.name != request.name
+            || !self
+                .entries
+                .lock()
+                .unwrap()
+                .by_stream
+                .get(&request.name)
+                .and_then(|sessions| sessions.get(&key))
+                .is_some_and(|entry| entry.id == identity)
+        {
+            return None;
+        }
+        Some(
+            self.authorize_inner(snapshot, request, true, None, None, Some(identity))
+                .await,
+        )
     }
     pub(crate) async fn authorize_control(
         &self,
         snapshot: PolicySnapshot,
         request: ViewerRequest,
     ) -> AuthOutcome {
-        self.authorize_inner(snapshot, request, false, None).await
+        self.authorize_inner(snapshot, request, false, None, None, None)
+            .await
     }
     pub(crate) fn reserve_capacity(&self, additional: usize) -> Option<Arc<CapacityReservation>> {
         let mut entries = self.entries.lock().unwrap();
@@ -457,8 +1224,7 @@ impl PlaybackAuth {
             .retain(|_, slot| slot.expires > Instant::now());
         if entries
             .values()
-            .filter(|e| e.occupied())
-            .count()
+            .fold(0usize, |sum, e| sum.saturating_add(e.occupied_units(true)))
             .saturating_add(
                 entries
                     .reserved
@@ -490,7 +1256,7 @@ impl PlaybackAuth {
         request: ViewerRequest,
         reservation: Arc<CapacityReservation>,
     ) -> AuthOutcome {
-        self.authorize_inner(snapshot, request, false, Some(reservation))
+        self.authorize_inner(snapshot, request, false, Some(reservation), None, None)
             .await
     }
     async fn authorize_inner(
@@ -499,6 +1265,8 @@ impl PlaybackAuth {
         request: ViewerRequest,
         playback: bool,
         reservation: Option<Arc<CapacityReservation>>,
+        handoff: Option<&Grant>,
+        reuse_identity: Option<&str>,
     ) -> AuthOutcome {
         if snapshot.name != request.name {
             return AuthOutcome::Denied;
@@ -510,7 +1278,30 @@ impl PlaybackAuth {
         if !policy.accepts_token(&request.token) {
             return AuthOutcome::Denied;
         }
+        if policy.kind == PolicyKind::Iptv
+            && self.remote_iptv.is_none()
+            && !self.iptv.as_ref().is_some_and(|store| {
+                store
+                    .snapshot()
+                    .authorize(&request.token, &request.name, SystemTime::now())
+                    .is_some()
+            })
+        {
+            return AuthOutcome::Denied;
+        }
+        #[cfg(test)]
+        if policy.kind == PolicyKind::Iptv {
+            let gate = self.iptv_lookup_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+        }
+        let iptv_request = (policy.kind == PolicyKind::Iptv).then(|| request.clone());
+        let segmented_delivery = request.proto == "hls" || request.finite_media;
         let identity = policy.identity(&request);
+        let callback_key =
+            (policy.kind == PolicyKind::Callback).then(|| policy.callback_identity(&request));
         let entry = {
             let authority = self.authority.lock().unwrap();
             if !authority.get(&request.name).is_some_and(|p| {
@@ -519,15 +1310,20 @@ impl PlaybackAuth {
                 return AuthOutcome::Denied;
             }
             let mut all = self.entries.lock().unwrap();
-            all.retain(|_, e| {
-                let s = e.state.lock().unwrap();
-                e.live.load(Ordering::Relaxed) > 0
-                    || e.admissions.load(Ordering::Relaxed) > 0
-                    || s.last_seen.elapsed() < Duration::from_secs(30)
-                    || (!matches!(s.decision, Decision::Allow) && s.next_check > Instant::now())
-            });
-            if !all.contains_key(&request.name, &identity) && all.len() >= 20_000 {
+            all.prune(Instant::now(), false);
+            if reuse_identity.is_some_and(|expected| {
+                all.by_stream
+                    .get(&request.name)
+                    .and_then(|sessions| sessions.get(&identity))
+                    .is_none_or(|entry| entry.id != expected)
+            }) {
                 return AuthOutcome::Denied;
+            }
+            if !all.contains_key(&request.name, &identity) && all.len() >= 20_000 {
+                all.prune(Instant::now(), true);
+                if all.len() >= 20_000 {
+                    return AuthOutcome::Denied;
+                }
             }
             let entry = all
                 .by_stream
@@ -546,16 +1342,28 @@ impl PlaybackAuth {
                             created: Instant::now(),
                             last_seen: Instant::now(),
                             playback_seen: None,
+                            segmented_seen: None,
+                            continuous_live: 0,
+                            control_live: 0,
+                            segmented_live: 0,
+                            segmented_control_live: 0,
+                            handoff_live: 0,
                             effective_max: None,
                             unique: false,
                             number: 0,
                             generation: 0,
+                            lane_serial: 0,
                             user_id: format!("{:x}", Sha256::digest(request.token.as_bytes())),
                             available: true,
                             revoked_until: None,
                             cancel: CancellationToken::new(),
+                            callback_lanes: HashMap::new(),
                         }),
-                        flight: AsyncMutex::new(()),
+                        flight: Arc::new(AsyncMutex::new(())),
+                        remote: AsyncMutex::new(RemoteState::default()),
+                        remote_notify: Notify::new(),
+                        remote_epoch: Instant::now(),
+                        remote_deadline_micros: AtomicU64::new(0),
                         live: AtomicU64::new(0),
                         admissions: AtomicU64::new(0),
                         bytes: AtomicU64::new(0),
@@ -566,16 +1374,91 @@ impl PlaybackAuth {
             entry
         };
         let _authorization = PendingAuthorization(entry.clone());
+        let needs_global_reclaim = callback_key.as_ref().is_some_and(|key| {
+            let s = entry.state.lock().unwrap();
+            !s.callback_lanes.contains_key(key)
+                && !(s.callback_lanes.len() >= 16
+                    && s.callback_lanes
+                        .values()
+                        .any(|lane| lane.live == 0 && lane.pending == 0))
+        });
+        if needs_global_reclaim
+            && self.callback_lane_count.load(Ordering::Acquire) >= self.callback_lane_limit
         {
+            let _ = self.reclaim_idle_callback_lanes();
+        }
+        let _callback_pending = {
             let mut s = entry.state.lock().unwrap();
             if s.revoked_until.is_some_and(|until| until > Instant::now()) {
                 return AuthOutcome::Denied;
             }
-            s.request = request;
+            s.request = request.clone();
             s.last_seen = Instant::now();
+            callback_key.as_ref().and_then(|key| {
+                if !s.callback_lanes.contains_key(key) {
+                    if s.callback_lanes.len() >= 16 {
+                        let oldest_idle = s
+                            .callback_lanes
+                            .iter()
+                            .filter(|(_, lane)| lane.live == 0 && lane.pending == 0)
+                            .min_by_key(|(_, lane)| lane.last_seen)
+                            .map(|(key, _)| key.clone())?;
+                        s.callback_lanes.remove(&oldest_idle);
+                    }
+                    if !self.reserve_callback_lane() {
+                        return None;
+                    }
+                    s.lane_serial += 1;
+                    let generation = s.lane_serial;
+                    let cancel = s.cancel.child_token();
+                    let user_id = format!("{:x}", Sha256::digest(request.token.as_bytes()));
+                    s.callback_lanes.insert(
+                        key.clone(),
+                        CallbackLane {
+                            count: self.callback_lane_count.clone(),
+                            flight: Arc::new(AsyncMutex::new(())),
+                            request: request.clone(),
+                            decision: Decision::Unknown,
+                            next_check: Instant::now(),
+                            allowed_until: Instant::now(),
+                            deadline_nanos: Arc::new(AtomicU64::new(0)),
+                            expiry_task: None,
+                            renewal_task: None,
+                            approvals: 0,
+                            forced: false,
+                            last_seen: Instant::now(),
+                            playback_seen: None,
+                            generation,
+                            pending: 0,
+                            live: 0,
+                            user_id,
+                            effective_max: None,
+                            unique: false,
+                            account_conflict: false,
+                            cancel,
+                        },
+                    );
+                }
+                let lane = s.callback_lanes.get_mut(key).unwrap();
+                lane.pending += 1;
+                lane.last_seen = Instant::now();
+                Some(PendingCallbackLane {
+                    entry: entry.clone(),
+                    key: key.clone(),
+                    generation: lane.generation,
+                    session_generation: s.generation,
+                })
+            })
+        };
+        if callback_key.is_some() && _callback_pending.is_none() {
+            return AuthOutcome::Denied;
         }
-        self.refresh(&entry).await;
-        let outcome = {
+        let pending_callback_generation = _callback_pending.as_ref().map(|lane| lane.generation);
+        let pending_session_generation = _callback_pending
+            .as_ref()
+            .map(|lane| lane.session_generation);
+        self.refresh(&entry, callback_key.as_deref()).await;
+        let admit = |remote_units: Option<usize>| {
             let authority = self.authority.lock().unwrap();
             if !authority.get(&snapshot.name).is_some_and(|p| {
                 p.revision == snapshot.revision && p.policy.as_ref() == Some(&policy)
@@ -601,27 +1484,96 @@ impl PlaybackAuth {
                 .count()
                 .saturating_sub(usize::from(own_pending));
             let mut s = entry.state.lock().unwrap();
-            match &s.decision {
+            if pending_session_generation.is_some_and(|generation| generation != s.generation) {
+                return AuthOutcome::Denied;
+            }
+            let decision = callback_key.as_ref().map_or_else(
+                || s.decision.clone(),
+                |key| {
+                    s.callback_lanes
+                        .get(key)
+                        .map_or(Decision::Unknown, |lane| lane.decision.clone())
+                },
+            );
+            match &decision {
                 Decision::Allow => {
+                    let (effective_max, unique) = if let Some(key) = &callback_key {
+                        let Some(lane) = s.callback_lanes.get(key) else {
+                            return AuthOutcome::Denied;
+                        };
+                        if Some(lane.generation) != pending_callback_generation {
+                            return AuthOutcome::Denied;
+                        }
+                        if lane.cancel.is_cancelled() {
+                            return AuthOutcome::Denied;
+                        }
+                        if lane.allowed_until <= Instant::now() {
+                            return AuthOutcome::Denied;
+                        }
+                        let user_id = lane.user_id.clone();
+                        if entry.live.load(Ordering::Relaxed) > 0 && user_id != s.user_id {
+                            return AuthOutcome::Denied;
+                        }
+                        let mut max = lane.effective_max;
+                        let mut unique = lane.unique;
+                        for active in s.callback_lanes.values().filter(|active| active.live > 0) {
+                            if active.user_id != user_id {
+                                return AuthOutcome::Denied;
+                            }
+                            if let Some(active_max) = active.effective_max {
+                                max = Some(max.map_or(active_max, |value| value.min(active_max)));
+                            }
+                            unique |= active.unique;
+                        }
+                        if entry.live.load(Ordering::Relaxed) == 0 {
+                            s.user_id = user_id;
+                            s.effective_max = max;
+                            s.unique = unique;
+                        }
+                        (max, unique)
+                    } else {
+                        (s.effective_max, s.unique)
+                    };
                     let others = all
                         .values()
                         .filter(|e| !Arc::ptr_eq(e, &entry))
                         .collect::<Vec<_>>();
-                    let already = entry.live.load(Ordering::Relaxed) > 0
-                        || s.playback_seen
-                            .is_some_and(|seen| seen.elapsed() < Duration::from_secs(30));
-                    let slots = others.iter().filter(|e| e.occupied()).count();
-                    let user_slots = others
+                    let live =
+                        usize::try_from(entry.live.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+                    let kind = GrantKind::for_request(playback, segmented_delivery);
+                    let own_slots = s.capacity_units(live, true);
+                    let handoff_valid = handoff.is_some_and(|h| {
+                        h.entry.as_ref().is_some_and(|e| Arc::ptr_eq(e, &entry))
+                            && GrantKind::from_u8(h.kind.load(Ordering::Relaxed))
+                                == GrantKind::Handoff
+                            && !h.is_cancelled()
+                    });
+                    let projected = s.projected_capacity_units(kind, handoff_valid);
+                    let additional = projected.saturating_sub(own_slots);
+                    let slots = others.iter().fold(own_slots, |sum, e| {
+                        sum.saturating_add(e.occupied_units(true))
+                    });
+                    let other_user_slots = others
                         .iter()
-                        .filter(|e| e.occupied() && e.state.lock().unwrap().user_id == s.user_id)
-                        .count();
-                    if !already && slots.saturating_add(pending) >= self.limit
-                        || !s.unique && s.effective_max.is_some_and(|n| user_slots as u64 >= n)
+                        .filter(|e| e.state.lock().unwrap().user_id == s.user_id)
+                        .fold(0usize, |sum, e| sum.saturating_add(e.occupied_units(false)));
+                    let exceeds_user_limit = effective_max.is_some_and(|max| {
+                        if policy.kind == PolicyKind::Iptv {
+                            other_user_slots.saturating_add(projected) as u64 > max
+                        } else {
+                            other_user_slots as u64 >= max
+                        }
+                    });
+                    if handoff.is_some() && !handoff_valid
+                        || remote_units.is_some_and(|units| units != projected)
+                        || additional > 0
+                            && slots.saturating_add(pending).saturating_add(additional) > self.limit
+                        || !unique && exceeds_user_limit
                     {
                         // Capacity is transient; do not poison the cached policy.
                         AuthOutcome::Denied
                     } else {
-                        if s.unique {
+                        if unique {
                             for e in others {
                                 let mut other = e.state.lock().unwrap();
                                 if other.user_id == s.user_id {
@@ -632,9 +1584,38 @@ impl PlaybackAuth {
                                 }
                             }
                         }
-                        if playback {
-                            s.playback_seen = Some(Instant::now());
+                        if playback && remote_units.is_none() {
+                            let now = Instant::now();
+                            s.playback_seen = Some(now);
+                            if segmented_delivery {
+                                s.segmented_seen = Some(now);
+                            }
+                            if let Some(key) = &callback_key
+                                && let Some(lane) = s.callback_lanes.get_mut(key)
+                            {
+                                lane.playback_seen = Some(now);
+                            }
                         }
+                        if handoff_valid {
+                            let handoff = handoff.expect("validated handoff");
+                            s.remove_grant(GrantKind::Handoff);
+                            handoff
+                                .kind
+                                .store(GrantKind::ConsumedHandoff as u8, Ordering::Relaxed);
+                        }
+                        s.add_grant(kind);
+                        let (cancel, callback_generation, callback_deadline_nanos) =
+                            if let Some(key) = &callback_key {
+                                let lane = s.callback_lanes.get_mut(key).unwrap();
+                                lane.live += 1;
+                                (
+                                    lane.cancel.child_token(),
+                                    Some(lane.generation),
+                                    Some(lane.deadline_nanos.clone()),
+                                )
+                            } else {
+                                (s.cancel.clone(), None, None)
+                            };
                         entry.live.fetch_add(1, Ordering::Relaxed);
                         if let Some(r) = &reservation {
                             all.reserved.get_mut(&r.id).unwrap().entry =
@@ -644,7 +1625,14 @@ impl PlaybackAuth {
                             capacity_reservation: reservation.clone(),
                             output_credit: None,
                             entry: Some(entry.clone()),
-                            cancel: s.cancel.clone(),
+                            callback_lane: callback_key.clone(),
+                            callback_generation,
+                            callback_deadline_nanos,
+                            cancel,
+                            expires_at: None,
+                            expiry_task: None,
+                            kind: AtomicU8::new(kind as u8),
+                            segmented_delivery,
                         })
                     }
                 }
@@ -652,33 +1640,184 @@ impl PlaybackAuth {
                 _ => AuthOutcome::Denied,
             }
         };
+        let outcome = if let Some(iptv_request) = iptv_request {
+            if let Some(client) = &self.remote_iptv {
+                let mut remote = entry.remote.lock().await;
+                let Some(units) =
+                    Self::projected_remote_units(&entry, playback, segmented_delivery, handoff)
+                else {
+                    return AuthOutcome::Denied;
+                };
+                let Ok(units_u32) = u32::try_from(units) else {
+                    return AuthOutcome::Denied;
+                };
+                let existing = remote.current.as_ref().filter(|lease| {
+                    lease.reply.units == units_u32
+                        && lease.reply.deadline > Instant::now() + Duration::from_secs(1)
+                        && lease.input.token == iptv_request.token
+                        && lease.input.channel == iptv_request.name
+                });
+                let (input, pending, needs_commit) = if let Some(lease) = existing {
+                    (lease.input.clone(), lease.reply, false)
+                } else {
+                    let input = LeaseInput {
+                        token: iptv_request.token.clone(),
+                        channel: iptv_request.name.clone(),
+                        session: SessionKey {
+                            boot: self.remote_boot,
+                            local: remote.session,
+                        },
+                        operation: uuid::Uuid::new_v4(),
+                        units: units_u32,
+                        lease_id: None,
+                    };
+                    let Ok(pending) = client.acquire(&input).await else {
+                        return AuthOutcome::Denied;
+                    };
+                    (input, pending, true)
+                };
+                let mut outcome = admit(Some(units));
+                if !matches!(outcome, AuthOutcome::Allowed(_)) {
+                    if needs_commit {
+                        let _ = client.rollback(&input, &pending).await;
+                    }
+                    return outcome;
+                }
+                let committed = if needs_commit {
+                    let mut with_id = input.clone();
+                    with_id.lease_id = Some(pending.lease_id);
+                    match client.commit(&with_id).await {
+                        Ok(reply) => reply,
+                        Err(_) => {
+                            drop(outcome);
+                            let _ = client.rollback(&input, &pending).await;
+                            return AuthOutcome::Denied;
+                        }
+                    }
+                } else {
+                    pending
+                };
+                if needs_commit {
+                    remote.current = Some(RemoteLease {
+                        input: input.clone(),
+                        reply: committed,
+                    });
+                }
+                entry.set_remote_deadline(committed.deadline);
+                let cancelled = {
+                    let mut state = entry.state.lock().unwrap();
+                    if state.cancel.is_cancelled() {
+                        true
+                    } else {
+                        if playback {
+                            let now = Instant::now();
+                            state.playback_seen = Some(now);
+                            if segmented_delivery {
+                                state.segmented_seen = Some(now);
+                            }
+                        }
+                        state.user_id = committed.subscriber.as_hex();
+                        state.allowed_until = committed.deadline;
+                        state.next_check = committed.deadline;
+                        false
+                    }
+                };
+                if cancelled {
+                    drop(outcome);
+                    Self::retire_remote_lease(&mut remote, client).await;
+                    return AuthOutcome::Denied;
+                }
+                if let (Some(expiry), AuthOutcome::Allowed(grant)) =
+                    (committed.subscriber_expires_at, &mut outcome)
+                {
+                    grant.expire_at(expiry);
+                }
+                if !remote.running {
+                    remote.running = true;
+                    let watcher_entry = entry.clone();
+                    let watcher_client = client.clone();
+                    tokio::spawn(async move {
+                        Self::watch_remote_lease(watcher_entry, watcher_client).await;
+                    });
+                }
+                outcome
+            } else {
+                let Some(store) = self.iptv.as_ref() else {
+                    return AuthOutcome::Denied;
+                };
+                let current = store.snapshot();
+                store
+                    .at_current(current.revision(), || {
+                        match current.authorize(
+                            &iptv_request.token,
+                            &iptv_request.name,
+                            SystemTime::now(),
+                        ) {
+                            Some(facts) => {
+                                let mut outcome = admit(None);
+                                if let (Some(expires_at), AuthOutcome::Allowed(grant)) =
+                                    (facts.expires_at, &mut outcome)
+                                {
+                                    grant.expire_at(expires_at);
+                                }
+                                outcome
+                            }
+                            None => AuthOutcome::Denied,
+                        }
+                    })
+                    .unwrap_or(AuthOutcome::Denied)
+            }
+        } else {
+            admit(None)
+        };
         // Model preemption/cancellation before the caller receives the outcome.
         // Its already-constructed grant owns capacity through this boundary.
         #[cfg(test)]
         tokio::task::yield_now().await;
         outcome
     }
-    async fn refresh(&self, entry: &Arc<Entry>) {
-        let _flight = entry.flight.lock().await;
-        let (policy, r, number, generation, duration) = {
+    async fn refresh(&self, entry: &Arc<Entry>, callback_key: Option<&str>) {
+        let flight = if let Some(key) = callback_key {
+            let state = entry.state.lock().unwrap();
+            let Some(lane) = state.callback_lanes.get(key) else {
+                return;
+            };
+            lane.flight.clone()
+        } else {
+            entry.flight.clone()
+        };
+        let _flight = flight.lock().await;
+        let (policy, r, number, generation, lane_generation, duration) = {
             let s = entry.state.lock().unwrap();
-            if !s.available
-                || s.revoked_until.is_some_and(|until| until > Instant::now())
-                || s.next_check > Instant::now()
-            {
+            if !s.available || s.revoked_until.is_some_and(|until| until > Instant::now()) {
                 return;
             }
+            let (request, lane_generation) = if let Some(key) = callback_key {
+                let Some(lane) = s.callback_lanes.get(key) else {
+                    return;
+                };
+                if lane.next_check > Instant::now() {
+                    return;
+                }
+                (lane.request.clone(), Some(lane.generation))
+            } else {
+                if s.next_check > Instant::now() {
+                    return;
+                }
+                (s.request.clone(), None)
+            };
             (
                 s.policy.clone(),
-                s.request.clone(),
+                request,
                 s.number,
                 s.generation,
+                lane_generation,
                 s.created.elapsed().as_secs(),
             )
         };
         // Background renewal can outlive a media worker. Only real callback
         // work holds this fence; an empty periodic sweep stays passive.
-        let _activity = if policy.url.is_some() {
+        let _activity = if policy.kind == PolicyKind::Callback {
             Some(self.idle_memory.activity().await)
         } else {
             None
@@ -688,11 +1827,31 @@ impl PlaybackAuth {
         let mut user_id = None;
         let mut max = policy.max_sessions;
         let mut unique = false;
+        let mut expiry_window = None;
+        let mut callback_latency = None;
         if !policy.accepts_token(&r.token) {
             decision = Decision::Deny;
+        } else if policy.kind == PolicyKind::Iptv && self.remote_iptv.is_none() {
+            match self.iptv.as_ref().and_then(|store| {
+                store
+                    .snapshot()
+                    .authorize(&r.token, &r.name, SystemTime::now())
+            }) {
+                Some(facts) => {
+                    user_id = Some(format!("{:x}", Sha256::digest(facts.subscriber.as_bytes())));
+                    max = facts.max_sessions.map(u64::from);
+                    expiry_window = facts
+                        .expires_at
+                        .and_then(|expiry| expiry.duration_since(SystemTime::now()).ok());
+                    if facts.expires_at.is_some() && expiry_window.is_none() {
+                        decision = Decision::Deny;
+                    }
+                }
+                None => decision = Decision::Deny,
+            }
         } else if let Some(url) = &policy.url {
             let Ok(_permit) = self.callbacks.try_acquire() else {
-                self.retry(entry, generation);
+                self.retry(entry, generation, callback_key, lane_generation);
                 return;
             };
             let (stream_clients, total_clients) = {
@@ -731,15 +1890,23 @@ impl PlaybackAuth {
             ];
             {
                 let mut s = entry.state.lock().unwrap();
-                if s.generation != generation {
+                if s.generation != generation
+                    || callback_key.is_some_and(|key| {
+                        s.callback_lanes
+                            .get(key)
+                            .is_none_or(|lane| Some(lane.generation) != lane_generation)
+                    })
+                {
                     return;
                 }
                 s.number += 1;
             }
+            let callback_started = Instant::now();
             let Ok(response) = self.client.get(url).query(&fields).send().await else {
-                self.retry(entry, generation);
+                self.retry(entry, generation, callback_key, lane_generation);
                 return;
             };
+            callback_latency = Some(callback_started.elapsed());
             let headers = response.headers();
             let header = |key: &str| headers.get(key).and_then(|v| v.to_str().ok());
             seconds = header("x-authduration")
@@ -755,7 +1922,7 @@ impl PlaybackAuth {
             }
             unique = header("x-unique").is_some_and(|v| v.eq_ignore_ascii_case("true"));
             if response.status().is_server_error() {
-                self.retry(entry, generation);
+                self.retry(entry, generation, callback_key, lane_generation);
                 return;
             }
             decision = if response.status().is_success() {
@@ -777,9 +1944,17 @@ impl PlaybackAuth {
         }
         // Serializing admission and user-limit decisions prevents simultaneous callbacks from oversubscribing.
         let all = self.entries.lock().unwrap();
-        let current_user = user_id
-            .clone()
-            .unwrap_or_else(|| entry.state.lock().unwrap().user_id.clone());
+        let current_user = user_id.clone().unwrap_or_else(|| {
+            let state = entry.state.lock().unwrap();
+            callback_key
+                .and_then(|key| {
+                    state
+                        .callback_lanes
+                        .get(key)
+                        .map(|lane| lane.user_id.clone())
+                })
+                .unwrap_or_else(|| state.user_id.clone())
+        });
         let others = all
             .values()
             .filter(|e| !Arc::ptr_eq(e, entry))
@@ -800,6 +1975,123 @@ impl PlaybackAuth {
         }
         let mut s = entry.state.lock().unwrap();
         if s.generation != generation {
+            return;
+        }
+        if let Some(key) = callback_key {
+            let account_conflict = entry.live.load(Ordering::Relaxed) > 0
+                && current_user != s.user_id
+                || s.callback_lanes
+                    .get(key)
+                    .is_some_and(|lane| lane.live > 0 && current_user != lane.user_id);
+            if account_conflict {
+                decision = Decision::Deny;
+            }
+            if matches!(decision, Decision::Allow) && s.cancel.is_cancelled() {
+                // A unique-session preemption cancels the old generation;
+                // a later successful callback may admit a new one.
+                s.cancel = CancellationToken::new();
+            }
+            let parent_cancel = s.cancel.clone();
+            let Some(lane) = s.callback_lanes.get_mut(key) else {
+                return;
+            };
+            if Some(lane.generation) != lane_generation {
+                return;
+            }
+            lane.account_conflict = account_conflict;
+            if matches!(decision, Decision::Allow) && unique && held {
+                for e in others {
+                    let mut other = e.state.lock().unwrap();
+                    if other.user_id == current_user {
+                        other.cancel_playback();
+                        other.decision = Decision::Deny;
+                        other.next_check = Instant::now() + Duration::from_secs(seconds);
+                        other.generation += 1;
+                    }
+                }
+            }
+            let now = Instant::now();
+            if !matches!(decision, Decision::Allow) {
+                lane.cancel.cancel();
+                lane.playback_seen = None;
+                lane.deadline_nanos.store(0, Ordering::Release);
+                if let Some(task) = lane.expiry_task.take() {
+                    task.abort();
+                }
+            } else if lane.cancel.is_cancelled()
+                || matches!(lane.decision, Decision::Allow) && lane.allowed_until <= now
+            {
+                // A late callback can approve a new viewer, never revive a
+                // grant whose original hard deadline has already passed.
+                lane.cancel.cancel();
+                lane.cancel = parent_cancel.child_token();
+            }
+            if !account_conflict {
+                lane.user_id = current_user.clone();
+            }
+            lane.effective_max = max;
+            lane.unique = unique;
+            lane.decision = decision;
+            lane.next_check = now + Duration::from_secs(seconds);
+            let allowed = matches!(lane.decision, Decision::Allow);
+            if allowed {
+                let deadline = now + Duration::from_secs(seconds);
+                lane.allowed_until = deadline;
+                // The first short lease probes early, so a backend that
+                // becomes slow still has time to answer before permission ends.
+                let lead = callback_latency
+                    .unwrap_or_default()
+                    .min(Duration::from_millis(600))
+                    + Duration::from_millis(300);
+                lane.next_check = if seconds == 1 && lane.approvals == 0 {
+                    now + Duration::from_millis(100)
+                } else {
+                    deadline
+                        .checked_sub(lead)
+                        .unwrap_or(now)
+                        .max(now + Duration::from_millis(100))
+                };
+                if let Some(window) = expiry_window {
+                    lane.next_check = lane.next_check.min(now + window);
+                }
+                lane.approvals = lane.approvals.saturating_add(1);
+                lane.forced = false;
+                let nanos = deadline
+                    .saturating_duration_since(entry.remote_epoch)
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64;
+                lane.deadline_nanos.store(nanos.max(1), Ordering::Release);
+                let entry = Arc::downgrade(entry);
+                let key = key.to_owned();
+                let generation = lane.generation;
+                let task = tokio::spawn(async move {
+                    tokio::time::sleep_until(deadline.into()).await;
+                    Self::expire_callback_lane(entry, key, generation, deadline);
+                });
+                if let Some(old) = lane.expiry_task.replace(task.abort_handle()) {
+                    old.abort();
+                }
+            } else {
+                lane.approvals = 0;
+                lane.forced = false;
+            }
+            let next_check = lane.next_check;
+            let allowed_until = lane.allowed_until;
+            if allowed {
+                s.user_id = current_user;
+                s.effective_max = max;
+                s.unique = unique;
+                s.decision = Decision::Allow;
+                s.next_check = next_check;
+                s.allowed_until = allowed_until;
+            } else if !s
+                .callback_lanes
+                .values()
+                .any(|lane| matches!(lane.decision, Decision::Allow))
+            {
+                s.decision = Decision::Deny;
+                s.next_check = next_check;
+            }
             return;
         }
         if matches!(decision, Decision::Allow) && unique && held {
@@ -823,14 +2115,144 @@ impl PlaybackAuth {
         s.unique = unique;
         s.decision = decision;
         s.next_check = Instant::now() + Duration::from_secs(seconds);
+        if let Some(window) = expiry_window {
+            s.next_check = s.next_check.min(Instant::now() + window);
+        }
         if matches!(s.decision, Decision::Allow) {
             s.allowed_until = s.next_check;
         }
     }
-    fn retry(&self, entry: &Entry, generation: u64) {
+    fn expire_callback_lane(entry: Weak<Entry>, key: String, generation: u64, deadline: Instant) {
+        let Some(entry) = entry.upgrade() else {
+            return;
+        };
+        let mut state = entry.state.lock().unwrap();
+        let Some(lane) = state.callback_lanes.get_mut(&key) else {
+            return;
+        };
+        if lane.generation != generation
+            || lane.allowed_until != deadline
+            || lane.allowed_until > Instant::now()
+            || !matches!(lane.decision, Decision::Allow)
+        {
+            return;
+        }
+        lane.cancel.cancel();
+        lane.deadline_nanos.store(0, Ordering::Release);
+        lane.decision = Decision::Unknown;
+        lane.playback_seen = None;
+        if !state
+            .callback_lanes
+            .values()
+            .any(|lane| matches!(lane.decision, Decision::Allow))
+        {
+            state.decision = Decision::Unknown;
+        }
+    }
+    fn retry(
+        &self,
+        entry: &Entry,
+        generation: u64,
+        callback_key: Option<&str>,
+        lane_generation: Option<u64>,
+    ) {
         let mut s = entry.state.lock().unwrap();
         if s.generation == generation {
-            s.next_check = Instant::now() + Duration::from_secs(10);
+            if let Some(key) = callback_key {
+                if let Some(lane) = s.callback_lanes.get_mut(key)
+                    && Some(lane.generation) == lane_generation
+                {
+                    lane.next_check = Instant::now() + Duration::from_secs(10);
+                }
+            } else {
+                s.next_check = Instant::now() + Duration::from_secs(10);
+            }
+        }
+    }
+    /// Start callback renewals without waiting for their HTTP responses.
+    pub fn schedule_due(self: &Arc<Self>) {
+        if self.callback_lane_count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let mut due = {
+            let all = self.entries.lock().unwrap();
+            all.values()
+                .flat_map(|entry| {
+                    let state = entry.state.lock().unwrap();
+                    if !state.available || state.policy.kind != PolicyKind::Callback {
+                        return Vec::new();
+                    }
+                    state
+                        .callback_lanes
+                        .iter()
+                        .filter_map(|(key, lane)| {
+                            let active = lane.live > 0
+                                || now.saturating_duration_since(lane.last_seen)
+                                    < Duration::from_secs(30)
+                                || lane.playback_seen.is_some_and(|seen| {
+                                    now.saturating_duration_since(seen) < Duration::from_secs(30)
+                                });
+                            (active
+                                && lane.next_check <= now
+                                && matches!(lane.decision, Decision::Allow | Decision::Unknown)
+                                && lane
+                                    .renewal_task
+                                    .as_ref()
+                                    .is_none_or(tokio::task::AbortHandle::is_finished))
+                            .then_some((
+                                !lane.forced,
+                                lane.allowed_until,
+                                lane.next_check,
+                                entry.clone(),
+                                key.clone(),
+                                lane.generation,
+                            ))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        due.sort_by_key(|(ordinary, deadline, check, _, _, _)| (*ordinary, *deadline, *check));
+        for (_, _, _, entry, key, generation) in due {
+            let Ok(permit) = self.background_callbacks.clone().try_acquire_owned() else {
+                break;
+            };
+            let mut state = entry.state.lock().unwrap();
+            if !state.available || state.policy.kind != PolicyKind::Callback {
+                continue;
+            }
+            let Some(lane) = state.callback_lanes.get_mut(&key) else {
+                continue;
+            };
+            if lane.generation != generation
+                || lane.next_check > Instant::now()
+                || !matches!(lane.decision, Decision::Allow | Decision::Unknown)
+                || lane
+                    .renewal_task
+                    .as_ref()
+                    .is_some_and(|task| !task.is_finished())
+            {
+                continue;
+            }
+            let auth = Arc::downgrade(self);
+            let job_entry = entry.clone();
+            let job_key = key.clone();
+            let task = tokio::spawn(async move {
+                let _permit = permit;
+                if let Some(auth) = auth.upgrade() {
+                    auth.refresh(&job_entry, Some(&job_key)).await;
+                }
+                let mut state = job_entry.state.lock().unwrap();
+                if let Some(lane) = state.callback_lanes.get_mut(&job_key)
+                    && lane.generation == generation
+                {
+                    lane.renewal_task = None;
+                }
+            });
+            if let Some(old) = lane.renewal_task.replace(task.abort_handle()) {
+                old.abort();
+            }
         }
     }
     /// Only sessions with ongoing activity are renewed. Work is bounded and oldest deadlines run first.
@@ -838,30 +2260,45 @@ impl PlaybackAuth {
         use futures_util::{StreamExt, stream};
         let mut due = {
             let mut all = self.entries.lock().unwrap();
-            all.retain(|_, e| {
-                let s = e.state.lock().unwrap();
-                e.live.load(Ordering::Relaxed) > 0
-                    || e.admissions.load(Ordering::Relaxed) > 0
-                    || s.last_seen.elapsed() < Duration::from_secs(30)
-                    || (!matches!(s.decision, Decision::Allow) && s.next_check > Instant::now())
-            });
+            let now = Instant::now();
+            all.prune(now, false);
             all.values()
-                .filter_map(|e| {
+                .flat_map(|e| {
                     let s = e.state.lock().unwrap();
-                    ((e.live.load(Ordering::Relaxed) > 0
-                        || s.last_seen.elapsed() < Duration::from_secs(30))
-                        && s.available
-                        && s.next_check <= Instant::now()
-                        && matches!(s.decision, Decision::Allow | Decision::Unknown))
-                    .then_some((s.next_check, e.clone()))
+                    if s.policy.kind == PolicyKind::Callback {
+                        s.callback_lanes
+                            .iter()
+                            .filter_map(|(key, lane)| {
+                                ((lane.live > 0
+                                    || now.duration_since(lane.last_seen)
+                                        < Duration::from_secs(30)
+                                    || lane.playback_seen.is_some_and(|seen| {
+                                        now.duration_since(seen) < Duration::from_secs(30)
+                                    }))
+                                    && s.available
+                                    && lane.next_check <= now
+                                    && matches!(lane.decision, Decision::Allow | Decision::Unknown))
+                                .then_some((lane.next_check, e.clone(), Some(key.clone())))
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        ((e.live.load(Ordering::Relaxed) > 0
+                            || s.last_seen.elapsed() < Duration::from_secs(30))
+                            && s.available
+                            && s.next_check <= Instant::now()
+                            && matches!(s.decision, Decision::Allow | Decision::Unknown))
+                        .then_some((s.next_check, e.clone(), None))
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                    }
                 })
                 .collect::<Vec<_>>()
         };
-        due.sort_by_key(|(time, _)| *time);
+        due.sort_by_key(|(time, _, _)| *time);
         stream::iter(
             due.into_iter()
                 .take(128)
-                .map(|(_, e)| async move { self.refresh(&e).await }),
+                .map(|(_, e, key)| async move { self.refresh(&e, key.as_deref()).await }),
         )
         .buffer_unordered(16)
         .collect::<Vec<_>>()
@@ -890,6 +2327,22 @@ impl PlaybackAuth {
             self.publish(&name, policy_for(&name));
         }
     }
+    /// Called while IPTV publication holds the store write lock. The order is
+    /// store -> authority -> entries -> state, matching final admission.
+    pub fn invalidate_iptv(&self) {
+        let _authority = self.authority.lock().unwrap();
+        let entries = self.entries.lock().unwrap();
+        for entry in entries.values() {
+            let mut state = entry.state.lock().unwrap();
+            if state.policy.kind != PolicyKind::Iptv {
+                continue;
+            }
+            state.cancel_playback();
+            state.decision = Decision::Unknown;
+            state.next_check = Instant::now();
+            state.generation += 1;
+        }
+    }
     pub fn revoke(&self, id: &str) -> bool {
         let all = self.entries.lock().unwrap();
         let Some(e) = all.values().find(|e| e.id == id) else {
@@ -897,6 +2350,7 @@ impl PlaybackAuth {
         };
         let mut s = e.state.lock().unwrap();
         s.cancel_playback();
+        s.callback_lanes.clear();
         s.decision = Decision::Deny;
         s.next_check = Instant::now() + Duration::from_secs(180);
         s.revoked_until = Some(s.next_check);
@@ -914,6 +2368,7 @@ impl PlaybackAuth {
             if state.request.name == name {
                 let permission_deadline = state.allowed_until;
                 state.cancel_playback();
+                state.callback_lanes.clear();
                 state.allowed_until = permission_deadline;
                 state.cancel = CancellationToken::new();
                 state.generation += 1;
@@ -930,7 +2385,25 @@ impl PlaybackAuth {
                 && matches!(s.decision, Decision::Allow)
                 && !s.revoked_until.is_some_and(|until| until > Instant::now())
             {
-                s.next_check = Instant::now();
+                let now = Instant::now();
+                s.next_check = now;
+                if s.policy.kind == PolicyKind::Callback {
+                    for lane in s.callback_lanes.values_mut() {
+                        if matches!(lane.decision, Decision::Allow) && !lane.cancel.is_cancelled() {
+                            if lane.live == 0
+                                && !lane.playback_seen.is_some_and(|seen| {
+                                    now.duration_since(seen) < Duration::from_secs(30)
+                                })
+                            {
+                                // An idle approval cannot admit a new viewer if
+                                // the forced callback fails or is unavailable.
+                                lane.decision = Decision::Unknown;
+                            }
+                            lane.next_check = now;
+                            lane.forced = true;
+                        }
+                    }
+                }
                 s.generation += 1;
                 count += 1;
             }
@@ -947,15 +2420,19 @@ impl PlaybackAuth {
     }
     fn describe(e: &Entry) -> Value {
         let s = e.state.lock().unwrap();
-        json!({"id":e.id,"name":s.request.name,"proto":s.request.proto,"ip":s.request.ip,"user_id":s.user_id,"duration":s.created.elapsed().as_secs(),"bytes":e.bytes.load(Ordering::Relaxed),"is_open":matches!(s.decision, Decision::Allow)})
+        let is_open = if s.policy.kind == PolicyKind::Callback {
+            s.callback_lanes
+                .values()
+                .any(|lane| matches!(lane.decision, Decision::Allow) && !lane.cancel.is_cancelled())
+        } else {
+            matches!(s.decision, Decision::Allow)
+        };
+        json!({"id":e.id,"name":s.request.name,"proto":s.request.proto,"ip":s.request.ip,"user_id":s.user_id,"duration":s.created.elapsed().as_secs(),"bytes":e.bytes.load(Ordering::Relaxed),"is_open":is_open})
     }
     pub fn active(&self) -> u64 {
-        self.entries
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|e| e.occupied())
-            .count() as u64
+        self.entries.lock().unwrap().values().fold(0u64, |sum, e| {
+            sum.saturating_add(e.occupied_units(true) as u64)
+        })
     }
     /// Live authorization holders, excluding cached decisions kept for reconnects.
     pub fn live_grants(&self) -> u64 {
@@ -1030,6 +2507,9 @@ impl PlaybackAuth {
             if s.playback_seen.is_some() {
                 s.playback_seen = Some(aged);
             }
+            if s.segmented_seen.is_some() {
+                s.segmented_seen = Some(aged);
+            }
         }
     }
 }
@@ -1038,8 +2518,526 @@ impl PlaybackAuth {
 mod idle_memory_tests;
 
 #[cfg(test)]
+mod capacity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callback_session_keys_require_token() {
+        let root = json!({});
+        let missing =
+            json!({"on_play":{"url":"https://auth.example/check","session_keys":["name","proto"]}});
+        assert_eq!(
+            Policy::from_config(&missing, &root).unwrap_err(),
+            "callback session_keys must include token"
+        );
+        assert!(
+            Policy::from_config(&json!({"on_play":"https://auth.example/check"}), &root).is_ok()
+        );
+        assert!(Policy::from_config(&json!({"on_play":{"url":"https://auth.example/check","session_keys":["proto","name","token","token"]}}), &root).is_ok());
+        assert!(Policy::from_config(&json!({"on_play":"iptv://"}), &root).is_ok());
+    }
+
+    #[tokio::test]
+    async fn remote_grant_checks_its_monotonic_deadline_even_if_watcher_is_delayed() {
+        let auth = PlaybackAuth::new(2);
+        let snapshot = auth
+            .publish(
+                "news",
+                Some(Policy::from_config(&json!({}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let viewer = ViewerRequest {
+            name: "news".into(),
+            proto: "mpegts".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(grant) = auth.authorize(snapshot, viewer).await else {
+            panic!("grant");
+        };
+        let entry = grant.entry.as_ref().unwrap();
+        entry.remote_deadline_micros.store(1, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert!(grant.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn projected_iptv_units_share_hls_but_count_independent_continuous_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IptvStore::open(dir.path().join("iptv.json")).unwrap();
+        store.set_enabled(true).unwrap();
+        store
+            .put_package("basic", json!({"channels":["news"]}))
+            .unwrap();
+        store
+            .put_subscriber(
+                "alice",
+                json!({"token":"subscriber","packages":["basic"],"max_sessions":3}),
+            )
+            .unwrap();
+        let auth = PlaybackAuth::with_iptv(8, store);
+        let policy = auth
+            .publish(
+                "news",
+                Some(Policy::from_config(&json!({"on_play":"iptv://"}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let viewer = ViewerRequest {
+            name: "news".into(),
+            proto: "hls".into(),
+            token: "subscriber".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(segment) = auth.authorize(policy.clone(), viewer.clone()).await
+        else {
+            panic!("first segment");
+        };
+        let entry = segment.entry.as_ref().unwrap().clone();
+        {
+            let state = entry.state.lock().unwrap();
+            assert_eq!(
+                state.projected_capacity_units(GrantKind::Segmented, false),
+                1
+            );
+        }
+        drop(segment);
+        {
+            let state = entry.state.lock().unwrap();
+            assert_eq!(
+                state.capacity_units(0, true),
+                1,
+                "recent HLS group retains a slot"
+            );
+            assert_eq!(
+                state.projected_capacity_units(GrantKind::Segmented, false),
+                1
+            );
+        }
+        let ts = ViewerRequest {
+            proto: "mpegts".into(),
+            ..viewer
+        };
+        let AuthOutcome::Allowed(first) = auth.authorize(policy.clone(), ts.clone()).await else {
+            panic!("first continuous output");
+        };
+        let continuous = first.entry.as_ref().unwrap();
+        assert_eq!(
+            continuous
+                .state
+                .lock()
+                .unwrap()
+                .projected_capacity_units(GrantKind::Continuous, false),
+            2
+        );
+        let AuthOutcome::Allowed(mut control) = auth.authorize_control(policy, ts).await else {
+            panic!("control handoff");
+        };
+        control.mark_handoff();
+        let owner = control.entry.as_ref().unwrap();
+        let state = owner.state.lock().unwrap();
+        let live = owner.live.load(Ordering::Relaxed) as usize;
+        assert_eq!(
+            state.projected_capacity_units(GrantKind::Continuous, true),
+            state.capacity_units(live, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn expiring_grant_cancels_its_transport_token_without_canceling_parent() {
+        let mut grant = Grant::peer();
+        let parent = grant.cancellation_token();
+        grant.expire_at(SystemTime::now() + Duration::from_millis(50));
+        let transport = grant.cancellation_token();
+        tokio::time::timeout(Duration::from_secs(1), transport.cancelled())
+            .await
+            .expect("expiry must wake token-only transport watchers");
+        assert!(grant.is_cancelled());
+        assert!(
+            !parent.is_cancelled(),
+            "other viewers share the parent token"
+        );
+    }
+
+    #[tokio::test]
+    async fn iptv_limit_rejects_a_second_live_connection_with_the_same_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IptvStore::open(dir.path().join("iptv.json")).unwrap();
+        store.set_enabled(true).unwrap();
+        store
+            .put_package("basic", json!({"channels":["news"]}))
+            .unwrap();
+        store
+            .put_subscriber(
+                "alice",
+                json!({"token":"subscriber-token","packages":["basic"],"max_sessions":1}),
+            )
+            .unwrap();
+        let auth = PlaybackAuth::with_iptv(8, store);
+        let policy = Policy::from_config(&json!({"on_play":"iptv://"}), &json!({})).unwrap();
+        let snapshot = auth.publish("news", Some(policy)).unwrap();
+        let viewer = ViewerRequest {
+            name: "news".into(),
+            proto: "mpegts".into(),
+            ip: "192.0.2.10".into(),
+            token: "subscriber-token".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(first) = auth.authorize(snapshot.clone(), viewer.clone()).await
+        else {
+            panic!("first subscriber connection denied")
+        };
+        assert!(matches!(
+            auth.authorize(snapshot.clone(), viewer.clone()).await,
+            AuthOutcome::Denied
+        ));
+        drop(first);
+        assert!(matches!(
+            auth.authorize(snapshot, viewer).await,
+            AuthOutcome::Allowed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn iptv_connections_use_global_capacity_without_blocking_hls_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IptvStore::open(dir.path().join("iptv.json")).unwrap();
+        store.set_enabled(true).unwrap();
+        store
+            .put_package("basic", json!({"channels":["news"]}))
+            .unwrap();
+        store
+            .put_subscriber(
+                "alice",
+                json!({"token":"subscriber-token","packages":["basic"],"max_sessions":3}),
+            )
+            .unwrap();
+        let policy = Policy::from_config(&json!({"on_play":"iptv://"}), &json!({})).unwrap();
+        let viewer = |proto: &str| ViewerRequest {
+            name: "news".into(),
+            proto: proto.into(),
+            ip: "192.0.2.10".into(),
+            token: "subscriber-token".into(),
+            ..Default::default()
+        };
+
+        let auth = PlaybackAuth::with_iptv(1, store.clone());
+        let snapshot = auth.publish("news", Some(policy.clone())).unwrap();
+        let AuthOutcome::Allowed(first) = auth.authorize(snapshot.clone(), viewer("mpegts")).await
+        else {
+            panic!("first connection denied")
+        };
+        assert!(matches!(
+            auth.authorize(snapshot, viewer("mpegts")).await,
+            AuthOutcome::Denied
+        ));
+        drop(first);
+
+        let hls = PlaybackAuth::with_iptv(1, store);
+        let snapshot = hls.publish("news", Some(policy)).unwrap();
+        let AuthOutcome::Allowed(first_segment) =
+            hls.authorize(snapshot.clone(), viewer("hls")).await
+        else {
+            panic!("first HLS request denied")
+        };
+        assert!(matches!(
+            hls.authorize(snapshot, viewer("hls")).await,
+            AuthOutcome::Allowed(_)
+        ));
+        drop(first_segment);
+    }
+
+    #[tokio::test]
+    async fn global_limit_counts_matching_continuous_connections_for_open_streams() {
+        let auth = PlaybackAuth::new(1);
+        let policy = Policy::from_config(&json!({}), &json!({})).unwrap();
+        let snapshot = auth.publish("news", Some(policy)).unwrap();
+        let request = ViewerRequest {
+            name: "news".into(),
+            proto: "mpegts".into(),
+            ip: "192.0.2.10".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(first) = auth.authorize(snapshot.clone(), request.clone()).await
+        else {
+            panic!("first open connection denied")
+        };
+        assert!(matches!(
+            auth.authorize(snapshot, request).await,
+            AuthOutcome::Denied
+        ));
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn finite_m4f_fragments_share_a_signal_slot_but_two_signals_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IptvStore::open(dir.path().join("iptv.json")).unwrap();
+        store.set_enabled(true).unwrap();
+        store
+            .put_package("basic", json!({"channels":["news"]}))
+            .unwrap();
+        store
+            .put_subscriber(
+                "alice",
+                json!({"token":"subscriber-token","packages":["basic"],"max_sessions":1}),
+            )
+            .unwrap();
+        let auth = PlaybackAuth::with_iptv(1, store);
+        let policy = Policy::from_config(&json!({"on_play":"iptv://"}), &json!({})).unwrap();
+        let snapshot = auth.publish("news", Some(policy)).unwrap();
+        let fragment = ViewerRequest {
+            name: "news".into(),
+            proto: "m4f".into(),
+            token: "subscriber-token".into(),
+            finite_media: true,
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(first_fragment) =
+            auth.authorize(snapshot.clone(), fragment.clone()).await
+        else {
+            panic!("first finite M4F fragment denied")
+        };
+        let AuthOutcome::Allowed(second_fragment) =
+            auth.authorize(snapshot.clone(), fragment.clone()).await
+        else {
+            panic!("overlapping finite M4F fragment denied")
+        };
+        let signal = ViewerRequest {
+            finite_media: false,
+            ..fragment
+        };
+        let AuthOutcome::Allowed(first_signal) =
+            auth.authorize(snapshot.clone(), signal.clone()).await
+        else {
+            panic!("matching M4F signal denied")
+        };
+        assert_eq!(auth.active(), 1);
+        assert!(matches!(
+            auth.authorize(snapshot, signal).await,
+            AuthOutcome::Denied
+        ));
+        drop((first_fragment, second_fragment, first_signal));
+    }
+
+    #[tokio::test]
+    async fn two_matching_rtsp_control_grants_cannot_bypass_capacity_on_promotion() {
+        let auth = PlaybackAuth::new(1);
+        let policy = Policy::from_config(&json!({}), &json!({})).unwrap();
+        let snapshot = auth.publish("news", Some(policy)).unwrap();
+        let viewer = ViewerRequest {
+            name: "news".into(),
+            proto: "rtsp".into(),
+            ip: "192.0.2.10".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(first) = auth
+            .authorize_control(snapshot.clone(), viewer.clone())
+            .await
+        else {
+            panic!("first control admission denied")
+        };
+        assert!(matches!(
+            auth.authorize_control(snapshot.clone(), viewer.clone())
+                .await,
+            AuthOutcome::Denied
+        ));
+        first.playback();
+        assert_eq!(auth.active(), 1);
+        assert!(matches!(
+            auth.authorize_control(snapshot, viewer).await,
+            AuthOutcome::Denied
+        ));
+    }
+
+    #[tokio::test]
+    async fn unrelated_direct_output_cannot_share_an_unclaimed_handoff_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IptvStore::open(dir.path().join("iptv.json")).unwrap();
+        store.set_enabled(true).unwrap();
+        store
+            .put_package("basic", json!({"channels":["news"]}))
+            .unwrap();
+        store
+            .put_subscriber(
+                "alice",
+                json!({"token":"subscriber-token","packages":["basic"],"max_sessions":3}),
+            )
+            .unwrap();
+        let auth = PlaybackAuth::with_iptv(3, store);
+        let policy = Policy::from_config(&json!({"on_play":"iptv://"}), &json!({})).unwrap();
+        let snapshot = auth.publish("news", Some(policy)).unwrap();
+        let viewer = ViewerRequest {
+            name: "news".into(),
+            proto: "mpegts".into(),
+            token: "subscriber-token".into(),
+            ..Default::default()
+        };
+        let mut handoffs = Vec::new();
+        for _ in 0..2 {
+            let slot = auth.reserve_capacity(0).unwrap();
+            let AuthOutcome::Allowed(mut handoff) = auth
+                .authorize_reserved(snapshot.clone(), viewer.clone(), slot)
+                .await
+            else {
+                panic!("reserved control denied")
+            };
+            handoff.release_capacity_reservation();
+            handoff.mark_handoff();
+            handoffs.push(handoff);
+        }
+        let AuthOutcome::Allowed(direct) = auth.authorize(snapshot.clone(), viewer.clone()).await
+        else {
+            panic!("third independent slot denied")
+        };
+        assert_eq!(auth.active(), 3);
+        assert!(matches!(
+            auth.authorize(snapshot.clone(), viewer.clone()).await,
+            AuthOutcome::Denied
+        ));
+        let AuthOutcome::Allowed(claimed) =
+            auth.authorize_handoff(snapshot, viewer, &handoffs[0]).await
+        else {
+            panic!("claimed handoff lost its promised slot")
+        };
+        assert_eq!(auth.active(), 3);
+        drop((direct, claimed, handoffs));
+    }
+
+    #[tokio::test]
+    async fn hls_segments_share_a_matching_unclaimed_handoff_identity() {
+        let auth = PlaybackAuth::new(1);
+        let policy = Policy::from_config(&json!({}), &json!({})).unwrap();
+        let snapshot = auth.publish("news", Some(policy)).unwrap();
+        let viewer = ViewerRequest {
+            name: "news".into(),
+            proto: "hls".into(),
+            token: "viewer".into(),
+            ..Default::default()
+        };
+        let reservation = auth.reserve_capacity(0).unwrap();
+        let AuthOutcome::Allowed(mut handoff) = auth
+            .authorize_reserved(snapshot.clone(), viewer.clone(), reservation)
+            .await
+        else {
+            panic!("HLS control handoff denied")
+        };
+        handoff.release_capacity_reservation();
+        handoff.mark_handoff();
+        let AuthOutcome::Allowed(segment) = auth.authorize(snapshot.clone(), viewer.clone()).await
+        else {
+            panic!("same-identity HLS segment denied")
+        };
+        assert_eq!(auth.active(), 1);
+        let AuthOutcome::Allowed(claimed) =
+            auth.authorize_handoff(snapshot, viewer, &handoff).await
+        else {
+            panic!("HLS handoff lost its slot")
+        };
+        assert_eq!(auth.active(), 1);
+        drop((segment, claimed, handoff));
+    }
+
+    #[tokio::test]
+    async fn subscriber_edit_between_lookup_and_admission_cannot_publish_old_token() {
+        for edit in [
+            "token",
+            "package",
+            "subscriber",
+            "limit",
+            "disable",
+            "expiry",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = IptvStore::open(dir.path().join("iptv.json")).unwrap();
+            store.set_enabled(true).unwrap();
+            store
+                .put_package("basic", json!({"channels":["news","sports"]}))
+                .unwrap();
+            store
+                .put_subscriber(
+                    "alice",
+                    json!({"token":"old-token","packages":["basic"],"max_sessions":2}),
+                )
+                .unwrap();
+            let auth = Arc::new(PlaybackAuth::with_iptv(8, store.clone()));
+            let weak = Arc::downgrade(&auth);
+            store.set_on_change(Box::new(move |_| {
+                if let Some(auth) = weak.upgrade() {
+                    auth.invalidate_iptv();
+                }
+            }));
+            let policy = Policy::from_config(&json!({"on_play":"iptv://"}), &json!({})).unwrap();
+            let news = auth.publish("news", Some(policy.clone())).unwrap();
+            let sports = auth.publish("sports", Some(policy)).unwrap();
+            let viewer = |name: &str| ViewerRequest {
+                name: name.into(),
+                proto: "mpegts".into(),
+                token: "old-token".into(),
+                ..Default::default()
+            };
+            let held = if edit == "limit" {
+                let AuthOutcome::Allowed(grant) =
+                    auth.authorize(news.clone(), viewer("news")).await
+                else {
+                    panic!("initial grant");
+                };
+                Some(grant)
+            } else {
+                None
+            };
+            let (selected, request) = if edit == "limit" {
+                (sports, viewer("sports"))
+            } else {
+                (news, viewer("news"))
+            };
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            *auth.iptv_lookup_gate.lock().unwrap() = Some((entered_tx, release_rx));
+            let pending = tokio::spawn({
+                let auth = auth.clone();
+                async move { auth.authorize(selected, request).await }
+            });
+            entered_rx.await.unwrap();
+            match edit {
+                "token" => {
+                    store
+                        .put_subscriber("alice", json!({"token":"new-token"}))
+                        .unwrap();
+                }
+                "package" => {
+                    store.delete_package("basic").unwrap();
+                }
+                "subscriber" => {
+                    store.delete_subscriber("alice").unwrap();
+                }
+                "limit" => {
+                    store
+                        .put_subscriber("alice", json!({"max_sessions":1}))
+                        .unwrap();
+                }
+                "disable" => {
+                    store.set_enabled(false).unwrap();
+                }
+                "expiry" => {
+                    store
+                        .put_subscriber(
+                            "alice",
+                            json!({"flussonix_expires_at":"2000-01-01T00:00:00Z"}),
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            release_tx.send(()).unwrap();
+            assert!(
+                matches!(pending.await.unwrap(), AuthOutcome::Denied),
+                "{edit}"
+            );
+            drop(held);
+        }
+    }
 
     async fn candidate_fixture() -> (Arc<PlaybackAuth>, RecoveryDemand, Arc<Entry>, Arc<Entry>) {
         let auth = Arc::new(PlaybackAuth::new(128));
@@ -1395,6 +3393,768 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_callback_due_keeps_recovery_until_hard_deadline() {
+        let backend = ControlBackend::with_duration(false, 1).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let AuthOutcome::Allowed(grant) = auth
+            .authorize(
+                snapshot,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "mpegts".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("initial callback approval")
+        };
+        grant.playback();
+        assert!(grant.recovery_activity().is_some());
+        assert!(auth.recovery_demand().contains_key("owned"));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!grant.is_cancelled());
+        assert!(
+            grant.recovery_activity().is_some(),
+            "early routine callback check blocked native recovery before hard expiry"
+        );
+        assert!(
+            auth.recovery_demand().contains_key("owned"),
+            "early routine callback check removed the shared worker's recovery demand"
+        );
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn forced_callback_reauth_fences_recovery_during_outage() {
+        let backend = ControlBackend::with_duration(false, 30).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let AuthOutcome::Allowed(grant) = auth
+            .authorize(
+                snapshot,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "mpegts".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("initial callback approval")
+        };
+        grant.playback();
+        assert!(auth.recovery_demand().contains_key("owned"));
+        backend.unavailable.store(true, Ordering::SeqCst);
+        assert_eq!(auth.force_reauth("owned"), 1);
+        assert!(grant.recovery_activity().is_none());
+        assert!(auth.recovery_demand().is_empty());
+        auth.renew_due().await;
+        assert!(grant.recovery_activity().is_none());
+        assert!(auth.recovery_demand().is_empty());
+        assert!(
+            !grant.is_cancelled(),
+            "force does not revoke a still-live viewer"
+        );
+        backend.unavailable.store(false, Ordering::SeqCst);
+        assert_eq!(auth.force_reauth("owned"), 1);
+        auth.renew_due().await;
+        assert!(grant.recovery_activity().is_some());
+        assert!(auth.recovery_demand().contains_key("owned"));
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn callback_reply_after_expiry_never_revives_original_grant() {
+        let backend = ControlBackend::with_duration(false, 1).await;
+        let auth = Arc::new(PlaybackAuth::new(8));
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "mpegts".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(original) =
+            auth.authorize(snapshot.clone(), request.clone()).await
+        else {
+            panic!("initial callback approval")
+        };
+        backend.delay_ms.store(1200, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let renew_auth = auth.clone();
+        let renewal = tokio::spawn(async move { renew_auth.renew_due().await });
+        tokio::time::timeout(Duration::from_millis(300), async {
+            while backend.calls.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("renewal did not enter callback");
+        tokio::time::timeout(Duration::from_millis(1100), original.cancelled())
+            .await
+            .expect("original grant did not expire while callback was pending");
+        renewal.await.unwrap();
+        assert!(
+            original.is_cancelled(),
+            "late callback revived expired viewer"
+        );
+        let AuthOutcome::Allowed(replacement) = auth.authorize(snapshot, request).await else {
+            panic!("fresh admission should use the later successful callback")
+        };
+        assert!(!replacement.is_cancelled());
+        assert!(original.is_cancelled());
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn stop_retires_callback_timer_and_pending_renewal() {
+        let backend = ControlBackend::with_duration(false, 30).await;
+        let auth = Arc::new(PlaybackAuth::new(8));
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let AuthOutcome::Allowed(grant) = auth
+            .authorize(
+                snapshot,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "mpegts".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("initial callback approval")
+        };
+        let entry = grant.entry.as_ref().unwrap().clone();
+        let key = grant.callback_lane.as_ref().unwrap().clone();
+        let expiry = entry.state.lock().unwrap().callback_lanes[&key]
+            .expiry_task
+            .as_ref()
+            .unwrap()
+            .clone();
+        backend.delay_ms.store(600, Ordering::SeqCst);
+        assert_eq!(auth.force_reauth("owned"), 1);
+        auth.schedule_due();
+        tokio::time::timeout(Duration::from_millis(300), async {
+            while backend.calls.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background renewal did not start");
+        let renewal = entry.state.lock().unwrap().callback_lanes[&key]
+            .renewal_task
+            .as_ref()
+            .unwrap()
+            .clone();
+        auth.stop_playback("owned");
+        assert!(grant.is_cancelled());
+        assert!(entry.state.lock().unwrap().callback_lanes.is_empty());
+        tokio::time::timeout(Duration::from_millis(300), async {
+            while !expiry.is_finished() || !renewal.is_finished() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("stopped lane retained timer or renewal job");
+        assert_eq!(auth.callback_lane_count.load(Ordering::Acquire), 0);
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn policy_replacement_retires_callback_timer() {
+        let backend = ControlBackend::with_duration(false, 30).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let AuthOutcome::Allowed(grant) = auth
+            .authorize(
+                snapshot,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "mpegts".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("initial callback approval")
+        };
+        let entry = grant.entry.as_ref().unwrap().clone();
+        let key = grant.callback_lane.as_ref().unwrap().clone();
+        let expiry = entry.state.lock().unwrap().callback_lanes[&key]
+            .expiry_task
+            .as_ref()
+            .unwrap()
+            .clone();
+        auth.publish(
+            "owned",
+            Some(
+                Policy::from_config(
+                    &json!({"on_play":{"url":backend.url,"max_sessions":2}}),
+                    &json!({}),
+                )
+                .unwrap(),
+            ),
+        );
+        assert!(grant.is_cancelled());
+        assert!(entry.state.lock().unwrap().callback_lanes.is_empty());
+        tokio::time::timeout(Duration::from_millis(300), async {
+            while !expiry.is_finished() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("replaced policy retained its old callback timer");
+        assert_eq!(auth.callback_lane_count.load(Ordering::Acquire), 0);
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn idle_lane_eviction_retires_its_expiry_timer() {
+        let backend = ControlBackend::with_duration(false, 30).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(
+                    Policy::from_config(
+                        &json!({"on_play":{"url":backend.url,"session_keys":["name","proto","token"]}}),
+                        &json!({}),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        let mut entry = None;
+        let mut evicted_key = String::new();
+        let mut expiry = None;
+        for index in 0..17 {
+            let AuthOutcome::Allowed(grant) = auth
+                .authorize(
+                    snapshot.clone(),
+                    ViewerRequest {
+                        name: "owned".into(),
+                        proto: "mpegts".into(),
+                        token: "shared".into(),
+                        qs: format!("lane={index}"),
+                        ..Default::default()
+                    },
+                )
+                .await
+            else {
+                panic!("callback lane {index} was denied")
+            };
+            if index == 0 {
+                let first_entry = grant.entry.as_ref().unwrap().clone();
+                let first_key = grant.callback_lane.as_ref().unwrap().clone();
+                expiry = Some(
+                    first_entry.state.lock().unwrap().callback_lanes[&first_key]
+                        .expiry_task
+                        .as_ref()
+                        .unwrap()
+                        .clone(),
+                );
+                entry = Some(first_entry);
+                evicted_key = first_key;
+            }
+            drop(grant);
+        }
+        let entry = entry.unwrap();
+        assert_eq!(entry.state.lock().unwrap().callback_lanes.len(), 16);
+        assert!(
+            !entry
+                .state
+                .lock()
+                .unwrap()
+                .callback_lanes
+                .contains_key(&evicted_key)
+        );
+        let expiry = expiry.unwrap();
+        tokio::time::timeout(Duration::from_millis(300), async {
+            while !expiry.is_finished() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("evicted callback lane retained its timer");
+        assert_eq!(auth.callback_lane_count.load(Ordering::Acquire), 16);
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn expired_callback_lane_cancels_live_grant_and_denies_cached_admission() {
+        let backend = ControlBackend::with_duration(false, 1).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "mpegts".into(),
+            token: "viewer".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(grant) = auth.authorize(snapshot.clone(), request.clone()).await
+        else {
+            panic!("initial callback approval")
+        };
+        backend.unavailable.store(true, Ordering::SeqCst);
+        assert_eq!(auth.force_reauth("owned"), 1);
+        auth.renew_due().await;
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+        let woke = tokio::time::timeout(Duration::from_millis(1300), grant.cancelled())
+            .await
+            .is_ok();
+        let new_admission = auth.authorize(snapshot, request).await;
+        assert!(woke, "an expired callback grant kept its media token live");
+        assert!(
+            matches!(new_admission, AuthOutcome::Denied),
+            "an expired cached allow admitted a new viewer during a 503 outage"
+        );
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn expired_lane_does_not_cancel_sibling_or_shared_worker() {
+        let backend = ControlBackend::with_duration(false, 1).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(
+                    &json!({"on_play":{"url":backend.url,"session_keys":["name","proto","token"]}}),
+                    &json!({}),
+                ).unwrap()),
+            )
+            .unwrap();
+        let first_request = ViewerRequest {
+            name: "owned".into(),
+            proto: "mpegts".into(),
+            token: "viewer".into(),
+            qs: "lane=short".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(short) = auth
+            .authorize(snapshot.clone(), first_request.clone())
+            .await
+        else {
+            panic!("short lane approval")
+        };
+        backend.duration.store(30, Ordering::SeqCst);
+        let long_request = ViewerRequest {
+            qs: "lane=long".into(),
+            ..first_request
+        };
+        let AuthOutcome::Allowed(long) = auth.authorize(snapshot, long_request).await else {
+            panic!("long lane approval")
+        };
+        backend.unavailable.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        auth.renew_due().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1300), short.cancelled())
+                .await
+                .is_ok(),
+            "the expired lane stayed open"
+        );
+        assert!(!long.is_cancelled(), "a sibling lane was canceled");
+        assert!(
+            auth.recovery_demand().contains_key("owned"),
+            "expiry of one lane stopped the sibling's shared source"
+        );
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn stale_expiry_timer_cannot_cancel_replaced_policy_or_renewed_lane() {
+        let backend = ControlBackend::with_duration(false, 1).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "mpegts".into(),
+            token: "viewer".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(first) = auth.authorize(snapshot, request.clone()).await else {
+            panic!("first callback approval")
+        };
+        let entry = first.entry.as_ref().unwrap().clone();
+        let key = first.callback_lane.as_ref().unwrap().clone();
+        let generation = first.callback_generation.unwrap();
+        let first_deadline = entry.state.lock().unwrap().callback_lanes[&key].allowed_until;
+
+        backend.duration.store(30, Ordering::SeqCst);
+        auth.force_reauth("owned");
+        auth.renew_due().await;
+        tokio::time::sleep_until((first_deadline + Duration::from_millis(30)).into()).await;
+        PlaybackAuth::expire_callback_lane(
+            Arc::downgrade(&entry),
+            key.clone(),
+            generation,
+            first_deadline,
+        );
+        assert!(
+            !first.is_cancelled(),
+            "stale timer canceled the renewed grant"
+        );
+
+        let replacement = auth
+            .publish(
+                "owned",
+                Some(
+                    Policy::from_config(
+                        &json!({"on_play":{"url":backend.url,"max_sessions":2}}),
+                        &json!({}),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        assert!(
+            first.is_cancelled(),
+            "policy replacement must stop the old grant"
+        );
+        let AuthOutcome::Allowed(current) = auth.authorize(replacement, request).await else {
+            panic!("replacement callback approval")
+        };
+        PlaybackAuth::expire_callback_lane(Arc::downgrade(&entry), key, generation, first_deadline);
+        assert!(
+            !current.is_cancelled(),
+            "old policy timer canceled a replacement grant"
+        );
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn healthy_one_second_callback_renews_without_cancelling_viewer() {
+        let backend = ControlBackend::with_duration(false, 1).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let AuthOutcome::Allowed(grant) = auth
+            .authorize(
+                snapshot,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "mpegts".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("initial callback approval")
+        };
+        let key = grant.callback_lane.as_ref().unwrap();
+        let first_deadline = grant
+            .entry
+            .as_ref()
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .callback_lanes[key]
+            .allowed_until;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        auth.renew_due().await;
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            2,
+            "one-second grant did not start early renewal"
+        );
+        tokio::time::sleep_until((first_deadline + Duration::from_millis(50)).into()).await;
+        assert!(
+            !grant.is_cancelled(),
+            "healthy renewal interrupted the viewer at the old deadline"
+        );
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn six_hundred_ms_callback_renews_one_second_lease() {
+        let backend = ControlBackend::with_duration(false, 1).await;
+        let auth = PlaybackAuth::new(8);
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let AuthOutcome::Allowed(grant) = auth
+            .authorize(
+                snapshot,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "mpegts".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("initial callback approval")
+        };
+        let key = grant.callback_lane.as_ref().unwrap();
+        let first_deadline = grant
+            .entry
+            .as_ref()
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .callback_lanes[key]
+            .allowed_until;
+        backend.delay_ms.store(600, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        auth.renew_due().await;
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            2,
+            "slow callback renewal was not started"
+        );
+        tokio::time::sleep_until((first_deadline + Duration::from_millis(50)).into()).await;
+        assert!(
+            !grant.is_cancelled(),
+            "600 ms callback missed a one-second hard deadline"
+        );
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn stalled_lane_does_not_block_healthy_lane() {
+        let backend = ControlBackend::with_duration(false, 1).await;
+        let auth = Arc::new(PlaybackAuth::new(8));
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(
+                    &json!({"on_play":{"url":backend.url,"session_keys":["name","proto","token"]}}),
+                    &json!({}),
+                ).unwrap()),
+            )
+            .unwrap();
+        let slow_request = ViewerRequest {
+            name: "owned".into(),
+            proto: "mpegts".into(),
+            token: "viewer".into(),
+            qs: "lane=slow".into(),
+            ..Default::default()
+        };
+        let fast_request = ViewerRequest {
+            qs: "lane=fast".into(),
+            ..slow_request.clone()
+        };
+        let AuthOutcome::Allowed(slow) =
+            auth.authorize(snapshot.clone(), slow_request.clone()).await
+        else {
+            panic!("initial slow-lane approval")
+        };
+        let AuthOutcome::Allowed(fast) =
+            auth.authorize(snapshot.clone(), fast_request.clone()).await
+        else {
+            panic!("initial fast-lane approval")
+        };
+        backend.slow_delay_ms.store(1500, Ordering::SeqCst);
+        assert_eq!(auth.force_reauth("owned"), 1);
+        let slow_auth = auth.clone();
+        let slow_snapshot = snapshot.clone();
+        let slow_task =
+            tokio::spawn(async move { slow_auth.authorize(slow_snapshot, slow_request).await });
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while backend.calls.load(Ordering::SeqCst) < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("stalled lane never entered callback");
+        let fast_result = tokio::time::timeout(
+            Duration::from_millis(500),
+            auth.authorize(snapshot, fast_request),
+        )
+        .await;
+        assert!(
+            matches!(fast_result, Ok(AuthOutcome::Allowed(_))),
+            "healthy lane waited for stalled callback"
+        );
+        assert!(backend.calls.load(Ordering::SeqCst) >= 4);
+        assert!(
+            !fast.is_cancelled(),
+            "healthy viewer lost its callback lease"
+        );
+        let _ = slow_task.await;
+        drop(slow);
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn background_renewal_is_nonblocking_and_deduplicated() {
+        let backend = ControlBackend::with_duration(false, 1).await;
+        let auth = Arc::new(PlaybackAuth::new(8));
+        let snapshot = auth
+            .publish(
+                "owned",
+                Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+            )
+            .unwrap();
+        let AuthOutcome::Allowed(grant) = auth
+            .authorize(
+                snapshot,
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "mpegts".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("initial callback approval")
+        };
+        let key = grant.callback_lane.as_ref().unwrap();
+        let first_deadline = grant
+            .entry
+            .as_ref()
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .callback_lanes[key]
+            .allowed_until;
+        backend.delay_ms.store(600, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let started = Instant::now();
+        auth.schedule_due();
+        auth.schedule_due();
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "scheduler waited for a callback response"
+        );
+        tokio::time::sleep_until((first_deadline + Duration::from_millis(50)).into()).await;
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            2,
+            "duplicate or absent renewal job"
+        );
+        assert!(
+            !grant.is_cancelled(),
+            "a healthy background renewal missed the hard deadline"
+        );
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn saturated_renewals_expire_at_original_deadline() {
+        let backend = ControlBackend::with_duration(true, 30).await;
+        let auth = Arc::new(PlaybackAuth::new(64));
+        assert_eq!(auth.callback_lane_limit, 50_000);
+        let mut grants = Vec::new();
+        for index in 0..17 {
+            let name = format!("owned-{index}");
+            let snapshot = auth
+                .publish(
+                    &name,
+                    Some(Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap()),
+                )
+                .unwrap();
+            let AuthOutcome::Allowed(grant) = auth
+                .authorize(
+                    snapshot,
+                    ViewerRequest {
+                        name: name.clone(),
+                        proto: "mpegts".into(),
+                        token: "b".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+            else {
+                panic!("initial approval for {name}")
+            };
+            grants.push(grant);
+        }
+        backend.duration.store(1, Ordering::SeqCst);
+        for index in 0..17 {
+            assert_eq!(auth.force_reauth(&format!("owned-{index}")), 1);
+        }
+        auth.renew_due().await;
+        let latest_deadline = grants
+            .iter()
+            .map(|grant| {
+                let entry = grant.entry.as_ref().unwrap();
+                let key = grant.callback_lane.as_ref().unwrap();
+                entry.state.lock().unwrap().callback_lanes[key].allowed_until
+            })
+            .max()
+            .unwrap();
+        let latest_check = grants
+            .iter()
+            .map(|grant| {
+                let entry = grant.entry.as_ref().unwrap();
+                let key = grant.callback_lane.as_ref().unwrap();
+                entry.state.lock().unwrap().callback_lanes[key].next_check
+            })
+            .max()
+            .unwrap();
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 34);
+        backend.delay_ms.store(1500, Ordering::SeqCst);
+        tokio::time::sleep_until((latest_check + Duration::from_millis(20)).into()).await;
+        auth.schedule_due();
+        tokio::time::timeout(Duration::from_millis(800), async {
+            while backend.calls.load(Ordering::SeqCst) < 50 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("sixteen renewal jobs did not begin");
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            50,
+            "background callback job limit exceeded"
+        );
+        tokio::time::sleep_until((latest_deadline + Duration::from_millis(50)).into()).await;
+        assert!(
+            grants.iter().all(Grant::is_cancelled),
+            "stalled or unscheduled renewal extended an old grant"
+        );
+        backend.close().await;
+    }
+
+    #[tokio::test]
     async fn stale_control_grant_cannot_repopulate_activity_after_policy_change() {
         let backend = ControlBackend::new(false).await;
         let auth = PlaybackAuth::new(8);
@@ -1521,6 +4281,11 @@ mod tests {
         drop(control);
         drop(playback);
         backend.close().await;
+        assert_eq!(
+            auth.active(),
+            0,
+            "denied playback retained a reconnect capacity slot"
+        );
         assert!(
             demand.is_empty(),
             "control revived canceled playback; unique={unique}"
@@ -1570,10 +4335,193 @@ mod tests {
         assert!(!auth.recovery_demand().is_empty());
     }
 
+    #[tokio::test]
+    async fn operator_stop_requires_fresh_callback_before_new_playback() {
+        let backend = ControlBackend::with_duration(false, 180).await;
+        let auth = PlaybackAuth::new(8);
+        let policy = Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap();
+        let snapshot = auth.publish("owned", Some(policy.clone())).unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "mpegts".into(),
+            token: "same".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(old) = auth.authorize(snapshot, request.clone()).await else {
+            panic!("initial callback playback")
+        };
+        auth.stop_playback("owned");
+        assert!(old.is_cancelled());
+        drop(old);
+        let current = auth.publish("owned", Some(policy)).unwrap();
+        let AuthOutcome::Allowed(new) = auth.authorize(current, request).await else {
+            panic!("post-stop callback playback")
+        };
+        assert!(!new.is_cancelled());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn expired_manual_revoke_requires_a_fresh_callback() {
+        let backend = ControlBackend::with_duration(false, 180).await;
+        let auth = PlaybackAuth::new(8);
+        let policy = Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap();
+        let snapshot = auth.publish("owned", Some(policy)).unwrap();
+        let request = ViewerRequest {
+            name: "owned".into(),
+            proto: "mpegts".into(),
+            token: "same".into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(old) = auth.authorize(snapshot.clone(), request.clone()).await
+        else {
+            panic!("initial callback playback")
+        };
+        let id = auth.snapshots()[0]["id"].as_str().unwrap().to_owned();
+        assert!(auth.revoke(&id));
+        assert!(old.is_cancelled());
+        assert!(matches!(
+            auth.authorize(snapshot.clone(), request.clone()).await,
+            AuthOutcome::Denied
+        ));
+        drop(old);
+        {
+            let entries = auth.entries.lock().unwrap();
+            let entry = entries.values().next().unwrap();
+            entry.state.lock().unwrap().revoked_until =
+                Some(Instant::now() - Duration::from_secs(1));
+        }
+        let AuthOutcome::Allowed(new) = auth.authorize(snapshot, request).await else {
+            panic!("expired hold should recheck callback and allow")
+        };
+        assert!(!new.is_cancelled());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn global_callback_lane_budget_reclaims_idle_but_never_live_decisions() {
+        let backend = ControlBackend::with_duration(false, 180).await;
+        let mut auth = PlaybackAuth::new(10);
+        auth.callback_lane_limit = 2;
+        let policy = Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap();
+        let snapshot = auth.publish("owned", Some(policy)).unwrap();
+        let request = |qs: &str| ViewerRequest {
+            name: "owned".into(),
+            proto: "mpegts".into(),
+            token: "same".into(),
+            qs: qs.into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(first) = auth.authorize(snapshot.clone(), request("first")).await
+        else {
+            panic!("first lane")
+        };
+        let AuthOutcome::Allowed(second) =
+            auth.authorize(snapshot.clone(), request("second")).await
+        else {
+            panic!("second lane")
+        };
+        assert!(matches!(
+            auth.authorize(snapshot.clone(), request("third")).await,
+            AuthOutcome::Denied
+        ));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+        drop(first);
+        assert!(matches!(
+            auth.authorize(snapshot.clone(), request("third")).await,
+            AuthOutcome::Denied
+        ));
+        tokio::time::sleep(Duration::from_millis(110)).await;
+        assert!(matches!(
+            auth.authorize(snapshot, request("third")).await,
+            AuthOutcome::Allowed(_)
+        ));
+        assert!(!second.is_cancelled());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 3);
+        drop(second);
+        assert!(auth.reclaim_idle_callback_lanes());
+        assert!(auth.reclaim_idle_callback_lanes());
+        assert_eq!(auth.callback_lane_count.load(Ordering::SeqCst), 0);
+        assert!(auth.snapshots().iter().all(|row| row["is_open"] == false));
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn saturated_lane_cache_reclaims_idle_decisions_in_an_amortized_batch() {
+        let backend = ControlBackend::with_duration(false, 180).await;
+        let mut auth = PlaybackAuth::new(8);
+        auth.callback_lane_limit = 4;
+        let policy = Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap();
+        let snapshot = auth.publish("owned", Some(policy)).unwrap();
+        let request = |qs: &str| ViewerRequest {
+            name: "owned".into(),
+            proto: "mpegts".into(),
+            token: "same".into(),
+            qs: qs.into(),
+            ..Default::default()
+        };
+        for index in 0..4 {
+            assert!(matches!(
+                auth.authorize(snapshot.clone(), request(&format!("{index}")))
+                    .await,
+                AuthOutcome::Allowed(_)
+            ));
+        }
+        assert_eq!(auth.callback_lane_count.load(Ordering::SeqCst), 4);
+        assert!(matches!(
+            auth.authorize(snapshot, request("next")).await,
+            AuthOutcome::Allowed(_)
+        ));
+        assert_eq!(auth.callback_lane_count.load(Ordering::SeqCst), 3);
+        backend.close().await;
+    }
+
+    #[tokio::test]
+    async fn all_live_lane_cache_does_not_rescan_for_every_new_context() {
+        let backend = ControlBackend::with_duration(false, 180).await;
+        let mut auth = PlaybackAuth::new(8);
+        auth.callback_lane_limit = 1;
+        let policy = Policy::from_config(&json!({"on_play":backend.url}), &json!({})).unwrap();
+        let snapshot = auth.publish("owned", Some(policy)).unwrap();
+        let request = |qs: &str| ViewerRequest {
+            name: "owned".into(),
+            proto: "mpegts".into(),
+            token: "same".into(),
+            qs: qs.into(),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(live) = auth.authorize(snapshot.clone(), request("live")).await
+        else {
+            panic!("initial lane")
+        };
+        assert!(matches!(
+            auth.authorize(snapshot.clone(), request("new")).await,
+            AuthOutcome::Denied
+        ));
+        drop(live);
+        assert!(matches!(
+            auth.authorize(snapshot.clone(), request("new")).await,
+            AuthOutcome::Denied
+        ));
+        tokio::time::sleep(Duration::from_millis(110)).await;
+        assert!(matches!(
+            auth.authorize(snapshot, request("new")).await,
+            AuthOutcome::Allowed(_)
+        ));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+        backend.close().await;
+    }
+
     struct ControlBackend {
         url: String,
         calls: Arc<AtomicU64>,
         deny: Arc<std::sync::atomic::AtomicBool>,
+        unavailable: Arc<std::sync::atomic::AtomicBool>,
+        duration: Arc<AtomicU64>,
+        delay_ms: Arc<AtomicU64>,
+        slow_delay_ms: Arc<AtomicU64>,
         stop: CancellationToken,
         task: tokio_util::task::AbortOnDropHandle<()>,
     }
@@ -1588,6 +4536,14 @@ mod tests {
             let count = calls.clone();
             let deny = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let reject = deny.clone();
+            let unavailable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let fail = unavailable.clone();
+            let duration = Arc::new(AtomicU64::new(duration));
+            let lease = duration.clone();
+            let delay_ms = Arc::new(AtomicU64::new(0));
+            let delay = delay_ms.clone();
+            let slow_delay_ms = Arc::new(AtomicU64::new(0));
+            let slow_delay = slow_delay_ms.clone();
             let router = axum::Router::new().route(
                 "/auth",
                 axum::routing::get(
@@ -1596,10 +4552,25 @@ mod tests {
                     >| {
                         let count = count.clone();
                         let reject = reject.clone();
+                        let fail = fail.clone();
+                        let lease = lease.clone();
+                        let delay = delay.clone();
+                        let slow_delay = slow_delay.clone();
                         async move {
                             count.fetch_add(1, Ordering::Relaxed);
+                            let wait = if q.get("qs").is_some_and(|value| value == "lane=slow") {
+                                slow_delay.load(Ordering::SeqCst)
+                            } else {
+                                delay.load(Ordering::SeqCst)
+                            };
+                            if wait > 0 {
+                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                            }
                             let mut headers = axum::http::HeaderMap::new();
-                            headers.insert("x-authduration", duration.to_string().parse().unwrap());
+                            headers.insert(
+                                "x-authduration",
+                                lease.load(Ordering::SeqCst).to_string().parse().unwrap(),
+                            );
                             headers.insert("x-userid", "account".parse().unwrap());
                             if unique {
                                 if q["token"] == "a" {
@@ -1609,7 +4580,9 @@ mod tests {
                                 headers.insert("x-max-sessions", "1".parse().unwrap());
                             }
                             (
-                                if reject.load(Ordering::SeqCst) {
+                                if fail.load(Ordering::SeqCst) {
+                                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                                } else if reject.load(Ordering::SeqCst) {
                                     axum::http::StatusCode::FORBIDDEN
                                 } else {
                                     axum::http::StatusCode::OK
@@ -1632,6 +4605,10 @@ mod tests {
                 url,
                 calls,
                 deny,
+                unavailable,
+                duration,
+                delay_ms,
+                slow_delay_ms,
                 stop,
                 task,
             }
@@ -1643,6 +4620,102 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
+    }
+    #[tokio::test]
+    async fn force_reauth_rechecks_idle_callback_lane_in_an_occupied_session() {
+        let backend = ControlBackend::new(false).await;
+        let auth = PlaybackAuth::new(8);
+        let policy = Policy::from_config(
+            &json!({"on_play":{"url":backend.url,"session_keys":["name","proto","token"]}}),
+            &json!({}),
+        )
+        .unwrap();
+        let snapshot = auth.publish("owned", Some(policy)).unwrap();
+        let active_request = ViewerRequest {
+            name: "owned".into(),
+            proto: "mpegts".into(),
+            token: "same".into(),
+            qs: "lane=active".into(),
+            ..Default::default()
+        };
+        let idle_request = ViewerRequest {
+            qs: "lane=idle".into(),
+            ..active_request.clone()
+        };
+        let AuthOutcome::Allowed(active) = auth.authorize(snapshot.clone(), active_request).await
+        else {
+            panic!("active lane should initially be allowed")
+        };
+        let AuthOutcome::Allowed(idle) = auth
+            .authorize_control(snapshot.clone(), idle_request.clone())
+            .await
+        else {
+            panic!("idle lane should initially be allowed")
+        };
+        drop(idle);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+
+        backend.deny.store(true, Ordering::SeqCst);
+        assert_eq!(auth.force_reauth("owned"), 1);
+        auth.renew_due().await;
+        assert!(active.is_cancelled(), "the denied active lane stayed open");
+        assert!(
+            matches!(
+                auth.authorize(snapshot, idle_request).await,
+                AuthOutcome::Denied
+            ),
+            "the idle lane reused its old approval after forced reauth"
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 4);
+        backend.close().await;
+    }
+    #[tokio::test]
+    async fn force_reauth_fails_closed_for_idle_lane_during_callback_outage() {
+        let backend = ControlBackend::new(false).await;
+        let auth = PlaybackAuth::new(8);
+        let policy = Policy::from_config(
+            &json!({"on_play":{"url":backend.url,"session_keys":["name","proto","token"]}}),
+            &json!({}),
+        )
+        .unwrap();
+        let snapshot = auth.publish("owned", Some(policy)).unwrap();
+        let active_request = ViewerRequest {
+            name: "owned".into(),
+            proto: "mpegts".into(),
+            token: "same".into(),
+            qs: "lane=active".into(),
+            ..Default::default()
+        };
+        let idle_request = ViewerRequest {
+            qs: "lane=idle".into(),
+            ..active_request.clone()
+        };
+        let AuthOutcome::Allowed(active) = auth.authorize(snapshot.clone(), active_request).await
+        else {
+            panic!("active lane should initially be allowed")
+        };
+        let AuthOutcome::Allowed(idle) = auth
+            .authorize_control(snapshot.clone(), idle_request.clone())
+            .await
+        else {
+            panic!("idle lane should initially be allowed")
+        };
+        drop(idle);
+        backend.close().await;
+
+        assert_eq!(auth.force_reauth("owned"), 1);
+        auth.renew_due().await;
+        assert!(
+            !active.is_cancelled(),
+            "existing playback should survive an outage"
+        );
+        assert!(
+            matches!(
+                auth.authorize(snapshot, idle_request).await,
+                AuthOutcome::Denied
+            ),
+            "the idle lane reused an old approval while reauthorization was unavailable"
+        );
     }
     #[tokio::test]
     async fn warmed_control_allow_rechecks_callback_user_limit_without_another_callback() {
@@ -1886,18 +4959,19 @@ mod tests {
     #[test]
     fn session_key_order_is_distinct_even_when_values_are_equal() {
         let a = Policy::from_config(
-            &json!({"on_play":{"url":"https://auth.example/play","session_keys":["name","proto"]}}),
+            &json!({"on_play":{"url":"https://auth.example/play","session_keys":["name","proto","token"]}}),
             &json!({}),
         )
         .unwrap();
         let b = Policy::from_config(
-            &json!({"on_play":{"url":"https://auth.example/play","session_keys":["proto","name"]}}),
+            &json!({"on_play":{"url":"https://auth.example/play","session_keys":["proto","name","token"]}}),
             &json!({}),
         )
         .unwrap();
         let r = ViewerRequest {
             name: "hls".into(),
             proto: "hls".into(),
+            token: "hls".into(),
             ..Default::default()
         };
         assert_ne!(a.identity(&r), b.identity(&r));

@@ -106,6 +106,36 @@ impl super::super::ReplicaSelector {
     ) -> Result<ActivatedCandidate, super::super::ReplicaFailure> {
         self.current(&choice)?;
         let (candidate, scope) = choice.into_managed();
+        let activated = scope.activate(candidate)?;
+        self.commit_static_demand(&activated, || true)?;
+        Ok(activated)
+    }
+    /// The daemon has a separate demand epoch gate after source activation.
+    /// Keep this route temporary until that gate accepts the exact demand.
+    pub(crate) fn activate_provisional(
+        &self,
+        choice: super::super::ReplicaChoice,
+    ) -> Result<ActivatedCandidate, super::super::ReplicaFailure> {
+        self.current(&choice)?;
+        let (candidate, scope) = choice.into_managed();
         scope.activate(candidate)
+    }
+    pub(crate) fn commit_static_demand(
+        &self,
+        activated: &ActivatedCandidate,
+        accept: impl FnOnce() -> bool,
+    ) -> Result<bool, super::super::ReplicaFailure> {
+        let scope = activated
+            .selection
+            .as_ref()
+            .ok_or(super::super::ReplicaFailure::Stale)?;
+        self.owner
+            .at_admission_candidate(&activated.candidate, &activated.name, |view, _| {
+                if !view.selected_static || activated.is_cancelled() {
+                    return Err(AdmissionFailure::Revoked);
+                }
+                Ok(scope.commit_if(self, accept))
+            })
+            .map_err(super::super::ReplicaFailure::Admission)?
     }
 }

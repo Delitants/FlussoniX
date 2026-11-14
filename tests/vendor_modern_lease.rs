@@ -636,27 +636,36 @@ async fn direct_self_refresh_revokes_old_lease_and_unknown_or_relayed_rows_stay_
         publish(&a, &old.candidate(NAME).unwrap()),
         Err(LeaseFailure::Superseded)
     );
+    let mut guarded_config = s.source();
+    guarded_config["group_config"] = json!({"protected":{"on_play":"https://other.invalid/check"}});
+    let guarded =
+        SourceAuthority::new_modern(&guarded_config, &json!([]), Duration::from_secs(3)).unwrap();
     for (row, reason) in [
         (
             json!({"name":NAME,"named_by":"config"}),
-            flussonix::source_directory::flussonic::EligibilityFailure::UnknownGroups,
+            ProjectionFailure::MissingGroupPin,
         ),
         (
             json!({"name":NAME,"named_by":"remote","groups":[]}),
-            flussonix::source_directory::flussonic::EligibilityFailure::Relayed,
+            ProjectionFailure::Ineligible(
+                flussonix::source_directory::flussonic::EligibilityFailure::Relayed,
+            ),
         ),
         (
             json!({"name":NAME,"named_by":"config","groups":[],"disabled":true}),
-            flussonix::source_directory::flussonic::EligibilityFailure::Disabled,
+            ProjectionFailure::Ineligible(
+                flussonix::source_directory::flussonic::EligibilityFailure::Disabled,
+            ),
         ),
     ] {
         *s.rows.lock().unwrap() = json!([row]);
-        let rows = a
+        let rows = guarded
             .leased_modern_inventory(&local(), Duration::from_secs(30))
             .await
             .unwrap();
-        assert!(
-            matches!(rows.candidate(NAME),Err(LeaseFailure::Binding(BindingFailure::Projection(ProjectionFailure::Ineligible(r)))) if r == reason)
+        assert_eq!(
+            rows.candidate(NAME).err(),
+            Some(LeaseFailure::Binding(BindingFailure::Projection(reason)))
         );
     }
     assert_eq!(s.paths.lock().unwrap().len(), 13);
@@ -687,4 +696,41 @@ async fn invalid_source_edit_preserves_lease_and_remove_readd_never_revives_it()
         .unwrap();
     publish(&a, &new.candidate(NAME).unwrap()).unwrap();
     assert_eq!(s.paths.lock().unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn omitted_groups_uniform_modern_binding_still_expires_and_fences_policy_edits() {
+    let s = Server::start().await;
+    *s.rows.lock().unwrap() = json!([{"name":NAME,"named_by":"config"}]);
+    let a = s.authority();
+    let rows = a
+        .leased_modern_inventory(&local(), Duration::from_millis(200))
+        .await
+        .unwrap();
+    let candidate = rows.candidate(NAME).unwrap();
+    publish(&a, &candidate).unwrap();
+    tokio::time::sleep(Duration::from_millis(220)).await;
+    assert_eq!(publish(&a, &candidate), Err(LeaseFailure::Expired));
+    let rows = a
+        .leased_modern_inventory(&local(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    let candidate = rows.candidate(NAME).unwrap();
+    let mut config = s.source();
+    config["group_config"] = json!({"protected":{"on_play":"https://other.invalid/check"}});
+    a.replace(&config, &json!([])).unwrap();
+    assert_eq!(
+        publish(&a, &candidate),
+        Err(binding(ProjectionFailure::Stale))
+    );
+    let rows = a
+        .leased_modern_inventory(&local(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert!(matches!(
+        rows.candidate(NAME),
+        Err(LeaseFailure::Binding(BindingFailure::Projection(
+            ProjectionFailure::MissingGroupPin
+        )))
+    ));
 }

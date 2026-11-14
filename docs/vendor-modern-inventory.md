@@ -23,7 +23,7 @@ A refresh performs:
 
 1. GET the configured root's `/streamer/api/v3/config`; read `stats.id`.
 2. GET `/streamer/api/v3/streams` with fixed
-   `select=name,named_by,groups,static,disabled` and `limit=100`, following the
+   `select=name,named_by,groups,static,disabled` and `limit=1000`, following the
    complete cursor chain at that same endpoint. Each page must supply a matching
    `server_id`.
 3. GET the same config endpoint again and require the same observed identity.
@@ -32,6 +32,13 @@ A cursor is one opaque query value, never a navigation target. There is no
 fallback to `/-/streams`, a different host, another credential, or another API
 profile after a denial, timeout, redirect or malformed response. Unknown response
 fields, including upstream inputs and remote viewer policy, are discarded.
+
+The larger requested page reduces round trips for ordinary catalogs without
+extending the refresh deadline or any shared response/row limit. Servers may
+return smaller pages; the client still follows every cursor until the complete
+chain ends. A server rejecting the requested limit fails closed, with no
+automatic profile or credential fallback. This does not change relay eligibility
+or turn missing memberships into permission.
 
 Modern HTTP rejections and redirects return `Invalid`; server failures and
 network/timeouts return `Unavailable`. This distinction lets the opt-in replica

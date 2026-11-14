@@ -84,3 +84,62 @@ fn incomplete_psi_does_not_invent_a_codec() {
     probe.push(&bytes[100..]);
     assert_eq!(probe.audio, Some(Some(0xf)));
 }
+
+#[test]
+fn numeric_filter_mapping_requires_complete_current_known_single_program() {
+    for (pat_flags, pmt_flags, kinds, extra_program, expected) in [
+        ([0xc1, 0, 0], [0xc1, 0, 0], vec![0x1b, 3, 0xf], false, true),
+        ([0xc1, 0, 0], [0xc1, 0, 0], vec![0x24, 0xf, 4], false, true),
+        ([0xc0, 0, 0], [0xc1, 0, 0], vec![0x1b, 0xf], false, false),
+        ([0xc1, 0, 1], [0xc1, 0, 0], vec![0x1b, 0xf], false, false),
+        ([0xc1, 0, 0], [0xc0, 0, 0], vec![0x1b, 0xf], false, false),
+        ([0xc1, 0, 0], [0xc1, 0, 1], vec![0x1b, 0xf], false, false),
+        ([0xc1, 0, 0], [0xc1, 0, 0], vec![0x1b, 6, 0xf], false, false),
+        ([0xc1, 0, 0], [0xc1, 0, 0], vec![0x1b, 0xf], true, false),
+    ] {
+        let mut pat = vec![
+            0,
+            0xb0,
+            0,
+            0,
+            1,
+            pat_flags[0],
+            pat_flags[1],
+            pat_flags[2],
+            0,
+            1,
+            0xf0,
+            0,
+        ];
+        if extra_program {
+            pat.extend([0, 2, 0xf0, 1]);
+        }
+        let mut pmt = vec![
+            2,
+            0xb0,
+            0,
+            0,
+            1,
+            pmt_flags[0],
+            pmt_flags[1],
+            pmt_flags[2],
+            0xe1,
+            0,
+            0xf0,
+            0,
+        ];
+        for kind in kinds {
+            pmt.extend([kind, 0xe1, 1, 0xf0, 0]);
+        }
+        let mut probe = Probe::for_publication();
+        probe.push(&section(0, pat));
+        probe.push(&section(4096, pmt));
+        let current = pat_flags[0] & 1 != 0 && pmt_flags[0] & 1 != 0;
+        assert_eq!(
+            probe.audio.is_some(),
+            current,
+            "current multi-section metadata must reach legacy fallback"
+        );
+        assert_eq!(probe.filter_mapping_known, expected);
+    }
+}

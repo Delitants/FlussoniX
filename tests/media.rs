@@ -1,5 +1,6 @@
 use flussonix::media::Engine;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{sync::Arc, time::Duration};
 #[tokio::test]
 async fn viewers_share_worker_and_stop_reaps_process() {
@@ -28,4 +29,27 @@ async fn viewers_share_worker_and_stop_reaps_process() {
     engine.stop("news").await;
     assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
     assert_eq!(engine.count().await, 0);
+}
+
+#[tokio::test]
+async fn generated_segment_symlink_cannot_expose_daemon_readable_secret() {
+    let media = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    let secret = private.path().join("secret");
+    std::fs::write(&secret, b"private-service-credential").unwrap();
+    let engine = Engine::new(media.path(), "ffmpeg");
+    let worker = engine
+        .ensure("news", &json!({"inputs":[{"url":"testsrc://"}]}))
+        .await
+        .unwrap();
+    let mut output = worker.subscribe();
+    tokio::time::timeout(Duration::from_secs(10), output.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let stream_dir = media.path().join(format!("{:x}", Sha256::digest(b"news")));
+    std::os::unix::fs::symlink(&secret, stream_dir.join("probe.ts")).unwrap();
+    let exposed = engine.read("news", "probe.ts").await;
+    engine.stop_all().await;
+    assert!(exposed.is_err(), "symlinked segment must not be served");
 }

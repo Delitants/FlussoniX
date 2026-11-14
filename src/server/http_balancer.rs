@@ -162,6 +162,10 @@ impl App {
             matches!(
                 key.as_str(),
                 "srt_playback"
+                    | "output_kbit"
+                    | "bandwidth_usage"
+                    | "total_clients"
+                    | "total_streams_count"
                     | "role"
                     | "uplink"
                     | "uplink_mbps"

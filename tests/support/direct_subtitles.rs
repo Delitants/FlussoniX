@@ -24,6 +24,10 @@ pub async fn run(secure: bool) {
         (true, true, "passthrough", true),
     ] {
         let d = tempfile::tempdir().unwrap();
+        if secure {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let source = d.path().join("source.ts");
         let input = original::inject(&if hevc {
             captions::hevc_transport(digital)
@@ -54,12 +58,17 @@ pub async fn run(secure: bool) {
         } else {
             json!({})
         };
+        let receiver_ledger = d.path().join("receiver-epochs");
+        if secure {
+            flussonix::direct_rtp::key_ledger::Ledger::initialize(&receiver_ledger).unwrap();
+        }
         let app = App::new(
             d.path().join("config.json"),
             d.path().join("media"),
             Options {
                 admin_password: "owned-rtp-admin".into(),
                 peer_key: "owned-rtp-peer".into(),
+                srtp_receiver_ledger: secure.then_some(receiver_ledger),
                 ..Default::default()
             },
         )

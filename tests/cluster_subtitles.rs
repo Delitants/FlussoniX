@@ -195,13 +195,64 @@ impl Cdn {
     }
 }
 async fn run(cpu: bool, bitmap: bool) {
+    run_with_early_erase(cpu, bitmap, false).await;
+}
+async fn run_with_early_erase(cpu: bool, bitmap: bool, early_erase: bool) {
     let _serial = SERIAL.acquire().await.unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let input = if bitmap {
+    let mut input = if bitmap {
         dvb::transport()
     } else {
         teletext::transport()
     };
+    if early_erase {
+        assert!(!bitmap);
+        // Deliver the erase PES ahead of its presentation time, as an
+        // asynchronous transcoding mux can. Keep every PES/PCR timestamp,
+        // continuity counter and encoded subtitle byte unchanged.
+        let first = input
+            .chunks_exact(188)
+            .find_map(|p| {
+                (teletext::original::pid(p) == 256 && p[1] & 0x40 != 0).then(|| {
+                    teletext::original::pts(teletext::original::payload(p).unwrap()).unwrap()
+                })
+            })
+            .unwrap();
+        let mut early = Vec::new();
+        let mut rest = Vec::new();
+        for packet in input.chunks_exact(188) {
+            let pid = teletext::original::pid(packet);
+            let stamp = if packet[1] & 0x40 != 0 {
+                teletext::original::payload(packet).and_then(teletext::original::pts)
+            } else {
+                None
+            };
+            if matches!(pid, 0x121 | 0x122) && stamp == Some(first + 75 * 3600) {
+                let payload = teletext::original::payload(packet).unwrap();
+                assert_eq!(
+                    6 + usize::from(u16::from_be_bytes([payload[4], payload[5]])),
+                    payload.len()
+                );
+                early.extend_from_slice(packet);
+            } else {
+                rest.extend_from_slice(packet);
+            }
+        }
+        assert_eq!(early.len(), 188 * 2);
+        let at = rest
+            .chunks_exact(188)
+            .position(|p| {
+                teletext::original::pid(p) == 256
+                    && p[1] & 0x40 != 0
+                    && teletext::original::pts(teletext::original::payload(p).unwrap())
+                        == Some(first + 69 * 3600)
+            })
+            .unwrap()
+            * 188;
+        rest.splice(at..at, early);
+        assert_eq!(rest.len(), input.len());
+        input = rest;
+    }
     let source = node(dir.path(), "source", "source").await;
     let mut cdn = Cdn::start(dir.path()).await;
     let lb = node(dir.path(), "lb", "lb").await;
@@ -479,7 +530,9 @@ async fn run(cpu: bool, bitmap: bool) {
                 bounds
                     .iter()
                     .any(|(start, end)| (*start - 2.16).abs() < 0.04 && (*end - 3.0).abs() < 0.04),
-                "source cue timing changed by more than one video frame: {words}"
+                "source cue timing changed by more than one video frame: {id} {prefix}: {words}; source: {}; CDN: {}",
+                publication.worker.stats(),
+                cdn.stats().await
             );
         }
     }
@@ -548,6 +601,14 @@ async fn copy_source_relays_teletext_originals_and_converted_hls() {
 #[tokio::test]
 async fn cpu_source_relays_teletext_without_reencoding_at_cdn() {
     run(true, false).await;
+}
+#[tokio::test]
+async fn cpu_source_preserves_teletext_presentation_times_when_pes_arrives_before_video() {
+    run_with_early_erase(true, false, true).await;
+}
+#[tokio::test]
+async fn copy_source_preserves_teletext_presentation_times_when_pes_arrives_before_video() {
+    run_with_early_erase(false, false, true).await;
 }
 #[tokio::test]
 async fn copy_source_relays_dvb_originals_and_recognized_hls() {

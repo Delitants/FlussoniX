@@ -11,7 +11,10 @@ use reqwest::header::HeaderValue;
 use serde_json::Value;
 use std::{
     collections::HashSet,
+    future::Future,
+    net::SocketAddr,
     path::Path,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use url::Url;
@@ -89,13 +92,16 @@ impl InventoryStream {
     }
 }
 
-/// Owns a verified, no-proxy, no-redirect HTTP client and a privileged key.
+/// Owns a verified, no-proxy, no-redirect HTTP client pinned on first use and
+/// a privileged key. One client and DNS address set live with this source profile.
 /// Credentials are never embedded in URLs, returned in errors or sent using the
 /// native peer protocol. Intentionally has no Debug/Serialize implementation.
 pub struct InventoryClient {
     endpoint: Url,
     key: Box<str>,
-    client: reqwest::Client,
+    tls: Arc<tokio_rustls::rustls::ClientConfig>,
+    request_deadline: Duration,
+    client: tokio::sync::OnceCell<reqwest::Client>,
 }
 impl InventoryClient {
     /// `base` is an HTTP(S) management root, optionally with a proxy path prefix.
@@ -135,20 +141,36 @@ impl InventoryClient {
             "{}/-/streams",
             endpoint.path().trim_end_matches('/')
         ));
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(request_deadline)
-            .use_preconfigured_tls(
-                (*crate::tls_input::client(ca).map_err(|_| LookupFailure::Invalid)?).clone(),
-            )
-            .build()
-            .map_err(|_| LookupFailure::Invalid)?;
+        let tls = crate::tls_input::client(ca).map_err(|_| LookupFailure::Invalid)?;
         Ok(Self {
             endpoint,
             key: key.into(),
-            client,
+            tls,
+            request_deadline,
+            client: tokio::sync::OnceCell::new(),
         })
+    }
+
+    async fn client_with<F, Fut>(&self, lookup: F) -> Result<&reqwest::Client, LookupFailure>
+    where
+        F: FnOnce(String, u16) -> Fut,
+        Fut: Future<Output = Result<Vec<SocketAddr>, String>>,
+    {
+        self.client
+            .get_or_try_init(|| async {
+                let addresses = crate::origin_pin::resolve_with(&self.endpoint, lookup)
+                    .await
+                    .map_err(|_| LookupFailure::Unavailable)?;
+                let builder = reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(self.request_deadline)
+                    .use_preconfigured_tls((*self.tls).clone());
+                crate::origin_pin::pin(builder, &self.endpoint, &addresses)
+                    .build()
+                    .map_err(|_| LookupFailure::Unavailable)
+            })
+            .await
     }
 
     /// Publish a result only after the complete cursor chain validates. All pages
@@ -218,12 +240,12 @@ impl InventoryClient {
         remaining: &mut usize,
         modern: bool,
     ) -> Result<Value, LookupFailure> {
+        let client = self.client_with(crate::origin_pin::lookup).await?;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| LookupFailure::Unavailable)?
             .as_secs();
-        let mut response = self
-            .client
+        let mut response = client
             .get(url)
             .header(
                 "Authorization",
@@ -349,6 +371,80 @@ fn inventory_authorization(key: &str, timestamp: u64) -> HeaderValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        net::SocketAddr,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    #[tokio::test]
+    async fn inventory_reuses_first_resolved_address_for_later_requests() {
+        let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = primary.local_addr().unwrap().port();
+        let secondary = tokio::net::TcpListener::bind(("127.0.0.2", port))
+            .await
+            .unwrap();
+        let primary_count = Arc::new(AtomicUsize::new(0));
+        let secondary_count = Arc::new(AtomicUsize::new(0));
+        for (listener, count) in [
+            (primary, primary_count.clone()),
+            (secondary, secondary_count.clone()),
+        ] {
+            tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    count.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut request = [0u8; 2048];
+                        let _ = socket.read(&mut request).await;
+                        let body = b"{\"streams\":[]}";
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        let _ = socket.write_all(body).await;
+                    });
+                }
+            });
+        }
+        let client = InventoryClient::new(
+            &format!("http://inventory.example:{port}"),
+            "test-key",
+            None,
+        )
+        .unwrap();
+        let first: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let second: SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
+        client
+            .client_with(move |_, _| async move { Ok(vec![first]) })
+            .await
+            .unwrap();
+        assert!(client.inventory().await.unwrap().is_empty());
+        client
+            .client_with(move |_, _| async move { Ok(vec![second]) })
+            .await
+            .unwrap();
+        assert!(client.inventory().await.unwrap().is_empty());
+        assert_eq!(primary_count.load(Ordering::SeqCst), 2);
+        assert_eq!(secondary_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_inventory_dns_never_creates_an_unpinned_client() {
+        let client =
+            InventoryClient::new("http://inventory.example:8000", "test-key", None).unwrap();
+        assert!(matches!(
+            client
+                .client_with(|_, _| async { Err("synthetic failure".into()) })
+                .await,
+            Err(LookupFailure::Unavailable)
+        ));
+        assert!(client.client.get().is_none());
+    }
     // Break caught: using minutes/milliseconds, uppercase/HMAC/SHA256, or native
     // raw credentials instead of the reference-version inventory digest.
     #[test]

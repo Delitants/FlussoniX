@@ -145,7 +145,62 @@ fn verify_auth(headers: &HeaderMap) {
     assert!(!headers["authorization"].to_str().unwrap().contains("owned"));
 }
 
+// A modest catalog must not spend its refresh budget on avoidable round trips.
+// The server honors requested size rather than returning a preselected fixture.
+#[tokio::test]
+async fn projected_catalog_fits_refresh_budget_without_expanding_limits() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let got = calls.clone();
+    let router = Router::new().fallback(get(move |OriginalUri(uri): OriginalUri| {
+        got.fetch_add(1, Ordering::SeqCst);
+        async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            if uri.path().ends_with("/config") {
+                return response(config(REMOTE));
+            }
+            let query = url::form_urlencoded::parse(uri.query().unwrap().as_bytes())
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let limit = query["limit"].parse::<usize>().unwrap();
+            assert!((1..=1000).contains(&limit));
+            let start = query
+                .get("cursor")
+                .map(|cursor| cursor.parse::<usize>().unwrap())
+                .unwrap_or(0);
+            let end = (start + limit).min(951);
+            let rows = (start..end)
+                .map(|i| row(&format!("owned-{i:04}")))
+                .collect::<Vec<_>>();
+            response(page(
+                REMOTE,
+                json!(rows),
+                if end < 951 {
+                    json!(end.to_string())
+                } else {
+                    Value::Null
+                },
+            ))
+        }
+    }));
+    let server = Server::start(router, None).await;
+    let outcome = client(&server.url, Duration::from_millis(650))
+        .inventory(&local())
+        .await;
+    server.stop().await;
+    let inventory =
+        outcome.expect("projected catalog exhausted the refresh deadline on small pages");
+    assert_eq!(inventory.rows().len(), 951);
+    for (i, item) in inventory.rows().iter().enumerate() {
+        assert_eq!(item.name, format!("owned-{i:04}"));
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "one projected page bracketed by both identity probes"
+    );
+}
+
 // Catches endpoint fallback, discarded proxy prefix, credential mistakes and cursor navigation.
+// Short pages deliberately model a server capping the requested page size.
 #[tokio::test]
 async fn complete_custom_id_discovery_keeps_fixed_origin_selected_fields_and_credentials() {
     let (s, got) = fixture(|n, path| {
@@ -199,7 +254,7 @@ async fn complete_custom_id_discovery_keeps_fixed_origin_selected_fields_and_cre
             pairs.get("select").unwrap(),
             "name,named_by,groups,static,disabled"
         );
-        assert_eq!(pairs.get("limit").unwrap(), "100");
+        assert_eq!(pairs.get("limit").unwrap(), "1000");
         if index == 0 {
             assert!(!pairs.contains_key("cursor"));
         } else {

@@ -8,6 +8,9 @@ Management and private media endpoints can use separate HTTP or HTTPS addresses.
 For private certificate authorities, enter absolute PEM file paths on the
 receiving FlussoniX node. Vendor media trust does not inherit the management CA;
 leaving its field empty uses public roots. Configure each private CA separately.
+Management discovery and M4 private pulls keep their first resolved address set
+for the configured source generation. A changed source configuration or daemon
+restart starts a new generation and resolves DNS afresh.
 
 Choose a viewer policy: no callback with a token guard, explicit allow without a
 callback, a named backend or a callback URL. New profiles start unresolved and cannot serve viewers until
@@ -36,5 +39,6 @@ The labeled Failover group and Content identity fields configure
 [equivalent source recovery](vendor-daemon-failover.md). FlussoniX LB placement
 is also supported. [Static activation](vendor-static-activation.md) and CDN/standalone
 [RTSP/RTSPS playback](vendor-daemon-playback.md) are supported; vendor RTSP LB
-placement and SRT delivery remain pending.
+placement and SRT delivery are supported. SRT callers connect directly to a CDN
+because SRT has no LB redirect mechanism.
 The native source editor retains its existing controls.

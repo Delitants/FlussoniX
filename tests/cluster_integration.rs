@@ -182,7 +182,17 @@ async fn check_source_cdn_balancer(transport: &str) {
             )
             .await
             .unwrap();
-        let (initial, _) = edge.wire.signal_subscribe();
+        let initial = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (initial, _) = edge.wire.signal_subscribe();
+                if !initial.is_empty() {
+                    break initial;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("restarted M4F worker must produce a segment");
         let line = String::from_utf8_lossy(initial.last().unwrap());
         let stamp = line
             .split_whitespace()
@@ -215,6 +225,14 @@ async fn check_source_cdn_balancer(transport: &str) {
         assert_eq!(r.unwrap().status(), 200)
     }
     assert_eq!(cdn.media.count().await, 1);
+    let playlist = client
+        .get(&canonical)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     let segment = playlist
         .lines()
         .find(|l| !l.starts_with('#') && !l.is_empty())
@@ -260,6 +278,61 @@ async fn check_source_cdn_balancer(transport: &str) {
             .iter()
             .any(|s| s["codec_name"] == "h264")
     );
+    if transport == "m4s" {
+        for (alias, child_name, extension) in [
+            ("index.ts.m3u8", "index.m3u8", ".ts"),
+            ("index.fmp4.m3u8", "fmp4/index.m3u8", ".m4s"),
+        ] {
+            let route = client
+                .get(format!(
+                    "{lb_url}/region/news/{alias}?token=viewer-test-token"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(route.status(), 302);
+            let destination = route.headers()["location"].to_str().unwrap();
+            assert!(destination.contains(&format!("/region/news/{alias}?")));
+            let redeemed = client.get(destination).send().await.unwrap();
+            assert_eq!(redeemed.status(), 302);
+            let clean = redeemed.headers()["location"].to_str().unwrap();
+            assert!(clean.starts_with(&format!("/region/news/{alias}?")));
+            assert!(!clean.contains("flussonix_ticket"));
+            let entry_url = url::Url::parse(&format!("{cdn_url}{clean}")).unwrap();
+            let master = client.get(entry_url.clone()).send().await.unwrap();
+            assert_eq!(master.status(), 200);
+            let master = master.text().await.unwrap();
+            assert!(master.contains("#EXT-X-STREAM-INF:BANDWIDTH="), "{master}");
+            assert!(
+                master.contains(&format!("{child_name}?token=viewer-test-token")),
+                "{master}"
+            );
+            let child = master
+                .lines()
+                .find(|line| !line.is_empty() && !line.starts_with('#'))
+                .unwrap();
+            let child_url = entry_url.join(child).unwrap();
+            let media = client.get(child_url.clone()).send().await.unwrap();
+            assert_eq!(media.status(), 200);
+            let media = media.text().await.unwrap();
+            let segment = media
+                .lines()
+                .find(|line| !line.is_empty() && !line.starts_with('#'))
+                .unwrap();
+            assert!(
+                segment.split('?').next().unwrap().ends_with(extension),
+                "{media}"
+            );
+            let segment_url = child_url.join(segment).unwrap();
+            let denied = client
+                .get(segment_url.as_str().split('?').next().unwrap())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), 403);
+            assert_eq!(client.get(segment_url).send().await.unwrap().status(), 200);
+        }
+    }
     for app in [&source, &cdn, &lb] {
         app.media.stop_all().await;
     }
@@ -418,7 +491,99 @@ async fn named_source_auth_policy_is_portable_and_cannot_use_a_different_edge_ba
             .await
             .unwrap()
             .status(),
+        404,
+        "a source callback requires an exact local Auth backend match"
+    );
+    cdn.config
+        .put("auth_backends", "billing", json!({"url":auth_url}))
+        .unwrap();
+    cdn.reconcile().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = client
+                .get(format!("{cdn_url}/owned/index.m3u8"))
+                .send()
+                .await
+                .unwrap()
+                .status();
+            if status == 200 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("approved callback must become available after denial cache expires");
+    let backend_url = format!("{cdn_url}/streamer/api/v3/auth_backends/billing");
+    assert_eq!(
+        client
+            .put(&backend_url)
+            .basic_auth("admin", Some("management-secret"))
+            .json(&json!({"url":"http://127.0.0.1:1/replaced"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
         200
+    );
+    assert_eq!(
+        client
+            .get(format!("{cdn_url}/owned/index.m3u8?token=after-change"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404,
+        "changing the approved URL must reject the cached mirror"
+    );
+    assert_eq!(
+        client
+            .put(&backend_url)
+            .basic_auth("admin", Some("management-secret"))
+            .json(&json!({"url":auth_url}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if client
+                .get(format!("{cdn_url}/owned/index.m3u8?token=after-restore"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                == 200
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("restoring the exact local callback should restore playback");
+    source_task.abort();
+    assert_eq!(
+        client
+            .delete(&backend_url)
+            .basic_auth("admin", Some("management-secret"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    assert_eq!(
+        client
+            .get(format!("{cdn_url}/owned/index.m3u8?token=after-delete"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404,
+        "an unavailable origin must not revive a deleted local callback approval"
     );
     for app in [&source, &cdn] {
         app.media.stop_all().await;

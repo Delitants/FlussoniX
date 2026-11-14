@@ -1,5 +1,4 @@
 //! Native, bounded continuous MPEG-TS POST. No destination remux process.
-use bytes::Bytes;
 use serde_json::{Value, json};
 use std::{
     sync::{
@@ -167,7 +166,7 @@ impl State {
     }
     pub async fn run(
         self: Arc<Self>,
-        mut receiver: broadcast::Receiver<Bytes>,
+        mut receiver: crate::media_queue::Receiver,
         cancel: CancellationToken,
     ) {
         if self.destination.disabled {
@@ -181,8 +180,7 @@ impl State {
                 c.http_status = None;
                 c.last_error = None;
             }
-            let fresh = receiver.resubscribe();
-            let error = self.attempt(receiver, &cancel).await;
+            let error = self.attempt(&mut receiver, &cancel).await;
             if cancel.is_cancelled() {
                 break;
             }
@@ -193,7 +191,7 @@ impl State {
             }
             tokio::select! {biased;_=cancel.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(self.destination.retry_seconds))=>{}}
             // A retry joins the live worker, without replaying the failed queue.
-            receiver = fresh.resubscribe();
+            receiver = receiver.resubscribe();
         }
         self.counters.lock().unwrap().status = "stopped";
     }
@@ -224,7 +222,7 @@ impl State {
     }
     async fn attempt(
         self: &Arc<Self>,
-        mut receiver: broadcast::Receiver<Bytes>,
+        receiver: &mut crate::media_queue::Receiver,
         cancel: &CancellationToken,
     ) -> &'static str {
         let startup =
@@ -298,6 +296,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use tokio::io::AsyncReadExt;
     use tokio_util::task::AbortOnDropHandle;
 
@@ -372,7 +371,8 @@ mod tests {
             Destination::parse(&json!({"url":format!("http://{address}/owned"),"retry_timeout":1}))
                 .unwrap();
         let state = State::new(destination, 0, egress.clone());
-        let (sender, receiver) = broadcast::channel(64);
+        let sender = crate::media_queue::Channel::new(64, 4 * 1024 * 1024);
+        let receiver = sender.subscribe();
         let sender_cancel = cancel.clone();
         let producer = AbortOnDropHandle::new(tokio::spawn(async move {
             let bytes = Bytes::from(vec![0x47; 188 * 64]);
@@ -469,8 +469,11 @@ mod tests {
         let destination =
             Destination::parse(&json!({"url":format!("http://{address}/owned")})).unwrap();
         let state = State::new(destination, 0, egress.clone());
-        let (sender, receiver) = broadcast::channel(64);
-        let producer_cancel = cancel.clone();
+        let sender = crate::media_queue::Channel::live(64, 4 * 1024 * 1024);
+        let receiver = sender.subscribe();
+        let backlog = sender.clone();
+        let producer_cancel = cancel.child_token();
+        let finish_producer = producer_cancel.clone();
         let producer = AbortOnDropHandle::new(tokio::spawn(async move {
             let bytes = Bytes::from(vec![0x47; 188 * 64]);
             let mut tick = tokio::time::interval(Duration::from_millis(10));
@@ -487,6 +490,15 @@ mod tests {
         })
         .await
         .expect("early acknowledgement must not end the continuous request");
+        finish_producer.cancel();
+        producer.await.unwrap();
+        let reclaimed = tokio::time::timeout(Duration::from_secs(1), async {
+            while backlog.retained() != (0, 0) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
         assert_eq!(state.stats()["attempts"], 1);
         assert_eq!(state.stats()["status"], "sending");
         cancel.cancel();
@@ -494,12 +506,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        producer.await.unwrap();
         let received = tokio::time::timeout(Duration::from_secs(2), server)
             .await
             .unwrap()
             .unwrap();
         assert!(received >= egress.load(Ordering::Relaxed) as usize);
         assert!(!owns_output_socket(address.port()));
+        assert!(
+            reclaimed,
+            "healthy HTTP push must not park an unread retry cursor"
+        );
     }
 }

@@ -4,6 +4,20 @@ use std::time::Duration;
 pub mod flussonic;
 pub mod flussonic_config;
 pub mod flussonic_policy;
+pub(crate) const NATIVE_DISCOVERY_FIELDS: &[&str] = &[
+    "name",
+    "title",
+    "comment",
+    "position",
+    "disabled",
+    "flussonix_content_id",
+    "flussonix_input_timeout",
+    "flussonix_subtitle_tracks",
+    "flussonix_hls_captions",
+    "flussonix_hls_subtitles",
+    "on_play",
+    "flussonix_token_sha256",
+];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LookupFailure {
     Unavailable,
@@ -15,6 +29,16 @@ pub(crate) fn native_source(source: &Value) -> bool {
     source
         .get("flussonix_source_kind")
         .is_none_or(|kind| kind.as_str() == Some("native"))
+}
+/// FXLink's media path can span a long-haul link. Give its authenticated
+/// source-discovery requests enough time for a cold management round trip,
+/// while retaining the normal limit for all other source types.
+pub(crate) fn control_timeout(source: &Value) -> Duration {
+    if native_source(source) && source["flussonix_transport"] == "fxlink" {
+        Duration::from_millis(2500)
+    } else {
+        Duration::from_millis(750)
+    }
 }
 /// Select a source namespace without renaming the upstream stream. Exclusions
 /// are relative to that namespace; without a prefix they use full stream names.
@@ -50,7 +74,7 @@ pub async fn query(
     name: &str,
     default_key: &str,
 ) -> Result<Value, LookupFailure> {
-    tokio::time::timeout(Duration::from_millis(750), async {
+    tokio::time::timeout(control_timeout(source), async {
         if !native_source(source) {
             return Err(LookupFailure::Invalid);
         }
@@ -63,6 +87,8 @@ pub async fn query(
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
             return Err(LookupFailure::Invalid);
         }
+        crate::peer_transport::require(&url, source["flussonix_allow_insecure_peer_http"] == true)
+            .map_err(|_| LookupFailure::Invalid)?;
         let name = name
             .split('/')
             .map(|p| {
@@ -147,7 +173,7 @@ pub(crate) async fn inventory(
     source: &Value,
     default_key: &str,
 ) -> Result<Vec<String>, LookupFailure> {
-    tokio::time::timeout(Duration::from_millis(750), async {
+    tokio::time::timeout(control_timeout(source), async {
         if !native_source(source) {
             return Err(LookupFailure::Invalid);
         }
@@ -156,6 +182,8 @@ pub(crate) async fn inventory(
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
             return Err(LookupFailure::Invalid);
         }
+        crate::peer_transport::require(&url, source["flussonix_allow_insecure_peer_http"] == true)
+            .map_err(|_| LookupFailure::Invalid)?;
         url.set_path(&format!(
             "{}/flussonix/api/v1/source-streams",
             url.path().trim_end_matches('/')
@@ -217,6 +245,102 @@ pub mod modern_coordinator;
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+    #[tokio::test]
+    async fn fxlink_management_query_and_inventory_allow_bounded_long_haul_response() {
+        let router = axum::Router::new()
+            .route(
+                "/flussonix/api/v1/stream/owned",
+                axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                    assert_eq!(headers["x-flussonix-peer"], "owned-longhaul-key");
+                    tokio::time::sleep(Duration::from_millis(900)).await;
+                    axum::Json(serde_json::json!({"name":"owned","disabled":false}))
+                }),
+            )
+            .route(
+                "/flussonix/api/v1/source-streams",
+                axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                    assert_eq!(headers["x-flussonix-peer"], "owned-longhaul-key");
+                    tokio::time::sleep(Duration::from_millis(900)).await;
+                    axum::Json(serde_json::json!({"streams":[
+                        {"name":"owned","static":true,"disabled":false}
+                    ]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let mut source = serde_json::json!({
+            "api_url":format!("http://{address}"),
+            "flussonix_transport":"fxlink",
+            "flussonix_fxlink_url":"fxlink://127.0.0.1:55000"
+        });
+        assert_eq!(
+            query(&client, &source, "owned", "owned-longhaul-key").await,
+            Ok(serde_json::json!({"name":"owned","disabled":false}))
+        );
+        assert_eq!(
+            inventory(&client, &source, "owned-longhaul-key").await,
+            Ok(vec!["owned".into()])
+        );
+        source["flussonix_transport"] = serde_json::json!("m4s");
+        source
+            .as_object_mut()
+            .unwrap()
+            .remove("flussonix_fxlink_url");
+        assert_eq!(
+            query(&client, &source, "owned", "owned-longhaul-key").await,
+            Err(LookupFailure::Unavailable)
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn inventory_blocks_remote_plaintext_key_unless_source_opts_in() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let router = axum::Router::new().route(
+            "/flussonix/api/v1/source-streams",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(headers["x-flussonix-peer"], "owned-inventory-key");
+                async { axum::Json(serde_json::json!({"streams":[]})) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("remote.example", address)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let mut source =
+            serde_json::json!({"api_url":format!("http://remote.example:{}",address.port())});
+        assert_eq!(
+            inventory(&client, &source, "owned-inventory-key").await,
+            Err(LookupFailure::Invalid)
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        source["flussonix_allow_insecure_peer_http"] = serde_json::json!(true);
+        assert_eq!(
+            inventory(&client, &source, "owned-inventory-key").await,
+            Ok(Vec::new())
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        task.abort();
+        let _ = task.await;
+    }
     #[tokio::test]
     async fn native_inventory_rejects_vendor_and_unknown_kind_without_dialing() {
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

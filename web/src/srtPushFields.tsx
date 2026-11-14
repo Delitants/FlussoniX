@@ -89,7 +89,7 @@ export function PushFields({value,inherited,onChange}:{value:Item,inherited?:Ite
  }));
  };
  return <fieldset><legend>Push destinations</legend>
-  <p className="muted">Send the processed stream using SRT, RTSP, or a continuous HTTP MPEG-TS upload. HTTPS and RTSPS verify the receiver certificate and identity. Enabled destinations keep a stream active without viewers. Editing destinations restarts the stream in this preview.</p>
+  <p className="muted">Send the processed stream using SRT, RTSP, or a continuous HTTP MPEG-TS upload. HTTPS and RTSPS verify the receiver certificate and identity. Enabled destinations keep a stream active without viewers. Editing destinations restarts the stream.</p>
   <Field label="Destination settings"><select value={mode} onChange={e=>{setEditingProtocols({});onChange(e.target.value==='inherit'?undefined:e.target.value==='none'?[]:inherited?.length?inherited.map(expandedPush):[{url:''}]);}}><option value="inherit">{value.template?'Use template destinations':'No destinations (default)'}</option><option value="override">Override destinations</option><option value="none">No destinations</option></select></Field>
   {mode==='inherit'&&value.template&&<div className="muted">{pushSummary(inherited||[])}</div>}
   {mode==='override'&&<>{rows.map((p,i)=><div className="form-details" key={i}><h3>Destination {i+1}</h3><div className="form-grid">

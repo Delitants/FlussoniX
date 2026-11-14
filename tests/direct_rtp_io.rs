@@ -105,7 +105,8 @@ async fn output_preserves_ts_in_mtu_packets_and_stops_without_a_remux_child() {
     )
     .unwrap();
     let state = State::new(defs.into_iter().next().unwrap(), 0);
-    let (tx, rx) = tokio::sync::broadcast::channel(8);
+    let tx = flussonix::media_queue::Channel::new(8, 4 * 1024 * 1024);
+    let rx = tx.subscribe();
     let cancel = CancellationToken::new();
     let c = cancel.clone();
     let s = state.clone();
@@ -158,7 +159,8 @@ async fn sparse_output_flushes_complete_ts_packets_without_waiting_for_seven() {
         .unwrap()
         .remove(0);
     let state = State::new(def, 0);
-    let (tx, rx) = tokio::sync::broadcast::channel(8);
+    let tx = flussonix::media_queue::Channel::new(8, 4 * 1024 * 1024);
+    let rx = tx.subscribe();
     let cancel = CancellationToken::new();
     let c = cancel.clone();
     let task = tokio::spawn(async move { state.run(rx, c).await });
@@ -224,7 +226,8 @@ async fn ipv4_multicast_uses_explicit_loopback_interface_and_releases_pair() {
         .remove(0);
     let state = State::new(definition, 0);
     let output_stats = state.clone();
-    let (tx, rx) = tokio::sync::broadcast::channel(4);
+    let tx = flussonix::media_queue::Channel::new(4, 4 * 1024 * 1024);
+    let rx = tx.subscribe();
     let c = cancel.clone();
     let sender = tokio::spawn(async move { state.run(rx, c).await });
     tx.send(bytes::Bytes::from(ts().repeat(7))).unwrap();
@@ -264,7 +267,7 @@ async fn one_broadcast_fans_out_to_independent_destinations() {
     let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let defs=outputs(&json!({"flussonix_rtp_outputs":[{"url":format!("rtp://{}",first.local_addr().unwrap())},{"url":format!("rtp://{}",second.local_addr().unwrap())}]})).unwrap();
-    let (tx, _) = tokio::sync::broadcast::channel(8);
+    let tx = flussonix::media_queue::Channel::new(8, 4 * 1024 * 1024);
     let cancel = CancellationToken::new();
     let mut tasks = vec![];
     for (i, def) in defs.into_iter().enumerate() {
@@ -315,7 +318,8 @@ async fn ipv6_loopback_receives_and_transmits_on_owned_consecutive_ports() {
             .remove(0),
         0,
     );
-    let (tx, rx) = tokio::sync::broadcast::channel(4);
+    let tx = flussonix::media_queue::Channel::new(4, 4 * 1024 * 1024);
+    let rx = tx.subscribe();
     let stop = cancel.clone();
     let sending = tokio::spawn(async move { output.run(rx, stop).await });
     tx.send(bytes::Bytes::from(ts().repeat(7))).unwrap();
@@ -452,7 +456,8 @@ async fn distinct_multicast_groups_share_ports_without_cross_delivery_and_releas
             .unwrap()
             .remove(0);
         let state = State::new(def, i);
-        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        let tx = flussonix::media_queue::Channel::new(4, 4 * 1024 * 1024);
+        let rx = tx.subscribe();
         txs.push(tx);
         let c = cancel.clone();
         tasks.push(tokio::spawn(async move { state.run(rx, c).await }));

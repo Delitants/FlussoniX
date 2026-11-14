@@ -4,6 +4,7 @@ use super::{ModernBoundCandidate, ModernBoundInventory};
 use crate::{
     m4_ingest::flussonic::MediaInput,
     source_directory::{
+        LookupFailure,
         flussonic::modern::ObservedServerId,
         flussonic_config::{
             BindingFailure, BoundCandidate, BoundInventory, CandidateView, LeaseFailure,
@@ -13,7 +14,7 @@ use crate::{
     },
 };
 use std::{
-    sync::{Arc, MutexGuard},
+    sync::{Arc, MutexGuard, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -25,6 +26,7 @@ fn projection(error: ProjectionFailure) -> LeaseFailure {
 pub struct ModernLeasedInventory {
     inventory: ModernBoundInventory,
     ticket: Ticket,
+    eligible: OnceLock<Arc<[String]>>,
 }
 /// Only modern leased inventory constructs this publication candidate.
 /// Unleased/legacy candidates cannot substitute at the leased publication gate.
@@ -33,6 +35,25 @@ pub struct ModernLeasedCandidate {
     ticket: Ticket,
 }
 impl ModernLeasedInventory {
+    /// One bounded source observation projected through every existing local
+    /// eligibility gate. This is negative evidence, never a routing grant.
+    pub(crate) fn eligible_names(&self) -> Arc<[String]> {
+        self.eligible
+            .get_or_init(|| {
+                Arc::from(
+                    self.names()
+                        .filter(|name| self.candidate(name).is_ok())
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .clone()
+    }
+
+    pub(crate) fn observation_turn(&self) -> Arc<()> {
+        self.ticket.turn.clone()
+    }
+
     pub(crate) fn path_provenance(
         &self,
         name: &str,
@@ -64,6 +85,22 @@ impl ModernLeasedInventory {
             },
             ticket: self.ticket.clone(),
         })
+    }
+    // Explicit relay assertions require known membership at the terminal too;
+    // the direct-origin uniform-policy exception does not attest relay paths.
+    pub(crate) fn relay_origin_candidate(
+        &self,
+        name: &str,
+    ) -> Result<ModernLeasedCandidate, LeaseFailure> {
+        let row = self
+            .inventory
+            .inventory
+            .rows
+            .get(name)
+            .ok_or(LeaseFailure::Binding(BindingFailure::Missing))?;
+        row.local_origin_candidate()
+            .map_err(|error| projection(ProjectionFailure::Ineligible(error)))?;
+        self.candidate(name)
     }
     /// Untrusted management claim, not private-endpoint identity or topology proof.
     pub fn server_id(&self) -> &ObservedServerId {
@@ -103,6 +140,18 @@ impl ModernLeasedCandidate {
     }
 }
 impl SourceAuthority {
+    /// Caller must also hold its coordinator/config/source-handle fence. These
+    /// compact facts are minted only by accepted source operations.
+    pub(crate) fn with_modern_fact_current<T>(
+        &self,
+        commit: impl FnOnce(super::super::ModernFact) -> T,
+    ) -> Result<Option<T>, ProjectionFailure> {
+        let state = self.state()?;
+        if state.profile.is_none() {
+            return Err(ProjectionFailure::Removed);
+        }
+        Ok(state.modern_fact.as_ref().map(|fact| commit(fact.clone())))
+    }
     /// Fence negative facts as well as candidates. Keep this source lock through
     /// the synchronous mutation; a pre-check alone races a newer refresh.
     pub(crate) fn with_modern_inventory_current<T>(
@@ -115,6 +164,13 @@ impl SourceAuthority {
             .current(snapshot.revision, &snapshot.profile)
             .map_err(projection)?;
         inventory.ticket.check(&state)?;
+        if matches!(
+            &state.modern_fact,
+            Some(super::super::ModernFact::Rejected { observation })
+                if !Arc::ptr_eq(observation, &inventory.ticket.turn)
+        ) {
+            return Err(LeaseFailure::Superseded);
+        }
         let result = commit();
         inventory.ticket.check(&state)?;
         Ok(result)
@@ -178,13 +234,21 @@ impl SourceAuthority {
             .await;
         // Same lock fences success AND error: exact profile, newest turn, expiry,
         // upstream result. No publication lock is held across network awaits.
-        let state = self
+        let mut state = self
             .current(snapshot.revision, &snapshot.profile)
             .map_err(projection)?;
         ticket.check(&state)?;
-        let (server_id, rows) = result
-            .map_err(|error| LeaseFailure::Binding(BindingFailure::Inventory(error)))?
-            .into_parts();
+        let (server_id, rows) = match result {
+            Ok(observed) => observed.into_parts(),
+            Err(error) => {
+                if matches!(error, LookupFailure::Absent | LookupFailure::Invalid) {
+                    state.modern_fact = Some(super::super::ModernFact::Rejected {
+                        observation: ticket.turn.clone(),
+                    });
+                }
+                return Err(LeaseFailure::Binding(BindingFailure::Inventory(error)));
+            }
+        };
         let inventory = ModernBoundInventory {
             inventory: BoundInventory {
                 snapshot,
@@ -194,7 +258,22 @@ impl SourceAuthority {
         };
         ticket.check(&state)?;
         drop(state);
-        Ok(ModernLeasedInventory { inventory, ticket })
+        let inventory = ModernLeasedInventory {
+            inventory,
+            ticket,
+            eligible: OnceLock::new(),
+        };
+        let names = inventory.eligible_names();
+        let snapshot = &inventory.inventory.inventory.snapshot;
+        let mut state = self
+            .current(snapshot.revision, &snapshot.profile)
+            .map_err(projection)?;
+        inventory.ticket.check(&state)?;
+        state.modern_fact = Some(super::super::ModernFact::Eligible {
+            observation: inventory.ticket.turn.clone(),
+            names,
+        });
+        Ok(inventory)
     }
     /// Under one publication lock, check current profile, latest turn and expiry
     /// before media construction and again before synchronous closure entry.

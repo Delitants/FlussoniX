@@ -1,9 +1,24 @@
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     time::Duration,
 };
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrackMedia {
+    Audio,
+    Video,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputTrackKey {
+    pub track_id: u32,
+    pub media: TrackMedia,
+    pub encoding: String,
+    pub key_file: PathBuf,
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -12,8 +27,13 @@ pub struct Settings {
     pub interface: Option<Ipv4Addr>,
     pub source_ip: Option<IpAddr>,
     pub jitter: Duration,
+    pub receive_buffer_bytes: Option<u32>,
     pub ttl: u32,
     pub key_file: Option<PathBuf>,
+    pub track_key_files: Option<Vec<PathBuf>>,
+    pub expected_ssrcs: Option<Vec<u32>>,
+    pub track_keys: Option<Vec<OutputTrackKey>>,
+    pub allow_legacy_reused_key: bool,
     pub elementary: bool,
     pub sdp_file: Option<PathBuf>,
 }
@@ -27,6 +47,9 @@ impl Settings {
             return Ok(None);
         }
         let settings = Self::parse(item)?;
+        if settings.track_keys.is_some() {
+            return Err("Elementary SRTP output track keys are not input options".into());
+        }
         if settings.elementary && settings.sdp_file.is_none() {
             return Err("Elementary RTP input requires an SDP file".into());
         }
@@ -86,8 +109,13 @@ impl Settings {
                 "interface",
                 "source_ip",
                 "jitter_ms",
+                "receive_buffer_bytes",
                 "ttl",
                 "key_file",
+                "track_key_files",
+                "expected_ssrcs",
+                "track_keys",
+                "allow_legacy_reused_key",
                 "profile",
                 "sdp_file",
             ]
@@ -155,31 +183,152 @@ impl Settings {
             );
         }
         let secure = u.scheme() == "srtp";
-        let key_file = opts
-            .get("key_file")
-            .map(|v| {
-                let s = v
-                    .as_str()
-                    .filter(|s| !s.chars().any(char::is_control))
-                    .ok_or("SRTP key file must be an absolute path")?;
-                let p = PathBuf::from(s);
-                if !p.is_absolute() || s.len() > 4096 {
-                    return Err("SRTP key file must be an absolute path");
+        let allow_legacy_reused_key = opts
+            .get("allow_legacy_reused_key")
+            .map(|value| {
+                value
+                    .as_bool()
+                    .ok_or("SRTP legacy key reuse option must be boolean")
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if !secure && opts.get("allow_legacy_reused_key").is_some() {
+            return Err("Plain RTP cannot override SRTP receiver key history".into());
+        }
+        let key_file = opts.get("key_file").map(key_path).transpose()?;
+        let track_key_files = opts
+            .get("track_key_files")
+            .map(|value| {
+                let entries = bounded_tracks(value, "SRTP track key files require 1..8 paths")?;
+                let paths: Vec<_> = entries.iter().map(key_path).collect::<Result<_, _>>()?;
+                if paths.iter().collect::<HashSet<_>>().len() != paths.len() {
+                    return Err("SRTP track key files must be distinct");
                 }
-                Ok(p)
+                Ok(paths)
             })
             .transpose()?;
-        if secure != key_file.is_some() {
-            return Err("SRTP requires a key file; plaintext RTP forbids one".into());
+        let expected_ssrcs = opts
+            .get("expected_ssrcs")
+            .map(|value| {
+                let entries = bounded_tracks(value, "SRTP expected SSRCs require 1..8 values")?;
+                let ssrcs: Vec<u32> = entries
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_u64()
+                            .and_then(|n| u32::try_from(n).ok())
+                            .filter(|n| *n != 0)
+                            .ok_or("SRTP expected SSRC must be a nonzero u32")
+                    })
+                    .collect::<Result<_, _>>()?;
+                if ssrcs.iter().collect::<HashSet<_>>().len() != ssrcs.len() {
+                    return Err("SRTP expected SSRCs must be distinct");
+                }
+                Ok(ssrcs)
+            })
+            .transpose()?;
+        let track_keys = opts
+            .get("track_keys")
+            .map(|value| {
+                let entries = bounded_tracks(value, "SRTP output track keys require 1..8 entries")?;
+                let keys: Vec<OutputTrackKey> = entries
+                    .iter()
+                    .map(|value| {
+                        let object = value
+                            .as_object()
+                            .ok_or("SRTP output track key must be an object")?;
+                        if object.len() != 4
+                            || object.keys().any(|key| {
+                                !["track_id", "media", "encoding", "key_file"]
+                                    .contains(&key.as_str())
+                            })
+                        {
+                            return Err(
+                                "SRTP output track key requires ID, media, encoding and key file",
+                            );
+                        }
+                        let track_id = value["track_id"]
+                            .as_u64()
+                            .and_then(|n| u32::try_from(n).ok())
+                            .filter(|n| *n != 0)
+                            .ok_or("SRTP output track ID must be a nonzero u32")?;
+                        let media = match value["media"].as_str() {
+                            Some("audio") => TrackMedia::Audio,
+                            Some("video") => TrackMedia::Video,
+                            _ => return Err("SRTP output track media must be audio or video"),
+                        };
+                        let encoding = value["encoding"]
+                            .as_str()
+                            .filter(|s| valid_track_encoding(s, &media))
+                            .ok_or("SRTP output track encoding is invalid")?
+                            .to_owned();
+                        Ok(OutputTrackKey {
+                            track_id,
+                            media,
+                            encoding,
+                            key_file: key_path(&value["key_file"])?,
+                        })
+                    })
+                    .collect::<Result<_, &'static str>>()?;
+                if keys
+                    .iter()
+                    .map(|k| k.track_id)
+                    .collect::<HashSet<_>>()
+                    .len()
+                    != keys.len()
+                    || keys
+                        .iter()
+                        .map(|k| &k.key_file)
+                        .collect::<HashSet<_>>()
+                        .len()
+                        != keys.len()
+                {
+                    return Err("SRTP output track IDs and key paths must be distinct");
+                }
+                Ok(keys)
+            })
+            .transpose()?;
+        if secure {
+            if elementary {
+                let modes = usize::from(key_file.is_some())
+                    + usize::from(track_key_files.is_some())
+                    + usize::from(track_keys.is_some());
+                if modes != 1 || expected_ssrcs.is_some() && key_file.is_none() {
+                    return Err("Elementary SRTP requires one track protection mode".into());
+                }
+            } else if key_file.is_none()
+                || track_key_files.is_some()
+                || expected_ssrcs.is_some()
+                || track_keys.is_some()
+            {
+                return Err(
+                    "MP2T SRTP requires one key file without elementary track options".into(),
+                );
+            }
+        } else if key_file.is_some()
+            || track_key_files.is_some()
+            || expected_ssrcs.is_some()
+            || track_keys.is_some()
+        {
+            return Err("Plaintext RTP forbids SRTP track protection".into());
         }
+        let receive_buffer_bytes = opts
+            .get("receive_buffer_bytes")
+            .map(|_| number(&opts, "receive_buffer_bytes", 0, 65536, 33554432).map(|n| n as u32))
+            .transpose()?;
         Ok(Self {
             address: SocketAddr::new(ip, port),
             secure,
             interface,
             source_ip,
             jitter: Duration::from_millis(number(&opts, "jitter_ms", 50, 0, 1000)?),
+            receive_buffer_bytes,
             ttl: number(&opts, "ttl", 16, 1, 255)? as u32,
             key_file,
+            track_key_files,
+            expected_ssrcs,
+            track_keys,
+            allow_legacy_reused_key,
             elementary,
             sdp_file,
         })
@@ -223,9 +372,18 @@ pub fn outputs(cfg: &Value) -> Result<Vec<Output>, String> {
                     return Err("RTP enabled setting must be boolean".into());
                 }
                 let settings = Settings::parse(row)?;
+                if settings.track_key_files.is_some()
+                    || settings.expected_ssrcs.is_some()
+                    || row["flussonix_rtp"]
+                        .get("allow_legacy_reused_key")
+                        .is_some()
+                {
+                    return Err("SRTP receive track bindings are not output options".into());
+                }
                 if settings.address.ip().is_unspecified()
                     || settings.sdp_file.is_some()
                     || settings.source_ip.is_some()
+                    || settings.receive_buffer_bytes.is_some()
                     || row["flussonix_rtp"].get("jitter_ms").is_some()
                 {
                     return Err(
@@ -255,6 +413,55 @@ pub fn outputs(cfg: &Value) -> Result<Vec<Output>, String> {
         }
     }
     Ok(outputs)
+}
+fn bounded_tracks<'a>(value: &'a Value, error: &'static str) -> Result<&'a [Value], &'static str> {
+    value
+        .as_array()
+        .map(Vec::as_slice)
+        .filter(|entries| (1..=8).contains(&entries.len()))
+        .ok_or(error)
+}
+fn key_path(value: &Value) -> Result<PathBuf, &'static str> {
+    let s = value
+        .as_str()
+        .filter(|s| s.len() <= 4096 && !s.chars().any(char::is_control))
+        .ok_or("SRTP key file must be an absolute path")?;
+    let path = PathBuf::from(s);
+    if !path.is_absolute() {
+        return Err("SRTP key file must be an absolute path");
+    }
+    Ok(path)
+}
+fn valid_track_encoding(value: &str, media: &TrackMedia) -> bool {
+    if value.len() > 64 {
+        return false;
+    }
+    match media {
+        TrackMedia::Video => ["H264/90000", "H265/90000"].contains(&value),
+        TrackMedia::Audio if value == "MPA/90000" => true,
+        TrackMedia::Audio => {
+            let Some(rest) = value.strip_prefix("MPEG4-GENERIC/") else {
+                return false;
+            };
+            let Some((rate, channels)) = rest.split_once('/') else {
+                return false;
+            };
+            let Ok(rate_number) = rate.parse::<u32>() else {
+                return false;
+            };
+            let Ok(channel_number) = channels.parse::<u8>() else {
+                return false;
+            };
+            rate == rate_number.to_string()
+                && channels == channel_number.to_string()
+                && [
+                    96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025,
+                    8000, 7350,
+                ]
+                .contains(&rate_number)
+                && (1..=8).contains(&channel_number)
+        }
+    }
 }
 pub fn enabled(cfg: &Value) -> bool {
     cfg["flussonix_rtp_outputs"]

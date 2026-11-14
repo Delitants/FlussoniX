@@ -1,10 +1,14 @@
 name: Publication safety
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   publication-safety:
     runs-on: ubuntu-latest
@@ -18,3 +22,5 @@ jobs:
           persist-credentials: false
       - name: Check source publication
         run: python3 .github/publication/guard.py history HEAD
+      - name: Test publication guard
+        run: python3 -m unittest discover -s .github/publication -p 'test_*.py' -v

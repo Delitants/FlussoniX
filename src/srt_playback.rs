@@ -1,5 +1,5 @@
 //! Shared listener playback; the listener is disabled unless explicitly enabled.
-mod native;
+pub(crate) mod native;
 mod selection;
 use crate::{
     playback_auth::ViewerRequest,
@@ -7,6 +7,7 @@ use crate::{
 };
 pub use native::{Listener, Socket};
 pub use selection::Selection;
+pub(crate) use selection::ticket_only;
 use std::{
     net::SocketAddr,
     sync::{Arc, atomic::Ordering},
@@ -53,7 +54,7 @@ pub async fn serve(
                     let accepted=match listener.accept(){Ok(v)=>v,Err(e)=>break 'serving Err(e)};
                     let Some((socket,peer))=accepted else {break};
                     let Ok(permit)=slots.clone().try_acquire_owned() else {drop(socket);continue;};
-                    app.srt_connections.fetch_add(1,Ordering::Relaxed);let slot=Slot{_permit:permit,app:app.clone()};let a=app.clone();let c=stop.clone();let address=listener.address();let context=(address,listener.settings().encrypted(),listener_id.clone());
+                    app.srt_connections.fetch_add(1,Ordering::Relaxed);let slot=Slot{_permit:permit,app:app.clone()};let a=app.clone();let c=stop.clone();let address=listener.address();let context=(address,listener.settings().encrypted(),listener.settings().allow_direct_tokens(),listener_id.clone());
                     tasks.spawn(async move {let _slot=slot;connection(socket,peer,context,a,c).await;});
                 }
             }
@@ -67,19 +68,22 @@ pub async fn serve(
 async fn connection(
     socket: Socket,
     peer: SocketAddr,
-    context: (SocketAddr, bool, String),
+    context: (SocketAddr, bool, bool, String),
     app: Arc<App>,
     cancel: CancellationToken,
 ) {
     let Ok(id) = socket.stream_id() else { return };
-    let (address, encrypted, listener_id) = context;
+    let (address, encrypted, allow_direct_tokens, listener_id) = context;
     let Ok((selection, ticket, clean)) = selection::playback(&id) else {
         return;
     };
+    if !allow_direct_tokens && !selection.token.is_empty() {
+        return;
+    }
     let query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("streamid", &clean)
         .finish();
-    let viewer = ViewerRequest {
+    let mut viewer = ViewerRequest {
         name: selection.name,
         proto: "srt".into(),
         ip: peer.ip().to_string(),
@@ -87,6 +91,30 @@ async fn connection(
         qs: query,
         host: address.to_string(),
         ..Default::default()
+    };
+    if ticket.is_some() && viewer.token.is_empty() {
+        let native = crate::server::srt_tickets::Ticket {
+            id: ticket.as_deref().unwrap(),
+            encrypted,
+            listener_id: &listener_id,
+        };
+        if let Some(restored) = app.srt_ticket_viewer(native, &viewer.name, peer.ip()).await {
+            viewer = restored;
+        } else if !app.srt_public_ticket(native, &viewer).await {
+            return;
+        }
+    }
+    // Vendor discovery may validate a primary and two bounded replica waves.
+    // This snapshot chooses timing only; ts_admit rechecks actual authority.
+    let admission_budget = if app.config.read(|root| {
+        matches!(
+            crate::vendor_playback::select(root, &viewer.name, app.config.revision()),
+            crate::vendor_playback::Selection::Vendor { .. }
+        )
+    }) {
+        crate::vendor_playback::SRT_ADMISSION_BUDGET
+    } else {
+        Duration::from_secs(10)
     };
     let admitting = async {
         if let Some(id) = ticket.as_deref() {
@@ -103,7 +131,7 @@ async fn connection(
             app.ts_admit(viewer).await
         }
     };
-    let admitted = tokio::select! {biased;_=cancel.cancelled()=>return,result=tokio::time::timeout(Duration::from_secs(10),admitting)=>result};
+    let admitted = tokio::select! {biased;_=cancel.cancelled()=>return,result=tokio::time::timeout(admission_budget,admitting)=>result};
     let Ok(Ok(mut playback)) = admitted else {
         return;
     };
@@ -196,6 +224,7 @@ pub struct Settings {
     latency_millis: u32,
     client_limit: usize,
     passphrase: String,
+    direct_tokens: bool,
 }
 impl Settings {
     pub fn new(
@@ -216,6 +245,7 @@ impl Settings {
             latency_millis,
             client_limit,
             passphrase,
+            direct_tokens: false,
         })
     }
     pub fn latency_millis(&self) -> u32 {
@@ -226,6 +256,13 @@ impl Settings {
     }
     pub fn encrypted(&self) -> bool {
         !self.passphrase.is_empty()
+    }
+    pub fn with_direct_tokens(mut self, allow: bool) -> Self {
+        self.direct_tokens = allow;
+        self
+    }
+    pub fn allow_direct_tokens(&self) -> bool {
+        self.direct_tokens
     }
 }
 #[cfg(test)]
@@ -252,5 +289,105 @@ mod tests {
             assert!(!error.contains(secret) || secret.is_empty());
         }
         assert!(Settings::new(120, 128, "a".repeat(80)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod private_ticket_tests {
+    use super::*;
+    use crate::server::Options;
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+
+    #[tokio::test]
+    async fn encrypted_listener_redeems_a_tokenless_ticket_without_starting_media_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            dir.path().join("config.json"),
+            dir.path().join("media"),
+            Options {
+                admin_password: "owned-admin-secret".into(),
+                peer_key: "owned-cluster-key".into(),
+                uplink_interface: "process".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.config.put("streams", "owned", json!({
+            "inputs":[{"url":"testsrc://"}],
+            "flussonix_token_sha256":format!("{:x}", Sha256::digest(b"private-viewer-token"))
+        })).unwrap();
+        let listener = Listener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Settings::new(120, 4, "owned-srt-passphrase".into()).unwrap(),
+        )
+        .unwrap();
+        let address = listener.address();
+        let cancel = CancellationToken::new();
+        let _on_drop = cancel.clone().drop_guard();
+        let serving = tokio::spawn(serve(listener, app.clone(), cancel.clone()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while app.srt_listener_id().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        app.sample_metrics();
+        let ticket = app
+            .reserve_srt_credential(
+                ViewerRequest {
+                    name: "owned".into(),
+                    proto: "srt".into(),
+                    ip: "127.0.0.1".into(),
+                    token: "private-viewer-token".into(),
+                    qs: "streamid=%23%21%3A%3Ar%3Downed%2Cu%3Dprivate-viewer-token".into(),
+                    ..Default::default()
+                },
+                5.0,
+            )
+            .await
+            .unwrap();
+        let id = selection::ticket_only("owned", &ticket).unwrap();
+        let worker_before = app.media.count().await;
+        let socket = native::receiver_caller(
+            address,
+            &native::ReceiveSettings {
+                streamid: id.clone(),
+                passphrase: "owned-srt-passphrase".into(),
+                pbkeylen: 16,
+                tsbpd: false,
+                latency_millis: 120,
+                connect_millis: 1000,
+                idle_millis: 5000,
+                rcvbuf_bytes: 1316 * 128,
+            },
+        )
+        .unwrap();
+        let mut buffer = [0u8; 1316];
+        let received = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                if socket.is_connected() {
+                    match socket.try_recv(&mut buffer) {
+                        Ok(Some(n)) if n > 0 => return true,
+                        Ok(Some(_)) | Ok(None) => {}
+                        Err(_) => return false,
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        drop(socket);
+        cancel.cancel();
+        let stopped = tokio::time::timeout(Duration::from_secs(3), serving).await;
+        app.media.stop_all().await;
+        assert_eq!(worker_before, 0);
+        assert!(id.starts_with("#!::r=owned,m=request,flussonix_ticket="));
+        assert!(!id.contains("private-viewer-token"));
+        assert!(received, "tokenless SRT caller received no media");
+        assert!(stopped.unwrap().unwrap().is_ok());
     }
 }

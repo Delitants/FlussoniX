@@ -11,7 +11,6 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::Command,
     sync::Semaphore,
 };
 use tokio_util::sync::CancellationToken;
@@ -416,7 +415,7 @@ pub async fn recognize_cancellable(
     let deadline = tokio::time::Instant::from_std(deadline);
     let _permit = tokio::select! {biased;_=cancel.cancelled()=>return Err(Failure::new("dvb_ocr_canceled")),r=tokio::time::timeout_at(deadline,SLOTS.get_or_init(||Semaphore::new(2)).acquire())=>r.map_err(|_|Failure::new("dvb_ocr_timeout"))?.map_err(|_|Failure::new("dvb_ocr_unavailable"))?};
     let input = pgm(image)?;
-    let mut child = Command::new(executable)
+    let mut child = crate::child_process::command(executable)
         .args([
             "stdin", "stdout", "--psm", "6", "-l", language, "--dpi", "150", "tsv",
         ])

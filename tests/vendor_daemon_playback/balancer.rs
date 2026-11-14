@@ -10,6 +10,82 @@ async fn discovered_vendor_lb_routes_guarded_decodable_hls_without_local_stream_
     super::placement::check_native_lb_vendor_cdn("index.m3u8", true).await;
 }
 #[tokio::test]
+async fn vendor_lb_preserves_exact_hls_master_alias_path() {
+    let f = Fixture::variant(json!({"on_play":"true"}), "m4s", "lb").await;
+    let peer = Peer::new().await;
+    peer.configure(&f);
+    let mut results = Vec::new();
+    for alias in ["index.ts.m3u8", "index.fmp4.m3u8"] {
+        let response = f.get(&format!("/owned/{alias}?token=viewer")).await;
+        results.push((
+            alias,
+            response.status(),
+            response
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+        ));
+    }
+    let media_calls = f.media_calls();
+    let media_workers = f.app.media.count().await;
+    peer.stop().await;
+    f.stop().await;
+    for (alias, status, location) in results {
+        assert_eq!(status, StatusCode::FOUND);
+        let location = location.unwrap();
+        assert!(location.contains(&format!("/owned/{alias}?")), "{location}");
+        assert!(location.contains("token=viewer"));
+    }
+    assert_eq!(media_calls, 0);
+    assert_eq!(media_workers, 0);
+}
+
+#[tokio::test]
+async fn named_vendor_source_uses_the_authorized_cdn_without_an_lb_media_worker() {
+    use sha2::{Digest, Sha256};
+    let f = Fixture::variant(
+        json!({"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"viewer"))}),
+        "m4s",
+        "lb",
+    )
+    .await;
+    let peer = Peer::new().await;
+    peer.configure(&f);
+    f.app
+        .config
+        .put(
+            "balancers",
+            "lb0",
+            json!({"mode":"clients","servers":[{"name":"edge"}]}),
+        )
+        .unwrap();
+    let denied = f.get("/lb0/owned/m4s?token=wrong").await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(f.media_calls(), 0);
+    let allowed = f.get("/lb0/owned/m4s?token=viewer&x=%2B").await;
+    let status = allowed.status();
+    let location = allowed
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let calls = peer.calls.lock().unwrap().clone();
+    let media_calls = f.media_calls();
+    let media_workers = f.app.media.count().await;
+    peer.stop().await;
+    f.stop().await;
+    assert_eq!(status, StatusCode::FOUND);
+    let location = location.unwrap();
+    assert!(location.contains("/owned/m4s?"), "{location}");
+    assert!(!location.contains("/lb0/"), "{location}");
+    assert!(location.contains("token=viewer"), "{location}");
+    assert!(location.contains("x=%2B"), "{location}");
+    assert!(calls.iter().any(|call| call == "admit"), "{calls:?}");
+    assert_eq!(media_calls, 0);
+    assert_eq!(media_workers, 0);
+}
+#[tokio::test]
 async fn vendor_lb_denial_and_absence_do_not_start_media() {
     use sha2::{Digest, Sha256};
     let f = Fixture::variant(
@@ -48,7 +124,7 @@ impl Peer {
                 assert_eq!(headers["x-flussonix-peer"],"owned-native-peer-key");
                 assert!(!headers.contains_key("cluster-auth-key"));assert!(!headers.contains_key("authorization"));
                 calls.lock().unwrap().push("node".into());
-                axum::Json(json!({"role":"cdn","uplink":0.1,"uplink_mbps":1000,"cpu":0.1,"ram":0.1,"drain":false,"age_ms":0,"active":0,"reserved":0,"reserved_mbps":0,"limit":1000,"streams":[],"stream_bitrates":{}}))
+                axum::Json(json!({"role":"cdn","uplink":0.1,"uplink_mbps":1000,"cpu":0.1,"ram":0.1,"drain":false,"age_ms":0,"active":0,"reserved":0,"reserved_mbps":0,"limit":1000,"output_kbit":1000,"bandwidth_usage":10.0,"total_clients":0,"total_streams_count":1,"streams":[],"stream_bitrates":{}}))
             }}))
             .route("/flussonix/api/v1/admit",post(move |headers:HeaderMap,Json(body):Json<Value>| {let calls=admit_calls.clone();let held=held.clone();async move {
                 assert_eq!(headers["x-flussonix-peer"],"owned-native-peer-key");
@@ -193,9 +269,94 @@ async fn vendor_lb_callback_redirect_precedes_peer_rpcs() {
 }
 
 #[tokio::test]
+async fn named_vendor_callback_redirect_is_suppressed_after_balancer_edit() {
+    let f = Fixture::variant(json!({"on_play":"true"}), "m4s", "lb").await;
+    let peer = Peer::new().await;
+    peer.configure(&f);
+    f.app
+        .config
+        .put(
+            "balancers",
+            "lb0",
+            json!({"mode":"bitrate","servers":[{"name":"edge"}]}),
+        )
+        .unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/auth", listener.local_addr().unwrap());
+    let entered_signal = entered.clone();
+    let release_signal = release.clone();
+    let callback = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/auth",
+                get(move || {
+                    let entered = entered_signal.clone();
+                    let release = release_signal.clone();
+                    async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        (
+                            StatusCode::FOUND,
+                            [("location", "https://owned-billing.invalid/permission")],
+                        )
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    f.app
+        .config
+        .put("sources", &f.source, json!({"on_play":url}))
+        .unwrap();
+    let service = router(f.app.clone());
+    let pending = tokio::spawn(async move {
+        service
+            .oneshot(
+                Request::builder()
+                    .uri("/lb0/owned/m4s?token=viewer")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    f.app
+        .config
+        .put(
+            "balancers",
+            "lb0",
+            json!({"mode":"clients","servers":[{"name":"edge"}]}),
+        )
+        .unwrap();
+    release.notify_one();
+    let response = tokio::time::timeout(Duration::from_secs(3), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    let status = response.status();
+    let redirected = response.headers().contains_key("location");
+    let media_calls = f.media_calls();
+    callback.abort();
+    let _ = callback.await;
+    peer.stop().await;
+    f.stop().await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!redirected);
+    assert_eq!(media_calls, 0);
+}
+
+#[tokio::test]
 async fn vendor_lb_group_policy_and_peer_header_cannot_bypass_viewer_guard() {
     use sha2::{Digest, Sha256};
-    let f=Fixture::variant(json!({"on_play":"true","group_config":{"paid":{"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"paid-viewer"))}}}),"m4s","lb").await;
+    let f=Fixture::variant(json!({"on_play":"true","group_config":{"paid":{"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"paid-viewer"))}},"flussonix_group_pins":{"owned":["paid"]}}),"m4s","lb").await;
     (*f.remote.lock().unwrap())[0]["groups"] = json!(["paid"]);
     let peer = Peer::new().await;
     peer.configure(&f);
@@ -219,6 +380,61 @@ async fn vendor_lb_group_policy_and_peer_header_cannot_bypass_viewer_guard() {
     assert_eq!(f.media_calls(), 0);
     assert_eq!(f.app.media.count().await, 0);
     assert_eq!(f.app.playback_auth.active(), 1);
+    peer.stop().await;
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn vendor_lb_rejects_forged_public_group_before_redirect() {
+    use sha2::{Digest, Sha256};
+    let f = Fixture::variant(
+        json!({"on_play":"true","group_config":{"paid":{"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"paid-viewer"))}},"flussonix_group_pins":{"owned":["paid"]}}),
+        "m4s",
+        "lb",
+    )
+    .await;
+    let peer = Peer::new().await;
+    peer.configure(&f);
+    let response = f.get("/owned/m4s?token=paid-viewer").await;
+    assert_ne!(response.status(), StatusCode::FOUND);
+    assert!(peer.calls.lock().unwrap().is_empty());
+    assert_eq!(f.media_calls(), 0);
+    assert_eq!(f.app.playback_auth.active(), 0);
+    peer.stop().await;
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn vendor_lb_pin_edit_rejects_stale_group_before_cdn_handoff() {
+    use sha2::{Digest, Sha256};
+    let f = Fixture::variant(
+        json!({"on_play":"true","group_config":{"paid":{"flussonix_token_sha256":format!("{:x}",Sha256::digest(b"paid-viewer"))},"public":{"on_play":"true"}},"flussonix_group_pins":{"owned":["paid"]}}),
+        "m4s",
+        "lb",
+    )
+    .await;
+    (*f.remote.lock().unwrap())[0]["groups"] = json!(["paid"]);
+    let peer = Peer::new().await;
+    peer.configure(&f);
+    assert_eq!(
+        f.get("/owned/m4s?token=paid-viewer").await.status(),
+        StatusCode::FOUND
+    );
+    let admitted = peer.calls.lock().unwrap().len();
+    f.app
+        .config
+        .put(
+            "sources",
+            &f.source,
+            json!({"flussonix_group_pins":{"owned":["public"]}}),
+        )
+        .unwrap();
+    assert_ne!(
+        f.get("/owned/m4s?token=paid-viewer").await.status(),
+        StatusCode::FOUND
+    );
+    assert_eq!(peer.calls.lock().unwrap().len(), admitted);
+    assert_eq!(f.media_calls(), 0);
     peer.stop().await;
     f.stop().await;
 }

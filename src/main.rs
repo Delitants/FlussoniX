@@ -1,7 +1,9 @@
 use clap::Parser;
-use flussonix::server::{App, Options, router};
+use flussonix::iptv::ha::connection::HaOptions;
+use flussonix::iptv::ha::{connection::HaPool, schema};
+use flussonix::server::{App, Options};
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use std::{future::IntoFuture, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 #[derive(Parser)]
 #[command(name = "flussonix", version, about = "Independent live media server")]
 struct Args {
@@ -17,6 +19,12 @@ struct Args {
     /// Disable plaintext HTTP binding; requires an HTTPS listener.
     #[arg(long, requires = "https_listen")]
     https_only: bool,
+    /// Permit management credentials over remote plaintext HTTP (unsafe).
+    #[arg(long, env = "FLUSSONIX_ALLOW_INSECURE_REMOTE_MANAGEMENT")]
+    allow_insecure_remote_management: bool,
+    /// Public HTTPS origin when a trusted reverse proxy terminates TLS for the admin UI.
+    #[arg(long, env = "FLUSSONIX_ADMIN_PUBLIC_ORIGIN")]
+    admin_public_origin: Option<url::Url>,
     /// Optional RTSP/1.0 playback and publication listener (disabled by default).
     #[arg(long)]
     rtsp_listen: Option<SocketAddr>,
@@ -27,6 +35,31 @@ struct Args {
     rtsps_cert: Option<PathBuf>,
     #[arg(long, requires = "rtsps_listen")]
     rtsps_key: Option<PathBuf>,
+    /// Optional encrypted FXLink native peer listener (disabled by default).
+    #[arg(long, requires_all = ["fxlink_cert", "fxlink_key"])]
+    fxlink_listen: Option<SocketAddr>,
+    #[arg(long, requires = "fxlink_listen")]
+    fxlink_cert: Option<PathBuf>,
+    #[arg(long, requires = "fxlink_listen")]
+    fxlink_key: Option<PathBuf>,
+    /// Advertise experimental v6 trimmed records on FXLink clients and listeners.
+    #[arg(long, env = "FLUSSONIX_FXLINK_TRIMMED_RECORDS")]
+    fxlink_trimmed_records: bool,
+    /// Advertise experimental v7 cached parity repairs; requires v6 layouts.
+    #[arg(
+        long,
+        env = "FLUSSONIX_FXLINK_REPAIR_PARITY",
+        requires_if("true", "fxlink_trimmed_records")
+    )]
+    fxlink_repair_parity: bool,
+    /// Advertise experimental v8 bounded bootstrap repairs; requires v6/v7 opt-ins.
+    #[arg(long, env = "FLUSSONIX_FXLINK_BOOTSTRAP_REPAIR",
+        requires_ifs = [("true", "fxlink_trimmed_records"), ("true", "fxlink_repair_parity")])]
+    fxlink_bootstrap_repair: bool,
+    /// Advertise experimental v9 weak geometry; requires all v6/v7/v8 opt-ins.
+    #[arg(long, env = "FLUSSONIX_FXLINK_GEOMETRY_HINTS",
+        requires_ifs = [("true", "fxlink_trimmed_records"), ("true", "fxlink_repair_parity"), ("true", "fxlink_bootstrap_repair")])]
+    fxlink_geometry_hints: bool,
     /// Shared UDP playback/publication port range (even-first/odd-last, 2..256 ports).
     #[arg(long, requires = "rtsp_listen")]
     rtsp_udp_ports: Option<flussonix::rtsp::udp::PortRange>,
@@ -36,6 +69,12 @@ struct Args {
     /// Optional shared SRT playback UDP listener (disabled by default).
     #[arg(long)]
     srt_play_listen: Option<SocketAddr>,
+    /// Public SRT listener root used in HTTPS-issued playback tickets.
+    #[arg(long, requires = "srt_play_listen")]
+    srt_play_public_url: Option<String>,
+    /// Permit reusable viewer tokens directly in SRT Stream IDs on trusted networks.
+    #[arg(long, requires = "srt_play_listen")]
+    srt_play_allow_direct_token: bool,
     #[arg(long, requires = "srt_play_listen")]
     srt_play_latency: Option<u32>,
     #[arg(long, requires = "srt_play_listen")]
@@ -49,6 +88,72 @@ struct Args {
     srt_play_passphrase: Option<String>,
     #[arg(long, default_value = "config.json")]
     config: PathBuf,
+    /// Owner-only durable history for direct SRTP receiver key generations.
+    #[arg(long, env = "FLUSSONIX_SRTP_RECEIVER_LEDGER")]
+    srtp_receiver_ledger: Option<PathBuf>,
+    /// Initialize the receiver history once, then exit without starting listeners.
+    #[arg(long, conflicts_with_all = ["iptv_ha_init_empty", "iptv_ha_init_from"])]
+    init_srtp_receiver_ledger: Option<PathBuf>,
+    /// Owner-only IPTV package and subscriber data (defaults beside config.json).
+    #[arg(long, env = "FLUSSONIX_IPTV_DATA")]
+    iptv_data: Option<PathBuf>,
+    /// Public HTTP(S) origin used in subscriber playlists.
+    #[arg(long, env = "FLUSSONIX_IPTV_PUBLIC_ORIGIN")]
+    iptv_public_origin: Option<url::Url>,
+    /// Enable this node as the one IPTV lease authority.
+    #[arg(long, env = "FLUSSONIX_IPTV_LEASE_AUTHORITY")]
+    iptv_lease_authority: bool,
+    /// Owner-only PostgreSQL settings for the opt-in IPTV HA authority.
+    #[arg(
+        long,
+        env = "FLUSSONIX_IPTV_HA_DB_CONFIG",
+        requires = "iptv_lease_authority"
+    )]
+    iptv_ha_db_config: Option<PathBuf>,
+    /// Initialize an empty IPTV HA database once, without starting listeners.
+    #[arg(
+        long,
+        requires = "iptv_ha_db_config",
+        conflicts_with = "iptv_ha_init_from"
+    )]
+    iptv_ha_init_empty: bool,
+    /// Initialize an empty IPTV HA database from an owner-only IPTV export.
+    #[arg(
+        long,
+        requires = "iptv_ha_db_config",
+        conflicts_with = "iptv_ha_init_empty"
+    )]
+    iptv_ha_init_from: Option<PathBuf>,
+    /// Permit peer lease RPC over plaintext from the actual loopback socket only.
+    #[arg(
+        long,
+        env = "FLUSSONIX_IPTV_PEER_ALLOW_INSECURE_LOOPBACK",
+        requires = "iptv_lease_authority"
+    )]
+    iptv_peer_allow_insecure_loopback: bool,
+    /// Single FlussoniX IPTV authority origin for this viewer-serving node.
+    #[arg(long, env = "FLUSSONIX_IPTV_AUTHORITY")]
+    iptv_authority: Option<url::Url>,
+    /// Second HTTPS IPTV authority in the same HA cluster.
+    #[arg(long, env = "FLUSSONIX_IPTV_AUTHORITY_SECONDARY", requires_all = ["iptv_authority", "iptv_authority_cluster_id"])]
+    iptv_authority_secondary: Option<url::Url>,
+    /// Stable cluster UUID shared by both IPTV authorities.
+    #[arg(
+        long,
+        env = "FLUSSONIX_IPTV_AUTHORITY_CLUSTER_ID",
+        requires = "iptv_authority_secondary"
+    )]
+    iptv_authority_cluster_id: Option<uuid::Uuid>,
+    /// Private CA PEM used to verify the IPTV authority certificate.
+    #[arg(long, env = "FLUSSONIX_IPTV_AUTHORITY_CA", requires = "iptv_authority")]
+    iptv_authority_ca: Option<PathBuf>,
+    /// Allow the IPTV authority client to use literal loopback plaintext for tests.
+    #[arg(
+        long,
+        env = "FLUSSONIX_IPTV_AUTHORITY_ALLOW_INSECURE_LOOPBACK",
+        requires = "iptv_authority"
+    )]
+    iptv_authority_allow_insecure_loopback: bool,
     #[arg(long, default_value = "runtime/media")]
     media_dir: PathBuf,
     #[arg(long, default_value = "web/dist")]
@@ -57,14 +162,24 @@ struct Args {
     ffmpeg: String,
     #[arg(long, env = "FLUSSONIX_ADMIN_USER", default_value = "admin")]
     admin_user: String,
-    #[arg(long, env = "FLUSSONIX_ADMIN_PASSWORD", hide_env_values = true)]
-    admin_password: String,
+    #[arg(
+        long,
+        env = "FLUSSONIX_ADMIN_PASSWORD",
+        hide_env_values = true,
+        required_unless_present_any = ["iptv_ha_init_empty", "iptv_ha_init_from", "init_srtp_receiver_ledger"]
+    )]
+    admin_password: Option<String>,
     #[arg(long, env = "FLUSSONIX_VIEW_USER")]
     view_user: Option<String>,
     #[arg(long, env = "FLUSSONIX_VIEW_PASSWORD", hide_env_values = true)]
     view_password: Option<String>,
-    #[arg(long, env = "FLUSSONIX_PEER_KEY", hide_env_values = true)]
-    peer_key: String,
+    #[arg(
+        long,
+        env = "FLUSSONIX_PEER_KEY",
+        hide_env_values = true,
+        required_unless_present_any = ["iptv_ha_init_empty", "iptv_ha_init_from", "init_srtp_receiver_ledger"]
+    )]
+    peer_key: Option<String>,
     #[arg(long, default_value = "standalone")]
     role: String,
     #[arg(long, default_value = "local")]
@@ -75,6 +190,9 @@ struct Args {
     client_limit: u64,
     #[arg(long, default_value = "auto")]
     uplink_interface: String,
+    /// Local MaxMindDB Country or City file for named balancer country rules.
+    #[arg(long)]
+    geoip_db: Option<PathBuf>,
     #[arg(long)]
     drain: bool,
 }
@@ -95,12 +213,126 @@ fn bind_tcp_listener(address: SocketAddr) -> std::io::Result<tokio::net::TcpList
     socket.listen(1024)
 }
 
+impl Args {
+    fn validate_iptv_authority_transport(&self) -> Result<(), String> {
+        if self.iptv_lease_authority && self.iptv_authority.is_none() {
+            return Err(
+                "IPTV lease authority requires --iptv-authority for viewer admission".into(),
+            );
+        }
+        if self.iptv_lease_authority
+            && self.https_listen.is_none()
+            && !self.iptv_peer_allow_insecure_loopback
+        {
+            return Err(
+                "IPTV lease authority requires HTTPS or explicit loopback test mode".into(),
+            );
+        }
+        if self.iptv_peer_allow_insecure_loopback
+            && !self.https_only
+            && !self.listen.ip().is_loopback()
+        {
+            return Err("IPTV insecure peer test mode requires a loopback HTTP listener".into());
+        }
+        Ok(())
+    }
+
+    fn fxlink_features(&self) -> Result<flussonix::fxlink::Features, String> {
+        if self.fxlink_repair_parity && !self.fxlink_trimmed_records {
+            return Err("FXLink parity repair requires --fxlink-trimmed-records".into());
+        }
+        if self.fxlink_bootstrap_repair
+            && !(self.fxlink_trimmed_records && self.fxlink_repair_parity)
+        {
+            return Err("FXLink bootstrap repair requires --fxlink-trimmed-records and --fxlink-repair-parity".into());
+        }
+        if self.fxlink_geometry_hints
+            && !(self.fxlink_trimmed_records
+                && self.fxlink_repair_parity
+                && self.fxlink_bootstrap_repair)
+        {
+            return Err("FXLink geometry hints require --fxlink-trimmed-records, --fxlink-repair-parity and --fxlink-bootstrap-repair".into());
+        }
+        Ok(flussonix::fxlink::Features {
+            trimmed_records: self.fxlink_trimmed_records,
+            repair_parity: self.fxlink_repair_parity,
+            bootstrap_repair: self.fxlink_bootstrap_repair,
+            geometry_hints: self.fxlink_geometry_hints,
+        })
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: Set the process umask before Tokio starts threads or any daemon
+    // worker/FFmpeg child can create media files.
+    #[cfg(unix)]
+    unsafe {
+        libc::umask(0o077);
+    }
+    run()
+}
+
+fn secure_media_root(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = std::fs::symlink_metadata(path)?;
+        // SAFETY: Reading the effective UID has no side effects.
+        let owner = unsafe { libc::geteuid() };
+        if !metadata.is_dir()
+            || metadata.uid() != owner
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
+            return Err(std::io::Error::other(
+                "media directory must belong to the daemon account and have mode 0700; fix permissions before starting",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let a = Args::parse();
+    if let Some(path) = a.init_srtp_receiver_ledger.as_deref() {
+        flussonix::direct_rtp::key_ledger::Ledger::initialize(path)?;
+        println!("SRTP receiver ledger initialized");
+        return Ok(());
+    }
+    if a.iptv_ha_init_empty || a.iptv_ha_init_from.is_some() {
+        let options = HaOptions::load(
+            a.iptv_ha_db_config
+                .as_deref()
+                .expect("clap requires HA database config"),
+        )?;
+        let pool = HaPool::new(&options)?;
+        if a.iptv_ha_init_from
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err("IPTV HA import file must have an absolute path".into());
+        }
+        schema::initialize(&pool, a.iptv_ha_init_from.as_deref()).await?;
+        println!("IPTV HA schema initialized");
+        return Ok(());
+    }
+    let mut shutdown_signals = ShutdownSignals::install()?;
+    if a.allow_insecure_remote_management {
+        eprintln!(
+            "WARNING: insecure remote HTTP management is enabled; credentials may be exposed on the network"
+        );
+    }
+    a.validate_iptv_authority_transport()?;
+    let iptv_ha = a
+        .iptv_ha_db_config
+        .as_deref()
+        .map(HaOptions::load)
+        .transpose()?;
+    let fxlink_features = a.fxlink_features()?;
     let udp_rate = a.rtsp_udp_mbps.unwrap_or(100.0);
     let https_config = match (&a.https_cert, &a.https_key) {
         (Some(cert), Some(key)) => Some(flussonix::rtsp::tls::server(cert, key)?),
@@ -112,6 +344,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
     // Validate encryption/limits and bind UDP before config/media ownership starts.
+    let srt_play_public_url = a
+        .srt_play_public_url
+        .as_deref()
+        .map(|raw| {
+            flussonix::server::validate_srt_public_url(raw)
+                .ok_or_else(|| std::io::Error::other("invalid public SRT playback URL"))
+        })
+        .transpose()?;
     let srt_listener = match a.srt_play_listen {
         Some(address) => Some(flussonix::srt_playback::Listener::bind(
             address,
@@ -119,26 +359,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 a.srt_play_latency.unwrap_or(120),
                 a.srt_play_client_limit.unwrap_or(128),
                 a.srt_play_passphrase.unwrap_or_default(),
-            )?,
+            )?
+            .with_direct_tokens(a.srt_play_allow_direct_token),
+        )?),
+        None => None,
+    };
+    let fxlink_listener = match a.fxlink_listen {
+        Some(address) => Some(flussonix::fxlink::Listener::bind_with_features(
+            address,
+            a.fxlink_cert
+                .as_deref()
+                .expect("clap requires FXLink certificate"),
+            a.fxlink_key.as_deref().expect("clap requires FXLink key"),
+            flussonix::fxlink::Settings::default(),
+            fxlink_features,
         )?),
         None => None,
     };
     let options = Options {
         admin_user: a.admin_user,
-        admin_password: a.admin_password,
+        admin_password: a
+            .admin_password
+            .expect("clap requires daemon admin password"),
+        admin_public_origin: a.admin_public_origin,
+        srt_play_public_url: srt_play_public_url.clone(),
+        allow_insecure_remote_management: a.allow_insecure_remote_management,
         view_user: a.view_user,
         view_password: a.view_password,
-        peer_key: a.peer_key,
+        peer_key: a.peer_key.expect("clap requires daemon peer key"),
         ffmpeg: a.ffmpeg,
+        srtp_receiver_ledger: a.srtp_receiver_ledger,
         role: a.role,
         node_name: a.node_name,
         uplink_mbps: a.uplink_mbps,
         uplink_interface: a.uplink_interface,
+        geoip_db: a.geoip_db,
         client_limit: a.client_limit,
         web_dir: a.web_dir,
+        iptv_data: a.iptv_data,
+        iptv_public_origin: a.iptv_public_origin,
+        iptv_lease_authority: a.iptv_lease_authority,
+        iptv_ha,
+        iptv_peer_allow_insecure_loopback: a.iptv_peer_allow_insecure_loopback,
+        iptv_authority: a.iptv_authority,
+        iptv_authority_secondary: a.iptv_authority_secondary,
+        iptv_authority_cluster_id: a.iptv_authority_cluster_id,
+        iptv_authority_ca: a.iptv_authority_ca,
+        iptv_authority_allow_insecure_loopback: a.iptv_authority_allow_insecure_loopback,
         drain: a.drain,
+        fxlink_features,
     };
+    secure_media_root(&a.media_dir)?;
     let app = App::new(a.config, a.media_dir, options)?;
+    if let Some(pool) = &app.iptv_ha_pool {
+        pool.verify_startup().await?;
+        let authority = app.iptv_ha.as_ref().expect("HA authority constructed");
+        authority.catalog.load_current().await?;
+        authority.ledger.ready().await?;
+        // The database is canonical; a failed local export is reported in node health.
+        let _ = authority.catalog.retry_export().await;
+    }
     let listener = if a.https_only {
         None
     } else {
@@ -169,6 +449,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?;
     app.set_http_delivery(http_address, https_address);
     app.set_srt_playback(srt_listener.as_ref());
+    app.set_fxlink_listener(fxlink_listener.as_ref());
     app.set_rtsp_publication(
         rtsp_listener.as_ref().map(|l| l.local_addr()).transpose()?,
         tls_listener.as_ref().map(|l| l.local_addr()).transpose()?,
@@ -176,16 +457,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.set_rtsp_publication_udp(udp_pool.is_some());
     println!(
         "{}",
-        serde_json::json!({"service":"FlussoniX","listen":http_address.map(|a|a.to_string()),"https_listen":https_address.map(|a|a.to_string()),"rtsp_listen":rtsp_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"rtsps_listen":tls_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"srt_play_listen":srt_listener.as_ref().map(|l|l.address().to_string()),"srt_play_encrypted":srt_listener.as_ref().map(|l|l.settings().encrypted()),"rtsp_udp_ports":a.rtsp_udp_ports.map(|p|p.to_string()),"rtsp_udp_mbps":a.rtsp_udp_ports.map(|_|udp_rate),"version":env!("CARGO_PKG_VERSION")})
+        serde_json::json!({"service":"FlussoniX","listen":http_address.map(|a|a.to_string()),"https_listen":https_address.map(|a|a.to_string()),"rtsp_listen":rtsp_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"rtsps_listen":tls_listener.as_ref().map(|l|l.local_addr().map(|a|a.to_string())).transpose()?,"fxlink_listen":fxlink_listener.as_ref().map(|l|l.address().to_string()),"srt_play_listen":srt_listener.as_ref().map(|l|l.address().to_string()),"srt_play_encrypted":srt_listener.as_ref().map(|l|l.settings().encrypted()),"srt_play_public_url":srt_play_public_url.as_ref().map(url::Url::as_str),"srt_play_direct_tokens_allowed":a.srt_play_allow_direct_token,"rtsp_udp_ports":a.rtsp_udp_ports.map(|p|p.to_string()),"rtsp_udp_mbps":a.rtsp_udp_ports.map(|_|udp_rate),"version":env!("CARGO_PKG_VERSION")})
     );
     app.reconcile().await;
     let background = app.clone();
     let cancel = tokio_util::sync::CancellationToken::new();
     let vendor_app = app.clone();
     let vendor_cancel = cancel.clone();
-    let vendor_playback =
-        tokio::spawn(async move { vendor_app.run_vendor_playback(vendor_cancel).await });
-    tokio::task::yield_now().await;
+    let (vendor_started, vendor_ready) = tokio::sync::oneshot::channel();
+    let vendor_playback = tokio::spawn(async move {
+        let driver = vendor_app.run_vendor_playback(vendor_cancel);
+        let _ = vendor_started.send(());
+        driver.await
+    });
+    vendor_ready.await?;
+    let mut fxlink_task = fxlink_listener
+        .map(|listener| tokio::spawn(listener.serve(app.fxlink_provider(), cancel.clone())));
     let mut srt_task = srt_listener.map(|listener| {
         tokio::spawn(flussonix::srt_playback::serve(
             listener,
@@ -225,6 +512,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::select! { _=auth_cancel.cancelled()=>break, _=interval.tick()=>auth_app.playback_auth.renew_due().await }
         }
     });
+    let renewal_app = app.clone();
+    let renewal_cancel = cancel.clone();
+    let renewal = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = renewal_cancel.cancelled() => break,
+                _ = interval.tick() => renewal_app.playback_auth.schedule_due(),
+            }
+        }
+    });
+    let iptv_probe = app.iptv_authority_client.clone().map(|client| {
+        let probe_cancel = cancel.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = probe_cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        tokio::select! {
+                            _ = probe_cancel.cancelled() => break,
+                            _ = client.probe() => {},
+                        }
+                    }
+                }
+            }
+        })
+    });
     let telemetry_app = app.clone();
     let telemetry_cancel = cancel.clone();
     let telemetry = tokio::spawn(async move {
@@ -241,14 +558,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     type Server = std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
     let mut serving = FuturesUnordered::<Server>::new();
     if let Some(listener) = listener {
-        serving.push(Box::pin(
-            axum::serve(
-                listener,
-                router(app.clone()).into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(cancel.clone().cancelled_owned())
-            .into_future(),
-        ));
+        serving.push(Box::pin(flussonix::http_transport::serve(
+            listener,
+            app.clone(),
+            cancel.clone(),
+        )));
     }
     if let Some(listener) = https_listener {
         serving.push(Box::pin(flussonix::http_tls::serve(
@@ -261,22 +575,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rtsp_result = None;
     let mut tls_result = None;
     let mut srt_result = None;
+    let mut fxlink_result = None;
     let completed = tokio::select! {
         result=serving.next()=>result,
         result=async{match rtsp_task.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{rtsp_result=Some(result);None},
         result=async{match tls_task.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{tls_result=Some(result);None},
         result=async{match srt_task.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{srt_result=Some(result);None},
-        _=shutdown()=>None
+        result=async{match fxlink_task.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{fxlink_result=Some(result);None},
+        _=shutdown_signals.wait()=>None
     };
     cancel.cancel();
     let _ = supervisor.await;
     let _ = authorization.await;
+    let _ = renewal.await;
+    if let Some(task) = iptv_probe {
+        let _ = task.await;
+    }
     let _ = telemetry.await;
     let _ = memory_maintenance.await;
     let vendor_result = vendor_playback.await;
     if srt_result.is_none() {
         if let Some(task) = srt_task {
             srt_result = Some(task.await);
+        }
+    }
+    if fxlink_result.is_none() {
+        if let Some(task) = fxlink_task {
+            fxlink_result = Some(task.await);
         }
     }
     app.media.stop_all().await;
@@ -314,18 +639,639 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(result) = srt_result {
         result??;
     }
+    if let Some(result) = fxlink_result {
+        result??;
+    }
     vendor_result??;
     Ok(())
 }
-async fn shutdown() {
-    #[cfg(unix)]
-    {
-        let mut term =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-        tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
+
+#[cfg(unix)]
+struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn install() -> std::io::Result<Self> {
+        Ok(Self {
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
     }
-    #[cfg(not(unix))]
-    {
+
+    async fn wait(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {},
+            _ = self.terminate.recv() => {},
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ShutdownSignals;
+
+#[cfg(not(unix))]
+impl ShutdownSignals {
+    fn install() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn wait(&mut self) {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn ha_initialization_is_explicit_and_single_purpose() {
+        let base = [
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+            "--iptv-lease-authority",
+            "--iptv-ha-db-config",
+            "/tmp/owned-ha.json",
+        ];
+        assert!(Args::try_parse_from(base.into_iter().chain(["--iptv-ha-init-empty"])).is_ok());
+        assert!(
+            Args::try_parse_from([
+                "flussonix",
+                "--iptv-lease-authority",
+                "--iptv-ha-db-config",
+                "/tmp/owned-ha.json",
+                "--iptv-ha-init-from",
+                "/tmp/private-import.json"
+            ])
+            .is_ok(),
+            "one-shot import must not require unused daemon credentials"
+        );
+        assert!(
+            Args::try_parse_from([
+                "flussonix",
+                "--iptv-lease-authority",
+                "--iptv-ha-db-config",
+                "/tmp/owned-ha.json",
+                "--iptv-ha-init-empty"
+            ])
+            .is_ok(),
+            "one-shot empty initialization must not require unused daemon credentials"
+        );
+        assert!(
+            Args::try_parse_from(
+                base.into_iter()
+                    .chain(["--iptv-ha-init-from", "/tmp/private-import.json"])
+            )
+            .is_ok()
+        );
+        assert!(
+            Args::try_parse_from(base.into_iter().chain([
+                "--iptv-ha-init-empty",
+                "--iptv-ha-init-from",
+                "/tmp/private-import.json"
+            ]))
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "flussonix",
+                "--admin-password",
+                "owned-admin",
+                "--peer-key",
+                "owned-peer-key-123",
+                "--iptv-ha-init-empty"
+            ])
+            .is_err()
+        );
+    }
+    #[test]
+    fn ha_database_configuration_requires_explicit_authority_mode() {
+        assert!(
+            Args::try_parse_from([
+                "flussonix",
+                "--admin-password",
+                "owned-admin",
+                "--peer-key",
+                "owned-peer-key-123",
+                "--iptv-ha-db-config",
+                "/tmp/owned-ha.json"
+            ])
+            .is_err()
+        );
+        let parsed = Args::try_parse_from([
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+            "--iptv-lease-authority",
+            "--iptv-authority",
+            "https://authority.example/",
+            "--iptv-ha-db-config",
+            "/tmp/owned-ha.json",
+        ]);
+        assert!(parsed.is_ok(), "{}", parsed.err().unwrap());
+    }
+
+    #[test]
+    fn secondary_iptv_authority_requires_stable_cluster_identity() {
+        let base = [
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+            "--iptv-authority",
+            "https://a.example/",
+        ];
+        assert!(
+            Args::try_parse_from(
+                base.into_iter()
+                    .chain(["--iptv-authority-secondary", "https://b.example/"])
+            )
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from(base.into_iter().chain([
+                "--iptv-authority-secondary",
+                "https://b.example/",
+                "--iptv-authority-cluster-id",
+                "a3192376-6df5-4b76-a15c-43942fd3d466"
+            ]))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn iptv_authority_requires_tls_or_explicit_loopback_exception() {
+        let base = [
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+            "--iptv-lease-authority",
+            "--iptv-authority",
+            "https://authority.example/",
+        ];
+        assert!(
+            Args::try_parse_from(base)
+                .unwrap()
+                .validate_iptv_authority_transport()
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from(base.into_iter().chain([
+                "--https-listen",
+                "127.0.0.1:18443",
+                "--https-cert",
+                "cert.pem",
+                "--https-key",
+                "key.pem"
+            ]))
+            .unwrap()
+            .validate_iptv_authority_transport()
+            .is_ok()
+        );
+        assert!(
+            Args::try_parse_from(
+                base.into_iter()
+                    .chain(["--iptv-peer-allow-insecure-loopback"])
+            )
+            .unwrap()
+            .validate_iptv_authority_transport()
+            .is_ok()
+        );
+        assert!(
+            Args::try_parse_from(base.into_iter().chain([
+                "--iptv-peer-allow-insecure-loopback",
+                "--listen",
+                "0.0.0.0:18210"
+            ]))
+            .unwrap()
+            .validate_iptv_authority_transport()
+            .is_err()
+        );
+    }
+    #[test]
+    fn lease_authority_requires_its_own_viewer_authority_client_in_every_role() {
+        let base = [
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+            "--role",
+            "lb",
+            "--iptv-lease-authority",
+            "--iptv-peer-allow-insecure-loopback",
+        ];
+        let missing = Args::try_parse_from(base).unwrap();
+        assert!(
+            missing
+                .validate_iptv_authority_transport()
+                .unwrap_err()
+                .contains("--iptv-authority")
+        );
+        let configured = Args::try_parse_from(base.into_iter().chain([
+            "--iptv-authority",
+            "http://127.0.0.1:18443/",
+            "--iptv-authority-allow-insecure-loopback",
+        ]))
+        .unwrap();
+        assert!(configured.validate_iptv_authority_transport().is_ok());
+        for role in ["standalone", "source", "cdn"] {
+            let missing = Args::try_parse_from([
+                "flussonix",
+                "--admin-password",
+                "owned-admin",
+                "--peer-key",
+                "owned-peer-key-123",
+                "--role",
+                role,
+                "--iptv-lease-authority",
+                "--iptv-peer-allow-insecure-loopback",
+            ])
+            .unwrap();
+            assert!(
+                missing.validate_iptv_authority_transport().is_err(),
+                "{role} authority must not start without its viewer client"
+            );
+        }
+    }
+    #[test]
+    fn fxlink_geometry_startup_matrix() {
+        const TEST: &str = "tests::fxlink_geometry_startup_matrix";
+        const KEYS: [&str; 4] = [
+            "FLUSSONIX_FXLINK_TRIMMED_RECORDS",
+            "FLUSSONIX_FXLINK_REPAIR_PARITY",
+            "FLUSSONIX_FXLINK_BOOTSTRAP_REPAIR",
+            "FLUSSONIX_FXLINK_GEOMETRY_HINTS",
+        ];
+        const FLAGS: [&str; 4] = [
+            "--fxlink-trimmed-records",
+            "--fxlink-repair-parity",
+            "--fxlink-bootstrap-repair",
+            "--fxlink-geometry-hints",
+        ];
+        if let Ok(case) = std::env::var("FXLINK_GEOMETRY_MATRIX_CHILD") {
+            let mut digits: usize = case.parse().unwrap();
+            let mode = std::env::var("FXLINK_GEOMETRY_MATRIX_MODE").unwrap();
+            let mut values = [false; 4];
+            let mut args = vec![
+                "flussonix",
+                "--admin-password",
+                "owned-admin",
+                "--peer-key",
+                "owned-peer-key-123",
+            ];
+            for (index, flag) in FLAGS.iter().enumerate() {
+                let value = digits % 3;
+                digits /= 3;
+                values[index] = value == 2;
+                if mode == "flags" && value == 2 {
+                    args.push(flag);
+                }
+            }
+            let [t, p, b, g] = values;
+            let parsed = Args::try_parse_from(args)
+                .map_err(|error| error.to_string())
+                .and_then(|args| args.fxlink_features());
+            assert_eq!(
+                parsed.is_ok(),
+                (!p || t) && (!b || (t && p)) && (!g || (t && p && b)),
+                "case{case} mode{mode}:{}",
+                parsed.as_ref().err().map_or("", String::as_str)
+            );
+            if let Ok(features) = parsed {
+                assert_eq!(
+                    [
+                        features.trimmed_records,
+                        features.repair_parity,
+                        features.bootstrap_repair,
+                        features.geometry_hints
+                    ],
+                    values
+                );
+            }
+            return;
+        }
+        for mode in ["environment", "flags"] {
+            for case in 0..81 {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args([TEST, "--exact", "--test-threads=1"])
+                    .env("FXLINK_GEOMETRY_MATRIX_CHILD", case.to_string())
+                    .env("FXLINK_GEOMETRY_MATRIX_MODE", mode);
+                let mut digits = case;
+                for key in KEYS {
+                    let value = digits % 3;
+                    digits /= 3;
+                    child.env_remove(key);
+                    if value != 0 {
+                        child.env(
+                            key,
+                            if mode == "environment" && value == 2 {
+                                "true"
+                            } else {
+                                "false"
+                            },
+                        );
+                    }
+                }
+                let output = child.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "case{case} mode{mode}:{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+    #[test]
+    fn fxlink_bootstrap_flags_require_both_prerequisites() {
+        const TEST: &str = "tests::fxlink_bootstrap_flags_require_both_prerequisites";
+        if std::env::var_os("FXLINK_BOOTSTRAP_FLAGS_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([TEST, "--exact", "--test-threads=1"])
+                .env("FXLINK_BOOTSTRAP_FLAGS_CHILD", "1")
+                .env_remove("FLUSSONIX_FXLINK_TRIMMED_RECORDS")
+                .env_remove("FLUSSONIX_FXLINK_REPAIR_PARITY")
+                .env_remove("FLUSSONIX_FXLINK_BOOTSTRAP_REPAIR")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        for trimmed in [false, true] {
+            for parity in [false, true] {
+                for bootstrap in [false, true] {
+                    let mut args = vec![
+                        "flussonix",
+                        "--admin-password",
+                        "owned-admin",
+                        "--peer-key",
+                        "owned-peer-key-123",
+                    ];
+                    if trimmed {
+                        args.push("--fxlink-trimmed-records");
+                    }
+                    if parity {
+                        args.push("--fxlink-repair-parity");
+                    }
+                    if bootstrap {
+                        args.push("--fxlink-bootstrap-repair");
+                    }
+                    let parsed = Args::try_parse_from(args)
+                        .map_err(|e| e.to_string())
+                        .and_then(|a| a.fxlink_features());
+                    let valid = (!parity || trimmed) && (!bootstrap || (trimmed && parity));
+                    assert_eq!(
+                        parsed.is_ok(),
+                        valid,
+                        "flags:{trimmed}/{parity}/{bootstrap}"
+                    );
+                    if valid {
+                        assert_eq!(parsed.unwrap().bootstrap_repair, bootstrap);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn fxlink_bootstrap_environment_matrix() {
+        const TEST: &str = "tests::fxlink_bootstrap_environment_matrix";
+        if let Ok(bits) = std::env::var("FXLINK_BOOTSTRAP_ENV_CHILD") {
+            let bits: u8 = bits.parse().unwrap();
+            let parsed = Args::try_parse_from([
+                "flussonix",
+                "--admin-password",
+                "owned-admin",
+                "--peer-key",
+                "owned-peer-key-123",
+            ])
+            .map_err(|e| e.to_string())
+            .and_then(|a| a.fxlink_features());
+            let (t, p, b) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+            assert_eq!(
+                parsed.is_ok(),
+                (!p || t) && (!b || (t && p)),
+                "env bits:{bits}"
+            );
+            if let Ok(f) = parsed {
+                assert_eq!(f.bootstrap_repair, b);
+                assert_eq!(f.repair_parity, p);
+                assert_eq!(f.trimmed_records, t);
+            }
+            return;
+        }
+        // Absent and explicitly false are distinct Clap argument sources.
+        for case in 0u32..27 {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args([TEST, "--exact", "--test-threads=1"]);
+            let mut digits = case;
+            let mut bits = 0u8;
+            for (bit, key) in [
+                (1, "FLUSSONIX_FXLINK_TRIMMED_RECORDS"),
+                (2, "FLUSSONIX_FXLINK_REPAIR_PARITY"),
+                (4, "FLUSSONIX_FXLINK_BOOTSTRAP_REPAIR"),
+            ] {
+                let value = digits % 3;
+                digits /= 3;
+                child.env_remove(key);
+                if value != 0 {
+                    child.env(key, if value == 2 { "true" } else { "false" });
+                }
+                if value == 2 {
+                    bits |= bit;
+                }
+            }
+            child.env("FXLINK_BOOTSTRAP_ENV_CHILD", bits.to_string());
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "env case{case} bits{bits}:{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+    #[test]
+    fn fxlink_parity_flag_requires_explicit_trimmed_layout_optin() {
+        let base = [
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+        ];
+        assert!(
+            Args::try_parse_from(
+                base.into_iter()
+                    .chain(["--fxlink-trimmed-records", "--fxlink-repair-parity"])
+            )
+            .is_ok(),
+            "new opt-in flag must be accepted"
+        );
+        assert!(
+            Args::try_parse_from(base.into_iter().chain(["--fxlink-repair-parity"])).is_err(),
+            "v7 cannot silently enable trimmed layouts"
+        );
+    }
+    #[test]
+    fn fxlink_parity_environment_is_opt_in_and_requires_trimmed() {
+        const TEST: &str = "tests::fxlink_parity_environment_is_opt_in_and_requires_trimmed";
+        if let Ok(expected) = std::env::var("FXLINK_PARITY_ENV_EXPECTED") {
+            let parsed = Args::try_parse_from([
+                "flussonix",
+                "--admin-password",
+                "owned-admin",
+                "--peer-key",
+                "owned-peer-key-123",
+            ])
+            .map_err(|error| error.to_string())
+            .and_then(|args| args.fxlink_features());
+            if expected == "rejected" {
+                assert!(parsed.is_err());
+            } else {
+                assert_eq!(parsed.unwrap().repair_parity, expected == "true");
+            }
+            return;
+        }
+        for (parity, trimmed, expected) in [
+            (None, None, "false"),
+            (Some("false"), None, "false"),
+            (Some("true"), None, "rejected"),
+            (Some("true"), Some("false"), "rejected"),
+            (Some("true"), Some("true"), "true"),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([TEST, "--exact", "--test-threads=1"])
+                .env("FXLINK_PARITY_ENV_EXPECTED", expected)
+                .env_remove("FLUSSONIX_FXLINK_REPAIR_PARITY")
+                .env_remove("FLUSSONIX_FXLINK_TRIMMED_RECORDS");
+            if let Some(value) = parity {
+                child.env("FLUSSONIX_FXLINK_REPAIR_PARITY", value);
+            }
+            if let Some(value) = trimmed {
+                child.env("FLUSSONIX_FXLINK_TRIMMED_RECORDS", value);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "owned env case:{expected}:{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+    #[test]
+    fn fxlink_trimmed_flag_is_an_independent_startup_optin() {
+        let parsed = Args::try_parse_from([
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+            "--fxlink-trimmed-records",
+        ]);
+        assert!(
+            parsed.is_ok(),
+            "client-only trimmed opt-in was rejected: {:?}",
+            parsed.err()
+        );
+    }
+    #[test]
+    fn fxlink_trimmed_environment_binding_is_parse_once_and_defaults_off() {
+        const TEST: &str =
+            "tests::fxlink_trimmed_environment_binding_is_parse_once_and_defaults_off";
+        if let Ok(expected) = std::env::var("FXLINK_OWNED_ENV_EXPECTED") {
+            let args = Args::try_parse_from([
+                "flussonix",
+                "--admin-password",
+                "owned-admin",
+                "--peer-key",
+                "owned-peer-key-123",
+            ])
+            .unwrap();
+            assert_eq!(args.fxlink_trimmed_records, expected == "true");
+            assert!(args.fxlink_listen.is_none());
+            return;
+        }
+        for (value, expected) in [(None, false), (Some("false"), false), (Some("true"), true)] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([TEST, "--exact", "--nocapture", "--test-threads=1"])
+                .env(
+                    "FXLINK_OWNED_ENV_EXPECTED",
+                    if expected { "true" } else { "false" },
+                )
+                .env_remove("FLUSSONIX_FXLINK_TRIMMED_RECORDS");
+            if let Some(value) = value {
+                command.env("FLUSSONIX_FXLINK_TRIMMED_RECORDS", value);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "owned env case {value:?}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    #[test]
+    fn fxlink_cli_requires_all_tls_material() {
+        let base = [
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+        ];
+        let args =
+            |extra: &[&str]| Args::try_parse_from(base.into_iter().chain(extra.iter().copied()));
+        assert!(args(&[]).is_ok());
+        assert!(
+            args(&[
+                "--fxlink-listen",
+                "127.0.0.1:0",
+                "--fxlink-cert",
+                "cert.pem",
+                "--fxlink-key",
+                "key.pem"
+            ])
+            .is_ok()
+        );
+        assert!(args(&["--fxlink-listen", "127.0.0.1:0"]).is_err());
+        assert!(args(&["--fxlink-cert", "cert.pem"]).is_err());
+        assert!(args(&["--fxlink-key", "key.pem"]).is_err());
+    }
+
+    #[test]
+    fn remote_http_management_override_is_opt_in() {
+        let base = [
+            "flussonix",
+            "--admin-password",
+            "owned-admin",
+            "--peer-key",
+            "owned-peer-key-123",
+        ];
+        let plain = Args::try_parse_from(base).unwrap();
+        assert!(!plain.allow_insecure_remote_management);
+        let explicit = Args::try_parse_from(
+            base.into_iter()
+                .chain(["--allow-insecure-remote-management"]),
+        )
+        .unwrap();
+        assert!(explicit.allow_insecure_remote_management);
     }
 }

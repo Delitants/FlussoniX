@@ -101,13 +101,62 @@ pub(crate) fn playback(id: &str) -> Result<(Selection, Option<String>, String), 
         }
     }
     let clean = format!("#!::{}", fields.join(","));
-    Ok((Selection::parse(&clean)?, ticket, clean))
+    let selection = Selection::parse(&clean)?;
+    if selection.token.is_empty()
+        && ticket
+            .as_deref()
+            .is_some_and(|value| ticket_only(&selection.name, value).as_deref() != Some(id))
+    {
+        return Err("invalid SRT ticket");
+    }
+    Ok((selection, ticket, clean))
+}
+
+/// A native ticket never repeats optional request fields, which may contain credentials.
+pub(crate) fn ticket_only(name: &str, ticket: &str) -> Option<String> {
+    if crate::config::valid_name(name).is_err() || name.contains(',') || name.contains('=') {
+        return None;
+    }
+    if uuid::Uuid::parse_str(ticket).ok()?.to_string() != ticket {
+        return None;
+    }
+    let id = format!("#!::r={name},m=request,flussonix_ticket={ticket}");
+    (id.len() <= 512).then_some(id)
 }
 
 #[cfg(test)]
 mod playback_tests {
     use super::*;
     const ID: &str = "00000000-0000-0000-0000-000000000001";
+    #[test]
+    fn ticket_builder_returns_only_canonical_minimal_fields() {
+        assert_eq!(
+            ticket_only("owned/nested", ID).as_deref(),
+            Some(
+                "#!::r=owned/nested,m=request,flussonix_ticket=00000000-0000-0000-0000-000000000001"
+            )
+        );
+        for name in [
+            "owned,u=secret",
+            "owned,s=secret",
+            "owned,a=secret",
+            "../owned",
+        ] {
+            assert!(ticket_only(name, ID).is_none(), "accepted {name}");
+        }
+        assert!(ticket_only("owned", "00000000000000000000000000000001").is_none());
+        assert!(ticket_only("owned", "invalid").is_none());
+        assert!(ticket_only(&"é".repeat(130), ID).is_none());
+        assert!(ticket_only(&"x".repeat(256), ID).is_some());
+        assert!(ticket_only(&"x".repeat(257), ID).is_none());
+    }
+    #[test]
+    fn legacy_mixed_token_and_ticket_remains_parseable_for_explicit_compatibility() {
+        let id = format!("#!::r=owned,m=request,u=secret,flussonix_ticket={ID}");
+        let (selection, ticket, _) = playback(&id).unwrap();
+        assert_eq!(selection.token, "secret");
+        assert_eq!(ticket.as_deref(), Some(ID));
+    }
     #[test]
     fn native_ticket_is_removed_without_rewriting_opaque_viewer_fields() {
         let clean = "#!::u=one%2B+é,r=owned,s=claim,a=opaque,m=request";

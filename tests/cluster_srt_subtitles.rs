@@ -148,7 +148,9 @@ async fn cluster(dir: &Path, cfg: Value) -> (Node, Node) {
 fn listener() -> (Listener, String) {
     let listener = Listener::bind(
         "127.0.0.1:0".parse().unwrap(),
-        Settings::new(120, 2, SECRET.into()).unwrap(),
+        Settings::new(120, 2, SECRET.into())
+            .unwrap()
+            .with_direct_tokens(true),
     )
     .unwrap();
     let endpoint = format!(

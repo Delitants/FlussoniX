@@ -126,36 +126,48 @@ mod tests {
     }
     #[test]
     fn publication_readiness_rejects_handoff_reservation_inodes() {
-        let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = reservation.local_addr().unwrap().port();
-        let inode = socket_inode(std::os::fd::AsRawFd::as_raw_fd(&reservation)).unwrap();
-        assert!(
-            !owned(&[port], std::process::id(), &[inode]).unwrap(),
-            "An inherited handoff reservation is not a decoder socket"
-        );
-        drop(reservation);
-        let decoder = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
-        assert!(
-            owned(&[port], std::process::id(), &[inode]).unwrap(),
-            "A new decoder socket on the same port must qualify"
-        );
-        drop(decoder);
+        // Another parallel media test can take an ephemeral port after release.
+        // Retry only that handoff race, while checking the same inode contract.
+        for _ in 0..128 {
+            let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = reservation.local_addr().unwrap().port();
+            let inode = socket_inode(std::os::fd::AsRawFd::as_raw_fd(&reservation)).unwrap();
+            assert!(
+                !owned(&[port], std::process::id(), &[inode]).unwrap(),
+                "An inherited handoff reservation is not a decoder socket"
+            );
+            drop(reservation);
+            let Ok(decoder) = std::net::UdpSocket::bind(("127.0.0.1", port)) else {
+                continue;
+            };
+            assert!(
+                owned(&[port], std::process::id(), &[inode]).unwrap(),
+                "A new decoder socket on the same port must qualify"
+            );
+            drop(decoder);
+            return;
+        }
+        panic!("could not reacquire an ephemeral UDP port after 128 attempts");
     }
     #[test]
     fn owned_readiness_observes_pairs_without_claiming_free_ports() {
-        let first = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let p = first.local_addr().unwrap().port();
-        assert!(bound(&[p]).unwrap());
-        drop(first);
-        assert!(!bound(&[p]).unwrap());
-        // The decoder can bind immediately after every readiness observation;
-        // the observer never holds a probe socket while it starts.
+        // A wildcard reservation excludes another loopback owner, so a false
+        // observation is meaningful even when other media tests run in parallel.
+        // Once released, an unrelated owner may win the race; retry that port.
+        let mut observed = 0;
         for _ in 0..128 {
+            let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+            let p = reservation.local_addr().unwrap().port();
             assert!(!bound(&[p]).unwrap());
-            let decoder = std::net::UdpSocket::bind(("127.0.0.1", p)).unwrap();
+            drop(reservation);
+            let Ok(decoder) = std::net::UdpSocket::bind(("127.0.0.1", p)) else {
+                continue;
+            };
             assert!(bound(&[p]).unwrap());
             drop(decoder);
+            observed += 1;
         }
+        assert!(observed >= 100, "other owners claimed most fixture ports");
     }
     #[test]
     fn readiness_requires_every_loopback_port_and_rejects_wildcards() {

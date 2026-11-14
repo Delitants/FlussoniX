@@ -36,7 +36,7 @@ async fn receive_authenticates_before_peer_pin_and_rejects_plaintext_tamper_repl
     key(&file, 0x33);
     let p = port();
     let cfg = Settings::parse(
-        &json!({"url":format!("srtp://127.0.0.1:{p}"),"flussonix_rtp":{"key_file":file}}),
+        &json!({"url":format!("srtp://127.0.0.1:{p}"),"flussonix_rtp":{"key_file":file,"allow_legacy_reused_key":true}}),
     )
     .unwrap();
     let input = Input::bind(&cfg).await.unwrap();
@@ -114,7 +114,7 @@ async fn srtcp_feedback_is_encrypted_and_plaintext_control_cannot_count() {
     key(&file, 0x33);
     let p = port();
     let cfg = Settings::parse(
-        &json!({"url":format!("srtp://127.0.0.1:{p}"),"flussonix_rtp":{"key_file":file}}),
+        &json!({"url":format!("srtp://127.0.0.1:{p}"),"flussonix_rtp":{"key_file":file,"allow_legacy_reused_key":true}}),
     )
     .unwrap();
     let input = Input::bind(&cfg).await.unwrap();
@@ -197,7 +197,8 @@ async fn encrypted_destination_never_sends_plaintext_and_releases_local_pair() {
         .await
         .unwrap();
     let state=State::new(outputs(&json!({"flussonix_rtp_outputs":[{"url":format!("srtp://127.0.0.1:{p}"),"flussonix_rtp":{"key_file":file}}]})).unwrap().remove(0),0);
-    let (tx, receiver) = tokio::sync::broadcast::channel(4);
+    let tx = flussonix::media_queue::Channel::new(4, 4 * 1024 * 1024);
+    let receiver = tx.subscribe();
     let c = CancellationToken::new();
     let stop = c.clone();
     let s = state.clone();
@@ -290,7 +291,7 @@ async fn key_reference_change_replaces_worker_and_reopens_input_pair() {
     key(&second, 0x34);
     let p = port();
     let engine = flussonix::media::Engine::new(d.path().join("media"), "ffmpeg");
-    let mut cfg = json!({"inputs":[{"url":format!("srtp://127.0.0.1:{p}"),"flussonix_rtp":{"key_file":first}}]});
+    let mut cfg = json!({"inputs":[{"url":format!("srtp://127.0.0.1:{p}"),"flussonix_rtp":{"key_file":first,"allow_legacy_reused_key":true}}]});
     let one = engine
         .ensure_guarded("owned", &cfg, true, std::future::ready(true))
         .await
@@ -299,13 +300,14 @@ async fn key_reference_change_replaces_worker_and_reopens_input_pair() {
         .ensure_guarded("owned", &cfg, true, std::future::ready(true))
         .await
         .unwrap();
-    assert_eq!(one.pid(), same.pid());
+    assert!(std::sync::Arc::ptr_eq(&one, &same));
     cfg["inputs"][0]["flussonix_rtp"]["key_file"] = json!(second);
     let two = engine
         .ensure_guarded("owned", &cfg, true, std::future::ready(true))
         .await
         .unwrap();
-    assert_ne!(one.pid(), two.pid());
+    assert!(!std::sync::Arc::ptr_eq(&one, &two));
+    assert_ne!(one.signature(), two.signature());
     assert_eq!(engine.count().await, 1);
     engine.stop_all().await;
     assert!(
@@ -333,7 +335,8 @@ async fn unavailable_or_unsafe_key_fails_closed_without_plaintext_or_input_socke
     assert!(UdpSocket::bind((cfg.address.ip(), p + 1)).await.is_ok());
     let listener = UdpSocket::bind(cfg.address).await.unwrap();
     let state=State::new(outputs(&json!({"flussonix_rtp_outputs":[{"url":cfg.endpoint(),"flussonix_rtp":{"key_file":file}}]})).unwrap().remove(0),0);
-    let (tx, rx) = tokio::sync::broadcast::channel(4);
+    let tx = flussonix::media_queue::Channel::new(4, 4 * 1024 * 1024);
+    let rx = tx.subscribe();
     tx.send(bytes::Bytes::from(ts().repeat(7))).unwrap();
     state.clone().run(rx, CancellationToken::new()).await;
     assert_eq!(state.stats()["status"], "failed");

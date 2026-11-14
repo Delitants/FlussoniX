@@ -1,70 +1,66 @@
 # FlussoniX
 
-An independent Linux streaming server with a web admin interface, transcoding and cluster load balancing. Built in Rust, with a Flussonic-compatible API in progress.
+FlussoniX is an independent Linux streaming server with a web admin interface,
+transcoding and cluster load balancing. It does not use official Flussonic
+components.
 
-**Development preview — not yet ready to replace Flussonic in production.**
-FlussoniX does not require any official Flussonic components.
+Support is qualified by protocol, direction, codec and authorization profile.
+Review the [compatibility guide](docs/compatibility.md) before migrating a live
+service.
 
-## What you can do
+## What it offers
 
-- Manage streams, templates, server settings and cluster nodes through normal web forms.
-- Receive and deliver HLS, HTTP MPEG-TS, M4F/M4S, SRT, RTSP/RTSPS and RTP/SRTP using the supported profiles.
-- Use HTTPS and encrypted transports, viewer tokens and authorization callbacks, and upstream/publisher Basic authentication.
-- Transcode video and audio with the CPU or supported Intel/NVIDIA GPUs. The UI reports GPU readiness.
-- Preserve, convert or remove subtitles; supported conversion profiles produce HLS WebVTT.
-- Build a FlussoniX source/CDN cluster with LAN stream pulls and load balancing based on uplink, CPU and RAM.
+- Web forms for streams, templates, server settings and cluster nodes.
+- Supported profiles for HLS, HTTP MPEG-TS, M4F/M4S, SRT, RTSP/RTSPS and RTP/SRTP, including secure transports and viewer authorization.
+- CPU transcoding, supported Intel/NVIDIA GPU profiles and subtitle controls. The admin interface reports GPU readiness.
+- IPTV packages and subscriber playlists.
+- [FXLink](docs/fxlink.md), an optional encrypted transport between FlussoniX nodes.
 
-Protocol, codec and API coverage is still incomplete. Mixed Flussonic clusters are under development; [mapped CDN routing](docs/vendor-cdn-placement.md) includes HTTP/RTSP redirects and HTTPS SRT lookup for compatible clients. Explicit Flussonic HTTP source profiles support playback and [equivalent-origin failover](docs/vendor-daemon-failover.md). See [compatibility](docs/compatibility.md) before planning a migration.
+Protocol directions, codecs and feature limits vary by profile; see [compatibility](docs/compatibility.md) for details.
 
-## Try it
+## Install
 
-Use a test server and an available port. Install **FFmpeg and FFprobe** independently; the standard CPU profile needs libx264 and AAC support. Optional GPU and protocol features require their corresponding drivers or libraries.
+The Linux x86-64 release is checked on Ubuntu 24.04 and requires glibc 2.39.
+Install FFmpeg and FFprobe separately; the standard CPU profile needs libx264
+and AAC support.
 
-[Download a Linux preview](https://github.com/Delitants/FlussoniX/releases). Packaged previews may be older than the current source. Extract the package, open a terminal in its directory and set your credentials:
+[Download the latest release](https://github.com/Delitants/FlussoniX/releases)
+and its matching `.sha256` file. Verify the archive, extract it and open a
+terminal in the extracted directory:
 
 ```bash
+sha256sum --check flussonix-*.tar.gz.sha256
+```
+
+Create private credentials and a data directory:
+
+```bash
+umask 077
 export FLUSSONIX_ADMIN_USER=admin
 read -r -s -p "Choose an admin password: " FLUSSONIX_ADMIN_PASSWORD
 echo
 export FLUSSONIX_ADMIN_PASSWORD
 export FLUSSONIX_PEER_KEY="$(openssl rand -hex 32)"
+flussonix_data="$HOME/flussonix-data"
+mkdir -p "$flussonix_data"
+chmod 700 "$flussonix_data"
 ```
 
-Keep the peer key the same across nodes in a FlussoniX cluster. To start the downloaded package:
+Save the password and peer key securely for future restarts. Start the server on a local test port:
 
 ```bash
 ./bin/flussonix --listen 127.0.0.1:18210 \
-  --config runtime/config.json --media-dir runtime/media --web-dir web
+  --config "$flussonix_data/config.json" \
+  --media-dir "$flussonix_data/media" --web-dir "$PWD/web"
 ```
 
-Open [the admin interface](http://127.0.0.1:18210/admin/) and sign in as `admin` with the password you chose. This address accepts connections from the same machine; use an SSH tunnel for remote access.
+Open [the admin interface](http://127.0.0.1:18210/admin/) and sign in. In **Media → Streams**, add `testsrc://` to check playback, then try your own input. Press **Ctrl+C** to stop the server. Use an SSH tunnel or [HTTPS](docs/https-delivery.md) for remote administration.
 
-In **Media → Streams**, add your input URL or use `testsrc://` for a test picture. Save the stream and open its player to check playback. Settings persist in the configuration file. Press **Ctrl+C** to stop the server and its workers.
+For verified downloads, upgrades and recovery, follow the [installation guide](docs/installation.md). To run a background service, see the [systemd guide](docs/service-installation.md).
 
-## Build from source
+## More information
 
-Install Rust through rustup (the repository selects its toolchain), Node.js 22.12+ and the media dependencies above.
-
-```bash
-git clone https://github.com/Delitants/FlussoniX.git
-cd FlussoniX
-cargo build --release --locked
-npm ci --prefix web
-npm run build --prefix web
-```
-
-Set the credentials shown above, then run:
-
-```bash
-./target/release/flussonix --listen 127.0.0.1:18210 \
-  --config runtime/config.json --media-dir runtime/media --web-dir web/dist
-```
-
-## Documentation
-
-- [Compatibility and current limitations](docs/compatibility.md)
 - [Cluster and load balancing](docs/cluster-loadbalancing.md)
-- [Supported native codecs](docs/native-codecs.md)
+- [IPTV setup](docs/iptv-transport.md)
 - [GPU transcoding](docs/gpu-codec-controls.md)
-
-The first production release depends on live Flussonic migration and cluster compatibility checks, authorization/failover validation and production-scale testing. There is no confirmed release date yet.
+- [Build from source](docs/packaging.md)

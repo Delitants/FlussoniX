@@ -1,20 +1,48 @@
 name: check
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   verify:
     runs-on: ubuntu-24.04
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y ffmpeg libsrtp2-1 tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu fonts-dejavu-core
+      - name: Install qualification dependencies
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i 's#http://azure.archive.ubuntu.com/ubuntu#https://archive.ubuntu.com/ubuntu#g' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2 update
+          sudo apt-get -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2 install -y ffmpeg libsrtp2-1 tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu fonts-dejavu-core postgresql-16
       - name: Verify vendor components are absent
         run: test ! -e /opt/flussonic
+      - name: Release package, service, credential and qualification regressions
+        run: |
+          python3 -m unittest discover -s tests -p 'test_*preview.py' -v
+          python3 -m unittest discover -s tests -p 'test_generate_notices.py' -v
+          python3 -m unittest discover -s tests -p 'test_inspect_demo.py' -v
+          python3 -m unittest tests.test_qualify_live_vendor -v
+          python3 -m unittest tests.test_sustained_http_gate -v
+          python3 -m unittest tests.test_run_sustained_http -v
       - run: rustup show
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Patched QUIC regressions
+        run: |
+          cargo clippy --locked -p quinn-proto --no-default-features --features rustls-ring --all-targets -- -D warnings
+          cargo test --locked -p quinn-proto --no-default-features --features rustls-ring --lib -- --test-threads=1
       - name: Streaming boundary regressions
         run: |
           cargo test --locked --test subtitle_preservation raw_hls_window_is_bounded_and_replacement_does_not_reuse_sequences_or_files -- --exact --test-threads=1
@@ -22,6 +50,7 @@ jobs:
           cargo test --locked --test rtsp_push independent_basic_and_digest_receivers_authenticate_and_decode_both_tracks -- --exact --test-threads=1
           cargo test --locked --test rtsp_push independent_receiver_decodes_native_rtsp_push -- --exact --test-threads=1
           cargo test --locked --test rtsp_push native_text_preserve_rejects_rtsp_before_connect_and_drop_delivers_audio -- --exact --test-threads=1
+          cargo test --locked --test vendor_http_destinations vendor_rtsp_destinations::independent_decoder_follows_vendor_redirect_and_destination_checks_viewer_policy -- --exact --test-threads=1
       - name: Owned cluster daemon environment isolation
         run: FLUSSONIX_SRT_PLAY_PASSPHRASE=owned-unused-SRT-setting cargo test --locked --test cluster_native_recovery daemon_recovers_equivalent_native_tls_origin_without_viewer_requests -- --exact --test-threads=1
       - name: Rust qualification and owned browser caption fixture
@@ -31,7 +60,11 @@ jobs:
         run: |
           mkdir -p .runtime
           FLUSSONIX_NATIVE_AUDIO_FIXTURE_FILE="$PWD/.runtime/owned-native-audio.m4s" FLUSSONIX_NATIVE_FIXTURE_FILE="$PWD/.runtime/owned-native.m4s" FLUSSONIX_DVB_FIXTURE_FILE="$PWD/.runtime/owned-dvb.ts" FLUSSONIX_TELETEXT_FIXTURE_FILE="$PWD/.runtime/owned-teletext.ts" FLUSSONIX_708_FIXTURE_FILE="$PWD/.runtime/owned-708.ts" FLUSSONIX_CAPTION_FIXTURE_FILE="$PWD/.runtime/owned-captions.ts" cargo test --locked -- --test-threads=1
-      - uses: actions/setup-node@v7
+      - name: IPTV HA two-authority load smoke gate
+        run: FLUSSONIX_IPTV_HA_LOAD_SECONDS=5 cargo test --locked --test iptv_ha_load -- --ignored --exact two_authorities_sustain_competing_channels_without_extra_grants --nocapture
+      - name: IPTV HA real-daemon load smoke gate
+        run: FLUSSONIX_IPTV_HA_DAEMON_LOAD_SECONDS=5 cargo test --locked --test iptv_ha_daemons two_real_authority_processes_sustain_competing_channels -- --ignored --exact --nocapture
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -50,8 +83,11 @@ jobs:
           export FLUSSONIX_CAPTION_FIXTURE_FILE="$PWD/.runtime/owned-captions.ts"
           export FLUSSONIX_ADMIN_USER=admin
           export FLUSSONIX_ADMIN_PASSWORD="$(openssl rand -hex 24)"
+          export FLUSSONIX_VIEW_USER=viewer
+          export FLUSSONIX_VIEW_PASSWORD="$(openssl rand -hex 24)"
           export FLUSSONIX_PEER_KEY="$(openssl rand -hex 32)"
           export FLUSSONIX_SRT_PLAY_PASSPHRASE="$(openssl rand -hex 24)"
+          export FLUSSONIX_IPTV_PUBLIC_ORIGIN=http://127.0.0.1:18210
           mkdir -p .runtime
           export FLUSSONIX_TEST_CA_FILE="$PWD/.runtime/ui-test-ca.pem"
           openssl req -x509 -newkey rsa:2048 -nodes -keyout .runtime/ui-test-ca.key -out "$FLUSSONIX_TEST_CA_FILE" -days 2 -subj '/CN=FlussoniX CI test CA' -addext 'basicConstraints=critical,CA:TRUE' > .runtime/ui-test-ca.log 2>&1
@@ -64,3 +100,98 @@ jobs:
             sleep 0.25
           done
           npm test --prefix web
+      - name: Verify IPTV HA admin against owned PostgreSQL authority
+        env:
+          FLUSSONIX_HA_UI_READY_FILE: ${{ runner.temp }}/flussonix-ha-ui-ready
+          FLUSSONIX_HA_UI_STOP_FILE: ${{ runner.temp }}/flussonix-ha-ui-stop
+        run: |
+          export FLUSSONIX_ADMIN_USER=admin
+          export FLUSSONIX_ADMIN_PASSWORD="$(openssl rand -hex 24)"
+          export FLUSSONIX_VIEW_USER=viewer
+          export FLUSSONIX_VIEW_PASSWORD="$(openssl rand -hex 24)"
+          rm -f "$FLUSSONIX_HA_UI_READY_FILE" "$FLUSSONIX_HA_UI_STOP_FILE"
+          cargo test --locked --test iptv_ha_browser_fixture launch_owned_ha_ui_server -- --ignored --exact --nocapture > .runtime/ha-ui.log 2>&1 &
+          flussonix_ha_ui_pid=$!
+          cleanup_ha_ui() {
+            touch "$FLUSSONIX_HA_UI_STOP_FILE"
+            if ! wait "$flussonix_ha_ui_pid"; then tail -n 40 .runtime/ha-ui.log; exit 1; fi
+            rm -f "$FLUSSONIX_HA_UI_READY_FILE" "$FLUSSONIX_HA_UI_STOP_FILE"
+          }
+          trap cleanup_ha_ui EXIT
+          for attempt in $(seq 1 120); do
+            if test -s "$FLUSSONIX_HA_UI_READY_FILE"; then break; fi
+            if ! kill -0 "$flussonix_ha_ui_pid" 2>/dev/null; then tail -n 40 .runtime/ha-ui.log; exit 1; fi
+            sleep 0.25
+          done
+          test -s "$FLUSSONIX_HA_UI_READY_FILE"
+          export FLUSSONIX_TEST_URL="$(cat "$FLUSSONIX_HA_UI_READY_FILE")"
+          npm test --prefix web -- --grep 'IPTV HA live'
+
+  release_package_smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install standalone media runtime dependencies
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i 's#http://azure.archive.ubuntu.com/ubuntu#https://archive.ubuntu.com/ubuntu#g' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2 update
+          sudo apt-get -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2 install -y ffmpeg libsrt1.5-gnutls
+      - name: Verify vendor components are absent
+        run: test ! -e /opt/flussonic
+      - name: Verify archive and upgrade smoke helpers
+        run: python3 -m unittest tests.test_release_archive_smoke tests.test_cold_upgrade_smoke -v
+      - name: Build actual release daemon
+        run: cargo build --locked --release
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build actual admin UI
+        run: npm ci --prefix web && npm run build --prefix web
+      - name: Package and start exact release archive
+        run: |
+          set -euo pipefail
+          package_dir=$(mktemp -d "$RUNNER_TEMP/flussonix-package.XXXXXXXX")
+          trap 'rm -rf "$package_dir"' EXIT
+          python3 scripts/package-preview.py --binary target/release/flussonix \
+            --web-dir web/dist --output-dir "$package_dir" --revision "$GITHUB_SHA"
+          mapfile -t archives < <(find "$package_dir" -maxdepth 1 -type f -name '*.tar.gz')
+          test "${#archives[@]}" -eq 1
+          python3 scripts/smoke-release-archive.py --archive "${archives[0]}" \
+            --revision "$GITHUB_SHA"
+          baseline_archive="$package_dir/flussonix-v0.10.0-preview-linux-x86_64.tar.gz"
+          curl --fail --location --retry 3 --retry-delay 2 \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --output "$baseline_archive" \
+            https://github.com/Delitants/FlussoniX/releases/download/v0.10.0-preview/flussonix-v0.10.0-preview-linux-x86_64.tar.gz
+          printf '%s  %s\n' \
+            '68fed74f74db1107c39adb6b369fa58d70336fbccde464b9ab73e6c1ec29f4a0' \
+            "$baseline_archive" | sha256sum --check
+          mkdir "$package_dir/previous" "$package_dir/current"
+          tar --extract --gzip --file "$baseline_archive" \
+            --directory "$package_dir/previous" --no-same-owner --no-same-permissions
+          tar --extract --gzip --file "${archives[0]}" \
+            --directory "$package_dir/current" --strip-components=1 \
+            --no-same-owner --no-same-permissions
+          TMPDIR="$package_dir" python3 scripts/smoke-cold-upgrade.py \
+            --previous "$package_dir/previous" --current "$package_dir/current" --media
+          mkdir "$GITHUB_WORKSPACE/release-candidate"
+          cp -- "${archives[0]}" "${archives[0]}.sha256" "$GITHUB_WORKSPACE/release-candidate/"
+          (cd "$GITHUB_WORKSPACE/release-candidate" && \
+            sha256sum --check -- "$(basename -- "${archives[0]}.sha256")")
+      - name: Retain exact tested archive and checksum for isolated qualification
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: flussonix-candidate-${{ github.sha }}
+          path: release-candidate/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

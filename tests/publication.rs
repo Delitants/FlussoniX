@@ -37,7 +37,10 @@ async fn publication_is_fenced_exclusive_owned_and_reconnects_immediately() {
         .expect("publisher starts worker");
     let old = p.worker.clone();
     assert!(p.stdin.is_some());
-    assert_eq!(engine.ensure("owned", &cfg).await.unwrap().pid(), old.pid());
+    assert!(Arc::ptr_eq(
+        &engine.ensure("owned", &cfg).await.unwrap(),
+        &old
+    ));
     assert!(
         engine
             .publish_guarded("owned", &cfg, std::future::ready(true))
@@ -53,7 +56,7 @@ async fn publication_is_fenced_exclusive_owned_and_reconnects_immediately() {
         .publish_guarded("owned", &cfg, std::future::ready(true))
         .await
         .expect("reconnect without pull backoff");
-    assert_ne!(replacement.worker.pid(), old.pid());
+    assert!(!Arc::ptr_eq(&replacement.worker, &old));
     engine.stop_if_current("owned", &old).await;
     assert!(
         !replacement.worker.is_closed(),
@@ -93,6 +96,89 @@ async fn until(mut check: impl AsyncFnMut() -> bool) {
     })
     .await
     .expect("condition deadline");
+}
+#[tokio::test]
+async fn cross_origin_basic_publication_is_rejected_before_worker_start() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let d = tempfile::tempdir().unwrap();
+    let a = app(d.path());
+    a.config
+        .put(
+            "streams",
+            "owned",
+            json!({"inputs":[{"url":"publish://"}],"password":"owned-publisher"}),
+        )
+        .unwrap();
+    let basic = format!("Basic {}", STANDARD.encode("publisher:owned-publisher"));
+    for (origin, site) in [
+        (Some("https://evil.example"), None),
+        (None, Some("cross-site")),
+        (Some("not-a-url"), None),
+    ] {
+        let mut request = post("/owned/mpegts", Body::empty());
+        request
+            .headers_mut()
+            .insert("host", "127.0.0.1:18210".parse().unwrap());
+        request
+            .headers_mut()
+            .insert("authorization", basic.parse().unwrap());
+        request
+            .headers_mut()
+            .insert("content-type", "text/plain".parse().unwrap());
+        if let Some(origin) = origin {
+            request
+                .headers_mut()
+                .insert("origin", origin.parse().unwrap());
+        }
+        if let Some(site) = site {
+            request
+                .headers_mut()
+                .insert("sec-fetch-site", site.parse().unwrap());
+        }
+        let response = router(a.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), 403, "origin {origin:?}, site {site:?}");
+        assert_eq!(a.media.count().await, 0);
+    }
+    let mut same_origin = post("/owned/mpegts", Body::empty());
+    same_origin
+        .headers_mut()
+        .insert("host", "127.0.0.1:18210".parse().unwrap());
+    same_origin
+        .headers_mut()
+        .insert("origin", "http://127.0.0.1:18210".parse().unwrap());
+    same_origin
+        .headers_mut()
+        .insert("authorization", basic.parse().unwrap());
+    same_origin
+        .headers_mut()
+        .insert("content-type", "text/plain".parse().unwrap());
+    assert_eq!(
+        router(a.clone())
+            .oneshot(same_origin)
+            .await
+            .unwrap()
+            .status(),
+        415
+    );
+    assert_eq!(
+        router(a.clone())
+            .oneshot(post("/owned/mpegts", Body::empty()))
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    for method in ["GET", "OPTIONS"] {
+        let request = Request::builder()
+            .method(method)
+            .uri("/owned/index.m3u8")
+            .header("origin", "https://evil.example")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(a.clone()).oneshot(request).await.unwrap();
+        assert_ne!(response.status(), 403, "{method} playback route");
+    }
+    a.media.stop_all().await;
 }
 #[tokio::test]
 async fn denied_publications_never_poll_body_or_start_workers() {
@@ -510,7 +596,8 @@ async fn publisher_callback_uses_post_metadata_and_renews_same_session_before_de
     assert_eq!(log[1]["request_type"], "update_session");
     assert_eq!(log[0]["session_id"], log[1]["session_id"]);
     assert_eq!(log[1]["bytes"], 188);
-    assert!(log[0]["qs"].as_str().unwrap().contains("extra=one%20two"));
+    assert_eq!(log[0]["qs"], "token=owned%2Btoken&extra=one%20two");
+    assert_eq!(log[1]["qs"], "token=owned%2Btoken&extra=one%20two");
     drop(log);
     a.media.stop_all().await;
     backend.abort();
@@ -971,12 +1058,16 @@ async fn publication_is_an_authenticated_private_native_cluster_source() {
     use sha2::{Digest, Sha256};
     let d = tempfile::tempdir().unwrap();
     let a = app(d.path());
+    // Build the paced fixture before starting the readiness deadline. Its
+    // first use runs FFmpeg synchronously and can exceed eight seconds under
+    // a parallel full-suite load before the publisher sends any bytes.
+    let media = synthetic_transport().clone();
     a.config.put("streams","owned",json!({"inputs":[{"url":"publish://"}],"password":"publisher","flussonix_token_sha256":format!("{:x}",Sha256::digest(b"viewer"))})).unwrap();
     let (source, server) = auth_backend(router(a.clone())).await;
     let (tx, t) = upload(a.clone(), "/owned/mpegts?password=publisher").await;
     let sending = tx.clone();
     let producer = tokio::spawn(async move {
-        for piece in synthetic_transport().chunks(65537) {
+        for piece in media.chunks(65537) {
             if sending
                 .send(Ok(bytes::Bytes::copy_from_slice(piece)))
                 .await
@@ -987,7 +1078,17 @@ async fn publication_is_an_authenticated_private_native_cluster_source() {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     });
-    until(async || a.media.ready("owned").await).await;
+    let source_ready = tokio::time::timeout(Duration::from_secs(20), async {
+        while !a.media.ready("owned").await {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        source_ready.is_ok(),
+        "source startup: {}",
+        a.media.stats("owned").await
+    );
     let client = reqwest::Client::new();
     assert_eq!(
         client

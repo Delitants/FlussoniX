@@ -2,7 +2,8 @@ use flussonix::rtsp::udp::PortRange;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // Disjoint ranges survive the reserve/drop/Pool::bind handoff. Stay below
-// Linux's default ephemeral range so concurrent FFmpeg clients cannot steal them.
+// Linux's default ephemeral range. Independent FFmpeg clients must explicitly
+// use their own reserved range: FFmpeg's default range also includes these ports.
 static NEXT_PORT: AtomicU32 = AtomicU32::new(20000);
 fn ip() -> std::net::IpAddr {
     "127.0.0.1".parse().unwrap()

@@ -2,6 +2,7 @@
 use flussonix::media::Engine;
 use serde_json::{Value, json};
 use std::{net::UdpSocket, path::Path, time::Duration};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 #[path = "decoder_readiness.rs"]
 mod decoder_readiness;
@@ -31,7 +32,7 @@ fn ports() -> (u16, Vec<UdpSocket>) {
     }
     panic!("owned RTP ports unavailable")
 }
-async fn decode(path: &Path, video: Option<&str>, audio: &[&str]) {
+pub async fn decode(path: &Path, video: Option<&str>, audio: &[&str]) {
     let probe = tokio::time::timeout(
         Duration::from_secs(30),
         Command::new("/usr/bin/ffprobe")
@@ -94,6 +95,88 @@ async fn decode(path: &Path, video: Option<&str>, audio: &[&str]) {
         path.display(),
         String::from_utf8_lossy(&decoded.stderr)
     );
+    if video.is_some() {
+        // The owned source is fixed at 25 fps. A clean decode and a minimum
+        // frame count alone can miss a long run of absent pictures.
+        let timing = tokio::time::timeout(
+            Duration::from_secs(30),
+            Command::new("/usr/bin/ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_frames",
+                    "-show_entries",
+                    "frame=best_effort_timestamp_time",
+                    "-of",
+                    "json",
+                ])
+                .arg(path)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("Video timing probe stalled: {}", path.display()))
+        .unwrap();
+        assert!(
+            timing.status.success() && timing.stderr.is_empty(),
+            "Video timing probe {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&timing.stderr)
+        );
+        let data: Value = serde_json::from_slice(&timing.stdout).unwrap();
+        let frames = data["frames"].as_array().unwrap();
+        assert!(
+            frames.len() >= 20,
+            "Video frames {}: {data}",
+            path.display()
+        );
+        let timestamps: Vec<f64> = frames
+            .iter()
+            .map(|frame| {
+                frame["best_effort_timestamp_time"]
+                    .as_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        for pair in timestamps.windows(2) {
+            let delta = pair[1] - pair[0];
+            assert!(
+                delta > 0.0 && delta <= 0.06,
+                "video picture gap in {}: {:.3} s between {:.3} and {:.3}",
+                path.display(),
+                delta,
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+}
+
+pub fn start_worker_recording(
+    mut receiver: flussonix::media_queue::Receiver,
+    file: std::fs::File,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // The media fixture uses a current-thread Tokio runtime. A blocking
+        // filesystem write here could delay the RTP receive and relay tasks.
+        let mut file = tokio::fs::File::from_std(file);
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                data = receiver.recv() => match data {
+                    Ok(data) => file.write_all(&data).await.unwrap(),
+                    Err(error) => panic!("Shared MPEG-TS recording failed: {error}"),
+                },
+            }
+        }
+        file.flush().await.unwrap();
+    })
 }
 pub async fn qualify(
     video: Option<&str>,
@@ -102,6 +185,27 @@ pub async fn qualify(
     secure_input: bool,
     secure_output: bool,
 ) {
+    qualify_inner(video, audio, profile, secure_input, secure_output, false).await;
+}
+
+pub async fn qualify_fmp4(
+    video: Option<&str>,
+    audio: &[&str],
+    profile: Value,
+    secure_input: bool,
+    secure_output: bool,
+) {
+    qualify_inner(video, audio, profile, secure_input, secure_output, true).await;
+}
+
+async fn qualify_inner(
+    video: Option<&str>,
+    audio: &[&str],
+    profile: Value,
+    secure_input: bool,
+    secure_output: bool,
+    require_fmp4: bool,
+) {
     let fixture_origin = std::time::Instant::now();
     let packet_taps = match std::env::var("FLUSSONIX_ELEMENTARY_PACKET_TAPS") {
         Err(std::env::VarError::NotPresent) => false,
@@ -109,6 +213,7 @@ pub async fn qualify(
         _ => panic!("FLUSSONIX_ELEMENTARY_PACKET_TAPS must be 1 or unset"),
     };
     let d = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let ffmpeg =
         std::env::var("FLUSSONIX_TEST_FFMPEG").unwrap_or_else(|_| "/usr/bin/ffmpeg".into());
     use base64::Engine as _;
@@ -133,6 +238,11 @@ pub async fn qualify(
                 secure_input,
                 secure_output
             );
+            let name = if require_fmp4 {
+                format!("{name}-fmp4")
+            } else {
+                name
+            };
             elementary_diagnostics::create_case_directory(Path::new(&base), &name).unwrap()
         });
     assert!(
@@ -151,12 +261,27 @@ pub async fn qualify(
     if let Some(evidence) = &evidence {
         evidence.watch_process("native_test_process", std::process::id());
     }
-    let (input, reserved) = ports();
+    let (input, input_reserved) = ports();
     #[cfg(target_os = "linux")]
     if packet_taps {
         elementary_packet_taps::check_capability(evidence.as_ref().unwrap())
             .expect("Owned packet tap setup failed; Linux CAP_NET_RAW is required");
     }
+    #[cfg(target_os = "linux")]
+    let mut public_tap = if packet_taps {
+        let public_sockets = (audio.len() + usize::from(video.is_some())) * 2;
+        Some(
+            elementary_packet_taps::Tap::public_prestart(
+                &input_reserved[..public_sockets],
+                evidence.as_ref().unwrap(),
+                artifact.as_ref().unwrap(),
+                fixture_origin,
+            )
+            .expect("Owned pre-sender public packet tap setup failed"),
+        )
+    } else {
+        None
+    };
     let (input_sdp, output_sdp) = (d.path().join("input.sdp"), d.path().join("output.sdp"));
     let mut sender = Command::new(&ffmpeg);
     sender.args([
@@ -206,6 +331,7 @@ pub async fn qualify(
                 "-srtp_out_params",
                 &key,
             ]);
+            sender.arg("-ssrc").arg((1000 + lane).to_string());
         }
         sender.args(["-f", "rtp"]).arg(format!(
             "{input_scheme}://127.0.0.1:{}?pkt_size=1200",
@@ -221,6 +347,7 @@ pub async fn qualify(
                 "-srtp_out_params",
                 &key,
             ]);
+            sender.arg("-ssrc").arg((1000 + lane).to_string());
         }
         sender
             .args([
@@ -251,7 +378,16 @@ pub async fn qualify(
         .stderr(std::fs::File::create(d.path().join("sender.log")).unwrap())
         .kill_on_drop(true);
     stage("sender_spawn");
+    #[cfg(target_os = "linux")]
+    if let Some(tap) = &mut public_tap {
+        tap.sender_spawning(fixture_origin)
+            .expect("Pre-sender packet tap spawn marker failed");
+    }
     let mut sender = sender.spawn().unwrap();
+    // Drop the tap before the sender on SDP-startup failures, while its socket
+    // identity is still available for evidence validation.
+    #[cfg(target_os = "linux")]
+    let mut public_tap = public_tap;
     if let Some(evidence) = &evidence {
         evidence.watch_process("sender", sender.id().unwrap());
     }
@@ -267,21 +403,36 @@ pub async fn qualify(
     })
     .await
     .unwrap();
+    #[cfg(target_os = "linux")]
+    if let Some(tap) = &mut public_tap {
+        let public_sockets = (audio.len() + usize::from(video.is_some())) * 2;
+        tap.bind_sender(sender.id().unwrap(), public_sockets, fixture_origin)
+            .expect("Owned sender packet tap witness failed");
+    }
     if secure_input {
         // FFmpeg emits AVP + inline SDES even for encrypted SRTP. Only the owned
         // test fixture converts it to our explicitly out-of-band SAVP descriptor.
         let source = std::fs::read_to_string(&input_sdp).unwrap();
-        let text = source
-            .lines()
-            .filter(|line| !line.starts_with("a=crypto:"))
-            .map(|line| line.replace("RTP/AVP", "RTP/SAVP"))
-            .collect::<Vec<_>>()
-            .join("\r\n")
-            + "\r\n";
+        let mut lines = Vec::new();
+        let mut media_index = 0;
+        for line in source.lines().map(|line| line.trim_end_matches('\r')) {
+            if line.starts_with("a=crypto:") || line.starts_with("a=ssrc:") {
+                continue;
+            }
+            lines.push(line.replace("RTP/AVP", "RTP/SAVP"));
+            if line.starts_with("m=") {
+                lines.push(format!(
+                    "a=ssrc:{} cname:owned-lane-{media_index}",
+                    1000 + media_index
+                ));
+                media_index += 1;
+            }
+        }
+        assert_eq!(media_index, lane as usize);
+        let text = lines.join("\r\n") + "\r\n";
         std::fs::write(&input_sdp, text).unwrap();
         std::fs::set_permissions(&input_sdp, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
-    let input_reserved = reserved;
     // Keep the output pairs owned until FFmpeg is ready to bind them; the native
     // sender can publish actual SDP without provoking ICMP destination failures.
     let (output, reserved) = ports();
@@ -301,10 +452,17 @@ pub async fn qualify(
     )
     .unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let engine = Engine::new(d.path().join("media"), executable.to_str().unwrap());
+    let mut engine = Engine::new(d.path().join("media"), executable.to_str().unwrap());
+    if secure_input {
+        let ledger_path = d.path().join("receiver-epochs");
+        flussonix::direct_rtp::key_ledger::Ledger::initialize(&ledger_path).unwrap();
+        engine.set_srtp_receiver_ledger(Some(std::sync::Arc::new(
+            flussonix::direct_rtp::key_ledger::Ledger::new(ledger_path),
+        )));
+    }
     // Shadow the moved guard so unwinding stops capture before dropping the engine.
     #[cfg(target_os = "linux")]
-    let mut public_tap = None;
+    let mut public_tap = public_tap;
     #[cfg(target_os = "linux")]
     let mut decoder_tap = None;
     if profile["encoder"]
@@ -320,10 +478,20 @@ pub async fn qualify(
             .unwrap();
         engine.stop_all().await;
     }
+    #[cfg(target_os = "linux")]
+    if packet_taps {
+        public_tap
+            .as_mut()
+            .unwrap()
+            .release_reservation(fixture_origin)
+            .expect("Public reservation changed before release");
+    }
     drop(input_reserved);
     let mut cfg = json!({"inputs":[{"url":format!("{input_scheme}://127.0.0.1:{input}"),"flussonix_rtp":{"profile":"elementary","sdp_file":input_sdp}}],"flussonix_rtp_outputs":[{"url":format!("{output_scheme}://127.0.0.1:{output}"),"flussonix_rtp":{"profile":"elementary"}}],"transcoder":profile,"flussonix_input_timeout":15});
     if secure_input {
         cfg["inputs"][0]["flussonix_rtp"]["key_file"] = json!(key_path);
+        cfg["inputs"][0]["flussonix_rtp"]["expected_ssrcs"] =
+            json!((0..lane).map(|index| 1000 + index).collect::<Vec<_>>());
     }
     if secure_output {
         cfg["flussonix_rtp_outputs"][0]["flussonix_rtp"]["key_file"] = json!(key_path);
@@ -335,15 +503,9 @@ pub async fn qualify(
     }
     stage("worker_sdp_startup");
     let record_cancel = tokio_util::sync::CancellationToken::new();
-    let mut ts = worker.subscribe();
-    let mut record = std::fs::File::create(d.path().join("worker.ts")).unwrap();
-    let c = record_cancel.clone();
-    let recording = tokio::spawn(async move {
-        use std::io::Write;
-        loop {
-            tokio::select! {biased;_=c.cancelled()=>break,data=ts.recv()=>match data {Ok(data)=>record.write_all(&data).unwrap(),Err(error)=>panic!("Shared MPEG-TS recording failed: {error}")}}
-        }
-    });
+    let ts = worker.subscribe();
+    let record = std::fs::File::create(d.path().join("worker.ts")).unwrap();
+    let recording = start_worker_recording(ts, record, record_cancel.clone());
     let text = tokio::time::timeout(Duration::from_secs(12), async {
         loop {
             if let Ok(s) = engine.rtp_sdp("owned", 0, &cfg).await {
@@ -391,17 +553,11 @@ pub async fn qualify(
         );
         #[cfg(target_os = "linux")]
         if packet_taps {
-            public_tap = Some(
-                elementary_packet_taps::Tap::native_input(
-                    std::process::id(),
-                    &(input..input + (audio.len() + usize::from(video.is_some())) as u16 * 2)
-                        .collect::<Vec<_>>(),
-                    evidence.as_ref().unwrap(),
-                    artifact.as_ref().unwrap(),
-                    fixture_origin,
-                )
-                .expect("Owned native input packet tap setup failed"),
-            );
+            public_tap
+                .as_mut()
+                .unwrap()
+                .bind_native(std::process::id(), fixture_origin)
+                .expect("Owned native input handoff verification failed");
             let ports = local
                 .iter()
                 .map(|address| {
@@ -529,6 +685,81 @@ pub async fn qualify(
     stage("media_delivery");
     let result = tokio::time::timeout(Duration::from_secs(15), receiver.wait()).await;
     stage("receiver_wait_complete");
+    if require_fmp4 {
+        let playlist = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Ok(data) = engine.read("owned", "fmp4/index.m3u8").await {
+                    let text = String::from_utf8(data.to_vec()).unwrap();
+                    if text.contains("#EXTINF:") {
+                        break text;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("direct RTP/SRTP fMP4 playlist readiness");
+        let init = playlist
+            .lines()
+            .find_map(|line| line.strip_prefix("#EXT-X-MAP:URI=\""))
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let segment = playlist
+            .lines()
+            .rfind(|line| !line.is_empty() && !line.starts_with('#'))
+            .unwrap();
+        let mut bytes = engine
+            .read("owned", &format!("fmp4/{init}"))
+            .await
+            .unwrap()
+            .to_vec();
+        bytes.extend_from_slice(
+            &engine
+                .read("owned", &format!("fmp4/{segment}"))
+                .await
+                .unwrap(),
+        );
+        let sample = d.path().join("fmp4-sample.mp4");
+        std::fs::write(&sample, bytes).unwrap();
+        let decoded = tokio::time::timeout(
+            Duration::from_secs(10),
+            Command::new("/usr/bin/ffmpeg")
+                .kill_on_drop(true)
+                .args([
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-xerror",
+                    "-err_detect",
+                    "explode",
+                    "-i",
+                ])
+                .arg(&sample)
+                .args([
+                    "-map", "0:v:0", "-map", "0:a:0", "-threads", "1", "-f", "framemd5", "-",
+                ])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            decoded.status.success() && decoded.stderr.is_empty(),
+            "direct RTP/SRTP fMP4 decode failed: {}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+        let frames = String::from_utf8(decoded.stdout).unwrap();
+        assert!(
+            frames.lines().filter(|line| line.starts_with("0,")).count() >= 25,
+            "direct RTP/SRTP fMP4 video missing: {playlist}; {frames}"
+        );
+        assert!(
+            frames.lines().filter(|line| line.starts_with("1,")).count() >= 25,
+            "direct RTP/SRTP fMP4 audio missing: {playlist}; {frames}"
+        );
+    }
     cancel.cancel();
     let mut captures = Vec::new();
     while let Some(result) = relay.join_next().await {
@@ -538,16 +769,42 @@ pub async fn qualify(
     }
     record_cancel.cancel();
     recording.await.unwrap();
-    let _ = sender.kill().await;
-    let _ = sender.wait().await;
     if result.is_err() {
         let _ = receiver.kill().await;
         let _ = receiver.wait().await;
     }
-    let stats = worker.stats();
     stage("worker_shutdown");
     // Stop while the input/decoder still own their destination ports. Submit the
     // in-memory recordings only after the worker has stopped.
+    #[cfg(target_os = "linux")]
+    {
+        // Quiesce only this owned synthetic sender. Let the native reorder
+        // timer account for any final sequence gap before taking final stats.
+        assert_eq!(
+            unsafe { libc::kill(sender.id().unwrap() as i32, libc::SIGSTOP) },
+            0
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(out) = &artifact {
+            use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt};
+            let public_ports = (0..lane)
+                .flat_map(|index| [input + index * 2, input + index * 2 + 1])
+                .collect::<Vec<_>>();
+            let snapshot = elementary_diagnostics::final_public_udp_snapshot(
+                std::process::id(),
+                &public_ports,
+            )
+            .unwrap_or_else(|error| json!({"observation":"unavailable","error":error.to_string()}));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(out.join("final-public-udp.json"))
+                .unwrap();
+            serde_json::to_writer_pretty(&mut file, &snapshot).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         if let Some(tap) = &mut public_tap {
@@ -557,8 +814,11 @@ pub async fn qualify(
             tap.stop();
         }
     }
+    let _ = sender.kill().await;
+    let _ = sender.wait().await;
     engine.stop_all().await;
     stage("worker_stopped");
+    let stats = worker.stats();
     #[cfg(target_os = "linux")]
     {
         drop(public_tap);
@@ -578,6 +838,17 @@ pub async fn qualify(
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
+    }
+    for counter in [
+        "lost",
+        "startup_dropped_packets",
+        "startup_dropped_rtcp_packets",
+    ] {
+        assert_eq!(
+            stats["direct_rtp_input"][counter].as_u64(),
+            Some(0),
+            "controlled elementary input {counter} must be zero: {stats}"
+        );
     }
     let status = result
         .unwrap_or_else(|_| {

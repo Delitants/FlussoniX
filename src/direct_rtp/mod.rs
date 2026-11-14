@@ -7,5 +7,6 @@ pub(crate) mod sockets;
 mod stats;
 
 pub mod crypto;
+pub mod key_ledger;
 
 pub mod elementary;

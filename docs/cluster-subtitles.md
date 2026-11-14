@@ -17,4 +17,19 @@ Before packager startup, the same source connection supplies at most 1 MiB of in
 
 Owned Linux qualification uses three real local servers and OS-allocated ports, with copy or CPU encoding at the source and copy at the CDN. The CDN runs as an owned daemon process, giving source and CDN separate daemon-wide OCR budgets as in deployment; source and LB HTTP servers run in the test process. Fixtures are fed on a live sixteen-second clock, rather than bursting an entire programme into the bounded decoder queue. Two Latin teletext languages and two DVB bitmap/OCR languages retain original descriptors and encoded PES. Both CDN HLS variants expose the expected service-isolated text, empty quiet-tail segments and source-relative cue boundaries within one 40 ms video frame. CPU-source fixtures have an observed 21 ms mux/encoder clock offset; zero timing error is not claimed. H.264/AAC and AAC-only native metadata and actual media remain available through M4S. Viewer tokens protect the subtitle assets, and disabling the origin denies cached media after the established source refresh. Generic cluster tests also cover LB admission, multiple viewers sharing one worker and decoded AV.
 
+Explicit MPEG-TS inputs preserve the subtitle PES clock instead of enabling
+FFmpeg's PCR-based timestamp repair. An asynchronous mux can deliver a subtitle
+before the video with the same presentation time; the default repair heuristic
+can shorten that cue even though its encoded body is unchanged. This applies
+to MPEG-TS publication, native AV bridges, direct MP2T input, TSHTTP/TSHTTPS and
+the existing verified live HTTP proxy. It does not add demuxer options to
+RTSP/SDP, HLS, synthetic inputs or an unclassified SRT/HTTP input. Missing or
+damaged source timestamps are not newly repaired by this policy.
+
+Two regressions move the complete teletext erase packets six video frames
+earlier in the input while retaining every timestamp, counter and payload byte.
+Copy and CPU sources must still preserve the original cue boundaries within
+one frame through the CDN, in both TS and fMP4 HLS. The CPU case first failed
+with a shortened cue before the input correction; the tolerance is unchanged.
+
 This does not qualify separate subtitle tracks over M4F/M4S, legacy migration aliases, arbitrary multiplex/program selection, multi-section PSI, GPU conversion, real HEVC browser subtitle output, every source codec combination or sustained production capacity. The caption input keeps its fixed 32-message queue and 16 KiB reads, allowing at most 250 ms for a transient backlog to drain. A persistent stall fails subtitle conversion and closes the optional caption socket while AV continues. Converted subtitle timing continues to use the existing HLS generation grid and bounded OCR deadlines. Source and CDN conversions are distinct; source CPU encoding is not applied again at the CDN.

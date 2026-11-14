@@ -12,7 +12,7 @@ use crate::{
     source_directory::flussonic_config::CandidateView,
 };
 pub use pull::{PrivatePullFailure, PrivatePullOptions};
-pub(crate) use shared::SharedFeed;
+pub(crate) use shared::{SharedDrain, SharedFeed};
 pub use shared::{
     SharedFailure, SharedInput, SharedInputAttachment, SharedInputOptions, SharedInputs,
     SharedRenewal, SharedSubscription, SharedViewer,

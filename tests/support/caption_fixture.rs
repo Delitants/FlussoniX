@@ -208,11 +208,47 @@ fn remux(input: &Path, output: &Path) {
         output.to_str().unwrap(),
     ]);
 }
-pub async fn paced(mut stdin: tokio::process::ChildStdin, bytes: Vec<u8>) {
+pub async fn paced(mut stdin: impl tokio::io::AsyncWrite + Unpin + Send, bytes: Vec<u8>) {
+    paced_observed(&mut stdin, bytes, None).await;
+}
+#[derive(Clone, Default, serde::Serialize)]
+pub struct PacingProgress {
+    pub phase: &'static str,
+    pub total_bytes: usize,
+    /// Completed write_all calls only; a pending write may have admitted a prefix.
+    pub written_bytes: usize,
+    pub pending_bytes: usize,
+    pub first_pts: Option<u64>,
+    pub target_pts: Option<u64>,
+    pub last_written_pts: Option<u64>,
+}
+pub async fn paced_observed(
+    stdin: &mut (impl tokio::io::AsyncWrite + Unpin + Send),
+    bytes: Vec<u8>,
+    progress: Option<std::sync::Arc<std::sync::Mutex<PacingProgress>>>,
+) {
     use tokio::io::AsyncWriteExt;
     let clock = tokio::time::Instant::now();
     let mut first = None;
     let mut chunk = vec![];
+    let mut chunk_pts = None;
+    let update = |phase, pending, target| {
+        if let Some(progress) = &progress {
+            let mut p = progress.lock().unwrap();
+            p.phase = phase;
+            p.pending_bytes = pending;
+            p.target_pts = target;
+        }
+    };
+    let admitted = |size, pts, initial| {
+        if let Some(progress) = &progress {
+            let mut p = progress.lock().unwrap();
+            p.written_bytes += size;
+            p.pending_bytes = 0;
+            p.last_written_pts = pts;
+            p.first_pts = initial;
+        }
+    };
     for packet in bytes.chunks_exact(188) {
         let offset = if packet[3] & 0x20 != 0 {
             5 + usize::from(packet[4])
@@ -222,10 +258,14 @@ pub async fn paced(mut stdin: tokio::process::ChildStdin, bytes: Vec<u8>) {
         if packet[1] & 31 == 1 && packet[2] == 0 && packet[1] & 0x40 != 0 && offset + 14 <= 188 {
             if let Some(pts) = flussonix::caption_transport::pts(&packet[offset + 9..offset + 14]) {
                 let initial = *first.get_or_insert(pts);
+                update("writing", chunk.len(), chunk_pts);
                 if stdin.write_all(&chunk).await.is_err() {
+                    update("closed", chunk.len(), chunk_pts);
                     return;
                 }
+                admitted(chunk.len(), chunk_pts, first);
                 chunk.clear();
+                update("sleeping", 0, Some(pts));
                 tokio::time::sleep_until(
                     clock
                         + std::time::Duration::from_micros(
@@ -233,10 +273,17 @@ pub async fn paced(mut stdin: tokio::process::ChildStdin, bytes: Vec<u8>) {
                         ),
                 )
                 .await;
+                chunk_pts = Some(pts);
             }
         }
         chunk.extend(packet);
     }
-    let _ = stdin.write_all(&chunk).await;
+    update("writing", chunk.len(), chunk_pts);
+    if stdin.write_all(&chunk).await.is_err() {
+        update("closed", chunk.len(), chunk_pts);
+        return;
+    }
+    admitted(chunk.len(), chunk_pts, first);
+    update("holding_open", 0, chunk_pts);
     std::future::pending::<()>().await;
 }

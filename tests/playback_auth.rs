@@ -4,8 +4,10 @@ use axum::{
     http::{Request, StatusCode},
     routing::get,
 };
+use flussonix::playback_auth::{AuthOutcome, PlaybackAuth, Policy, ViewerRequest};
 use flussonix::server::{App, Options, router};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{
@@ -26,13 +28,23 @@ async fn callback(
     Query(q): Query<HashMap<String, String>>,
 ) -> impl axum::response::IntoResponse {
     b.calls.fetch_add(1, Ordering::SeqCst);
-    b.queries.lock().unwrap().push(q);
+    b.queries.lock().unwrap().push(q.clone());
     let mode = b.mode.load(Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(60)).await;
     let status = match mode {
         1 => StatusCode::FORBIDDEN,
         2 => StatusCode::INTERNAL_SERVER_ERROR,
+        15 => StatusCode::SERVICE_UNAVAILABLE,
         3 => StatusCode::FOUND,
+        5 if ["qs", "user_agent", "referer", "host"]
+            .iter()
+            .any(|key| q.get(*key).is_some_and(|value| value.contains("denied")))
+            || q.get("ip").is_some_and(|ip| ip == "192.0.2.2") =>
+        {
+            StatusCode::FORBIDDEN
+        }
+        8 if q.get("qs").is_some_and(|qs| qs.contains("lane=first")) => StatusCode::FORBIDDEN,
+        9 if q.get("qs").is_some_and(|qs| qs.contains("lane=redirect")) => StatusCode::FOUND,
         _ => StatusCode::OK,
     };
     let mut headers = axum::http::HeaderMap::new();
@@ -47,8 +59,36 @@ async fn callback(
             value.parse().unwrap(),
         );
     }
+    if mode == 7 || mode == 12 {
+        let user = if mode == 12 || q.get("qs").is_some_and(|qs| qs.contains("profile=two")) {
+            "account-two"
+        } else {
+            "account-one"
+        };
+        headers.insert("x-userid", user.parse().unwrap());
+    }
+    if mode == 13 {
+        if q.get("qs").is_some_and(|qs| qs.contains("profile=two")) {
+            headers.insert("x-userid", "account-two".parse().unwrap());
+        } else if q.get("request_number").is_some_and(|number| number == "0") {
+            headers.insert("x-userid", "account-one".parse().unwrap());
+        } else {
+            headers.remove("x-userid");
+        }
+    }
     if mode == 4 {
         headers.remove("x-authduration");
+    }
+    let long_lease = match mode {
+        5 => q.get("qs").is_some_and(|qs| qs.contains("plan=allowed")),
+        8 => q.get("qs").is_some_and(|qs| qs.contains("lane=second")),
+        13 => q.get("qs").is_some_and(|qs| qs.contains("profile=two")),
+        14 => q.get("qs").is_some_and(|qs| qs.contains("lane=long")),
+        16 => true,
+        _ => false,
+    };
+    if long_lease {
+        headers.insert("x-authduration", "30".parse().unwrap());
     }
     (status, headers)
 }
@@ -108,6 +148,32 @@ async fn media(app: &Arc<App>, path: &str) -> axum::response::Response {
         .unwrap()
 }
 #[tokio::test]
+async fn token_free_callback_config_is_rejected_before_persistence() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let (_d, app, _backend, task, _) = setup().await;
+    let previous = app.config.effective("owned").unwrap();
+    let payload =
+        json!({"on_play":{"url":"https://auth.example/check","session_keys":["name","proto"]}});
+    let response = router(app.clone())
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/streamer/api/v3/streams/owned")
+                .header(
+                    "authorization",
+                    format!("Basic {}", STANDARD.encode("admin:edit-secret")),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(app.config.effective("owned").unwrap(), previous);
+    task.abort();
+}
+#[tokio::test]
 async fn callback_has_required_fields_uuid_and_actual_protocol() {
     let (_d, app, b, task, _) = setup().await;
     let response = media(&app, "/owned/mpegts?token=one&customer=demo").await;
@@ -144,6 +210,554 @@ async fn concurrent_initial_requests_share_one_callback() {
         calls, 1,
         "a first viewer triggers only one backend decision"
     );
+}
+#[tokio::test]
+async fn changed_callback_visible_field_gets_its_own_decision_in_one_session() {
+    let (_d, _app, backend, task, url) = setup().await;
+    backend.mode.store(5, Ordering::SeqCst);
+    for field in ["qs", "user_agent", "referer", "host", "ip"] {
+        let auth = PlaybackAuth::new(100);
+        let policy = Policy::from_config(
+            &json!({"on_play":{"url":url,"session_keys":["name","proto","token"]}}),
+            &json!({}),
+        )
+        .unwrap();
+        let snapshot = auth.publish("direct", Some(policy)).unwrap();
+        let mut first = ViewerRequest {
+            name: "direct".into(),
+            proto: "mpegts".into(),
+            ip: "192.0.2.1".into(),
+            token: "same-token".into(),
+            ..Default::default()
+        };
+        match field {
+            "qs" => first.qs = "plan=allowed".into(),
+            "user_agent" => first.user_agent = "allowed-device".into(),
+            "referer" => first.referer = "https://allowed.example/".into(),
+            "host" => first.host = "allowed.example".into(),
+            "ip" => {}
+            _ => unreachable!(),
+        }
+        let before = backend.calls.load(Ordering::SeqCst);
+        let grant = match auth.authorize(snapshot.clone(), first.clone()).await {
+            AuthOutcome::Allowed(grant) => grant,
+            _ => panic!("first {field} request should be allowed"),
+        };
+        let mut changed = first;
+        match field {
+            "qs" => changed.qs = "plan=denied".into(),
+            "user_agent" => changed.user_agent = "denied-device".into(),
+            "referer" => changed.referer = "https://denied.example/".into(),
+            "host" => changed.host = "denied.example".into(),
+            "ip" => changed.ip = "192.0.2.2".into(),
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(auth.authorize(snapshot, changed).await, AuthOutcome::Denied),
+            "changed {field} must be denied by a fresh callback"
+        );
+        assert!(
+            !grant.is_cancelled(),
+            "denial of changed {field} must not revoke the first grant"
+        );
+        let queries = backend.queries.lock().unwrap();
+        assert_eq!(backend.calls.load(Ordering::SeqCst) - before, 2, "{field}");
+        assert_eq!(
+            queries[before]["session_id"],
+            queries[before + 1]["session_id"]
+        );
+        assert_eq!(queries[before + 1]["request_type"], "update_session");
+        assert_eq!(queries[before + 1]["request_number"], "1");
+    }
+    task.abort();
+}
+#[tokio::test]
+async fn changed_query_denial_does_not_close_an_existing_mpegts_viewer() {
+    let (_d, app, backend, task, _) = setup().await;
+    backend.mode.store(5, Ordering::SeqCst);
+    let live = media(&app, "/owned/mpegts?token=same&plan=allowed").await;
+    assert_eq!(live.status(), 200);
+    assert_eq!(
+        media(&app, "/owned/mpegts?token=same&plan=denied")
+            .await
+            .status(),
+        403
+    );
+    assert!(
+        !closed(live).await,
+        "another fingerprint's denial closed the viewer"
+    );
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+    app.media.stop_all().await;
+    task.abort();
+}
+#[tokio::test]
+async fn real_http_socket_denies_changed_query_without_closing_the_first_viewer() {
+    use futures_util::StreamExt;
+
+    let (_d, app, backend, callback_task, _) = setup().await;
+    backend.mode.store(5, Ordering::SeqCst);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let served_app = app.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router(served_app)).await.unwrap();
+    });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://{address}/owned/mpegts?token=same&plan=");
+
+    let cold_denied = client
+        .get(format!(
+            "http://{address}/other/mpegts?token=cold&plan=denied"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cold_denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        app.media.count().await,
+        0,
+        "denial must precede worker start"
+    );
+
+    let first = client.get(format!("{base}allowed")).send().await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let denied = client.get(format!("{base}denied")).send().await.unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let same = client.get(format!("{base}allowed")).send().await.unwrap();
+    assert_eq!(same.status(), StatusCode::OK);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 3);
+
+    let mut body = first.bytes_stream();
+    let ended = tokio::time::timeout(Duration::from_millis(500), async {
+        while let Some(chunk) = body.next().await {
+            chunk.unwrap();
+        }
+    })
+    .await
+    .is_ok();
+    assert!(
+        !ended,
+        "changed-query denial closed the authorized HTTP socket"
+    );
+
+    drop(same);
+    app.media.stop_all().await;
+    server.abort();
+    callback_task.abort();
+}
+#[tokio::test]
+async fn changed_callback_policy_discards_old_decisions_before_new_admission() {
+    let (_d, _app, backend, task, url) = setup().await;
+    let auth = PlaybackAuth::new(10);
+    let request = ViewerRequest {
+        name: "direct".into(),
+        proto: "mpegts".into(),
+        ip: "192.0.2.1".into(),
+        token: "same".into(),
+        ..Default::default()
+    };
+    let first_policy = Policy::from_config(&json!({"on_play":url}), &json!({})).unwrap();
+    let first = auth.publish("direct", Some(first_policy)).unwrap();
+    let first_grant = match auth.authorize(first.clone(), request.clone()).await {
+        AuthOutcome::Allowed(grant) => grant,
+        _ => panic!("initial callback should allow"),
+    };
+    let other_request = ViewerRequest {
+        qs: "lane=other".into(),
+        ..request.clone()
+    };
+    let other_grant = match auth.authorize(first, other_request).await {
+        AuthOutcome::Allowed(grant) => grant,
+        _ => panic!("second lane should allow"),
+    };
+    let changed_url = format!("{url}?revision=two");
+    let second_policy = Policy::from_config(&json!({"on_play":changed_url}), &json!({})).unwrap();
+    let second = auth.publish("direct", Some(second_policy)).unwrap();
+    assert!(first_grant.is_cancelled());
+    assert!(other_grant.is_cancelled());
+    let second_grant = match auth.authorize(second, request).await {
+        AuthOutcome::Allowed(grant) => grant,
+        _ => panic!("updated callback should allow"),
+    };
+    assert!(
+        !second_grant.is_cancelled(),
+        "a new policy must not inherit a canceled lane"
+    );
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 3);
+    task.abort();
+}
+#[tokio::test]
+async fn one_configurable_session_cannot_merge_different_callback_user_ids() {
+    let (_d, _app, backend, task, url) = setup().await;
+    backend.mode.store(7, Ordering::SeqCst);
+    let auth = PlaybackAuth::new(10);
+    let policy = Policy::from_config(&json!({"on_play":url}), &json!({})).unwrap();
+    let snapshot = auth.publish("direct", Some(policy)).unwrap();
+    let first = ViewerRequest {
+        name: "direct".into(),
+        proto: "mpegts".into(),
+        ip: "192.0.2.1".into(),
+        token: "same".into(),
+        qs: "profile=one".into(),
+        ..Default::default()
+    };
+    let first_grant = match auth.authorize(snapshot.clone(), first.clone()).await {
+        AuthOutcome::Allowed(grant) => grant,
+        _ => panic!("first account should allow"),
+    };
+    let second = ViewerRequest {
+        qs: "profile=two".into(),
+        ..first
+    };
+    assert!(matches!(
+        auth.authorize(snapshot, second).await,
+        AuthOutcome::Denied
+    ));
+    assert!(!first_grant.is_cancelled());
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+    task.abort();
+}
+#[tokio::test]
+async fn account_conflict_rechecks_after_old_grant_ends() {
+    let (_d, _app, backend, task, url) = setup().await;
+    backend.mode.store(7, Ordering::SeqCst);
+    let auth = PlaybackAuth::new(10);
+    let policy = Policy::from_config(&json!({"on_play":url}), &json!({})).unwrap();
+    let snapshot = auth.publish("direct", Some(policy)).unwrap();
+    let first = ViewerRequest {
+        name: "direct".into(),
+        proto: "mpegts".into(),
+        ip: "192.0.2.1".into(),
+        token: "same".into(),
+        qs: "profile=one".into(),
+        ..Default::default()
+    };
+    let grant = match auth.authorize(snapshot.clone(), first.clone()).await {
+        AuthOutcome::Allowed(grant) => grant,
+        _ => panic!("first account should allow"),
+    };
+    let second = ViewerRequest {
+        qs: "profile=two".into(),
+        ..first
+    };
+    assert!(matches!(
+        auth.authorize(snapshot.clone(), second.clone()).await,
+        AuthOutcome::Denied
+    ));
+    drop(grant);
+    let next = auth.authorize(snapshot, second).await;
+    assert!(
+        matches!(next, AuthOutcome::Allowed(_)),
+        "new account needs a fresh check after old grants end"
+    );
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 3);
+    task.abort();
+}
+#[tokio::test]
+async fn cached_lane_cannot_rejoin_a_session_owned_by_another_account() {
+    let (_d, _app, backend, task, url) = setup().await;
+    backend.mode.store(7, Ordering::SeqCst);
+    let auth = PlaybackAuth::new(10);
+    let policy = Policy::from_config(&json!({"on_play":url}), &json!({})).unwrap();
+    let snapshot = auth.publish("direct", Some(policy)).unwrap();
+    let first = ViewerRequest {
+        name: "direct".into(),
+        proto: "mpegts".into(),
+        ip: "192.0.2.1".into(),
+        token: "same".into(),
+        qs: "profile=one".into(),
+        ..Default::default()
+    };
+    let first_grant = match auth.authorize(snapshot.clone(), first.clone()).await {
+        AuthOutcome::Allowed(grant) => grant,
+        _ => panic!("first account should allow"),
+    };
+    drop(first_grant);
+    let second = ViewerRequest {
+        qs: "profile=two".into(),
+        ..first.clone()
+    };
+    let second_grant = match auth.authorize(snapshot.clone(), second).await {
+        AuthOutcome::Allowed(grant) => grant,
+        _ => panic!("second account should allow after first leaves"),
+    };
+    assert!(
+        matches!(auth.authorize(snapshot, first).await, AuthOutcome::Denied),
+        "cached first-account approval joined a live second-account session"
+    );
+    assert!(!second_grant.is_cancelled());
+    task.abort();
+}
+#[tokio::test]
+async fn missing_user_id_on_renewal_keeps_the_lanes_original_account() {
+    let (_d, _app, backend, task, url) = setup().await;
+    backend.mode.store(13, Ordering::SeqCst);
+    let auth = PlaybackAuth::new(10);
+    let policy = Policy::from_config(&json!({"on_play":url}), &json!({})).unwrap();
+    let snapshot = auth.publish("direct", Some(policy)).unwrap();
+    let first = ViewerRequest {
+        name: "direct".into(),
+        proto: "mpegts".into(),
+        ip: "192.0.2.1".into(),
+        token: "same".into(),
+        qs: "profile=one".into(),
+        ..Default::default()
+    };
+    let AuthOutcome::Allowed(first_grant) = auth.authorize(snapshot.clone(), first.clone()).await
+    else {
+        panic!("first account should allow")
+    };
+    drop(first_grant);
+    let second = ViewerRequest {
+        qs: "profile=two".into(),
+        ..first.clone()
+    };
+    let AuthOutcome::Allowed(second_grant) = auth.authorize(snapshot.clone(), second).await else {
+        panic!("second account should allow after first leaves")
+    };
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(
+        matches!(auth.authorize(snapshot, first).await, AuthOutcome::Denied),
+        "missing X-UserId must not silently transfer the old lane to the live second account"
+    );
+    assert!(!second_grant.is_cancelled());
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 3);
+    task.abort();
+}
+#[tokio::test]
+async fn renewal_account_change_cancels_old_grant_and_rechecks_after_release() {
+    let (_d, _app, backend, task, url) = setup().await;
+    backend.mode.store(7, Ordering::SeqCst);
+    let auth = PlaybackAuth::new(10);
+    let policy = Policy::from_config(&json!({"on_play":url}), &json!({})).unwrap();
+    let snapshot = auth.publish("direct", Some(policy)).unwrap();
+    let request = ViewerRequest {
+        name: "direct".into(),
+        proto: "mpegts".into(),
+        ip: "192.0.2.1".into(),
+        token: "same".into(),
+        qs: "profile=one".into(),
+        ..Default::default()
+    };
+    let grant = match auth.authorize(snapshot.clone(), request.clone()).await {
+        AuthOutcome::Allowed(grant) => grant,
+        _ => panic!("first account should allow"),
+    };
+    backend.mode.store(12, Ordering::SeqCst);
+    assert_eq!(auth.force_reauth("direct"), 1);
+    auth.renew_due().await;
+    assert!(
+        grant.is_cancelled(),
+        "account-changing renewal must revoke old playback"
+    );
+    drop(grant);
+    assert!(
+        matches!(
+            auth.authorize(snapshot, request).await,
+            AuthOutcome::Allowed(_)
+        ),
+        "replacement account needs a fresh decision"
+    );
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 3);
+    task.abort();
+}
+#[tokio::test]
+async fn callback_outage_retains_only_the_same_fingerprint() {
+    let (_d, _app, backend, task, url) = setup().await;
+    let auth = PlaybackAuth::new(10);
+    let policy = Policy::from_config(&json!({"on_play":url}), &json!({})).unwrap();
+    let snapshot = auth.publish("direct", Some(policy)).unwrap();
+    let request = ViewerRequest {
+        name: "direct".into(),
+        proto: "mpegts".into(),
+        ip: "192.0.2.1".into(),
+        token: "same".into(),
+        qs: "lane=existing".into(),
+        ..Default::default()
+    };
+    let grant = match auth.authorize(snapshot.clone(), request.clone()).await {
+        AuthOutcome::Allowed(grant) => grant,
+        _ => panic!("initial callback should allow"),
+    };
+    backend.mode.store(2, Ordering::SeqCst);
+    assert_eq!(auth.force_reauth("direct"), 1);
+    auth.renew_due().await;
+    assert!(matches!(
+        auth.authorize(snapshot.clone(), request.clone()).await,
+        AuthOutcome::Allowed(_)
+    ));
+    let changed = ViewerRequest {
+        qs: "lane=new".into(),
+        ..request
+    };
+    assert!(matches!(
+        auth.authorize(snapshot, changed).await,
+        AuthOutcome::Denied
+    ));
+    assert!(!grant.is_cancelled());
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 3);
+    task.abort();
+}
+#[tokio::test]
+async fn callback_lane_cache_caps_live_contexts_and_reclaims_an_idle_one() {
+    let (_d, _app, backend, task, url) = setup().await;
+    let auth = PlaybackAuth::new(100);
+    let policy = Policy::from_config(&json!({"on_play":url}), &json!({})).unwrap();
+    let snapshot = auth.publish("direct", Some(policy)).unwrap();
+    let mut grants = Vec::new();
+    for index in 0..16 {
+        let request = ViewerRequest {
+            name: "direct".into(),
+            proto: "mpegts".into(),
+            ip: "192.0.2.1".into(),
+            token: "same".into(),
+            qs: format!("context={index}"),
+            ..Default::default()
+        };
+        let AuthOutcome::Allowed(grant) = auth.authorize(snapshot.clone(), request).await else {
+            panic!("context {index} should be allowed")
+        };
+        grants.push(grant);
+    }
+    let overflow = ViewerRequest {
+        name: "direct".into(),
+        proto: "mpegts".into(),
+        ip: "192.0.2.1".into(),
+        token: "same".into(),
+        qs: "context=overflow".into(),
+        ..Default::default()
+    };
+    assert!(
+        matches!(
+            auth.authorize(snapshot.clone(), overflow.clone()).await,
+            AuthOutcome::Denied
+        ),
+        "all protected lanes must cause fail-closed overflow"
+    );
+    assert_eq!(
+        backend.calls.load(Ordering::SeqCst),
+        16,
+        "overflow must not call the backend"
+    );
+    drop(grants.remove(0));
+    assert!(
+        matches!(
+            auth.authorize(snapshot, overflow).await,
+            AuthOutcome::Allowed(_)
+        ),
+        "an idle lane should be reclaimed for a fresh callback"
+    );
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 17);
+    assert!(grants.iter().all(|grant| !grant.is_cancelled()));
+    task.abort();
+}
+#[tokio::test]
+async fn renewal_denial_cancels_only_its_original_mpegts_viewer() {
+    let (_d, app, backend, task, _) = setup().await;
+    let first = media(&app, "/owned/mpegts?token=same&lane=first").await;
+    let second = media(&app, "/owned/mpegts?token=same&lane=second").await;
+    assert_eq!(first.status(), 200);
+    assert_eq!(second.status(), 200);
+    backend.mode.store(8, Ordering::SeqCst);
+    assert_eq!(app.playback_auth.force_reauth("owned"), 1);
+    app.playback_auth.renew_due().await;
+    assert!(closed(first).await, "the denied lane stayed live");
+    assert!(
+        !closed(second).await,
+        "another lane was cancelled by the denial"
+    );
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 4);
+    app.media.stop_all().await;
+    task.abort();
+}
+
+#[tokio::test]
+async fn callback_503_expires_only_short_http_viewer_and_denies_reconnect() {
+    let (_dir, app, backend, task, _) = setup().await;
+    backend.mode.store(14, Ordering::SeqCst);
+    let short = media(&app, "/owned/mpegts?token=same&lane=short").await;
+    let long = media(&app, "/owned/mpegts?token=same&lane=long").await;
+    assert_eq!(short.status(), StatusCode::OK);
+    assert_eq!(long.status(), StatusCode::OK);
+    backend.mode.store(15, Ordering::SeqCst);
+    assert_eq!(app.playback_auth.force_reauth("owned"), 1);
+    app.playback_auth.renew_due().await;
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 4);
+    assert!(
+        closed(short).await,
+        "expired MPEG-TS viewer stayed connected"
+    );
+    let denied = media(&app, "/owned/mpegts?token=same&lane=short").await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !closed(long).await,
+        "longer-lived sibling or shared worker stopped"
+    );
+    app.media.stop_all().await;
+    task.abort();
+}
+#[tokio::test]
+async fn redirected_lane_does_not_cancel_an_allowed_lane() {
+    let (_d, _app, backend, task, url) = setup().await;
+    backend.mode.store(9, Ordering::SeqCst);
+    let auth = PlaybackAuth::new(10);
+    let policy = Policy::from_config(&json!({"on_play":url}), &json!({})).unwrap();
+    let snapshot = auth.publish("direct", Some(policy)).unwrap();
+    let request = ViewerRequest {
+        name: "direct".into(),
+        proto: "mpegts".into(),
+        ip: "192.0.2.1".into(),
+        token: "same".into(),
+        qs: "lane=allowed".into(),
+        ..Default::default()
+    };
+    let grant = match auth.authorize(snapshot.clone(), request.clone()).await {
+        AuthOutcome::Allowed(grant) => grant,
+        _ => panic!("allowed lane"),
+    };
+    let redirected = ViewerRequest {
+        qs: "lane=redirect".into(),
+        ..request
+    };
+    assert!(matches!(
+        auth.authorize(snapshot, redirected).await,
+        AuthOutcome::Redirect(_)
+    ));
+    assert!(!grant.is_cancelled());
+    task.abort();
+}
+#[tokio::test]
+async fn operator_revoke_cancels_all_lanes_in_one_session() {
+    let (_d, _app, _backend, task, url) = setup().await;
+    let auth = PlaybackAuth::new(10);
+    let policy = Policy::from_config(&json!({"on_play":url}), &json!({})).unwrap();
+    let snapshot = auth.publish("direct", Some(policy)).unwrap();
+    let request = ViewerRequest {
+        name: "direct".into(),
+        proto: "mpegts".into(),
+        ip: "192.0.2.1".into(),
+        token: "same".into(),
+        qs: "lane=one".into(),
+        ..Default::default()
+    };
+    let first = match auth.authorize(snapshot.clone(), request.clone()).await {
+        AuthOutcome::Allowed(grant) => grant,
+        _ => panic!("first lane"),
+    };
+    let second = ViewerRequest {
+        qs: "lane=two".into(),
+        ..request
+    };
+    let second = match auth.authorize(snapshot, second).await {
+        AuthOutcome::Allowed(grant) => grant,
+        _ => panic!("second lane"),
+    };
+    let session = auth.snapshots()[0]["id"].as_str().unwrap().to_owned();
+    assert!(auth.revoke(&session));
+    assert!(first.is_cancelled());
+    assert!(second.is_cancelled());
+    task.abort();
 }
 #[tokio::test]
 async fn standard_max_sessions_header_limits_one_user_across_streams() {
@@ -213,6 +827,36 @@ async fn session_id(app: &Arc<App>) -> String {
         .as_str()
         .unwrap()
         .into()
+}
+#[tokio::test]
+async fn view_session_reads_hide_token_derived_user_id() {
+    let (_d, app, _backend, task, _) = setup().await;
+    let digest = format!("{:x}", Sha256::digest(b"short-pin"));
+    app.config
+        .put(
+            "streams",
+            "owned",
+            json!({"on_play": null, "flussonix_token_sha256": digest}),
+        )
+        .unwrap();
+    let live = media(&app, "/owned/mpegts?token=short-pin").await;
+    assert_eq!(live.status(), StatusCode::OK);
+    let edit = value(api(&app, "GET", "sessions", json!(null), false).await).await;
+    assert_eq!(edit["sessions"][0]["user_id"], digest);
+    let id = edit["sessions"][0]["id"].as_str().unwrap();
+
+    let view = value(api(&app, "GET", "sessions", json!(null), true).await).await;
+    assert_eq!(view["estimated_count"], 1);
+    assert_eq!(view["sessions"][0]["id"], id);
+    assert_eq!(view["sessions"][0]["user_id"], "[redacted]");
+    assert!(!view.to_string().contains(&digest));
+    let detail = value(api(&app, "GET", &format!("sessions/{id}"), json!(null), true).await).await;
+    assert_eq!(detail["user_id"], "[redacted]");
+    assert!(!detail.to_string().contains(&digest));
+
+    drop(live);
+    app.media.stop_all().await;
+    task.abort();
 }
 async fn closed(response: axum::response::Response) -> bool {
     use futures_util::StreamExt;
@@ -353,6 +997,8 @@ async fn in_flight_approval_cannot_restore_manual_revoke() {
 #[tokio::test]
 async fn metadata_edit_keeps_identity_but_changed_policy_revokes_live_grant() {
     let (_d, app, b, task, _) = setup().await;
+    // This test is about config edits, not the first short-lease renewal at 100 ms.
+    b.mode.store(16, Ordering::SeqCst);
     let first = media(&app, "/owned/mpegts?token=metadata").await;
     let id = session_id(&app).await;
     assert_eq!(
@@ -809,7 +1455,8 @@ async fn review_concurrent_different_streams_preserve_user_limit() {
 async fn review_silent_m4_bodies_close_on_revocation() {
     use futures_util::StreamExt;
     for protocol in ["m4s", "m4f"] {
-        let (_d, app, _b, task, _) = setup().await;
+        let (_d, app, backend, task, _) = setup().await;
+        backend.mode.store(16, Ordering::SeqCst);
         let response = media(&app, &format!("/owned/{protocol}?token=silent")).await;
         assert_eq!(response.status(), 200);
         let id = session_id(&app).await;

@@ -115,6 +115,17 @@ impl SourceAuthority {
         let observed = match observed {
             Ok(observed) => observed,
             Err(error) => {
+                if matches!(
+                    error,
+                    LeaseFailure::Binding(BindingFailure::Inventory(
+                        crate::source_directory::LookupFailure::Absent
+                            | crate::source_directory::LookupFailure::Invalid
+                    ))
+                ) {
+                    state.modern_fact = Some(super::super::super::ModernFact::Rejected {
+                        observation: pending.next.turn.clone(),
+                    });
+                }
                 reject(error);
                 return Err(error);
             }
@@ -132,12 +143,23 @@ impl SourceAuthority {
                 server_id,
             },
             ticket: pending.next.clone(),
+            eligible: OnceLock::new(),
         };
+        drop(state);
+        let names = inventory.eligible_names();
+        let mut state = self
+            .current(pending.snapshot.revision, &pending.snapshot.profile)
+            .map_err(projection)?;
+        check(&state)?;
         let valid = |bound: &ModernLeasedCandidate| current(&state, bound).is_ok();
         let (result, apply) = prepare(&inventory, &valid);
         check(&state)?;
         state.lease_turn = Some(pending.next.turn.clone());
         state.renewal_turn = None;
+        state.modern_fact = Some(super::super::super::ModernFact::Eligible {
+            observation: pending.next.turn.clone(),
+            names,
+        });
         apply();
         drop(state);
         Ok((inventory, result))

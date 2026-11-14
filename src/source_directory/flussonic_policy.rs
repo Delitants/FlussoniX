@@ -165,8 +165,11 @@ impl PolicySet {
             }
             // Validate a direct HTTP(S) URL without resolving another backend.
             let url = backend["url"].as_str().ok_or(PolicyFailure::Invalid)?;
-            Policy::from_config(&json!({"on_play":url}), &json!({}))
+            let policy = Policy::from_config(&json!({"on_play":url}), &json!({}))
                 .map_err(|_| PolicyFailure::Invalid)?;
+            if policy.url.is_none() {
+                return Err(PolicyFailure::Invalid);
+            }
         }
         let root = json!({"auth_backends":backends});
         let mut resolved_templates = HashMap::new();

@@ -1,5 +1,5 @@
 //! Bounded SRT caller destinations. No vendor transport code is loaded.
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use serde_json::Value;
 use std::{
     sync::{Arc, Mutex},
@@ -7,17 +7,17 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
     sync::broadcast,
 };
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct Destination {
-    pub url: String,
     pub endpoint: String,
     pub disabled: bool,
     pub retry_seconds: u64,
     startup_seconds: u64,
+    connect_seconds: u64,
+    latency_millis: u64,
     streamid: String,
     passphrase: String,
 }
@@ -149,27 +149,16 @@ fn parse(item: &Value) -> Result<Destination, String> {
     }
     url.set_query(None);
     let endpoint = url.to_string();
-    {
-        let mut query = url.query_pairs_mut();
-        query
-            .append_pair("mode", "caller")
-            .append_pair("transtype", "live")
-            .append_pair("pkt_size", "1316")
-            .append_pair("linger", "0")
-            .append_pair("timeout", "10000000")
-            .append_pair("enforced_encryption", "1")
-            .append_pair("latency", &(latency * 1000).to_string())
-            .append_pair("connect_timeout", &(connect * 1000).to_string());
-        if !passphrase.is_empty() {
-            query.append_pair("pbkeylen", "16");
-        }
-    }
     Ok(Destination {
-        url: url.into(),
         endpoint,
         disabled: item["disabled"] == true,
         retry_seconds,
-        startup_seconds: connect + 5,
+        // FFmpeg 6 can complete a subtitle-preserving publication probe just
+        // after five seconds. Keep the accepted SRT socket through that
+        // bounded startup window rather than forcing a listener reconnect.
+        startup_seconds: 10,
+        connect_seconds: connect,
+        latency_millis: latency,
         streamid: streamid.to_owned(),
         passphrase: passphrase.to_owned(),
     })
@@ -239,7 +228,7 @@ impl State {
     pub async fn run(
         self: Arc<Self>,
         ffmpeg: String,
-        mut receiver: broadcast::Receiver<Bytes>,
+        mut receiver: crate::media_queue::Receiver,
         cancel: CancellationToken,
     ) {
         if self.destination.disabled {
@@ -270,10 +259,73 @@ impl State {
     async fn attempt(
         &self,
         ffmpeg: &str,
-        receiver: &mut broadcast::Receiver<Bytes>,
+        receiver: &mut crate::media_queue::Receiver,
         cancel: &CancellationToken,
     ) -> &'static str {
-        let mut cmd = Command::new(ffmpeg);
+        let target = match url::Url::parse(&self.destination.endpoint) {
+            Ok(target) => target,
+            Err(_) => return "push_connect_failed",
+        };
+        let host = match target.host() {
+            Some(url::Host::Domain(host)) => host.to_owned(),
+            Some(url::Host::Ipv4(host)) => host.to_string(),
+            Some(url::Host::Ipv6(host)) => host.to_string(),
+            None => return "push_connect_failed",
+        };
+        let Some(port) = target.port() else {
+            return "push_connect_failed";
+        };
+        let addresses = tokio::select! {biased;
+            _=cancel.cancelled()=>return "push_stopped",
+            result=tokio::time::timeout(Duration::from_secs(self.destination.connect_seconds),tokio::net::lookup_host((host.as_str(),port)))=>match result {
+                Ok(Ok(addresses))=>addresses.take(8).collect::<Vec<_>>(),
+                _=>return "push_connect_failed",
+            }
+        };
+        if addresses.is_empty() {
+            return "push_connect_failed";
+        }
+        let mut candidates: Vec<_> = addresses
+            .into_iter()
+            .filter_map(|address| {
+                crate::srt_playback::native::caller(
+                    address,
+                    &self.destination.streamid,
+                    &self.destination.passphrase,
+                    self.destination.latency_millis,
+                    self.destination.connect_seconds,
+                )
+                .ok()
+            })
+            .collect();
+        if candidates.is_empty() {
+            return "push_connect_failed";
+        }
+        let connection_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(self.destination.connect_seconds);
+        let socket = loop {
+            if let Some(index) = candidates.iter().position(|socket| socket.is_connected()) {
+                break candidates.swap_remove(index);
+            }
+            candidates.retain(|socket| socket.is_connecting());
+            if candidates.is_empty() {
+                return "push_connect_failed";
+            }
+            tokio::select! {biased;
+                _=cancel.cancelled()=>return "push_stopped",
+                _=tokio::time::sleep_until(connection_deadline)=>return "push_connect_failed",
+                _=tokio::time::sleep(Duration::from_millis(5))=>{},
+            }
+        };
+        drop(candidates);
+        // Preserve the initial PAT/PMT and keyframe queued before or during
+        // the handshake. Retries already resubscribe in run(); a genuinely
+        // evicted initial cursor must fail explicitly instead of sending a
+        // media tail without the bootstrap needed by the downstream demuxer.
+        if receiver.is_lagged() {
+            return "push_queue_overflow";
+        }
+        let mut cmd = crate::child_process::command(ffmpeg);
         cmd.args([
             "-hide_banner",
             "-loglevel",
@@ -303,21 +355,12 @@ impl State {
             "-stats_period",
             "0.2",
             "-progress",
-            "pipe:1",
+            "pipe:2",
         ]);
-        // FFmpeg 5/6 do not URL-decode SRT strings, and later versions
-        // extract encoded query values through a 1024-byte buffer. Preserve
-        // the validated UTF-8/ASCII values as separate output options.
-        if !self.destination.streamid.is_empty() {
-            cmd.args(["-srt_streamid", &self.destination.streamid]);
-        }
-        if !self.destination.passphrase.is_empty() {
-            cmd.args(["-passphrase", &self.destination.passphrase]);
-        }
-        cmd.args(["-f", "mpegts", &self.destination.url])
+        cmd.args(["-f", "mpegts", "pipe:1"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         let Ok(mut child) = cmd.spawn() else {
             return "push_start_failed";
@@ -325,12 +368,20 @@ impl State {
         self.counters.lock().unwrap().pid = child.id().unwrap_or(0);
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = child.stdout.take().unwrap();
-        let mut buffer = [0u8; 4096];
-        let mut line = Vec::new();
-        let mut previous = 0;
+        let mut stderr = child.stderr.take().unwrap();
+        let mut media = [0u8; 1316 * 8];
+        let mut diagnostics = [0u8; 4096];
+        let mut pending = BytesMut::with_capacity(1316 * 32);
+        let mut input: Option<Bytes> = None;
+        let mut input_offset = 0;
+        let mut sent_bytes = 0u64;
+        let mut stderr_open = true;
+        let mut send_ready = false;
+        let mut tick = tokio::time::interval(Duration::from_millis(5));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut progress = Instant::now();
-        let error = loop {
-            let limit = if previous == 0 {
+        let error = 'sending: loop {
+            let limit = if sent_bytes == 0 {
                 self.destination.startup_seconds
             } else {
                 10
@@ -340,30 +391,56 @@ impl State {
                 _=cancel.cancelled()=>break "push_stopped",
                 _=tokio::time::sleep(remaining)=>break "push_stalled",
                 _=child.wait()=>break "push_failed",
-                result=stdout.read(&mut buffer)=> {
+                _=tick.tick(),if pending.len()>=188 && !send_ready=> {
+                    if !socket.is_connected() {
+                        break "push_failed";
+                    }
+                    send_ready=pending.len()>=188;
+                },
+                _=std::future::ready(()),if send_ready=> {
+                    let mut blocked=false;
+                    for _ in 0..256 {
+                        let n=(pending.len().min(1316)/188)*188;
+                        if n==0 {break;}
+                        match socket.try_send(&pending[..n]) {
+                            Ok(true)=>{
+                                let _=pending.split_to(n);
+                                sent_bytes=sent_bytes.saturating_add(n as u64);
+                                let mut c=self.counters.lock().unwrap();
+                                c.muxed_bytes=c.muxed_bytes.saturating_add(n as u64);
+                                c.status="sending";
+                                c.last_error=None;
+                                progress=Instant::now();
+                            }
+                            Ok(false)=>{blocked=true;break;},
+                            Err(_)=>break 'sending "push_failed",
+                        }
+                    }
+                    send_ready=!blocked && pending.len()>=188;
+                    if send_ready {tokio::task::yield_now().await;}
+                },
+                result=stdout.read(&mut media),if pending.len()<1316*32=> {
                     let Ok(n)=result else {break "push_failed";};
                     if n==0 {break "push_failed";}
-                    let mut invalid=false;
-                    for &byte in &buffer[..n] {
-                        if byte==b'\n' {
-                            if let Some(size)=std::str::from_utf8(&line).ok().and_then(|s|s.strip_prefix("total_size=")).and_then(|s|s.parse::<u64>().ok()).filter(|size|*size>previous) {
-                                let mut c=self.counters.lock().unwrap();c.muxed_bytes=c.muxed_bytes.saturating_add(size-previous);c.status="sending";c.last_error=None;previous=size;progress=Instant::now();
-                            }
-                            line.clear();
-                        } else if line.len()<1024 {line.push(byte);} else {invalid=true;break;}
-                    }
-                    if invalid {break "push_failed";}
+                    pending.extend_from_slice(&media[..n]);
+                    send_ready=pending.len()>=188;
                 },
-                result=receiver.recv()=> {
+                result=stderr.read(&mut diagnostics),if stderr_open=> {
+                    match result {Ok(0)=>stderr_open=false,Ok(_)=>{},Err(_)=>break "push_failed"}
+                },
+                result=receiver.recv(),if input.is_none()=> {
                     let data=match result {Ok(data)=>data,Err(broadcast::error::RecvError::Lagged(_))=>break "push_queue_overflow",Err(broadcast::error::RecvError::Closed)=>break "push_stopped"};
-                    let limit=if previous==0 {self.destination.startup_seconds}else{10};
-                    let remaining=Duration::from_secs(limit).saturating_sub(progress.elapsed());
-                    let written=tokio::select! {biased;
-                        _=cancel.cancelled()=>break "push_stopped",
-                        _=child.wait()=>break "push_failed",
-                        result=tokio::time::timeout(remaining,stdin.write_all(&data))=>result,
-                    };
-                    match written {Ok(Ok(()))=>{let mut c=self.counters.lock().unwrap();c.fed_bytes=c.fed_bytes.saturating_add(data.len() as u64);},Ok(Err(_))=>break "push_failed",Err(_)=>break "push_stalled"}
+                    if data.is_empty(){continue;}
+                    input=Some(data);
+                    input_offset=0;
+                },
+                result=async {stdin.write(&input.as_ref().unwrap()[input_offset..]).await},if input.is_some()=> {
+                    let Ok(n)=result else {break "push_failed";};
+                    if n==0 {break "push_failed";}
+                    input_offset+=n;
+                    let mut c=self.counters.lock().unwrap();
+                    c.fed_bytes=c.fed_bytes.saturating_add(n as u64);
+                    if input_offset==input.as_ref().unwrap().len(){input=None;}
                 },
             }
         };
@@ -372,5 +449,128 @@ impl State {
         let _ = child.wait().await;
         self.counters.lock().unwrap().pid = 0;
         error
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use crate::media_queue::Channel;
+    use std::process::Stdio;
+
+    #[tokio::test]
+    async fn queued_ts_survives_srt_handshake_before_first_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("source.ts");
+        let generated = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x90:rate=25",
+                "-t",
+                "4",
+                "-c:v",
+                "mpeg2video",
+                "-g",
+                "25",
+                "-f",
+                "mpegts",
+            ])
+            .arg(&fixture)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "fixture generation failed: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let recording = dir.path().join("received.ts");
+        let mut listener = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-probesize",
+                "32768",
+                "-analyzeduration",
+                "100000",
+                "-i",
+                &format!("srt://127.0.0.1:{port}?mode=listener&listen_timeout=10000000"),
+                "-t",
+                "0.5",
+                "-c",
+                "copy",
+                "-f",
+                "mpegts",
+            ])
+            .arg(&recording)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let queue = Channel::live(32 * 1024, 4 * 1024 * 1024);
+        let mut cursor = queue.subscribe();
+        for chunk in std::fs::read(&fixture).unwrap().chunks(1316) {
+            queue.send(Bytes::copy_from_slice(chunk)).unwrap();
+        }
+        assert!(!cursor.is_lagged(), "fixture must fit the bounded queue");
+        let destination = configuration(&serde_json::json!({"pushes":[{
+            "url":format!("srt://127.0.0.1:{port}"),
+            "connect_timeout":2
+        }]}))
+        .unwrap()
+        .remove(0);
+        let state = State::new(destination, 0);
+        let cancel = CancellationToken::new();
+        let send = tokio::spawn({
+            let state = state.clone();
+            let cancel = cancel.clone();
+            async move { state.attempt("ffmpeg", &mut cursor, &cancel).await }
+        });
+        let received = tokio::time::timeout(Duration::from_secs(8), listener.wait()).await;
+        cancel.cancel();
+        let send_error = send.await.unwrap();
+        let Ok(Ok(status)) = received else {
+            let _ = listener.kill().await;
+            let output = listener.wait_with_output().await.unwrap();
+            panic!(
+                "SRT receiver did not receive the queued TS bootstrap: send={send_error}, stats={}, bytes={}, stderr={}",
+                state.stats(),
+                std::fs::metadata(&recording).map_or(0, |m| m.len()),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        assert!(
+            status.success(),
+            "SRT recording failed: {status}, send={send_error}"
+        );
+        let decoded = tokio::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-xerror", "-i"])
+            .arg(&recording)
+            .args(["-map", "0:v:0", "-f", "null", "-"])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            decoded.status.success(),
+            "queued TS did not decode: {}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
     }
 }

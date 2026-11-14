@@ -1,8 +1,766 @@
 # Preview qualification
 
+## Exact product-source CI (2026-11-08 UTC)
+
+[GitHub Actions run 42467348754](https://github.com/Delitants/FlussoniX/actions/runs/42467348754)
+completed successfully on PR #51 head
+`74cbd0f691118bbc87ed769372ac27630a365b10`. Its `verify` job passed
+formatting, warning-denied all-target Clippy, the full serial locked Rust
+suite with owned media fixtures, IPTV authority load smokes, UI build, and
+live browser checks. Its `release_package_smoke` job passed the independently
+packaged daemon and upgrade checks. This qualifies that exact source head for
+those checks; later commits require their own verification. The failed
+24-hour soak and remaining migration/release gates below are unchanged.
+
+[GitHub Actions run 42444739064](https://github.com/Delitants/FlussoniX/actions/runs/42444739064)
+completed successfully on PR #51 head
+`283584309636e626a74ea1ac5355ccfa77161c4e`. Its `verify` job ran
+formatting, warning-denied all-target Clippy, the full serial locked Rust
+suite with owned media fixtures, bounded IPTV authority load smokes, and the
+UI build and browser checks. Its `release_package_smoke` job built and started
+an independently packaged daemon, exercised installation/upgrade smoke checks,
+and verified official Flussonic components were absent. This run is historical
+evidence for that head. Later product changes require fresh exact-head checks,
+tracked on [PR #51](https://github.com/Delitants/FlussoniX/pull/51). It does
+not close the 24-hour soak, live migration or full API-compatibility gates.
+
+## M4F/M4S origin address lifetime (2026-11-08 UTC)
+
+The candidate keeps each M4F/M4S origin's initial resolved address set for its
+input generation. Native inputs resolve when the worker pull starts; the
+explicit Flussonic media input retains its pinned client across M4F control
+reconnects and announced segment GETs. A replacement input may resolve again.
+HTTPS continues to verify the configured hostname. The focused locked Rust
+`m4_ingest::` suite passed all 21 tests on local candidate `97c2103`, including
+two-address native M4F/M4S fixtures, vendor M4F reconnect/replacement, and a
+pinned-hostname TLS fixture. This is deterministic local coverage; it does not
+establish a live DNS failover SLA.
+
+## Isolated two-host private-TLS relay (2026-11-08 UTC)
+
+The `0c3b666` candidate binary (SHA-256
+`47470961eb3f38ec32784a361eaba7f6321f9b6cd206dc004afffc629558a003`)
+ran in separate resource-limited transient units on cdn4 and cdn5. cdn4
+read the existing Flussonic H.264/AAC test stream over M4SS without changing
+that server. cdn5 reached cdn4 at its private IP over HTTPS, verified a
+test-only IP certificate with an explicit CA, and pulled native M4S, then M4F.
+The insecure peer-HTTP override was absent. In each round, an anonymous CDN
+HLS request returned 403; an authorized request returned a playlist, FFprobe
+identified H.264/AAC, and FFmpeg completed strict video/audio decode. Source
+and CDN service memory peaks were 60.1 and 55.5 MB during the short probes.
+
+The first attempt using the historical test CDN's plain-HTTP source settings
+returned 404 before media activation because the current secure default
+rejects that remote peer-key transport. It was not treated as a successful
+relay. Both transient units, their FFmpeg children, credentials, certificates
+and media files were removed. Existing test units and production Flussonic
+PIDs/listeners remained unchanged. These short probes do not qualify a load
+balancer, sustained playback, WAN impairment, HEVC, or migration capacity.
+
+## Completed 24-hour HTTP soak — failed gap gate (2026-11-08 UTC)
+
+The isolated two-stream/eight-viewer run on revision `9b56379e2499c25ec1f4a2998d1970399c3f21f8`
+completed its full 86,400-second window with 1,440 samples and 88.82 GiB delivered.
+The unchanged `scripts/assess-sustained-http.py` gate returned `fail`:
+`media_gap_exceeded` and `reconnect_gap_exceeded`. All eight viewers saw two
+synchronized media gaps; the largest was 5,262.2 ms, above the 3,000 ms limit.
+One churn viewer reached a 4,268.53 ms reconnect gap. The matching owned source
+observations reached 5,212 and 5,167 ms of media age. No viewer decode-sync
+errors, source-observation errors, early daemon exit or OOM were recorded.
+Service-cgroup memory peaked at 125.69 MiB. The runner and its two FFmpeg
+children exited, and the report remains owner-only.
+
+The gap window coincided with a separate heavy local build and elevated host
+disk writes/I/O wait. That supports a contention hypothesis, not a proved
+cause or a passing playback result. A clean run on the final immutable binary,
+without competing heavy local builds, remains mandatory. This failed run is
+historical evidence for its stated revision; it cannot qualify later source.
+
+## Durable HLS sequence recovery candidate (2026-11-07)
+
+Runtime commit `1917a8b54ca388e41980ccf259a0163a2c782350` persists a
+per-stream HLS sequence floor outside disposable media directories. Owned
+real-FFmpeg tests restarted both TS-HLS and fMP4 after placing the prior
+timeline ahead of the wall clock. Both public sequences advanced, old segment
+and init names were unavailable, and independent FFmpeg strictly decoded both
+new variants. A separate subtitle-passthrough restart advanced the public
+normalized TS playlist even though its private FFmpeg list restarted at a
+lower sequence. Unit cases covered surviving public playlists, corrupt and
+exhausted state, stop/replacement races, and an unrelated startup while one
+state write was stalled. The existing raw-HLS replacement and caption-policy
+regressions passed.
+
+`cargo fmt --all`, warning-denied all-target Clippy, 843 library tests (one
+ignored), 51 preview-helper tests, seven archive/upgrade-helper tests, and
+four notice-generator tests passed. A fresh release build (binary SHA-256
+`59c0cc56cb583692efff284f351c08298eed7b6a2c60c5efaa83051768c178fa`)
+and lockfile-pinned UI build produced a 395-file x86-64 archive (SHA-256
+`1c1baa1e0cdf49315658102b3687550662c8c3222c17d860af3930b9adf8dcf6`).
+The extracted archive passed loopback health, admin, RTSP, and encrypted-SRT
+smoke checks. A media-enabled cold upgrade from the checksum-pinned
+v0.10.0-preview archive passed upgrade, rollback, and return with independent
+HLS decode. All package-test daemons and files exited or were removed.
+
+The full serial `cargo test --locked -- --test-threads=1` pass was stopped
+after its 843 library tests and 16 integration targets completed; no failure
+was reported before interruption, but the remaining integration targets have
+not passed this candidate. The build temporarily raised root use to 82%; 196
+disposable test executables (61.57 GiB), the temporary archive/extractions,
+and this worktree's UI dependencies were removed. Root space afterward was
+about 145 GiB free. The separate 24-hour soak stayed active with no daemon
+restart and eight viewers, but its checkpoint recorded two simultaneous
+media gaps above three seconds on every viewer during the heavy build, with
+a maximum near 5.26 seconds. That soak cannot yet establish uninterrupted
+playback. Power-loss sequence continuity, the remaining full CI gate, and
+the separately tracked SRT/RTP and release-security work remain open.
+
+The same soak checkpoint places the first viewer gaps at elapsed 50,250.77 s
+and the second at 50,274.90 s. Both owned source observations report aligned
+freshness stalls: 5.21/5.17 s and 3.23/3.19 s respectively, with no source
+poll gaps or observation errors in those windows. This localizes the visible
+delay upstream of the viewer responses but does not identify whether source
+generation, media processing, scheduling, or storage caused it. The next
+candidate soak must run without a concurrent heavy build on the same root
+filesystem and retain host I/O evidence for any new gap; the current run
+remains a failed uninterrupted-playback qualification.
+
+The host's sysstat sample ending at 14:50 HST covers the gap window near
+14:48. Its ten-minute averages show 21.65% CPU I/O wait, 128,956.64 kB/s
+of NVMe writes, 18.21 ms NVMe request wait and a 25.61 NVMe queue depth.
+The preceding sample had 0.10% I/O wait and 15,871.85 kB/s of NVMe writes;
+the following sample had 0.04% I/O wait. The kernel journal has no entries in
+the five-minute gap window. These coarse host measurements support a storage
+contention hypothesis but cannot prove that contention caused the source
+stalls or exclude a media-path defect.
+
+A final lifecycle review found that synchronous sequence-state I/O could stall
+the async runtime, idle cleanup could retire a newer worker, and cancellation
+could release the per-stream fence before old media was removed. The follow-up
+runtime patch at `2088e29` moves durable operations to blocking workers, keeps
+retirement and media cleanup in an independently owned task. It rechecks worker
+identity and idle eligibility under the stream gate. Deterministic cancellation
+tests paused old worker completion and media removal. A single-thread runtime
+test stalled one stream's state write while another stream started. The 54
+media unit cases, both real-FFmpeg HLS recovery cases, warning-denied
+all-target Clippy, and the full library suite (847 passed, one ignored)
+passed after the patch. Raw-HLS replacement and subtitle-policy integration
+regressions also passed. The archive and upgrade results above belong to the
+earlier `1917a8b` runtime. A new archive for runtime revision `ba61670` had
+binary SHA-256 `0edc22f6d3ebfb037f81fcbba6d2c34965e3681c9aca26d64a2129a08b7e0b04`
+and archive SHA-256
+`144214d1939c3928b547f937d00b964d30c94f30ebbc7a8582144a3b660edb2c`.
+The extracted archive passed loopback health, admin, RTSP, and encrypted-SRT
+smoke checks. A media-enabled cold upgrade from the checksum-pinned previous
+release passed upgrade, rollback, and return with independent HLS decode.
+Temporary package files, test daemons, and UI dependencies were removed. The
+remaining integration suite and separate release gates remain open.
+
+An additional owned loopback check used the exact packaged candidate binary
+`0edc22f6d3ebfb037f81fcbba6d2c34965e3681c9aca26d64a2129a08b7e0b04`.
+After both TS-HLS and fMP4 published a segment, the test sent `SIGKILL` to
+the test daemon's process group, including its FFmpeg child, and restarted
+against the same private state and media directory. Both new public playlists
+started at the prior next sequence, neither reused its old segment name, old
+segment URLs were unavailable, and independent FFmpeg decoded five pictures
+from each new playlist. The test daemon, child processes and temporary state
+were removed. This verifies one ungraceful process restart; it does not model
+storage write loss or establish the separate physical power-loss gate.
+
+## Isolated FXLink v9 two-stream loss probe (2026-11-07)
+
+The exact `9b56379` release binary (SHA-256
+`cd2c5210f989d7154803f1318af9c33f5c5f386905c925ad07ab7d50bf59aacb`)
+served two owned synthetic streams through separate source and CDN daemons in
+an unprivileged network namespace. An isolated `tc netem` queue gave FXLink UDP
+125 ms delay in each direction (about 250 ms RTT) and 1% random loss; the
+receiver used a 1,000 ms media buffer. Both peers explicitly enabled the v9
+geometry-hint feature set. Over 90 seconds, each stream delivered 44
+consecutive HLS segments with no post-start fetch failures; independent FFmpeg
+strictly decoded the first and last segment from each stream. The netem queue
+dropped 416 UDP packets. FXLink reported v9 for both streams, 57 and 61
+original lost shards respectively, the same counts recovered by FEC, and zero
+expired records or queue drops. The test-owned daemons, namespace, staged
+binary, and temporary media were removed; a compact owner-only result remains
+under `.runtime/fxlink-longhaul-9b56379/`.
+
+This is a short loopback loss probe. It does not qualify 500 ms RTT, a 500 ms
+buffer, sustained competing traffic, real WAN behavior, or production capacity.
+
+## Isolated IPTV authority HA load (2026-11-07)
+
+The exact `9b56379` source passed the existing real-daemon PostgreSQL load
+gate with two authority processes and a catalog of 30,016 subscribers. For
+900 seconds, 16 viewers competed across two channels and completed 28,017
+lease cycles. The test reported zero excess grants, zero missed renewals, a
+peak of 16 active sessions and zero remaining sessions after cleanup. Acquire
+latency was 341 ms at p99; renew latency was 8 ms at p99. Peak database
+connections were 24, peak authority RSS was 79,928/76,044 KiB, and WAL growth
+was 53,938,632 bytes. The owned test finished in 902.78 seconds and retained
+only a compact local log; its PostgreSQL fixture and authority processes exited.
+
+This qualifies the exercised two-authority, single-database load profile. It
+does not establish database-primary promotion, a production fencing
+controller, a larger viewer population, or a full-day authority soak. Those
+remain separate release checks.
+
+## HTTP HLS origin address pinning (2026-11-05)
+
+At runtime commit `b39c9cb`, the owned loopback regression used an unresolved
+hostname pinned to an OS-selected local listener. Forced new connections fetched
+the playlist, key, map, segment and a same-origin redirect with the configured
+Host header; a second listener received zero requests. Resolver tests covered
+duplicate, empty, failing and timed-out answers, the eight-address cap, IPv4
+and IPv6 literals and an initial set that includes a private address. Startup
+tests paused one origin while an unrelated stream started, then rejected a
+stale route and a cancelled preparation before worker/proxy publication; a
+failed first HLS DNS lookup selected a healthy fallback input. The HLS
+fetcher module, `peer_hls` (9 cases), `http_input_tls` (18 cases) and
+warnings-denied all-target Clippy passed locally. This pins only the initial
+resolved set for each generation; it does not validate the trustworthiness of
+the configured origin or its first DNS answer. Exact-head CI and final release
+qualification remain separate gates.
+
+## Isolated runtime without vendor files (2026-11-02 HST)
+
+The local debug daemon with SHA-256
+`dad1960c656587471857b97adbe55ab9fa3b23ec1d2e2a865b06b7487ce1d699`
+ran inside a private mount namespace where `/opt/flussonic` was bind-hidden by
+an empty test directory. On an OS-selected loopback port, liveness and an
+authenticated stream PUT returned 200. A token-guarded HLS playlist and its
+279,368-byte MPEG-TS segment both returned 200; independent system FFmpeg
+strictly decoded the segment without errors. The debug executable dynamically
+linked only the standard GNU C, math and GCC support libraries. The test-owned
+daemon and FFmpeg processes exited, and its state and mount namespace were
+removed. This verifies one local synthetic playback profile
+without vendor files; the final packaged binary and broader protocol matrix
+still require their own exact-release qualification.
+
+On 2026-11-07, the exact `9b56379` release binary (SHA-256
+`cd2c5210f989d7154803f1318af9c33f5c5f386905c925ad07ab7d50bf59aacb`)
+passed a separate owned smoke in unprivileged mount and network namespaces.
+The host's `/opt/flussonic` was bind-hidden before daemon startup; its dynamic
+library list contained only system GNU C, math and GCC support libraries.
+Health, authenticated admin, token-protected HLS playlist and the 279,368-byte
+MPEG-TS segment all returned HTTP 200, and system FFmpeg strictly decoded the
+segment. The daemon, decoder, namespaces and temporary files were removed.
+This covers one synthetic H.264/AAC stream on the current release binary; it
+does not cover the full protocol matrix or a packaged installation.
+
+## Exact candidate archive and cold upgrade smoke (2026-11-02)
+
+At documentation-only revision `aa767045`, the independently built web UI
+and recorded release binary SHA-256
+`391012fa4438e11be06f6591941fb1f53134283d8a984e0343067726b03f9d98`
+were packaged into a Linux x86-64 archive (SHA-256
+`9c0fca2fda86f7f750308f378741850a11c86cfb48b956d84ed51fb1312164b8`).
+The package smoke started the extracted daemon on private loopback ports and
+verified health 200, authenticated admin 200, RTSP availability and encrypted
+SRT. The cold-upgrade helper then upgraded from the pinned v0.10.0-preview
+archive, decoded packaged HLS media with independent FFmpeg, and rolled back.
+Both checks passed; their temporary daemons, archive, extracted files and web
+build dependencies were removed after qualification. This is a local archive
+and cold-upgrade smoke, not a live in-place upgrade, power-loss recovery test,
+capacity qualification or final production release gate.
+
+On 2026-11-07, the exact `9b56379` release binary (SHA-256
+`cd2c5210f989d7154803f1318af9c33f5c5f386905c925ad07ab7d50bf59aacb`)
+and a fresh lockfile-pinned admin UI build produced a 395-file Linux x86-64
+archive (SHA-256
+`d0423c66e47403537579642f706200ad24e1c1f4c979c6dba9da1ed19c1481c8`).
+The extracted package passed loopback health, authenticated admin, RTSP and
+encrypted SRT smoke checks. A separate media-enabled cold upgrade from the
+checksum-pinned v0.10.0-preview archive passed upgrade, rollback and return,
+including independent HLS decode in each phase. The owned daemons, archives,
+extracted packages and temporary UI dependencies were removed. This remains
+an isolated smoke, not a live in-place upgrade, power-loss test or capacity
+qualification.
+
+## Current NVIDIA H.264 startup check (2026-11-02)
+
+On the local GTX 750 Ti with NVIDIA driver 580.159.03, the opt-in
+`warm_nvidia_http_ts_starts_with_decodable_video` test passed at documentation-
+only revision `dc38023`. Its owned worker emitted H.264 NVENC native frames;
+a late HTTP MPEG-TS viewer joined between keyframes, and independent FFmpeg
+decoded one second of the captured video without errors. The test stopped its
+worker and left no test-owned encoder. The concurrent bounded HTTP soak
+reported no new media gaps or source errors at its next checkpoint. This is a
+startup/playback check, not NVIDIA HEVC, sustained GPU capacity or driver
+recovery qualification.
+
+An isolated loopback release daemon with owner-only temporary state returned
+`h264_nvenc: available` and `hevc_nvenc: unavailable` with the sanitized
+`encoder_unsupported` diagnostic from its authenticated capabilities API.
+The admin UI consumes those statuses in Config and processing forms; existing
+browser cases cover their labels. The temporary daemon and state were removed.
+
+On 2026-11-07, the unchanged `9b56379` source's warm-start test runner passed
+both the CPU `libx265` HEVC case and the opt-in GTX 750 Ti `h264_nvenc` case.
+Each test joined a late HTTP MPEG-TS viewer between keyframes and used system
+FFmpeg to decode one second of the captured video. Both test workers exited;
+the separate 24-hour soak remained active with its two own FFmpeg children.
+This does not qualify NVIDIA HEVC encoding, sustained GPU capacity or driver
+recovery.
+
+## Short live Flussonic source topology matrix (2026-11-02)
+
+Exact release binary SHA-256
+`391012fa4438e11be06f6591941fb1f53134283d8a984e0343067726b03f9d98`
+passed six read-only probes of the approved cdn4 Flussonic
+`C4UK_4EverMusicHD` source. Each probe started only an isolated loopback
+FlussoniX LB and CDN. Plain M4S and M4F source modes delivered native M4S
+metadata/media and one announced, fetched M4F segment respectively; both
+reported H.264/AAC. HLS playback from M4S, M4F, verified-TLS M4SS and
+verified-TLS M4FS source modes each yielded a 1920×1080 H.264/AAC segment
+that independent FFmpeg decoded. In every run the LB placed the authorized
+viewer on its CDN, both local nodes rejected tokenless playback with 403,
+and the LB hosted no local stream. The vendor source was read only; all
+probe-owned processes and temporary files were removed.
+
+These were short probes of one live stream. Native-output checks parsed M4S
+records and M4F boxes; only the four HLS legs received independent decode.
+They do not qualify other codecs, source outages, sustained load, long-haul
+loss, complete vendor API parity or secure native viewer output.
+
+On 2026-11-07, the exact `9b56379` release binary (SHA-256
+`cd2c5210f989d7154803f1318af9c33f5c5f386905c925ad07ab7d50bf59aacb`)
+passed eight further read-only source-topology cases against the approved cdn4
+stream. Owned loopback LB/CDN pairs placed an authorized viewer on the CDN for
+native M4S output from M4S and verified-TLS M4SS sources, native M4F output
+from M4F and verified-TLS M4FS sources, and HLS output from each of those four
+source schemes. All local viewer endpoints used HTTP. All cases
+advertised H.264/AAC; the four HLS segments independently decoded with
+FFmpeg, while native M4S records and M4F boxes were parsed and validated.
+Every LB had zero local stream workers, and tokenless requests to both LB and
+CDN returned 403. The temporary daemons and state were removed after each
+case. This is still a short probe of one live vendor stream, without codec,
+outage, sustained-load, long-haul or full API-parity qualification.
+
+## Intermittent native HTTP publishing CI failure (2026-11-02)
+
+GitHub Actions run `41507578327` failed one nonignored HTTP publishing
+supervisor test after an M4S-to-M4F source fallback: the recovered H.264/AAC
+HTTP output contained an invalid H.264 macroblock under independent strict
+decoding. The fixture's independent source and native remux checks passed.
+Another complete CI run on the same runtime commit (`41507676164`) passed.
+On the isolated diagnostic branch, 10 unrestricted and 12 two-CPU local repeats
+of the exact failing test all passed. Their per-generation captures were
+188-byte TS aligned, 729,064–841,488 bytes, and equal in length across both
+destinations; passing captures were deleted. This rules out the fixture's
+4 MiB capture cap in those runs, but does not locate or repair the CI media
+corruption. A further run of the complete `http_push` test binary in CI's
+single-threaded order passed all 10 enabled tests, including both replacement
+uploads; its passing media captures were removed. The harness currently stops
+the daemon before strictly decoding each captured body. Source inspection shows
+worker cancellation wins over the FFmpeg stdout read, then kills the child;
+the HTTP publisher also closes its upload on cancellation. A final incomplete
+access unit is therefore possible on intentional shutdown. In a separate bounded
+probe, truncating a valid H.264 MPEG-TS file on 188-byte packet boundaries
+reproduced the same class of macroblock/bytestream decoder error. This makes
+shutdown-tail truncation a plausible explanation, not a confirmed cause of the
+CI failure. No failing CI capture was retained. The cause remains a release
+gate, and a passing rerun alone does not close it.
+
+## Two-host native cluster smoke (2026-11-02)
+
+The exact `2b848ab` release binary was staged temporarily on the approved
+cdn4/cdn5 test hosts, on unused private HTTP ports separate from existing
+Flussonic and FlussoniX services. An isolated source on cdn4 published a
+synthetic H.264/AAC stream. A separate LB on cdn4 redirected an authorized
+viewer to a CDN on cdn5; the CDN reported native M4S input from the source,
+served an HLS playlist and a 353,252-byte segment, and independent FFmpeg
+decoded both codecs. Unauthorized LB and CDN requests returned 403. The
+test-only peer relationships explicitly allowed private HTTP; this does not
+exercise HTTPS cluster transport. All three temporary systemd units stopped
+and both staging directories were removed. This is a short functional smoke,
+not long-haul, sustained, failure-recovery, or production-capacity evidence.
+
+The same exact binary also passed a separate cross-host HTTPS-only run with
+ephemeral, IP-verified certificates. The source catalog, native CDN pull and
+LB placement used trusted HTTPS without the insecure-peer override. The CDN
+reported `m4ss` input, the LB and CDN each returned 302 for the authorized
+handoff, and an independently decoded HLS segment contained H.264/AAC. Both
+nodes returned 403 without a token. All three HTTPS test units and both
+staging directories were removed. This verifies the secure route in one short
+run; it does not qualify long-haul capacity or certificate renewal.
+
+A separate 573-second private-network recovery run used the same binary
+(`391012fa4438e11be06f6591941fb1f53134283d8a984e0343067726b03f9d98`)
+at documentation-only revision `58e2f96`. The test stopped and restarted only
+its temporary source unit while the LB and CDN stayed running. All 20
+post-restart probes, spaced 30 seconds apart, completed the authorized LB/CDN
+redirect and ticket flow, fetched HLS media, and independently decoded H.264
+and AAC; 20 distinct segment names showed continuing media progression.
+Requests without a token returned 403 on both LB and CDN. The slowest probe
+took 3.89 seconds. All temporary units and staging directories were removed;
+both production Flussonic processes and their 80/443 listeners matched the
+pre-test baseline. This qualifies bounded LAN recovery of the native M4S path,
+not long-haul behavior, HTTPS recovery, capacity, or the exact-head 24-hour
+release gate.
+
+A subsequent HTTPS-only recovery run at documentation-only revision `1d9424e`
+used that same binary and ephemeral IP-verified certificates. The source on
+cdn4 was stopped and restarted while the LB on cdn4 and CDN on cdn5 remained
+running. All 20 post-restart probes over 635.89 seconds passed the authenticated
+LB/CDN redirects, native M4SS pull, HLS media fetch, independent H.264/AAC
+decode and tokenless 403 checks. The initial and recovery probes observed 21
+distinct segment paths; the slowest probe took 4.07 seconds. Both hosts were
+audited after cleanup: no test units, staging directories or occupied test
+ports remained, while the production Flussonic processes and 80/443 listeners
+matched their baseline. This qualifies bounded secure LAN recovery on these
+hosts, not certificate rotation, long-haul capacity or the exact-head 24-hour
+release gate.
+
+On 2026-11-07, the exact `9b56379` release binary (SHA-256
+`cd2c5210f989d7154803f1318af9c33f5c5f386905c925ad07ab7d50bf59aacb`)
+ran on both approved hosts in three temporary, capped units: source and LB on
+cdn4, CDN on cdn5. Private-IP certificates verified against an ephemeral CA;
+the source catalog and CDN pull used HTTPS, and the CDN reported `m4ss` input.
+The initial and eight post-restart probes passed LB/CDN ticket redirects,
+tokenless 403 checks, and independent H.264/AAC segment decode. Restarting
+only the temporary source produced a new media generation; the eight probes,
+spaced 15 seconds apart, observed eight distinct post-restart segments, with
+the slowest probe taking 359 ms. The LB listed the discovered stream but had
+zero active media workers. All temporary units, ports, media and credentials
+were removed; both hosts' pre-existing Flussonic and FlussoniX services and
+PIDs matched their pre-test baseline. This is bounded private-LAN recovery,
+not sustained WAN capacity, certificate rotation or production failover.
+
+## Cold package upgrade and rollback (2026-11-02)
+
+The checksum-verified published v0.6 preview archive was cold-upgraded to the
+new `0.10.0` archive built from revision `56bee65`, rolled back to v0.6, and
+started again on `0.10.0` in a disposable loopback installation. All four
+starts passed saved Streams/Templates checks and independent HLS H.264 decoding;
+the candidate also preserved IPTV subscriber data and its node UUID across
+rollback and return. The current package SHA-256 was
+`7175d1a53efe8f3bdc167393f9766258b7f5476b86d90f7d6c3cc5caa388e77b`.
+The smoke helper reaped its daemons and media children; the extracted packages
+and temporary lab were removed after verification. This covers that specific
+published-preview upgrade path, not a production installation or the final
+candidate after security fixes.
+
+## M4F ingest bridge backpressure and terminal control (2026-11-02)
+
+The independent M4F ingest bridge at code commit `461c376` bounds queued
+child-stdin payloads to 8 MiB, counts delivery only after a successful child
+write, and retains a 15-second upper deadline for accepted media on a
+transient source failure. A terminal source failure fences new M4F control
+subscriptions before the accepted media drains. Invalid or rejected input
+retires immediately. The focused bridge, selected-route, daemon, packaging,
+renewal and private-pull regressions, formatting, warnings-denied all-target
+Clippy and the binary build passed on that code commit.
+
+Three separate, read-only, 600-second comparisons used the authorized cdn4
+Flussonic M4F source and an isolated FlussoniX CDN. In the common 20–580 second
+window, the source served 100, 99 and 101 timestamped segments respectively;
+every one appeared in the CDN announcements and was successfully fetched from
+the CDN. Each comparison observed one origin control EOF, approximately one
+minute of origin unavailability and a successful new origin/CDN control. The
+CDN returned 503 during the outage and opened only two successful controls per
+comparison. The earlier repeated short HTTP 200/EOF controls did not recur.
+Probe-owned daemons, FFmpeg children and media directories were reaped after
+each run.
+
+This establishes timestamp availability in these three windows, not byte-for-
+byte segment identity, every M4F codec variant, production capacity or full
+mixed-vendor behavior. The separate 24-hour HTTP soak, exact-head CI, archived
+HEVC-loss investigation and installation/upgrade/recovery checks remain release
+gates.
+
+## Sustained HTTP release gate (2026-10-31)
+
+`scripts/assess-sustained-http.py` evaluates an owner-only completed report
+from the isolated two-stream, eight-viewer, 24-hour MPEG-TS HTTP soak. It
+requires continuous sampling, clean viewer and metadata checks, planned
+connection churn, per-viewer media volume, and reported media gaps of at most
+three seconds between packets, from run start to first media, across reconnects,
+and from last media to the deadline. It also requires bounded service-cgroup
+memory and media disk use.
+The report's short revision is self-reported; binary/package provenance and
+all other release gates remain separate. A local loopback pass would not
+establish WAN or production-scale capacity.
+
+The versioned `scripts/run-sustained-http.py` creates the report in a fresh,
+private state directory. Run it in a separate cgroup-v2 scope limited to two
+CPU cores, 1 GiB of memory and 512 processes, for example:
+
+```sh
+systemd-run --scope --collect -p CPUQuota=200% -p MemoryMax=1G -p TasksMax=512 \
+  python3 scripts/run-sustained-http.py --binary /path/to/flussonix \
+  --state /private/new-soak --revision FULL_40_CHARACTER_GIT_SHA
+python3 scripts/assess-sustained-http.py \
+  --report /private/new-soak/report.json --revision FULL_40_CHARACTER_GIT_SHA
+```
+
+The state directory must not exist beforehand. The runner hashes the supplied
+binary, records bounded timestamps for media gaps over three seconds, checks
+media disk use at each sample, and caps the private daemon log at 1 MiB. It
+stops its owned cgroup children and removes media and config on exit. It leaves
+the private report and log for diagnosis; the supplied binary is never removed.
+The assessor applies its 512 MiB current-memory and high-water limits across the
+entire run. Its 64 MiB growth limit starts at the first valid sample at or after
+one hour, so normal startup allocation is reported without being treated as a
+leak. Results include both startup-to-end and post-warmup growth and identify the
+3,600-second warmup. A report without a post-warmup baseline fails closed. These
+rules do not relax the whole-run 512 MiB ceiling.
+
+For gap attribution, add `--observe-source` to the runner. It polls only the
+two owned synthetic streams every 500 ms and adds bounded source-age episodes
+with the same elapsed-time base as viewer gaps. Poll errors and the largest
+observation interval remain visible. Timestamped error and delayed-poll
+intervals show where source evidence is missing; a viewer gap crossing one of
+those intervals cannot be attributed from source age alone. The option is off
+by default and does not change the release assessor or its pass criteria.
+
+An isolated 24-hour run on commit `4286712` passed the assessor: 1,440
+samples, 88.82 GiB delivered to eight viewers, no reported failures, a
+2,938.75 ms maximum media gap, a 1,969.92 ms maximum reconnect gap, and a
+98.4 MiB cgroup memory peak. Its report and package provenance were retained
+after the binary hash was checked. This is evidence for that earlier commit,
+not the final candidate. A later run on `5256867` ended early when its
+temporary filesystem fell below the runner's free-space threshold; the
+exact-head 24-hour gate must be repeated after release fixes using a state
+directory on the root filesystem.
+
+A later isolated 24-hour run on commit `565c65c` also passed the current
+assessor: 1,440 samples, 88.82 GiB delivered, no gate issues, a 166.31 MiB
+cgroup peak, 79.4 MiB startup-to-end growth, and 55.27 MiB growth after the
+one-hour warmup. This validates the warmup calculation against a completed
+report, but it remains evidence for that earlier revision. The immutable final
+candidate still requires its own exact-revision 24-hour pass.
+
+## Config OpenMetrics subset (2026-10-31)
+
+Read-only comparison with the installed 26.04.1 reference identified its
+OpenMetrics Config GET response and confirmed that Config stats remains JSON.
+FlussoniX now negotiates `application/openmetrics-text` from the Accept header
+or `?format=openmetrics`, emits gauge samples under the stable `server_id`, and
+ends the body with `# EOF`. The supported families are `server_started_at`,
+`server_cpu_usage`, `server_memory_usage`, `server_online_streams`,
+`server_total_clients`, and `server_output_bitrate`. CPU/RAM/output samples
+are omitted when telemetry is unavailable; online-stream observation is bounded
+and omitted if it cannot complete promptly. A renderer regression was red on the
+missing families then green, and a real synthetic-worker regression verifies
+startup stability and ready-stream transitions. Complete reference metric
+coverage, text/plain Config serialization, exact-head CI and full release
+qualification remain open.
+
+## Config stats response shape (2026-10-31)
+
+Read-only comparison with the installed 26.04.1 reference showed that
+`GET /streamer/api/v3/config/stats` returns a top-level server-stats object.
+FlussoniX previously returned its native node diagnostics there. The endpoint
+now uses the same stats projection as JSON Config GET; native-only fields remain
+on `/flussonix/api/v1/node`. A new response-shape regression failed on the old
+handler and passes after the change. Focused API, Config, viewer-redaction, IPTV
+and idle-memory runs passed 33 tests. Broader CI and complete vendor stats-field
+parity remain open.
+
+## Config JSON read compatibility (2026-10-31)
+
+An installed-schema and read-only demo comparison found that default
+`GET /streamer/api/v3/config` is a compact runtime view, while `?full=true`
+adds saved collections. FlussoniX now returns a stable UUID as both
+`server_id` and `stats.id`, with compact default and explicit full JSON reads.
+The UUID lives in an owner-only file beside the saved configuration; malformed,
+linked or readable-by-others identity files fail startup instead of silently
+changing identity. The admin editor requests the full response but compares and
+writes only saved collections, so changing runtime counters do not create a
+false edit conflict. A default relative `config.json` startup failure found by
+a regression test was fixed before qualification.
+
+Five Config/identity Rust regressions pass, together with the focused API,
+redaction, source-URL and vendor-discovery tests. The full owned live-daemon
+browser suite passed 135 tests with one intentional skip after generating the
+same media and CA fixtures used by CI. A disposable binary cold-upgrade test
+passed previous → candidate → previous → candidate, including independent HLS
+decode, IPTV data, the unchanged saved config and the stable node ID. The
+temporary daemons and staged packages were removed. All-target warnings-denied
+Clippy passed. Exact-head CI and final package qualification are still required
+for this branch. The compact response does not yet claim Flussonic-only root
+fields, text/plain serialization or OpenMetrics representation parity.
+
+## Callback decision isolation (2026-10-31)
+
+The `on_play` callback decision now follows the exact request fields sent to
+the callback, even when configured `session_keys` group different requests into
+one session. A changed query, IP, user agent, referer or host requires a fresh
+callback decision. A denied changed request does not close an already
+authorized MPEG-TS viewer on another decision lane. Account changes, forced
+reauthorization, revocation and in-flight callbacks are fenced per lane or
+session as appropriate. A real HTTP socket test confirms that a cold denial
+starts no media worker and leaves the unchanged authorized viewer playing.
+
+The decision cache is limited to 16 lanes per session and 50,000 per server
+instance. Under pressure it reclaims only idle lanes, in bounded batches; if
+all lanes are in use it denies a new context. A full-scan miss has a 100 ms
+retry cooldown. Forced reauthorization now makes every approved callback lane
+due, including an idle lane in a session held open by another viewer. An idle
+lane loses its cached approval at that boundary, so a callback denial or outage
+cannot admit a new viewer from stale state. Active and recently played lanes
+retain the existing callback-outage continuity behavior. Both denial and outage
+regressions failed before their fixes and pass afterward. The focused
+playback-auth library run passed 53 tests and the integration run passed 37.
+Format, diff checks and all-target warnings-denied Clippy passed locally.
+
+An earlier full serial Rust run passed 2,708 tests across 189 result targets,
+with 36 intentional hardware or extended-load skips and zero failures. It
+includes the vendor LB case that reauthorizes a recent redirected viewer after
+its handoff grant is gone. Later changes added the recent-playback renewal and
+idle-lane reauthorization regressions. The final local full-suite run was
+stopped during its first test target to preserve root-disk space; its disposable
+Cargo cache and fixture files were removed. GitHub CI remains the full-suite
+gate for this candidate. Existing M4S/M4SS transport behavior is unchanged.
+The independent exact-head soak remains a release gate.
+
+## Authority-checked M4F control reconnect (2026-10-30)
+
+An owned local origin now closes an established M4F control stream after a
+complete, privately acknowledged segment. FlussoniX obtains a fresh full
+catalog for the same source, opens a new playback session, and continues with
+the same media worker and packager PID. Replayed announcements are skipped
+before fetch. An isolated vendor-origin/CDN daemon test closed control twice:
+the first renewed session replayed the old timestamp without a second fetch;
+the next announced a new timestamp, fetched it once, and delivered distinct
+native media timestamps with the original packager PID. A two-GOP MPEG-TS
+fixture retained per-PID continuity counters and decoded with FFmpeg. Owned
+cases also close the old worker for an uncovered forward announcement, a
+contiguous announcement whose first served audio/video frame is far ahead,
+an unknown backward timestamp, changed audio/video metadata, or a fifth
+rapid EOF after four reopens. Sparse subtitle presence remains compatible;
+older EOFs leave the rolling 30-second budget only after new media progress.
+The focused run passed 48 packaging, 11 renewal, 69 daemon playback, and
+51 daemon failover tests. All-target Clippy passed with warnings denied.
+
+Held-renewal tests reject stream removal, disablement, changed origin ID,
+locally pinned group mismatch, changed source relationship, source/configuration
+or processing edits, expired demand, and last-viewer revocation before another
+control request. One revoked viewer stays closed when a second authorized
+viewer keeps the worker. Four EOF renewal slots and a five-second/remaining-
+lease deadline bound the new path; scheduled and EOF renewals share a
+per-source gate. M4S/M4SS behavior and vendor wire formats are unchanged.
+An owned five-origin fixture now holds four distinct source catalogs in
+renewal concurrently and observes the fifth begin only after one finishes.
+Changing the limit to three or five makes the test fail at the respective
+boundary; the restored four-slot implementation passes all 12 renewal tests.
+This qualifies the renewal budget, not production media throughput.
+
+The full `cargo test` run passed 2,683 tests across 189 result targets, with
+36 intentionally ignored hardware or extended-load cases and zero failures.
+`cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` passed.
+A 45-second read-only private M4F comparison against the approved cdn4 origin
+found nine matching, actually served timestamps in the aligned source/CDN
+range, with no source-only or CDN-only timestamp there. The source served 13
+segments and the isolated CDN served nine overall; observation edges differed.
+The probe's temporary daemon and owner-only files were removed.
+
+A later read-only 600-second comparison, with a control-read observer timeout
+above the private input's 15-second deadline, matched all 106 origin-served
+timestamps in its fixed measurement window through the isolated CDN. Both
+sides returned four control HTTP 503s during startup; the CDN then ran without
+a control reconnect, read error, or missing measured timestamp. An earlier
+300-second comparison using an eight-second observer timeout missed four
+origin-served timestamps. That timeout may have induced a probe reconnect,
+but the cause of the miss was not proved. All temporary media and processes
+were removed.
+
+These samples do not establish that a live Flussonic origin will replay
+every missing announcement or keep every segment available during an outage.
+Sustained read-only source/CDN parity, production capacity, and exact-head CI
+remain release gates.
+
+## Bounded vendor M4F recovery after an origin outage (2026-10-29)
+
+A paired five-minute read-only run against the authorized cdn4 source found
+three source-only M4F timestamps in the common window after HTTP 503s. The
+source itself also stalled, but the CDN's longer retry pause added avoidable
+loss as it recovered. A same-worker control-EOF experiment was withdrawn:
+owned removal and revocation tests showed that reopening control before a new
+catalog check could bypass source authority.
+
+M4F-only vendor sources with current static or viewer demand now cap scheduled
+recovery delay at two seconds plus under 500 ms of per-stream spread. Existing
+source selection, inventory refresh, permission fences and eight-job limit
+still run before a replacement worker starts. M4S and mixed-protocol groups
+retain their prior schedule. The new owned single-origin regression observes
+three consecutive HTTP 503 control attempts, restores the origin, and requires
+new worker media within six seconds. It failed with the old delay and passes
+with this policy. The full focused vendor suite and all-target warnings-denied
+Clippy pass locally. A separate isolated LB/CDN read-only probe on the updated
+binary observed five local 503 controls followed by one successful M4F control,
+one fetched 3.8 MB H.264/AAC segment, and 403 for unauthenticated LB/CDN
+requests. Its temporary daemons and files were removed.
+
+This check shows recovery and compatible media after a live source outage; it
+does not establish gapless delivery, a sustained post-change source/CDN
+timestamp match, or production capacity. The exact PR17 head `4cb0f18` passed
+[full verification](https://github.com/Delitants/FlussoniX/actions/runs/40985266390)
+and publication-safety CI on 2026-10-30. A diff-scoped security review of the
+four changed source files found no candidate vulnerabilities; it was not a
+whole-repository audit. The 35 local package and service-preview regression
+tests passed on the same runtime source. Source/CDN continuity and production
+capacity remain open release gates.
+
+Two subsequent five-minute read-only comparisons used the exact PR candidate
+against the authorized origin and an isolated local CDN. The first observed 53
+matching timestamps in a 276.7-second common observation window, with three
+CDN-only timestamps at its leading edge and three source-only timestamps at its
+trailing edge. A second run aligned the actual media timestamp ranges: 32
+matched, but three source-only timestamps remained. That run also saw five CDN
+HTTP 503 responses and one origin HTTP 403; the collector did not establish
+which condition caused the missing CDN announcements. These comparisons count
+control announcements, not successful fetches of every segment. The sustained
+source/CDN parity gate remains open. Both temporary daemons, their packaging
+children, and their owner-only configuration and logs were removed afterward.
+The direct-origin collector in those two comparisons omitted the M4F
+`x-playback-session-id` header, so its one 403 cannot be attributed to the
+server implementation and those comparisons are superseded for parity claims.
+
+A corrected read-only collector sent the same private M4F session and
+`X-Supported` headers as FlussoniX, required `cluster-auth: yes`, and fetched
+every source segment with the same session. In a 45-second run, the origin
+served all ten announced segments while the CDN announced seven; three
+source-available timestamps were absent around two CDN control reconnections. A 90-second
+repeat had no aligned gaps and its worker remained healthy. In a five-minute
+repeat, the origin served all 51 announced segments. The CDN matched 46
+timestamps in the aligned range but omitted four source-available timestamps.
+Worker-state sampling recorded `input_closed` and a replacement worker at the
+first gap, followed by several failed startup attempts during a later source
+outage. The local diagnostic log held no additional detail. This establishes
+a real continuity deficit during private input closure; it does not prove that
+every missing segment has the same cause or that a replacement can recover it.
+The temporary CDN, packager, owner-only probe files and logs were removed.
+
+## Current M4FS to M4F playback gate (2026-10-29)
+
+The explicit Flussonic-source route previously sent HTTP 200 before its first
+M4F segment existed. An eight-second HTTP readiness limit could then drop the
+only source viewer before a slower segment arrived; repeated requests restarted
+the worker instead of letting that startup finish. Two read-only local LB/CDN
+series against the authorized cdn4 source captured 45-second no-media periods
+with repeated empty controls or 503s and alternating `starting` and
+`retrying/input_closed` workers with zero bytes. Separate direct authenticated
+cdn4 controls returned announcements, so those samples did not establish an
+origin outage.
+
+The explicit-source route now waits for a cached M4F segment through the
+worker's configured startup deadline and returns 503 if none arrives. Daemon
+regressions demonstrated both prior failures before the fix and pass afterward:
+no segment never yields a successful control, while a segment arriving after
+eight seconds but within the worker allowance succeeds on the first request.
+Thirty isolated local LB/CDN starts on the updated binary all delivered and
+fetched M4F media; no empty control or 45-second restart loop appeared. The
+probe retains only bounded worker and allowlisted failure data when media is
+absent. Full exact-head CI and longer mixed-vendor qualification remain release
+gates; thirty successful starts do not prove the source never stalls.
+
+## Local Flussonic group approval gate
+
+Owned projection, config, replica, CDN, load-balancer and browser tests cover exact per-stream group pins, forged public-group claims, omitted memberships, pin edits that retire viewers, and view-role redaction. Static inventory status counts missing and mismatched pins without policy values or credentials. These tests use independent fixtures; live mixed-vendor playback and the full exact-head CI workflow remain separate release gates. M4S/M4SS/M4F/M4FS wire behavior is unchanged.
+
 This milestone is an executable subset of the product design, not complete Flussonic parity. Baseline reference: installed Flussonic 26.04.1. The native cluster uses FlussoniX peer authentication and source discovery; a mixed Flussonic cluster is not qualified.
 
-## Evidence
+## Early preview evidence (historical)
 
 - Rust tests exercise deep partial/reset/null merge, template inheritance across restart, validation without mutation, disk-write failure rollback and rejection of unsupported options.
 - Management tests exercise edit/view roles, Basic and base64 Bearer credentials, multi-segment stream names, auth before any media worker, and preserving unrelated workers on metadata changes.
@@ -15,23 +773,27 @@ This milestone is an executable subset of the product design, not complete Fluss
 - Browser tests cover stream creation/persistence, config validation without saving, Templates and Cluster views, and preserving template inheritance after a title edit.
 - Review regressions cover bounded SIGTERM shutdown with an open MPEG-TS response, portable named source auth backends, clean CDN playlist reload URLs, strict auth policy validation and keeping live bodies in admission accounting.
 
-## Limits
+## Early preview limits (historical)
 
-M4F currently supports up to two uniquely identified H.264/AAC tracks with one contiguous chunk each, 90 kHz normalization, at most 100,000 decoded samples and 32 MiB of aggregate decoded payload per segment. M4S supports observed MDin/FRam AVC/AAC frames and Fgop packed AVC/AAC segments. HEVC, subtitles, SCTE/ad metadata semantics and full legacy control behavior remain unqualified. Unknown records can be forwarded live as opaque bytes without executing them. Generated audio-only M4F output and subsecond GOP timestamp-path reuse remain unqualified. These modes must be qualified separately before migration.
+The limits in this section describe the initial HTTP-only preview. Later dated
+sections above and below record HTTPS and expanded transport/codec support;
+none of these stage results alone qualifies the current release candidate.
 
-CPU encoding uses libx264 plus AAC. NVIDIA configuration is exposed, but no GPU success is claimed without a real supported device and decoder test. v0.6 adds the explicitly tested RTSP TCP playback profile below. FFmpeg adapters and this profile do not establish full RTSP or SRT serving/publishing parity. RTSPS, direct RTP/SRTP and push roles are not implemented.
+This preview's M4F supported up to two uniquely identified H.264/AAC tracks with one contiguous chunk each, 90 kHz normalization, at most 100,000 decoded samples and 32 MiB of aggregate decoded payload per segment. M4S supported observed MDin/FRam AVC/AAC frames and Fgop packed AVC/AAC segments. HEVC, subtitles, SCTE/ad metadata semantics and full legacy control behavior remained unqualified at that stage. Unknown records could be forwarded live as opaque bytes without executing them. Generated audio-only M4F output and subsecond GOP timestamp-path reuse remained unqualified. These modes require separate qualification before migration.
 
-HLS and M4 windows are bounded; live subscribers use bounded shared queues and disconnect on lag. There is a 256-worker implementation limit. This build has not been benchmarked for production stream/viewer counts. v0.2 samples Linux CPU/RAM and aggregate TX bytes on the selected interface independently of management requests. HTTP media egress is reported separately; explicit process mode is available. Unknown/warmup/reset/stale metrics exclude new admissions. Balancing applies resource headroom and authoritative CDN reservations; it does not promise perfect uplink prediction.
+CPU encoding used libx264 plus AAC. NVIDIA configuration was exposed, but no GPU success was claimed without a real supported device and decoder test. v0.6 added the explicitly tested RTSP TCP playback profile below. FFmpeg adapters and that profile did not establish full RTSP or SRT serving/publishing parity. RTSPS, direct RTP/SRTP and push roles were not implemented in this preview.
+
+HLS and M4 windows were bounded; live subscribers used bounded shared queues and disconnected on lag. There was a 256-worker implementation limit. This build had not been benchmarked for production stream/viewer counts. v0.2 sampled Linux CPU/RAM and aggregate TX bytes on the selected interface independently of management requests. HTTP media egress was reported separately; explicit process mode was available. Unknown/warmup/reset/stale metrics excluded new admissions. Balancing applied resource headroom and authoritative CDN reservations; it did not promise perfect uplink prediction.
 
 API compatibility is a subset. Collection default ordering is by name; composite scalar sorting, literal substring `q`, nested `select`, scalar filtering and the documented value-based cursor profile for Streams/Templates collections are implemented. Complete filter/schema coverage, reference default ordering, full vendor cursor parity, selection on other collections/items, configuration-text formats and many operations remain open. API credentials/listeners/resource limits are startup settings rather than the complete vendor config contract. Unknown saved options fail validation. Viewer session counts expire after 30 seconds of inactivity when no continuous response remains open; global cross-node session ownership remains open.
 
-For testing, keep management endpoints on a trusted interface or reach them through SSH forwarding. The daemon currently serves HTTP, so HTTPS delivery requires a separately configured TLS terminator. The dedicated test instances must use separate directories, accounts, units and unused ports; never replace or restart existing Flussonic services.
+For that preview test, management endpoints stayed on a trusted interface or were reached through SSH forwarding. The daemon then served HTTP, so HTTPS delivery required a separately configured TLS terminator. The dedicated test instances used separate directories, accounts, units and unused ports; existing Flussonic services were not replaced or restarted.
 
 ## CDN test deployment
 
-The user authorized installations on cdn4-uk.ott.pink and cdn5-uk.ott.pink. Read-only inspection verified Ubuntu 24.04 x86_64, independent `/usr/bin/ffmpeg`, unused TCP 18210, and a shared private network. Installed isolated prefix/unit: `/opt/flussonix-test` / `flussonix-test.service`. Release artifacts are built for x86_64 Linux with musl so no host libc upgrade is required.
+The user authorized installations on two CDN test hosts. Read-only inspection verified Ubuntu 24.04 x86_64, independent `/usr/bin/ffmpeg`, unused TCP 18210, and a shared private network. Installed isolated prefix/unit: `/opt/flussonix-test` / `flussonix-test.service`. Release artifacts are built for x86_64 Linux with musl so no host libc upgrade is required.
 
-Qualification completed 2026-10-01 HST on the same x86_64 musl binary at both nodes (SHA256 `b3678fb1dde7a4856cc37bfd1a1f9e78802f4187a5557708da358a2487465e87`). cdn4 ran the source role, receiving the authorized Flussonic M4S AVC/AAC stream over HTTPS. cdn5 ran the CDN role and its FFmpeg input was verified to use cdn4's private address, 172.16.0.7. The local LB ran on 127.0.0.1:18211 and queried management through SSH forwards (18214/18215). It returned a 302 to cdn5; ticket redemption returned a clean reload URL. Delivered 1920x1080 H.264/AAC MPEG-TS passed FFprobe and an actual FFmpeg decode. Anonymous entry and segment requests were denied, and a later playlist reload succeeded.
+Qualification completed 2026-10-01 HST on the same x86_64 musl binary at both nodes (SHA256 `b3678fb1dde7a4856cc37bfd1a1f9e78802f4187a5557708da358a2487465e87`). cdn4 ran the source role, receiving the authorized Flussonic M4S AVC/AAC stream over HTTPS. cdn5 ran the CDN role and its FFmpeg input was verified to use cdn4's private network address. The local LB ran on 127.0.0.1:18211 and queried management through SSH forwards (18214/18215). It returned a 302 to cdn5; ticket redemption returned a clean reload URL. Delivered 1920x1080 H.264/AAC MPEG-TS passed FFprobe and an actual FFmpeg decode. Anonymous entry and segment requests were denied, and a later playlist reload succeeded.
 
 A Chromium HLS player followed the LB/CDN redirect flow through the SSH forwards and sustained playback beyond the initial playlist: 11 manifest loads, 10 buffered fragments, no fatal HLS errors. The test temporarily set the LB's public delivery endpoint to the CDN SSH forward and restored the cdn5 host endpoint afterward. Direct public access to test port 18210 was unavailable from the development host; no firewall or production listener was changed. Use SSH forwarding to access the remote test UI.
 
@@ -57,7 +819,7 @@ A temporary backend on the source's private interface qualified structured sourc
 
 Both nodes auto-selected their public default-route interface `ens19`. A measured interval reported 115.8 Mb/s aggregate source TX versus 8.7 Mb/s HTTP media output, and 183.5 Mb/s CDN TX versus zero HTTP media output, demonstrating that other-process traffic contributes to admission load. These are functional measurements, not throughput benchmarks.
 
-Local qualification passed 52 Rust tests, fmt and clippy with warnings denied, plus five browser tests against the release candidate on the unused local port 18220. One live-source test remains opt-in; the authorized live M4S source was qualified through the remote topology. The native-guard and unrelated-metadata-save regressions also passed. Production Flussonic remained at PID 1346636 on cdn4 and PID 211384 on cdn5, with the same port 80/443 listeners.
+Local qualification passed 52 Rust tests, fmt and clippy with warnings denied, plus five browser tests against the release candidate on the unused local port 18220. One live-source test remains opt-in; the authorized live M4S source was qualified through the remote topology. The native-guard and unrelated-metadata-save regressions also passed. Production Flussonic processes remained unchanged on both test hosts, with the same port 80/443 listeners.
 
 ## v0.3 operator forms and original M4 relay
 
@@ -79,7 +841,7 @@ On 2026-10-02 HST the same static x86_64 musl binary (SHA256 `036d7574150810bafa
 
 The local LB and remote source/CDN topology passed separately with native HLS, M4S and M4F source selection over the source's private LAN endpoint. Every mode demonstrated protected entry/segments, clean ticket redemption/reload, running shared workers, 1920×1080 H.264/AAC probing and actual FFmpeg decoding. Native M4F also demonstrated byte-identical source/CDN segment bodies at the same UTC path. This proves the independent native relay; direct access to the supplied production Flussonic M4F URL remains denied and unqualified.
 
-With M4S retained as the CDN test transport, Chromium sustained LB/CDN playback through the SSH forwards: 11 manifest loads, 9 buffered fragments, no fatal HLS errors. Its temporary loopback public endpoint was restored afterward. Production Flussonic remained at PID 1346636 on cdn4 and PID 211384 on cdn5, with the same port 80/443 listeners. Test units retain their separate resource limits; no production service, listener or firewall was changed.
+With M4S retained as the CDN test transport, Chromium sustained LB/CDN playback through the SSH forwards: 11 manifest loads, 9 buffered fragments, no fatal HLS errors. Its temporary loopback public endpoint was restored afterward. Production Flussonic processes remained unchanged on both test hosts, with the same port 80/443 listeners. Test units retain their separate resource limits; no production service, listener or firewall was changed.
 
 ## v0.4 supervised recovery
 
@@ -99,7 +861,7 @@ That same binary was installed into both isolated test units on TCP 18210. Nativ
 
 A SIGKILL was sent only after confirming that the target FFmpeg process belonged to `flussonix-test.service` and had the dedicated FlussoniX process as parent. Management-only polling demonstrated background CDN replacement without any new media request. Its playlist continued after the old window, changed generation, marked discontinuity and delivered decodable protected media. A separate kill during Chromium playback through the local LB and SSH-forwarded CDN produced 19 playlist loads and 17 buffered fragments, no fatal errors, and 5.003 seconds of playback advancement in the final five-second interval after old buffered media had been passed.
 
-The temporary loopback delivery endpoint was restored. Both nodes retain v0.3 test binaries and UI directories as rollback copies. Production Flussonic remained at PID 1346636 on cdn4 and PID 211384 on cdn5, with unchanged port 80/443 listeners. No production service, configuration or firewall was modified. This qualifies worker recovery in the tested subset; it does not establish gapless playback, daemon-restart timeline continuity, complete protocol/API parity, GPU support or production scale.
+The temporary loopback delivery endpoint was restored. Both nodes retain v0.3 test binaries and UI directories as rollback copies. Production Flussonic processes remained unchanged on both test hosts, with unchanged port 80/443 listeners. No production service, configuration or firewall was modified. This qualifies worker recovery in the tested subset; it does not establish gapless playback, daemon-restart timeline continuity, complete protocol/API parity, GPU support or production scale.
 
 ## v0.5 equivalent-origin failover
 
@@ -111,11 +873,11 @@ The original v0.5 qualification stopped media after all-origin blackout and requ
 
 ### v0.5 isolated LAN failover
 
-On 2026-10-02 HST, exact static x86_64 musl binary SHA256 `308dd73ce3e9746cd068f88c8c777758d5ed45c028e5c1f6f0c75a138b34b280` was installed in both existing isolated units on TCP 18210, retaining the v0.4 binary/UI for rollback. An owned temporary source on cdn4’s private address 172.16.0.7:18212 ran as a separate resource-limited transient unit. Primary and backup carried an owned synthetic stream with explicit matching group/content identity and viewer token guard; no production stream was used for failure injection.
+On 2026-10-02 HST, exact static x86_64 musl binary SHA256 `308dd73ce3e9746cd068f88c8c777758d5ed45c028e5c1f6f0c75a138b34b280` was installed in both existing isolated units on TCP 18210, retaining the v0.4 binary/UI for rollback. An owned temporary source on the source host’s private interface and port 18212 ran as a separate resource-limited transient unit. Primary and backup carried an owned synthetic stream with explicit matching group/content identity and viewer token guard; no production stream was used for failure injection.
 
 After validating its unit/parent, only the CDN test packaging child received SIGKILL. Management-only polling observed background switching to the backup while the primary source API remained alive. Protected delivered media decoded, and the fallback stayed selected after the primary recovered. Stopping only the temporary backup source then caused an API/media outage; the CDN returned to the primary with switch count 2. Chromium followed LB ticket redemption, buffered a distinct generation, advanced beyond the old buffered media and sustained 5.003 seconds of normal advancement over the final five-second interval: 11 manifest loads, 9 buffered fragments, no fatal errors. The active-pulls UI reported the current source and both switches. Anonymous segments remained denied.
 
-The temporary replica, configuration and SSH forward were removed; source/CDN/LB root configurations were restored and verified. Production Flussonic remained at PID 1346636 on cdn4 and PID 211384 on cdn5, with unchanged 80/443 listeners. A first cold qualification attempt timed out before the expected state was observed; instrumented retries observed the intended transitions and the final complete run passed. An intermediate browser helper read the UI before asynchronous loading completed; the helper now waits for the row. These are lab results, not a production-scale availability claim.
+The temporary replica, configuration and SSH forward were removed; source/CDN/LB root configurations were restored and verified. Production Flussonic processes remained unchanged on both test hosts, with unchanged 80/443 listeners. A first cold qualification attempt timed out before the expected state was observed; instrumented retries observed the intended transitions and the final complete run passed. An intermediate browser helper read the UI before asynchronous loading completed; the helper now waits for the row. These are lab results, not a production-scale availability claim.
 
 The same exact binary also passed the existing authorized live-source regression separately with native LAN HLS, M4S and M4F. Each mode demonstrated protected LB redirects, clean ticket redemption/reload, protected segments, H.264/AAC probing and actual FFmpeg decode. Source/CDN M4F segment bodies remained byte-identical at the original UTC path. M4S was restored as the dedicated CDN source transport; the production input/configuration remains unchanged.
 
@@ -129,7 +891,7 @@ Full direction-matrix, mixed-vendor RTSP dialect/authentication, UDP/TLS/direct 
 
 ### v0.6 isolated RTSP and HTTP qualification
 
-On 2026-10-02 HST the exact static x86_64 musl binary SHA256 `082492cefa7bed63d501e65b7cc6ebd0b7e2a3af3514563433b8382364805d0e` was installed into both existing isolated cdn4/cdn5 test units. HTTP remains on 18210; RTSP listens only on 127.0.0.1:18554. The v0.5 binary, web directory and service unit are retained for rollback. Production Flussonic remained at PID 1346636 on cdn4 and PID 211384 on cdn5, with unchanged 80/443 listeners.
+On 2026-10-02 HST the exact static x86_64 musl binary SHA256 `082492cefa7bed63d501e65b7cc6ebd0b7e2a3af3514563433b8382364805d0e` was installed into both existing isolated source/CDN test units. HTTP remains on 18210; RTSP listens only on 127.0.0.1:18554. The v0.5 binary, web directory and service unit are retained for rollback. Production Flussonic processes remained unchanged on both test hosts, with unchanged 80/443 listeners.
 
 Owned token-protected synthetic streams supplied the RTSP checks. Independent FFmpeg decoded 125 video and 235 audio frames over five seconds from each source and CDN output; anonymous DESCRIBE was denied. The CDN reused its authenticated private M4S pull. A separate owned source worker ingested its loopback RTSP output and produced HLS with both tracks independently decoded. The fixtures and temporary RTSP SSH forwards were removed. No production stream was used for RTSP failure injection or altered.
 
@@ -146,9 +908,9 @@ Fresh whole-branch review reproduced wildcard socket route pinning, more stale R
 
 ### v0.7 isolated LAN qualification
 
-On 2026-10-02 HST exact static x86_64 musl binary SHA256 `3539a469a5fce2096757c2f3e141fec8bdda267d8073dd1704ce96bb5f92f61a` was installed in both existing isolated test units. The v0.6 binary, web directory and unit remain available for rollback. For qualification only, control and the 32-port UDP pool used private interfaces 172.16.0.7/172.16.0.8 on TCP 18554 and UDP 42000–42031. Independent FFmpeg ran on the other LAN host: source UDP and TCP and CDN UDP/TCP each decoded 125 video and 235 audio frames over five seconds. Both native M4S and M4F authenticated private pulls supplied CDN UDP output. Anonymous DESCRIBE returned 403 before synthetic worker startup.
+On 2026-10-02 HST exact static x86_64 musl binary SHA256 `3539a469a5fce2096757c2f3e141fec8bdda267d8073dd1704ce96bb5f92f61a` was installed in both existing isolated test units. The v0.6 binary, web directory and unit remain available for rollback. For qualification only, control and the 32-port UDP pool used private source/CDN interfaces on TCP 18554 and UDP 42000–42031. Independent FFmpeg ran on the other LAN host: source UDP and TCP and CDN UDP/TCP each decoded 125 video and 235 audio frames over five seconds. Both native M4S and M4F authenticated private pulls supplied CDN UDP output. Anonymous DESCRIBE returned 403 before synthetic worker startup.
 
-An owned RTSP input with `rtp:"udp"` produced HLS independently decoded as 50 video and 94 audio frames. Source UDP output increased by 531909 application bytes during this roundtrip, distinguishing it from the default TCP adapter. Final source/CDN UDP counters were 1380462/1403989 bytes. Synthetic fixtures and their workers were removed, the CDN source transport restored, and both dedicated RTSP listeners/pools returned to loopback. HTTP remains on the existing test port 18210. Production Flussonic PIDs remained 1346636 on cdn4 and 211384 on cdn5 with unchanged 80/443 listeners. No production configuration, stream or process was altered.
+An owned RTSP input with `rtp:"udp"` produced HLS independently decoded as 50 video and 94 audio frames. Source UDP output increased by 531909 application bytes during this roundtrip, distinguishing it from the default TCP adapter. Final source/CDN UDP counters were 1380462/1403989 bytes. Synthetic fixtures and their workers were removed, the CDN source transport restored, and both dedicated RTSP listeners/pools returned to loopback. HTTP remains on the existing test port 18210. Production Flussonic processes and 80/443 listeners remained unchanged on both test hosts. No production configuration, stream or process was altered.
 
 The staged standalone binary serves its compiled UI and independently decodes UDP and TCP playback (75 video/141 audio frames each over three seconds) with a system PATH. Credential, dependency-license and artifact-whitelist audits pass; no official Flussonic runtime/component or private lab credential is packaged. This qualifies the exercised H.264/AAC-LC preview subset. RTSPS, direct RTP/SRTP, publishing/push, Basic/Digest viewer authentication, RTSP LB redirection, full API/vendor parity, GPU and production-scale/migration qualification remain open.
 
@@ -165,9 +927,9 @@ After the fresh review findings and one fix pass, 181 Rust tests pass with zero 
 
 On 2026-10-02 HST static x86_64 musl binary SHA256 `118602dd8254a29534719ece1bb596bbc67947b89314f9ba2e38b6b33ba9605b` passed the compiled UI and all 13 Chromium cases. A system-PATH standalone smoke decoded TCP, unicast UDP and TLS playback as 75 video and 141 audio frames each over three seconds; a separate strict Python/OpenSSL client verified its certificate/IP identity. Credential, license-graph and artifact-whitelist audits pass: no official Flussonic component, vendor asset, Erlang module, private test key/certificate or lab credential is packaged. Direct Rustls/roots dependencies promote already-resolved libraries without changing the licensed dependency graph.
 
-The same binary runs in the existing limited source/CDN test units on cdn4/cdn5. Only for qualification, unused TLS port 18555 listened on private LAN addresses 172.16.0.7/172.16.0.8. Independent peer FFmpeg 6.1.1 decoded source TLS and CDN TLS via private M4S and M4F pulls as 125 video and 235 audio frames each over five seconds. A strict independent client verified source IP identity and anonymous DESCRIBE returned 403 before worker startup. A FlussoniX RTSPS input on cdn5 verified cdn4 against its owned private CA, reported `input_protocol:rtsps`, and produced HLS independently decoded as 50 video and 94 audio frames. This exercises actual verified remote input, not a separate certificate preflight.
+The same binary runs in the existing limited source/CDN test units on both hosts. Only for qualification, unused TLS port 18555 listened on private LAN interfaces. Independent peer FFmpeg 6.1.1 decoded source TLS and CDN TLS via private M4S and M4F pulls as 125 video and 235 audio frames each over five seconds. A strict independent client verified source IP identity and anonymous DESCRIBE returned 403 before worker startup. A FlussoniX RTSPS input on the CDN verified the source against its owned private CA, reported `input_protocol:rtsps`, and produced HLS independently decoded as 50 video and 94 audio frames. This exercises actual verified remote input, not a separate certificate preflight.
 
-Owned synthetic streams/workers were removed, source transport restored to M4S, and TLS listeners returned to loopback. The final local preview also independently decodes UDP and TLS as 75 video/141 audio frames, with strict TLS identity and anonymous-denial checks. Both hosts retain v0.7 binary/web/unit rollback copies. Production Flussonic PIDs stayed 1346636/211384 with unchanged 80/443 listeners; production streams/configuration/processes were not altered. The dedicated lab uses owned temporary certificates valid for 14 days; users supply their own certificates for the optional TLS listener, and no test key/certificate is shipped.
+Owned synthetic streams/workers were removed, source transport restored to M4S, and TLS listeners returned to loopback. The final local preview also independently decodes UDP and TLS as 75 video/141 audio frames, with strict TLS identity and anonymous-denial checks. Both hosts retain v0.7 binary/web/unit rollback copies. Production Flussonic processes and 80/443 listeners remained unchanged; production streams/configuration/processes were not altered. The dedicated lab uses owned temporary certificates valid for 14 days; users supply their own certificates for the optional TLS listener, and no test key/certificate is shipped.
 
 The final binary and local load balancer also regress all three private native HLS/M4S/M4F paths against the already authorized live test source: protected redirects, clean ticket redemption/reload, anonymous segment denial and H.264/AAC decode pass. Original M4F payload bytes and UTC segment path are preserved. These results qualify the exercised preview subset; full API/vendor parity, publishing/push, direct RTP/SRTP, GPU, performance/scale and migration readiness remain open.
 
@@ -188,7 +950,7 @@ Changing the processing configuration closed the old publisher, left the stream 
 
 Initial lab harness attempts used Python’s default form content type instead of video/mp2t and multiplexed publication upload with API requests over one WAN SSH connection. The server correctly rejected the wrong content type. Quiet API roundtrip measured559ms against the unchanged750ms lookup bound; a separate owned publication tunnel allowed the complete qualification to pass. Unique fixture names avoid stale test-policy caches. Product lookup/media deadlines were not increased. These results do not qualify WAN management lookup latency or sustained performance/scale.
 
-Production Flussonic PIDs remained1346636/211384 and 80/443 listeners were unchanged during installation; production configuration, streams and processes were not altered. This qualifies configured HTTP receiving in the exercised preview subset. Full publisher policy/session parity, HTTPS receiving listener, RTSP/SRT publication/push, direct RTP/SRTP, additional codecs, GPU hardware, full vendor/API/mixed-cluster parity and migration/scale readiness remain open.
+Production Flussonic processes and 80/443 listeners were unchanged during installation; production configuration, streams and processes were not altered. This qualifies configured HTTP receiving in the exercised preview subset. Full publisher policy/session parity, HTTPS receiving listener, RTSP/SRT publication/push, direct RTP/SRTP, additional codecs, GPU hardware, full vendor/API/mixed-cluster parity and migration/scale readiness remain open.
 
 
 The same exact binary and local LB also pass the separate authorized live-source regression in native private HLS, M4S and M4F modes. Protected redirects, clean ticket redemption/reload, anonymous segment denial, H.264/AAC probing and independent FFmpeg decoding pass in each mode. Original M4F segment bytes and UTC path are preserved. M4S is restored as the dedicated CDN source transport; the authorized production input/configuration is unchanged.
@@ -207,7 +969,7 @@ The exact static musl binary SHA256 is `107c9c2091a127aea80ebb88740d74273894f738
 
 This exact binary/UI was installed only in the dedicated local/source/CDN/LB previews. Source/CDN verified HTTPS HLS and fMP4 each decoded73/141 over3seconds; continuous TS checks used5seconds to observe recovery after an original B-frame GOP boundary and decoded80/235 and116/235 respectively. Only bounded initial missing-PPS/slice/reference warnings were accepted for this declared continuous-TS late-join behavior; separate plaintext checks decoded both tracks. No product timeout/retry/framing workaround was added.
 
-HTTPS M4F signaling and segments preserved original payload hashes versus plaintext; HTTPS M4S delivered native wire. Protected viewer denial, HTTPS LB redirects, capacity-ticket removal and local HTTPS MPEG-TS publication/independent fMP4 decode passed. The publication fixture was deleted and producer reaped. Production Flussonic PIDs1346636 on cdn4 and211384 on cdn5 and listeners80/443 stayed unchanged during dedicated installation; PIDs and deployed binary hashes were rechecked after qualification. Original dedicated source/CDN private LAN transport/configuration remains in place; the owned LB public test endpoint now uses HTTPS through the owned forwarding tunnel.
+HTTPS M4F signaling and segments preserved original payload hashes versus plaintext; HTTPS M4S delivered native wire. Protected viewer denial, HTTPS LB redirects, capacity-ticket removal and local HTTPS MPEG-TS publication/independent fMP4 decode passed. The publication fixture was deleted and producer reaped. Production Flussonic processes and listeners on ports 80/443 stayed unchanged during dedicated installation; process identities and deployed binary hashes were rechecked after qualification. Original dedicated source/CDN private LAN transport/configuration remains in place; the owned LB public test endpoint now uses HTTPS through the owned forwarding tunnel.
 
 The static candidate passed all15 browser cases; Config status and publication-origin inheritance additionally passed over HTTPS. The browser lab pins only its owned leaf public key, while its API requests use the owned CA; independent TLS transport/negative certificate tests remain strictly verified. Lab TLS uses owned certificates on loopback18443, local LB18444 and forwarded18224/18225; it does not establish public production-host certificate provisioning. The CA was corrected to include keyCertSign/cRLSign after Python3.13 strict validation rejected the original fixture; verification was not disabled.
 
@@ -1109,6 +1871,8 @@ A controlled comparison freshly compiled the unchanged prior production source a
 
 A later bounded investigation at revision `08e4cb7` ran the unchanged plaintext six-codec matrix three times with fresh owned packet captures. All 18 cases passed strict worker and receiver decoding, including nine HEVC cases and three HEVC/MP3 cases. Across the shared sequence intervals, 4,728 public-input and private-decoder RTP packets matched byte for byte, with no internal sequence gaps or reported native input loss. All 36 capture summaries report unchanged destination ownership and zero packet-socket drops. Six private packets precede their lane's first captured public sequence and lie outside common startup coverage. These kernel-path observations do not prove userspace receipt; startup and socket handoff remain unobserved. The historical failure did not reproduce, its cause remains unresolved, and no production media repair is established.
 
+At release integration revision `e1c51a9`, the isolated plaintext HEVC/MP3 case passed 11 consecutive runs with owned public-input and private-decoder packet taps enabled. Each run strictly decoded both the worker recording and independent receiver recording; the successful private captures were deleted. This increases repeat coverage but still does not reproduce or explain the archived 38-picture gap. No production RTP repair is claimed.
+
 ## Cluster collection field selection qualification
 
 Seven real-router regressions first fail against full-row cluster responses.
@@ -1432,3 +2196,338 @@ regressions distinguish missing/ambiguous acknowledgment from accepted media and
 retain public/native-peer behavior. Read-only reference header checks support the
 wire contract; they do not qualify serving-server identity, consistent live M4F
 payloads or automatic mixed-vendor routing. See [endpoint checks](vendor-endpoint-checks.md).
+
+## Elementary RTP/SRTP decoder startup queue
+
+The isolated candidate at `437c704` starts public per-track RTP/SRTP admission
+before writing the private decoder SDP. Valid early packets wait behind the
+existing all-port decoder-ownership gate. A track can retain 1,024 RTP packets
+or 2 MiB and 64 RTCP packets or 128 KiB; oldest overflow drops have distinct
+runtime counters. Wrong-key, malformed and foreign early packets cannot pin a
+peer, queued media cannot reach a partly bound or foreign decoder, and queued
+packets are discarded on cancellation. Real UDP regressions cover 1,025 paced
+SRTP packets (one intentional oldest drop), two-track isolation, 65 SRTCP
+reports (one intentional oldest drop), and ordered delivery across startup.
+
+The fresh serial `elementary_media` and `elementary_srtp_media` matrices passed
+five plaintext and four secure test functions, with one hardware-only case
+ignored in each. Their 27 owned H.264/HEVC with AAC/MP2/MP3, audio-only and CPU
+conversion cases all finished with strict worker/receiver decoding. All 27
+retained boundary evidence files ended qualified and complete. Their worker
+snapshots reported zero `startup_dropped_packets`,
+`startup_dropped_rtcp_packets` and native RTP `lost`; observed UDP socket-drop
+counters were zero. The controlled overflow tests show the counters work, but
+normal media rates did not exercise their limits. This does not establish that
+the archived 38-picture HEVC loss is repaired. The loss did not reproduce in
+this run, and the passive taps used in that prior run did not cover startup.
+
+## Elementary RTP/SRTP startup handoff capture
+
+The optional owned-fixture public tap now starts after the synthetic sender's
+SDP, before input reservations are released, and stays on one filtered packet
+socket through native input binding. It records sender, reservation and native
+socket witnesses and the handoff timestamps. The unchanged private tap starts
+after decoder readiness. This is a test-only diagnostic change; no server media
+path or ordinary CI privilege requirement changed.
+
+On the isolated Linux host, the strict H.264/HEVC × AAC/MP2/MP3 plaintext
+matrix and the corresponding encrypted-source SRTP matrix each passed all six
+owned cases. Every public and private tap retained an attributable, complete
+trace. Public captures contained 278–464 packets per case; private captures
+contained 214–324. Within each observed RTP/SRTP lane, distinct sequence
+counts equaled the first-to-last sequence span. All 24 taps reported zero
+packet-socket drops and zero queued bytes at stop. Native input reported zero
+RTP sequence loss, zero startup RTP drops and zero startup RTCP drops. The
+independent worker and receiver recordings passed strict codec, frame and
+decode checks. The pre-activation sender prefix is still unobserved, and
+packets observed during handoff are attempts rather than proof of native
+application receipt. The archived 38-picture HEVC loss did not recur in these
+cases; its cause and repair were unresolved at that stage. The final release
+disposition is recorded below.
+
+An additional 43 serial runs of the owned HEVC/MP3 plaintext diagnostic on the
+isolated Linux host passed strict worker and receiver decoding with optional
+packet taps enabled. One inspected run retained complete public and private
+traces with zero packet-socket drops or queued bytes at stop. The inspected
+artifact and other passing-run artifacts were removed; no test FFmpeg process
+was left running. These passes did not reproduce or explain the archived
+picture loss. The final release disposition below incorporates the later
+exact-head repetition while preserving the unknown cause.
+
+## Tokenless SRT playback candidate
+
+The isolated SRT ticket candidate issues five-second, single-use playback
+credentials over HTTPS for encrypted native SRT listeners. The returned SRT
+Stream ID omits the original viewer token. Local and two-node tests cover
+single-use redemption, wrong-IP denial, viewer-policy recheck, native CDN
+placement and HEVC with MP2/MP3 recovery. Direct-token playback is off by
+default and requires an explicit trusted-network option; Flussonic peers need
+their own separate opt-in. The API and operator setup are described in
+[SRT playback](srt-playback.md) and [CDN placement](vendor-cdn-placement.md).
+
+An owned UDP relay captured the first 128 client datagrams of a tokenless SRT
+connection. The assertion checks raw bytes and all 32-bit word alignments used
+by the SRT Stream ID extension. The reusable token was absent, while a
+deliberately enabled direct-token control was detected by the same parser.
+Independent FFmpeg strictly decoded H.264/AAC media from both connections;
+wrong-passphrase admission did not consume the ticket, and replay after use
+delivered no media. The six-profile encrypted listener matrix and four HEVC
+MP2/MP3 M4F/M4S native recovery profiles also passed serially.
+
+A later full CI run (`41944935451`) failed the M4F/HEVC/MP2 recovery case at
+its first fresh HTTPS SRT lookup with HTTP 503; the other three recovery cases
+passed. The exact failing case passed six serial runs on the isolated Linux
+host, including one initial run and five repeats with failure-only placement
+diagnostics. All test-owned daemons and FFmpeg children exited, passing logs
+were removed, and the temporary build target was deleted. These passes do not
+explain or repair the CI refusal. The bounded placement diagnostic is prepared
+for the next immutable-head run; SRT recovery remains a release gate.
+
+This candidate was not a production release. Full exact-head Rust/browser and
+packaging checks, review, WAN/capacity measurements, the independent 24-hour
+run and installation/upgrade/recovery checks remained open at that stage.
+Local success did not establish live Flussonic SRT interoperability.
+
+## Explicit stream input selection candidate
+
+The private bodyless `POST /streamer/api/v3/streams/{name}/inputs/{index}/select`
+accepts a zero-based configured input index and returns empty `204`. Invalid,
+disabled or publisher selections return `400`; an absent stream returns `404`.
+Normal edit-role, management transport and browser-origin checks apply. A
+selection changes a runtime preference, not saved input order. Active and
+static local workers switch; retrying on-demand workers resume on the new
+input, while never-started on-demand streams remain idle. Load-balancer nodes
+do not start local media for a selection. Automatic
+fallback remains in effect, and the preference clears when effective inputs
+change or the daemon restarts. Shared-source workers are excluded.
+
+Focused engine, API, recovery and native-startup tests passed. The owned-daemon
+browser tests verified the bodyless request, preferred/retrying/active labels,
+credential masking and view-only controls. An isolated loopback smoke observed
+the old MPEG-TS viewer close after its queued data drained, the old worker
+process exit, a new worker on input 2, and fresh TS packets for a reconnecting
+viewer; the saved config bytes did not change. This is local qualification of
+the candidate route and UI, not a claim of seamless viewer continuity or full
+Flussonic parity.
+
+## Pre-sender elementary RTP trace candidate
+
+The optional, owned-fixture public packet tap now activates before FFmpeg is
+spawned and keeps one bounded capture through SDP creation, reservation release
+and native input binding. Because the sender source ports are not yet known at
+activation, the locked kernel filter limits capture to the fixture's exact
+loopback destination ports. Final retention requires unchanged sender and
+native socket owners, candidate source ports matching the later sender witness,
+and userspace observation timestamps after the spawn marker. Incomplete or
+ambiguous traces are discarded. The pre-witness prefix is labeled candidate
+only: later port ownership and dequeue timestamps cannot prove its sender.
+
+On the isolated Linux host, strict H.264/HEVC × AAC/MP2/MP3 plaintext and
+encrypted-source/encrypted-destination matrices passed all 12 cases. All 12
+public taps began before sender spawn and retained complete, port-correlated
+candidate traces; all 12 private decoder taps were complete. Public taps retained 272–486
+RTP packets per case, reported zero packet-socket drops, and native input
+reported zero RTP loss or startup packet drops. The two privileged loopback tap
+regressions, the sender-spawn ordering regression and the handoff media
+assertion also passed. The early interval is now visible as candidate packets,
+but sender attribution in that interval and the private pre-readiness interval
+remain limits. The archived 38-picture HEVC failure did not
+reproduce, its cause is still unknown, and no production media repair is claimed.
+
+## Direct SRTP track binding candidate
+
+The isolated branch now requires a durable owner-only receiver key history for
+direct SRTP input by default, with an explicit legacy reuse option. MP2T and
+two-track elementary receivers deny a repeated key after restart; an occupied
+later RTP/RTCP port or failed atomic claim leaves public ports closed without
+partially consuming a new track key. Two elementary input modes were exercised:
+one shared key with SDP-matched expected SSRCs, and distinct per-track keys.
+The shared-key receiver also binds two tracks from configured SSRCs when an
+external SDP omits optional identity lines; a conflicting declared identity
+still fails. Receiver-history capability checks reject an owner-only directory
+without owner read/write/search permission.
+Captured first-lane ciphertext was rejected on the second lane before its
+first packet and during the startup queue, while valid media and SRTCP from
+both lanes were delivered. Independent FFmpeg media tests passed H.264/HEVC,
+AAC/MP2/MP3 and CPU conversion cases; the Intel VAAPI-only case remains gated
+by hardware availability.
+
+Outbound keys are matched by packetizer track ID, media and encoding before
+sockets and SDP are published. Live UDP tests decrypted each lane with only its
+configured key, rejected duplicate key bytes, and withdrew SDP on a same-count
+track-ID change. The Streams and Templates browser flows saved, reloaded and
+cleared the new labeled controls without a JSON editor. On isolated test
+daemons, CDN4 sent encrypted MP2T SRTP over the private LAN to CDN5 using a
+fresh receiver key epoch. CDN5 returned an HLS playlist and a 280,120-byte
+segment; independent FFprobe identified H.264 video and AAC audio in that
+segment. The receiver history recorded the new key claim. The temporary
+firewall rule, test daemons and test files were removed afterward; both hosts'
+Flussonic services remained active. This checks one cross-host MP2T profile,
+not the elementary profiles or a sustained-loss run.
+
+On candidate `69da2e00`, a separate isolated two-track elementary SRTP run
+sent H.264 and AAC from CDN4 to CDN5 using a shared key and the sender's
+published per-track SSRCs. With the private-LAN UDP rule in place before
+receiver startup and a fresh key epoch, the CDN5 receiver reported 15,852
+admitted packets, 38 RTCP packets, zero authentication failures and zero loss
+at the first status check. Independent FFprobe identified H.264 video and AAC
+audio from its HLS playlist. A receiver restart with the same key returned
+503 and had no public SRTP sockets. The first attempt, started before the
+temporary firewall rule was installed, did not recover media after the rule
+was opened; that recovery path remains to be diagnosed. Both isolated daemons,
+their test files and the exact temporary firewall rule were removed, and the
+pre-existing services stayed active. This qualifies the exercised shared-key
+elementary path. A second isolated run on the same candidate used different
+keys for the H.264 and AAC tracks, mapped by output track IDs 256 and 257 and
+received in SDP media order. CDN5 reported 3,873 admitted RTP packets and 8
+RTCP packets, with no authentication failures or reported loss; FFprobe again
+decoded H.264 and AAC from its HLS output. Its exact UDP rule, short-lived
+daemons, keys and media files were removed afterward. Both elementary binding
+modes are qualified for this cross-host H.264/AAC case; sustained-loss
+recovery and the remaining release blockers are still pending. These results
+do not establish a production-ready release.
+
+A later isolated no-media regression bound the two-track elementary SRTP
+receiver without starting a sender. Binding durably claimed both keys; after
+the receiver was dropped, a same-key bind failed with the expected rotate-key
+error and closed its public UDP sockets. Rotating both keys admitted a fresh
+receiver. This confirms that a startup timeout followed by a same-key retry
+cannot recover under the approved receiver-epoch policy, even if no packet was
+received. The earlier cross-host run did not retain enough worker and ledger
+timing to attribute that specific failure solely to this mechanism. An
+operator must coordinate a new sender/key epoch after a receiver generation
+ends; the explicit legacy key-reuse option has weaker replay protection.
+
+The candidate capabilities endpoint now reports receiver-history readiness
+without disclosing its path or fingerprints; a background check is coalesced
+for 30 seconds. The focused API test covered absent, valid and unsafe history
+with 12 concurrent authenticated requests. The optional systemd helper now
+renders a stable history path under the private state directory without
+creating it. All 28 helper tests passed, including unsafe ledger/lock refusal
+and an actual `systemd-analyze verify` on a generated secure-listener unit.
+The upgrade instructions require explicit initialization and a fresh sender
+key/epoch before media admission. The helper itself does not start a service.
+
+## SRT ticket body admission candidate
+
+Candidate `36f731b` gives the public SRT ticket issuer a five-second absolute
+body-read deadline and limits unfinished ticket bodies to 16 globally and
+eight per canonical peer IP. Deadline expiry returns 408; quota exhaustion
+returns 429. Both responses carry no-store and close the HTTP/1 connection.
+The quota is released before JSON parsing and authorization, and cancellation
+also releases it. The integrated candidate's eight issuer tests passed,
+including stalled-body expiry and same-peer capacity release. An owned raw
+loopback HTTP/1 test observed socket closure for both 408 and 429, an immediate
+health response while eight bodies were held, and no retained test daemon.
+Formatting and warning-denied all-target Clippy passed on the isolated fix.
+This is focused evidence; full candidate CI and release security review must
+be repeated after the remaining fixes are integrated.
+
+## M4 input-generation origin pinning candidate
+
+Candidate `2f14bd3` resolves each configured M4F/M4S origin once when its
+input generation starts, limits the result to eight addresses and keeps that
+set for control reconnects and M4F segment GETs. A new input generation
+resolves again. The integrated M4 ingest unit suite passed all 26 tests,
+including resolution timeout/cancellation, reconnect and segment placement,
+and a local HTTPS check that accepted a pinned hostname with its trusted
+certificate while rejecting a trusted certificate for a different hostname
+before any HTTP request. Native Basic and peer-key behavior remained covered.
+
+An isolated, read-only local LB/CDN qualification against the existing CDN4
+Flussonic source returned H.264/AAC media for both secure M4S and M4F.
+The M4S path delivered 61,440 bytes and the M4F path delivered 2,499,295
+bytes, including an acknowledged control and a fetched segment. The local LB
+redirected to the local CDN; unauthenticated requests were denied at both
+local nodes. This checks one live stream and these exercised paths. It does
+not establish sustained-loss recovery or a production-ready release.
+On the integrated candidate, the native TLS, vendor source binding, modern
+vendor binding and SRT ticket suites passed all 44 tests. Formatting and
+warning-denied all-target Clippy also passed. Full CI and the release security
+review still need to run on this combined source.
+
+## RTSP connection admission candidate
+
+Candidate `c55bf30` keeps a per-peer-IP connection lease for the full RTSP or
+RTSPS socket lifetime, including TLS setup, admitted playback and publication.
+One IP can hold at most 64 of a listener's 256 control connections. An owned
+loopback listener rejected a saturated IP, completed an admitted DESCRIBE from
+another IP, retained that lease through the response and re-admitted the first
+IP after release. Cancellation emptied the gate and stopped the owned worker.
+The RTSP unit and RTSP/RTSPS authorization suites passed locally, as did
+formatting and warning-denied all-target Clippy on the isolated branch. The
+same-source full CI and release security review remain pending.
+
+## FXLink long-haul source discovery candidate
+
+An explicitly configured native FXLink source now has a 2.5-second limit for
+authenticated metadata query and static inventory, including waiting for a
+source-query permit. A lookup with an eligible, non-draining FXLink source has
+six seconds to select an origin. Ordinary sources retain their 750 ms request
+limit and three-second selection window. The existing 64 query permits,
+16 concurrent inventory refreshes, three-second HTTP client limit, response
+size bounds, authorization and stale-revision checks remain in place.
+
+Three loopback regressions first failed at the former 750 ms deadline, then
+passed with 900 ms authorized responses for FXLink while an ordinary source
+still timed out. A slow primary control request followed by an authorized
+backup resolved after the ordinary three-second window, and an unrelated
+FXLink source group did not extend an ordinary mirror's deadline. The 19
+source-directory, 22 resolver and five activation unit tests passed. All 16
+source-failover integration tests passed in a serial run.
+An earlier four-thread run under a 60% CPU cap had four timing/media failures;
+the serial run with adequate CPU passed those same cases.
+
+The CI release-package job for runtime head `5526fc9` passed, and the extracted
+binary (`743a2b12e9d1985ec8918be6de3bfdc9568b91bad02ea65b112b1fbe1a5a7099`)
+passed a separate 90-second two-stream FXLink v9 probe in a disposable cdn5
+network namespace. Netem shaped all loopback traffic, including management
+HTTP and media UDP, to 250 ms each direction with 1% loss. Authenticated source
+discovery succeeded, both HLS playlists advanced across 12 samples, and the
+first and last segments strictly decoded as H.264/AAC. FXLink reported 500 ms
+RTT, 27/27 and 86/86 original losses recovered, and no expired records or
+queue drops. The namespace, daemons and FFmpeg children exited; the existing
+CDN test service remained active. Full CI verification is still pending. This
+short same-host impairment probe does not establish sustained WAN behavior,
+production capacity or full migration compatibility.
+
+## Direct RTP/SRTP fMP4 codec qualification
+
+The owned direct MP2T RTP and SRTP fMP4 copy tests now run both H.264 and HEVC
+with simultaneous AAC, MPEG Layer II and MPEG Layer III audio. Each case probes
+the produced fMP4 video codec, checks the actual MPEG audio frame headers for
+both Layer II and III, and independently decodes all four tracks. FFprobe labels
+both MPEG audio tracks `mp3` in this MP4 container, so its codec name alone does
+not distinguish the preserved layers. The focused plaintext and encrypted
+tests passed on the isolated Linux host. A separate secure elementary SRTP
+fMP4 matrix passed all six H.264/HEVC × AAC/MP2/MP3 cases. These tests do not
+explain the archived intermittent 38-picture HEVC input loss, establish browser
+support for every MPEG audio track, or replace exact-head full CI.
+
+## Elementary HEVC release disposition
+
+Exact head `f235001d78186f8f92710d15a7d02ad3060cd29a` passed 26 consecutive
+HEVC/MP3 plaintext runs with packet taps and strict worker and independent
+receiver decoding. The gate comprised one initial pass and a bounded 25-run
+repeat; the repeat completed 25/25 runs in 121.894 seconds. Every repeat
+retained at least 277 native input packets, 298 public packet records and 215
+private packet records. The initial pass retained 281 public and 216 private
+packet records. Across all 26 runs, observed kernel drops, native sequence
+loss, startup RTP/RTCP drops, invalid packets, authentication failures and
+foreign packets were zero, and every retained public/private tap was complete.
+
+The archived failure predates both the asynchronous synthetic recorder change
+(`740f585`) and the bounded startup queue (`18450c3`). Those changes remove a
+known test-harness scheduling confounder and bound packets admitted during
+decoder startup, but the archive does not prove that either change repaired
+the older failure or establish its root cause. The 38-picture loss remains
+historical diagnostic context with an unknown cause.
+
+This evidence closes the archived observation as a release blocker for the
+supported direct elementary RTP/SRTP profile. It is a bounded localhost
+qualification, not evidence of WAN reliability, sustained capacity, recovery
+after actual packet loss or an unbounded guarantee for every workload. Direct
+RTP/SRTP over UDP cannot recover network loss, kernel drops, runtime starvation
+or bursts beyond the fixed per-track startup queue of 1,024 RTP packets or
+2 MiB plus 64 RTCP packets or 128 KiB. Operators should use SRT or FXLink for
+lossy or long-haul paths that need transport recovery.

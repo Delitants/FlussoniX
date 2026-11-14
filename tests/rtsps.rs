@@ -338,10 +338,23 @@ async fn verified_rtsps_input_can_be_ingested_by_an_independent_worker_to_hls() 
     let worker = relay
         .ensure(
             "roundtrip",
-            &json!({"inputs":[{"url":format!("{url}?token=owned-token"),"flussonix_tls_ca":cert.ca}]}),
+            &json!({"inputs":[{"url":format!("{}?token=owned-token",url.replacen("rtsps://","rtsps://owned-user:owned-input-secret@",1)),"flussonix_tls_ca":cert.ca}]}),
         )
         .await
         .unwrap();
+    let args = std::fs::read(format!("/proc/{}/cmdline", worker.pid())).unwrap();
+    assert!(
+        !args
+            .windows(b"owned-token".len())
+            .any(|part| part == b"owned-token"),
+        "RTSPS source token appeared in decoder arguments"
+    );
+    assert!(
+        !args
+            .windows(b"owned-input-secret".len())
+            .any(|part| part == b"owned-input-secret"),
+        "RTSPS source password appeared in decoder arguments"
+    );
     let mut file = None;
     for _ in 0..180 {
         if let Ok(data) = relay.read("roundtrip", "index.m3u8").await {
