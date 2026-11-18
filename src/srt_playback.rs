@@ -20,6 +20,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+pub(crate) fn native_available() -> bool {
+    native::available()
+}
+
 struct Slot {
     _permit: OwnedSemaphorePermit,
     app: Arc<App>,

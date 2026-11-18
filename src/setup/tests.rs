@@ -1,8 +1,12 @@
 use super::*;
+use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 struct FakeService {
     state: ServiceState,
@@ -98,6 +102,21 @@ impl Fixture {
             _root: root,
             layout,
         }
+    }
+
+    fn install_package_layout(&self) {
+        fs::create_dir_all(self.layout.binary.parent().unwrap()).unwrap();
+        fs::write(&self.layout.binary, b"qualified flussonix fixture").unwrap();
+        fs::set_permissions(&self.layout.binary, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir_all(self.layout.base_unit.parent().unwrap()).unwrap();
+        fs::write(
+            &self.layout.base_unit,
+            b"[Service]\nExecStart=/usr/bin/flussonix\n",
+        )
+        .unwrap();
+        fs::set_permissions(&self.layout.base_unit, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::create_dir_all(&self.layout.state_dir).unwrap();
+        fs::set_permissions(&self.layout.state_dir, fs::Permissions::from_mode(0o700)).unwrap();
     }
 }
 
@@ -552,4 +571,438 @@ fn reconfiguration_health_failure_restores_prior_pair_and_state() {
     assert_eq!(fs::read(&fixture.layout.drop_in).unwrap(), drop_in);
     assert_eq!(service.state, prior);
     assert!(!fixture.layout.journal.exists());
+}
+
+fn available_tool(detail: &str) -> ToolStatus {
+    ToolStatus::available(detail)
+}
+
+fn ready_dependencies() -> DependencyReport {
+    DependencyReport {
+        ffmpeg: available_tool("ffmpeg 6.1"),
+        ffprobe: available_tool("ffprobe 6.1"),
+        h264_aac_profile: available_tool("H.264/AAC encode available"),
+        srt: available_tool("libsrt 1.5 available"),
+        srtp: available_tool("libsrtp2 available"),
+        gpu: vec![CapabilityStatus::unavailable(
+            "hevc_nvenc",
+            "NVIDIA driver unavailable",
+        )],
+    }
+}
+
+fn preflight_facts(fixture: &Fixture) -> PreflightFacts {
+    let owner = unsafe { libc::geteuid() };
+    PreflightFacts {
+        effective_uid: owner,
+        trusted_uid: owner,
+        service_uid: owner,
+        pid1_comm: "systemd".to_owned(),
+        unit_fragment: fixture.layout.base_unit.clone(),
+        listener_available: true,
+    }
+}
+
+#[test]
+fn preflight_required_dependencies_fail_independently_but_gpu_is_diagnostic_only() {
+    let mut report = ready_dependencies();
+    assert!(report.required_ready());
+    assert!(!report.gpu[0].available);
+
+    report.ffmpeg = ToolStatus::missing("install ffmpeg");
+    assert!(!report.required_ready());
+    report = ready_dependencies();
+    report.ffprobe = ToolStatus::missing("install ffmpeg for ffprobe");
+    assert!(!report.required_ready());
+    report = ready_dependencies();
+    report.h264_aac_profile = ToolStatus::failed("H.264/AAC probe failed");
+    assert!(!report.required_ready());
+    report = ready_dependencies();
+    report.srt = ToolStatus::missing("install libsrt1.5-gnutls");
+    assert!(!report.required_ready());
+    report = ready_dependencies();
+    report.srtp = ToolStatus::missing("install libsrtp2-1");
+    assert!(!report.required_ready());
+}
+
+#[test]
+fn preflight_rejects_non_root_before_package_or_listener_checks() {
+    let fixture = Fixture::new();
+    let mut facts = preflight_facts(&fixture);
+    facts.effective_uid = facts.trusted_uid.saturating_add(1);
+
+    let error = evaluate_preflight(&fixture.layout, ready_dependencies(), None, facts).unwrap_err();
+
+    assert!(error.to_string().contains("root"));
+    assert!(!fixture.layout.binary.exists());
+}
+
+#[test]
+fn preflight_rejects_non_systemd_pid_one() {
+    let fixture = Fixture::new();
+    fixture.install_package_layout();
+    let mut facts = preflight_facts(&fixture);
+    facts.pid1_comm = "init".to_owned();
+
+    let error = evaluate_preflight(&fixture.layout, ready_dependencies(), None, facts).unwrap_err();
+
+    assert!(error.to_string().contains("systemd"));
+}
+
+#[test]
+fn preflight_rejects_wrong_package_mode_without_changing_it() {
+    let fixture = Fixture::new();
+    fixture.install_package_layout();
+    fs::set_permissions(&fixture.layout.binary, fs::Permissions::from_mode(0o777)).unwrap();
+    let before = fs::metadata(&fixture.layout.binary)
+        .unwrap()
+        .permissions()
+        .mode();
+
+    let error = evaluate_preflight(
+        &fixture.layout,
+        ready_dependencies(),
+        None,
+        preflight_facts(&fixture),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("package layout"));
+    assert_eq!(
+        fs::metadata(&fixture.layout.binary)
+            .unwrap()
+            .permissions()
+            .mode(),
+        before
+    );
+}
+
+#[test]
+fn preflight_rejects_unmanaged_service_fragment() {
+    let fixture = Fixture::new();
+    fixture.install_package_layout();
+    let mut facts = preflight_facts(&fixture);
+    facts.unit_fragment = fixture._root.path().join("operator/flussonix.service");
+
+    let error = evaluate_preflight(&fixture.layout, ready_dependencies(), None, facts).unwrap_err();
+
+    assert!(error.to_string().contains("unmanaged flussonix.service"));
+}
+
+#[test]
+fn preflight_reports_occupied_listener_without_writing_setup() {
+    let fixture = Fixture::new();
+    fixture.install_package_layout();
+    let mut facts = preflight_facts(&fixture);
+    facts.listener_available = false;
+
+    let report = evaluate_preflight(&fixture.layout, ready_dependencies(), None, facts).unwrap();
+
+    assert!(!report.listener_available);
+    assert!(report.current.is_none());
+    assert!(!fixture.layout.credentials.exists());
+    assert!(!fixture.layout.drop_in.exists());
+    assert!(!fixture.layout.journal.exists());
+}
+
+#[derive(Clone)]
+struct RecordedCommands {
+    calls: Arc<Mutex<Vec<(PathBuf, Vec<OsString>)>>>,
+}
+
+impl RecordedCommands {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn snapshot(&self) -> Vec<(PathBuf, Vec<OsString>)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+struct RecordingRunner {
+    recorded: RecordedCommands,
+    replies: VecDeque<systemd::CommandOutput>,
+}
+
+impl RecordingRunner {
+    fn with_replies(recorded: RecordedCommands, replies: &[(i32, &str, &str)]) -> Self {
+        Self {
+            recorded,
+            replies: replies
+                .iter()
+                .map(|(status, stdout, stderr)| systemd::CommandOutput {
+                    status: *status,
+                    stdout: stdout.as_bytes().to_vec(),
+                    stderr: stderr.as_bytes().to_vec(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl systemd::CommandRunner for RecordingRunner {
+    fn run(
+        &mut self,
+        program: &Path,
+        args: &[OsString],
+    ) -> Result<systemd::CommandOutput, SetupError> {
+        self.recorded
+            .calls
+            .lock()
+            .unwrap()
+            .push((program.to_path_buf(), args.to_vec()));
+        self.replies
+            .pop_front()
+            .ok_or_else(|| SetupError::service("recording runner has no queued response"))
+    }
+}
+
+fn os_args(values: &[&str]) -> Vec<OsString> {
+    values.iter().map(OsString::from).collect()
+}
+
+#[test]
+fn systemd_state_and_fragment_use_fixed_argument_arrays() {
+    let recorded = RecordedCommands::new();
+    let runner = RecordingRunner::with_replies(
+        recorded.clone(),
+        &[
+            (0, "active\n", ""),
+            (1, "disabled\n", ""),
+            (0, "/usr/lib/systemd/system/flussonix.service\n", ""),
+        ],
+    );
+    let mut manager = SystemdManager::with_runner(Box::new(runner));
+
+    assert_eq!(
+        manager.state().unwrap(),
+        ServiceState {
+            active: true,
+            enabled: false,
+        }
+    );
+    assert_eq!(
+        manager.fragment_path().unwrap(),
+        PathBuf::from("/usr/lib/systemd/system/flussonix.service")
+    );
+
+    assert_eq!(
+        recorded.snapshot(),
+        vec![
+            (
+                PathBuf::from("/usr/bin/systemctl"),
+                os_args(&[
+                    "--no-pager",
+                    "--no-ask-password",
+                    "is-active",
+                    "flussonix.service"
+                ]),
+            ),
+            (
+                PathBuf::from("/usr/bin/systemctl"),
+                os_args(&[
+                    "--no-pager",
+                    "--no-ask-password",
+                    "is-enabled",
+                    "flussonix.service"
+                ]),
+            ),
+            (
+                PathBuf::from("/usr/bin/systemctl"),
+                os_args(&[
+                    "--no-pager",
+                    "--no-ask-password",
+                    "show",
+                    "--property=FragmentPath",
+                    "--value",
+                    "flussonix.service",
+                ]),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn systemd_lifecycle_keeps_enablement_and_activation_failures_separate() {
+    let recorded = RecordedCommands::new();
+    let runner = RecordingRunner::with_replies(recorded.clone(), &[(0, "", ""); 7]);
+    let mut manager = SystemdManager::with_runner(Box::new(runner));
+
+    manager.daemon_reload().unwrap();
+    manager.enable_now().unwrap();
+    manager.restart().unwrap();
+    manager.disable_now().unwrap();
+
+    let actions = recorded
+        .snapshot()
+        .into_iter()
+        .map(|(_, args)| args)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actions,
+        vec![
+            os_args(&["--no-pager", "--no-ask-password", "daemon-reload"]),
+            os_args(&[
+                "--no-pager",
+                "--no-ask-password",
+                "enable",
+                "flussonix.service"
+            ]),
+            os_args(&[
+                "--no-pager",
+                "--no-ask-password",
+                "start",
+                "flussonix.service"
+            ]),
+            os_args(&[
+                "--no-pager",
+                "--no-ask-password",
+                "restart",
+                "flussonix.service"
+            ]),
+            os_args(&[
+                "--no-pager",
+                "--no-ask-password",
+                "stop",
+                "flussonix.service"
+            ]),
+            os_args(&[
+                "--no-pager",
+                "--no-ask-password",
+                "disable",
+                "flussonix.service"
+            ]),
+        ]
+    );
+}
+
+#[test]
+fn systemd_enablement_and_activation_report_the_failing_operation() {
+    let recorded = RecordedCommands::new();
+    let runner = RecordingRunner::with_replies(recorded.clone(), &[(1, "", "enable denied")]);
+    let mut manager = SystemdManager::with_runner(Box::new(runner));
+    let error = manager.enable_now().unwrap_err();
+    assert!(error.to_string().contains("enable flussonix"));
+    assert_eq!(recorded.snapshot().len(), 1);
+
+    let recorded = RecordedCommands::new();
+    let runner =
+        RecordingRunner::with_replies(recorded.clone(), &[(0, "", ""), (1, "", "start denied")]);
+    let mut manager = SystemdManager::with_runner(Box::new(runner));
+    let error = manager.enable_now().unwrap_err();
+    assert!(error.to_string().contains("start flussonix"));
+    assert_eq!(recorded.snapshot().len(), 2);
+}
+
+#[test]
+fn systemd_restore_preserves_active_and_enabled_state_independently() {
+    let cases = [
+        (true, true, ["enable", "restart"]),
+        (true, false, ["disable", "restart"]),
+        (false, true, ["enable", "stop"]),
+        (false, false, ["disable", "stop"]),
+    ];
+    for (active, enabled, expected) in cases {
+        let recorded = RecordedCommands::new();
+        let runner = RecordingRunner::with_replies(recorded.clone(), &[(0, "", ""); 2]);
+        let mut manager = SystemdManager::with_runner(Box::new(runner));
+
+        manager
+            .restore_state(ServiceState { active, enabled })
+            .unwrap();
+
+        let calls = recorded.snapshot();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1[2], OsString::from(expected[0]));
+        assert_eq!(calls[1].1[2], OsString::from(expected[1]));
+    }
+}
+
+#[test]
+fn systemd_verify_uses_systemd_analyze_without_a_shell() {
+    let fixture = Fixture::new();
+    fixture.install_package_layout();
+    fs::write(
+        &fixture.layout.drop_in_staged,
+        b"[Service]\nRestart=on-failure\n",
+    )
+    .unwrap();
+    let recorded = RecordedCommands::new();
+    let runner = RecordingRunner::with_replies(recorded.clone(), &[(0, "", "")]);
+    let mut manager = SystemdManager::with_runner(Box::new(runner));
+
+    manager
+        .verify(&fixture.layout, &fixture.layout.drop_in_staged)
+        .unwrap();
+
+    let calls = recorded.snapshot();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, PathBuf::from("/usr/bin/systemd-analyze"));
+    assert_eq!(calls[0].1[0], OsString::from("verify"));
+    assert_eq!(calls[0].1[1], OsString::from("--man=no"));
+    assert!(calls[0].1[2].to_string_lossy().starts_with("--root="));
+    assert_eq!(
+        calls[0].1[3],
+        OsString::from("/usr/lib/systemd/system/flussonix.service")
+    );
+}
+
+#[test]
+fn preflight_reads_only_non_secret_current_setup_fields() {
+    let fixture = Fixture::new();
+    let mut service = FakeService::stopped();
+    let expected = request("password-must-not-be-read", "peer-key-must-not-be-read");
+    apply(
+        &fixture.layout,
+        &expected,
+        &InitOptions {
+            reconfigure: false,
+            non_interactive: true,
+            no_start: true,
+        },
+        &mut service,
+    )
+    .unwrap()
+    .complete()
+    .unwrap();
+
+    let current = read_current_setup(
+        &fixture.layout,
+        ServiceState {
+            active: false,
+            enabled: false,
+        },
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(current.admin_user, expected.admin_user);
+    assert_eq!(current.role, expected.role);
+    assert_eq!(current.node_name, expected.node_name);
+    assert_eq!(current.listen, expected.listen);
+}
+
+#[test]
+fn preflight_listener_table_matches_wildcard_and_selected_ipv4_only() {
+    let directory = tempfile::tempdir().unwrap();
+    let table = directory.path().join("tcp");
+    fs::write(
+        &table,
+        "  sl  local_address rem_address   st\n   0: 0100007F:4722 00000000:0000 0A\n",
+    )
+    .unwrap();
+    let selected = "127.0.0.1:18210".parse().unwrap();
+    assert!(occupied_tcp_listeners(&table, selected).unwrap());
+    let other = "127.0.0.2:18210".parse().unwrap();
+    assert!(!occupied_tcp_listeners(&table, other).unwrap());
+
+    fs::write(
+        &table,
+        "  sl  local_address rem_address   st\n   0: 00000000:4722 00000000:0000 0A\n",
+    )
+    .unwrap();
+    assert!(occupied_tcp_listeners(&table, other).unwrap());
 }

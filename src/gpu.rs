@@ -16,6 +16,12 @@ pub(crate) struct Readiness {
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostic: Option<&'static str>,
 }
+
+pub(crate) struct SetupReadiness {
+    pub(crate) name: String,
+    pub(crate) available: bool,
+    pub(crate) detail: String,
+}
 impl Readiness {
     fn error(&self) -> Option<&'static str> {
         match (self.encoder, self.status) {
@@ -146,6 +152,23 @@ impl Checks {
             None => Ok(()),
         }
     }
+}
+
+pub(crate) async fn setup_report(ffmpeg: &str) -> Vec<SetupReadiness> {
+    let checks = Checks::default();
+    let (nvenc, vaapi) = tokio::join!(
+        async { checks.report(ffmpeg).await.to_vec() },
+        checks.vaapi_report(ffmpeg)
+    );
+    nvenc
+        .into_iter()
+        .chain(vaapi)
+        .map(|readiness| SetupReadiness {
+            name: readiness.encoder.to_owned(),
+            available: readiness.status == "available",
+            detail: readiness.diagnostic.unwrap_or(readiness.status).to_owned(),
+        })
+        .collect()
 }
 
 async fn check(ffmpeg: &str, encoder: &str) -> Probe {

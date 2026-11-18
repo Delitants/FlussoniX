@@ -133,6 +133,10 @@ impl Api {
             .map_err(|message| failure(message))
     }
 }
+
+pub(super) fn available() -> bool {
+    Api::shared().is_ok()
+}
 pub struct Socket {
     api: Arc<Api>,
     id: i32,

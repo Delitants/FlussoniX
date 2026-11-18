@@ -1,11 +1,17 @@
+mod dependencies;
 mod files;
+mod systemd;
 
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::ffi::CString;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+
+pub use dependencies::{CapabilityStatus, DependencyReport, ToolStatus};
+pub use systemd::SystemdManager;
 
 #[cfg(test)]
 mod tests;
@@ -93,6 +99,9 @@ pub trait ServiceManager {
 
 #[derive(Clone, Debug)]
 pub struct Layout {
+    pub(crate) binary: PathBuf,
+    pub(crate) base_unit: PathBuf,
+    pub(crate) state_dir: PathBuf,
     pub(crate) credentials: PathBuf,
     pub(crate) credentials_staged: PathBuf,
     pub(crate) credentials_backup: PathBuf,
@@ -112,6 +121,9 @@ impl Layout {
         let config = root.join("etc/flussonix");
         let drop_in_dir = root.join("etc/systemd/system/flussonix.service.d");
         Self {
+            binary: root.join("usr/bin/flussonix"),
+            base_unit: root.join("usr/lib/systemd/system/flussonix.service"),
+            state_dir: root.join("var/lib/flussonix"),
             credentials: config.join("credentials.env"),
             credentials_staged: config.join(".credentials.env.staged"),
             credentials_backup: config.join(".credentials.env.backup"),
@@ -122,6 +134,270 @@ impl Layout {
             journal_temp: config.join(".setup-transaction.json.tmp"),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentSetup {
+    pub admin_user: String,
+    pub role: NodeRole,
+    pub node_name: String,
+    pub listen: SocketAddr,
+    pub service: ServiceState,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreflightReport {
+    pub dependencies: DependencyReport,
+    pub current: Option<CurrentSetup>,
+    pub listener_available: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreflightFacts {
+    effective_uid: u32,
+    trusted_uid: u32,
+    service_uid: u32,
+    pid1_comm: String,
+    unit_fragment: PathBuf,
+    listener_available: bool,
+}
+
+pub(crate) fn evaluate_preflight(
+    layout: &Layout,
+    dependencies: DependencyReport,
+    current: Option<CurrentSetup>,
+    facts: PreflightFacts,
+) -> Result<PreflightReport, SetupError> {
+    if facts.effective_uid != facts.trusted_uid {
+        return Err(SetupError::invalid("flussonix --init must run as root"));
+    }
+    if facts.pid1_comm.trim() != "systemd" {
+        return Err(SetupError::invalid(
+            "flussonix --init requires systemd as PID 1",
+        ));
+    }
+    validate_package_layout(layout, facts.trusted_uid, facts.service_uid)?;
+    if facts.unit_fragment != layout.base_unit {
+        return Err(SetupError::invalid(
+            "refusing to take over an unmanaged flussonix.service",
+        ));
+    }
+    Ok(PreflightReport {
+        dependencies,
+        current,
+        listener_available: facts.listener_available,
+    })
+}
+
+pub async fn preflight(
+    layout: &Layout,
+    request: Option<&InitRequest>,
+) -> Result<PreflightReport, SetupError> {
+    // SAFETY: geteuid reads process credentials and has no side effects.
+    let effective_uid = unsafe { libc::geteuid() };
+    if effective_uid != 0 {
+        return Err(SetupError::invalid("flussonix --init must run as root"));
+    }
+    let pid1_comm = std::fs::read_to_string("/proc/1/comm")
+        .map_err(|source| SetupError::io("inspect PID 1", source))?;
+    if pid1_comm.trim() != "systemd" {
+        return Err(SetupError::invalid(
+            "flussonix --init requires systemd as PID 1",
+        ));
+    }
+    let service_uid = account_uid("flussonix")?;
+    validate_package_layout(layout, 0, service_uid)?;
+    files::validate_layout(layout)?;
+
+    let mut service = SystemdManager::system();
+    let unit_fragment = service.fragment_path()?;
+    let service_state = service.state()?;
+    let current = read_current_setup(layout, service_state)?;
+    let listener_available = match request {
+        Some(request)
+            if current.as_ref().is_some_and(|existing| {
+                existing.listen == request.listen && service_state.active
+            }) =>
+        {
+            true
+        }
+        Some(request) => listener_is_available(request.listen)?,
+        None => true,
+    };
+    let dependencies = dependencies::inspect().await?;
+    evaluate_preflight(
+        layout,
+        dependencies,
+        current,
+        PreflightFacts {
+            effective_uid,
+            trusted_uid: 0,
+            service_uid,
+            pid1_comm,
+            unit_fragment,
+            listener_available,
+        },
+    )
+}
+
+fn account_uid(name: &str) -> Result<u32, SetupError> {
+    let name = CString::new(name)
+        .map_err(|_| SetupError::invalid("service account name contains an invalid byte"))?;
+    let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0_u8; 16 * 1024];
+    // SAFETY: all pointers refer to live, correctly sized storage for the duration of the call.
+    let status = unsafe {
+        libc::getpwnam_r(
+            name.as_ptr(),
+            record.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 {
+        return Err(SetupError::io(
+            "look up flussonix service account",
+            std::io::Error::from_raw_os_error(status),
+        ));
+    }
+    if result.is_null() {
+        return Err(SetupError::invalid(
+            "the flussonix service account is missing",
+        ));
+    }
+    // SAFETY: getpwnam_r populated record and returned its address through result.
+    Ok(unsafe { record.assume_init() }.pw_uid)
+}
+
+fn read_current_setup(
+    layout: &Layout,
+    service: ServiceState,
+) -> Result<Option<CurrentSetup>, SetupError> {
+    if !files::configuration_exists(layout)? {
+        return Ok(None);
+    }
+    let metadata = std::fs::metadata(&layout.drop_in)
+        .map_err(|source| SetupError::io("inspect existing setup drop-in", source))?;
+    if metadata.len() > 64 * 1024 {
+        return Err(SetupError::invalid("existing setup drop-in is too large"));
+    }
+    let text = std::fs::read_to_string(&layout.drop_in)
+        .map_err(|source| SetupError::io("read existing setup drop-in", source))?;
+    let command = text
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart=/usr/bin/flussonix "))
+        .ok_or_else(|| SetupError::invalid("existing setup drop-in has no managed ExecStart"))?;
+    let field = |name: &str| {
+        command
+            .split_ascii_whitespace()
+            .find_map(|item| item.strip_prefix(name))
+            .map(str::to_owned)
+            .ok_or_else(|| SetupError::invalid("existing setup drop-in is incomplete"))
+    };
+    let listen = field("--listen=")?
+        .parse::<SocketAddr>()
+        .map_err(|_| SetupError::invalid("existing setup listener is invalid"))?;
+    let role = field("--role=")?.parse::<NodeRole>()?;
+    Ok(Some(CurrentSetup {
+        admin_user: field("--admin-user=")?,
+        role,
+        node_name: field("--node-name=")?,
+        listen,
+        service,
+    }))
+}
+
+fn listener_is_available(address: SocketAddr) -> Result<bool, SetupError> {
+    let mut occupied = occupied_tcp_listeners(Path::new("/proc/net/tcp"), address)?;
+    occupied |= occupied_tcp_listeners(Path::new("/proc/net/tcp6"), address)?;
+    Ok(!occupied)
+}
+
+fn occupied_tcp_listeners(path: &Path, address: SocketAddr) -> Result<bool, SetupError> {
+    let table = match std::fs::read_to_string(path) {
+        Ok(table) => table,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(SetupError::io("inspect active TCP listeners", source)),
+    };
+    for line in table.lines().skip(1) {
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() < 4 || fields[3] != "0A" {
+            continue;
+        }
+        let Some((encoded_address, encoded_port)) = fields[1].split_once(':') else {
+            continue;
+        };
+        let Ok(port) = u16::from_str_radix(encoded_port, 16) else {
+            continue;
+        };
+        if port != address.port() {
+            continue;
+        }
+        if path.ends_with("tcp6") {
+            return Ok(true);
+        }
+        let Ok(raw) = u32::from_str_radix(encoded_address, 16) else {
+            continue;
+        };
+        let existing = Ipv4Addr::from(raw.to_le_bytes());
+        match address.ip() {
+            IpAddr::V4(selected) if existing.is_unspecified() || existing == selected => {
+                return Ok(true);
+            }
+            IpAddr::V6(_) => return Ok(true),
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+fn validate_package_layout(
+    layout: &Layout,
+    trusted_uid: u32,
+    service_uid: u32,
+) -> Result<(), SetupError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn check(path: &Path, directory: bool, owner: u32, mode: u32) -> Result<(), SetupError> {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|_| SetupError::invalid("packaged setup layout is incomplete"))?;
+        let kind_matches = if directory {
+            metadata.is_dir()
+        } else {
+            metadata.is_file()
+        };
+        if !kind_matches || metadata.uid() != owner || metadata.permissions().mode() & 0o777 != mode
+        {
+            return Err(SetupError::invalid(
+                "package layout has unsafe ownership, type or mode",
+            ));
+        }
+        Ok(())
+    }
+
+    check(&layout.binary, false, trusted_uid, 0o755)?;
+    check(&layout.base_unit, false, trusted_uid, 0o644)?;
+    check(
+        layout
+            .credentials
+            .parent()
+            .ok_or_else(|| SetupError::unsafe_path(&layout.credentials))?,
+        true,
+        trusted_uid,
+        0o700,
+    )?;
+    check(
+        layout
+            .drop_in
+            .parent()
+            .ok_or_else(|| SetupError::unsafe_path(&layout.drop_in))?,
+        true,
+        trusted_uid,
+        0o755,
+    )?;
+    check(&layout.state_dir, true, service_uid, 0o700)
 }
 
 #[derive(Debug)]
