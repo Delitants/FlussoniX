@@ -1,0 +1,13 @@
+{
+  "format": 1,
+  "legacy_archives": [
+    {
+      "version": "0.10.0",
+      "iteration": 1,
+      "architecture": "x86_64",
+      "source_revision": "f2939b6f3e48d1816dff8ce34d41d5e0ecb25a37",
+      "sha256": "4ff1e1bcaa9b0e0be1c4cb482ce7aa0eedb0b89570f6d544539038a9173ee0bc",
+      "supports_init": false
+    }
+  ]
+}

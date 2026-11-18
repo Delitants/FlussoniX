@@ -1,0 +1,33 @@
+[Unit]
+Description=FlussoniX media server
+Documentation=https://github.com/Delitants/FlussoniX
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/flussonix/credentials.env
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=flussonix
+Group=flussonix
+WorkingDirectory=/var/lib/flussonix
+EnvironmentFile=/etc/flussonix/credentials.env
+ExecStart=/usr/bin/flussonix --config=/var/lib/flussonix/config.json --media-dir=/var/lib/flussonix/media --web-dir=/usr/share/flussonix/web
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths=/var/lib/flussonix
+StateDirectory=flussonix
+StateDirectoryMode=0700
+LimitNOFILE=65536
+SyslogIdentifier=flussonix
+
+[Install]
+WantedBy=multi-user.target

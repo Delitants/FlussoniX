@@ -1,0 +1,12 @@
+Package: flussonix
+Version: @VERSION@
+Section: video
+Priority: optional
+Architecture: amd64
+Maintainer: FlussoniX Project <noreply@flussonix.invalid>
+Depends: @DEPENDS@
+Recommends: tesseract-ocr, tesseract-ocr-eng, vainfo, intel-gpu-tools, pciutils
+Homepage: https://github.com/Delitants/FlussoniX
+Description: independent live media server and cluster control plane
+ FlussoniX provides live streaming, transcoding, clustering, authorization,
+ protocol compatibility, and a browser administration interface.

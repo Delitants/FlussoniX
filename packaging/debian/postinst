@@ -1,0 +1,41 @@
+#!/bin/sh
+set -eu
+
+root=${DPKG_ROOT:-}
+config="$root/etc/flussonix"
+dropins="$root/etc/systemd/system/flussonix.service.d"
+state="$root/var/lib/flussonix"
+marker="$root/run/flussonix/package-was-active"
+
+case "${1:-}" in
+  configure)
+    for directory in "$config" "$dropins" "$state"; do
+      if [ -L "$directory" ] || { [ -e "$directory" ] && [ ! -d "$directory" ]; }; then
+        printf '%s\n' "refusing unsafe FlussoniX package directory: $directory" >&2
+        exit 1
+      fi
+    done
+    if ! getent passwd flussonix >/dev/null 2>&1; then
+      adduser --system --group --home /var/lib/flussonix --no-create-home \
+        --shell /usr/sbin/nologin flussonix
+    fi
+    mkdir -p "$config" "$dropins" "$state"
+    chmod 0700 "$config" "$state"
+    chmod 0755 "$dropins"
+    chown root:root "$config" "$dropins"
+    chown flussonix:flussonix "$state"
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    if [ -f "$marker" ] && [ ! -L "$marker" ] \
+       && [ "$(cat "$marker")" = active ]; then
+      rm -f -- "$marker"
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl try-restart flussonix.service >/dev/null 2>&1 || true
+      fi
+    else
+      rm -f -- "$marker"
+    fi
+    ;;
+esac
+exit 0

@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+root=${DPKG_ROOT:-}
+marker_dir="$root/run/flussonix"
+marker="$marker_dir/package-was-active"
+
+case "${1:-}" in
+  upgrade)
+    mkdir -p "$marker_dir"
+    chmod 0700 "$marker_dir"
+    rm -f -- "$marker"
+    if command -v systemctl >/dev/null 2>&1 \
+       && systemctl is-active --quiet flussonix.service >/dev/null 2>&1; then
+      umask 077
+      printf '%s\n' active > "$marker"
+    fi
+    ;;
+esac
+exit 0

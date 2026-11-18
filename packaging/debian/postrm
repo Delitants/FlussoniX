@@ -1,0 +1,44 @@
+#!/bin/sh
+set -eu
+
+root=${DPKG_ROOT:-}
+config="$root/etc/flussonix"
+dropins="$root/etc/systemd/system/flussonix.service.d"
+
+remove_generated() {
+  path=$1
+  expected_mode=$2
+  parent=$3
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    return 0
+  fi
+  if [ -L "$path" ] || [ ! -f "$path" ] || [ ! -d "$parent" ] || [ -L "$parent" ]; then
+    return 0
+  fi
+  trusted_uid=$(stat -c %u "$parent") || return 0
+  actual_uid=$(stat -c %u "$path") || return 0
+  actual_mode=$(stat -c %a "$path") || return 0
+  if [ "$actual_uid" = "$trusted_uid" ] && [ "$actual_mode" = "$expected_mode" ]; then
+    rm -f -- "$path"
+  fi
+}
+
+case "${1:-}" in
+  purge)
+    remove_generated "$config/credentials.env" 600 "$config"
+    remove_generated "$config/.credentials.env.staged" 600 "$config"
+    remove_generated "$config/.credentials.env.backup" 600 "$config"
+    remove_generated "$config/.setup-transaction.json" 600 "$config"
+    remove_generated "$config/.setup-transaction.json.tmp" 600 "$config"
+    remove_generated "$dropins/10-setup.conf" 644 "$dropins"
+    remove_generated "$dropins/.10-setup.conf.staged" 644 "$dropins"
+    remove_generated "$dropins/.10-setup.conf.backup" 644 "$dropins"
+    rmdir "$dropins" 2>/dev/null || true
+    rmdir "$config" 2>/dev/null || true
+    ;;
+esac
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+exit 0
