@@ -207,6 +207,11 @@ impl ServiceManager for SystemdManager {
     fn enable_now(&mut self) -> Result<(), SetupError> {
         self.service_action("enable", "enable flussonix service")?;
         self.service_action("start", "start flussonix service")
+            .map_err(|error| {
+                SetupError::service(format!(
+                    "{error}; the service is enabled at boot but is not active. Retry with systemctl start flussonix.service or undo enablement with systemctl disable flussonix.service"
+                ))
+            })
     }
 
     fn restart(&mut self) -> Result<(), SetupError> {

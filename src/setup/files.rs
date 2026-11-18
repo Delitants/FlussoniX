@@ -1,6 +1,7 @@
 use super::{InitRequest, Layout, ServiceState, SetupError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use std::cell::Cell;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -464,9 +465,9 @@ pub(crate) fn set_test_failpoint(phase: Option<TransactionPhase>) {
     FAILPOINT.with(|value| value.set(phase));
 }
 
-pub(crate) fn check_failpoint(phase: TransactionPhase) -> Result<(), SetupError> {
+pub(crate) fn check_failpoint(_phase: TransactionPhase) -> Result<(), SetupError> {
     #[cfg(test)]
-    if FAILPOINT.with(|value| value.get() == Some(phase)) {
+    if FAILPOINT.with(|value| value.get() == Some(_phase)) {
         FAILPOINT.with(|value| value.set(None));
         return Err(SetupError::InjectedCrash);
     }

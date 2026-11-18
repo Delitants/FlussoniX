@@ -2,6 +2,7 @@ use super::*;
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::Path;
@@ -11,6 +12,7 @@ use std::sync::{Arc, Mutex};
 struct FakeService {
     state: ServiceState,
     fail_verify: bool,
+    fail_enable: bool,
     events: Vec<&'static str>,
 }
 
@@ -22,6 +24,7 @@ impl FakeService {
                 enabled: false,
             },
             fail_verify: false,
+            fail_enable: false,
             events: Vec::new(),
         }
     }
@@ -48,6 +51,9 @@ impl ServiceManager for FakeService {
 
     fn enable_now(&mut self) -> Result<(), SetupError> {
         self.events.push("enable");
+        if self.fail_enable {
+            return Err(SetupError::service("service activation failed"));
+        }
         self.state = ServiceState {
             active: true,
             enabled: true,
@@ -894,6 +900,12 @@ fn systemd_enablement_and_activation_report_the_failing_operation() {
     let mut manager = SystemdManager::with_runner(Box::new(runner));
     let error = manager.enable_now().unwrap_err();
     assert!(error.to_string().contains("start flussonix"));
+    assert!(error.to_string().contains("enabled at boot"));
+    assert!(
+        error
+            .to_string()
+            .contains("systemctl disable flussonix.service")
+    );
     assert_eq!(recorded.snapshot().len(), 2);
 }
 
@@ -1005,4 +1017,294 @@ fn preflight_listener_table_matches_wildcard_and_selected_ipv4_only() {
     )
     .unwrap();
     assert!(occupied_tcp_listeners(&table, other).unwrap());
+}
+
+struct ScriptedPrompt {
+    lines: VecDeque<Result<String, io::Error>>,
+    hidden: VecDeque<Result<String, io::Error>>,
+    output: String,
+}
+
+impl ScriptedPrompt {
+    fn new(lines: &[&str], hidden: &[&str]) -> Self {
+        Self {
+            lines: lines.iter().map(|value| Ok((*value).to_owned())).collect(),
+            hidden: hidden.iter().map(|value| Ok((*value).to_owned())).collect(),
+            output: String::new(),
+        }
+    }
+}
+
+impl wizard::PromptIo for ScriptedPrompt {
+    fn write(&mut self, text: &str) -> Result<(), io::Error> {
+        self.output.push_str(text);
+        Ok(())
+    }
+
+    fn read_line(&mut self, prompt: &str) -> Result<String, io::Error> {
+        self.output.push_str(prompt);
+        self.lines.pop_front().expect("scripted line input")
+    }
+
+    fn read_hidden(&mut self, prompt: &str) -> Result<String, io::Error> {
+        self.output.push_str(prompt);
+        self.hidden.pop_front().expect("scripted hidden input")
+    }
+}
+
+struct FixedRandom(u8);
+
+impl wizard::RandomSource for FixedRandom {
+    fn fill(&mut self, output: &mut [u8]) -> Result<(), SetupError> {
+        output.fill(self.0);
+        Ok(())
+    }
+}
+
+fn wizard_defaults() -> ExplicitInitOptions {
+    ExplicitInitOptions {
+        role: NodeRole::Standalone,
+        node_name: "local".to_owned(),
+        listen: "127.0.0.1:18210".parse().unwrap(),
+    }
+}
+
+fn collect_scripted(
+    prompt: &mut ScriptedPrompt,
+    defaults: &ExplicitInitOptions,
+    no_start: bool,
+    listener_available: &mut dyn FnMut(SocketAddr) -> Result<bool, SetupError>,
+) -> Result<InitRequest, SetupError> {
+    wizard::collect_interactive(
+        prompt,
+        defaults,
+        no_start,
+        listener_available,
+        &mut FixedRandom(0x5a),
+    )
+}
+
+#[test]
+fn wizard_reprompts_after_password_mismatch() {
+    let mut prompt = ScriptedPrompt::new(
+        &["", "", "", "n", "", ""],
+        &["first", "different", "correct", "correct"],
+    );
+    let request =
+        collect_scripted(&mut prompt, &wizard_defaults(), false, &mut |_| Ok(true)).unwrap();
+
+    assert_eq!(request.admin_password.expose(), "correct");
+    assert!(prompt.output.contains("Passwords did not match"));
+}
+
+#[test]
+fn wizard_accepts_an_existing_peer_key_only_through_hidden_input() {
+    let peer_key = "existing-cluster-peer-key";
+    let mut prompt = ScriptedPrompt::new(
+        &["", "", "", "y", "", ""],
+        &["password", "password", peer_key],
+    );
+    let request =
+        collect_scripted(&mut prompt, &wizard_defaults(), false, &mut |_| Ok(true)).unwrap();
+
+    assert_eq!(request.peer_key.expose(), peer_key);
+    assert!(!prompt.output.contains(peer_key));
+}
+
+#[test]
+fn wizard_generates_a_32_byte_peer_key_and_uses_role_listener_defaults() {
+    let defaults = ExplicitInitOptions {
+        role: NodeRole::Cdn,
+        node_name: "cdn-default".to_owned(),
+        listen: "127.0.0.2:19000".parse().unwrap(),
+    };
+    let mut prompt = ScriptedPrompt::new(&["", "", "", "n", "", ""], &["password", "password"]);
+    let request = collect_scripted(&mut prompt, &defaults, false, &mut |_| Ok(true)).unwrap();
+
+    assert_eq!(request.peer_key.expose().len(), 64);
+    assert_eq!(request.peer_key.expose(), "5a".repeat(32));
+    assert_eq!(request.role, NodeRole::Cdn);
+    assert_eq!(request.node_name, "cdn-default");
+    assert_eq!(request.listen, defaults.listen);
+}
+
+#[test]
+fn wizard_retries_an_occupied_listener() {
+    let mut prompt = ScriptedPrompt::new(
+        &["", "", "", "n", "127.0.0.1:19001", "127.0.0.1:19002", ""],
+        &["password", "password"],
+    );
+    let mut checked = Vec::new();
+    let request = collect_scripted(&mut prompt, &wizard_defaults(), false, &mut |address| {
+        checked.push(address);
+        Ok(address.port() == 19002)
+    })
+    .unwrap();
+
+    assert_eq!(request.listen.port(), 19002);
+    assert_eq!(checked.len(), 2);
+    assert!(prompt.output.contains("already in use"));
+}
+
+#[test]
+fn wizard_summary_is_redacted_and_enablement_defaults_to_yes() {
+    let password = "summary-admin-secret";
+    let peer_key = "summary-peer-secret";
+    let mut prompt = ScriptedPrompt::new(
+        &["operator", "source", "origin-1", "y", "", ""],
+        &[password, password, peer_key],
+    );
+    let request =
+        collect_scripted(&mut prompt, &wizard_defaults(), false, &mut |_| Ok(true)).unwrap();
+
+    assert!(request.enable_now);
+    assert!(prompt.output.contains("origin-1"));
+    assert!(prompt.output.contains("source"));
+    assert!(!prompt.output.contains(password));
+    assert!(!prompt.output.contains(peer_key));
+}
+
+#[test]
+fn wizard_can_decline_enablement_or_force_no_start() {
+    let mut declined = ScriptedPrompt::new(&["", "", "", "n", "", "n"], &["password", "password"]);
+    let request =
+        collect_scripted(&mut declined, &wizard_defaults(), false, &mut |_| Ok(true)).unwrap();
+    assert!(!request.enable_now);
+
+    let mut no_start = ScriptedPrompt::new(&["", "", "", "n", ""], &["password", "password"]);
+    let request =
+        collect_scripted(&mut no_start, &wizard_defaults(), true, &mut |_| Ok(true)).unwrap();
+    assert!(!request.enable_now);
+    assert!(!no_start.output.contains("Enable and start"));
+}
+
+#[test]
+fn wizard_interruption_before_summary_returns_without_a_request() {
+    let mut prompt = ScriptedPrompt::new(&[], &[]);
+    prompt
+        .lines
+        .push_back(Err(io::Error::from(io::ErrorKind::Interrupted)));
+    let result = collect_scripted(&mut prompt, &wizard_defaults(), false, &mut |_| Ok(true));
+
+    assert!(result.is_err());
+    assert!(!prompt.output.contains("Setup summary"));
+}
+
+#[test]
+fn wizard_terminal_reader_observes_an_interrupt_even_without_input() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let (reader, _writer) = UnixStream::pair().unwrap();
+    let reader = fs::File::from(OwnedFd::from(reader));
+    let mut prompt = wizard::TtyPrompt::from_file_for_test(reader);
+    let _guard = wizard::InterruptGuard::install().unwrap();
+    wizard::mark_interrupted_for_test();
+
+    let error = prompt.read_raw_line().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+}
+
+#[test]
+fn unattended_setup_requires_exact_environment_inputs() {
+    let mut requested = Vec::new();
+    let result = wizard::collect_unattended(&wizard_defaults(), false, &mut |name| {
+        requested.push(name.to_owned());
+        match name {
+            "FLUSSONIX_ADMIN_USER" => Some("admin".to_owned()),
+            "FLUSSONIX_ADMIN_PASSWORD" => Some("password".to_owned()),
+            _ => None,
+        }
+    });
+    let error = match result {
+        Ok(_) => panic!("missing peer key must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("FLUSSONIX_PEER_KEY"));
+    assert_eq!(
+        requested,
+        vec![
+            "FLUSSONIX_ADMIN_USER",
+            "FLUSSONIX_ADMIN_PASSWORD",
+            "FLUSSONIX_PEER_KEY"
+        ]
+    );
+}
+
+#[test]
+fn no_start_never_enables_or_restarts_the_service() {
+    let fixture = Fixture::new();
+    let mut service = FakeService::stopped();
+    apply(
+        &fixture.layout,
+        &request("admin-secret", "peer-secret"),
+        &InitOptions {
+            reconfigure: false,
+            non_interactive: true,
+            no_start: true,
+        },
+        &mut service,
+    )
+    .unwrap()
+    .complete()
+    .unwrap();
+
+    assert!(!service.events.contains(&"enable"));
+    assert!(!service.events.contains(&"restart"));
+}
+
+#[test]
+fn fresh_start_failure_keeps_the_verified_configuration_for_retry() {
+    let fixture = Fixture::new();
+    let mut service = FakeService::stopped();
+    service.fail_enable = true;
+
+    let error = match apply(
+        &fixture.layout,
+        &request("admin-secret", "peer-secret"),
+        &InitOptions {
+            reconfigure: false,
+            non_interactive: true,
+            no_start: false,
+        },
+        &mut service,
+    ) {
+        Ok(_) => panic!("activation failure must be reported"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("activation"));
+    assert!(fixture.layout.credentials.exists());
+    assert!(fixture.layout.drop_in.exists());
+    assert!(!fixture.layout.journal.exists());
+    assert!(service.events.contains(&"enable"));
+}
+
+#[test]
+fn plain_rerun_reports_current_setup_while_reconfigure_continues() {
+    let current = CurrentSetup {
+        admin_user: "admin".to_owned(),
+        role: NodeRole::Cdn,
+        node_name: "cdn-1".to_owned(),
+        listen: "127.0.0.1:18210".parse().unwrap(),
+        service: ServiceState {
+            active: true,
+            enabled: true,
+        },
+    };
+    let mut prompt = ScriptedPrompt::new(&[], &[]);
+    let outcome = wizard::report_existing(&mut prompt, &current, false)
+        .unwrap()
+        .expect("plain rerun exits after reporting current setup");
+    assert!(outcome.configured);
+    assert!(prompt.output.contains("cdn-1"));
+    assert!(prompt.output.contains("127.0.0.1:18210"));
+
+    assert!(
+        wizard::report_existing(&mut prompt, &current, true)
+            .unwrap()
+            .is_none(),
+        "explicit reconfigure must continue into collection and apply"
+    );
 }

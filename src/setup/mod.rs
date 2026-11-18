@@ -1,6 +1,7 @@
 mod dependencies;
 mod files;
 mod systemd;
+mod wizard;
 
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -12,6 +13,7 @@ use std::str::FromStr;
 
 pub use dependencies::{CapabilityStatus, DependencyReport, ToolStatus};
 pub use systemd::SystemdManager;
+pub use wizard::{ExplicitInitOptions, run};
 
 #[cfg(test)]
 mod tests;
@@ -275,6 +277,9 @@ fn read_current_setup(
     layout: &Layout,
     service: ServiceState,
 ) -> Result<Option<CurrentSetup>, SetupError> {
+    if files::journal_present(layout)? {
+        return Ok(None);
+    }
     if !files::configuration_exists(layout)? {
         return Ok(None);
     }
@@ -309,7 +314,7 @@ fn read_current_setup(
     }))
 }
 
-fn listener_is_available(address: SocketAddr) -> Result<bool, SetupError> {
+pub(crate) fn listener_is_available(address: SocketAddr) -> Result<bool, SetupError> {
     let mut occupied = occupied_tcp_listeners(Path::new("/proc/net/tcp"), address)?;
     occupied |= occupied_tcp_listeners(Path::new("/proc/net/tcp6"), address)?;
     Ok(!occupied)
@@ -530,11 +535,13 @@ pub fn apply(
         return Err(error);
     }
 
+    let mut unit_verified = false;
     let operation = (|| {
         files::install_credentials(layout)?;
         files::install_drop_in(layout)?;
         service.verify(layout, &layout.drop_in)?;
         files::set_phase(layout, files::TransactionPhase::UnitVerified)?;
+        unit_verified = true;
         files::check_failpoint(files::TransactionPhase::UnitVerified)?;
         service.daemon_reload()?;
         if !options.no_start {
@@ -553,7 +560,11 @@ pub fn apply(
         Ok(state) => state,
         Err(error) => {
             if !error.injected_crash() {
-                let _ = recover(layout, service);
+                if !options.reconfigure && unit_verified {
+                    files::finish(layout)?;
+                } else {
+                    let _ = recover(layout, service);
+                }
             }
             return Err(error);
         }

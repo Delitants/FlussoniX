@@ -7,6 +7,21 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 #[derive(Parser)]
 #[command(name = "flussonix", version, about = "Independent live media server")]
 struct Args {
+    /// Configure a packaged FlussoniX installation, then exit.
+    #[arg(
+        long,
+        conflicts_with_all = ["init_srtp_receiver_ledger", "iptv_ha_init_empty", "iptv_ha_init_from"]
+    )]
+    init: bool,
+    /// Replace an existing wizard-generated setup.
+    #[arg(long, requires = "init")]
+    reconfigure: bool,
+    /// Read setup credentials from the environment without opening a terminal.
+    #[arg(long, requires = "init")]
+    non_interactive: bool,
+    /// Write and verify setup without enabling or starting the service.
+    #[arg(long, requires = "init")]
+    no_start: bool,
     #[arg(long, default_value = "127.0.0.1:18210")]
     listen: SocketAddr,
     /// Optional HTTPS listener for media, publication, APIs and admin.
@@ -166,7 +181,7 @@ struct Args {
         long,
         env = "FLUSSONIX_ADMIN_PASSWORD",
         hide_env_values = true,
-        required_unless_present_any = ["iptv_ha_init_empty", "iptv_ha_init_from", "init_srtp_receiver_ledger"]
+        required_unless_present_any = ["init", "iptv_ha_init_empty", "iptv_ha_init_from", "init_srtp_receiver_ledger"]
     )]
     admin_password: Option<String>,
     #[arg(long, env = "FLUSSONIX_VIEW_USER")]
@@ -177,7 +192,7 @@ struct Args {
         long,
         env = "FLUSSONIX_PEER_KEY",
         hide_env_values = true,
-        required_unless_present_any = ["iptv_ha_init_empty", "iptv_ha_init_from", "init_srtp_receiver_ledger"]
+        required_unless_present_any = ["init", "iptv_ha_init_empty", "iptv_ha_init_from", "init_srtp_receiver_ledger"]
     )]
     peer_key: Option<String>,
     #[arg(long, default_value = "standalone")]
@@ -298,6 +313,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let a = Args::parse();
+    if a.init {
+        if setup_secret_was_passed_on_command_line() {
+            return Err("setup secrets must be entered at the hidden prompt or supplied through the documented environment variables".into());
+        }
+        let outcome = flussonix::setup::run(
+            flussonix::setup::InitOptions {
+                reconfigure: a.reconfigure,
+                non_interactive: a.non_interactive,
+                no_start: a.no_start,
+            },
+            flussonix::setup::ExplicitInitOptions {
+                role: a.role.parse()?,
+                node_name: a.node_name,
+                listen: a.listen,
+            },
+        )
+        .await?;
+        println!("FlussoniX admin: {}", outcome.admin_url);
+        println!("Status: systemctl status flussonix.service");
+        println!("Logs: journalctl -u flussonix.service");
+        return Ok(());
+    }
     if let Some(path) = a.init_srtp_receiver_ledger.as_deref() {
         flussonix::direct_rtp::key_ledger::Ledger::initialize(path)?;
         println!("SRTP receiver ledger initialized");
@@ -646,6 +683,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn setup_secret_was_passed_on_command_line() -> bool {
+    std::env::args_os().skip(1).any(|argument| {
+        let argument = argument.to_string_lossy();
+        argument == "--admin-password"
+            || argument.starts_with("--admin-password=")
+            || argument == "--peer-key"
+            || argument.starts_with("--peer-key=")
+    })
+}
+
 #[cfg(unix)]
 struct ShutdownSignals {
     interrupt: tokio::signal::unix::Signal,
@@ -686,6 +733,57 @@ impl ShutdownSignals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn init_mode_bypasses_daemon_credentials() {
+        let parsed = Args::try_parse_from([
+            "flussonix",
+            "--init",
+            "--non-interactive",
+            "--role",
+            "cdn",
+            "--node-name",
+            "cdn-01",
+            "--listen",
+            "127.0.0.1:18210",
+        ])
+        .expect("setup mode must not require daemon credential arguments");
+        assert!(parsed.init);
+        assert!(parsed.non_interactive);
+    }
+
+    #[test]
+    fn init_only_flags_require_init() {
+        for flag in ["--reconfigure", "--non-interactive", "--no-start"] {
+            assert!(
+                Args::try_parse_from([
+                    "flussonix",
+                    "--admin-password",
+                    "daemon-admin",
+                    "--peer-key",
+                    "daemon-peer",
+                    flag,
+                ])
+                .is_err(),
+                "{flag} must be rejected outside setup mode"
+            );
+        }
+    }
+
+    #[test]
+    fn init_changes_do_not_relax_daemon_credentials() {
+        assert!(Args::try_parse_from(["flussonix"]).is_err());
+        assert!(
+            Args::try_parse_from([
+                "flussonix",
+                "--admin-password",
+                "daemon-admin",
+                "--peer-key",
+                "daemon-peer",
+            ])
+            .is_ok()
+        );
+    }
+
     #[test]
     fn ha_initialization_is_explicit_and_single_purpose() {
         let base = [
