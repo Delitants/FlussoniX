@@ -20,6 +20,7 @@ pub mod playback_auth;
 mod push;
 mod rtsp_push;
 pub mod server;
+pub mod setup;
 mod srt_input;
 pub mod srt_playback;
 mod srt_push;
