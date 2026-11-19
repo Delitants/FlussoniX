@@ -713,8 +713,10 @@ fn preflight_reports_occupied_listener_without_writing_setup() {
 
 #[derive(Clone)]
 struct RecordedCommands {
-    calls: Arc<Mutex<Vec<(PathBuf, Vec<OsString>)>>>,
+    calls: Arc<Mutex<Vec<RecordedCommand>>>,
 }
+
+type RecordedCommand = (PathBuf, Vec<OsString>);
 
 impl RecordedCommands {
     fn new() -> Self {
@@ -723,7 +725,7 @@ impl RecordedCommands {
         }
     }
 
-    fn snapshot(&self) -> Vec<(PathBuf, Vec<OsString>)> {
+    fn snapshot(&self) -> Vec<RecordedCommand> {
         self.calls.lock().unwrap().clone()
     }
 }
