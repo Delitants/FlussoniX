@@ -68,6 +68,14 @@ Delete the temporary directory after installation. APT verifies `InRelease`
 with the dedicated keyring; do not use `apt-key`, `trusted=yes`, or signature
 check overrides.
 
+The repository trust anchor is
+`8EF4 A06B 60F9 B89C 39D1 F438 6570 D339 1675 1290` and expires on
+2031-11-18 UTC. Its current signing subkey is
+`6F02 2E7F 62F5 F237 5C24 A13C D693 B0BB 0AEC 4620` and expires on
+2027-11-19 UTC. Rotation starts at least 90 days earlier and keeps the old and
+new signing state available long enough to verify an update from an existing
+installation as well as a fresh installation.
+
 ## Files and service
 
 The package owns the executable, web files and base unit under `/usr`. The setup

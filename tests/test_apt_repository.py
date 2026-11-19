@@ -209,6 +209,28 @@ class AptRepositoryTests(unittest.TestCase):
         self.assertFalse(any('private' in path.lower() or 'secret' in path.lower()
                              for path in actual))
 
+    def test_checked_in_production_key_is_public_and_names_current_signing_subkey(self):
+        key = ROOT / 'packaging/apt/flussonix-archive-keyring.gpg'
+        expected_signing = (ROOT / 'packaging/apt/signing-key-fingerprint.txt').read_text().strip()
+        listing = subprocess.run(
+            ['gpg', '--batch', '--no-options', '--show-keys', '--with-colons',
+             '--fingerprint', str(key)],
+            check=True, capture_output=True, text=True, timeout=10,
+        ).stdout
+        records = [line.split(':') for line in listing.splitlines()]
+        self.assertEqual([row[0] for row in records if row[0] in {'pub', 'sub'}],
+                         ['pub', 'sub'])
+        fingerprints = [row[9] for row in records if row[0] == 'fpr']
+        self.assertEqual(len(fingerprints), 2)
+        self.assertEqual(fingerprints[-1], expected_signing)
+        self.assertRegex(expected_signing, r'^[0-9A-F]{40}$')
+        packets = subprocess.run(
+            ['gpg', '--batch', '--no-options', '--list-packets', str(key)],
+            check=True, capture_output=True, text=True, timeout=10,
+        ).stdout
+        self.assertNotIn(':secret key packet:', packets)
+        self.assertNotIn(':secret sub key packet:', packets)
+
     def verify_signatures(self, repository):
         with tempfile.TemporaryDirectory(prefix='flussonix-apt-verify-') as name:
             home = Path(name)
