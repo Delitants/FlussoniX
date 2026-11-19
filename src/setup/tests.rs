@@ -963,6 +963,60 @@ fn systemd_verify_uses_systemd_analyze_without_a_shell() {
 }
 
 #[test]
+fn systemd_verify_root_contains_implicit_targets_and_executable_marker() {
+    struct InspectingRunner;
+    impl systemd::CommandRunner for InspectingRunner {
+        fn run(
+            &mut self,
+            _program: &Path,
+            args: &[OsString],
+        ) -> Result<systemd::CommandOutput, SetupError> {
+            let root = args
+                .iter()
+                .find_map(|argument| argument.to_str()?.strip_prefix("--root="))
+                .map(PathBuf::from)
+                .expect("verification root argument");
+            for target in [
+                "sysinit.target",
+                "basic.target",
+                "shutdown.target",
+                "network-online.target",
+                "multi-user.target",
+            ] {
+                assert!(
+                    root.join("usr/lib/systemd/system").join(target).is_file(),
+                    "missing isolated verification target {target}"
+                );
+            }
+            let binary = root.join("usr/bin/flussonix");
+            assert!(binary.is_file());
+            assert_ne!(
+                fs::metadata(binary).unwrap().permissions().mode() & 0o111,
+                0
+            );
+            Ok(systemd::CommandOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    let fixture = Fixture::new();
+    fixture.install_package_layout();
+    fs::write(
+        &fixture.layout.drop_in_staged,
+        b"[Service]\nRestart=always\n",
+    )
+    .unwrap();
+    let mut manager = SystemdManager::with_runner(Box::new(InspectingRunner));
+
+    manager
+        .verify(&fixture.layout, &fixture.layout.drop_in_staged)
+        .unwrap();
+}
+
+#[test]
 fn preflight_reads_only_non_secret_current_setup_fields() {
     let fixture = Fixture::new();
     let mut service = FakeService::stopped();

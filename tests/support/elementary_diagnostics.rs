@@ -517,13 +517,27 @@ pub(super) fn final_public_udp_snapshot(pid: u32, ports: &[u16]) -> io::Result<V
         return Err(io::Error::other("duplicate owned UDP port"));
     }
     let start_ticks = identity(pid)?.0;
-    let (state, rows, races) = observe(&Target {
+    let target = Target {
         pid,
         start_ticks: Some(start_ticks),
-    })?;
-    if state == "Z" || races != 0 {
-        return Err(io::Error::other("owned UDP observation incomplete"));
-    }
+    };
+    // Other fixture threads can close unrelated descriptors while procfs is
+    // enumerated. Preserve the complete-snapshot requirement, but allow the
+    // same bounded retry used by the periodic observer's 100 ms cadence.
+    let deadline = Instant::now() + Duration::from_millis(20);
+    let rows = loop {
+        let (state, rows, races) = observe(&target)?;
+        if state == "Z" {
+            return Err(io::Error::other("owned UDP observation incomplete"));
+        }
+        if races == 0 {
+            break rows;
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other("owned UDP observation incomplete"));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
     let loopback = format!("{:08X}", u32::from_ne_bytes([127, 0, 0, 1]));
     let mut selected = BTreeMap::new();
     for row in rows {

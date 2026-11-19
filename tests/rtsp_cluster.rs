@@ -131,6 +131,7 @@ struct Probe {
     admission_chunked: AtomicBool,
     admission_tickets: Mutex<Vec<String>>,
     admission_body_gate: Mutex<Option<CancellationToken>>,
+    synthetic_admission: AtomicBool,
 }
 struct HttpProbeGuard(Arc<Probe>);
 impl Drop for HttpProbeGuard {
@@ -243,6 +244,11 @@ async fn intercept(
             if p.reject.load(Ordering::SeqCst) {
                 p.admission_statuses.lock().unwrap().push(503);
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            if p.synthetic_admission.load(Ordering::SeqCst) {
+                p.admission_statuses.lock().unwrap().push(200);
+                return axum::Json(json!({"ticket":uuid::Uuid::new_v4().to_string()}))
+                    .into_response();
             }
         }
     }
@@ -1733,6 +1739,9 @@ async fn failed_admission_tries_one_alternate_without_starting_media() {
         let mut n=get_node(&lab.cdn).await;n["ready"]=json!(["region/owned"]);n["cpu"]=json!(0.0);n["ram"]=json!(0.0);n["uplink"]=json!(0.0);*lab.cdn.probe.snapshot.lock().unwrap()=Some(n);
         let mut n=get_node(&alternative).await;n["ready"]=json!([]);n["cpu"]=json!(0.8);n["ram"]=json!(0.8);*alternative.probe.snapshot.lock().unwrap()=Some(n);
         lab.cdn.probe.reject.store(true,Ordering::SeqCst);
+        // This case verifies LB retry order. Other cases cover the native CDN's
+        // live resource recheck; keep host CPU pressure out of this fixture.
+        alternative.probe.synthetic_admission.store(true,Ordering::SeqCst);
         assert!(location(&lab.lb.describe(false,"region/owned",QS).await).starts_with(&alternative.plain));
         assert_eq!(lab.cdn.probe.admits.load(Ordering::SeqCst),1);assert_eq!(alternative.probe.admits.load(Ordering::SeqCst),1);
         assert_eq!(alternative.app.media.count().await,0);assert!(!alternative.probe.bad_key.load(Ordering::SeqCst));

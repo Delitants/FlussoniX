@@ -2,6 +2,7 @@ use super::{Layout, ServiceManager, ServiceState, SetupError};
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -12,6 +13,13 @@ const SYSTEMD_ANALYZE: &str = "/usr/bin/systemd-analyze";
 const UNIT: &str = "flussonix.service";
 const OUTPUT_LIMIT: u64 = 64 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+const VERIFY_TARGETS: [&str; 5] = [
+    "sysinit.target",
+    "basic.target",
+    "shutdown.target",
+    "network-online.target",
+    "multi-user.target",
+];
 
 pub(crate) struct CommandOutput {
     pub status: i32,
@@ -185,6 +193,22 @@ impl ServiceManager for SystemdManager {
         fs::copy(&layout.base_unit, unit_dir.join(UNIT))
             .and_then(|_| fs::copy(staged_drop_in, drop_in_dir.join("10-setup.conf")))
             .map_err(|error| SetupError::io("copy staged systemd configuration", error))?;
+        for target in VERIFY_TARGETS {
+            fs::write(
+                unit_dir.join(target),
+                b"[Unit]\nDescription=FlussoniX isolated verification target\n",
+            )
+            .map_err(|error| SetupError::io("create systemd verification target", error))?;
+        }
+        let executable = root.path().join("usr/bin/flussonix");
+        fs::create_dir_all(
+            executable
+                .parent()
+                .expect("fixed verification executable parent"),
+        )
+        .and_then(|_| fs::write(&executable, []))
+        .and_then(|_| fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)))
+        .map_err(|error| SetupError::io("create systemd verification executable", error))?;
         let args = vec![
             OsString::from("verify"),
             OsString::from("--man=no"),

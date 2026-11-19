@@ -154,6 +154,8 @@ mod tests {
         // A wildcard reservation excludes another loopback owner, so a false
         // observation is meaningful even when other media tests run in parallel.
         // Once released, an unrelated owner may win the race; retry that port.
+        // A loaded kernel can also publish the new socket to procfs one scheduler
+        // turn after bind returns, matching the production poller's behavior.
         let mut observed = 0;
         for _ in 0..128 {
             let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
@@ -163,7 +165,15 @@ mod tests {
             let Ok(decoder) = std::net::UdpSocket::bind(("127.0.0.1", p)) else {
                 continue;
             };
-            assert!(bound(&[p]).unwrap());
+            let observed_bound = (0..20).any(|_| {
+                if bound(&[p]).unwrap() {
+                    true
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    false
+                }
+            });
+            assert!(observed_bound, "bound decoder socket was not observed");
             drop(decoder);
             observed += 1;
         }

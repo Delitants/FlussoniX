@@ -100,6 +100,8 @@ sudo --preserve-env=FLUSSONIX_ADMIN_USER,FLUSSONIX_ADMIN_PASSWORD,FLUSSONIX_PEER
 Use `--no-start` to write and verify the setup without enabling or starting the
 service. Supply the same peer key to nodes joining one native cluster. Keep all
 three variables out of logs and clear them when the automation step finishes.
+For a shared subscriber catalog and session limits across two authorities, see
+the [IPTV authority high-availability guide](iptv-ha.md).
 
 ## GPU transcoding
 
@@ -179,6 +181,30 @@ sudo flussonix --init
 
 A fully disconnected host also needs an Ubuntu package cache containing every
 dependency. The FlussoniX package does not bundle system libraries or drivers.
+
+## Release installation qualification
+
+Release maintainers can verify the complete APT lifecycle in disposable Ubuntu
+24.04 machines before publication. The repository must contain both the prior
+qualified package and the release candidate:
+
+```bash
+sudo python3 scripts/qualify-apt-install.py \
+  --repository /absolute/path/to/signed-apt-repository \
+  --current-version 0.11.0-1 \
+  --rootfs-dir /var/tmp/flussonix-apt-qualification
+```
+
+The gate checks repository signature rejection, dependency installation,
+interactive-default and `--no-start` setup, reboot, remove and purge. It also
+upgrades and rolls back active/enabled, active/disabled, inactive/enabled and
+inactive/disabled service states. Each boot uses a private network namespace;
+the host service is never enabled, disabled, started, stopped or restarted.
+
+Machines and their root filesystems are removed after success, failure or
+interruption. The owner-only result JSON remains beside the requested rootfs
+path. `--keep-on-failure` retains the root filesystem for diagnostics while
+still terminating every machine; remove the retained directory after review.
 
 ## Advanced portable archive
 
