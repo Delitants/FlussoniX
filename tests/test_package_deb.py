@@ -319,6 +319,32 @@ class PackageDebTests(unittest.TestCase):
             next(second_dir.glob('*.deb')).read_bytes(),
         )
 
+    def test_public_installation_guides_cover_package_lifecycle(self):
+        installation = (ROOT / 'docs/installation.md').read_text()
+        for value in (
+            'gpg --show-keys --with-colons --fingerprint',
+            'Signed-By: /usr/share/keyrings/flussonix-archive-keyring.gpg',
+            'sudo apt update', 'sudo apt upgrade',
+            'sudo apt install flussonix=VERSION-1',
+            'sudo apt remove flussonix', 'sudo apt purge flussonix',
+            '/etc/flussonix/credentials.env',
+            '/etc/systemd/system/flussonix.service.d/10-setup.conf',
+            '/var/lib/flussonix',
+            'FLUSSONIX_ADMIN_USER', 'FLUSSONIX_ADMIN_PASSWORD',
+            'FLUSSONIX_PEER_KEY', '--non-interactive', '--no-start',
+            'ffmpeg', 'ffprobe',
+        ):
+            self.assertIn(value, installation)
+        self.assertRegex(installation, r'(?i)GPU.*driver')
+        self.assertRegex(installation, r'(?is)apt remove.*preserv')
+        self.assertRegex(installation, r'(?is)apt purge.*preserv.*var/lib/flussonix')
+        self.assertRegex(installation, r'(?i)portable archive')
+
+        service = (ROOT / 'docs/service-installation.md').read_text()
+        self.assertRegex(service.splitlines()[0], r'(?i)advanced.*multi-instance')
+        self.assertIn('sudo flussonix --init', service)
+        self.assertRegex(service, r'(?is)APT package.*does not.*helper')
+
     def maintainer_environment(self, name, *, active=False, enabled=False):
         root = self.directory / name
         root.mkdir()

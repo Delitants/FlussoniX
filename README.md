@@ -1,66 +1,54 @@
 # FlussoniX
 
 FlussoniX is an independent Linux streaming server with a web admin interface,
-transcoding and cluster load balancing. It does not use official Flussonic
-components.
-
-Support is qualified by protocol, direction, codec and authorization profile.
-Review the [compatibility guide](docs/compatibility.md) before migrating a live
-service.
-
-## What it offers
-
-- Web forms for streams, templates, server settings and cluster nodes.
-- Supported profiles for HLS, HTTP MPEG-TS, M4F/M4S, SRT, RTSP/RTSPS and RTP/SRTP, including secure transports and viewer authorization.
-- CPU transcoding, supported Intel/NVIDIA GPU profiles and subtitle controls. The admin interface reports GPU readiness.
-- IPTV packages and subscriber playlists.
-- [FXLink](docs/fxlink.md), an optional encrypted transport between FlussoniX nodes.
-
-Protocol directions, codecs and feature limits vary by profile; see [compatibility](docs/compatibility.md) for details.
+transcoding, authorization, clustering and load balancing. It does not use
+official Flussonic components.
 
 ## Install
 
-The Linux x86-64 release is checked on Ubuntu 24.04 and requires glibc 2.39.
-Install FFmpeg and FFprobe separately; the standard CPU profile needs libx264
-and AAC support.
-
-[Download the latest release](https://github.com/Delitants/FlussoniX/releases)
-and its matching `.sha256` file. Verify the archive, extract it and open a
-terminal in the extracted directory:
+The first package release supports **Ubuntu 24.04 amd64**. Install FlussoniX,
+FFmpeg, FFprobe and the required runtime libraries with:
 
 ```bash
-sha256sum --check flussonix-*.tar.gz.sha256
+curl -fsSL https://delitants.github.io/FlussoniX/apt/install.sh | sudo bash
 ```
 
-Create private credentials and a data directory:
+The installer opens the setup wizard when a terminal is available. For an
+unattended install, finish setup later:
 
 ```bash
-umask 077
-export FLUSSONIX_ADMIN_USER=admin
-read -r -s -p "Choose an admin password: " FLUSSONIX_ADMIN_PASSWORD
-echo
-export FLUSSONIX_ADMIN_PASSWORD
-export FLUSSONIX_PEER_KEY="$(openssl rand -hex 32)"
-flussonix_data="$HOME/flussonix-data"
-mkdir -p "$flussonix_data"
-chmod 700 "$flussonix_data"
+sudo flussonix --init
 ```
 
-Save the password and peer key securely for future restarts. Start the server on a local test port:
+The wizard creates private credentials in `/etc/flussonix`, stores server state
+under `/var/lib/flussonix`, and offers to enable and start the included systemd
+service at boot. Open <http://127.0.0.1:18210/admin/> after setup.
+
+Once the repository is configured, normal updates are:
 
 ```bash
-./bin/flussonix --listen 127.0.0.1:18210 \
-  --config "$flussonix_data/config.json" \
-  --media-dir "$flussonix_data/media" --web-dir "$PWD/web"
+sudo apt update
+sudo apt upgrade
 ```
 
-Open [the admin interface](http://127.0.0.1:18210/admin/) and sign in. In **Media → Streams**, add `testsrc://` to check playback, then try your own input. Press **Ctrl+C** to stop the server. Use an SSH tunnel or [HTTPS](docs/https-delivery.md) for remote administration.
+See the [installation and update guide](docs/installation.md) for manual APT
+setup, automation, backup, rollback, removal and portable archive use.
 
-For verified downloads, upgrades and recovery, follow the [installation guide](docs/installation.md). To run a background service, see the [systemd guide](docs/service-installation.md).
+## Capabilities
 
-## More information
+- HLS, HTTP MPEG-TS, M4F/M4S, SRT, RTSP/RTSPS and RTP/SRTP profiles.
+- CPU transcoding, supported Intel/NVIDIA GPU profiles and subtitle controls.
+- Source, CDN and load-balancer roles with viewer authorization.
+- IPTV packages and subscriber playlists.
+- [FXLink](docs/fxlink.md), an encrypted long-haul transport between FlussoniX nodes.
+
+Protocol direction, codec and migration limits vary by profile. Review the
+[compatibility guide](docs/compatibility.md) before moving live traffic.
+
+## Guides
 
 - [Cluster and load balancing](docs/cluster-loadbalancing.md)
 - [IPTV setup](docs/iptv-transport.md)
 - [GPU transcoding](docs/gpu-codec-controls.md)
+- [Advanced portable and multi-instance systemd setup](docs/service-installation.md)
 - [Build from source](docs/packaging.md)

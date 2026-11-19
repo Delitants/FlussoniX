@@ -23,6 +23,7 @@
   "public_data": [
     "THIRD_PARTY_NOTICES.txt",
     "packaging/debian/baselines.json",
+    "packaging/apt/signing-key-fingerprint.txt",
     "third_party/manifest.json",
     "third_party/licenses/rust/*/LICENSE*",
     "third_party/licenses/rust/*/COPYRIGHT*",

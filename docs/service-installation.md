@@ -1,9 +1,13 @@
-# Run FlussoniX as a Linux service
+# Advanced portable and multi-instance systemd setup
 
-Use this optional workflow after checking the archive on a test host. It requires
-systemd, Python 3.11+ and independently installed FFmpeg/FFprobe. The packaged
-`bin/flussonix-service` helper creates credentials and writes a service unit;
-it never starts, enables or replaces a service.
+The APT package already installs a hardened systemd unit. A normal package
+installation runs `sudo flussonix --init` and does not need this helper. Use this
+advanced workflow for a portable archive, a custom layout, or multiple isolated
+instances on one host.
+
+It requires systemd, Python 3.11+ and independently installed FFmpeg/FFprobe.
+The portable archive's `bin/flussonix-service` helper creates credentials and
+writes a service unit; it never starts, enables or replaces a service.
 
 ## Prepare the directories
 

@@ -79,7 +79,7 @@ jobs:
           printf '%s' "$APT_SIGNING_SUBKEY_B64" | base64 --decode > "$secret_packet"
           gpg --batch --no-options --homedir "$signing_home" \
             --import "$secret_packet" >/dev/null 2>&1
-          expected_fingerprint=$(tr -d '[:space:]' < packaging/apt/signing-fingerprint.txt)
+          expected_fingerprint=$(tr -d '[:space:]' < packaging/apt/signing-key-fingerprint.txt)
           test "${#expected_fingerprint}" -eq 40
           gpg --batch --no-options --homedir "$signing_home" --with-colons \
             --fingerprint --list-secret-keys "$expected_fingerprint" \

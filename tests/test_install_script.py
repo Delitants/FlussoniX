@@ -231,6 +231,25 @@ if [ "$1" = "-m" ]; then mode=$2; source=$3; destination=$4; else exit 2; fi
         self.assertEqual(code, 0, output)
         self.assertNotIn('wizard', self.log.read_text())
 
+    def test_readme_leads_with_supported_one_command_install(self):
+        readme = (ROOT / 'README.md').read_text()
+        bootstrap = (
+            'curl -fsSL https://delitants.github.io/FlussoniX/apt/install.sh '
+            '| sudo bash'
+        )
+        self.assertIn(bootstrap, readme)
+        self.assertIn('sudo flussonix --init', readme)
+        self.assertIn('Ubuntu 24.04', readme)
+        self.assertIn('amd64', readme)
+        self.assertIn('/etc/flussonix', readme)
+        self.assertIn('/var/lib/flussonix', readme)
+        self.assertLess(readme.index(bootstrap), readme.find('tar -x')
+                        if 'tar -x' in readme else len(readme))
+        install = readme.index('## Install')
+        details = readme.index('docs/installation.md')
+        self.assertLess(install, details)
+        self.assertLess(readme.index(bootstrap), details)
+
 
 if __name__ == '__main__':
     unittest.main()

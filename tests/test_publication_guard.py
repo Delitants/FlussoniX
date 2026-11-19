@@ -45,7 +45,7 @@ class PublicationWorkflowTests(unittest.TestCase):
         self.assertRegex(workflow, r'(?m)^\s*contents:\s*write\s*$')
         self.assertIn('environment: apt-production', workflow)
         self.assertIn('secrets.APT_SIGNING_SUBKEY_B64', workflow)
-        self.assertIn('packaging/apt/signing-fingerprint.txt', workflow)
+        self.assertIn('packaging/apt/signing-key-fingerprint.txt', workflow)
         self.assertIn('.github/publication/guard.py', workflow)
         self.assertIn('git rev-parse HEAD', workflow)
         self.assertIn('scripts/build-apt-repository.py', workflow)
