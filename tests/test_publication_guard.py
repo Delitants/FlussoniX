@@ -50,7 +50,7 @@ class PublicationWorkflowTests(unittest.TestCase):
         self.assertIn('git rev-parse HEAD', workflow)
         self.assertIn('scripts/build-apt-repository.py', workflow)
         self.assertIn('pages/apt', workflow)
-        self.assertIn('test "${#asset_arguments[@]}" -eq 5', workflow)
+        self.assertIn('test "${#asset_arguments[@]}" -eq 10', workflow)
         self.assertNotIn('upload-artifact@', workflow)
         self.assertEqual([], guard.workflow_pin_errors(path.as_posix(), workflow))
         secret_line = next(line for line in workflow.splitlines()
