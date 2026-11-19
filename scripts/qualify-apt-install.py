@@ -332,18 +332,38 @@ class QualificationRunner:
             ),
             Operation('configure-signed-repository', ('internal', 'configure-base'), 30, 'internal'),
             Operation(
+                'bootstrap-ca-certificates',
+                self._nspawn(
+                    self.base_root, '/bin/bash', '-ec',
+                    "export DEBIAN_FRONTEND=noninteractive; "
+                    "apt-get update "
+                    "-o Dir::Etc::sourcelist=/etc/apt/sources.list "
+                    "-o Dir::Etc::sourceparts=-; "
+                    "apt-get install -y --no-install-recommends ca-certificates"
+                ),
+                900,
+            ),
+            Operation(
                 'signature-rejection',
                 self._nspawn(
                     self.base_root, '/bin/bash', '-ec',
-                    "mkdir -p /var/lib/apt/lists-invalid/partial; "
+                    "set -eu; lists=/var/lib/apt/lists-invalid; "
+                    "log=/tmp/flussonix-invalid-signature.log; "
+                    "rm -rf \"$lists\"; mkdir -p \"$lists/partial\"; "
                     "printf 'invalid-key' >/tmp/invalid.gpg; "
                     "sed 's#Signed-By: .*#Signed-By: /tmp/invalid.gpg#' "
                     "/etc/apt/sources.list.d/flussonix.sources >/tmp/invalid.sources; "
+                    "status=0; "
                     "apt-get update -o Dir::Etc::sourcelist=/tmp/invalid.sources "
-                    "-o Dir::Etc::sourceparts=- -o Dir::State::Lists=/var/lib/apt/lists-invalid"
+                    "-o Dir::Etc::sourceparts=- -o Dir::State::Lists=\"$lists\" "
+                    ">\"$log\" 2>&1 || status=$?; "
+                    "cat \"$log\" >&2; test \"$status\" -ne 0; "
+                    "grep -Eq \"NO_PUBKEY|signatures couldn.t be verified|"
+                    "OpenPGP signature verification failed|repository .* is not signed\" \"$log\"; "
+                    "test -z \"$(find \"$lists\" -maxdepth 2 -type f "
+                    "-name '*_Packages*' -print -quit)\""
                 ),
                 300,
-                expect_failure=True,
             ),
             Operation(
                 'base-dependencies-ffmpeg-ffprobe-libsrt1.5-gnutls-libsrtp2-1-adduser-dbus',

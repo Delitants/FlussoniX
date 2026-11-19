@@ -191,6 +191,24 @@ class AptQualificationTests(unittest.TestCase):
                          if operation.phase == 'debootstrap-noble-amd64')
         self.assertIn('--components=main,universe', bootstrap.argv)
 
+    def test_plan_bootstraps_tls_before_proving_signature_rejection(self):
+        _module, runner, _removed = self.runner()
+        operations = runner.plan()
+        phases = [operation.phase for operation in operations]
+        bootstrap = next(operation for operation in operations
+                         if operation.phase == 'bootstrap-ca-certificates')
+        rejection = next(operation for operation in operations
+                         if operation.phase == 'signature-rejection')
+
+        self.assertLess(phases.index('bootstrap-ca-certificates'),
+                        phases.index('signature-rejection'))
+        self.assertIn('ca-certificates', ' '.join(bootstrap.argv))
+        self.assertIn('Dir::Etc::sourceparts=-', ' '.join(bootstrap.argv))
+        self.assertFalse(rejection.expect_failure)
+        rejection_command = ' '.join(rejection.argv)
+        self.assertIn('NO_PUBKEY', rejection_command)
+        self.assertIn('_Packages', rejection_command)
+
     def test_success_failure_and_interruption_cleanup_machines_and_rootfs(self):
         module, runner, removed = self.runner()
         probe = module.Operation('probe', ('/usr/bin/true',), 5)
