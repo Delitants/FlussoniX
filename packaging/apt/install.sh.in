@@ -1,0 +1,106 @@
+#!/bin/sh
+set -eu
+
+EXPECTED_FINGERPRINT=@PUBLIC_KEY_FINGERPRINT@
+REPOSITORY_URL=@REPOSITORY_URL@
+ROOT_PREFIX=@ROOT_PREFIX@
+PATH=@COMMAND_PATH@
+export PATH
+
+fail() {
+  printf 'FlussoniX installation failed: %s\n' "$1" >&2
+  exit 1
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+  fail 'run this installer as root (for example: curl ... | sudo bash)'
+fi
+
+os_release="${ROOT_PREFIX}/etc/os-release"
+[ -f "$os_release" ] || fail 'Ubuntu release information is unavailable'
+ID=
+VERSION_ID=
+# This file is package-manager owned on the supported host.
+. "$os_release"
+[ "${ID:-}" = ubuntu ] && [ "${VERSION_ID:-}" = 24.04 ] ||
+  fail 'only Ubuntu 24.04 is supported by this repository'
+
+[ "$(dpkg --print-architecture)" = amd64 ] ||
+  fail 'only the amd64 architecture is supported by this repository'
+
+case "$REPOSITORY_URL" in
+  https://*) ;;
+  *) fail 'the repository URL must use HTTPS' ;;
+esac
+
+command -v curl >/dev/null 2>&1 || fail 'curl is required to run this installer'
+
+certificate_bundle="${ROOT_PREFIX}/etc/ssl/certs/ca-certificates.crt"
+if [ ! -r "$certificate_bundle" ] || ! command -v gpg >/dev/null 2>&1; then
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates gnupg
+fi
+command -v gpg >/dev/null 2>&1 || fail 'GnuPG installation did not provide gpg'
+[ -r "$certificate_bundle" ] || fail 'the CA certificate bundle is unavailable'
+
+umask 077
+temporary=$(mktemp -d "${TMPDIR:-/tmp}/flussonix-install.XXXXXX") ||
+  fail 'cannot create a private temporary directory'
+cleanup() {
+  rm -rf -- "$temporary"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+downloaded_key="$temporary/archive-key"
+curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  --output "$downloaded_key" "${REPOSITORY_URL}/flussonix-archive-keyring.gpg"
+
+key_listing="$temporary/key-listing"
+gpg --batch --no-options --show-keys --with-colons --fingerprint \
+  "$downloaded_key" >"$key_listing" 2>/dev/null || fail 'repository key is invalid'
+public_key_count=$(awk -F: '$1 == "pub" { count++ } END { print count + 0 }' "$key_listing")
+secret_key_count=$(awk -F: '$1 == "sec" { count++ } END { print count + 0 }' "$key_listing")
+actual_fingerprint=$(awk -F: '$1 == "fpr" { print toupper($10); exit }' "$key_listing")
+[ "$public_key_count" -eq 1 ] && [ "$secret_key_count" -eq 0 ] &&
+  [ "$actual_fingerprint" = "$EXPECTED_FINGERPRINT" ] ||
+  fail 'repository key fingerprint does not match the pinned key'
+
+dearmored_key="$temporary/flussonix-archive-keyring.gpg"
+gpg --batch --yes --no-options --dearmor --output "$dearmored_key" \
+  "$downloaded_key" || fail 'repository key cannot be converted to a keyring'
+
+source_file="$temporary/flussonix.sources"
+cat >"$source_file" <<EOF
+Types: deb
+URIs: ${REPOSITORY_URL}
+Suites: noble
+Components: main
+Architectures: amd64
+Signed-By: /usr/share/keyrings/flussonix-archive-keyring.gpg
+EOF
+
+keyring_directory="${ROOT_PREFIX}/usr/share/keyrings"
+sources_directory="${ROOT_PREFIX}/etc/apt/sources.list.d"
+keyring="${keyring_directory}/flussonix-archive-keyring.gpg"
+source="${sources_directory}/flussonix.sources"
+install -d -m 0755 "$keyring_directory"
+install -d -m 0755 "$sources_directory"
+install -m 0644 "$dearmored_key" "${keyring}.new.$$"
+install -m 0644 "$source_file" "${source}.new.$$"
+mv -f -- "${keyring}.new.$$" "$keyring"
+mv -f -- "${source}.new.$$" "$source"
+
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y flussonix
+
+credentials="${ROOT_PREFIX}/etc/flussonix/credentials.env"
+flussonix="${ROOT_PREFIX}/usr/bin/flussonix"
+if [ -e "$credentials" ]; then
+  printf '%s\n' 'FlussoniX is already initialized; existing configuration was preserved.'
+elif tty </dev/tty >/dev/null 2>&1; then
+  [ -x "$flussonix" ] || fail 'the installed flussonix executable is unavailable'
+  "$flussonix" --init </dev/tty >/dev/tty 2>/dev/tty
+else
+  printf '%s\n' 'FlussoniX is installed. Complete setup with: sudo flussonix --init'
+fi
