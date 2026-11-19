@@ -1,0 +1,38 @@
+Package: flussonix
+Architecture: amd64
+Version: 0.10.0-1
+Priority: optional
+Section: video
+Maintainer: FlussoniX Project <noreply@flussonix.invalid>
+Depends: ffmpeg, libsrt1.5-gnutls, libsrtp2-1, ca-certificates, adduser, init-system-helpers, libc6 (>= 2.39), libgcc-s1 (>= 4.2)
+Recommends: tesseract-ocr, tesseract-ocr-eng, vainfo, intel-gpu-tools, pciutils
+Filename: pool/main/f/flussonix/flussonix_0.10.0-1_amd64.deb
+Size: 7244776
+MD5sum: 9e3ad5871b547fce830e5ac875cbee14
+SHA1: f530724ed3dd4f333ed4c8c3efa873f101a2e004
+SHA256: be6f1691129ec4d38f11dcdb1b4da98e33f6830c1f956d8ff15fe943a38ccf37
+SHA512: cd067d9cc20fdac6fbb666f2937458c1ab6c67d7774c09af32f85c74a0eeda8a5b978214ed58d8b05779e2ab6f386ea4db2330d036a76a519027185fe1f99603
+Homepage: https://github.com/Delitants/FlussoniX
+Description: independent live media server and cluster control plane
+ FlussoniX provides live streaming, transcoding, clustering, authorization,
+ protocol compatibility, and a browser administration interface.
+
+Package: flussonix
+Architecture: amd64
+Version: 0.11.0-1
+Priority: optional
+Section: video
+Maintainer: FlussoniX Project <noreply@flussonix.invalid>
+Depends: ffmpeg, libsrt1.5-gnutls, libsrtp2-1, ca-certificates, adduser, init-system-helpers, libc6 (>= 2.39), libgcc-s1 (>= 4.2)
+Recommends: tesseract-ocr, tesseract-ocr-eng, vainfo, intel-gpu-tools, pciutils
+Filename: pool/main/f/flussonix/flussonix_0.11.0-1_amd64.deb
+Size: 7323192
+MD5sum: d0b790f373869436be31841502350e91
+SHA1: 095d28fac03138268a1f1d3db62ad767f2c68fa9
+SHA256: 4345a4238eac8109567914cae7524b53e77cf551f00d780877a7a0bc81d4c48d
+SHA512: 0dedd35ca7174dc3bc3ac387e048fca94d895a2cd7649d7166109ecdd085b80a0540b3f0c7be140f174a199e6d51f70aabb06fb30c22f935ec1a76ec782be88a
+Homepage: https://github.com/Delitants/FlussoniX
+Description: independent live media server and cluster control plane
+ FlussoniX provides live streaming, transcoding, clustering, authorization,
+ protocol compatibility, and a browser administration interface.
+

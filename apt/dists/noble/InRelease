@@ -1,0 +1,37 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+Architectures: amd64
+Codename: noble
+Components: main
+Date: Thu, 19 Nov 2026 12:08:27 +0000
+Description: FlussoniX signed package repository
+Label: FlussoniX
+Origin: FlussoniX
+Suite: stable
+MD5Sum:
+ c5c8210f85b007b49eb7172964b1342d             1984 main/binary-amd64/Packages
+ 6a6690ac30a9281bd7126b2c9c2fbb21              865 main/binary-amd64/Packages.gz
+SHA1:
+ e6feab349bbeb855fd5a916e27f32540d9ebd2f7             1984 main/binary-amd64/Packages
+ 497fbcb6f0c07170a670528d3e44adde6cba87bd              865 main/binary-amd64/Packages.gz
+SHA256:
+ 05de276f3c2b2aad7e0e6f82dfa365cfdb759c999b337e4c77e888da097296b3             1984 main/binary-amd64/Packages
+ 1e9354954cad11640e294da5600638f93299d058db5a3807e6358690e42ff420              865 main/binary-amd64/Packages.gz
+SHA512:
+ ded55850ef8c0c6297d2a96e2ef0632b4f69417b70c79a4cab4f7e119d3b49e54d83ff8f693bb8b36d3642a133bda1b3f4d0b50a364dabc94b9e9e7914f5f70b             1984 main/binary-amd64/Packages
+ 7d178cb944267ae5dfa6165c713d856a0314b7a4a6cee51538ca3c887803ab396575d525e84e053f2db5bba4d759bfaa0aa79a85beca8e6402af5dd60b8da587              865 main/binary-amd64/Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+iQGzBAEBCAAdFiEEbwIuf2L18jdcJKE81pOwuwrsRiAFAmr+5rsACgkQ1pOwuwrs
+RiCW4gv/ZxQOkLx5nzvEJ8OiU8SH0/egiEr3Gfp7HC2ZLJlRUJl626tYHzbbqA+6
+gIlydd7zD6SvdPPutajR0TWbNjdJ0hEcFr/3I0PqLuxrXREc2orqOWAyJPXvDHi4
+eo3v5EYmDDgxSZLfkQAyFhjNEUbKYkO/KEy+3xTsDZlBeYbaD4CjtrobtgJSp8pg
+Bo2JgyqjqKtRBZAu8HH0mOnNfq6SsMEkDV2i5Hi5/7AHoxpR0/4edlSbp8cKGl7B
+LpFnbp4ZLHVx/2MX68G39jLmreeU+sXpQUPOrW/Vy10oDXkz2YsrPXHTgOPkSqIZ
+KcICQ+isoge2RI3plywr6sUJa47m9MquH3I5ns0GBtJ9ub6x//Lce34VEktJTAtf
+CjdzzhA3vNhsNBJXuno6lXCZEgtx4Zfkn93cPc/8JXcSb1C0UZHCnFoaiosidQR2
+WMZ30l/FIC0y52NdNvIHy3AVWGDvH8SzseOkqFccYchr/C8kaR9ZJzNLhQgmCAfh
+V3Br4Fg/
+=Uwsf
+-----END PGP SIGNATURE-----
