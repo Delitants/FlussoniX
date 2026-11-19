@@ -142,7 +142,7 @@ jobs:
             sudo sed -i 's#http://azure.archive.ubuntu.com/ubuntu#https://archive.ubuntu.com/ubuntu#g' /etc/apt/apt-mirrors.txt
           fi
           sudo apt-get -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2 update
-          sudo apt-get -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2 install -y ffmpeg libsrt1.5-gnutls
+          sudo apt-get -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=2 install -y ffmpeg libsrt1.5-gnutls dpkg-dev apt-utils
       - name: Verify vendor components are absent
         run: test ! -e /opt/flussonic
       - name: Verify archive and upgrade smoke helpers
@@ -167,27 +167,42 @@ jobs:
           test "${#archives[@]}" -eq 1
           python3 scripts/smoke-release-archive.py --archive "${archives[0]}" \
             --revision "$GITHUB_SHA"
-          baseline_archive="$package_dir/flussonix-v0.10.0-preview-linux-x86_64.tar.gz"
+          baseline_archive="$package_dir/flussonix-0.10.0-linux-x86_64-f2939b6f3e48.tar.gz"
           curl --fail --location --retry 3 --retry-delay 2 \
             --proto '=https' --proto-redir '=https' --tlsv1.2 \
             --output "$baseline_archive" \
-            https://github.com/Delitants/FlussoniX/releases/download/v0.10.0-preview/flussonix-v0.10.0-preview-linux-x86_64.tar.gz
+            https://github.com/Delitants/FlussoniX/releases/download/v0.10.0/flussonix-0.10.0-linux-x86_64-f2939b6f3e48.tar.gz
           printf '%s  %s\n' \
-            '68fed74f74db1107c39adb6b369fa58d70336fbccde464b9ab73e6c1ec29f4a0' \
+            '4ff1e1bcaa9b0e0be1c4cb482ce7aa0eedb0b89570f6d544539038a9173ee0bc' \
             "$baseline_archive" | sha256sum --check
           mkdir "$package_dir/previous" "$package_dir/current"
           tar --extract --gzip --file "$baseline_archive" \
-            --directory "$package_dir/previous" --no-same-owner --no-same-permissions
+            --directory "$package_dir/previous" --strip-components=1 \
+            --no-same-owner --no-same-permissions
           tar --extract --gzip --file "${archives[0]}" \
             --directory "$package_dir/current" --strip-components=1 \
             --no-same-owner --no-same-permissions
           TMPDIR="$package_dir" python3 scripts/smoke-cold-upgrade.py \
             --previous "$package_dir/previous" --current "$package_dir/current" --media
+          python3 -m unittest tests.test_package_deb -v
+          python3 scripts/package-deb.py --archive "${archives[0]}" \
+            --checksum "${archives[0]}.sha256" \
+            --output-dir "$package_dir/debian" --revision "$GITHUB_SHA"
+          mapfile -t debs < <(find "$package_dir/debian" -maxdepth 1 -type f -name '*.deb')
+          test "${#debs[@]}" -eq 1
+          test -f "${debs[0]}.sha256"
+          test -f "${debs[0]}.inspection.json"
+          dpkg-deb --info "${debs[0]}" >/dev/null
           mkdir "$GITHUB_WORKSPACE/release-candidate"
-          cp -- "${archives[0]}" "${archives[0]}.sha256" "$GITHUB_WORKSPACE/release-candidate/"
+          cp -- "${archives[0]}" "${archives[0]}.sha256" \
+            "${debs[0]}" "${debs[0]}.sha256" "${debs[0]}.inspection.json" \
+            "$GITHUB_WORKSPACE/release-candidate/"
+          test "$(find "$GITHUB_WORKSPACE/release-candidate" -maxdepth 1 -type f | wc -l)" -eq 5
+          test "$(find "$GITHUB_WORKSPACE/release-candidate" -maxdepth 1 -type f -name '*.deb.inspection.json' | wc -l)" -eq 1
           (cd "$GITHUB_WORKSPACE/release-candidate" && \
-            sha256sum --check -- "$(basename -- "${archives[0]}.sha256")")
-      - name: Retain exact tested archive and checksum for isolated qualification
+            sha256sum --check -- "$(basename -- "${archives[0]}.sha256")" \
+              "$(basename -- "${debs[0]}.sha256")")
+      - name: Retain exact tested archive and Debian package for isolated qualification
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: flussonix-candidate-${{ github.sha }}

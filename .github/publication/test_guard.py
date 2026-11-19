@@ -7,6 +7,7 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -27,6 +28,13 @@ RELEASE_POLICY = {"release_assets": [
     "flussonix-*-linux-x86_64*.tar.gz.sha256",
     "SHA256SUMS",
 ]}
+PACKAGE_RELEASE_POLICY = {"release_assets": [
+    "flussonix-*-linux-x86_64*.tar.gz",
+    "flussonix-*-linux-x86_64*.tar.gz.sha256",
+    "flussonix_*_amd64.deb",
+    "flussonix_*_amd64.deb.sha256",
+    "flussonix_*_amd64.deb.inspection.json",
+], "require_debian_package": True}
 PACKAGE_NAME = "flussonix-1-linux-x86_64-abc.tar.gz"
 QUALIFIED_SHA = "a" * 40
 QUALIFIED_TAG = "v1.2.3"
@@ -51,17 +59,151 @@ def qualified_run_evidence():
 
 
 class PublicationGuardTests(unittest.TestCase):
+    def qualified_release_files(self, directory, *, version="1.2.3",
+                                revision=QUALIFIED_SHA):
+        root = pathlib.Path(directory)
+        prefix = f"flussonix-{version}-linux-x86_64-{revision[:12]}"
+        archive = root / f"{prefix}.tar.gz"
+        manifest = {
+            "format": 1, "name": "FlussoniX", "version": version,
+            "source_revision": revision, "source_date_epoch": 1_700_000_000,
+            "architecture": "x86_64", "files": {},
+        }
+        with tarfile.open(archive, "w:gz") as output:
+            directory_info = tarfile.TarInfo(prefix)
+            directory_info.type = tarfile.DIRTYPE
+            output.addfile(directory_info)
+            data = (json.dumps(manifest, sort_keys=True) + "\n").encode()
+            member = tarfile.TarInfo(prefix + "/manifest.json")
+            member.size = len(data)
+            member.mode = 0o644
+            output.addfile(member, io.BytesIO(data))
+        archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        archive_checksum = pathlib.Path(str(archive) + ".sha256")
+        archive_checksum.write_text(f"{archive_digest}  {archive.name}\n")
+
+        tree = root / "deb-tree"
+        (tree / "DEBIAN").mkdir(parents=True)
+        executable = tree / "usr/bin/flussonix"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"qualified release fixture\n")
+        executable.chmod(0o755)
+        (tree / "DEBIAN/control").write_text(
+            "Package: flussonix\n"
+            f"Version: {version}-1\n"
+            "Section: video\nPriority: optional\nArchitecture: amd64\n"
+            "Maintainer: FlussoniX Test <test@flussonix.invalid>\n"
+            "Description: publication fixture\n"
+        )
+        package = root / f"flussonix_{version}-1_amd64.deb"
+        subprocess.run(
+            ["dpkg-deb", "--root-owner-group", "-Zxz", "--build",
+             str(tree), str(package)],
+            check=True, capture_output=True, text=True,
+        )
+        package_digest = hashlib.sha256(package.read_bytes()).hexdigest()
+        package_checksum = pathlib.Path(str(package) + ".sha256")
+        package_checksum.write_text(f"{package_digest}  {package.name}\n")
+        inspection = pathlib.Path(str(package) + ".inspection.json")
+        inspection.write_text(json.dumps({
+            "format": 1,
+            "archive": {
+                "sha256": archive_digest, "source_revision": revision,
+                "version": version, "architecture": "x86_64", "legacy": False,
+            },
+            "package": {
+                "name": "flussonix", "version": f"{version}-1",
+                "architecture": "amd64", "depends": [], "recommends": [],
+            },
+            "files": {
+                "/usr/bin/flussonix": {
+                    "sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+                    "bytes": executable.stat().st_size, "mode": "0o755",
+                },
+            },
+        }, sort_keys=True) + "\n")
+        return [archive, archive_checksum, package, package_checksum, inspection]
+
+    @unittest.skipUnless(shutil.which("dpkg-deb"), "requires dpkg-deb")
+    def test_release_requires_exact_archive_linked_debian_triple(self):
+        with tempfile.TemporaryDirectory() as directory:
+            assets = self.qualified_release_files(directory)
+            self.assertEqual(
+                [], guard.release_errors(PACKAGE_RELEASE_POLICY, "v1.2.3", assets)
+            )
+            for omitted in assets[2:]:
+                with self.subTest(omitted=omitted.name):
+                    self.assertTrue(guard.release_errors(
+                        PACKAGE_RELEASE_POLICY, "v1.2.3",
+                        [asset for asset in assets if asset != omitted],
+                    ))
+            self.assertTrue(guard.release_errors(
+                PACKAGE_RELEASE_POLICY, "v1.2.3", assets + [assets[2]]
+            ))
+
+    @unittest.skipUnless(shutil.which("dpkg-deb"), "requires dpkg-deb")
+    def test_release_rejects_repacked_or_misidentified_debian_package(self):
+        mutations = (
+            ("repacked", lambda paths: paths[2].write_bytes(paths[2].read_bytes() + b"x")),
+            ("wrong-digest", lambda paths: self.change_inspection(
+                paths[4], "archive", "sha256", "0" * 64)),
+            ("wrong-revision", lambda paths: self.change_inspection(
+                paths[4], "archive", "source_revision", "b" * 40)),
+            ("wrong-version", lambda paths: self.change_inspection(
+                paths[4], "package", "version", "9.9.9-1")),
+            ("wrong-architecture", lambda paths: self.change_inspection(
+                paths[4], "package", "architecture", "arm64")),
+            ("extra-payload", lambda paths: self.change_inspection(
+                paths[4], "files", "/unexpected", {
+                    "sha256": "0" * 64, "bytes": 0, "mode": "0o644"})),
+        )
+        for name, mutate in mutations:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                assets = self.qualified_release_files(directory)
+                mutate(assets)
+                self.assertTrue(
+                    guard.release_errors(PACKAGE_RELEASE_POLICY, "v1.2.3", assets)
+                )
+
+    @staticmethod
+    def change_inspection(path, section, field, value):
+        report = json.loads(path.read_text())
+        report[section][field] = value
+        path.write_text(json.dumps(report) + "\n")
+
+    def test_release_rejects_renamed_or_non_debian_package(self):
+        with tempfile.TemporaryDirectory() as directory:
+            assets = self.qualified_release_files(directory)
+            renamed = assets[2].with_name("flussonix_1.2.3-2_amd64.deb")
+            assets[2].rename(renamed)
+            assets[2] = renamed
+            self.assertTrue(
+                guard.release_errors(PACKAGE_RELEASE_POLICY, "v1.2.3", assets)
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            assets = self.qualified_release_files(directory)
+            assets[2].write_bytes(b"not a Debian package")
+            digest = hashlib.sha256(assets[2].read_bytes()).hexdigest()
+            assets[3].write_text(f"{digest}  {assets[2].name}\n")
+            self.assertTrue(
+                guard.release_errors(PACKAGE_RELEASE_POLICY, "v1.2.3", assets)
+            )
+
     def test_qualified_ci_run_accepts_main_ref_workflow_path(self):
         run, jobs, artifacts, artifact, archive = qualified_run_evidence()
         run["path"] = ".github/workflows/ci.yml@main"
-        self.assertEqual((artifact, archive, archive + ".sha256"),
+        package="flussonix_1.2.3-1_amd64.deb"
+        self.assertEqual((artifact, archive, archive + ".sha256", package,
+                          package+".sha256", package+".inspection.json"),
                          guard.verify_ci_metadata(run, jobs, artifacts, 123,
                                                   QUALIFIED_TAG, QUALIFIED_SHA,
                                                   "Delitants/FlussoniX"))
 
     def test_qualified_ci_run_requires_matching_successful_main_build(self):
         run, jobs, artifacts, artifact, archive = qualified_run_evidence()
-        self.assertEqual((artifact, archive, archive + ".sha256"),
+        package="flussonix_1.2.3-1_amd64.deb"
+        self.assertEqual((artifact, archive, archive + ".sha256", package,
+                          package+".sha256", package+".inspection.json"),
                          guard.verify_ci_metadata(run, jobs, artifacts, 123,
                                                   QUALIFIED_TAG, QUALIFIED_SHA,
                                                   "Delitants/FlussoniX"))
@@ -97,11 +239,13 @@ class PublicationGuardTests(unittest.TestCase):
             local = root / "local"
             downloaded = root / "downloaded.zip"
             local.mkdir()
-            (local / archive).write_bytes(b"archive bytes")
-            (local / (archive + ".sha256")).write_bytes(b"sidecar bytes")
+            package="flussonix_1.2.3-1_amd64.deb"
+            payloads={archive:b"archive bytes",archive+".sha256":b"sidecar bytes",
+                      package:b"package bytes",package+".sha256":b"package sidecar",
+                      package+".inspection.json":b"inspection"}
+            for name,value in payloads.items():(local/name).write_bytes(value)
             with zipfile.ZipFile(downloaded, "w") as bundle:
-                bundle.writestr(archive, b"archive bytes")
-                bundle.writestr(archive + ".sha256", b"sidecar bytes")
+                for name,value in payloads.items():bundle.writestr(name,value)
             files = list(local.iterdir())
             digest = "sha256:" + hashlib.sha256(downloaded.read_bytes()).hexdigest()
             guard.verify_ci_zip(downloaded, files, archive, digest,
@@ -121,8 +265,7 @@ class PublicationGuardTests(unittest.TestCase):
                 guard.verify_ci_zip(downloaded, files, archive, digest,
                                     downloaded.stat().st_size)
             with zipfile.ZipFile(downloaded, "w") as bundle:
-                bundle.writestr(archive, b"archive bytes")
-                bundle.writestr(archive + ".sha256", b"sidecar bytes")
+                for name,value in payloads.items():bundle.writestr(name,value)
             (local / archive).unlink()
             (local / archive).symlink_to(root / "other")
             with self.assertRaises(ValueError):
@@ -137,12 +280,14 @@ class PublicationGuardTests(unittest.TestCase):
             (root / ".git").mkdir()
             local = root / "local"
             local.mkdir()
-            (local / archive).write_bytes(b"archive bytes")
-            (local / (archive + ".sha256")).write_bytes(b"sidecar bytes")
+            package="flussonix_1.2.3-1_amd64.deb"
+            payloads={archive:b"archive bytes",archive+".sha256":b"sidecar bytes",
+                      package:b"package bytes",package+".sha256":b"package sidecar",
+                      package+".inspection.json":b"inspection"}
+            for name,value in payloads.items():(local/name).write_bytes(value)
             bundle = root / "owned-ci.zip"
             with zipfile.ZipFile(bundle, "w") as compressed:
-                compressed.writestr(archive, b"archive bytes")
-                compressed.writestr(archive + ".sha256", b"sidecar bytes")
+                for name,value in payloads.items():compressed.writestr(name,value)
             artifacts["artifacts"][0]["size_in_bytes"] = bundle.stat().st_size
             artifacts["artifacts"][0]["digest"] = (
                 "sha256:" + hashlib.sha256(bundle.read_bytes()).hexdigest())

@@ -1,0 +1,121 @@
+name: Publish signed APT repository
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apt-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.event.repository.full_name == 'Delitants/FlussoniX' && !github.event.release.draft && !github.event.release.prerelease
+    environment: apt-production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - name: Check out the released source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install repository build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-utils dpkg-dev ffmpeg
+      - name: Download and verify exact public release assets
+        run: |
+          set -euo pipefail
+          assets="$RUNNER_TEMP/release-assets"
+          mkdir "$assets"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$assets"
+          asset_arguments=()
+          while IFS= read -r -d '' asset; do
+            asset_arguments+=(--asset "$asset")
+          done < <(find "$assets" -maxdepth 1 -type f -print0 | sort -z)
+          test "${#asset_arguments[@]}" -eq 10
+          python3 .github/publication/guard.py release-files \
+            --tag "$RELEASE_TAG" "${asset_arguments[@]}"
+          mapfile -t inspections < <(find "$assets" -maxdepth 1 -type f \
+            -name 'flussonix_*_amd64.deb.inspection.json')
+          test "${#inspections[@]}" -eq 1
+          test "$(jq -r '.archive.source_revision' "${inspections[0]}")" = \
+            "$(git rev-parse HEAD)"
+      - name: Rebuild retained prior package
+        run: |
+          set -euo pipefail
+          prior="$RUNNER_TEMP/prior-release"
+          mkdir "$prior"
+          gh release download v0.10.0 --repo "$GITHUB_REPOSITORY" \
+            --pattern 'flussonix-0.10.0-linux-x86_64-f2939b6f3e48.tar.gz*' \
+            --dir "$prior"
+          python3 scripts/package-deb.py \
+            --archive "$prior/flussonix-0.10.0-linux-x86_64-f2939b6f3e48.tar.gz" \
+            --checksum "$prior/flussonix-0.10.0-linux-x86_64-f2939b6f3e48.tar.gz.sha256" \
+            --output-dir "$RUNNER_TEMP/prior-package" \
+            --revision f2939b6f3e48d1816dff8ce34d41d5e0ecb25a37
+      - name: Import protected signing subkey and build repository
+        env:
+          APT_SIGNING_SUBKEY_B64: ${{ secrets.APT_SIGNING_SUBKEY_B64 }}
+        run: |
+          set -euo pipefail
+          signing_home=$(mktemp -d "$RUNNER_TEMP/flussonix-signing.XXXXXXXX")
+          secret_packet=$(mktemp "$RUNNER_TEMP/flussonix-subkey.XXXXXXXX")
+          cleanup_signing() {
+            chmod -R u+rwX,go-rwx "$signing_home" "$secret_packet" 2>/dev/null || true
+            rm -rf "$signing_home" "$secret_packet"
+          }
+          trap cleanup_signing EXIT
+          trap 'exit 1' HUP INT TERM
+          chmod 700 "$signing_home"
+          chmod 600 "$secret_packet"
+          printf '%s' "$APT_SIGNING_SUBKEY_B64" | base64 --decode > "$secret_packet"
+          gpg --batch --no-options --homedir "$signing_home" \
+            --import "$secret_packet" >/dev/null 2>&1
+          expected_fingerprint=$(tr -d '[:space:]' < packaging/apt/signing-fingerprint.txt)
+          test "${#expected_fingerprint}" -eq 40
+          gpg --batch --no-options --homedir "$signing_home" --with-colons \
+            --fingerprint --list-secret-keys "$expected_fingerprint" \
+            | awk -F: -v expected="$expected_fingerprint" \
+                '$1 == "fpr" && $10 == expected { found = 1 } END { exit !found }'
+          mapfile -t current_packages < <(find "$RUNNER_TEMP/release-assets" \
+            -maxdepth 1 -type f -name 'flussonix_*_amd64.deb')
+          mapfile -t prior_packages < <(find "$RUNNER_TEMP/prior-package" \
+            -maxdepth 1 -type f -name 'flussonix_*_amd64.deb')
+          test "${#current_packages[@]}" -eq 1
+          test "${#prior_packages[@]}" -eq 1
+          GNUPGHOME="$signing_home" python3 scripts/build-apt-repository.py \
+            --package "${current_packages[0]}" \
+            --package "${prior_packages[0]}" \
+            --public-key packaging/apt/flussonix-archive-keyring.gpg \
+            --signing-fingerprint "$expected_fingerprint" \
+            --output-dir "$RUNNER_TEMP/apt-output"
+      - name: Check out GitHub Pages
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: gh-pages
+          path: pages
+          fetch-depth: 1
+          persist-credentials: true
+      - name: Publish only the signed APT tree
+        run: |
+          set -euo pipefail
+          rm -rf pages/apt
+          mv "$RUNNER_TEMP/apt-output" pages/apt
+          git -C pages add --all -- apt
+          mapfile -t changed < <(git -C pages diff --cached --name-only)
+          test "${#changed[@]}" -gt 0
+          for path in "${changed[@]}"; do
+            case "$path" in apt/*) ;; *) exit 1 ;; esac
+          done
+          git -C pages config user.name 'FlussoniX release automation'
+          git -C pages config user.email 'noreply@flussonix.invalid'
+          git -C pages commit -m "Publish APT repository for $RELEASE_TAG"
+          git -C pages push origin HEAD:gh-pages

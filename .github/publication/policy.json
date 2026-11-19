@@ -17,10 +17,12 @@
     "docs/srt-input.md",
     "docs/vendor-group-membership.md",
     "docs/vendor-replica-discovery.md",
+    "packaging/apt/README.md",
     "vendor/quinn-proto/FLUSSONIX_PATCH.md"
   ],
   "public_data": [
     "THIRD_PARTY_NOTICES.txt",
+    "packaging/debian/baselines.json",
     "third_party/manifest.json",
     "third_party/licenses/rust/*/LICENSE*",
     "third_party/licenses/rust/*/COPYRIGHT*",
@@ -32,6 +34,10 @@
   "release_assets": [
     "flussonix-*-linux-x86_64*.tar.gz",
     "flussonix-*-linux-x86_64*.tar.gz.sha256",
+    "flussonix_*_amd64.deb",
+    "flussonix_*_amd64.deb.sha256",
+    "flussonix_*_amd64.deb.inspection.json",
     "SHA256SUMS"
-  ]
+  ],
+  "require_debian_package": true
 }

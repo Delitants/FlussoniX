@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Keep local planning and reports out of source pushes and release uploads."""
-import argparse,fnmatch,gzip,hashlib,json,pathlib,re,shutil,stat,subprocess,sys,tarfile,tempfile,zipfile
+import argparse,fnmatch,gzip,hashlib,io,json,pathlib,re,shutil,stat,subprocess,sys,tarfile,tempfile,zipfile
 from contextlib import contextmanager
 CONTROL='.github/publication/'
 CONTROL_FILES={CONTROL+'guard.py',CONTROL+'install-hooks.py',CONTROL+'policy.json'}
@@ -20,7 +20,10 @@ MAX_TEXT=1048576
 MAX_ARCHIVE_MEMBERS=4096
 MAX_ARCHIVE_UNCOMPRESSED=512*1024*1024
 MAX_CHECKSUM=65536
-CHECKSUM_LINE=re.compile(r'[0-9a-fA-F]{64}  [A-Za-z0-9][A-Za-z0-9._+-]*\.tar\.gz(?:\.sha256)?')
+MAX_DEBIAN=512*1024*1024
+MAX_DEBIAN_FILES=16384
+MAX_INSPECTION=16*1024*1024
+CHECKSUM_LINE=re.compile(r'[0-9a-fA-F]{64}  (?:[A-Za-z0-9][A-Za-z0-9._+-]*\.tar\.gz(?:\.sha256)?|flussonix_[A-Za-z0-9.+:~+-]+_amd64\.deb(?:\.sha256|\.inspection\.json)?)')
 GITHUB_ORIGIN=re.compile(
  r'(?:https://(?:[^@/?#\s]+@)?github\.com/|git@github\.com:|ssh://git@github\.com/)'
  r'([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?',re.I|re.ASCII)
@@ -257,11 +260,154 @@ def checksum_errors(path):
   return []
  except (OSError,UnicodeError) as error:return [str(path)+': '+str(error)]
 
+def bounded_regular(path,limit):
+ if path.is_symlink() or not path.is_file() or path.stat().st_size>limit:
+  raise ValueError(str(path)+': missing, linked or oversized file')
+ with path.open('rb') as source:
+  value=source.read(limit+1)
+ if len(value)>limit:raise ValueError(str(path)+': file exceeds size limit')
+ return value
+
+def release_archive_identity(path):
+ manifests=[]
+ try:
+  with tarfile.open(path,'r:gz') as bundle:
+   for member in bundle:
+    parts=pathlib.PurePosixPath(member.name).parts
+    if len(parts)==2 and parts[1]=='manifest.json' and member.isfile():
+     source=bundle.extractfile(member)
+     if source is None or member.size>MAX_INSPECTION:raise ValueError('release manifest is invalid')
+     manifests.append(json.loads(source.read(MAX_INSPECTION+1)))
+ except (OSError,UnicodeError,json.JSONDecodeError,tarfile.TarError) as error:
+  raise ValueError('release manifest cannot be read') from error
+ if len(manifests)!=1:raise ValueError('release archive must contain one top-level manifest')
+ manifest=manifests[0]
+ if (not isinstance(manifest,dict) or manifest.get('format')!=1
+     or manifest.get('name')!='FlussoniX'
+     or not re.fullmatch(r'[0-9][0-9A-Za-z.+~-]*',str(manifest.get('version','')))
+     or not re.fullmatch(r'[0-9a-f]{40}',str(manifest.get('source_revision','')))
+     or manifest.get('architecture')!='x86_64'
+     or not isinstance(manifest.get('files'),dict)):
+  raise ValueError('release manifest identity is invalid')
+ return manifest
+
+def debian_ar_members(path):
+ data=bounded_regular(path,MAX_DEBIAN)
+ if not data.startswith(b'!<arch>\n'):raise ValueError('Debian package lacks ar magic')
+ position=8;members={}
+ while position<len(data):
+  if len(data)-position<60:raise ValueError('Debian package has a truncated ar header')
+  header=data[position:position+60];position+=60
+  if header[58:60]!=b'`\n':raise ValueError('Debian package has an invalid ar header')
+  try:
+   name=header[:16].decode('ascii').strip().removesuffix('/')
+   size=int(header[48:58].decode('ascii').strip())
+  except (UnicodeDecodeError,ValueError) as error:
+   raise ValueError('Debian package has invalid ar metadata') from error
+  if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.+-]*',name) or name in members
+      or size<0 or size>MAX_DEBIAN or position+size>len(data)):
+   raise ValueError('Debian package has unsafe ar members')
+  members[name]=data[position:position+size];position+=size
+  if size%2:
+   if position>=len(data) or data[position:position+1]!=b'\n':
+    raise ValueError('Debian package has invalid ar padding')
+   position+=1
+ expected={'debian-binary'}
+ controls=[name for name in members if name.startswith('control.tar.')]
+ payloads=[name for name in members if name.startswith('data.tar.')]
+ if (members.get('debian-binary')!=b'2.0\n' or len(controls)!=1 or len(payloads)!=1
+     or set(members)!=(expected|set(controls)|set(payloads))
+     or pathlib.PurePosixPath(controls[0]).suffix not in {'.gz','.xz'}
+     or pathlib.PurePosixPath(payloads[0]).suffix not in {'.gz','.xz'}):
+  raise ValueError('Debian package ar members are not the supported format')
+ return members[controls[0]],members[payloads[0]]
+
+def safe_debian_path(name):
+ path=pathlib.PurePosixPath(name.removeprefix('./'))
+ if path.is_absolute() or not path.parts or any(part in ('','.','..') for part in path.parts):
+  raise ValueError('Debian package contains an unsafe path')
+ return '/'+path.as_posix()
+
+def tar_regular_files(data,control=False):
+ files={};control_bytes=None
+ try:
+  with tarfile.open(fileobj=io.BytesIO(data),mode='r:*') as bundle:
+   for index,member in enumerate(bundle):
+    if index>=MAX_DEBIAN_FILES:raise ValueError('Debian package contains too many files')
+    if member.isdir():continue
+    if not member.isfile() or member.issym() or member.islnk() or member.size>MAX_DEBIAN:
+     raise ValueError('Debian package contains linked, special or oversized content')
+    path=safe_debian_path(member.name)
+    if path in files:raise ValueError('Debian package contains duplicate files')
+    source=bundle.extractfile(member)
+    if source is None:raise ValueError('Debian package member cannot be read')
+    payload=source.read(MAX_DEBIAN+1)
+    if len(payload)!=member.size:raise ValueError('Debian package member size changed')
+    files[path]={'sha256':hashlib.sha256(payload).hexdigest(),'bytes':len(payload),
+                 'mode':oct(member.mode&0o777)}
+    if control and path=='/control':control_bytes=payload
+ except (OSError,EOFError,tarfile.TarError) as error:
+  raise ValueError('Debian package contains an invalid tar member') from error
+ if control and control_bytes is None:raise ValueError('Debian package control file is missing')
+ return control_bytes if control else files
+
+def debian_control(data):
+ try:text=data.decode('utf-8')
+ except UnicodeDecodeError as error:raise ValueError('Debian control is not UTF-8') from error
+ fields={};current=None
+ for line in text.splitlines():
+  if line.startswith((' ','\t')) and current:
+   fields[current]+=' '+line.strip();continue
+  if ': ' not in line:raise ValueError('Debian control has invalid fields')
+  current,value=line.split(': ',1)
+  if current in fields:raise ValueError('Debian control has duplicate fields')
+  fields[current]=value
+ return fields
+
+def package_release_errors(package,checksum,inspection,archive,manifest,version):
+ errors=[]
+ try:
+  expected_name=f'flussonix_{version}-1_amd64.deb'
+  if package.name!=expected_name or checksum.name!=expected_name+'.sha256' or inspection.name!=expected_name+'.inspection.json':
+   raise ValueError('Debian release filenames do not match the release version')
+  checksum_problems=checksum_errors(checksum)
+  if checksum_problems:raise ValueError('; '.join(checksum_problems))
+  digest=hashlib.sha256(bounded_regular(package,MAX_DEBIAN)).hexdigest()
+  line=bounded_regular(checksum,MAX_CHECKSUM).decode('ascii').strip().split('  ',1)
+  if line!=[digest,package.name]:raise ValueError('Debian package checksum mismatch')
+  report=json.loads(bounded_regular(inspection,MAX_INSPECTION))
+  metadata=report.get('package') if isinstance(report,dict) else None
+  archive_row=report.get('archive') if isinstance(report,dict) else None
+  expected_files=report.get('files') if isinstance(report,dict) else None
+  archive_digest=hashlib.sha256(bounded_regular(archive,MAX_ARCHIVE_UNCOMPRESSED)).hexdigest()
+  if (report.get('format')!=1 or not isinstance(metadata,dict)
+      or not isinstance(archive_row,dict) or not isinstance(expected_files,dict)
+      or metadata.get('name')!='flussonix' or metadata.get('version')!=version+'-1'
+      or metadata.get('architecture')!='amd64'
+      or archive_row.get('sha256')!=archive_digest
+      or archive_row.get('source_revision')!=manifest['source_revision']
+      or archive_row.get('version')!=version or archive_row.get('architecture')!='x86_64'):
+   raise ValueError('Debian inspection identity differs from the accepted release archive')
+  control_tar,data_tar=debian_ar_members(package)
+  control=debian_control(tar_regular_files(control_tar,control=True))
+  if (control.get('Package')!='flussonix' or control.get('Version')!=version+'-1'
+      or control.get('Architecture')!='amd64'):
+   raise ValueError('Debian control identity is invalid')
+  dependencies=[value.strip() for value in control.get('Depends','').split(',') if value.strip()]
+  recommends=[value.strip() for value in control.get('Recommends','').split(',') if value.strip()]
+  if metadata.get('depends')!=dependencies or metadata.get('recommends')!=recommends:
+   raise ValueError('Debian control dependencies differ from inspection')
+  if tar_regular_files(data_tar)!=expected_files:
+   raise ValueError('Debian payload differs from inspection')
+ except (OSError,UnicodeError,json.JSONDecodeError,ValueError) as error:
+  errors.append(package.name+': '+str(error))
+ return errors
+
 def release_errors(policy,tag,assets,notes=None):
  if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]*',tag):return ['Unsafe release tag']
  version=tag[1:] if tag.startswith('v') else tag
  patterns=[p.replace('{version}',version) for p in policy.get('release_assets',[])]
- errors=[];seen=set();archives={};checksums={}
+ errors=[];seen=set();archives={};checksums={};packages={};inspections={}
  for value in assets:
   p=pathlib.Path(value);name=p.name
   if name in seen:errors.append('Duplicated release asset: '+name)
@@ -274,10 +420,15 @@ def release_errors(policy,tag,assets,notes=None):
    archive_problems=archive_errors(p)
    errors+=archive_problems
    if not archive_problems:archives[name]=p
-  elif name.endswith('.tar.gz.sha256') or name=='SHA256SUMS':
+  elif name.endswith('.tar.gz.sha256') or name.endswith('.deb.sha256') or name=='SHA256SUMS':
    checksum_problems=checksum_errors(p)
    errors+=checksum_problems
    if not checksum_problems:checksums[name]=p
+  elif name.endswith('.deb'):
+   packages[name]=p
+  elif name.endswith('.deb.inspection.json'):
+   try:bounded_regular(p,MAX_INSPECTION);inspections[name]=p
+   except ValueError as problem:errors.append(str(problem))
   else:errors.append(name+': release asset type has no validator')
   if name.casefold() in USER_DOCS:
    if p.stat().st_size>MAX_TEXT:errors.append(name+': help exceeds size limit')
@@ -296,6 +447,26 @@ def release_errors(policy,tag,assets,notes=None):
     errors.append(checksum_file.name+': checksum must name '+name+' exactly once')
    elif matching[0].lower()!=digest:
     errors.append(checksum_file.name+': checksum mismatch for '+name)
+ if policy.get('require_debian_package'):
+  expected_package=f'flussonix_{version}-1_amd64.deb'
+  if len(archives)!=1:
+   errors.append('Release must contain exactly one accepted x86_64 archive')
+  if set(packages)!={expected_package}:
+   errors.append('Release must contain exactly one version-matched amd64 Debian package')
+  package_checksum=checksums.get(expected_package+'.sha256')
+  inspection=inspections.get(expected_package+'.inspection.json')
+  if package_checksum is None:errors.append(expected_package+': missing checksum sidecar')
+  if inspection is None:errors.append(expected_package+': missing inspection record')
+  if len(archives)==1 and expected_package in packages and package_checksum and inspection:
+   archive=next(iter(archives.values()))
+   try:
+    manifest=release_archive_identity(archive)
+    if manifest['version']!=version:raise ValueError('release archive version differs from tag')
+    expected_archive=f'flussonix-{version}-linux-x86_64-{manifest["source_revision"][:12]}.tar.gz'
+    if archive.name!=expected_archive:raise ValueError('release archive filename differs from manifest')
+    errors+=package_release_errors(packages[expected_package],package_checksum,
+                                   inspection,archive,manifest,version)
+   except ValueError as problem:errors.append(archive.name+': '+str(problem))
  if notes:
   p=pathlib.Path(notes)
   if p.is_symlink() or not p.is_file() or p.stat().st_size>MAX_TEXT:errors.append('Missing/unsafe release notes')
@@ -307,6 +478,7 @@ def verify_ci_metadata(run,jobs,artifacts,run_id,tag,revision,repository):
   raise ValueError('Qualified CI metadata is invalid')
  version=tag[1:] if tag.startswith('v') else tag
  archive=f'flussonix-{version}-linux-x86_64-{revision[:12]}.tar.gz'
+ package=f'flussonix_{version}-1_amd64.deb'
  artifact_name=f'flussonix-candidate-{revision}'
  if (run.get('status')!='completed' or run.get('conclusion')!='success'
      or run.get('event')!='push' or run.get('head_branch')!='main'
@@ -340,12 +512,17 @@ def verify_ci_metadata(run,jobs,artifacts,run_id,tag,revision,repository):
      or row['workflow_run'].get('head_sha')!=revision
      or row['workflow_run'].get('repository_id')!=run['repository']['id']):
   raise ValueError('Qualified CI artifact does not match the release run')
- return artifact_name,archive,archive+'.sha256'
+ return (artifact_name,archive,archive+'.sha256',package,package+'.sha256',
+         package+'.inspection.json')
 
 def verify_ci_zip(downloaded,assets,archive,digest,size):
- names={archive,archive+'.sha256'}
- if len(assets)!=2 or {path.name for path in assets}!=names:
-  raise ValueError('Upload must contain the exact CI archive and checksum')
+ match=re.fullmatch(r'flussonix-(.+)-linux-x86_64-[0-9a-f]{12}\.tar\.gz',archive)
+ if not match:raise ValueError('Qualified CI archive name is invalid')
+ package=f'flussonix_{match[1]}-1_amd64.deb'
+ names={archive,archive+'.sha256',package,package+'.sha256',
+        package+'.inspection.json'}
+ if len(assets)!=5 or {path.name for path in assets}!=names:
+  raise ValueError('Upload must contain the exact CI archive and Debian package sidecars')
  if (downloaded.is_symlink() or not downloaded.is_file()
      or downloaded.stat().st_size!=size or size>MAX_ARCHIVE_UNCOMPRESSED):
   raise ValueError('Qualified CI ZIP size differs from GitHub metadata')
@@ -355,10 +532,12 @@ def verify_ci_zip(downloaded,assets,archive,digest,size):
  try:
   with zipfile.ZipFile(downloaded) as bundle:
    entries=bundle.infolist()
-   if len(entries)!=2 or {item.filename for item in entries}!=names:
+   if len(entries)!=5 or {item.filename for item in entries}!=names:
     raise ValueError('Downloaded CI artifact has unexpected files')
    for item in entries:
-    limit=MAX_CHECKSUM if item.filename.endswith('.sha256') else MAX_ARCHIVE_UNCOMPRESSED
+    if item.filename.endswith('.sha256'):limit=MAX_CHECKSUM
+    elif item.filename.endswith('.inspection.json'):limit=MAX_INSPECTION
+    else:limit=MAX_ARCHIVE_UNCOMPRESSED
     mode=stat.S_IFMT(item.external_attr>>16)
     if (item.is_dir() or item.flag_bits&1 or mode not in (0,stat.S_IFREG)
         or item.file_size>limit):
@@ -412,7 +591,8 @@ def verify_ci_provenance(repo,policy,tag,assets,run_id):
  run=github_json(repository,root)
  jobs=github_json(repository,root+'/jobs?per_page=100')
  artifacts=github_json(repository,root+'/artifacts?per_page=100')
- _,archive,_=verify_ci_metadata(run,jobs,artifacts,run_id,tag,revision,repository)
+ metadata=verify_ci_metadata(run,jobs,artifacts,run_id,tag,revision,repository)
+ archive=metadata[1]
  artifact=artifacts['artifacts'][0]
  common=(pathlib.Path(repo)/git(repo,'rev-parse','--git-common-dir').decode().strip()).resolve()
  with tempfile.TemporaryDirectory(prefix='publication-qualified-',dir=common) as temporary:
