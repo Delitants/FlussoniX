@@ -655,7 +655,9 @@ def main():
    if not origin_matches_repository(origin,policy['repository']):raise ValueError('Upload repository identity differs')
    with upload_snapshot(repo,policy,args.tag,args.asset,args.notes_file) as (assets,notes):
     verify_ci_provenance(repo,policy,args.tag,assets,args.qualified_run)
-    release=json.loads(subprocess.check_output(['gh','api',f'repos/{policy["repository"]}/releases/tags/{args.tag}']))
+    release=json.loads(subprocess.check_output([
+     'gh','release','view',args.tag,'--repo',policy['repository'],
+     '--json','body,assets,isDraft,tagName']))
     if text_errors('Release notes',release.get('body') or ''):raise ValueError('Existing release notes contain internal details')
     version=args.tag[1:] if args.tag.startswith('v') else args.tag
     patterns=[p.replace('{version}',version) for p in policy.get('release_assets',[])]

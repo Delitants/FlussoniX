@@ -987,9 +987,14 @@ class PublicationGuardTests(unittest.TestCase):
                 self.assertEqual([PACKAGE_NAME + ".sha256"], [path.name for path in assets])
                 order.append("qualified")
 
-            def release(_args):
+            def release(command):
+                self.assertEqual(
+                    ["gh", "release", "view", "v1", "--repo", "Delitants/FlussoniX",
+                     "--json", "body,assets,isDraft,tagName"],
+                    command,
+                )
                 order.append("release")
-                return b'{"body":"","assets":[]}'
+                return b'{"tagName":"v1","isDraft":true,"body":"","assets":[]}'
 
             with mock.patch.object(sys, "argv", args), \
                  mock.patch.object(guard, "release_errors", return_value=[]), \
